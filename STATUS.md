@@ -13,7 +13,8 @@ single source of truth for build progress across sessions. Phase details in PLAY
 - [x] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)
 - [x] 6 — Interferogram network + SBAS L2 inversion (`dolphin-timeseries`)
       (L2 only; L1/ADMM = Phase 6b, the documented temporary divergence from the L1-default oracle)
-- [ ] 7 — Filters (`dolphin-filtering`)
+- [x] 7 — Filters (`dolphin-filtering`): long-wavelength high-pass + Goldstein
+      (GDAL gap-fill for bad pixels deferred to Phase 8 I/O)
 - [ ] 8 — I/O layer + S3 read-staging (`dolphin-io` + `dolphin-ingest`) — needs GDAL/HDF5
 - [ ] 9 — Unwrapping dispatch (`dolphin-unwrap`) — needs SNAPHU binary
 - [ ] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
