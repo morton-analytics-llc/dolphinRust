@@ -11,56 +11,107 @@ unwrapping, and SBAS network inversion. The rebuild targets the numerically hot 
 covariance estimation, eigensolver-based phase linking, SHP selection — where Rust's
 `rayon` + `faer` stack replaces the Python `jax`/`numba` JIT kernels without dispatch or
 cold-start overhead, while delegating mature external solvers (SNAPHU) via subprocess.
-Correctness is validated against analytic fixtures and dolphin as a reference oracle.
 
 ## Status
 
-**v1.0.0 — first complete build.** `dolphin run --config <yaml>` produces an end-to-end
-displacement time series + velocity from a CSLC stack (read → sequential phase-linking →
-interferogram network → SNAPHU unwrap → SBAS L2 inversion → velocity → GeoTIFF outputs),
-validated against Python dolphin **v0.35.0** as a reference oracle within physically
-meaningful tolerances. All numerical phases carry green analytic + oracle contract tests.
+**v1.0.0 — first complete build.** A single synchronous entry point,
+[`dolphin_workflows::run_displacement`](crates/dolphin-workflows/src/displacement.rs), runs
+the end-to-end pipeline (read CSLC → sequential phase-linking → interferogram network →
+SNAPHU unwrap → SBAS inversion → velocity) and returns a typed result — displacement cube,
+velocity (mm/yr), temporal coherence, acquisition dates, CRS + geotransform — while also
+writing Cloud-Optimized GeoTIFFs. The `dolphin` CLI is a thin wrapper over it. The library
+path is runtime-agnostic (no tokio), so a host app bridges it via `spawn_blocking`.
 
-Known deferrals (off the v1.0.0 critical path): CRLB / closure-phase rasters and L1/ADMM
-inversion (not in the pinned v0.35.0 / deferred to 6b), `EagerLoader` prefetch,
-complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform, multi-burst stitching, and
-the tophu/spurt/whirlwind unwrappers. See [STATUS.md](STATUS.md) and
-[PLAYBOOK.md](PLAYBOOK.md).
+**Validated against Python dolphin v0.35.0** as a reference oracle, to physically-meaningful
+tolerances (not bit-exactness):
+
+- **Per-kernel contract tests** — every numerical kernel matches a dolphin `.npy` fixture
+  (phase linking eigenvector overlap > 0.999, coherence < 1e-4, **L1/ADMM inversion < 1.5e-6**).
+- **End-to-end, synthetic single-burst stack** — full `dolphin run` vs `dolphinRust` on a
+  genuine `dolphin config` YAML: displacement corr 1.0000 / demeaned RMS ≤ 0.05 rad, and
+  **velocity absolute scale matches** (affine slope a = 1.0000 noise-free → 0.9997 at
+  realistic speckle). See [VALIDATION.md](VALIDATION.md).
+
+**Not yet validated / deferred** (honest scope):
+- **Real OPERA CSLC validation is still pending** — equivalence above is on *synthetic*
+  inputs. The real-data tier is the next gate (tracked in VALIDATION.md / STATUS.md).
+- **Multi-burst frame stitching** is not implemented — runs are single-burst.
+- CRLB / closure-phase rasters, `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer,
+  NISAR custom geotransform, and the tophu/spurt/whirlwind unwrappers are deferred.
+
+See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
+
+## System requirements
+
+| Dependency | Version | Needed for |
+|---|---|---|
+| Rust | ≥ 1.94 | build |
+| GDAL | ≥ 3.4 (tested 3.12) | GeoTIFF/COG I/O (`gdal` 0.19) |
+| HDF5 | 1.10+ (tested 2.x) | CSLC reading (`hdf5-metno` 0.12) |
+| SNAPHU | binary on `PATH` (tested 2.0.7) | phase unwrapping |
+
+The numerical crates (`dolphin-core/-phaselink/-shp/-ps/-stack/-timeseries/-filtering`) build
+with a pure-Rust dependency set; only the I/O, unwrap, and workflow layers need the system
+libraries above. `cargo test` runs analytic contracts always; oracle/SNAPHU-dependent tests
+skip cleanly when fixtures or the binary are absent.
+
+## Quickstart — CLI
+
+```sh
+cargo build --release
+# accepts a genuine dolphin `DisplacementWorkflow` YAML unchanged
+./target/release/dolphin run --config workflow.yaml
+# writes velocity.tif, temporal_coherence.tif, displacement_NN.tif (COGs) to work_directory
+```
+
+## Quickstart — library
+
+Add the workflow crate (path or git) and call the one entry point:
+
+```rust
+use dolphin_core::config::DisplacementWorkflow;
+use dolphin_workflows::run_displacement;
+
+fn main() -> anyhow::Result<()> {
+    let cfg = DisplacementWorkflow::from_yaml(&std::fs::read_to_string("workflow.yaml")?)?;
+    let out = run_displacement(&cfg)?; // synchronous; ~no tokio in the library path
+    println!(
+        "{} dates, velocity {}x{} px in mm/yr, EPSG {:?}",
+        out.acquisition_days.len(),
+        out.velocity_mm_yr.nrows(),
+        out.velocity_mm_yr.ncols(),
+        out.epsg,
+    );
+    Ok(())
+}
+```
+
+A host app on a tokio runtime bridges the blocking call:
+
+```rust
+let out = tokio::task::spawn_blocking(move || dolphin_workflows::run_displacement(&cfg)).await??;
+```
+
+A runnable version is in [`crates/dolphin-workflows/examples/run_synthetic.rs`](crates/dolphin-workflows/examples/run_synthetic.rs)
+(generates a synthetic stack and produces output in one command). Full integration guide,
+config reference, and output schema: **[docs/usage.md](docs/usage.md)**.
 
 ## Workspace layout
 
 | Crate | Reference (dolphin) | Responsibility |
 |---|---|---|
 | `dolphin-core` | cross-cutting | Types, block/tiling geometry, config models, errors |
-| `dolphin-io` | `dolphin/io/` | VRT stack, HDF5 CSLC reading, GeoTIFF block I/O |
-| `dolphin-phaselink` | `dolphin/phase_link/` | Covariance, EVD/EMI, compression, CRLB, metrics |
+| `dolphin-io` | `dolphin/io/` | HDF5 CSLC reading, geotransform/CRS, GeoTIFF/COG I/O |
+| `dolphin-phaselink` | `dolphin/phase_link/` | Covariance, EVD/EMI, compression, temporal coherence |
 | `dolphin-shp` | `dolphin/shp/` | GLRT / KS homogeneous-pixel selection |
 | `dolphin-ps` | `dolphin/ps.py` | Amplitude-dispersion PS selection |
 | `dolphin-stack` | `dolphin/stack.py` | Ministack planning, compressed-SLC sequencing |
-| `dolphin-timeseries` | `dolphin/timeseries.py` | SBAS network inversion, velocity |
+| `dolphin-timeseries` | `dolphin/timeseries.py` | SBAS L1/L2 network inversion, velocity |
 | `dolphin-filtering` | `dolphin/filtering.py` | Long-wavelength / Goldstein FFT filters |
 | `dolphin-unwrap` | `dolphin/unwrap/` | Dispatch to external unwrappers (SNAPHU) |
 | `dolphin-ingest` | — | Concurrent S3 read-staging (feature `s3`, off by default) |
 | `dolphin-workflows` | `dolphin/workflows/` | Displacement pipeline orchestration + config |
 | `dolphin-cli` | `dolphin` CLI | `dolphin run --config <yaml>` |
-
-## Build
-
-```sh
-cargo build
-cargo test
-```
-
-The numerical crates build with a pure-Rust dependency set. The I/O and unwrap layers
-need system libraries: **GDAL ≥ 3.4** (`gdal` 0.19), **HDF5** (`hdf5-metno` 0.12), and the
-**SNAPHU** binary on `PATH` for unwrapping. `cargo test` runs analytic contracts always;
-oracle/SNAPHU-dependent tests skip cleanly when fixtures or the binary are absent.
-
-Run the pipeline:
-
-```sh
-dolphin run --config workflow.yaml   # accepts dolphin's displacement-workflow YAML
-```
 
 ## License
 
