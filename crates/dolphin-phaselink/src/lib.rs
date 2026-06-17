@@ -8,3 +8,11 @@
 //! Design: JAX `vmap(vmap(f))` over the (rows, cols) pixel grid maps to a
 //! `rayon` parallel iterator where each closure solves one NxN complex matrix
 //! via `faer`. This is the highest-value module to port first.
+
+pub mod covariance;
+pub mod estimator;
+
+pub use covariance::estimate_stack_covariance;
+pub use estimator::{
+    process_coherence_matrices, process_coherence_matrix, PixelEstimate, StackEstimate,
+};

@@ -7,8 +7,10 @@ scientific spec), and we are free to choose the fastest correct Rust realization
 algorithm. The goal is **scientific correctness**, validated at each phase against analytic
 fixtures and dolphin outputs used as a reference oracle.
 
-Pin a specific dolphin release (e.g. `v0.x`) before starting and record it — oracle data is
-generated from that pinned version so validation is reproducible.
+**Pinned dolphin reference: `v0.35.0`** (commit `e567e554300f9bb2c6c4c49358d41876ce81e5a7`,
+`isce-framework/dolphin`). All oracle data is generated from this version so validation is
+reproducible. (Phase 0 types/config were initially mirrored from `main`; reconcile any
+default drift against v0.35.0 if a Phase-0 contract ever depends on it.)
 
 ---
 
@@ -339,9 +341,14 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
 
 ## Open questions (technical, resolve before Phase 1)
 
-1. Pin the exact dolphin reference version/commit for oracle generation.
-2. Confirm `faer`'s complex Cholesky + shift-invert (or its direct dense eigensolver) hit
-   the correctness tolerances, or whether a thin LAPACK path (`ndarray-linalg`) is needed
-   for the EMI inverse.
+1. ~~Pin the exact dolphin reference version/commit for oracle generation.~~ **Resolved:
+   `v0.35.0` (`e567e55`).**
+2. ~~Confirm `faer`'s complex Cholesky + shift-invert (or its direct dense eigensolver) hit
+   the correctness tolerances~~ **Resolved (Phase 1):** Rust uses faer's direct
+   `selfadjoint_eigendecomposition` for both EVD (largest) and EMI (least) eigenvectors —
+   the sanctioned divergence from dolphin's JAX power/inverse iteration. EMI inverts
+   `Γ=|C|` via faer real Cholesky (`Side::Lower`), falling back to EVD on Cholesky failure
+   or a non-finite inverse (the dolphin NaN fallback). Validated against the v0.35.0 oracle:
+   covariance max-err < 1e-4, eigenvector `|⟨v_rust,v_oracle⟩|` > 0.999. No LAPACK needed.
 3. Decide the oracle-fixture generation env (containerized Python + pinned dolphin) so
    reference data is reproducible.

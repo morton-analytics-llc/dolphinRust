@@ -12,5 +12,8 @@ num-complex.workspace = true
 faer.workspace = true
 rayon.workspace = true
 
+[dev-dependencies]
+ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
+
 [lints]
 workspace = true

@@ -5,7 +5,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
-- [ ] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
+- [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
 - [ ] 2 — SHP selection (`dolphin-shp`)
 - [ ] 3 — PS selection (`dolphin-ps`)
 - [ ] 4 — Quality layers: temp_coh, CRLB, closure, compressed SLC (`dolphin-phaselink`)
@@ -17,7 +17,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 - [ ] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
 
 ## Awaiting input (see PLAYBOOK.md questions)
-- Pin the dolphin reference version — required before any oracle-based validation.
+- ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.
 - Packaging: workspace member of `eo` vs. separate crate dependency — before Phase 10.
 
 ## Scaffold (done)
