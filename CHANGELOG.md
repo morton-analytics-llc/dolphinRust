@@ -22,6 +22,15 @@ All notable changes to dolphinRust are documented here. The format follows
   T005-008704-IW1 — velocity TLS (orthogonal) slope ≈1.03 vs the oracle with matching
   magnitude, closing the documented real-data scale gap. See `VALIDATION.md`.
 
+### Integration
+- **GroundPulse (eo) adoption**: a `gp-dolphin` crate + standalone worker in `../eo`
+  (branch `feature/gp-dolphin-rust`) calls `run_displacement` in-process via
+  `spawn_blocking`, lands a velocity COG via `gp-storage`, and writes
+  `displacement_aoi_summary` + `aoi_raster_products` rows in PostGIS. One real OPERA
+  frame ran end-to-end. Isolated as its own Cargo workspace because dolphinRust's
+  `hdf5-metno` (system HDF5 2.x) cannot share a binary graph with eo's static
+  `hdf5-sys` (HDF5 1.x). Unpushed, pending review.
+
 ## [1.0.0] — 2026-06-16
 
 First complete build: an end-to-end, library-first Rust rebuild of the OPERA / DISP-S1
