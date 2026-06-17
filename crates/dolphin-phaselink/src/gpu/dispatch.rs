@@ -35,6 +35,59 @@ pub(crate) fn output_buffer(ctx: &GpuContext, label: &str, byte_len: u64) -> wgp
     })
 }
 
+/// Build a compute pipeline from `source` (entry `main`), bind `buffers` in
+/// order at bindings `0..n`, and dispatch `workgroups` groups of 64 threads.
+pub(crate) fn dispatch_compute(
+    ctx: &GpuContext,
+    source: &str,
+    label: &str,
+    buffers: &[&wgpu::Buffer],
+    workgroups: u32,
+) {
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+    let pipeline = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+    let entries: Vec<wgpu::BindGroupEntry> = buffers
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupEntry {
+            binding: i as u32,
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    ctx.queue.submit(Some(enc.finish()));
+}
+
 /// Copy `src` to a staging buffer, block until mapped, and read back `count`
 /// elements of `T`.
 ///

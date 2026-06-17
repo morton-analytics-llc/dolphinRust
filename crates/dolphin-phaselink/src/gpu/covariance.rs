@@ -4,7 +4,7 @@ use dolphin_core::{Cf32, HalfWindow, Strides};
 use ndarray::{Array4, ArrayView3};
 
 use super::context::{GpuContext, GpuError};
-use super::dispatch::{input_buffer, output_buffer, readback, uniform_buffer};
+use super::dispatch::{dispatch_compute, input_buffer, output_buffer, readback, uniform_buffer};
 
 /// Largest ministack the f32 kernel supports (matches `MAX_NSLC` in the WGSL).
 pub const MAX_NSLC: usize = 32;
@@ -99,23 +99,6 @@ fn run(
     params: &Params,
     out_len: usize,
 ) -> Result<Vec<[f32; 2]>, GpuError> {
-    let shader = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("covariance"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("covariance.wgsl").into()),
-        });
-    let pipeline = ctx
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("covariance"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
     let stack_buf = input_buffer(ctx, "stack", stack);
     let param_buf = uniform_buffer(ctx, "params", params);
     let out_buf = output_buffer(
@@ -123,41 +106,14 @@ fn run(
         "cov-out",
         (out_len * std::mem::size_of::<[f32; 2]>()) as u64,
     );
-    let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("covariance"),
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: stack_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: param_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: out_buf.as_entire_binding(),
-            },
-        ],
-    });
-
     let n_pix = params.out_rows * params.out_cols;
-    let mut enc = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("covariance"),
-        });
-    {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("covariance"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(n_pix.div_ceil(64), 1, 1);
-    }
-    ctx.queue.submit(Some(enc.finish()));
+    dispatch_compute(
+        ctx,
+        include_str!("covariance.wgsl"),
+        "covariance",
+        &[&stack_buf, &param_buf, &out_buf],
+        n_pix.div_ceil(64),
+    );
     readback(ctx, &out_buf, out_len)
 }
 
