@@ -107,6 +107,7 @@ fn covariance_matches_oracle() {
         to_c64(stack).view(),
         HalfWindow { y: 2, x: 2 },
         Strides { y: 1, x: 1 },
+        None,
     )
     .unwrap();
 

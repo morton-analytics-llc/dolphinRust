@@ -6,7 +6,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
-- [ ] 2 — SHP selection (`dolphin-shp`)
+- [x] 2 — SHP selection (`dolphin-shp`)
 - [ ] 3 — PS selection (`dolphin-ps`)
 - [ ] 4 — Quality layers: temp_coh, CRLB, closure, compressed SLC (`dolphin-phaselink`)
 - [ ] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)

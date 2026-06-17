@@ -430,7 +430,10 @@ name = "dolphin-shp"
 version = "1.0.0"
 dependencies = [
  "dolphin-core",
+ "dolphin-phaselink",
  "ndarray",
+ "ndarray-npy",
+ "num-complex",
  "rayon",
  "statrs",
 ]
