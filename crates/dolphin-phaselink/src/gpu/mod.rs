@@ -12,5 +12,8 @@
 //! inverse iteration for EMI), mirroring `covariance.rs`/`estimator.rs`.
 
 mod context;
+mod covariance;
+mod dispatch;
 
 pub use context::{enumerate_adapters, AdapterReport, GpuContext, GpuError};
+pub use covariance::{estimate_stack_covariance_gpu, MAX_NSLC};
