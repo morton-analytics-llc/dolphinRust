@@ -31,11 +31,18 @@ tolerances (not bit-exactness):
   genuine `dolphin config` YAML: displacement corr 1.0000 / demeaned RMS ≤ 0.05 rad, and
   **velocity absolute scale matches** (affine slope a = 1.0000 noise-free → 0.9997 at
   realistic speckle). See [VALIDATION.md](VALIDATION.md).
+- **Real OPERA CSLC stack** — both engines run the full pipeline on genuine OPERA L2 CSLC-S1
+  granules (config compatibility on real data: PASS) across four bursts. Engine agreement is
+  confirmed: displacement RMS residual ≤ 0.008 rad (within the sanctioned envelope), matching
+  velocity magnitude, and matching temporal coherence. See [VALIDATION.md](VALIDATION.md).
 
-**Not yet validated / deferred** (honest scope):
-- **Real OPERA CSLC validation is still pending** — equivalence above is on *synthetic*
-  inputs. The real-data tier is the next gate (tracked in VALIDATION.md / STATUS.md).
-- **Multi-burst frame stitching** is not implemented — runs are single-burst.
+**Honest scope / deferred:**
+- **Real-data velocity *absolute scale* under strong signal** is not independently pinned: the
+  coherent windows sampled were tectonically stable (deformation at the cross-engine noise
+  floor), so the scale regression is signal-limited there. Absolute scale is confirmed on the
+  synthetic tier (a = 1.0000); a high-coherence *deforming* scene is the narrow follow-up.
+- **Multi-burst frame stitching** is implemented (frame mosaic by burst geotransform); not yet
+  exercised on a real multi-burst OPERA frame.
 - CRLB / closure-phase rasters, `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer,
   NISAR custom geotransform, and the tophu/spurt/whirlwind unwrappers are deferred.
 
