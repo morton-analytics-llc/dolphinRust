@@ -3,6 +3,23 @@
 Target: **v1.0.0** (first complete build). Update this file as phases land — it is the
 single source of truth for build progress across sessions. Phase details in PLAYBOOK.md.
 
+## Ready-to-ship v1 progress (branch `v1-ready-to-ship`, per V1_PROMPT.md)
+
+| Workstream | State |
+|---|---|
+| A1 velocity mm/yr via real temporal baselines + wavelength | ✅ done (oracle scale a=1.0000) |
+| A2 L1/ADMM inversion, config-driven default | ✅ done (oracle <1.5e-6) |
+| A3 multi-burst frame stitching | ⏳ **remaining** |
+| B4 real OPERA CSLC validation tier | ⏳ **remaining** (Earthdata token present) |
+| C5 typed sync public API (+temp coh, CRS/geotransform) | ✅ done |
+| C6 COG outputs + documented schema | ✅ done (LAYOUT=COG verified) |
+| C7 `#![warn(missing_docs)]` all crates, doc clean | ✅ done |
+| D README + docs/usage.md + runnable example | ✅ done |
+| E11 release metadata + CHANGELOG + packaging | ✅ done (core dry-run clean; see RELEASING.md) |
+
+Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --no-deps.
+**Nothing pushed** — all on branch `v1-ready-to-ship`, awaiting sign-off.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
