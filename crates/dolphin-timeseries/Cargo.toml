@@ -11,5 +11,8 @@ ndarray.workspace = true
 faer.workspace = true
 rayon.workspace = true
 
+[dev-dependencies]
+ndarray-npy = { version = "0.9", default-features = false }
+
 [lints]
 workspace = true
