@@ -4,6 +4,24 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v1.1.0
+
+### Added
+- **Auto spatial reference-point selection** (dolphin v0.36 center-of-mass): the displacement
+  series is referenced to a stable pixel — `timeseries_options.reference_point` if set, else
+  the quality-weighted center of mass of the largest high-coherence region
+  (`dolphin_timeseries::select_reference_point` / `reference_to_point`). The chosen point is
+  exposed on `DisplacementOutput::reference_point`. The pinned v0.35.0 oracle uses `argmin`
+  (no center-of-mass), so selection is contract-tested analytically.
+- **Speed baseline** (`bench/`): reproducible dolphinRust-vs-dolphin benchmark with per-stage
+  `tracing` timing in `run_displacement` (`RUST_LOG=info`). Real-frame phase-linking 3.6×,
+  end-to-end 2.0× (unwrap-bound by an emulated snaphu binary). See `bench/README.md`.
+
+### Validated
+- **Velocity absolute scale on a real deforming scene** (B4): Mexico City burst
+  T005-008704-IW1 — velocity TLS (orthogonal) slope ≈1.03 vs the oracle with matching
+  magnitude, closing the documented real-data scale gap. See `VALIDATION.md`.
+
 ## [1.0.0] — 2026-06-16
 
 First complete build: an end-to-end, library-first Rust rebuild of the OPERA / DISP-S1

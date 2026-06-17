@@ -20,6 +20,17 @@ single source of truth for build progress across sessions. Phase details in PLAY
 Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --no-deps.
 **Nothing pushed** — all on branch `v1-ready-to-ship`, awaiting sign-off.
 
+## v1.1.0 progress (branch `v1.1`, per R1_PROMPT.md / ROADMAP.md)
+
+| Item | State |
+|---|---|
+| Baseline speed benchmark (`bench/`) | ✅ done — PL 3.6× / e2e 2.0× on a real frame; per-stage `tracing` timing; honest unwrap caveat (Rosetta snaphu) |
+| Close velocity-scale residual (B4) | ✅ done — Mexico City T005, TLS slope ≈1.03, magnitudes match; VALIDATION.md updated |
+| Auto reference-point selection (center-of-mass) | ✅ done — `select_reference_point`/`reference_to_point`, wired via `timeseries_options.reference_point`, 5 analytic contracts + e2e green |
+| eo integration | ⏸ paused at the documented gate — awaiting sign-off (crate name, SNAPHU in worker image) |
+
+Gates green (fmt, clippy -D warnings, test, doc). **Nothing pushed** — branch `v1.1`.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
