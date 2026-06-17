@@ -477,6 +477,9 @@ name = "dolphin-unwrap"
 version = "1.0.0"
 dependencies = [
  "dolphin-core",
+ "ndarray",
+ "ndarray-npy",
+ "num-complex",
  "thiserror 2.0.18",
  "tracing",
 ]

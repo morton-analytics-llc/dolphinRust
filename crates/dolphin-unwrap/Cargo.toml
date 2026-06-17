@@ -7,8 +7,13 @@ license.workspace = true
 
 [dependencies]
 dolphin-core.workspace = true
+ndarray.workspace = true
+num-complex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 
 [lints]
 workspace = true

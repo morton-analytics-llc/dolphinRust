@@ -19,14 +19,14 @@ single source of truth for build progress across sessions. Phase details in PLAY
       GeoTIFF r/w (gdal 0.19) + CSLC HDF5 read (hdf5-metno 0.12) + CSLC stack + S3 stage().
       Deferred: `EagerLoader` prefetch, complex-GeoTIFF writer (CFloat32), NISAR custom
       geotransform — not on the v1.0.0 local-run critical path.
-- [ ] 9 — Unwrapping dispatch (`dolphin-unwrap`) — needs SNAPHU binary
+- [x] 9 — Unwrapping dispatch (`dolphin-unwrap`) — SNAPHU subprocess wrapper
+      (tophu/spurt/whirlwind = documented gaps, not built)
 - [ ] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
 
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.
-- **SNAPHU binary MISSING** — required for Phase 9 (unwrapping) and the Phase 10
-  end-to-end run. Install (e.g. `conda install -c conda-forge snaphu`, or build from
-  the Stanford source) before Phase 9. GDAL 3.12.2 / HDF5 2.1.1 / OpenBLAS present.
+- ~~SNAPHU binary MISSING~~ — **built v2.0.7 from Stanford source, at
+  `/opt/homebrew/bin/snaphu`**. GDAL 3.12.2 / HDF5 2.1.1 / OpenBLAS present.
 - Packaging: workspace member of `eo` vs. separate crate dependency — before Phase 10.
 
 ## Scaffold (done)
