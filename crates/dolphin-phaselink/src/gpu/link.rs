@@ -18,7 +18,10 @@ use rayon::prelude::*;
 
 use super::context::{GpuContext, GpuError};
 use super::covariance::MAX_NSLC;
-use super::dispatch::{dispatch_compute, input_buffer, output_buffer, readback, uniform_buffer};
+use super::dispatch::{
+    dispatch_compute, dispatch_compute_overrides, input_buffer, output_buffer, readback,
+    uniform_buffer,
+};
 use crate::estimator::{process_coherence_matrix, PixelEstimate, StackEstimate};
 
 /// Default power-iteration count — ample for the eigenvalue gaps of DS coherence
@@ -194,12 +197,12 @@ fn run(
     let est_buf = output_buffer(ctx, "link-est", (n_pix * std::mem::size_of::<u32>()) as u64);
     let rel_buf = output_buffer(ctx, "link-rel", (n_pix * std::mem::size_of::<u32>()) as u64);
 
-    let groups = (n_pix as u32).div_ceil(if use_evd { 64 } else { 32 });
     dispatch_link(
         ctx,
         use_evd,
+        nslc,
+        n_pix as u32,
         &[&c_buf, &param_buf, &phase_buf, &eig_buf, &est_buf, &rel_buf],
-        groups,
     );
 
     let phase = readback::<[f32; 2]>(ctx, &phase_buf, n_pix * nslc)?;
@@ -214,12 +217,36 @@ fn run(
     Ok((phase, eig, est, rel))
 }
 
-/// EVD binds the first 4 buffers; EMI also binds the estimator + reliable outputs.
-fn dispatch_link(ctx: &GpuContext, use_evd: bool, bufs: &[&wgpu::Buffer], groups: u32) {
-    match use_evd {
-        true => dispatch_compute(ctx, include_str!("evd.wgsl"), "evd", &bufs[..4], groups),
-        false => dispatch_compute(ctx, include_str!("emi.wgsl"), "emi", bufs, groups),
+/// EVD binds the first 4 buffers at a fixed workgroup size; EMI also binds the
+/// estimator + reliable outputs and sets its `WG` / `GAM_LEN` scratch overrides
+/// (threadgroup-sized so the nslc² scratch fits the 32 KB budget — see emi.wgsl).
+fn dispatch_link(ctx: &GpuContext, use_evd: bool, nslc: usize, n_pix: u32, bufs: &[&wgpu::Buffer]) {
+    if use_evd {
+        let groups = n_pix.div_ceil(64);
+        dispatch_compute(ctx, include_str!("evd.wgsl"), "evd", &bufs[..4], groups);
+        return;
     }
+    let (wg, gam_len) = emi_workgroup(nslc);
+    let groups = n_pix.div_ceil(wg);
+    let constants = [("WG", f64::from(wg)), ("GAM_LEN", f64::from(gam_len))];
+    dispatch_compute_overrides(
+        ctx,
+        include_str!("emi.wgsl"),
+        "emi",
+        bufs,
+        groups,
+        &constants,
+    );
+}
+
+/// EMI workgroup size and scratch length for a given `nslc`. Each thread owns an
+/// `nslc²` slice of two threadgroup arrays; `2·WG·nslc²·4` must stay under the
+/// 32 KiB threadgroup budget with headroom (hitting the exact limit is not
+/// reliable on Metal), so we budget 24 KiB: `WG = clamp(3072 / nslc², 1, 64)`.
+fn emi_workgroup(nslc: usize) -> (u32, u32) {
+    let nn = (nslc * nslc) as u32;
+    let wg = (3072 / nn).clamp(1, 64);
+    (wg, wg * nn)
 }
 
 /// Repack flat GPU output into stacked arrays.

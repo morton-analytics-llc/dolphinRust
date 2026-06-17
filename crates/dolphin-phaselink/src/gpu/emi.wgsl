@@ -20,11 +20,17 @@
 // recomputes the flagged minority on the f64 CPU path — so EMI matches the CPU
 // reference on *every* pixel, sub-mm, with no π-rad tail.
 //
-// Γ, its Cholesky factor, and the inverse share private nslc² scratch; the
-// iterate vectors are private nslc-length. nslc ≤ MAX_NSLC. Complex = vec2<f32>.
+// Scratch (Γ → Cholesky L → Γ⁻¹) is **threadgroup** memory, not per-thread
+// private: at nslc up to 32 the nslc² scratch (~8 KB/thread for Γ + Γ⁻¹) spilled
+// out of registers and produced run-to-run nondeterministic output at 384².
+// Threadgroup memory never spills, so EMI is deterministic at every size. Each
+// thread owns a private slice `[goff, goff + nslc²)` of the shared arrays (no
+// barrier — there is no cross-thread sharing); the host sets the workgroup size
+// WG and array length GAM_LEN = WG·nslc² so the two arrays fit the 32 KB
+// threadgroup budget (WG ≈ 24 at nslc 13, 4 at nslc 32). The iterate vectors stay
+// private (nslc-length, tiny). nslc ≤ MAX_NSLC. Complex = vec2<f32>.
 
-const MAX_NSLC: u32 = 16u;
-const MAX_NN: u32 = 256u; // MAX_NSLC * MAX_NSLC
+const MAX_NSLC: u32 = 32u;
 
 // Reliability thresholds (tuned on the real Mexico stack so the host fallback
 // removes the π-rad tail; generous — false positives only cost a CPU recompute).
@@ -32,6 +38,10 @@ const GAP_TOL: f32 = 0.07;    // bottom relative eigengap floor (λ_2nd−λ_min
 const COH_FLOOR: f32 = 0.10;  // mean off-diagonal |C| floor
 const RHO_FRAC: f32 = 0.50;   // Rayleigh(v_least)/λ_max ceiling (wrong-mode capture)
 const SHIFT_MARGIN: f32 = 1.02; // shift = λ_max·margin (‖Mv‖ underestimates λ_max)
+
+// Host-set pipeline overrides: workgroup size and threadgroup-scratch length.
+override WG: u32 = 4u;          // pixels (threads) per workgroup
+override GAM_LEN: u32 = 4096u;  // WG · nslc² (≤ 4096 so 2 arrays fit 32 KB)
 
 struct Params {
     nslc: u32,
@@ -47,8 +57,9 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> estimator_out: array<u32>;
 @group(0) @binding(5) var<storage, read_write> reliable_out: array<u32>;
 
-var<private> gam: array<f32, MAX_NN>; // Γ, then its Cholesky factor L (lower)
-var<private> inv: array<f32, MAX_NN>; // Γ⁻¹
+var<workgroup> gam_wg: array<f32, GAM_LEN>; // Γ, then its Cholesky factor L (lower)
+var<workgroup> inv_wg: array<f32, GAM_LEN>; // Γ⁻¹
+var<private> goff: u32;                      // this thread's scratch slice base
 var<private> v: array<vec2<f32>, MAX_NSLC>;
 var<private> w: array<vec2<f32>, MAX_NSLC>;
 var<private> v1: array<vec2<f32>, MAX_NSLC>; // saved least eigenvector
@@ -57,44 +68,44 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-// Cholesky factor of Γ (lower, in place over `gam`). Returns false if not PD.
+// Cholesky factor of Γ (lower, in place over `gam_wg` slice). Returns false if not PD.
 fn cholesky(n: u32) -> bool {
     for (var j = 0u; j < n; j = j + 1u) {
-        var sum = gam[j * n + j];
+        var sum = gam_wg[goff + j * n + j];
         for (var k = 0u; k < j; k = k + 1u) {
-            sum = sum - gam[j * n + k] * gam[j * n + k];
+            sum = sum - gam_wg[goff + j * n + k] * gam_wg[goff + j * n + k];
         }
         if (sum <= 1e-12) { return false; }
         let ljj = sqrt(sum);
-        gam[j * n + j] = ljj;
+        gam_wg[goff + j * n + j] = ljj;
         for (var i = j + 1u; i < n; i = i + 1u) {
-            var s = gam[i * n + j];
+            var s = gam_wg[goff + i * n + j];
             for (var k = 0u; k < j; k = k + 1u) {
-                s = s - gam[i * n + k] * gam[j * n + k];
+                s = s - gam_wg[goff + i * n + k] * gam_wg[goff + j * n + k];
             }
-            gam[i * n + j] = s / ljj;
+            gam_wg[goff + i * n + j] = s / ljj;
         }
     }
     return true;
 }
 
-// Given the Cholesky factor L in `gam`, write Γ⁻¹ into `inv` (solve L Lᵀ X = I).
+// Given the Cholesky factor L in `gam_wg`, write Γ⁻¹ into `inv_wg` (solve L Lᵀ X = I).
 fn invert_from_cholesky(n: u32) {
     for (var c = 0u; c < n; c = c + 1u) {
         for (var i = 0u; i < n; i = i + 1u) {
             var b = select(0.0, 1.0, i == c);
             for (var k = 0u; k < i; k = k + 1u) {
-                b = b - gam[i * n + k] * inv[k * n + c];
+                b = b - gam_wg[goff + i * n + k] * inv_wg[goff + k * n + c];
             }
-            inv[i * n + c] = b / gam[i * n + i];
+            inv_wg[goff + i * n + c] = b / gam_wg[goff + i * n + i];
         }
         for (var ii = 0u; ii < n; ii = ii + 1u) {
             let i = n - 1u - ii;
-            var b = inv[i * n + c];
+            var b = inv_wg[goff + i * n + c];
             for (var k = i + 1u; k < n; k = k + 1u) {
-                b = b - gam[k * n + i] * inv[k * n + c];
+                b = b - gam_wg[goff + k * n + i] * inv_wg[goff + k * n + c];
             }
-            inv[i * n + c] = b / gam[i * n + i];
+            inv_wg[goff + i * n + c] = b / gam_wg[goff + i * n + i];
         }
     }
 }
@@ -106,7 +117,7 @@ fn matvec(n: u32, base: u32, use_emi: bool) -> f32 {
         var acc = vec2<f32>(0.0, 0.0);
         for (var j = 0u; j < n; j = j + 1u) {
             let c = cmat[base + i * n + j];
-            let wgt = select(length(c), inv[i * n + j], use_emi);
+            let wgt = select(length(c), inv_wg[goff + i * n + j], use_emi);
             acc = acc + wgt * cmul(c, v[j]);
         }
         w[i] = acc;
@@ -118,6 +129,14 @@ fn matvec(n: u32, base: u32, use_emi: bool) -> f32 {
 fn set_v_ones(n: u32) {
     for (var i = 0u; i < n; i = i + 1u) {
         v[i] = vec2<f32>(1.0, 0.0);
+    }
+}
+
+// Normalize `w` into `v` by ‖w‖; returns ‖w‖ (the dominant eigenvalue estimate).
+fn normalize_w_into_v(n: u32, nrm: f32) {
+    let s = select(0.0, 1.0 / nrm, nrm > 0.0);
+    for (var i = 0u; i < n; i = i + 1u) {
+        v[i] = w[i] * s;
     }
 }
 
@@ -165,26 +184,19 @@ fn power_dominant(n: u32, base: u32, use_emi: bool, iters: u32) {
     set_v_ones(n);
     for (var it = 0u; it < iters; it = it + 1u) {
         let nrm = matvec(n, base, use_emi);
-        let s = select(0.0, 1.0 / nrm, nrm > 0.0);
-        for (var i = 0u; i < n; i = i + 1u) {
-            v[i] = w[i] * s;
-        }
+        normalize_w_into_v(n, nrm);
     }
 }
 
-// Normalize `w` into `v` by ‖w‖; returns ‖w‖ (the dominant eigenvalue estimate).
-fn normalize_w_into_v(n: u32, nrm: f32) {
-    let s = select(0.0, 1.0 / nrm, nrm > 0.0);
-    for (var i = 0u; i < n; i = i + 1u) {
-        v[i] = w[i] * s;
-    }
-}
-
-@compute @workgroup_size(32)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(WG)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
     let pix = gid.x;
-    if (pix >= p.n_pix) { return; }
     let n = p.nslc;
+    goff = lid * n * n; // this thread's scratch slice (set before any guard return)
+    if (pix >= p.n_pix) { return; }
     let base = pix * n * n;
 
     // Γ = |C|, mean off-diagonal coherence, Cholesky-invert (EVD fallback if non-PD).
@@ -192,7 +204,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < n; i = i + 1u) {
         for (var j = 0u; j < n; j = j + 1u) {
             let mag = length(cmat[base + i * n + j]);
-            gam[i * n + j] = mag;
+            gam_wg[goff + i * n + j] = mag;
             if (i != j) { coh_sum = coh_sum + mag; }
         }
     }

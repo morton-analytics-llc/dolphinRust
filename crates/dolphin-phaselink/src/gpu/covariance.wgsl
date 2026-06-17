@@ -6,7 +6,7 @@
 // vec2<f32> = (re, im). SHP masking is not modeled here (the spike compares the
 // rectangular-window path); non-finite samples are treated as zero.
 
-const MAX_NSLC: u32 = 16u;
+const MAX_NSLC: u32 = 32u;
 const AMP_FLOOR: f32 = 1e-6;
 
 struct Params {

@@ -24,6 +24,17 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
 }
 
+/// One process-wide GPU context, serialized across tests. Production uses a single
+/// backend context; many concurrent contexts contend for device memory and make
+/// large dispatches flaky, so the test suite shares and locks one (matching real
+/// usage and keeping the determinism checks honest).
+fn gpu() -> std::sync::MutexGuard<'static, GpuContext> {
+    static GPU: std::sync::OnceLock<std::sync::Mutex<GpuContext>> = std::sync::OnceLock::new();
+    GPU.get_or_init(|| std::sync::Mutex::new(GpuContext::new().expect("GPU device")))
+        .lock()
+        .unwrap()
+}
+
 /// `|⟨a, b⟩|` normalized — global-phase-invariant eigenvector overlap.
 fn cos_sim(a: &[Cf32], b: &[Cf32]) -> f64 {
     let inner: Cf64 = a
@@ -121,8 +132,9 @@ fn gpu_covariance_matches_cpu() {
     )
     .unwrap();
 
-    let ctx = GpuContext::new().expect("GPU device");
-    let gpu = estimate_stack_covariance_gpu(&ctx, stack.view(), half, strides).unwrap();
+    let guard = gpu();
+    let ctx = &*guard;
+    let gpu = estimate_stack_covariance_gpu(ctx, stack.view(), half, strides).unwrap();
     assert_eq!(cpu.dim(), gpu.dim());
 
     let max_err = cpu
@@ -147,8 +159,9 @@ fn gpu_evd_recovers_analytic_rank_one() {
             c[(0, 0, i, j)] = Cf32::from_polar(1.0, theta[i] - theta[j]);
         }
     }
-    let ctx = GpuContext::new().expect("GPU device");
-    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
+    let guard = gpu();
+    let ctx = &*guard;
+    let (min_sim, max_dphi) = compare_link(ctx, &c, true);
     eprintln!("analytic EVD: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999, "eigenvector overlap {min_sim} <= 0.999");
     assert!(
@@ -165,8 +178,9 @@ fn gpu_evd_matches_cpu_on_oracle_ds() {
         return;
     }
     let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
-    let ctx = GpuContext::new().expect("GPU device");
-    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
+    let guard = gpu();
+    let ctx = &*guard;
+    let (min_sim, max_dphi) = compare_link(ctx, &c, true);
     eprintln!("oracle DS EVD: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999, "eigenvector overlap {min_sim} <= 0.999");
     assert!(
@@ -183,8 +197,9 @@ fn gpu_emi_matches_cpu_on_oracle_ds() {
         return;
     }
     let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
-    let ctx = GpuContext::new().expect("GPU device");
-    let (min_sim, max_dphi) = compare_link(&ctx, &c, false);
+    let guard = gpu();
+    let ctx = &*guard;
+    let (min_sim, max_dphi) = compare_link(ctx, &c, false);
     eprintln!("oracle DS EMI: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(
         min_sim > 0.999,
@@ -223,11 +238,12 @@ fn gpu_emi_hybrid_no_pi_tail_on_real_stack() {
     }
     let c32: Array4<Cf32> = ndarray_npy::read_npy(dir.join("real_cov_C.npy")).unwrap();
     let c64 = to_c64(&c32);
-    let ctx = GpuContext::new().expect("GPU device");
+    let guard = gpu();
+    let ctx = &*guard;
 
     let cpu = process_coherence_matrices(c64.view(), false, 0.0, 0.0, 0);
     let hybrid = process_coherence_matrices_gpu_hybrid(
-        &ctx,
+        ctx,
         c64.view(),
         false,
         0.0,
@@ -239,7 +255,7 @@ fn gpu_emi_hybrid_no_pi_tail_on_real_stack() {
 
     // Diagnostic: how many pixels the kernel flagged for CPU recompute.
     let raw =
-        process_coherence_matrices_gpu(&ctx, c32.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+        process_coherence_matrices_gpu(ctx, c32.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
     let n_pix = raw.reliable.len();
     let n_flag = unreliable_count(&raw);
 
@@ -256,6 +272,81 @@ fn gpu_emi_hybrid_no_pi_tail_on_real_stack() {
     );
 }
 
+/// Synthetic KMS (AR(1)) coherence stack `(s, s, nslc, nslc)` — Hermitian PD, so
+/// it exercises the EMI Cholesky/inverse path; phase ramps vary by pixel.
+fn synth_coh(s: usize, nslc: usize) -> Array4<Cf32> {
+    let gamma = 0.85_f32;
+    Array4::from_shape_fn((s, s, nslc, nslc), |(r, c, i, j)| {
+        let theta = 0.1 * (r + c) as f32;
+        let mag = gamma.powi((i as i32 - j as i32).abs());
+        Cf32::from_polar(mag, theta * (i as f32 - j as f32))
+    })
+}
+
+/// Are two GPU phase cubes bit-identical?
+fn phase_bit_identical(a: &Array3<Cf32>, b: &Array3<Cf32>) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.re == y.re && x.im == y.im)
+}
+
+/// Item 2: at the lifted `MAX_NSLC = 32`, EMI must be **run-to-run deterministic**
+/// (the spike's nslc-32 scratch spill made it nondeterministic). Two identical
+/// dispatches must produce bit-identical phase output.
+#[test]
+fn gpu_emi_deterministic_nslc32() {
+    let c = synth_coh(128, 32);
+    let guard = gpu();
+    let ctx = &*guard;
+    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    assert!(
+        phase_bit_identical(&a.cpx_phase, &b.cpx_phase),
+        "nslc=32 EMI phase differs run-to-run — scratch not deterministic"
+    );
+    assert_eq!(a.reliable, b.reliable, "reliable flags differ run-to-run");
+}
+
+/// Item 2: EMI also stays deterministic on a large 384² grid (real-stack scale).
+#[test]
+fn gpu_emi_deterministic_384() {
+    let c = synth_coh(384, 13);
+    let guard = gpu();
+    let ctx = &*guard;
+    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    assert!(
+        phase_bit_identical(&a.cpx_phase, &b.cpx_phase),
+        "384² EMI phase differs run-to-run"
+    );
+}
+
+/// Item 2: at nslc=32 the hybrid still matches CPU EMI within f32 tolerance.
+#[test]
+fn gpu_emi_hybrid_accurate_nslc32() {
+    let c32 = synth_coh(64, 32);
+    let c64 = to_c64(&c32);
+    let guard = gpu();
+    let ctx = &*guard;
+    let cpu = process_coherence_matrices(c64.view(), false, 0.0, 0.0, 0);
+    let hybrid = process_coherence_matrices_gpu_hybrid(
+        ctx,
+        c64.view(),
+        false,
+        0.0,
+        0.0,
+        0,
+        DEFAULT_LINK_ITERS,
+    )
+    .unwrap();
+    let max_mm = max_dphi_all(&cpu, &hybrid) * MM_PER_RAD;
+    eprintln!("nslc=32 hybrid EMI vs CPU: max Δφ = {max_mm:.4} mm");
+    assert!(
+        max_mm < 1.0,
+        "nslc=32 hybrid max Δφ {max_mm:.4} mm not sub-mm"
+    );
+}
+
 #[test]
 fn gpu_emi_falls_back_to_evd_on_singular_gamma() {
     // Rank-1 unit coherence ⇒ Γ = all-ones (singular) ⇒ Cholesky fails ⇒ EVD.
@@ -267,10 +358,11 @@ fn gpu_emi_falls_back_to_evd_on_singular_gamma() {
             c[(0, 0, i, j)] = Cf32::from_polar(1.0, theta[i] - theta[j]);
         }
     }
-    let ctx = GpuContext::new().expect("GPU device");
-    let gpu = process_coherence_matrices_gpu(&ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let guard = gpu();
+    let ctx = &*guard;
+    let gpu = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
     assert_eq!(gpu.estimator[(0, 0)], 0, "singular Γ must fall back to EVD");
-    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
+    let (min_sim, max_dphi) = compare_link(ctx, &c, true);
     eprintln!("EMI→EVD fallback: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999);
 }

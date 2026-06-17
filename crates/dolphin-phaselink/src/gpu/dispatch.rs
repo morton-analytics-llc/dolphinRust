@@ -36,13 +36,26 @@ pub(crate) fn output_buffer(ctx: &GpuContext, label: &str, byte_len: u64) -> wgp
 }
 
 /// Build a compute pipeline from `source` (entry `main`), bind `buffers` in
-/// order at bindings `0..n`, and dispatch `workgroups` groups of 64 threads.
+/// order at bindings `0..n`, and dispatch `workgroups` groups.
 pub(crate) fn dispatch_compute(
     ctx: &GpuContext,
     source: &str,
     label: &str,
     buffers: &[&wgpu::Buffer],
     workgroups: u32,
+) {
+    dispatch_compute_overrides(ctx, source, label, buffers, workgroups, &[]);
+}
+
+/// Like [`dispatch_compute`], but sets pipeline-overridable shader constants
+/// (e.g. the EMI kernel's `WG` workgroup size and `GAM_LEN` scratch length).
+pub(crate) fn dispatch_compute_overrides(
+    ctx: &GpuContext,
+    source: &str,
+    label: &str,
+    buffers: &[&wgpu::Buffer],
+    workgroups: u32,
+    constants: &[(&str, f64)],
 ) {
     let shader = ctx
         .device
@@ -57,7 +70,10 @@ pub(crate) fn dispatch_compute(
             layout: None,
             module: &shader,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                zero_initialize_workgroup_memory: true,
+            },
             cache: None,
         });
     let entries: Vec<wgpu::BindGroupEntry> = buffers
