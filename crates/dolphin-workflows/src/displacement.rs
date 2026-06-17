@@ -6,6 +6,7 @@
 //! Synchronous; the host app bridges to its runtime.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
@@ -52,16 +53,31 @@ pub struct DisplacementOutput {
     pub geotransform: [f64; 6],
 }
 
+/// Run `f`, emitting its wall-clock under `stage` at INFO (`stage` + `elapsed_s`
+/// fields) so the benchmark and host app can read per-stage timing via `RUST_LOG`.
+fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
+    let t0 = Instant::now();
+    let out = f();
+    tracing::info!(
+        stage,
+        elapsed_s = t0.elapsed().as_secs_f64(),
+        "stage complete"
+    );
+    out
+}
+
 /// Run the displacement workflow from a parsed config.
 ///
 /// # Errors
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
-    let bursts = groups
-        .values()
-        .map(|idxs| link_one_burst(cfg, idxs))
-        .collect::<Result<Vec<_>>>()?;
+    let bursts = timed("phase_linking", || {
+        groups
+            .values()
+            .map(|idxs| link_one_burst(cfg, idxs))
+            .collect::<Result<Vec<_>>>()
+    })?;
     let days = bursts
         .first()
         .map(|b| b.days.clone())
@@ -78,15 +94,15 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     let pairs = network(cfg, &days);
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
-    let dphi_rad = unwrap_network(cfg, pl.view(), &pairs)?;
+    let dphi_rad = timed("unwrap", || unwrap_network(cfg, pl.view(), &pairs))?;
     let incidence = get_incidence_matrix(&pairs);
-    let disp_rad = match cfg.timeseries_options.method {
+    let disp_rad = timed("timeseries", || match cfg.timeseries_options.method {
         TimeseriesMethod::L1 => {
             invert_stack_l1(incidence.view(), dphi_rad.view(), L1Config::default())
         }
         TimeseriesMethod::L2 => invert_stack(incidence.view(), dphi_rad.view(), None),
-    };
-    let vel_rad = velocity_of(disp_rad.view(), &days);
+    });
+    let vel_rad = timed("velocity", || velocity_of(disp_rad.view(), &days));
 
     let phase_to_disp = cfg
         .input_options

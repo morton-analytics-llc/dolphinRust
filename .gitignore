@@ -11,6 +11,8 @@ Cargo.lock.bak
 # Local InSAR test data / outputs
 /data
 /scratch
+/bench/runs
+/validation/runs
 *.tif
 *.h5
 *.nc

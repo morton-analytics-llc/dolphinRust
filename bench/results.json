@@ -1,0 +1,88 @@
+{
+  "synthetic_48x64x5": {
+    "shape": {
+      "n": 5,
+      "rows": 48,
+      "cols": 64,
+      "pixels": 3072
+    },
+    "endtoend": {
+      "label": "synthetic_48x64x5",
+      "oracle_total": {
+        "cold_s": 8.005697666900232,
+        "warm_s": 8.488458416890353,
+        "reps": 4
+      },
+      "rust_total": {
+        "cold_s": 0.2336626669857651,
+        "warm_s": 0.23069504206068814,
+        "reps": 4
+      },
+      "oracle_phase_linking": {
+        "cold_s": 5.07,
+        "warm_s": 5.59,
+        "reps": 4
+      },
+      "rust_phase_linking": {
+        "cold_s": 0.027016959,
+        "warm_s": 0.027164625,
+        "reps": 4
+      },
+      "rust_stages_warm_s": {
+        "phase_linking": 0.0272,
+        "unwrap": 0.0497,
+        "timeseries": 0.0055,
+        "velocity": 0.0001
+      }
+    },
+    "jax": {
+      "import_s": 0.4657124171499163,
+      "first_call_s": 0.5968823749572039,
+      "warm_call_s": 0.028048374922946095,
+      "jit_warmup_s": 0.5688340000342578
+    }
+  },
+  "real_T144_384x384x9": {
+    "shape": {
+      "n": 9,
+      "rows": 384,
+      "cols": 384,
+      "pixels": 147456
+    },
+    "endtoend": {
+      "label": "real_T144_384x384x9",
+      "oracle_total": {
+        "cold_s": 17.114885916933417,
+        "warm_s": 17.123486417112872,
+        "reps": 4
+      },
+      "rust_total": {
+        "cold_s": 8.314683582866564,
+        "warm_s": 8.355322249932215,
+        "reps": 4
+      },
+      "oracle_phase_linking": {
+        "cold_s": 7.23,
+        "warm_s": 7.24,
+        "reps": 4
+      },
+      "rust_phase_linking": {
+        "cold_s": 1.9700840830000002,
+        "warm_s": 2.008370542,
+        "reps": 4
+      },
+      "rust_stages_warm_s": {
+        "phase_linking": 2.0084,
+        "unwrap": 5.8334,
+        "timeseries": 0.1118,
+        "velocity": 0.0015
+      }
+    },
+    "jax": {
+      "import_s": 4.670885391533375e-05,
+      "first_call_s": 2.1329662499483675,
+      "warm_call_s": 2.012573332991451,
+      "jit_warmup_s": 0.12039291695691645
+    }
+  }
+}
