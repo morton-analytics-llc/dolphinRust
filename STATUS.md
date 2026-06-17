@@ -15,7 +15,10 @@ single source of truth for build progress across sessions. Phase details in PLAY
       (L2 only; L1/ADMM = Phase 6b, the documented temporary divergence from the L1-default oracle)
 - [x] 7 — Filters (`dolphin-filtering`): long-wavelength high-pass + Goldstein
       (GDAL gap-fill for bad pixels deferred to Phase 8 I/O)
-- [ ] 8 — I/O layer + S3 read-staging (`dolphin-io` + `dolphin-ingest`) — needs GDAL/HDF5
+- [x] 8 — I/O layer + S3 read-staging (`dolphin-io` + `dolphin-ingest`)
+      GeoTIFF r/w (gdal 0.19) + CSLC HDF5 read (hdf5-metno 0.12) + CSLC stack + S3 stage().
+      Deferred: `EagerLoader` prefetch, complex-GeoTIFF writer (CFloat32), NISAR custom
+      geotransform — not on the v1.0.0 local-run critical path.
 - [ ] 9 — Unwrapping dispatch (`dolphin-unwrap`) — needs SNAPHU binary
 - [ ] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
 

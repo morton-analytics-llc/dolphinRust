@@ -10,9 +10,14 @@ dolphin-core.workspace = true
 ndarray.workspace = true
 num-complex.workspace = true
 thiserror.workspace = true
-# NOTE: `gdal` and `hdf5` crates require system GDAL/HDF5 libraries and are
-# added during Phase 8 (see PLAYBOOK.md). Kept out of the scaffold so the
-# workspace builds without system deps.
+# System-lib bindings (Phase 8). gdal 0.19 builds against system GDAL 3.12;
+# hdf5-metno (maintained fork) builds against HDF5 2.x where the old `hdf5`
+# crate (0.8) cannot. See PLAYBOOK.md / memory build-env-preflight.
+gdal = "0.19"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
+
+[dev-dependencies]
+ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 
 [lints]
 workspace = true

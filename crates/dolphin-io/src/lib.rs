@@ -1,5 +1,17 @@
-//! Block-based raster/HDF5 I/O — port of `dolphin/io/`.
+//! Block raster & HDF5 I/O — port of `dolphin/io/`.
 //!
-//! Targets: the `VRTStack` SLC stack abstraction, `EagerLoader` background
-//! prefetch, HDF5 CSLC subdataset reading (`HDF5:"f.h5"://path/VV`), and
-//! GeoTIFF block writing. GDAL/HDF5 bindings are wired in Phase 8.
+//! GeoTIFF block read/write via GDAL ([`geotiff`]) and OPERA/NISAR CSLC reading
+//! from HDF5 ([`cslc`]). GDAL/HDF5 are blocking C libraries; access is kept
+//! synchronous and parallelism happens across tiles, not within a reader.
+//!
+//! Bindings: `gdal` 0.19 (system GDAL 3.12) and `hdf5-metno` 0.12 (system HDF5
+//! 2.x). The `EagerLoader` prefetch and complex-GeoTIFF writer are follow-ups
+//! (see STATUS.md); S3 read-staging lives in the feature-gated `dolphin-ingest`.
+
+pub mod cslc;
+pub mod error;
+pub mod geotiff;
+
+pub use cslc::{read_cslc, read_cslc_stack};
+pub use error::{IoError, Result};
+pub use geotiff::{read_raster, write_raster, RasterData};
