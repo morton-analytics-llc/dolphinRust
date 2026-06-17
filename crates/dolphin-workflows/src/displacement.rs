@@ -1,16 +1,16 @@
 //! End-to-end displacement pipeline (port of `workflows/displacement.py`).
 //!
-//! Single-burst order: read CSLC stack → sequential phase linking → ifg network
-//! → SNAPHU unwrap → SBAS L2 inversion → velocity → write GeoTIFFs. Multi-burst
-//! stitching is a follow-up (see STATUS.md). Synchronous; the host app bridges
-//! to its runtime.
+//! Order: group inputs by burst → per-burst sequential phase linking → stitch
+//! bursts onto the frame grid → ifg network → SNAPHU unwrap → SBAS inversion →
+//! velocity → write COGs. Single-burst stacks take the stitch identity path.
+//! Synchronous; the host app bridges to its runtime.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
 use dolphin_core::{Cf32, Cf64};
-use dolphin_io::{read_cslc_stack, read_geotransform, write_raster};
+use dolphin_io::{read_cslc_stack, read_geotransform, write_raster, GeoInfo};
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     L1Config, NetworkConfig,
@@ -18,6 +18,7 @@ use dolphin_timeseries::{
 use dolphin_unwrap::{unwrap, CostMode, InitMethod, UnwrapConfig};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
+use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo};
 use crate::dates::decimal_days;
 use crate::sequential::{run_sequential, SequentialConfig};
 
@@ -56,10 +57,18 @@ pub struct DisplacementOutput {
 /// # Errors
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
-    let stack = read_stack(cfg)?;
-    let days = decimal_days(&cfg.cslc_file_list, &cfg.input_options.cslc_date_fmt)
-        .context("parsing acquisition dates from CSLC filenames")?;
-    let (pl, temporal_coherence) = phase_link(cfg, stack.view())?;
+    let groups = group_by_burst(&cfg.cslc_file_list);
+    let bursts = groups
+        .values()
+        .map(|idxs| link_one_burst(cfg, idxs))
+        .collect::<Result<Vec<_>>>()?;
+    let days = bursts
+        .first()
+        .map(|b| b.days.clone())
+        .context("cslc_file_list is empty")?;
+    let (pl, temporal_coherence, geo) = stitch_bursts(bursts)?;
+    let epsg = (geo.epsg != 0).then_some(geo.epsg);
+    let geotransform = geo.geotransform;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -88,7 +97,6 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     let displacement = disp_rad.mapv(|p| p * phase_to_disp);
     let velocity = vel_rad.mapv(|v| v * phase_to_disp);
     let velocity_mm_yr = vel_rad.mapv(|v| v * mm);
-    let (epsg, geotransform) = resolve_geo(cfg);
 
     write_outputs(
         cfg,
@@ -109,35 +117,110 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     })
 }
 
-/// Resolve the output georeferencing: prefer the CSLC grid's geotransform + EPSG,
-/// falling back to the config EPSG and an identity transform (synthetic inputs).
-fn resolve_geo(cfg: &DisplacementWorkflow) -> (Option<u32>, [f64; 6]) {
+/// One burst's phase-linking products, carried until stitched onto the frame.
+struct BurstLink {
+    /// Linked phase history `(n_dates, out_rows, out_cols)`.
+    pl: Array3<Cf64>,
+    /// Temporal coherence `(out_rows, out_cols)`.
+    temp_coh: Array2<f64>,
+    /// Burst footprint on the output grid.
+    geo: BurstGeo,
+    /// Acquisition decimal-days for this burst's dates.
+    days: Vec<f64>,
+}
+
+/// Phase-link a single burst from the CSLC files at `idxs` in `cfg.cslc_file_list`.
+fn link_one_burst(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Result<BurstLink> {
+    let files: Vec<PathBuf> = idxs
+        .iter()
+        .map(|&i| cfg.cslc_file_list[i].clone())
+        .collect();
+    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+        .context("parsing acquisition dates from CSLC filenames")?;
+    let stack = read_stack_files(cfg, &files)?;
+    let (pl, temp_coh) = phase_link(cfg, stack.view())?;
+    anyhow::ensure!(
+        days.len() == pl.dim().0,
+        "parsed {} dates but phase-linking produced {} acquisitions",
+        days.len(),
+        pl.dim().0
+    );
+    let (_, rows, cols) = pl.dim();
+    let geo = resolve_burst_geo(cfg, &files[0], rows, cols);
+    Ok(BurstLink {
+        pl,
+        temp_coh,
+        geo,
+        days,
+    })
+}
+
+/// Mosaic the per-burst linked phase + temporal coherence onto the frame grid.
+/// A single burst is returned as-is (identity path).
+fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<(Array3<Cf64>, Array2<f64>, GeoInfo)> {
+    anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
+    if bursts.len() == 1 {
+        let b = bursts.remove(0);
+        return Ok((b.pl, b.temp_coh, b.geo.geo));
+    }
+    let geos: Vec<BurstGeo> = bursts.iter().map(|b| b.geo).collect();
+    let frame = frame_grid(&geos)?;
+    let nslc = bursts[0].pl.dim().0;
+    let mut pl = Array3::<Cf64>::zeros((nslc, frame.rows, frame.cols));
+    let mut temp_coh = Array2::<f64>::zeros((frame.rows, frame.cols));
+    for b in &bursts {
+        anyhow::ensure!(b.pl.dim().0 == nslc, "bursts have differing date counts");
+        let off = burst_offset(&frame, &b.geo);
+        paste3(&mut pl, &b.pl, off);
+        paste2(&mut temp_coh, &b.temp_coh, off);
+    }
+    Ok((pl, temp_coh, frame.geo))
+}
+
+/// Burst footprint on the output grid: the CSLC geotransform (scaled by the
+/// output strides for multilooking), else the config EPSG + identity placeholder.
+fn resolve_burst_geo(
+    cfg: &DisplacementWorkflow,
+    path: &Path,
+    rows: usize,
+    cols: usize,
+) -> BurstGeo {
     let identity = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
-    let (Some(first), Some(sds)) = (
-        cfg.cslc_file_list.first(),
-        cfg.input_options.subdataset.as_deref(),
-    ) else {
-        return (cfg.output_options.epsg, identity);
+    let read = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .and_then(|sds| read_geotransform(path, sds).ok());
+    let (epsg, gt) = match read {
+        Some(g) => (g.epsg, g.geotransform),
+        None => (cfg.output_options.epsg.unwrap_or(0), identity),
     };
-    match read_geotransform(first, sds) {
-        Ok(geo) => (Some(geo.epsg), geo.geotransform),
-        Err(_) => (cfg.output_options.epsg, identity),
+    let (sx, sy) = (
+        cfg.output_options.strides.x as f64,
+        cfg.output_options.strides.y as f64,
+    );
+    BurstGeo {
+        geo: GeoInfo {
+            epsg,
+            geotransform: [gt[0], gt[1] * sx, 0.0, gt[3], 0.0, gt[5] * sy],
+        },
+        rows,
+        cols,
     }
 }
 
-/// Read the CSLC stack named in the config into `(n, rows, cols)` `Cf64`.
-fn read_stack(cfg: &DisplacementWorkflow) -> Result<Array3<Cf64>> {
+/// Read the CSLC files into a `(n, rows, cols)` `Cf64` stack.
+fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Array3<Cf64>> {
     let subdataset = cfg
         .input_options
         .subdataset
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let files: Vec<(PathBuf, String)> = cfg
-        .cslc_file_list
+    let pairs: Vec<(PathBuf, String)> = files
         .iter()
         .map(|p| (p.clone(), subdataset.clone()))
         .collect();
-    let stack = read_cslc_stack(&files)?;
+    let stack = read_cslc_stack(&pairs)?;
     Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
 }
 

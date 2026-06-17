@@ -7,6 +7,7 @@
 //! (`config/`) and the burst-parallel executor.
 #![warn(missing_docs)]
 
+pub mod burst;
 pub mod dates;
 pub mod displacement;
 pub mod sequential;

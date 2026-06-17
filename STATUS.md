@@ -9,7 +9,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 |---|---|
 | A1 velocity mm/yr via real temporal baselines + wavelength | ✅ done (oracle scale a=1.0000) |
 | A2 L1/ADMM inversion, config-driven default | ✅ done (oracle <1.5e-6) |
-| A3 multi-burst frame stitching | ⏳ **remaining** |
+| A3 multi-burst frame stitching | ✅ done (2-burst frame stitch contract) |
 | B4 real OPERA CSLC validation tier | ⏳ **remaining** (Earthdata token present) |
 | C5 typed sync public API (+temp coh, CRS/geotransform) | ✅ done |
 | C6 COG outputs + documented schema | ✅ done (LAYOUT=COG verified) |
@@ -42,8 +42,8 @@ Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --n
       (tophu/spurt/whirlwind = documented gaps, not built)
 - [x] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
       `dolphin run --config <yaml>`: read CSLC → sequential phase-link → ifg network →
-      SNAPHU unwrap → SBAS L2 invert → velocity → GeoTIFF outputs. Single-burst
-      (multi-burst stitching deferred); end-to-end matches the dolphin oracle.
+      SNAPHU unwrap → SBAS L2 invert → velocity → GeoTIFF outputs. Multi-burst
+      frame stitching now supported (A3); end-to-end matches the dolphin oracle.
 
 ## ✅ v1.0.0 — first complete build
 All phases green. `dolphin run --config <yaml>` produces a displacement time series +
