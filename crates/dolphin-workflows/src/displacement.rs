@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
 use dolphin_core::{Cf32, Cf64};
-use dolphin_io::{read_cslc_stack, write_raster};
+use dolphin_io::{read_cslc_stack, read_geotransform, write_raster};
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     L1Config, NetworkConfig,
@@ -38,8 +38,17 @@ pub struct DisplacementOutput {
     /// scoring). Derived from the LOS phase rate via `-λ/4π`, using the config
     /// wavelength or the Sentinel-1 default, `(rows, cols)`.
     pub velocity_mm_yr: Array2<f64>,
+    /// Temporal coherence per pixel in `[0, 1]`, averaged across ministacks
+    /// (dolphin's `temporal_coherence_average`); a phase-quality mask, `(rows, cols)`.
+    pub temporal_coherence: Array2<f64>,
     /// Acquisition dates as decimal days from acquisition 0, length `n_dates`.
     pub acquisition_days: Vec<f64>,
+    /// EPSG code of the output grid (`None` if neither the CSLC metadata nor the
+    /// config supplied one).
+    pub epsg: Option<u32>,
+    /// GDAL affine geotransform `[origin_x, dx, 0, origin_y, 0, dy]` shared by all
+    /// output rasters (read from the CSLC grid, else an identity placeholder).
+    pub geotransform: [f64; 6],
 }
 
 /// Run the displacement workflow from a parsed config.
@@ -50,7 +59,7 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     let stack = read_stack(cfg)?;
     let days = decimal_days(&cfg.cslc_file_list, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
-    let pl = phase_link(cfg, stack.view())?;
+    let (pl, temporal_coherence) = phase_link(cfg, stack.view())?;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -79,14 +88,41 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     let displacement = disp_rad.mapv(|p| p * phase_to_disp);
     let velocity = vel_rad.mapv(|v| v * phase_to_disp);
     let velocity_mm_yr = vel_rad.mapv(|v| v * mm);
+    let (epsg, geotransform) = resolve_geo(cfg);
 
-    write_outputs(cfg, displacement.view(), velocity.view())?;
+    write_outputs(
+        cfg,
+        displacement.view(),
+        velocity.view(),
+        temporal_coherence.view(),
+        epsg,
+        geotransform,
+    )?;
     Ok(DisplacementOutput {
         displacement,
         velocity,
         velocity_mm_yr,
+        temporal_coherence,
         acquisition_days: days,
+        epsg,
+        geotransform,
     })
+}
+
+/// Resolve the output georeferencing: prefer the CSLC grid's geotransform + EPSG,
+/// falling back to the config EPSG and an identity transform (synthetic inputs).
+fn resolve_geo(cfg: &DisplacementWorkflow) -> (Option<u32>, [f64; 6]) {
+    let identity = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+    let (Some(first), Some(sds)) = (
+        cfg.cslc_file_list.first(),
+        cfg.input_options.subdataset.as_deref(),
+    ) else {
+        return (cfg.output_options.epsg, identity);
+    };
+    match read_geotransform(first, sds) {
+        Ok(geo) => (Some(geo.epsg), geo.geotransform),
+        Err(_) => (cfg.output_options.epsg, identity),
+    }
 }
 
 /// Read the CSLC stack named in the config into `(n, rows, cols)` `Cf64`.
@@ -105,8 +141,12 @@ fn read_stack(cfg: &DisplacementWorkflow) -> Result<Array3<Cf64>> {
     Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
 }
 
-/// Sequential phase linking over the stack.
-fn phase_link(cfg: &DisplacementWorkflow, stack: ArrayView3<Cf64>) -> Result<Array3<Cf64>> {
+/// Sequential phase linking over the stack; returns the linked phase history and
+/// the averaged temporal-coherence quality layer.
+fn phase_link(
+    cfg: &DisplacementWorkflow,
+    stack: ArrayView3<Cf64>,
+) -> Result<(Array3<Cf64>, Array2<f64>)> {
     let scfg = SequentialConfig {
         ministack_size: cfg.phase_linking.ministack_size,
         max_num_compressed: cfg.phase_linking.max_num_compressed,
@@ -119,7 +159,7 @@ fn phase_link(cfg: &DisplacementWorkflow, stack: ArrayView3<Cf64>) -> Result<Arr
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
     };
     let out = run_sequential(stack, &scfg).map_err(anyhow::Error::msg)?;
-    Ok(out.cpx_phase)
+    Ok((out.cpx_phase, out.temporal_coherence))
 }
 
 /// Build the interferogram index pairs from the config and real baselines.
@@ -208,33 +248,26 @@ fn velocity_of(displacement: ArrayView3<f64>, days: &[f64]) -> Array2<f64> {
     estimate_velocity(days, series.view(), None)
 }
 
-/// Write the velocity and per-date displacement rasters as GeoTIFFs.
+/// Write the velocity, temporal-coherence, and per-date displacement rasters as
+/// GeoTIFFs, all sharing the resolved geotransform + EPSG.
 fn write_outputs(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     velocity: ArrayView2<f64>,
+    temporal_coherence: ArrayView2<f64>,
+    epsg: Option<u32>,
+    gt: [f64; 6],
 ) -> Result<()> {
-    let gt = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
     let dir = &cfg.work_directory;
     std::fs::create_dir_all(dir)?;
-    write_raster(
-        &dir.join("velocity.tif"),
-        velocity.mapv(|v| v as f32).view(),
-        gt,
-        cfg.output_options.epsg,
-        None,
-    )?;
+    let write_f32 = |name: &str, a: ArrayView2<f64>| {
+        write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
+    };
+    write_f32("velocity.tif", velocity)?;
+    write_f32("temporal_coherence.tif", temporal_coherence)?;
     for t in 0..displacement.dim().0 {
-        let band = displacement
-            .index_axis(ndarray::Axis(0), t)
-            .mapv(|v| v as f32);
-        write_raster(
-            &dir.join(format!("displacement_{t:02}.tif")),
-            band.view(),
-            gt,
-            cfg.output_options.epsg,
-            None,
-        )?;
+        let band = displacement.index_axis(ndarray::Axis(0), t);
+        write_f32(&format!("displacement_{t:02}.tif"), band)?;
     }
     Ok(())
 }

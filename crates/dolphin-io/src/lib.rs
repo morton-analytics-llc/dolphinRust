@@ -10,8 +10,10 @@
 
 pub mod cslc;
 pub mod error;
+pub mod geo;
 pub mod geotiff;
 
 pub use cslc::{read_cslc, read_cslc_stack};
 pub use error::{IoError, Result};
+pub use geo::{read_geotransform, GeoInfo};
 pub use geotiff::{read_raster, write_raster, RasterData};

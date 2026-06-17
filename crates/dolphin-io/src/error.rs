@@ -14,6 +14,10 @@ pub enum IoError {
     /// A shape/assembly error.
     #[error("{0}")]
     Shape(String),
+
+    /// Missing or malformed georeferencing metadata.
+    #[error("geo: {0}")]
+    Geo(String),
 }
 
 /// Convenience alias for fallible I/O operations.
