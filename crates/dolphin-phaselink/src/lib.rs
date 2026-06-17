@@ -11,8 +11,10 @@
 
 pub mod covariance;
 pub mod estimator;
+pub mod quality;
 
 pub use covariance::estimate_stack_covariance;
 pub use estimator::{
     process_coherence_matrices, process_coherence_matrix, PixelEstimate, StackEstimate,
 };
+pub use quality::{compress, estimate_temp_coh};

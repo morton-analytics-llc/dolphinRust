@@ -181,6 +181,12 @@ integrates with Phase 1 output.
 
 **Done when:** temp_coh, CRLB, closure, and compressed-SLC contract tests pass.
 
+> **Pin note (v0.35.0):** the pinned reference has **no `crlb.py` or `_closure_phase.py`**
+> (those are `main`-only, as are the `write_crlb`/`write_closure_phase` config flags).
+> Phase 4 shipped temp_coh + compressed SLC with oracle validation; **CRLB and closure
+> phase are deferred** — they are optional quality side-outputs, off the v1.0.0 displacement
+> critical path (1→5→6→10). Revisit if a newer dolphin pin or those rasters are required.
+
 ---
 
 ## Phase 5 — Ministack sequencing (`dolphin-stack` + `dolphin-workflows::sequential`)

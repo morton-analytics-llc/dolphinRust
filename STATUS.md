@@ -8,7 +8,8 @@ single source of truth for build progress across sessions. Phase details in PLAY
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
 - [x] 2 — SHP selection (`dolphin-shp`)
 - [x] 3 — PS selection (`dolphin-ps`)
-- [ ] 4 — Quality layers: temp_coh, CRLB, closure, compressed SLC (`dolphin-phaselink`)
+- [x] 4 — Quality layers (`dolphin-phaselink`): temp_coh + compressed SLC done;
+      **CRLB/closure deferred** — absent in pinned dolphin v0.35.0 (off the v1.0.0 critical path)
 - [ ] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)
 - [ ] 6 — Interferogram network + SBAS L2 inversion (`dolphin-timeseries`)
 - [ ] 7 — Filters (`dolphin-filtering`)
