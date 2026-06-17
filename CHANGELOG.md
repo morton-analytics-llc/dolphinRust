@@ -42,10 +42,15 @@ physically-meaningful tolerances.
   overlap > 0.999, coherence < 1e-4, L1 < 1.5e-6).
 - End-to-end synthetic single-burst equivalence: displacement corr 1.0000 / demeaned
   RMS ≤ 0.05 rad; velocity absolute scale a = 1.0000 (noise-free) → 0.9997 (realistic speckle).
+- Real OPERA tier (4 bursts incl. Central Valley): config compatibility PASS; engine
+  agreement PASS (displacement RMS residual ≤ 0.008 rad, matching velocity magnitude +
+  temporal coherence). Reproducer: `validation/{fetch_real,crop_real,scan_coherence}.py`,
+  `run_real.sh`.
 
 ### Known limitations / deferred
-- **Real OPERA CSLC validation pending** — equivalence is established on synthetic inputs.
-- **Multi-burst frame stitching** not implemented (single-burst runs only).
+- **Real-data velocity absolute scale under strong signal** not independently pinned (sampled
+  coherent scenes were tectonically stable); scale confirmed on the synthetic tier.
+- Multi-burst stitching is implemented but not yet exercised on a real multi-burst frame.
 - CRLB / closure-phase rasters, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform,
   `EagerLoader` prefetch, and tophu/spurt/whirlwind unwrappers are deferred (see STATUS.md).
 
