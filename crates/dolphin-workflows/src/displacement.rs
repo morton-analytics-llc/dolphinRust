@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
 use dolphin_core::{Cf32, Cf64};
 use dolphin_io::{read_cslc_stack, read_geotransform, write_raster, GeoInfo};
+use dolphin_phaselink::ComputeEngine;
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
@@ -76,10 +77,13 @@ fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
+    // One compute engine for the whole run: it acquires a single GPU context (if
+    // selected and available) and is reused across every burst + ministack.
+    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
     let bursts = timed("phase_linking", || {
         groups
             .values()
-            .map(|idxs| link_one_burst(cfg, idxs))
+            .map(|idxs| link_one_burst(cfg, idxs, &engine))
             .collect::<Result<Vec<_>>>()
     })?;
     let days = bursts
@@ -162,7 +166,11 @@ struct BurstLink {
 }
 
 /// Phase-link a single burst from the CSLC files at `idxs` in `cfg.cslc_file_list`.
-fn link_one_burst(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Result<BurstLink> {
+fn link_one_burst(
+    cfg: &DisplacementWorkflow,
+    idxs: &[usize],
+    engine: &ComputeEngine,
+) -> Result<BurstLink> {
     let files: Vec<PathBuf> = idxs
         .iter()
         .map(|&i| cfg.cslc_file_list[i].clone())
@@ -170,7 +178,7 @@ fn link_one_burst(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Result<BurstLin
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
     let stack = read_stack_files(cfg, &files)?;
-    let (pl, temp_coh) = phase_link(cfg, stack.view())?;
+    let (pl, temp_coh) = phase_link(cfg, stack.view(), engine)?;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -261,6 +269,7 @@ fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Arr
 fn phase_link(
     cfg: &DisplacementWorkflow,
     stack: ArrayView3<Cf64>,
+    engine: &ComputeEngine,
 ) -> Result<(Array3<Cf64>, Array2<f64>)> {
     let scfg = SequentialConfig {
         ministack_size: cfg.phase_linking.ministack_size,
@@ -273,7 +282,7 @@ fn phase_link(
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
     };
-    let out = run_sequential(stack, &scfg).map_err(anyhow::Error::msg)?;
+    let out = run_sequential(stack, &scfg, engine).map_err(anyhow::Error::msg)?;
     Ok((out.cpx_phase, out.temporal_coherence))
 }
 

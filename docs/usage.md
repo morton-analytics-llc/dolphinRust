@@ -72,11 +72,37 @@ unwrap_options:
 output_options:
   strides: { y: 1, x: 1 }      # output multilooking
   epsg: 32611                  # fallback CRS when the CSLC carries none
+worker_settings:
+  compute_backend: cpu         # default; phase-linking backend: cpu | auto | gpu (see below)
 work_directory: /out           # outputs are written here
 ```
 
 The complete config tree, with every field documented, is the rustdoc for
 `dolphin_core::config::DisplacementWorkflow` (`cargo doc --no-deps -p dolphin-core --open`).
+
+### Compute backend (CPU / GPU)
+
+Phase linking (covariance + EVD/EMI) has a first-class `wgpu` GPU backend compiled into the
+default build, but it is **off by default**. `worker_settings.compute_backend` selects it:
+
+- **`cpu`** (default) — always the `faer` f64 reference path.
+- **`auto`** — GPU at/above the ~128² output-pixel kernel crossover, CPU below it.
+- **`gpu`** — GPU wherever supported.
+
+**Fallback is automatic and safe.** With no GPU adapter, an `nslc` above the kernel cap (32),
+or a CPU-only (`no-gpu`) build, any mode runs on the CPU with a `tracing` warning — never a
+panic. The CPU path is the correctness reference.
+
+**Accuracy (f32 vs f64).** The GPU runs single precision. EVD matches the f64 CPU sub-mm on
+every pixel; EMI's f32 least-eigenvector is ill-conditioned on near-degenerate pixels, so the
+GPU flags those and the host recomputes them on f64 `faer` — EMI then matches the CPU
+reference **sub-mm on every pixel** (real 384² stack: ≤ 0.61 mm). One config gives the same
+result on CPU or GPU.
+
+**Platform & speed.** Any `wgpu` adapter works (Metal on macOS, Vulkan/DX12 elsewhere). On an
+*integrated* Apple GPU the end-to-end speed is marginal and often CPU-favoured; the payoff is
+discrete NVIDIA/AMD, where the same shaders run unchanged. Honest numbers: `bench/GPU.md`. To
+build without linking wgpu: `cargo build --no-default-features --features no-gpu`.
 
 ## 4. Running
 

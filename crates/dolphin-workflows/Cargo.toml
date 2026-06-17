@@ -29,6 +29,12 @@ rayon.workspace = true
 ndarray.workspace = true
 chrono.workspace = true
 
+[features]
+# GPU first-class by default; `--no-default-features --features no-gpu` for CPU-only hosts.
+default = ["gpu"]
+gpu = ["dolphin-phaselink/gpu"]
+no-gpu = ["dolphin-phaselink/no-gpu"]
+
 [dev-dependencies]
 num-complex.workspace = true
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }

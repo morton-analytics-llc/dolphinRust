@@ -190,6 +190,45 @@ scale is confirmed (TLS ≈ 1.03, magnitudes match), while bit-level pattern par
 data remains noise-limited — consistent with the **synthetic tier (a = 1.0000)**, which stays
 the controlled-magnitude scale anchor. This **closes the documented B4 gap**.
 
+## GPU backend validation (first-class, 2026-06-17)
+
+The GPU compute backend (`wgpu`/Metal, f32) validated against the CPU (`faer`, f64)
+reference and the dolphin v0.35.0 oracle on the **real** Mexico stack (13 acqs, 384²,
+`half_window` 11×5). Backend: Apple M2 Pro, Metal (integrated). Full numbers + method
+in [bench/GPU.md](bench/GPU.md); reproduce with
+`cargo run -p dolphin-phaselink --release --example gpu_bench`.
+
+**Accuracy — all 147,456 pixels (no coherent-only masking):**
+
+| Comparison | overlap ≥ | max Δφ |
+|---|---|---|
+| EVD GPU(f32) vs CPU(f64) | 1.0000 | 0.176 mm |
+| EMI **raw** GPU(f32) vs CPU(f64) | 0.343 | 13.85 mm (π-rad tail) |
+| EMI **hybrid** GPU vs CPU(f64) | 0.9991 | **0.607 mm** |
+| EMI hybrid GPU vs oracle | 0.9888 | 5.35 mm |
+| EMI CPU(f64) vs oracle | 0.9888 | 5.35 mm |
+
+- EVD is sub-mm everywhere. Raw f32 EMI has a π-rad tail on ill-conditioned pixels;
+  the **hybrid** (GPU flags near-degenerate / borderline-PD pixels, host recomputes
+  the 5.9% minority on f64 `faer`) makes EMI **sub-mm across every pixel — no tail.**
+- The hybrid-vs-oracle and CPU-vs-oracle max are identical (5.35 mm, one degenerate
+  pixel): the GPU hybrid tracks the f64 CPU exactly; the residual is a Rust-CPU vs
+  dolphin difference, not a GPU error.
+- EMI is run-to-run **deterministic** (bit-identical) at 384²/nslc 13 and nslc 32.
+
+**Speed — end-to-end (covariance + phase-link + transfer + hybrid recompute), honest:**
+on this *integrated* M2 Pro the GPU is **0.66× on the real 384² stack (slower than CPU)**
+and ~1.09× on clean synthetic stacks above the ~192² crossover. The readback + f64
+round-trip + 5.9% CPU recompute outweigh the kernel saving on integrated silicon with a
+strong `faer`+`rayon` CPU baseline. **The first-class value is correctness + portability:**
+the same WGSL runs unchanged on discrete NVIDIA/AMD, where the FP32 headroom is. On Apple
+silicon, prefer `compute_backend = auto` (CPU below the crossover) or `cpu`.
+
+**Backend selection + fallback:** GPU compiled into the default build; runtime-selected via
+`worker_settings.compute_backend` (`auto`/`cpu`/`gpu`); no adapter / unsupported nslc /
+`no-gpu` build → automatic CPU fallback with a warning, never a panic (contract:
+`engine_contract::no_adapter_falls_back_to_cpu_without_panic`).
+
 ## Open / pending
 
 - **Real-data velocity absolute scale under strong signal** — RESOLVED (2026-06-17, v1.1.0):

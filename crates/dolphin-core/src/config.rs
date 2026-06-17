@@ -338,12 +338,35 @@ impl Default for OutputOptions {
     }
 }
 
+/// Compute backend for phase linking (covariance + EVD/EMI). dolphin exposes a
+/// bool `gpu_enabled`; we generalize to a tri-state. **The default is `Cpu`** (the
+/// f64 correctness reference). `Gpu` and `Auto` are opt-in: on integrated GPUs the
+/// CPU path is faster end-to-end — the GPU's win is on discrete hardware. See the
+/// performance note in `bench/GPU.md` before selecting them. With no GPU adapter
+/// (or a `no-gpu` build) every mode falls back to the CPU path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeBackend {
+    /// Always the CPU (faer, f64) reference path. The default.
+    #[default]
+    Cpu,
+    /// Size-based: GPU at/above the ~128² kernel crossover, CPU below; CPU if no
+    /// GPU. Note the crossover is kernel-only — end-to-end on an integrated GPU the
+    /// CPU is faster, so prefer explicit `Gpu` only on discrete hardware.
+    Auto,
+    /// GPU where supported; automatic CPU fallback if no adapter / unsupported.
+    Gpu,
+}
+
 /// Parallelism / worker settings. dolphin `WorkerSettings`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerSettings {
-    /// Use the GPU for processing (if available).
+    /// Use the GPU for processing (if available). dolphin parity; superseded by
+    /// `compute_backend` (kept so existing dolphin YAML deserializes unchanged).
     pub gpu_enabled: bool,
+    /// Compute backend selection for phase linking (`auto` / `cpu` / `gpu`).
+    pub compute_backend: ComputeBackend,
     /// Number of threads to use per worker.
     pub threads_per_worker: usize,
     /// Number of spatial bursts to run in parallel for wrapped-phase estimation.
@@ -356,6 +379,7 @@ impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
             gpu_enabled: false,
+            compute_backend: ComputeBackend::default(),
             threads_per_worker: 1,
             n_parallel_bursts: 1,
             block_shape: (512, 512),

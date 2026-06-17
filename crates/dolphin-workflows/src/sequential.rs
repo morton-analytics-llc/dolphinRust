@@ -8,9 +8,7 @@
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{
-    compress, estimate_stack_covariance, estimate_temp_coh, process_coherence_matrices,
-};
+use dolphin_phaselink::{compress, estimate_temp_coh, ComputeEngine};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
 
@@ -55,6 +53,7 @@ pub struct SequentialOutput {
 pub fn run_sequential(
     slc_stack: ArrayView3<Cf64>,
     cfg: &SequentialConfig,
+    engine: &ComputeEngine,
 ) -> Result<SequentialOutput, &'static str> {
     let planner = MiniStackPlanner {
         num_slc: slc_stack.dim().0,
@@ -69,7 +68,7 @@ pub fn run_sequential(
     let mut temp_cohs: Vec<Array2<f64>> = Vec::new();
     for ms in plans {
         let combined = assemble(&compressed_slcs, slc_stack, ms);
-        let r = link_and_compress(combined.view(), ms, cfg)?;
+        let r = link_and_compress(combined.view(), ms, cfg, engine)?;
         real_phases.push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
         compressed_slcs.push(r.compressed);
         temp_cohs.push(r.temp_coh);
@@ -127,9 +126,10 @@ fn link_and_compress(
     combined: ArrayView3<Cf64>,
     ms: MiniStack,
     cfg: &SequentialConfig,
+    engine: &ComputeEngine,
 ) -> Result<MinistackResult, &'static str> {
-    let c = estimate_stack_covariance(combined, cfg.half_window, cfg.strides, None)?;
-    let est = process_coherence_matrices(
+    let c = engine.covariance(combined, cfg.half_window, cfg.strides, None)?;
+    let est = engine.estimate(
         c.view(),
         cfg.use_evd,
         cfg.beta,
