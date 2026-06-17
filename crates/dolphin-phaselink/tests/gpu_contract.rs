@@ -11,7 +11,8 @@ use std::f64::consts::TAU;
 
 use dolphin_core::{Cf32, Cf64, HalfWindow, Strides};
 use dolphin_phaselink::gpu::{
-    enumerate_adapters, estimate_stack_covariance_gpu, evd_link_gpu, GpuContext, DEFAULT_EVD_ITERS,
+    enumerate_adapters, estimate_stack_covariance_gpu, process_coherence_matrices_gpu, GpuContext,
+    DEFAULT_LINK_ITERS,
 };
 use dolphin_phaselink::{estimate_stack_covariance, process_coherence_matrices};
 use ndarray::{Array3, Array4};
@@ -48,30 +49,30 @@ fn to_c64(a: &Array4<Cf32>) -> Array4<Cf64> {
     a.mapv(|z| Cf64::new(z.re.into(), z.im.into()))
 }
 
-/// Compare GPU EVD against CPU EVD over a coherence stack: min eigenvector
-/// overlap and max referenced-phase delta (radians).
-fn compare_evd(ctx: &GpuContext, c32: &Array4<Cf32>) -> (f64, f64) {
-    let cpu = process_coherence_matrices(to_c64(c32).view(), true, 0.0, 0.0, 0);
-    let gpu = evd_link_gpu(ctx, c32.view(), 0, DEFAULT_EVD_ITERS).unwrap();
+/// Compare GPU vs CPU phase linking (EVD if `use_evd`, else EMI) over a
+/// coherence stack: min eigenvector overlap and max referenced-phase Δ (rad).
+fn compare_link(ctx: &GpuContext, c32: &Array4<Cf32>, use_evd: bool) -> (f64, f64) {
+    let cpu = process_coherence_matrices(to_c64(c32).view(), use_evd, 0.0, 0.0, 0);
+    let gpu =
+        process_coherence_matrices_gpu(ctx, c32.view(), use_evd, 0, DEFAULT_LINK_ITERS).unwrap();
     let (nslc, rows, cols) = cpu.cpx_phase.dim();
 
     let mut min_sim = 1.0_f64;
     let mut max_dphi = 0.0_f64;
-    for r in 0..rows {
-        for c in 0..cols {
-            let cv: Vec<Cf32> = (0..nslc)
-                .map(|t| {
-                    let z = cpu.cpx_phase[(t, r, c)];
-                    Cf32::new(z.re as f32, z.im as f32)
-                })
-                .collect();
-            let gv: Vec<Cf32> = (0..nslc).map(|t| gpu.cpx_phase[(t, r, c)]).collect();
-            min_sim = min_sim.min(cos_sim(&cv, &gv));
-            for t in 0..nslc {
-                let d = wrap(f64::from(gv[t].arg()) - f64::from(cv[t].arg()));
-                max_dphi = max_dphi.max(d.abs());
-            }
-        }
+    for pix in 0..rows * cols {
+        let (r, c) = (pix / cols, pix % cols);
+        let cv: Vec<Cf32> = (0..nslc)
+            .map(|t| {
+                let z = cpu.cpx_phase[(t, r, c)];
+                Cf32::new(z.re as f32, z.im as f32)
+            })
+            .collect();
+        let gv: Vec<Cf32> = (0..nslc).map(|t| gpu.cpx_phase[(t, r, c)]).collect();
+        min_sim = min_sim.min(cos_sim(&cv, &gv));
+        let dphi = (0..nslc)
+            .map(|t| wrap(f64::from(gv[t].arg()) - f64::from(cv[t].arg())).abs())
+            .fold(0.0_f64, f64::max);
+        max_dphi = max_dphi.max(dphi);
     }
     (min_sim, max_dphi)
 }
@@ -144,7 +145,7 @@ fn gpu_evd_recovers_analytic_rank_one() {
         }
     }
     let ctx = GpuContext::new().expect("GPU device");
-    let (min_sim, max_dphi) = compare_evd(&ctx, &c);
+    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
     eprintln!("analytic EVD: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999, "eigenvector overlap {min_sim} <= 0.999");
     assert!(
@@ -162,11 +163,51 @@ fn gpu_evd_matches_cpu_on_oracle_ds() {
     }
     let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
     let ctx = GpuContext::new().expect("GPU device");
-    let (min_sim, max_dphi) = compare_evd(&ctx, &c);
+    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
     eprintln!("oracle DS EVD: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999, "eigenvector overlap {min_sim} <= 0.999");
     assert!(
         max_dphi < 5e-3,
         "referenced phase delta {max_dphi} rad exceeds 5e-3"
     );
+}
+
+#[test]
+fn gpu_emi_matches_cpu_on_oracle_ds() {
+    let dir = fixtures();
+    if !dir.join("cov_C.npy").exists() {
+        eprintln!("skipping gpu_emi_matches_cpu_on_oracle_ds: no fixtures");
+        return;
+    }
+    let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
+    let ctx = GpuContext::new().expect("GPU device");
+    let (min_sim, max_dphi) = compare_link(&ctx, &c, false);
+    eprintln!("oracle DS EMI: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
+    assert!(
+        min_sim > 0.999,
+        "EMI eigenvector overlap {min_sim} <= 0.999"
+    );
+    assert!(
+        max_dphi < 5e-3,
+        "EMI referenced phase delta {max_dphi} rad exceeds 5e-3"
+    );
+}
+
+#[test]
+fn gpu_emi_falls_back_to_evd_on_singular_gamma() {
+    // Rank-1 unit coherence ⇒ Γ = all-ones (singular) ⇒ Cholesky fails ⇒ EVD.
+    const N: usize = 8;
+    let theta: Vec<f32> = (0..N).map(|i| 0.5 * i as f32).collect();
+    let mut c = Array4::<Cf32>::zeros((1, 1, N, N));
+    for i in 0..N {
+        for j in 0..N {
+            c[(0, 0, i, j)] = Cf32::from_polar(1.0, theta[i] - theta[j]);
+        }
+    }
+    let ctx = GpuContext::new().expect("GPU device");
+    let gpu = process_coherence_matrices_gpu(&ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    assert_eq!(gpu.estimator[(0, 0)], 0, "singular Γ must fall back to EVD");
+    let (min_sim, max_dphi) = compare_link(&ctx, &c, true);
+    eprintln!("EMI→EVD fallback: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
+    assert!(min_sim > 0.999);
 }
