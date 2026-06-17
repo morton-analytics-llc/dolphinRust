@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import h5py
@@ -32,6 +33,7 @@ HALF = HalfWindow(1, 1)
 STRIDES = Strides(1, 1)
 DATASET = "/data/VV"
 DT_DAYS = 12.0
+BASE_DATE = date(2022, 11, 19)  # real 12-day Sentinel-1 cadence; names carry the dates
 
 
 def synth_stack() -> np.ndarray:
@@ -67,7 +69,8 @@ def main() -> None:
     # Write per-date CSLC HDF5 files + the workflow YAML.
     files = []
     for t in range(N):
-        path = DISP_DIR / f"cslc_{t:02d}.h5"
+        stamp = (BASE_DATE + timedelta(days=int(t * DT_DAYS))).strftime("%Y%m%d")
+        path = DISP_DIR / f"cslc_{stamp}.h5"
         with h5py.File(path, "w") as f:
             f.create_dataset(DATASET, data=stack[t])
         files.append(path)

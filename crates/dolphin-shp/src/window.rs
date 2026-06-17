@@ -10,9 +10,13 @@ use ndarray::{Array2, Array4};
 /// A window clamped to image bounds: `[r_start, r_end) x [c_start, c_end)`.
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
+    /// Inclusive starting row.
     pub r_start: usize,
+    /// Exclusive ending row.
     pub r_end: usize,
+    /// Inclusive starting column.
     pub c_start: usize,
+    /// Exclusive ending column.
     pub c_end: usize,
 }
 

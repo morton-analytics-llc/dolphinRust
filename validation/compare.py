@@ -29,6 +29,7 @@ gdal.UseExceptions()
 # (two independent pipelines, different eigensolvers + different SNAPHU builds).
 CORR_MIN = 0.95          # dominant-signal date pattern agreement
 RMS_MAX_RAD = 0.10       # demeaned per-pixel residual (< 0.016 cycle)
+VELOCITY_SCALE_TOL = 0.02  # |affine slope - 1| for velocity absolute scale
 
 
 def read(path: Path) -> np.ndarray:
@@ -82,15 +83,21 @@ def main() -> None:
         st["pass"] = st["corr"] >= CORR_MIN and st["rms"] <= RMS_MAX_RAD
         rows.append(st)
 
-    # Velocity: dolphinRust hardcodes 12-day cadence (DT_DAYS); the oracle parses the real
-    # 1-day cadence. Report demeaned-pattern agreement (cadence-independent) + the raw scale.
+    # Velocity absolute scale. Both engines now parse the real acquisition dates, so the
+    # rate is a true physical /year. dolphin additionally subtracts a spatial reference
+    # pixel (a per-field additive constant), so the honest scale metric is the slope of the
+    # affine fit oracle = a*rust + b — a==1 means the absolute scale matches. (A raw median
+    # ratio is dominated by the additive offset b and is meaningless here.)
     ov = read(args.oracle / "timeseries" / "velocity.tif")
     rv = read(args.rust / "velocity.tif")
     vst = compare_field(ov, rv)
-    vst["stage"] = "velocity (pattern)"
-    vst["pass"] = vst["corr"] >= CORR_MIN
+    vst["stage"] = "velocity"
     m = np.isfinite(ov) & np.isfinite(rv)
-    vst["raw_scale_oracle_over_rust"] = float(np.median(ov[m] / rv[m]))
+    a_mat = np.vstack([rv[m], np.ones(int(m.sum()))]).T
+    (slope, offset), *_ = np.linalg.lstsq(a_mat, ov[m], rcond=None)
+    vst["velocity_scale_slope"] = float(slope)
+    vst["velocity_offset"] = float(offset)
+    vst["pass"] = bool(vst["corr"] >= CORR_MIN and abs(float(slope) - 1.0) <= VELOCITY_SCALE_TOL)
     rows.append(vst)
 
     print(f"\n=== end-to-end comparison: {args.label} ===")
@@ -102,9 +109,15 @@ def main() -> None:
             f"{s['stage']:22s} {s['n']:5d} {s['corr']:8.4f} {s['sign']:+5.0f} "
             f"{s['rms']:9.4e} {s['max']:9.4e} {'PASS' if s['pass'] else 'FAIL':>5s}"
         )
-    if "raw_scale_oracle_over_rust" in rows[-1]:
-        print(f"\nvelocity raw scale (oracle/rust median) = {rows[-1]['raw_scale_oracle_over_rust']:.3f}")
-    print(f"\ntolerances: corr >= {CORR_MIN}, demeaned RMS <= {RMS_MAX_RAD} rad")
+    if "velocity_scale_slope" in rows[-1]:
+        print(
+            f"\nvelocity absolute scale (affine slope oracle=a*rust+b): "
+            f"a={rows[-1]['velocity_scale_slope']:.4f} b={rows[-1]['velocity_offset']:.3f}"
+        )
+    print(
+        f"\ntolerances: corr >= {CORR_MIN}, demeaned RMS <= {RMS_MAX_RAD} rad, "
+        f"|velocity slope-1| <= {VELOCITY_SCALE_TOL}"
+    )
 
     if args.json_out:
         args.json_out.write_text(json.dumps({"label": args.label, "rows": rows}, indent=2))

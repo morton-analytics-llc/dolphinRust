@@ -12,7 +12,9 @@ pub type Cf64 = num_complex::Complex<f64>;
 /// `PhaseLinkingOptions.half_window` default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HalfWindow {
+    /// Half-window size (in pixels) in the y (row) direction.
     pub y: usize,
+    /// Half-window size (in pixels) in the x (column) direction.
     pub x: usize,
 }
 
@@ -27,7 +29,9 @@ impl Default for HalfWindow {
 /// Mirrors dolphin's `Strides` namedtuple. Default `(1, 1)` = no decimation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Strides {
+    /// Decimation factor in the y (row) direction.
     pub y: usize,
+    /// Decimation factor in the x (column) direction.
     pub x: usize,
 }
 

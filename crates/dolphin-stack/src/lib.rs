@@ -6,6 +6,7 @@
 //! Each ministack compresses to one SLC, carried forward as the leading
 //! element(s) of later ministacks (up to `max_num_compressed`). The
 //! [`CompressedSlcPlan`] sets the reference-index convention.
+#![warn(missing_docs)]
 
 use dolphin_core::config::CompressedSlcPlan;
 

@@ -9,7 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_timeseries::{
-    build_network, estimate_velocity, get_incidence_matrix, invert_stack, NetworkConfig,
+    build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
+    L1Config, NetworkConfig,
 };
 use ndarray::{Array2, Array3};
 
@@ -178,4 +179,29 @@ fn l2_inversion_and_velocity_match_oracle() {
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f64, f64::max);
     assert!(verr < 1e-4, "velocity error {verr}");
+}
+
+#[test]
+fn l1_inversion_matches_oracle() {
+    let dir = fixtures();
+    if !dir.join("ts_phase_l1.npy").exists() {
+        eprintln!("skipping l1 oracle: no fixtures");
+        return;
+    }
+    let a: Array2<i64> = ndarray_npy::read_npy(dir.join("ts_incidence.npy")).unwrap();
+    let a = a.mapv(|v| v as f64);
+    let dphi: Array3<f64> = ndarray_npy::read_npy(dir.join("ts_dphi.npy")).unwrap();
+    let phase_o: Array3<f64> = ndarray_npy::read_npy(dir.join("ts_phase_l1.npy")).unwrap();
+
+    // dolphin's default L1/ADMM on the redundant bandwidth-2 network: identical
+    // fixed 20-iteration ADMM (rho=0.4, alpha=1.0). dolphin runs it in jax (float32
+    // by default); Rust accumulates in f64, so the floor is the float32-vs-f64
+    // difference (~1.5e-6), tighter than the L2 path's SVD-vs-normal-eq 1e-4.
+    let phase = invert_stack_l1(a.view(), dphi.view(), L1Config::default());
+    let perr = phase
+        .iter()
+        .zip(phase_o.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(perr < 1e-5, "L1 displacement error {perr}");
 }

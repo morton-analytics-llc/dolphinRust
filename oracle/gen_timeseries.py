@@ -5,9 +5,9 @@ Emits, for several network modes, the interferogram index pairs; and for one
 bandwidth network: the incidence matrix, synthetic weighted unwrapped ifgs, the
 dolphin L2-inverted displacement series, and the fitted velocity.
 
-NOTE: dolphin defaults to L1 inversion; we validate the L2 path
-(`invert_stack` with weights) — the documented temporary divergence (L1/ADMM is
-Phase 6b). Run inside the pinned env:
+Validates both inversion paths: the L2 weighted least squares (`invert_stack`)
+and dolphin's default **L1/ADMM** (`invert_stack_l1`, Phase 6b). Run inside the
+pinned env:
     oracle/.venv/bin/python oracle/gen_timeseries.py
 """
 
@@ -19,7 +19,12 @@ from pathlib import Path
 import numpy as np
 
 from dolphin.interferogram import Network
-from dolphin.timeseries import estimate_velocity, get_incidence_matrix, invert_stack
+from dolphin.timeseries import (
+    estimate_velocity,
+    get_incidence_matrix,
+    invert_stack,
+    invert_stack_l1,
+)
 
 OUT = Path(__file__).resolve().parent / "fixtures"
 N_DATES = 6
@@ -66,6 +71,10 @@ def main() -> None:
     phase, _ = invert_stack(A, dphi, weights=weights)
     phase = np.asarray(phase)  # (N_DATES-1, rows, cols)
 
+    # L1/ADMM inversion (unweighted, dolphin default) on the same network + dphi.
+    phase_l1, _ = invert_stack_l1(A, dphi)
+    phase_l1 = np.asarray(phase_l1)  # (N_DATES-1, rows, cols)
+
     full_series = np.concatenate([np.zeros((1, ROWS, COLS)), phase], axis=0)
     velocity = np.asarray(estimate_velocity(np.array(days, dtype=float), full_series, None))
 
@@ -73,6 +82,7 @@ def main() -> None:
     np.save(OUT / "ts_dphi.npy", dphi.astype(np.float64))
     np.save(OUT / "ts_weights.npy", weights.astype(np.float64))
     np.save(OUT / "ts_phase.npy", phase.astype(np.float64))
+    np.save(OUT / "ts_phase_l1.npy", phase_l1.astype(np.float64))
     np.save(OUT / "ts_velocity.npy", velocity.astype(np.float64))
 
     print(f"wrote timeseries fixtures to {OUT}")

@@ -3,6 +3,23 @@
 Target: **v1.0.0** (first complete build). Update this file as phases land — it is the
 single source of truth for build progress across sessions. Phase details in PLAYBOOK.md.
 
+## Ready-to-ship v1 progress (branch `v1-ready-to-ship`, per V1_PROMPT.md)
+
+| Workstream | State |
+|---|---|
+| A1 velocity mm/yr via real temporal baselines + wavelength | ✅ done (oracle scale a=1.0000) |
+| A2 L1/ADMM inversion, config-driven default | ✅ done (oracle <1.5e-6) |
+| A3 multi-burst frame stitching | ✅ done (2-burst frame stitch contract) |
+| B4 real OPERA CSLC validation tier | ✅ tier built; engine agreement on real OPERA confirmed (RMS ≤0.008 rad, velocity magnitude + temp_coh match). Strong-signal velocity *scale* = synthetic-confirmed; high-coherence deforming scene is a narrow follow-up (see VALIDATION.md) |
+| C5 typed sync public API (+temp coh, CRS/geotransform) | ✅ done |
+| C6 COG outputs + documented schema | ✅ done (LAYOUT=COG verified) |
+| C7 `#![warn(missing_docs)]` all crates, doc clean | ✅ done |
+| D README + docs/usage.md + runnable example | ✅ done |
+| E11 release metadata + CHANGELOG + packaging | ✅ done (core dry-run clean; see RELEASING.md) |
+
+Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --no-deps.
+**Nothing pushed** — all on branch `v1-ready-to-ship`, awaiting sign-off.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
@@ -11,8 +28,10 @@ single source of truth for build progress across sessions. Phase details in PLAY
 - [x] 4 — Quality layers (`dolphin-phaselink`): temp_coh + compressed SLC done;
       **CRLB/closure deferred** — absent in pinned dolphin v0.35.0 (off the v1.0.0 critical path)
 - [x] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)
-- [x] 6 — Interferogram network + SBAS L2 inversion (`dolphin-timeseries`)
-      (L2 only; L1/ADMM = Phase 6b, the documented temporary divergence from the L1-default oracle)
+- [x] 6 — Interferogram network + SBAS inversion (`dolphin-timeseries`)
+      L2 weighted least squares **and** L1/ADMM (Phase 6b, dolphin's default `least_absolute_deviations`).
+      Method is config-driven (`timeseries_options.method`, default L1); L1 matches the dolphin
+      oracle to 1.5e-6 on a redundant bandwidth-2 network (`l1_inversion_matches_oracle`).
 - [x] 7 — Filters (`dolphin-filtering`): long-wavelength high-pass + Goldstein
       (GDAL gap-fill for bad pixels deferred to Phase 8 I/O)
 - [x] 8 — I/O layer + S3 read-staging (`dolphin-io` + `dolphin-ingest`)
@@ -23,8 +42,8 @@ single source of truth for build progress across sessions. Phase details in PLAY
       (tophu/spurt/whirlwind = documented gaps, not built)
 - [x] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
       `dolphin run --config <yaml>`: read CSLC → sequential phase-link → ifg network →
-      SNAPHU unwrap → SBAS L2 invert → velocity → GeoTIFF outputs. Single-burst
-      (multi-burst stitching deferred); end-to-end matches the dolphin oracle.
+      SNAPHU unwrap → SBAS L2 invert → velocity → GeoTIFF outputs. Multi-burst
+      frame stitching now supported (A3); end-to-end matches the dolphin oracle.
 
 ## ✅ v1.0.0 — first complete build
 All phases green. `dolphin run --config <yaml>` produces a displacement time series +
@@ -40,10 +59,11 @@ binary v2.0.7) on **one** genuine `dolphin config` YAML, synthetic single-burst 
 - **Config compatibility: PASS** — dolphinRust runs a real dolphin DisplacementWorkflow YAML unchanged.
 - **Displacement: PASS** — noise-free agreement max 1.1e-3 rad (corr 1.0000); residual
   scales linearly with speckle ⇒ sanctioned faer-vs-jax eigensolver divergence, not a bug.
-- **Velocity: FINDING** — `DT_DAYS=12.0` hardcoded (`dolphin-workflows/.../displacement.rs:23`)
-  ignores filename dates; absolute scale off by the cadence ratio for non-12-day stacks
-  (pattern still corr ≥0.97). Fix tracked in VALIDATION.md; product code left untouched.
-- **Pending:** real OPERA CSLC validation (no Earthdata creds here — synthetic only).
+- **Velocity: FIXED (A1)** — acquisition dates are now parsed from CSLC filenames
+  (`dolphin-workflows::dates`), so velocity carries a true physical rate. Affine scale vs
+  oracle a=1.0000 (noise-free) → 0.9997 (speckle 0.05), within ±0.02 all tiers. Typed API
+  exposes `velocity_mm_yr` (`−λ/4π`, config wavelength or S1 default).
+- **Pending:** real OPERA CSLC validation tier (B4); L1/ADMM default (A2); multi-burst (A3).
 
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.

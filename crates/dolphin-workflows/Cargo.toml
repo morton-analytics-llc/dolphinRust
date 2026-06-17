@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "End-to-end displacement pipeline orchestration for dolphinRust (the library entry point)."
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
 dolphin-core.workspace = true
@@ -21,10 +27,16 @@ anyhow.workspace = true
 tracing.workspace = true
 rayon.workspace = true
 ndarray.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 num-complex.workspace = true
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
+
+[[example]]
+name = "run_synthetic"
+path = "examples/run_synthetic.rs"
 
 [lints]
 workspace = true

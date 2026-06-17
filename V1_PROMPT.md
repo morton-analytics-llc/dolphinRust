@@ -42,9 +42,14 @@ dolphin" README; do not repeat it.)
    multi-burst frame runs end to end.
 
 ### Workstream B — real-data validation
-4. Obtain a small real OPERA S1 CSLC stack (a few cropped bursts). If Earthdata/ASF creds
-   are required and absent ⛔ pause and ask for creds or a local path. Run both engines; add
-   a **real-data tier** to `validation/` + `VALIDATION.md` (displacement + velocity in mm/yr).
+4. Obtain a small real OPERA S1 CSLC stack (a few cropped bursts). **Credentials are already
+   provisioned: `source validation/creds.sh`, then authenticate with the bearer token** —
+   `asf_search.ASFSession().auth_with_token(os.environ["GP_EARTHDATA_TOKEN"])`, or
+   `earthaccess.login(strategy="environment")`. **Do NOT use `~/.netrc`** — its password is
+   stale (401); the token is verified working (asf_search ↔ EDL, 2026-06-17). Install
+   `asf_search`/`earthaccess` in the validation env if absent. Run both engines; add a
+   **real-data tier** to `validation/` + `VALIDATION.md` (displacement + velocity in mm/yr).
+   Only if the token itself fails to authenticate ⛔ pause and tell me (it needs refreshing).
    Divergence beyond the sanctioned eigensolver noise ⛔ stop and report with a hypothesis.
 
 ### Workstream C — shippable library surface
@@ -100,10 +105,11 @@ not debate directions: state the load-bearing assumption in one line and proceed
 
 Two steps. **Step 2 is a slash command typed inside Claude Code — not a shell command.**
 
-1. In your terminal (this one line only):
+1. In your terminal, load the working Earthdata token into the session, then launch:
 
 ```sh
 cd /Users/ryanemorton/Documents/GitHub/dolphinRust
+source validation/creds.sh          # exports GP_EARTHDATA_TOKEN (the working credential)
 claude --dangerously-skip-permissions
 ```
 
@@ -114,5 +120,7 @@ claude --dangerously-skip-permissions
 ```
 
 `--dangerously-skip-permissions` lets it run cargo/git/conda/pip unattended. `/loop` with no
-interval = dynamic self-pacing. It pauses and asks if Earthdata creds are needed or if
-real-data output diverges beyond the sanctioned eigensolver noise.
+interval = dynamic self-pacing. Sourcing `validation/creds.sh` first puts the verified bearer
+token in the loop's environment (the `~/.netrc` password is stale — the loop uses the token).
+It pauses only if the token stops authenticating or real-data output diverges beyond the
+sanctioned eigensolver noise.

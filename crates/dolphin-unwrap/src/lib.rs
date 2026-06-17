@@ -4,6 +4,7 @@
 //! whirlwind). dolphin contains no unwrapping math; this crate shells out to
 //! the SNAPHU binary and manages tiling, nodata propagation, and connected
 //! components. Not a reimplementation target.
+#![warn(missing_docs)]
 
 pub mod snaphu;
 

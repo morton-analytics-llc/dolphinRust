@@ -8,21 +8,32 @@
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{compress, estimate_stack_covariance, process_coherence_matrices};
+use dolphin_phaselink::{
+    compress, estimate_stack_covariance, estimate_temp_coh, process_coherence_matrices,
+};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
 pub struct SequentialConfig {
+    /// Number of real SLCs per ministack.
     pub ministack_size: usize,
+    /// Maximum compressed SLCs carried into a ministack.
     pub max_num_compressed: usize,
+    /// Covariance estimation half-window (rows, cols).
     pub half_window: HalfWindow,
+    /// Output downsampling strides (rows, cols).
     pub strides: Strides,
+    /// Use eigenvalue decomposition (EVD) instead of EMI phase linking.
     pub use_evd: bool,
+    /// Coherence-matrix regularization weight (EMI `beta`).
     pub beta: f64,
+    /// Coherence values at or below this are treated as zero.
     pub zero_correlation_threshold: f64,
+    /// Index of the reference date for the output phase history.
     pub output_reference_idx: usize,
+    /// Strategy for choosing each ministack's compressed-SLC reference.
     pub compressed_slc_plan: CompressedSlcPlan,
 }
 
@@ -32,6 +43,9 @@ pub struct SequentialOutput {
     pub cpx_phase: Array3<Cf64>,
     /// Compressed SLC produced by each ministack, `(rows, cols)` each.
     pub compressed_slcs: Vec<Array2<Cf64>>,
+    /// Temporal coherence averaged across ministacks, `(out_rows, out_cols)`
+    /// (dolphin's `temporal_coherence_average`). 1.0 = perfect phase consistency.
+    pub temporal_coherence: Array2<f64>,
 }
 
 /// Run the sequential estimator over `slc_stack` `(nslc, rows, cols)`.
@@ -52,19 +66,33 @@ pub fn run_sequential(
 
     let mut compressed_slcs: Vec<Array2<Cf64>> = Vec::new();
     let mut real_phases: Vec<Array3<Cf64>> = Vec::new();
+    let mut temp_cohs: Vec<Array2<f64>> = Vec::new();
     for ms in plans {
         let combined = assemble(&compressed_slcs, slc_stack, ms);
-        let (cpx, compressed) = link_and_compress(combined.view(), ms, cfg)?;
-        real_phases.push(cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
-        compressed_slcs.push(compressed);
+        let r = link_and_compress(combined.view(), ms, cfg)?;
+        real_phases.push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
+        compressed_slcs.push(r.compressed);
+        temp_cohs.push(r.temp_coh);
     }
 
     let views: Vec<ArrayView3<Cf64>> = real_phases.iter().map(Array3::view).collect();
     let cpx_phase = concatenate(Axis(0), &views).map_err(|_| "phase-history concat failed")?;
+    let temporal_coherence = average_temp_coh(&temp_cohs);
     Ok(SequentialOutput {
         cpx_phase,
         compressed_slcs,
+        temporal_coherence,
     })
+}
+
+/// Equal-weight mean of the per-ministack temporal coherence layers
+/// (dolphin's `temporal_coherence_average`).
+fn average_temp_coh(layers: &[Array2<f64>]) -> Array2<f64> {
+    let mut sum = Array2::<f64>::zeros(layers[0].dim());
+    for layer in layers {
+        sum += layer;
+    }
+    sum / layers.len() as f64
 }
 
 /// Stack the carried compressed SLCs ahead of this ministack's real SLCs.
@@ -83,12 +111,23 @@ fn assemble(
     })
 }
 
-/// Phase-link a combined ministack and compress it to one SLC.
+/// One ministack's phase-linking products.
+struct MinistackResult {
+    /// Linked phase (unit magnitude), `(nslc, out_rows, out_cols)`.
+    cpx: Array3<Cf64>,
+    /// Compressed SLC, `(out_rows, out_cols)`.
+    compressed: Array2<Cf64>,
+    /// Temporal coherence, `(out_rows, out_cols)`.
+    temp_coh: Array2<f64>,
+}
+
+/// Phase-link a combined ministack and compress it to one SLC, plus its
+/// temporal coherence.
 fn link_and_compress(
     combined: ArrayView3<Cf64>,
     ms: MiniStack,
     cfg: &SequentialConfig,
-) -> Result<(Array3<Cf64>, Array2<Cf64>), &'static str> {
+) -> Result<MinistackResult, &'static str> {
     let c = estimate_stack_covariance(combined, cfg.half_window, cfg.strides, None)?;
     let est = process_coherence_matrices(
         c.view(),
@@ -98,13 +137,19 @@ fn link_and_compress(
         ms.output_reference_idx as usize,
     );
     let cpx = est.cpx_phase.mapv(unit_phasor);
+    // estimate_temp_coh wants (rows, cols, nslc); cpx is (nslc, rows, cols).
+    let temp_coh = estimate_temp_coh(cpx.view().permuted_axes([1, 2, 0]), c.view());
     let compressed = compress(
         combined,
         cpx.view(),
         ms.num_compressed,
         Some(ms.compressed_reference_idx as usize),
     );
-    Ok((cpx, compressed))
+    Ok(MinistackResult {
+        cpx,
+        compressed,
+        temp_coh,
+    })
 }
 
 /// Unit-magnitude phasor `exp(j∠z)` (dolphin's `exp(1j*angle(cpx_phase))`).

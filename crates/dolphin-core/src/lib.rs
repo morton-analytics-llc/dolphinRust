@@ -6,6 +6,7 @@
 //! `dolphin/io/_blocks.py`), the workflow config tree ([`config`], mirroring
 //! dolphin's pydantic `DisplacementWorkflow`), and the crate error type
 //! ([`error`]).
+#![warn(missing_docs)]
 
 pub mod blocks;
 pub mod config;

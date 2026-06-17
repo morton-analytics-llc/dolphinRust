@@ -21,16 +21,22 @@ Oracle env rebuild recipe: see auto-memory `oracle-env`. The two engines use **d
 SNAPHU implementations** (snaphu-py wheel vs Stanford binary) — an intended consequence of
 the "shell out for unwrapping" architecture decision, exercised here for the first time.
 
-## Data path: synthetic (real-OPERA validation still pending)
+## Data paths: synthetic tier + real OPERA tier
 
-No Earthdata/ASF credentials or local OPERA CSLC stack were available, so this is
-**synthetic-input equivalence**. `validation/gen_stack.py` emits a deterministic
-single-burst stack (fixed seed 21): N=5 acquisitions, 48×64, complex64 at `/data/VV`, files
-named `cslc_YYYYMMDD.h5` (1-day cadence) so dolphin's date parser accepts them. Signal is a
-smooth range ramp growing linearly in time (`0.3·t·x/cols`), kept small (|ifg phase| < ~1.2
-rad) so SNAPHU is cycle-free and the comparison isolates the estimators, not integer-cycle
+**Synthetic tier.** `validation/gen_stack.py` emits a deterministic single-burst stack
+(fixed seed 21): N=5 acquisitions, 48×64, complex64 at `/data/VV`, files named
+`cslc_YYYYMMDD.h5` (1-day cadence) so dolphin's date parser accepts them. Signal is a smooth
+range ramp growing linearly in time (`0.3·t·x/cols`), kept small (|ifg phase| < ~1.2 rad) so
+SNAPHU is cycle-free and the comparison isolates the estimators, not integer-cycle
 disagreements. A `--speckle` knob sets per-SLC complex noise; the sweep below uses it to
-characterize the divergence. **Real-data (true OPERA CSLC) validation remains open.**
+characterize the divergence.
+
+**Real OPERA tier (new).** Genuine OPERA L2 CSLC-S1 v1.1 granules from ASF, fetched with the
+Earthdata bearer token (`validation/fetch_real.py`, `creds.sh`), cropped to a 384×384 window
+(`crop_real.py`) so both engines run quickly on identical pixels. Bursts sampled: a coastal
+burst (T063-133231-IW1) and three land bursts — Mojave (T071-151223-IW1), Las Vegas
+(T173-370304-IW2), and Central Valley/Corcoran (T144-308011-IW2), each a 5- or 9-acquisition,
+12-day-cadence stack. See "Real-data results" below.
 
 ## One config, both engines — compatibility: PASS
 
@@ -66,7 +72,7 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 | SHP GLRT/KS (`dolphin-shp`) | shp_contract | 5 | PASS |
 | PS selection (`dolphin-ps`) | ps_contract | 4 | PASS |
 | ministack planner + sequential (`dolphin-stack`) | planner_contract, sequential_contract | 3, 1 | PASS |
-| network + SBAS-L2 (`dolphin-timeseries`) | timeseries_contract | 5 | PASS |
+| network + SBAS L2 **and L1/ADMM** (`dolphin-timeseries`) | timeseries_contract | 6 | PASS (L1 vs dolphin oracle <1.5e-6) |
 | filters (`dolphin-filtering`) | filtering_contract | 4 | PASS |
 | I/O round-trip (`dolphin-io`) | io_contract | 5 | PASS |
 | SNAPHU dispatch (`dolphin-unwrap`) | unwrap_contract | 1 | PASS |
@@ -102,7 +108,8 @@ Full per-date table at realistic speckle 0.05:
 ¹ The **RMS floor is constant (~0.050 rad) across all dates**; correlation only dips on the
 early dates because their signal is weakest (low SNR), not because agreement worsens. See
 divergence #1.
-² Velocity *pattern* matches; absolute *scale* does not — see divergence #2.
+² Velocity now matches on **absolute scale** (affine slope a=0.9997 at speckle 0.05; a=1.0000
+  noise-free) after the real-baseline fix — see divergence #2 (resolved).
 
 ## Divergences (with hypotheses)
 
@@ -115,33 +122,76 @@ divergence #1.
    eigenvector-overlap metric (>0.999, confirmed by `phaselink_contract`) but realized as a
    phase difference proportional to per-pixel speckle. Physical and within tolerance.
 
-2. **Velocity absolute scale is wrong for non-12-day cadence — real finding.**
-   On noise-free data, `oracle_velocity = 12.0004 · rust_velocity` (+ a reference-frame
-   offset); the velocity *pattern* correlates at ≥0.97. Root cause:
-   `crates/dolphin-workflows/src/displacement.rs:23` hardcodes `DT_DAYS = 12.0` and the
-   workflow never reads acquisition dates from the CSLC filenames (also lines 90, 161),
-   whereas dolphin parses the real dates (here 1-day cadence). The factor is exactly the
-   cadence ratio (12 days / 1 day). For genuine 12-day OPERA Sentinel-1 stacks the two
-   agree; for any other cadence dolphinRust's velocity is mis-scaled. Displacement is
-   unaffected (it is the inverted phase, cadence-independent).
-   **Recommendation:** parse dates from filenames (opera_utils-style, `cslc_date_fmt`
-   already exists in `InputOptions`) and feed real decimal-day positions to
-   `build_network` / `estimate_velocity` instead of the constant. Not fixed here — product
-   code was left untouched per the validation brief.
+2. **Velocity absolute scale — RESOLVED (was: wrong for non-12-day cadence).**
+   Previously `oracle_velocity = 12.0004 · rust_velocity` because
+   `displacement.rs` hardcoded `DT_DAYS = 12.0` and never read acquisition dates. **Fixed
+   (Workstream A1):** `dolphin-workflows::dates::decimal_days` parses the real acquisition
+   dates from the CSLC filenames (`input_options.cslc_date_fmt`) and feeds real decimal-day
+   baselines to `build_network` / `estimate_velocity`. The affine fit `oracle = a·rust + b`
+   now gives **a = 1.0000 / 0.9994 / 0.9997** at speckle 0.0 / 0.005 / 0.05 — absolute scale
+   matches within ±0.02 across all tiers. (`b` is dolphin's spatial reference-pixel offset,
+   removed by the demean; a raw median ratio is meaningless against it, so `compare.py` now
+   reports the affine slope.) The typed API additionally exposes `velocity_mm_yr`, converting
+   LOS phase rate via `−λ/4π` (config wavelength, else Sentinel-1 default). Contract tests:
+   `displacement::tests::recovers_injected_rate_in_mm_per_yr`, `rate_is_independent_of_cadence`.
+
+## Real-data results (OPERA CSLC, both engines)
+
+Both engines ran the **full pipeline on genuine OPERA CSLC-S1 granules** — config
+compatibility on real data: **PASS** (the same `dolphin config` YAML drives both, unchanged).
+Findings, consistent across all four bursts sampled:
+
+- **Engine agreement — PASS.** The demeaned per-pixel displacement residual between the two
+  independent engines is **≤ 0.008 rad** (velocity residual ≤ 0.031 rad/yr) on real data —
+  well inside the sanctioned eigensolver+SNAPHU divergence envelope (≤ 0.10 rad) established
+  on synthetic data. The engines produce near-identical output on real OPERA scenes.
+- **Velocity magnitude agreement — PASS.** On the Central Valley window both engines report
+  the same velocity spread (oracle std 0.020, rust std 0.020 rad/yr; comparable ranges); the
+  per-field means differ only by dolphin's spatial-reference-pixel offset. Rust does **not**
+  fabricate signal — a direct check that the engines see the same deformation magnitude.
+- **Temporal coherence agreement — PASS.** Rust vs oracle `temporal_coherence_average` agree
+  to ~0.01 on valid pixels (e.g. 0.598 vs 0.608).
+
+**What the sampled scenes could not pin: velocity *absolute scale* under strong signal.**
+Per-date correlation and the affine scale-slope are diagnostic only when the deformation
+spatial structure exceeds the cross-engine noise floor. In every coherent window sampled the
+deformation was at that floor (std ~0.02 rad/yr) — high coherence selects *stable* ground, so
+correlations scatter near zero and the scale regression is ill-conditioned (near-zero
+variance). A velocity pre-scan over a 1400² Central Valley crop located large rates only at
+low-coherence edges (unwrapping artifacts), not coherent deformation that survives into a
+comparison window. This is a **scene-selection limit, not a divergence or a bug** (RMS stays
+within the sanctioned envelope and rust's velocity magnitude tracks the oracle). The velocity
+absolute-scale match is therefore confirmed on the **synthetic tier (a = 1.0000)**, where the
+injected ramp provides controlled signal; an independent real-data scale confirmation needs a
+high-coherence *deforming* scene (e.g. an urban subsidence bowl with persistent scatterers) —
+a narrow documented follow-up.
 
 ## Open / pending
 
-- **Real OPERA CSLC validation** — synthetic only so far; needs Earthdata/ASF creds or a
-  local mini-stack to close.
-- **Velocity cadence fix** (divergence #2) — tracked above; a `dolphin-workflows` change.
+- **Real-data velocity absolute scale under strong signal** — engine agreement, velocity
+  magnitude, and coherence all match on real OPERA data; an independent real-data *scale*
+  check awaits a high-coherence deforming scene (scale already confirmed on synthetic).
+- **Velocity cadence fix** (divergence #2) — RESOLVED above; a `dolphin-workflows` change.
 - **Per-stage CLI intermediates** (linked-phase SLCs, temp_coh, unwrapped ifgs) are not
   persisted by the dolphinRust CLI, so end-to-end comparison is on displacement + velocity;
   those intermediates are covered by the §A contract tests against the same oracle.
 
 ## Reproduce
 
+Synthetic tier:
+
 ```sh
 oracle/.venv/bin/python validation/gen_stack.py --outdir /tmp/d --speckle 0.05  # stack
 validation/run.sh 0.05      # gen config, run both engines, compare
 validation/run.sh 0.0       # noise-free (pure-algorithm) agreement
+```
+
+Real OPERA tier (needs the Earthdata token in `.env`):
+
+```sh
+source validation/creds.sh
+oracle/.venv/bin/python validation/fetch_real.py --burst T144_308011_IW2 --n 9   # download
+oracle/.venv/bin/python validation/scan_coherence.py                              # find window
+oracle/.venv/bin/python validation/crop_real.py --row0 <r> --col0 <c> --size 384  # crop
+validation/run_real.sh                                                            # both engines + compare
 ```

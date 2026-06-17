@@ -12,6 +12,7 @@
 //! the rest of the pipeline — and any host app calling it — stays
 //! runtime-agnostic. The host app bridges the (sync, CPU-bound) compute run via
 //! `spawn_blocking` / a dedicated thread; see PLAYBOOK.md §Architecture #6–7.
+#![warn(missing_docs)]
 
 #[cfg(feature = "s3")]
 mod staging;

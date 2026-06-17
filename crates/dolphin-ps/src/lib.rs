@@ -5,6 +5,7 @@
 //! a uint8 PS mask (1 = PS, 0 = non-PS, 255 = nodata). At phase-linking output,
 //! PS pixels bypass covariance: each looked output cell takes the phase of the
 //! brightest PS in its window (referenced to `reference_idx`) and `temp_coh = 1`.
+#![warn(missing_docs)]
 
 use dolphin_core::{Cf64, Strides};
 use ndarray::{s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};

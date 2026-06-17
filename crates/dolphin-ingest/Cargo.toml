@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "S3 read-staging of OPERA CSLC inputs for the dolphinRust pipeline."
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [features]
 # Off by default: local-path callers pull no async/runtime deps.
