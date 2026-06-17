@@ -60,12 +60,16 @@ dolphinRust produces a displacement product end-to-end from a `gp-tasks` job on 
 
 ## v1.2.0 — 2026-09-01 · "Quality layers + production-grade unwrapping"
 
-- **CRLB uncertainty rasters** (dolphin v0.40) (~1–2 wks). Per-pixel phase-estimate σ from
-  the Fisher information of the covariance model. *Rationale: feeds GroundPulse
-  `confidence_score`/risk tiers a real physical uncertainty — a product capability, not just
-  parity.*
-- **Sequential closure-phase rasters** (dolphin v0.41) (~1 wk). Triplet non-closure
-  diagnostic; also the prerequisite signal for phase-bias work in R4.
+- **CRLB uncertainty rasters** (dolphin v0.40) — **SHIPPED** (branch `v1.2-quality`,
+  validated vs forward oracle dolphin v0.42.0, σ max |Δ| < 1e-4, singular-Γ NaN matches).
+  Per-pixel per-date phase-estimate σ from the Fisher information of the coherence model,
+  CPU `faer`/f64; on `DisplacementOutput.crlb_sigma` + per-band COGs, default on. *Feeds
+  GroundPulse `confidence_score`/risk tiers a real physical uncertainty — a product
+  capability, not just parity.* GPU CRLB is a later follow-up.
+- **Sequential closure-phase rasters** (dolphin v0.41) — **SHIPPED** (same branch/oracle,
+  closure max |Δ| < 1e-4). Nearest-neighbour triplet non-closure on
+  `DisplacementOutput.closure_phase` + per-band COGs (default off, matching dolphin); the
+  prerequisite signal for phase-bias work in R4.
 - **tophu-style multi-scale tiled unwrapping** (~2–3 wks). OPERA's *production* unwrapper —
   coarse-resolution init feeding tiled SNAPHU, merged. Materially better than raw SNAPHU on
   large, low-coherence (vegetated) scenes. Keep SNAPHU as the simple path.

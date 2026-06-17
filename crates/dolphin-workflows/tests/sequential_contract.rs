@@ -55,6 +55,8 @@ fn sequential_phase_history_matches_oracle() {
         zero_correlation_threshold: 0.0,
         output_reference_idx: 0,
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
+        compute_crlb: false,
+        compute_closure_phase: false,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();

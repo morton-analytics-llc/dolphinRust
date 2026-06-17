@@ -63,6 +63,8 @@ phase_linking:
   ministack_size: 15           # SLCs per ministack (sequential estimator)
   half_window: { y: 7, x: 14 } # covariance/SHP window half-extent
   use_evd: false               # false = EMI (default), true = EVD
+  write_crlb: true             # per-date CRLB σ uncertainty layer (default on)
+  write_closure_phase: false   # per-triplet closure-phase layer (default off)
 interferogram_network:
   reference_idx: 0             # single-reference network; or set max_bandwidth / max_temporal_baseline
 timeseries_options:
@@ -154,6 +156,8 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 | `velocity` | `Array2<f64>` `(rows, cols)` | m/yr (if `wavelength`) else rad/yr | raster-unit linear rate |
 | `velocity_mm_yr` | `Array2<f64>` `(rows, cols)` | **mm/yr** | LOS rate via `−λ/4π`; config λ or Sentinel-1 default |
 | `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | ministack-averaged phase quality (unmasked) |
+| `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-date Cramér–Rao σ lower bound; band 0 = reference (σ=0), singular-Γ pixels `NaN`. `Some` by default (`write_crlb`) |
+| `closure_phase` | `Option<Array3<f64>>` `(n_dates-2, rows, cols)` | radians | per-triplet nearest-neighbour non-closure; `Some` only when `write_closure_phase` |
 | `acquisition_days` | `Vec<f64>` length `n_dates` | days | decimal days from acquisition 0 |
 | `epsg` | `Option<u32>` | — | output CRS (CSLC metadata, else config) |
 | `geotransform` | `[f64; 6]` | — | GDAL `[origin_x, dx, 0, origin_y, 0, dy]` |
@@ -168,9 +172,21 @@ DEFLATE-compressed, overviews) sharing `epsg` + `geotransform`:
 | `velocity.tif` | linear velocity | raster units/yr (m/yr or rad/yr) |
 | `temporal_coherence.tif` | temporal coherence | `[0, 1]` |
 | `displacement_NN.tif` | cumulative displacement at date `NN+1` | meters or radians |
+| `crlb_sigma_NN.tif` | CRLB σ at date `NN` (band 0 = reference) | radians |
+| `closure_phase_NN.tif` | nearest-neighbour closure of triplet `NN` (only if `write_closure_phase`) | radians |
 
 No-data is unset (the typed layers are filled, not masked); threshold on
 `temporal_coherence` to mask low-quality pixels downstream.
+
+**CRLB → GroundPulse `confidence_score`.** `crlb_sigma` is the per-pixel, per-date
+*physical* uncertainty (radians) of the phase-linking estimate — the Cramér–Rao lower bound
+from the Fisher information of the coherence model. It is the missing input to GroundPulse's
+asset-risk `confidence_score`: a velocity is only as trustworthy as the σ of the phases it
+was fit from. A pixel with low CRLB σ (and high temporal coherence) carries a high-confidence
+velocity; a high-σ or `NaN` (singular-Γ, fully decorrelated) pixel should be down-weighted or
+masked. To reduce the per-date layer to one scalar per pixel for scoring, take a
+baseline-appropriate summary (e.g. the last date's σ, or the RMS across dates); the choice is
+the consumer's, so dolphinRust surfaces the full per-date bound rather than pre-collapsing it.
 
 ## 6. Known limitations (v1.0.0)
 

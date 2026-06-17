@@ -22,6 +22,7 @@ fn defaults_match_dolphin() {
         CompressedSlcPlan::AlwaysFirst
     );
     assert!(c.phase_linking.write_crlb);
+    assert!(!c.phase_linking.write_closure_phase);
     assert_eq!(c.ps_options.amp_dispersion_threshold, 0.25);
     assert_eq!(c.timeseries_options.method, TimeseriesMethod::L1);
     assert_eq!(c.timeseries_options.correlation_threshold, 0.2);
@@ -80,6 +81,8 @@ phase_linking:
   half_window:
     y: 11
     x: 5
+  write_crlb: false
+  write_closure_phase: true
 output_options:
   strides:
     y: 6
@@ -100,7 +103,22 @@ work_directory: /work/run1
     assert_eq!(c.phase_linking.half_window.x, 5);
     assert_eq!(c.output_options.strides.y, 6);
     assert_eq!(c.output_options.strides.x, 3);
+    assert!(
+        !c.phase_linking.write_crlb,
+        "explicit write_crlb: false parsed"
+    );
+    assert!(
+        c.phase_linking.write_closure_phase,
+        "write_closure_phase: true parsed"
+    );
     assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Spurt);
+
+    // The quality flags survive a serialize → parse round-trip.
+    let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();
+    assert_eq!(
+        reparsed, c,
+        "real dolphin YAML round-trips with quality flags"
+    );
 
     // Unspecified fields fall back to dolphin defaults.
     assert_eq!(c.phase_linking.max_num_compressed, 10);
