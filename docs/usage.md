@@ -73,7 +73,7 @@ output_options:
   strides: { y: 1, x: 1 }      # output multilooking
   epsg: 32611                  # fallback CRS when the CSLC carries none
 worker_settings:
-  compute_backend: auto        # phase-linking backend: auto | cpu | gpu (see below)
+  compute_backend: cpu         # default; phase-linking backend: cpu | auto | gpu (see below)
 work_directory: /out           # outputs are written here
 ```
 
@@ -82,11 +82,11 @@ The complete config tree, with every field documented, is the rustdoc for
 
 ### Compute backend (CPU / GPU)
 
-Phase linking (covariance + EVD/EMI) has a first-class `wgpu` GPU backend, on in the default
-build. `worker_settings.compute_backend` selects it:
+Phase linking (covariance + EVD/EMI) has a first-class `wgpu` GPU backend compiled into the
+default build, but it is **off by default**. `worker_settings.compute_backend` selects it:
 
-- **`auto`** (default) — GPU at/above the ~128² output-pixel crossover, CPU below it.
-- **`cpu`** — always the `faer` f64 reference path.
+- **`cpu`** (default) — always the `faer` f64 reference path.
+- **`auto`** — GPU at/above the ~128² output-pixel kernel crossover, CPU below it.
 - **`gpu`** — GPU wherever supported.
 
 **Fallback is automatic and safe.** With no GPU adapter, an `nslc` above the kernel cap (32),

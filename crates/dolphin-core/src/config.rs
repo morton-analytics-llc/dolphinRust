@@ -339,18 +339,21 @@ impl Default for OutputOptions {
 }
 
 /// Compute backend for phase linking (covariance + EVD/EMI). dolphin exposes a
-/// bool `gpu_enabled`; we generalize to a tri-state. `Auto` runs on the GPU above
-/// the ~128² crossover and on the CPU below it; explicit modes are honored. With
-/// no GPU adapter (or a `no-gpu` build) every mode falls back to the CPU path,
-/// which stays the f64 correctness reference.
+/// bool `gpu_enabled`; we generalize to a tri-state. **The default is `Cpu`** (the
+/// f64 correctness reference). `Gpu` and `Auto` are opt-in: on integrated GPUs the
+/// CPU path is faster end-to-end — the GPU's win is on discrete hardware. See the
+/// performance note in `bench/GPU.md` before selecting them. With no GPU adapter
+/// (or a `no-gpu` build) every mode falls back to the CPU path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeBackend {
-    /// Size-based: GPU at/above the crossover, CPU below; CPU if no GPU.
+    /// Always the CPU (faer, f64) reference path. The default.
     #[default]
-    Auto,
-    /// Always the CPU (faer, f64) reference path.
     Cpu,
+    /// Size-based: GPU at/above the ~128² kernel crossover, CPU below; CPU if no
+    /// GPU. Note the crossover is kernel-only — end-to-end on an integrated GPU the
+    /// CPU is faster, so prefer explicit `Gpu` only on discrete hardware.
+    Auto,
     /// GPU where supported; automatic CPU fallback if no adapter / unsupported.
     Gpu,
 }

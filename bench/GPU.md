@@ -89,7 +89,7 @@ phase-linking *kernel only*, covariance excluded; those numbers are not comparab
 - **The payoff is portability, not this machine.** The same WGSL ports unchanged
   to a discrete NVIDIA/AMD GPU with far more FP32 throughput, dedicated bandwidth,
   and headroom — that is the motivating next test. On integrated Apple silicon,
-  prefer `compute_backend = auto` (CPU below the crossover) or `cpu`.
+  keep the default `compute_backend = cpu`; reserve `gpu`/`auto` for discrete hardware.
 - Wall-clock carries ±10–20% run-to-run variance (thermal/scheduling); the
   ordering and crossover are stable across runs.
 
