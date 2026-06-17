@@ -8,11 +8,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use dolphin_core::config::DisplacementWorkflow;
+use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
 use dolphin_core::{Cf32, Cf64};
 use dolphin_io::{read_cslc_stack, write_raster};
 use dolphin_timeseries::{
-    build_network, estimate_velocity, get_incidence_matrix, invert_stack, NetworkConfig,
+    build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
+    L1Config, NetworkConfig,
 };
 use dolphin_unwrap::{unwrap, CostMode, InitMethod, UnwrapConfig};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
@@ -61,7 +62,12 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
 
     let dphi_rad = unwrap_network(cfg, pl.view(), &pairs)?;
     let incidence = get_incidence_matrix(&pairs);
-    let disp_rad = invert_stack(incidence.view(), dphi_rad.view(), None);
+    let disp_rad = match cfg.timeseries_options.method {
+        TimeseriesMethod::L1 => {
+            invert_stack_l1(incidence.view(), dphi_rad.view(), L1Config::default())
+        }
+        TimeseriesMethod::L2 => invert_stack(incidence.view(), dphi_rad.view(), None),
+    };
     let vel_rad = velocity_of(disp_rad.view(), &days);
 
     let phase_to_disp = cfg

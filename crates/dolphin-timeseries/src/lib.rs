@@ -8,5 +8,7 @@
 pub mod inversion;
 pub mod network;
 
-pub use inversion::{estimate_velocity, get_incidence_matrix, invert_stack};
+pub use inversion::{
+    estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1, L1Config,
+};
 pub use network::{build_network, NetworkConfig};

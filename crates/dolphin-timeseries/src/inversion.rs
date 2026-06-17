@@ -64,6 +64,94 @@ pub fn invert_stack(
     Array3::from_shape_fn((n_dates, rows, cols), |(d, r, c)| columns[r * cols + c][d])
 }
 
+/// ADMM parameters for L1 (least-absolute-deviations) inversion. Defaults match
+/// dolphin's `least_absolute_deviations` (`rho=0.4`, `alpha=1.0`, 20 iterations);
+/// the network structure is regular enough that ADMM converges in few steps.
+#[derive(Debug, Clone, Copy)]
+pub struct L1Config {
+    /// Augmented-Lagrangian penalty parameter ρ.
+    pub rho: f64,
+    /// Over-relaxation parameter α (typically 1.0–1.8).
+    pub alpha: f64,
+    /// Fixed ADMM iteration count.
+    pub max_iter: usize,
+}
+
+impl Default for L1Config {
+    fn default() -> Self {
+        Self {
+            rho: 0.4,
+            alpha: 1.0,
+            max_iter: 20,
+        }
+    }
+}
+
+/// Soft-thresholding (shrinkage) operator `max(0,a−κ) − max(0,−a−κ)`.
+fn shrinkage(a: f64, kappa: f64) -> f64 {
+    (a - kappa).max(0.0) - (-a - kappa).max(0.0)
+}
+
+/// Solve the SBAS stack in the **L1 norm** (`min ‖Aφ−Δφ‖₁`) per pixel via
+/// ADMM/LAD — dolphin's default inversion, robust to unwrapping outliers.
+/// `dphi` is `(n_ifgs, rows, cols)`; returns `(n_dates, rows, cols)`. Port of
+/// dolphin `least_absolute_deviations` / `invert_stack_l1`.
+#[must_use]
+pub fn invert_stack_l1(a: ArrayView2<f64>, dphi: ArrayView3<f64>, cfg: L1Config) -> Array3<f64> {
+    let (n_ifgs, rows, cols) = dphi.dim();
+    let n = a.ncols();
+    let ata = Mat::from_fn(n, n, |i, j| {
+        (0..n_ifgs).map(|k| a[(k, i)] * a[(k, j)]).sum::<f64>()
+    });
+    let llt = ata
+        .cholesky(Side::Lower)
+        .expect("AtA not SPD (rank-deficient network)");
+    let columns: Vec<Vec<f64>> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| lad_pixel(a, dphi, &llt, (idx / cols, idx % cols), cfg))
+        .collect();
+    Array3::from_shape_fn((n, rows, cols), |(d, r, c)| columns[r * cols + c][d])
+}
+
+/// Least-absolute-deviations ADMM solve for one pixel.
+fn lad_pixel(
+    a: ArrayView2<f64>,
+    dphi: ArrayView3<f64>,
+    llt: &faer::linalg::solvers::Cholesky<f64>,
+    pixel: (usize, usize),
+    cfg: L1Config,
+) -> Vec<f64> {
+    let n = a.ncols();
+    let m = a.nrows();
+    let b: Vec<f64> = (0..m).map(|k| dphi[(k, pixel.0, pixel.1)]).collect();
+    let mut x = vec![0.0; n];
+    let mut z = vec![0.0; m];
+    let mut z_old = vec![0.0; m];
+    let mut u = vec![0.0; m];
+    let kappa = 1.0 / cfg.rho;
+
+    for _ in 0..cfg.max_iter {
+        let q = Mat::from_fn(n, 1, |i, _| {
+            (0..m)
+                .map(|k| a[(k, i)] * (b[k] + z[k] - u[k]))
+                .sum::<f64>()
+        });
+        let xs = llt.solve(&q);
+        (0..n).for_each(|i| x[i] = xs[(i, 0)]);
+
+        let mut z_new = vec![0.0; m];
+        for k in 0..m {
+            let ax = (0..n).map(|i| a[(k, i)] * x[i]).sum::<f64>();
+            let ax_hat = cfg.alpha * ax + (1.0 - cfg.alpha) * (z_old[k] + b[k]);
+            z_new[k] = shrinkage(ax_hat - b[k] + u[k], kappa);
+            u[k] += ax_hat - z_new[k] - b[k];
+        }
+        z_old = z;
+        z = z_new;
+    }
+    x
+}
+
 /// Weighted least-squares solve for one pixel.
 fn solve_pixel(
     a: ArrayView2<f64>,

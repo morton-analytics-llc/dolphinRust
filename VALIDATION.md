@@ -66,7 +66,7 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 | SHP GLRT/KS (`dolphin-shp`) | shp_contract | 5 | PASS |
 | PS selection (`dolphin-ps`) | ps_contract | 4 | PASS |
 | ministack planner + sequential (`dolphin-stack`) | planner_contract, sequential_contract | 3, 1 | PASS |
-| network + SBAS-L2 (`dolphin-timeseries`) | timeseries_contract | 5 | PASS |
+| network + SBAS L2 **and L1/ADMM** (`dolphin-timeseries`) | timeseries_contract | 6 | PASS (L1 vs dolphin oracle <1.5e-6) |
 | filters (`dolphin-filtering`) | filtering_contract | 4 | PASS |
 | I/O round-trip (`dolphin-io`) | io_contract | 5 | PASS |
 | SNAPHU dispatch (`dolphin-unwrap`) | unwrap_contract | 1 | PASS |

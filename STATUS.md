@@ -11,8 +11,10 @@ single source of truth for build progress across sessions. Phase details in PLAY
 - [x] 4 — Quality layers (`dolphin-phaselink`): temp_coh + compressed SLC done;
       **CRLB/closure deferred** — absent in pinned dolphin v0.35.0 (off the v1.0.0 critical path)
 - [x] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)
-- [x] 6 — Interferogram network + SBAS L2 inversion (`dolphin-timeseries`)
-      (L2 only; L1/ADMM = Phase 6b, the documented temporary divergence from the L1-default oracle)
+- [x] 6 — Interferogram network + SBAS inversion (`dolphin-timeseries`)
+      L2 weighted least squares **and** L1/ADMM (Phase 6b, dolphin's default `least_absolute_deviations`).
+      Method is config-driven (`timeseries_options.method`, default L1); L1 matches the dolphin
+      oracle to 1.5e-6 on a redundant bandwidth-2 network (`l1_inversion_matches_oracle`).
 - [x] 7 — Filters (`dolphin-filtering`): long-wavelength high-pass + Goldstein
       (GDAL gap-fill for bad pixels deferred to Phase 8 I/O)
 - [x] 8 — I/O layer + S3 read-staging (`dolphin-io` + `dolphin-ingest`)
