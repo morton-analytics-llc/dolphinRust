@@ -11,11 +11,14 @@ use std::f64::consts::TAU;
 
 use dolphin_core::{Cf32, Cf64, HalfWindow, Strides};
 use dolphin_phaselink::gpu::{
-    enumerate_adapters, estimate_stack_covariance_gpu, process_coherence_matrices_gpu, GpuContext,
-    DEFAULT_LINK_ITERS,
+    enumerate_adapters, estimate_stack_covariance_gpu, process_coherence_matrices_gpu,
+    process_coherence_matrices_gpu_hybrid, unreliable_count, GpuContext, DEFAULT_LINK_ITERS,
 };
-use dolphin_phaselink::{estimate_stack_covariance, process_coherence_matrices};
+use dolphin_phaselink::{estimate_stack_covariance, process_coherence_matrices, StackEstimate};
 use ndarray::{Array3, Array4};
+
+/// Sentinel-1 C-band displacement scale: |Δd| = λ/(4π)·|Δφ|, mm per rad.
+const MM_PER_RAD: f64 = 55.465_76 / (4.0 * std::f64::consts::PI);
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
@@ -190,6 +193,66 @@ fn gpu_emi_matches_cpu_on_oracle_ds() {
     assert!(
         max_dphi < 5e-3,
         "EMI referenced phase delta {max_dphi} rad exceeds 5e-3"
+    );
+}
+
+/// Max referenced-phase Δ (rad) over ALL pixels between two f64 stack estimates.
+fn max_dphi_all(a: &StackEstimate, b: &StackEstimate) -> f64 {
+    let (nslc, rows, cols) = a.cpx_phase.dim();
+    (0..rows * cols)
+        .map(|pix| {
+            let (r, c) = (pix / cols, pix % cols);
+            (0..nslc)
+                .map(|t| wrap(a.cpx_phase[(t, r, c)].arg() - b.cpx_phase[(t, r, c)].arg()).abs())
+                .fold(0.0_f64, f64::max)
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+/// Item 1 (gating): the GPU EMI hybrid must match CPU EMI to **sub-mm on every
+/// pixel** of the real Mexico stack — the spike's π-rad (13.9 mm) tail removed by
+/// recomputing the flagged near-degenerate minority on the f64 CPU path.
+#[test]
+fn gpu_emi_hybrid_no_pi_tail_on_real_stack() {
+    let dir = fixtures();
+    if !dir.join("real_cov_C.npy").exists() {
+        eprintln!(
+            "skipping gpu_emi_hybrid_no_pi_tail_on_real_stack: run oracle/gen_phaselink_real.py"
+        );
+        return;
+    }
+    let c32: Array4<Cf32> = ndarray_npy::read_npy(dir.join("real_cov_C.npy")).unwrap();
+    let c64 = to_c64(&c32);
+    let ctx = GpuContext::new().expect("GPU device");
+
+    let cpu = process_coherence_matrices(c64.view(), false, 0.0, 0.0, 0);
+    let hybrid = process_coherence_matrices_gpu_hybrid(
+        &ctx,
+        c64.view(),
+        false,
+        0.0,
+        0.0,
+        0,
+        DEFAULT_LINK_ITERS,
+    )
+    .unwrap();
+
+    // Diagnostic: how many pixels the kernel flagged for CPU recompute.
+    let raw =
+        process_coherence_matrices_gpu(&ctx, c32.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let n_pix = raw.reliable.len();
+    let n_flag = unreliable_count(&raw);
+
+    let max_dphi = max_dphi_all(&cpu, &hybrid);
+    let max_mm = max_dphi * MM_PER_RAD;
+    eprintln!(
+        "hybrid EMI vs CPU [ALL {n_pix} px]: max Δφ={max_dphi:.3e} rad ({max_mm:.4} mm); \
+         CPU-recomputed {n_flag} px ({:.1}%)",
+        100.0 * n_flag as f64 / n_pix as f64
+    );
+    assert!(
+        max_mm < 1.0,
+        "max Δφ {max_mm:.4} mm over all pixels is not sub-mm — π-rad tail not removed"
     );
 }
 

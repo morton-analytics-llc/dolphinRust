@@ -31,6 +31,23 @@ Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --n
 
 Gates green (fmt, clippy -D warnings, test, doc). **Nothing pushed** — branch `v1.1`.
 
+## GPU first-class progress (branch `gpu-first-class`, per GPU_FIRSTCLASS_PROMPT.md)
+
+Promoting the R4 GPU phase-linking spike to a production, runtime-selected backend.
+CPU (faer, f64) stays the correctness reference and automatic fallback.
+
+| Item | State |
+|---|---|
+| 1. EMI GPU↔CPU hybrid — no π-rad tail | ✅ done — kernel emits a per-pixel `reliable` flag (bottom eigengap via Hotelling deflation + Rayleigh wrong-mode guard + coherence floor); host recomputes the flagged minority on f64 faer. Real Mexico stack (384², 13 acqs): **max Δφ 0.61 mm over ALL 147,456 px** (was 13.9 mm / π-rad), 5.6% CPU-recomputed. Contract `gpu_emi_hybrid_no_pi_tail_on_real_stack` green |
+| 2. MAX_NSLC ≥ 32, deterministic scratch | ⏳ next |
+| 3. GPU covariance SHP mask + β | ⏳ |
+| 4. Runtime backend selection (default build) + no-adapter fallback + `no-gpu` | ⏳ |
+| 5. Wire selected backend through `run_displacement` | ⏳ |
+| 6. End-to-end validation + honest speedup/crossover | ⏳ |
+| 7. Docs (README/usage/CHANGELOG/ROADMAP) | ⏳ |
+
+Gates green so far (fmt, clippy -D warnings, gpu_contract). **Nothing pushed** — branch `gpu-first-class`.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★

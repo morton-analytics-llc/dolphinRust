@@ -18,4 +18,7 @@ mod link;
 
 pub use context::{enumerate_adapters, AdapterReport, GpuContext, GpuError};
 pub use covariance::{estimate_stack_covariance_gpu, MAX_NSLC};
-pub use link::{process_coherence_matrices_gpu, GpuStackEstimate, DEFAULT_LINK_ITERS};
+pub use link::{
+    process_coherence_matrices_gpu, process_coherence_matrices_gpu_hybrid, unreliable_count,
+    GpuStackEstimate, DEFAULT_LINK_ITERS,
+};

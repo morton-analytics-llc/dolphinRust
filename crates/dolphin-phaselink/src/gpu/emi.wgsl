@@ -3,17 +3,35 @@
 // Per output pixel: Γ = |C| (β=0 path), Cholesky-invert it, form the Hermitian
 // M = Γ⁻¹ ⊙ C, and take its *least* eigenvector. M is PSD (Schur product of the
 // PSD Γ⁻¹ and PSD C), so we first power-iterate M for its dominant eigenvalue
-// λ_max, then power-iterate B = λ_max·I − M whose dominant mode is M's least —
-// no per-iteration linear solve, and a tight shift (so B's spectrum is well
-// separated, unlike a loose Gershgorin bound). On a non-PD Γ (Cholesky failure)
-// we fall back to EVD (dominant eigenvector of C ⊙ |C|), matching the CPU
-// NaN-triggered fallback.
+// λ_max, then power-iterate B = shift·I − M (shift = λ_max·SHIFT_MARGIN, strictly
+// above λ_max so B stays PSD and its dominant mode is M's *least* — a tight ‖Mv‖
+// shift underestimates λ_max and can lock onto the wrong mode). No per-iteration
+// linear solve. On a non-PD Γ (Cholesky failure) we fall back to EVD (dominant
+// eigenvector of C ⊙ |C|), matching the CPU NaN-triggered fallback.
+//
+// First-class hybrid: the least eigenvector of M is numerically ill-defined when
+// M's two smallest eigenvalues are nearly degenerate — there an f32 iterative
+// solver and faer's f64 direct decomposition pick different vectors in the
+// near-degenerate subspace (the spike's π-rad tail). We recover M's second-least
+// eigenvalue with one Hotelling-deflated power pass and emit a per-pixel
+// `reliable` flag: a pixel is unreliable when the bottom eigengap (λ_2nd − λ_min)
+// is small, the Rayleigh quotient of the "least" vector is too large (the
+// iteration locked onto a high mode), or the mean coherence is low. The host
+// recomputes the flagged minority on the f64 CPU path — so EMI matches the CPU
+// reference on *every* pixel, sub-mm, with no π-rad tail.
 //
 // Γ, its Cholesky factor, and the inverse share private nslc² scratch; the
 // iterate vectors are private nslc-length. nslc ≤ MAX_NSLC. Complex = vec2<f32>.
 
 const MAX_NSLC: u32 = 16u;
 const MAX_NN: u32 = 256u; // MAX_NSLC * MAX_NSLC
+
+// Reliability thresholds (tuned on the real Mexico stack so the host fallback
+// removes the π-rad tail; generous — false positives only cost a CPU recompute).
+const GAP_TOL: f32 = 0.07;    // bottom relative eigengap floor (λ_2nd−λ_min)/λ_max
+const COH_FLOOR: f32 = 0.10;  // mean off-diagonal |C| floor
+const RHO_FRAC: f32 = 0.50;   // Rayleigh(v_least)/λ_max ceiling (wrong-mode capture)
+const SHIFT_MARGIN: f32 = 1.02; // shift = λ_max·margin (‖Mv‖ underestimates λ_max)
 
 struct Params {
     nslc: u32,
@@ -27,11 +45,13 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> phase_out: array<vec2<f32>>;
 @group(0) @binding(3) var<storage, read_write> eig_out: array<f32>;
 @group(0) @binding(4) var<storage, read_write> estimator_out: array<u32>;
+@group(0) @binding(5) var<storage, read_write> reliable_out: array<u32>;
 
 var<private> gam: array<f32, MAX_NN>; // Γ, then its Cholesky factor L (lower)
 var<private> inv: array<f32, MAX_NN>; // Γ⁻¹
 var<private> v: array<vec2<f32>, MAX_NSLC>;
 var<private> w: array<vec2<f32>, MAX_NSLC>;
+var<private> v1: array<vec2<f32>, MAX_NSLC>; // saved least eigenvector
 
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
@@ -101,6 +121,45 @@ fn set_v_ones(n: u32) {
     }
 }
 
+// Least eigenvector of M into `v` via shifted power iteration on B = shift·I − M
+// (from the current `v` start). Returns B's dominant eigenvalue (= shift − λ_min).
+fn least_pass(n: u32, base: u32, shift: f32, iters: u32) -> f32 {
+    var beta = 0.0;
+    for (var it = 0u; it < iters; it = it + 1u) {
+        _ = matvec(n, base, true);
+        var nrm = 0.0;
+        for (var i = 0u; i < n; i = i + 1u) {
+            w[i] = shift * v[i] - w[i];
+            nrm = nrm + dot(w[i], w[i]);
+        }
+        beta = sqrt(nrm);
+        normalize_w_into_v(n, beta);
+    }
+    return beta;
+}
+
+// Second-least eigenvalue of M via Hotelling deflation of v₁ out of B = shift·I − M.
+// Iterates the current `v` and returns B's deflated dominant (= shift − λ_2nd).
+fn deflated_pass(n: u32, base: u32, shift: f32, beta1: f32, iters: u32) -> f32 {
+    var beta = 0.0;
+    for (var it = 0u; it < iters; it = it + 1u) {
+        _ = matvec(n, base, true);
+        var proj = vec2<f32>(0.0, 0.0);
+        for (var i = 0u; i < n; i = i + 1u) {
+            proj = proj + cmul(vec2<f32>(v1[i].x, -v1[i].y), v[i]);
+        }
+        var nrm = 0.0;
+        for (var i = 0u; i < n; i = i + 1u) {
+            let bv = shift * v[i] - w[i];
+            w[i] = bv - beta1 * cmul(proj, v1[i]);
+            nrm = nrm + dot(w[i], w[i]);
+        }
+        beta = sqrt(nrm);
+        normalize_w_into_v(n, beta);
+    }
+    return beta;
+}
+
 // Power-iterate the dominant mode of M into `v` (iters steps).
 fn power_dominant(n: u32, base: u32, use_emi: bool, iters: u32) {
     set_v_ones(n);
@@ -113,6 +172,14 @@ fn power_dominant(n: u32, base: u32, use_emi: bool, iters: u32) {
     }
 }
 
+// Normalize `w` into `v` by ‖w‖; returns ‖w‖ (the dominant eigenvalue estimate).
+fn normalize_w_into_v(n: u32, nrm: f32) {
+    let s = select(0.0, 1.0 / nrm, nrm > 0.0);
+    for (var i = 0u; i < n; i = i + 1u) {
+        v[i] = w[i] * s;
+    }
+}
+
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pix = gid.x;
@@ -120,12 +187,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = p.nslc;
     let base = pix * n * n;
 
-    // Γ = |C|, Cholesky-invert (EVD fallback if non-PD).
+    // Γ = |C|, mean off-diagonal coherence, Cholesky-invert (EVD fallback if non-PD).
+    var coh_sum = 0.0;
     for (var i = 0u; i < n; i = i + 1u) {
         for (var j = 0u; j < n; j = j + 1u) {
-            gam[i * n + j] = length(cmat[base + i * n + j]);
+            let mag = length(cmat[base + i * n + j]);
+            gam[i * n + j] = mag;
+            if (i != j) { coh_sum = coh_sum + mag; }
         }
     }
+    let off = max(1.0, f32(n * (n - 1u)));
+    let coh_mean = coh_sum / off;
     let use_emi = cholesky(n);
     if (use_emi) {
         invert_from_cholesky(n);
@@ -135,22 +207,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     power_dominant(n, base, use_emi, p.iters);
     let lambda_max = matvec(n, base, use_emi);
 
-    // EMI: shifted pass for the least mode of M = dominant of λ_max·I − M.
+    var reliable = 1u;
     if (use_emi) {
+        // Shift strictly above λ_max so B = shift·I − M stays PSD and its dominant
+        // mode is M's *least* (a tight ‖Mv‖ shift can undershoot → wrong mode).
+        let shift = lambda_max * SHIFT_MARGIN;
+        // Least eigenvector (β₁ = shift − λ_min); save it in v1.
         set_v_ones(n);
-        for (var it = 0u; it < p.iters; it = it + 1u) {
-            _ = matvec(n, base, true);
-            var nrm = 0.0;
-            for (var i = 0u; i < n; i = i + 1u) {
-                w[i] = lambda_max * v[i] - w[i];
-                nrm = nrm + dot(w[i], w[i]);
-            }
-            nrm = sqrt(nrm);
-            let s = select(0.0, 1.0 / nrm, nrm > 0.0);
-            for (var i = 0u; i < n; i = i + 1u) {
-                v[i] = w[i] * s;
-            }
-        }
+        let beta1 = least_pass(n, base, shift, p.iters);
+        for (var i = 0u; i < n; i = i + 1u) { v1[i] = v[i]; }
+        // Second-least eigenvalue via deflation (β₂ = shift − λ_2nd).
+        set_v_ones(n);
+        let beta2 = deflated_pass(n, base, shift, beta1, p.iters);
+        let gap = beta1 - beta2; // = λ_2nd − λ_min
+
+        // Rayleigh ρ = v₁ᴴ M v₁: the true least mode has the smallest ρ; a ρ near
+        // λ_max means the iteration locked onto a high mode (non-convergence).
+        for (var i = 0u; i < n; i = i + 1u) { v[i] = v1[i]; }
+        _ = matvec(n, base, true);
+        var rho = 0.0;
+        for (var i = 0u; i < n; i = i + 1u) { rho = rho + dot(v1[i], w[i]); }
+
+        // Flag ill-defined / non-converged / decorrelated pixels for CPU recompute.
+        if (gap < GAP_TOL * lambda_max) { reliable = 0u; }
+        if (rho > RHO_FRAC * lambda_max) { reliable = 0u; }
+        if (coh_mean <= COH_FLOOR) { reliable = 0u; }
     }
 
     // Reference to ref_idx: multiply every entry by exp(-j·∠v[ref]).
@@ -163,4 +244,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     eig_out[pix] = lambda_max;
     estimator_out[pix] = select(0u, 1u, use_emi);
+    reliable_out[pix] = reliable;
 }
