@@ -19,8 +19,8 @@ members = [
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.94"
-license = "Apache-2.0"
-repository = "https://github.com/mortonanalytics/dolphinRust"
+license = "MIT"
+repository = "https://github.com/morton-analytics-llc/dolphinRust"
 authors = ["Morton Analytics"]
 
 [workspace.dependencies]

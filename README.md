@@ -47,5 +47,5 @@ The scaffold builds with a pure-Rust dependency set. System-library bindings
 
 ## License
 
-Apache-2.0. Algorithms referenced from the upstream dolphin project
-(also Apache-2.0, isce-framework / Caltech); this is an independent Rust implementation.
+MIT © Morton Analytics LLC. An independent Rust implementation; algorithms are referenced
+from the upstream dolphin project (Apache-2.0, isce-framework / Caltech), no code is copied.
