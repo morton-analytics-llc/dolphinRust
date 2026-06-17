@@ -20,3 +20,6 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 rayon.workspace = true
+
+[lints]
+workspace = true

@@ -13,3 +13,6 @@ thiserror.workspace = true
 # NOTE: `gdal` and `hdf5` crates require system GDAL/HDF5 libraries and are
 # added during Phase 8 (see PLAYBOOK.md). Kept out of the scaffold so the
 # workspace builds without system deps.
+
+[lints]
+workspace = true

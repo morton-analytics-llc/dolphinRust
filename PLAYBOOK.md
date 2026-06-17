@@ -1,11 +1,14 @@
 # dolphinRust Implementation Playbook
 
-Phased plan to port [dolphin](https://github.com/isce-framework/dolphin) to Rust. The
-goal is **algorithmic parity** with the Python reference on the DISP-S1 wrapped-phase →
-displacement pipeline, validated numerically against dolphin outputs at each phase.
+Phased plan for a ground-up Rust **rebuild** of the DISP-S1 wrapped-phase → displacement
+pipeline, optimized for performance. This is **not a port**:
+[dolphin](https://github.com/isce-framework/dolphin) is the algorithm reference (the
+scientific spec), and we are free to choose the fastest correct Rust realization of each
+algorithm. The goal is **scientific correctness**, validated at each phase against analytic
+fixtures and dolphin outputs used as a reference oracle.
 
-Reference commit/version: pin a specific dolphin release (e.g. `v0.x`) before starting and
-record it in [PARITY.md](#parity-strategy). All parity claims are against that pinned ref.
+Pin a specific dolphin release (e.g. `v0.x`) before starting and record it — oracle data is
+generated from that pinned version so validation is reproducible.
 
 ---
 
@@ -25,7 +28,7 @@ record it in [PARITY.md](#parity-strategy). All parity claims are against that p
    via subprocess. Not a reimplementation target.
 4. **f64 inside kernels, f32 at the I/O boundary.** SLCs are `complex64` (f32) on disk;
    covariance/eigensolver math runs in `Cf64` to match NumPy/JAX default accumulation
-   precision, then casts back. This matters for parity tolerances.
+   precision, then casts back. This matters for hitting the correctness tolerances.
 5. **System-lib deps deferred to Phase 8.** GDAL/HDF5/LAPACK bindings are introduced
    only when the I/O layer lands, so the numerical core builds and tests on any machine
    with synthetic in-memory arrays.
@@ -66,25 +69,28 @@ Run `command -v gdal-config h5cc || echo missing` at the top of Phase 8 to fail 
 
 ---
 
-## Parity strategy
+## Correctness & validation strategy
 
-Each numerical phase ships with a **golden-data parity test** before it is called done:
+Since this is a rebuild, not a port, validation proves the Rust kernels are *scientifically
+correct* — it does not chase bit-exactness with the Python. Two complementary checks per
+numerical phase, contract test written FIRST (red):
 
-1. In a scratch Python env, install the pinned dolphin and emit reference outputs for a
-   small synthetic stack (script lives in `parity/gen_<module>.py`, not committed data).
-   Use a fixed seed; dump inputs + outputs to `.npy`.
-2. Load the `.npy` in a Rust integration test (`ndarray-npy` dev-dependency), run the
-   Rust kernel, assert closeness.
-3. **Tolerances:** phase quantities compared modulo `2π` and up to a global phase
-   reference; `temp_coh`/coherence to `atol=1e-4`; eigenvector phase to `1e-3` rad after
-   referencing. Document any kernel that cannot meet these and why (e.g. eigenvector sign
-   ambiguity → compare `|⟨v_rust, v_py⟩|`).
-4. A kernel is "ported" only when its parity test is green against the pinned ref. Code
-   existence is not done.
+1. **Analytic fixtures (primary).** A synthetic input with a known closed-form answer
+   (e.g. a coherence matrix whose dominant eigenvector is known by construction; a PS-like
+   stable point with `D_A → 0`). These are Rust-native fixtures — no Python dependency —
+   and are the real correctness contract.
+2. **Reference oracle (secondary).** In a scratch Python env, install the pinned dolphin
+   and emit outputs for the same synthetic stack (`oracle/gen_<module>.py`, data not
+   committed; fixed seed; dump to `.npy`, load via `ndarray-npy` dev-dependency). Confirms
+   we agree with the established implementation where the algorithm has no closed form.
 
-Cross-cutting test data: one synthetic DS region (known coherence matrix → simulated
-SLC samples) + one PS-like region (high-amplitude stable point). Build these as Rust
-fixtures so unit tests don't depend on Python.
+**Tolerances are physical, not numerical-identity:** phase compared modulo `2π` and up to a
+global phase reference; coherence to `atol≈1e-4`; eigenvectors as `|⟨v_rust, v_oracle⟩|`
+(sign / global-phase ambiguity). Where an optimized Rust algorithm choice diverges from
+dolphin's numerics (different eigensolver, accumulation order), that is fine as long as it
+stays inside these tolerances — note the choice and why.
+
+A kernel is "done" only when its contract test is green. Code existence is not done.
 
 ---
 
@@ -94,7 +100,7 @@ fixtures so unit tests don't depend on Python.
 
 - `types`: `Cf32`/`Cf64` (done), `HalfWindow { y, x }`, `Strides { y, x }`,
   acquisition date wrappers.
-- `blocks`: port `StridedBlockManager` / `BlockIndices` from `io/_blocks.py` — the
+- `blocks`: build `StridedBlockManager` / `BlockIndices` (algorithm from `io/_blocks.py`) — the
   5-tuple (out block, out trim, in block, in-no-pad, in trim) halo scheme. This is the
   single most reused struct; get it exactly right with property tests (every input pixel
   covered exactly once after trimming; output strides honored).
@@ -119,9 +125,9 @@ deserializes with all defaults matching the Python brief (§6).
    `C_ij = Σ(z_i z_j*) / sqrt(Σ|z_i|² · Σ|z_j|²)`, optionally masked by the SHP neighbor
    array (Phase 2). Parallelize over output pixels with `rayon`. Respect `strides` for
    output decimation. This is the #1 hot path.
-2. **Eigensolvers.** `power_iteration(A, tol=1e-5, max_iters=50)` (dominant pair) and
-   `inverse_iteration(A, mu=0.99, ...)` (shift-invert via LU, smallest pair). Match
-   dolphin's iteration counts/tolerances for parity.
+2. **Eigensolvers.** Iterative power / inverse iteration is dolphin's approach; faer's
+   direct dense eigensolver is a candidate too. The N×N systems are small — pick whichever
+   is faster as long as it converges to the correct eigenvector within tolerance.
 3. **EVD estimator.** Largest eigenvector of `C ⊙ |C|`.
 4. **EMI estimator (default).** `Γ = |C|`; regularize `Γ ← (1-β)Γ + βI`; threshold
    near-zero entries (`zero_correlation_threshold`); Cholesky-invert with `1e-6` jitter;
@@ -129,7 +135,7 @@ deserializes with all defaults matching the Python brief (§6).
    dolphin's `lax.select` behavior exactly.
 5. **Phase referencing.** `θ ← θ · exp(-j·∠θ[ref_idx])`.
 
-**Done when:** EVD and EMI eigenvector parity tests pass on the synthetic DS fixture
+**Done when:** EVD and EMI eigenvector contract tests pass on the synthetic DS fixture
 (compare `|⟨v,v_py⟩|` and referenced phase); singular-matrix fallback verified.
 
 ---
@@ -145,8 +151,8 @@ deserializes with all defaults matching the Python brief (§6).
   the numba `njit(parallel=True)` loop → `rayon`.
 - Output: boolean `(rows, cols, win_h, win_w)` neighbor array.
 
-**Done when:** GLRT and KS neighbor arrays match dolphin bit-for-bit (boolean) on the
-fixture; wire into Phase 1 covariance and re-run Phase 1 parity with SHP weighting on.
+**Done when:** GLRT and KS neighbor arrays match the oracle's boolean decision on the
+fixture; wire into Phase 1 covariance and re-run Phase 1 validation with SHP weighting on.
 
 ---
 
@@ -171,7 +177,7 @@ integrates with Phase 1 output.
 - **Compressed SLC**: `Σ_k z_k exp(-j θ_k)/N` projection; magnitude from mean amplitude.
   Needed by Phase 5.
 
-**Done when:** temp_coh, CRLB, closure, and compressed-SLC parity tests pass.
+**Done when:** temp_coh, CRLB, closure, and compressed-SLC contract tests pass.
 
 ---
 
@@ -201,11 +207,11 @@ synthetic stack matches phase history end-to-end.
   weighted least squares via `faer`, block-parallel (256×256). Optional correlation
   weighting; `correlation_threshold` censoring.
 - **Velocity**: linear regression of phase series → rate.
-- **L1/ADMM deferred** to Phase 6b — port only after L2 parity, since dolphin defaults to
-  L1; document the temporary divergence in PARITY.md.
+- **L1/ADMM deferred** to Phase 6b — build only after L2 is validated. Note: dolphin
+  defaults to L1, so the L2-only interim is a known temporary divergence from the oracle.
 
-**Done when:** L2 displacement series + velocity match dolphin (L2 mode) on synthetic
-unwrapped ifgs; network construction matches for each network mode.
+**Done when:** L2 displacement series + velocity match the dolphin oracle (L2 mode) on
+synthetic unwrapped ifgs; network construction matches for each network mode.
 
 ---
 
@@ -261,12 +267,12 @@ per-burst wrapped_phase (mask → PS → SHP → covariance → phase-link → c
 process pool equivalent). `dolphin run --config <yaml>` drives it.
 
 **Done when:** an end-to-end run on a small real OPERA CSLC burst stack produces a
-displacement time series matching dolphin within parity tolerances; CLI config matches
+displacement time series matching the dolphin oracle within tolerance; CLI config matches
 dolphin's YAML.
 
 ---
 
-## Port priority (critical path)
+## Build priority (critical path)
 
 ```
 0 core ─► 1 phaselink ─► 2 shp ─┐
@@ -280,24 +286,62 @@ dolphin's YAML.
 
 Phases 1–5 are the differentiated value (the JAX/numba kernels). Phases 8–9 are
 integration glue (bindings + subprocess) and can proceed in parallel once core types
-(Phase 0) exist. Do **not** start Phase 10 until 1–6, 8, 9 each carry green parity tests.
+(Phase 0) exist. Do **not** start Phase 10 until 1–6, 8, 9 each carry green contract tests.
+
+---
+
+## GroundPulse integration (host app: `../eo`)
+
+GroundPulse is the consumer — a Rust monorepo (Axum/tokio/sqlx, PostGIS + TimescaleDB,
+Postgres `SKIP LOCKED` task queue; S3 via `gp-storage`/aws-sdk-s3; GDAL + HDF5).
+
+**GroundPulse is adopting the Python `dolphin` now.** dolphinRust is its **optimized Rust
+drop-in replacement** — same algorithms, same workflow surface, faster. This sets the bar:
+
+- **Match the Python dolphin GP runs, end to end.** Since GP runs Python dolphin in
+  production, the cleanest oracle is GP's own production output: dolphinRust must reproduce
+  it within the §Correctness tolerances. Migration = "swap `dolphin run` for dolphinRust,
+  confirm equivalent displacement."
+- **Full scope, not just the front half.** Mirror dolphin's whole pipeline including
+  timeseries/SBAS (Phase 6). GP's existing `gp-displacement` SBAS (`sbas.rs`, Berardino
+  2002) becomes legacy once it moves to dolphin; dolphinRust replaces *dolphin's*
+  timeseries, not gp-displacement's. (Resolves the earlier SBAS-overlap question.)
+- **Compatible config.** Accept dolphin's displacement-workflow YAML unchanged, so a GP
+  task can point either implementation at the same config.
+- **Consumed as a synchronous library** by a `gp-dolphin` / `gp-phase-linking` crate (or
+  inside `gp-displacement`), called from a `gp-tasks` `Task` via `spawn_blocking` on its
+  bounded worker runtime — replacing whatever subprocess/binding GP uses to invoke Python
+  dolphin.
+- **S3:** GroundPulse's `gp-storage` already stages S3 → local (staging-key + lifecycle
+  pattern) and runs blocking work via `spawn_blocking`. On the GroundPulse path, GP stages
+  and hands dolphinRust **local paths**; `dolphin-ingest` is for the standalone CLI only.
+- Reuse GP conventions: EPSG:4326 geometry with native UTM in COG metadata; COG 512×512,
+  DEFLATE+predictor3, overviews [2,4,8,16,32]; outputs as COG via `gp-storage`, summary
+  stats to PostGIS.
 
 ---
 
 ## Out of scope (initial)
 
 - `atmosphere/` tropospheric corrections (wraps external delay models) — defer.
-- DISP-S1 HDF5 product schema — owned by `disp-s1` SAS, not dolphin; port only if needed.
-- GPU paths (JAX GPU, CUDA KS) — `rayon` CPU first; revisit GPU after parity.
+- DISP-S1 HDF5 product schema — owned by `disp-s1` SAS, not dolphin; build only if needed.
+- GPU paths — `rayon` CPU first; revisit GPU after the CPU rebuild is correct and profiled.
 - L1/ADMM inversion until L2 lands (Phase 6b).
 
 ---
 
-## Open questions to resolve before Phase 1
+## Elevated questions (need your input)
 
-1. Pin the exact dolphin reference version/commit for all parity tests.
-2. Confirm `faer`'s complex Cholesky + shift-invert match JAX's numerics within
-   tolerance, or whether a thin LAPACK path (`ndarray-linalg`) is needed for the EMI
-   inverse.
-3. Decide the parity-fixture generation env (containerized Python + pinned dolphin) so
-   golden data is reproducible.
+Strategic decisions surfaced by the `../eo` review — answer before the affected phase:
+
+1. **Packaging (before Phase 10).** Does dolphinRust ship as a workspace member of `eo` or
+   as a separately versioned crate dependency?
+
+## Open questions (technical, resolve before Phase 1)
+
+1. Pin the exact dolphin reference version/commit for oracle generation.
+2. Confirm `faer`'s complex Cholesky + shift-invert (or its direct dense eigensolver) hit
+   the correctness tolerances, or whether a thin LAPACK path (`ndarray-linalg`) is needed
+   for the EMI inverse.
+3. Decide the oracle-fixture generation env (containerized Python + pinned dolphin) so
+   reference data is reproducible.

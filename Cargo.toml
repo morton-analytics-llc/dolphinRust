@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -52,6 +52,14 @@ dolphin-filtering = { path = "crates/dolphin-filtering" }
 dolphin-unwrap = { path = "crates/dolphin-unwrap" }
 dolphin-ingest = { path = "crates/dolphin-ingest" }
 dolphin-workflows = { path = "crates/dolphin-workflows" }
+
+# Enforced idiomatic-Rust standards. Each crate opts in via `[lints] workspace = true`.
+# `cargo clippy --all-targets -- -D warnings` is the per-phase gate.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+cognitive_complexity = "warn" # minimal branching / nesting
+too_many_lines = "warn"       # small, single-purpose functions
+needless_range_loop = "warn"  # iterator chains over manual index loops
 
 [profile.release]
 opt-level = 3

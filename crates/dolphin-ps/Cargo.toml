@@ -9,3 +9,6 @@ license.workspace = true
 dolphin-core.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
+
+[lints]
+workspace = true

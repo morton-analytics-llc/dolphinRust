@@ -6,7 +6,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "dolphin", version, about = "Rust port of the dolphin InSAR displacement library")]
+#[command(
+    name = "dolphin",
+    version,
+    about = "Optimized Rust rebuild of the dolphin InSAR displacement pipeline"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

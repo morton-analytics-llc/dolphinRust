@@ -10,3 +10,6 @@ dolphin-core.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
 statrs.workspace = true
+
+[lints]
+workspace = true

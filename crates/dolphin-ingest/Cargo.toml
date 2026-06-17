@@ -18,3 +18,6 @@ tracing.workspace = true
 object_store = { version = "0.11", features = ["aws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 futures = { version = "0.3", optional = true }
+
+[lints]
+workspace = true

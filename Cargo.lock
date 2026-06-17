@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-core"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "ndarray",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-filtering"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-ingest"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "futures",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-io"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-phaselink"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "faer",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-ps"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-shp"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-stack"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "dolphin-core",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-timeseries"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "faer",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-unwrap"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "thiserror 2.0.18",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-workflows"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dolphin-core",
