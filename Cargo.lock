@@ -500,6 +500,7 @@ dependencies = [
  "dolphin-stack",
  "dolphin-timeseries",
  "dolphin-unwrap",
+ "hdf5-metno",
  "ndarray",
  "ndarray-npy",
  "num-complex",
