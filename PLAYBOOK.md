@@ -29,6 +29,19 @@ record it in [PARITY.md](#parity-strategy). All parity claims are against that p
 5. **System-lib deps deferred to Phase 8.** GDAL/HDF5/LAPACK bindings are introduced
    only when the I/O layer lands, so the numerical core builds and tests on any machine
    with synthetic in-memory arrays.
+6. **Stage, don't stream (S3).** Raw CSLC stacks live in S3 (the host app puts them
+   there; dolphinRust only *reads*). Do not read processing blocks over `/vsis3/` —
+   phase linking is sliding-window, so every pixel is read many times across overlapping
+   covariance windows, and OPERA CSLC HDF5 is not cloud-optimized (random access over S3
+   is pathological). Download each granule **once** to local scratch/tmpfs, open with
+   GDAL/HDF5 locally, delete after. COG GeoTIFFs are the sole exception — those may be
+   read via GDAL `/vsis3/` directly. The concurrent download is the *only* async stage.
+7. **Runtime-agnostic public API.** Compute crates stay sync + `rayon` and own no
+   runtime. S3 read-staging lives in a feature-gated `dolphin-ingest` crate
+   (`object_store` + `tokio`, off by default) that downloads concurrently and returns
+   local paths. The library's public entry points are synchronous (`fn run(cfg) -> …`);
+   the host app — which already has a tokio runtime — bridges via `spawn_blocking` / a
+   dedicated thread so a long CPU-bound burst run never blocks its reactor.
 
 ---
 
@@ -205,9 +218,16 @@ Goldstein adaptive filter via `rustfft`. Optional pre-unwrap stages.
 
 ---
 
-## Phase 8 — I/O layer (`dolphin-io`) — introduces system libs
+## Phase 8 — I/O layer (`dolphin-io` + `dolphin-ingest`) — introduces system libs
 
-**Scope.** `io/_readers.py`, writers. **Run the environment preflight first.**
+**Scope.** `io/_readers.py`, writers, and S3 read-staging. **Run the environment
+preflight first.**
+
+- `dolphin-ingest` (feature `s3`): given S3 URIs for a CSLC stack, download granules
+  concurrently (`object_store` + bounded `tokio` runtime) to a local scratch dir, return
+  local paths, clean up on drop. Read-only — dolphinRust never writes raw data to S3.
+  Synchronous `stage(uris, scratch) -> Vec<PathBuf>` facade hides the runtime so callers
+  stay sync. Off by default; local-path callers pull zero async deps.
 
 - `gdal` crate: GeoTIFF block read/write; multi-band VRT construction for the SLC stack
   (`VRTStack` — auto-sort by date, NumPy-like 3D indexing).

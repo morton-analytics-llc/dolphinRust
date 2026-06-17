@@ -28,6 +28,7 @@ phased implementation plan and the parity strategy against the Python reference.
 | `dolphin-timeseries` | `dolphin/timeseries.py` | SBAS network inversion, velocity |
 | `dolphin-filtering` | `dolphin/filtering.py` | Long-wavelength / Goldstein FFT filters |
 | `dolphin-unwrap` | `dolphin/unwrap/` | Dispatch to external unwrappers (SNAPHU) |
+| `dolphin-ingest` | — | Concurrent S3 read-staging (feature `s3`, off by default) |
 | `dolphin-workflows` | `dolphin/workflows/` | Displacement pipeline orchestration + config |
 | `dolphin-cli` | `dolphin` CLI | `dolphin run --config <yaml>` |
 
