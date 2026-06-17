@@ -34,6 +34,7 @@ STRIDES = Strides(1, 1)
 DATASET = "/data/VV"
 DT_DAYS = 12.0
 BASE_DATE = date(2022, 11, 19)  # real 12-day Sentinel-1 cadence; names carry the dates
+REF_POINT = (24, 32)  # explicit spatial reference pixel (row, col); see write_config
 
 
 def synth_stack() -> np.ndarray:
@@ -91,6 +92,12 @@ def main() -> None:
     series = np.concatenate([np.zeros((1, ROWS, COLS)), disp], axis=0)
     velocity = np.asarray(estimate_velocity(days, series, None))
 
+    # Spatially reference to REF_POINT (matches dolphinRust's reference_to_point with
+    # the explicit timeseries_options.reference_point set in the config below).
+    rr, cc = REF_POINT
+    disp = disp - disp[:, rr, cc][:, None, None]
+    velocity = velocity - velocity[rr, cc]
+
     np.save(OUT / "disp_displacement.npy", disp.astype(np.float64))
     np.save(OUT / "disp_velocity.npy", velocity.astype(np.float64))
     print(f"wrote displacement fixtures to {OUT}")
@@ -115,6 +122,10 @@ def write_config(files: list[Path]) -> None:
         "    x: 1",
         "interferogram_network:",
         "  reference_idx: 0",
+        "timeseries_options:",
+        "  reference_point:",
+        f"    - {REF_POINT[0]}",
+        f"    - {REF_POINT[1]}",
         f"work_directory: {DISP_DIR}",
     ]
     (DISP_DIR / "config.yaml").write_text("\n".join(lines) + "\n")

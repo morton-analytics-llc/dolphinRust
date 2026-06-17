@@ -26,10 +26,11 @@ def main() -> None:
     ap.add_argument("--size", type=int, default=384)
     ap.add_argument("--dec", type=int, default=4)
     ap.add_argument("--box", type=int, default=5)
+    ap.add_argument("--burst", default="", help="substring filter (e.g. T005) when real_data holds multiple bursts")
     args = ap.parse_args()
     d = args.dec
 
-    files = sorted(SRC.glob("OPERA_*.h5"))
+    files = sorted(p for p in SRC.glob("OPERA_*.h5") if args.burst in p.name)
     stack = [h5py.File(f, "r")["/data/VV"][::d, ::d] for f in files]
     stack = np.nan_to_num(np.stack(stack).astype(np.complex64))  # (n, R/d, C/d)
 

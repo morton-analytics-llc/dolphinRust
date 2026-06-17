@@ -152,25 +152,49 @@ Findings, consistent across all four bursts sampled:
 - **Temporal coherence agreement — PASS.** Rust vs oracle `temporal_coherence_average` agree
   to ~0.01 on valid pixels (e.g. 0.598 vs 0.608).
 
-**What the sampled scenes could not pin: velocity *absolute scale* under strong signal.**
-Per-date correlation and the affine scale-slope are diagnostic only when the deformation
-spatial structure exceeds the cross-engine noise floor. In every coherent window sampled the
-deformation was at that floor (std ~0.02 rad/yr) — high coherence selects *stable* ground, so
-correlations scatter near zero and the scale regression is ill-conditioned (near-zero
-variance). A velocity pre-scan over a 1400² Central Valley crop located large rates only at
-low-coherence edges (unwrapping artifacts), not coherent deformation that survives into a
-comparison window. This is a **scene-selection limit, not a divergence or a bug** (RMS stays
-within the sanctioned envelope and rust's velocity magnitude tracks the oracle). The velocity
-absolute-scale match is therefore confirmed on the **synthetic tier (a = 1.0000)**, where the
-injected ramp provides controlled signal; an independent real-data scale confirmation needs a
-high-coherence *deforming* scene (e.g. an urban subsidence bowl with persistent scatterers) —
-a narrow documented follow-up.
+### Velocity absolute scale on a real deforming scene (Mexico City) — CONFIRMED
+
+The narrow B4 follow-up — *velocity absolute scale under strong real signal* — is now
+closed against a genuine subsidence scene. Earlier samples sat at the cross-engine noise
+floor because high coherence selects *stable* ground, and a small window over a *broad*
+subsidence bowl is nearly uniform, so demeaning removes the signal and the scale regression
+is ill-conditioned (corr ~0.16, slope meaningless). The fix is **scene + window selection
+on the velocity gradient**, not just on coherence.
+
+Scene: OPERA CSLC-S1 burst **T005-008704-IW1** (Mexico City), 13 acquisitions
+**2023-01-04 … 2023-06-09**, 12-day cadence, cropped 384² at full-burst (row0 3656,
+col0 3488), EPSG 32614, λ=0.0555 m. The window was located by a cumulative-phase-gradient
+scan over the decimated burst (highest differential-deformation window with mean
+phase-linking temporal coherence **0.99**), so the within-window velocity rises clearly
+above the floor (corr **0.865** vs 0.16 on stable windows).
+
+| metric | value | reading |
+|---|---|---|
+| velocity corr (oracle vs rust) | **0.865** | common deformation pattern, unambiguous |
+| OLS slope `oracle = a·rust + b` | 0.884 | biased low — errors-in-variables attenuation¹ |
+| **TLS (orthogonal) slope** | **1.026 – 1.030** | **absolute scale matches within ~3 %** |
+| magnitude (velocity std) | oracle 0.096 / rust 0.094 mm/yr | magnitudes agree |
+| engine displacement RMS / max | ≤ 0.011 / 0.080 rad | inside the ≤0.10 rad sanctioned envelope |
+
+¹ OLS regresses oracle on the *noisy* rust velocity, so cross-engine noise in the regressor
+biases the slope toward zero. The symmetric **total-least-squares** slope removes that bias
+and is the honest scale metric; it is **stable at ≈1.03 across all coherence gates**
+(0.0/0.6/0.8/0.9), confirming the match is not a coherence artifact. Reproduced by
+`validation/velocity_scale.py`.
+
+The strict end-to-end table threshold (corr ≥ 0.95) is *not* reached here: within-window
+differential subsidence over a broad bowl is modest, and per-pixel cross-engine unwrap noise
+(two independent SNAPHU builds) caps pattern agreement at ~0.86 — a larger 768² window made
+it worse (corr 0.30) as the extra area introduced integer-cycle unwrap divergence. So the
+scale is confirmed (TLS ≈ 1.03, magnitudes match), while bit-level pattern parity on real
+data remains noise-limited — consistent with the **synthetic tier (a = 1.0000)**, which stays
+the controlled-magnitude scale anchor. This **closes the documented B4 gap**.
 
 ## Open / pending
 
-- **Real-data velocity absolute scale under strong signal** — engine agreement, velocity
-  magnitude, and coherence all match on real OPERA data; an independent real-data *scale*
-  check awaits a high-coherence deforming scene (scale already confirmed on synthetic).
+- **Real-data velocity absolute scale under strong signal** — RESOLVED (2026-06-17, v1.1.0):
+  confirmed on Mexico City burst T005-008704-IW1 to TLS slope ≈1.03 with matching magnitude;
+  see "Velocity absolute scale on a real deforming scene" above.
 - **Velocity cadence fix** (divergence #2) — RESOLVED above; a `dolphin-workflows` change.
 - **Per-stage CLI intermediates** (linked-phase SLCs, temp_coh, unwrapped ifgs) are not
   persisted by the dolphinRust CLI, so end-to-end comparison is on displacement + velocity;
@@ -194,4 +218,17 @@ oracle/.venv/bin/python validation/fetch_real.py --burst T144_308011_IW2 --n 9  
 oracle/.venv/bin/python validation/scan_coherence.py                              # find window
 oracle/.venv/bin/python validation/crop_real.py --row0 <r> --col0 <c> --size 384  # crop
 validation/run_real.sh                                                            # both engines + compare
+```
+
+Real-data velocity absolute-scale check (Mexico City strong-signal scene):
+
+```sh
+source validation/creds.sh
+oracle/.venv/bin/python validation/fetch_real.py --burst T005_008704_IW1 --n 13 \
+    --start 2023-01-01 --end 2023-07-15                                           # download
+oracle/.venv/bin/python validation/crop_real.py --burst T005 \
+    --row0 3656 --col0 3488 --size 384 --out validation/real_data/cropped_mexico  # crop on the gradient
+validation/run_real.sh validation/real_data/cropped_mexico real_mexico_T005       # both engines
+oracle/.venv/bin/python validation/velocity_scale.py \
+    --run validation/runs/real_mexico_T005                                        # OLS + TLS scale
 ```

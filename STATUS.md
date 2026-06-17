@@ -10,7 +10,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 | A1 velocity mm/yr via real temporal baselines + wavelength | ✅ done (oracle scale a=1.0000) |
 | A2 L1/ADMM inversion, config-driven default | ✅ done (oracle <1.5e-6) |
 | A3 multi-burst frame stitching | ✅ done (2-burst frame stitch contract) |
-| B4 real OPERA CSLC validation tier | ✅ tier built; engine agreement on real OPERA confirmed (RMS ≤0.008 rad, velocity magnitude + temp_coh match). Strong-signal velocity *scale* = synthetic-confirmed; high-coherence deforming scene is a narrow follow-up (see VALIDATION.md) |
+| B4 real OPERA CSLC validation tier | ✅ tier built; engine agreement on real OPERA confirmed (RMS ≤0.008 rad, velocity magnitude + temp_coh match). Strong-signal velocity *scale* now **confirmed on real data** (Mexico City T005-008704-IW1, TLS slope ≈1.03, v1.1.0) — see VALIDATION.md |
 | C5 typed sync public API (+temp coh, CRS/geotransform) | ✅ done |
 | C6 COG outputs + documented schema | ✅ done (LAYOUT=COG verified) |
 | C7 `#![warn(missing_docs)]` all crates, doc clean | ✅ done |
@@ -19,6 +19,17 @@ single source of truth for build progress across sessions. Phase details in PLAY
 
 Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --no-deps.
 **Nothing pushed** — all on branch `v1-ready-to-ship`, awaiting sign-off.
+
+## v1.1.0 progress (branch `v1.1`, per R1_PROMPT.md / ROADMAP.md)
+
+| Item | State |
+|---|---|
+| Baseline speed benchmark (`bench/`) | ✅ done — PL 3.6× / e2e 2.0× on a real frame; per-stage `tracing` timing; honest unwrap caveat (Rosetta snaphu) |
+| Close velocity-scale residual (B4) | ✅ done — Mexico City T005, TLS slope ≈1.03, magnitudes match; VALIDATION.md updated |
+| Auto reference-point selection (center-of-mass) | ✅ done — `select_reference_point`/`reference_to_point`, wired via `timeseries_options.reference_point`, 5 analytic contracts + e2e green |
+| eo integration | ✅ done (signed off) — `gp-dolphin` crate+worker in `../eo` (branch `feature/gp-dolphin-rust`, unpushed): in-process `run_displacement` via `spawn_blocking`, COG → gp-storage + summary rows → PostGIS. One real frame ran end-to-end (T144, COG in MinIO + `displacement_aoi_summary`/`aoi_raster_products` ready). Isolated as its own workspace to avoid the hdf5-metno vs hdf5-sys link clash |
+
+Gates green (fmt, clippy -D warnings, test, doc). **Nothing pushed** — branch `v1.1`.
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
