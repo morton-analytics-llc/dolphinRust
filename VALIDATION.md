@@ -102,7 +102,8 @@ Full per-date table at realistic speckle 0.05:
 ¹ The **RMS floor is constant (~0.050 rad) across all dates**; correlation only dips on the
 early dates because their signal is weakest (low SNR), not because agreement worsens. See
 divergence #1.
-² Velocity *pattern* matches; absolute *scale* does not — see divergence #2.
+² Velocity now matches on **absolute scale** (affine slope a=0.9997 at speckle 0.05; a=1.0000
+  noise-free) after the real-baseline fix — see divergence #2 (resolved).
 
 ## Divergences (with hypotheses)
 
@@ -115,19 +116,18 @@ divergence #1.
    eigenvector-overlap metric (>0.999, confirmed by `phaselink_contract`) but realized as a
    phase difference proportional to per-pixel speckle. Physical and within tolerance.
 
-2. **Velocity absolute scale is wrong for non-12-day cadence — real finding.**
-   On noise-free data, `oracle_velocity = 12.0004 · rust_velocity` (+ a reference-frame
-   offset); the velocity *pattern* correlates at ≥0.97. Root cause:
-   `crates/dolphin-workflows/src/displacement.rs:23` hardcodes `DT_DAYS = 12.0` and the
-   workflow never reads acquisition dates from the CSLC filenames (also lines 90, 161),
-   whereas dolphin parses the real dates (here 1-day cadence). The factor is exactly the
-   cadence ratio (12 days / 1 day). For genuine 12-day OPERA Sentinel-1 stacks the two
-   agree; for any other cadence dolphinRust's velocity is mis-scaled. Displacement is
-   unaffected (it is the inverted phase, cadence-independent).
-   **Recommendation:** parse dates from filenames (opera_utils-style, `cslc_date_fmt`
-   already exists in `InputOptions`) and feed real decimal-day positions to
-   `build_network` / `estimate_velocity` instead of the constant. Not fixed here — product
-   code was left untouched per the validation brief.
+2. **Velocity absolute scale — RESOLVED (was: wrong for non-12-day cadence).**
+   Previously `oracle_velocity = 12.0004 · rust_velocity` because
+   `displacement.rs` hardcoded `DT_DAYS = 12.0` and never read acquisition dates. **Fixed
+   (Workstream A1):** `dolphin-workflows::dates::decimal_days` parses the real acquisition
+   dates from the CSLC filenames (`input_options.cslc_date_fmt`) and feeds real decimal-day
+   baselines to `build_network` / `estimate_velocity`. The affine fit `oracle = a·rust + b`
+   now gives **a = 1.0000 / 0.9994 / 0.9997** at speckle 0.0 / 0.005 / 0.05 — absolute scale
+   matches within ±0.02 across all tiers. (`b` is dolphin's spatial reference-pixel offset,
+   removed by the demean; a raw median ratio is meaningless against it, so `compare.py` now
+   reports the affine slope.) The typed API additionally exposes `velocity_mm_yr`, converting
+   LOS phase rate via `−λ/4π` (config wavelength, else Sentinel-1 default). Contract tests:
+   `displacement::tests::recovers_injected_rate_in_mm_per_yr`, `rate_is_independent_of_cadence`.
 
 ## Open / pending
 

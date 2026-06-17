@@ -6,6 +6,7 @@
 //! unwrap → timeseries inversion → velocity. Owns the YAML config models
 //! (`config/`) and the burst-parallel executor.
 
+pub mod dates;
 pub mod displacement;
 pub mod sequential;
 

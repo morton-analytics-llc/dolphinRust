@@ -40,10 +40,11 @@ binary v2.0.7) on **one** genuine `dolphin config` YAML, synthetic single-burst 
 - **Config compatibility: PASS** — dolphinRust runs a real dolphin DisplacementWorkflow YAML unchanged.
 - **Displacement: PASS** — noise-free agreement max 1.1e-3 rad (corr 1.0000); residual
   scales linearly with speckle ⇒ sanctioned faer-vs-jax eigensolver divergence, not a bug.
-- **Velocity: FINDING** — `DT_DAYS=12.0` hardcoded (`dolphin-workflows/.../displacement.rs:23`)
-  ignores filename dates; absolute scale off by the cadence ratio for non-12-day stacks
-  (pattern still corr ≥0.97). Fix tracked in VALIDATION.md; product code left untouched.
-- **Pending:** real OPERA CSLC validation (no Earthdata creds here — synthetic only).
+- **Velocity: FIXED (A1)** — acquisition dates are now parsed from CSLC filenames
+  (`dolphin-workflows::dates`), so velocity carries a true physical rate. Affine scale vs
+  oracle a=1.0000 (noise-free) → 0.9997 (speckle 0.05), within ±0.02 all tiers. Typed API
+  exposes `velocity_mm_yr` (`−λ/4π`, config wavelength or S1 default).
+- **Pending:** real OPERA CSLC validation tier (B4); L1/ADMM default (A2); multi-burst (A3).
 
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.

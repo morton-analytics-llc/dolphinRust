@@ -490,6 +490,7 @@ name = "dolphin-workflows"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dolphin-core",
  "dolphin-filtering",
  "dolphin-io",
