@@ -38,6 +38,8 @@ const GAP_TOL: f32 = 0.07;    // bottom relative eigengap floor (λ_2nd−λ_min
 const COH_FLOOR: f32 = 0.10;  // mean off-diagonal |C| floor
 const RHO_FRAC: f32 = 0.50;   // Rayleigh(v_least)/λ_max ceiling (wrong-mode capture)
 const SHIFT_MARGIN: f32 = 1.02; // shift = λ_max·margin (‖Mv‖ underestimates λ_max)
+const PIVOT_TOL: f32 = 1.0e-4; // min Cholesky pivot floor — below this the f32/f64
+                               // PD decision can disagree (EMI vs EVD), so recompute on CPU
 
 // Host-set pipeline overrides: workgroup size and threadgroup-scratch length.
 override WG: u32 = 4u;          // pixels (threads) per workgroup
@@ -62,6 +64,7 @@ struct Params {
 var<workgroup> gam_wg: array<f32, GAM_LEN>; // Γ, then its Cholesky factor L (lower)
 var<workgroup> inv_wg: array<f32, GAM_LEN>; // Γ⁻¹
 var<private> goff: u32;                      // this thread's scratch slice base
+var<private> min_pivot: f32;                 // smallest Cholesky pivot (PD margin)
 var<private> v: array<vec2<f32>, MAX_NSLC>;
 var<private> w: array<vec2<f32>, MAX_NSLC>;
 var<private> v1: array<vec2<f32>, MAX_NSLC>; // saved least eigenvector
@@ -70,13 +73,17 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-// Cholesky factor of Γ (lower, in place over `gam_wg` slice). Returns false if not PD.
+// Cholesky factor of Γ (lower, in place over `gam_wg` slice). Returns false if not
+// PD. Records the smallest diagonal pivot in `min_pivot` (set before any early
+// return) so the host can flag borderline-PD pixels for f64 recompute.
 fn cholesky(n: u32) -> bool {
+    min_pivot = 1.0e30;
     for (var j = 0u; j < n; j = j + 1u) {
         var sum = gam_wg[goff + j * n + j];
         for (var k = 0u; k < j; k = k + 1u) {
             sum = sum - gam_wg[goff + j * n + k] * gam_wg[goff + j * n + k];
         }
+        min_pivot = min(min_pivot, sum);
         if (sum <= 1e-12) { return false; }
         let ljj = sqrt(sum);
         gam_wg[goff + j * n + j] = ljj;
@@ -227,7 +234,9 @@ fn main(
     power_dominant(n, base, use_emi, p.iters);
     let lambda_max = matvec(n, base, use_emi);
 
-    var reliable = 1u;
+    // Borderline-PD Γ: the f32 Cholesky PD decision can differ from f64 faer's
+    // (EMI vs EVD), so recompute these on the CPU regardless of which path ran.
+    var reliable = select(1u, 0u, min_pivot < PIVOT_TOL);
     if (use_emi) {
         // Shift strictly above λ_max so B = shift·I − M stays PSD and its dominant
         // mode is M's *least* (a tight ‖Mv‖ shift can undershoot → wrong mode).

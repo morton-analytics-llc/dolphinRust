@@ -7,8 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use dolphin_core::config::CompressedSlcPlan;
+use dolphin_core::config::{CompressedSlcPlan, ComputeBackend};
 use dolphin_core::{Cf32, Cf64, HalfWindow, Strides};
+use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{run_sequential, SequentialConfig};
 use ndarray::{Array2, Array3};
 
@@ -55,7 +56,8 @@ fn sequential_phase_history_matches_oracle() {
         output_reference_idx: 0,
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
     };
-    let out = run_sequential(stack.view(), &cfg).unwrap();
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
 
     // Per-date phase: compare each pixel's time series (global-phase invariant).
     let (nslc, rows, cols) = out.cpx_phase.dim();
