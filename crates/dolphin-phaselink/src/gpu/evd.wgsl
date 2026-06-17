@@ -6,7 +6,7 @@
 // rebuilt entry-by-entry inside the matvec (M_ij = C_ij·|C_ij|), so only the
 // length-nslc iterate vectors live in registers.
 
-const MAX_NSLC: u32 = 32u;
+const MAX_NSLC: u32 = 16u;
 
 struct Params {
     nslc: u32,

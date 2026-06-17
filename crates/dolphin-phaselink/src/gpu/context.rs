@@ -91,11 +91,13 @@ impl GpuContext {
             .await
             .map_err(|_| GpuError::NoAdapter)?;
         let report = describe(&adapter.get_info());
+        // Use the adapter's real limits — Metal allows storage buffers far past
+        // the conservative 128 MiB default (a 384² coherence stack is ~200 MiB).
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("dolphin-phaselink-gpu"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 trace: wgpu::Trace::Off,

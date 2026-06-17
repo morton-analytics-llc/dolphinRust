@@ -7,7 +7,7 @@ use super::context::{GpuContext, GpuError};
 use super::dispatch::{dispatch_compute, input_buffer, output_buffer, readback, uniform_buffer};
 
 /// Largest ministack the f32 kernel supports (matches `MAX_NSLC` in the WGSL).
-pub const MAX_NSLC: usize = 32;
+pub const MAX_NSLC: usize = 16;
 
 /// Compute parameters mirrored into the shader's `Params` uniform.
 #[repr(C)]

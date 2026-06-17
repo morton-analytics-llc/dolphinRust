@@ -29,5 +29,9 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 [dev-dependencies]
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 
+[[example]]
+name = "gpu_bench"
+required-features = ["gpu"]
+
 [lints]
 workspace = true

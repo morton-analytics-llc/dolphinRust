@@ -12,8 +12,8 @@
 // Γ, its Cholesky factor, and the inverse share private nslc² scratch; the
 // iterate vectors are private nslc-length. nslc ≤ MAX_NSLC. Complex = vec2<f32>.
 
-const MAX_NSLC: u32 = 32u;
-const MAX_NN: u32 = 1024u; // MAX_NSLC * MAX_NSLC
+const MAX_NSLC: u32 = 16u;
+const MAX_NN: u32 = 256u; // MAX_NSLC * MAX_NSLC
 
 struct Params {
     nslc: u32,

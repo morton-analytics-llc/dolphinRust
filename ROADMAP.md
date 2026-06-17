@@ -127,6 +127,13 @@ non-closure on a long series; unwrap interface ready for a 3D backend.
 - **GPU acceleration** — Rust GPU stack (cudarc/wgpu/rust-gpu) isn't yet worth the platform
   complexity for per-pixel small-matrix EVD. A tuned faer+rayon CPU path closes most of the
   JAX/CPU gap. Revisit post-R4 / rust-gpu maturity.
+  - **Spike done** (branch `gpu-phaselink`, `gpu` feature, wgpu/Metal; see `bench/GPU.md`).
+    GPU **EVD** is production-accurate on a real 384² stack (f32 vs f64, ≤0.18 mm worst-case,
+    overlap 1.0). GPU **EMI** is sub-mm for the bulk but has a π-rad tail on ill-conditioned
+    pixels (least-eigenvector degeneracy) — so EVD on GPU, EMI stays on the f64 CPU. Speed on
+    the *integrated* M2 Pro GPU is **~1.5–1.6×** above ~128² (crossover ≈128², CPU wins below);
+    modest by design (integrated GPU, strong faer+rayon baseline). The same WGSL ports
+    unchanged to discrete NVIDIA, where the real headroom is. Unpushed.
 - **Native RAiDER reimplementation** — ray-tracing NWP interpolation; subprocess dispatch is
   correct, a rewrite is not.
 - **oxigdal / pure-Rust GDAL** — too new (v0.1.x) for production.
