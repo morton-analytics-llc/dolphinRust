@@ -17,14 +17,23 @@ use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
 pub struct SequentialConfig {
+    /// Number of real SLCs per ministack.
     pub ministack_size: usize,
+    /// Maximum compressed SLCs carried into a ministack.
     pub max_num_compressed: usize,
+    /// Covariance estimation half-window (rows, cols).
     pub half_window: HalfWindow,
+    /// Output downsampling strides (rows, cols).
     pub strides: Strides,
+    /// Use eigenvalue decomposition (EVD) instead of EMI phase linking.
     pub use_evd: bool,
+    /// Coherence-matrix regularization weight (EMI `beta`).
     pub beta: f64,
+    /// Coherence values at or below this are treated as zero.
     pub zero_correlation_threshold: f64,
+    /// Index of the reference date for the output phase history.
     pub output_reference_idx: usize,
+    /// Strategy for choosing each ministack's compressed-SLC reference.
     pub compressed_slc_plan: CompressedSlcPlan,
 }
 

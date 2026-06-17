@@ -5,6 +5,7 @@
 //! covariance → phase-link → compress → ifg network) → stitch bursts →
 //! unwrap → timeseries inversion → velocity. Owns the YAML config models
 //! (`config/`) and the burst-parallel executor.
+#![warn(missing_docs)]
 
 pub mod dates;
 pub mod displacement;

@@ -5,6 +5,7 @@
 //! numba `njit(parallel=True)` hot loop → `rayon`). Produces the boolean
 //! neighbor array `(out_rows, out_cols, win_h, win_w)` consumed by covariance
 //! estimation for adaptive multilooking.
+#![warn(missing_docs)]
 
 pub mod glrt;
 pub mod ks;

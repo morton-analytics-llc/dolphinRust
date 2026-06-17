@@ -1,4 +1,5 @@
 //! `dolphin` CLI — entry point mirroring the Python `dolphin run` command.
+#![warn(missing_docs)]
 
 use std::path::PathBuf;
 

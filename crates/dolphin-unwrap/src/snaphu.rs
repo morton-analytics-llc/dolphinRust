@@ -15,26 +15,37 @@ use ndarray::{Array2, ArrayView2};
 /// SNAPHU cost mode.
 #[derive(Debug, Clone, Copy)]
 pub enum CostMode {
+    /// Smooth-solution cost (SNAPHU `-s`); dolphin's default.
     Smooth,
+    /// Deformation cost (SNAPHU `-d`).
     Defo,
+    /// Topography cost (SNAPHU `-t`).
     Topo,
 }
 
 /// SNAPHU initialization method.
 #[derive(Debug, Clone, Copy)]
 pub enum InitMethod {
+    /// Minimum-cost-flow initialization (SNAPHU `--mcf`).
     Mcf,
+    /// Minimum-spanning-tree initialization (SNAPHU `--mst`).
     Mst,
 }
 
 /// SNAPHU invocation configuration.
 #[derive(Debug, Clone)]
 pub struct UnwrapConfig {
+    /// SNAPHU statistical cost mode.
     pub cost: CostMode,
+    /// SNAPHU phase-unwrapping initialization method.
     pub init: InitMethod,
+    /// Tile grid as `(rows, cols)`; `(1, 1)` disables tiling.
     pub ntiles: (usize, usize),
+    /// Tile overlap in pixels as `(row_overlap, col_overlap)`.
     pub tile_overlap: (usize, usize),
+    /// Number of parallel tile-solving processes (`--nproc`).
     pub nproc: usize,
+    /// Path to (or name of) the SNAPHU executable.
     pub snaphu_path: String,
 }
 
@@ -53,17 +64,22 @@ impl Default for UnwrapConfig {
 
 /// Unwrapped phase + connected-component labels.
 pub struct UnwrapResult {
+    /// Unwrapped phase in radians, `(rows, cols)`.
     pub unwrapped: Array2<f32>,
+    /// Connected-component labels, `(rows, cols)` (0 = masked/no component).
     pub conncomp: Array2<u32>,
 }
 
 /// Errors from the SNAPHU dispatch.
 #[derive(Debug, thiserror::Error)]
 pub enum UnwrapError {
+    /// Scratch-file read/write failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// SNAPHU exited non-zero; carries its stderr.
     #[error("snaphu failed: {0}")]
     Snaphu(String),
+    /// A SNAPHU output raster did not match the expected shape.
     #[error("output shape mismatch: {0}")]
     Shape(String),
 }

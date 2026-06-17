@@ -17,9 +17,12 @@ use crate::types::{HalfWindow, Strides};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShpMethod {
+    /// Generalized likelihood ratio test.
     #[default]
     Glrt,
+    /// Kolmogorov-Smirnov two-sample test.
     Ks,
+    /// No SHP search; use the full rectangular window.
     Rect,
 }
 
@@ -27,9 +30,12 @@ pub enum ShpMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressedSlcPlan {
+    /// Always reference the first date of the first ministack.
     #[default]
     AlwaysFirst,
+    /// Reference the first date of each ministack.
     FirstPerMinistack,
+    /// Reference the last date of each ministack.
     LastPerMinistack,
 }
 
@@ -37,19 +43,26 @@ pub enum CompressedSlcPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UnwrapMethod {
+    /// SNAPHU statistical-cost network-flow unwrapper.
     #[default]
     Snaphu,
+    /// ISCE ICU (residue-cut) unwrapper.
     Icu,
+    /// ISCE PHASS unwrapper.
     Phass,
+    /// spurt 3D temporal/spatial unwrapper.
     Spurt,
+    /// Whirlwind unwrapper.
     Whirlwind,
 }
 
 /// Timeseries inversion norm. dolphin `TimeseriesOptions.method`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TimeseriesMethod {
+    /// L1 (least-absolute-deviations) norm.
     #[default]
     L1,
+    /// L2 (least-squares) norm.
     L2,
 }
 
@@ -57,6 +70,7 @@ pub enum TimeseriesMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PsOptions {
+    /// Amplitude dispersion threshold to consider a pixel a PS.
     pub amp_dispersion_threshold: f64,
 }
 
@@ -72,19 +86,33 @@ impl Default for PsOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PhaseLinkingOptions {
+    /// Size of the ministack for the sequential estimator.
     pub ministack_size: usize,
+    /// Maximum number of compressed images to use in the sequential estimator.
     pub max_num_compressed: usize,
+    /// Index of the input SLC to reference for phase-linked interferograms after EVD/EMI.
     pub output_reference_idx: Option<usize>,
+    /// Half-window size for multilooking during phase linking.
     pub half_window: HalfWindow,
+    /// Use EVD on the coherence instead of the EMI algorithm.
     pub use_evd: bool,
+    /// Beta regularization parameter for correlation-matrix inversion; 0 is none.
     pub beta: f64,
+    /// Snap coherence-matrix correlation values below this threshold to 0.
     pub zero_correlation_threshold: f64,
+    /// Statistical test used to find SHPs during phase linking.
     pub shp_method: ShpMethod,
+    /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
+    /// Set PS-labeled pixels to NaN during phase linking to avoid summing their phase.
     pub mask_input_ps: bool,
+    /// StBAS lag: include only the nearest-N interferograms for phase linking.
     pub baseline_lag: Option<i64>,
+    /// Plan for which date each ministack's compressed SLC references.
     pub compressed_slc_plan: CompressedSlcPlan,
+    /// Write the Cramer-Rao lower bound raster.
     pub write_crlb: bool,
+    /// Write the closure-phase raster.
     pub write_closure_phase: bool,
 }
 
@@ -113,9 +141,13 @@ impl Default for PhaseLinkingOptions {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InterferogramNetwork {
+    /// Single-reference network: index of the reference image.
     pub reference_idx: Option<usize>,
+    /// Max `n` to form the nearest-`n` interferograms by index.
     pub max_bandwidth: Option<usize>,
+    /// Maximum temporal baseline of interferograms.
     pub max_temporal_baseline: Option<f64>,
+    /// Manual-index network: list of (ref_idx, sec_idx) interferograms to form.
     pub indexes: Option<Vec<(usize, usize)>>,
 }
 
@@ -123,13 +155,21 @@ pub struct InterferogramNetwork {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TimeseriesOptions {
+    /// Run the inversion step after unwrapping (if more than a single-reference network).
     pub run_inversion: bool,
+    /// Norm to use during timeseries inversion.
     pub method: TimeseriesMethod,
+    /// Reference point (row, col); auto-selected if not provided.
     pub reference_point: Option<(usize, usize)>,
+    /// Run velocity estimation from the phase time series.
     pub run_velocity: bool,
+    /// Apply the mask to the output timeseries rasters.
     pub apply_mask_to_timeseries: bool,
+    /// Pixels with correlation below this value are masked out.
     pub correlation_threshold: f64,
+    /// Size (rows, columns) of data blocks to load at a time.
     pub block_shape: (usize, usize),
+    /// Number of parallel blocks to process at once.
     pub num_parallel_blocks: usize,
 }
 
@@ -152,11 +192,17 @@ impl Default for TimeseriesOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SnaphuOptions {
+    /// Number of tiles (row, col) to split inputs into via SNAPHU's internal tiling.
     pub ntiles: (usize, usize),
+    /// Tile overlap (in pixels) along the (row, col) directions.
     pub tile_overlap: (usize, usize),
+    /// Number of tiles to unwrap in parallel for each interferogram.
     pub n_parallel_tiles: usize,
+    /// SNAPHU initialization method (`mcf` or `mst`).
     pub init_method: String,
+    /// SNAPHU statistical cost mode (`defo` or `smooth`).
     pub cost: String,
+    /// After multi-tile unwrapping, re-optimize the phase using a single tile.
     pub single_tile_reoptimize: bool,
 }
 
@@ -177,10 +223,15 @@ impl Default for SnaphuOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PreprocessOptions {
+    /// Adaptive-phase (Goldstein) filter exponent parameter.
     pub alpha: f64,
+    /// Maximum radius (in pixels) to find scatterers during interpolation.
     pub max_radius: usize,
+    /// Correlation threshold below which pixels are interpolated.
     pub interpolation_cor_threshold: f64,
+    /// Similarity threshold below which pixels are interpolated.
     pub interpolation_similarity_threshold: f64,
+    /// Zero out correlation at pixels that were interpolated.
     pub zero_correlation_where_interpolating: bool,
 }
 
@@ -201,13 +252,21 @@ impl Default for PreprocessOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UnwrapOptions {
+    /// Run the unwrapping step after wrapped-phase estimation.
     pub run_unwrap: bool,
+    /// Run Goldstein filtering on the wrapped interferogram.
     pub run_goldstein: bool,
+    /// Run interpolation on the wrapped interferogram.
     pub run_interpolation: bool,
+    /// Phase-unwrapping backend to dispatch to.
     pub unwrap_method: UnwrapMethod,
+    /// Number of interferograms to unwrap in parallel.
     pub n_parallel_jobs: i64,
+    /// Set wrapped phase/correlation to 0 where the mask is 0 before unwrapping.
     pub zero_where_masked: bool,
+    /// Goldstein-filter / interpolation preprocessing options.
     pub preprocess_options: PreprocessOptions,
+    /// SNAPHU subprocess options.
     pub snaphu_options: SnaphuOptions,
 }
 
@@ -230,8 +289,11 @@ impl Default for UnwrapOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputOptions {
+    /// Subdataset to use from HDF5/NetCDF CSLC files.
     pub subdataset: Option<String>,
+    /// Format of dates contained in CSLC filenames.
     pub cslc_date_fmt: String,
+    /// Radar wavelength (meters); used to convert timeseries radians to meters.
     pub wavelength: Option<f64>,
 }
 
@@ -249,11 +311,17 @@ impl Default for InputOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutputOptions {
+    /// (x, y) strides (decimation factor) to apply while processing input.
     pub strides: Strides,
+    /// EPSG code of the output grid.
     pub epsg: Option<u32>,
+    /// Area of interest as [left, bottom, right, top] coordinates.
     pub bounds: Option<(f64, f64, f64, f64)>,
+    /// EPSG code for the `bounds` coordinates.
     pub bounds_epsg: Option<u32>,
+    /// Add overviews to the output GeoTIFFs.
     pub add_overviews: bool,
+    /// Overview levels to create (if `add_overviews`).
     pub overview_levels: Vec<u32>,
 }
 
@@ -274,9 +342,13 @@ impl Default for OutputOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerSettings {
+    /// Use the GPU for processing (if available).
     pub gpu_enabled: bool,
+    /// Number of threads to use per worker.
     pub threads_per_worker: usize,
+    /// Number of spatial bursts to run in parallel for wrapped-phase estimation.
     pub n_parallel_bursts: usize,
+    /// Size (rows, columns) of data blocks to load at a time.
     pub block_shape: (usize, usize),
 }
 
@@ -295,20 +367,35 @@ impl Default for WorkerSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplacementWorkflow {
+    /// Options specifying the input datasets.
     pub input_options: InputOptions,
+    /// List of input CSLC files.
     pub cslc_file_list: Vec<PathBuf>,
+    /// Output size/format/compression options.
     pub output_options: OutputOptions,
+    /// PS pixel-selection options.
     pub ps_options: PsOptions,
+    /// Existing amplitude-dispersion files (1 per SLC region) for PS update.
     pub amplitude_dispersion_files: Vec<PathBuf>,
+    /// Existing amplitude-mean files (1 per SLC region) for PS update.
     pub amplitude_mean_files: Vec<PathBuf>,
+    /// Layover/shadow binary masks (0 = layover/shadow, 1 = good pixel).
     pub layover_shadow_mask_files: Vec<PathBuf>,
+    /// Phase-linking (wrapped-phase estimation) options.
     pub phase_linking: PhaseLinkingOptions,
+    /// Interferogram-network construction options.
     pub interferogram_network: InterferogramNetwork,
+    /// Unwrapping dispatch options.
     pub unwrap_options: UnwrapOptions,
+    /// Timeseries inversion and velocity options.
     pub timeseries_options: TimeseriesOptions,
+    /// Mask file used to ignore low-correlation/bad data (0 = invalid, 1 = good).
     pub mask_file: Option<PathBuf>,
+    /// Sub-directory for writing output files.
     pub work_directory: PathBuf,
+    /// CPU/GPU and parallelism settings.
     pub worker_settings: WorkerSettings,
+    /// Path to the output log file (in addition to stderr).
     pub log_file: Option<PathBuf>,
 }
 

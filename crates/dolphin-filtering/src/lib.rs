@@ -2,6 +2,7 @@
 //!
 //! Long-wavelength FFT Gaussian high-pass filter and the Goldstein adaptive
 //! filter, both via `rustfft`. Used as optional pre-unwrap stages.
+#![warn(missing_docs)]
 
 pub mod fft;
 pub mod filters;

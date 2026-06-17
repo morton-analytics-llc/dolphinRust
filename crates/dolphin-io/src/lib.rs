@@ -7,6 +7,7 @@
 //! Bindings: `gdal` 0.19 (system GDAL 3.12) and `hdf5-metno` 0.12 (system HDF5
 //! 2.x). The `EagerLoader` prefetch and complex-GeoTIFF writer are follow-ups
 //! (see STATUS.md); S3 read-staging lives in the feature-gated `dolphin-ingest`.
+#![warn(missing_docs)]
 
 pub mod cslc;
 pub mod error;

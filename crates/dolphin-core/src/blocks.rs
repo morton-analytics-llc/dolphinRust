@@ -20,9 +20,13 @@ use crate::types::{HalfWindow, Strides};
 /// Slices for 2D array access (concrete start/stop, full resolution or output grid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockIndices {
+    /// First row in the block (inclusive).
     pub row_start: usize,
+    /// One past the last row in the block (exclusive).
     pub row_stop: usize,
+    /// First column in the block (inclusive).
     pub col_start: usize,
+    /// One past the last column in the block (exclusive).
     pub col_stop: usize,
 }
 
@@ -56,9 +60,13 @@ impl BlockIndices {
 /// back of a computed block. `end_trim == 0` means "to the end".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trim {
+    /// Rows to drop from the front of the block.
     pub row_start: usize,
+    /// Rows to drop from the back of the block.
     pub row_end_trim: usize,
+    /// Columns to drop from the front of the block.
     pub col_start: usize,
+    /// Columns to drop from the back of the block.
     pub col_end_trim: usize,
 }
 
@@ -79,10 +87,15 @@ impl Trim {
 /// The five regions describing one processing tile (see module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileBlocks {
+    /// Decimated output region this tile writes.
     pub out_block: BlockIndices,
+    /// Slice into the decimated kernel output that drops the halo.
     pub out_trim: Trim,
+    /// Full-resolution region to read, padded by the window halo.
     pub input_block: BlockIndices,
+    /// Full-resolution region matching `out_block`, without the halo.
     pub input_no_padding: BlockIndices,
+    /// Slice into the read block that recovers `input_no_padding`.
     pub input_trim: Trim,
 }
 
