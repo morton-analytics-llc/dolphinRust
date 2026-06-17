@@ -512,6 +512,7 @@ dependencies = [
  "num-complex",
  "pollster",
  "rayon",
+ "tracing",
  "wgpu",
 ]
 

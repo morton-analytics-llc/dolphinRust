@@ -11,12 +11,14 @@
 #![warn(missing_docs)]
 
 pub mod covariance;
+pub mod engine;
 pub mod estimator;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod quality;
 
 pub use covariance::estimate_stack_covariance;
+pub use engine::{ComputeEngine, ResolvedBackend};
 pub use estimator::{
     process_coherence_matrices, process_coherence_matrix, PixelEstimate, StackEstimate,
 };

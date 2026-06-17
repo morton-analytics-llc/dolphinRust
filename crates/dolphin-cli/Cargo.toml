@@ -23,5 +23,11 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# GPU first-class by default; `--no-default-features --features no-gpu` for CPU-only hosts.
+default = ["gpu"]
+gpu = ["dolphin-workflows/gpu"]
+no-gpu = ["dolphin-workflows/no-gpu"]
+
 [lints]
 workspace = true

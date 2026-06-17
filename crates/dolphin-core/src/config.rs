@@ -338,12 +338,32 @@ impl Default for OutputOptions {
     }
 }
 
+/// Compute backend for phase linking (covariance + EVD/EMI). dolphin exposes a
+/// bool `gpu_enabled`; we generalize to a tri-state. `Auto` runs on the GPU above
+/// the ~128² crossover and on the CPU below it; explicit modes are honored. With
+/// no GPU adapter (or a `no-gpu` build) every mode falls back to the CPU path,
+/// which stays the f64 correctness reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeBackend {
+    /// Size-based: GPU at/above the crossover, CPU below; CPU if no GPU.
+    #[default]
+    Auto,
+    /// Always the CPU (faer, f64) reference path.
+    Cpu,
+    /// GPU where supported; automatic CPU fallback if no adapter / unsupported.
+    Gpu,
+}
+
 /// Parallelism / worker settings. dolphin `WorkerSettings`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerSettings {
-    /// Use the GPU for processing (if available).
+    /// Use the GPU for processing (if available). dolphin parity; superseded by
+    /// `compute_backend` (kept so existing dolphin YAML deserializes unchanged).
     pub gpu_enabled: bool,
+    /// Compute backend selection for phase linking (`auto` / `cpu` / `gpu`).
+    pub compute_backend: ComputeBackend,
     /// Number of threads to use per worker.
     pub threads_per_worker: usize,
     /// Number of spatial bursts to run in parallel for wrapped-phase estimation.
@@ -356,6 +376,7 @@ impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
             gpu_enabled: false,
+            compute_backend: ComputeBackend::default(),
             threads_per_worker: 1,
             n_parallel_bursts: 1,
             block_shape: (512, 512),
