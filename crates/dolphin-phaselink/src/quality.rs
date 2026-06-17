@@ -7,8 +7,8 @@
 //! onto the linked phase: magnitude from the mean amplitude, phase from
 //! `∠Σ_k z_k · conj(θ_k)`.
 //!
-//! NOTE: dolphin v0.35.0 (the pinned oracle) has no CRLB or closure-phase
-//! kernels; those are deferred (see STATUS.md / PLAYBOOK.md).
+//! CRLB uncertainty and sequential closure phase live in sibling modules
+//! [`crate::crlb`] and [`crate::closure`] (validated against the v0.42.0 oracle).
 
 use dolphin_core::Cf64;
 use ndarray::{s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4};

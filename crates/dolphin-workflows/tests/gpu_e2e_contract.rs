@@ -50,6 +50,8 @@ fn config() -> SequentialConfig {
         zero_correlation_threshold: 0.0,
         output_reference_idx: 0,
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
+        compute_crlb: false,
+        compute_closure_phase: false,
     }
 }
 

@@ -4,6 +4,27 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v1.2.0
+
+### Added
+- **CRLB uncertainty + sequential closure-phase quality layers** (`dolphin-phaselink`),
+  validated against a **forward dolphin oracle v0.42.0** used *only* for these two layers
+  (existing kernels stay validated at v0.35.0).
+  - `crlb::estimate_crlb` — per-date Cramér–Rao σ from the Fisher information of the
+    coherence model (`X = 2L·(Γ⊙Γ⁻¹−I)`, σ = `sqrt(diag(inv(ΘᵀXΘ+εI)))`), CPU `faer`/f64.
+    Singular / fully-decorrelated Γ → `NaN` past the reference date (the v0.42 fix). This is
+    the physical per-pixel uncertainty that feeds GroundPulse's `confidence_score`.
+  - `closure::estimate_closure_phases` — nearest-neighbour triplet non-closure
+    `∠(C[k,k+1]·C[k+1,k+2]·conj(C[k,k+2]))`; the prerequisite signal for phase-bias work.
+  - Surfaced on `DisplacementOutput` (`crlb_sigma`, `closure_phase`, both `Option<Array3<f64>>`)
+    and written as per-band COGs (`crlb_sigma_NN.tif`, `closure_phase_NN.tif`), sharing the
+    grid CRS/geotransform; produced end-to-end by `run_displacement`.
+  - Config flags match dolphin: `phase_linking.write_crlb` (default **on**),
+    `phase_linking.write_closure_phase` (default **off**) — a real dolphin YAML round-trips.
+  - Contracts: `quality_v042_contract` (CRLB σ + closure max |Δ| < 1e-4 vs v0.42.0;
+    singular-Γ NaN matches; analytic consistency checks). GPU CRLB is a later follow-up;
+    tophu unwrapping + per-ministack coherence stitching remain for the rest of v1.2.0.
+
 ## [Unreleased] — v1.1.0
 
 ### Added

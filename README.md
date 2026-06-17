@@ -84,7 +84,16 @@ cargo build --release
 # accepts a genuine dolphin `DisplacementWorkflow` YAML unchanged
 ./target/release/dolphin run --config workflow.yaml
 # writes velocity.tif, temporal_coherence.tif, displacement_NN.tif (COGs) to work_directory
+# plus crlb_sigma_NN.tif (CRLB σ uncertainty, on by default) and — when enabled —
+# closure_phase_NN.tif
 ```
+
+The **CRLB σ** layer (`crlb_sigma`) is the per-pixel, per-date physical uncertainty (radians)
+of the phase-linking estimate, from the Fisher information of the coherence model — the input
+GroundPulse's `confidence_score` needs to weight a velocity by how well-determined it is. The
+**closure-phase** layer (`closure_phase`, off by default) is the nearest-neighbour triplet
+non-closure diagnostic. Both are validated against a forward dolphin v0.42.0 oracle; see
+[docs/usage.md](docs/usage.md) §5 and [VALIDATION.md](VALIDATION.md).
 
 ## Quickstart — library
 

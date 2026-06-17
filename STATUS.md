@@ -48,13 +48,31 @@ CPU (faer, f64) stays the correctness reference and automatic fallback.
 
 **All 7 items done.** Gates green (default build *and* `no-gpu`): fmt, clippy -D warnings, test, `cargo doc --no-deps`. **Nothing pushed** — committed on branch `gpu-first-class`, awaiting sign-off.
 
+## v1.2.0 quality-layers progress (branch `v1.2-quality`, per QUALITY_LAYERS_PROMPT.md)
+
+The quality half of v1.2.0 (CRLB + closure phase). tophu unwrapping + per-ministack
+coherence stitching are the *other* half — a separate later loop.
+
+| Item | State |
+|---|---|
+| v0.42.0 forward oracle stood up | ✅ done — `oracle/.venv-v042` (dolphin 0.42.0), used **only** for the two new layers; existing kernels stay at v0.35.0 (reuses the committed `cov_C.npy`, no existing-kernel re-tune). Pin recorded in VALIDATION.md |
+| CRLB σ raster | ✅ done — `crlb::estimate_crlb`, Fisher-information σ (CPU faer/f64), singular-Γ → NaN (v0.42 fix); contract `quality_v042_contract` σ max \|Δ\| <1e-4 incl. singular case |
+| Closure-phase raster | ✅ done — `closure::estimate_closure_phases`, nearest-neighbour triplet non-closure; contract closure max \|Δ\| <1e-4 vs v0.42.0 |
+| Typed API + COG + config + e2e | ✅ done — `DisplacementOutput.{crlb_sigma,closure_phase}` (`Option<Array3>`), per-band COGs, `phase_linking.write_crlb`(on)/`write_closure_phase`(off) match dolphin, produced through `run_displacement`; real dolphin YAML round-trips (`config_contract`, `displacement_contract`) |
+| Docs (README/usage/CHANGELOG/ROADMAP) | ✅ done — incl. the CRLB→`confidence_score` note |
+
+Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, test (default 42
+groups), `cargo doc --no-deps`. GPU CRLB + tophu + stitching remain. **Nothing pushed** —
+committed on branch `v1.2-quality`, awaiting sign-off.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
 - [x] 2 — SHP selection (`dolphin-shp`)
 - [x] 3 — PS selection (`dolphin-ps`)
 - [x] 4 — Quality layers (`dolphin-phaselink`): temp_coh + compressed SLC done;
-      **CRLB/closure deferred** — absent in pinned dolphin v0.35.0 (off the v1.0.0 critical path)
+      **CRLB + closure phase landed in v1.2.0** (branch `v1.2-quality`, validated vs forward
+      oracle dolphin v0.42.0) — see the v1.2.0 progress section above
 - [x] 5 — Ministack sequencing (`dolphin-stack` + `workflows::sequential`)
 - [x] 6 — Interferogram network + SBAS inversion (`dolphin-timeseries`)
       L2 weighted least squares **and** L1/ADMM (Phase 6b, dolphin's default `least_absolute_deviations`).

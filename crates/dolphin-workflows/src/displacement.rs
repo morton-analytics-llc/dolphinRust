@@ -20,9 +20,9 @@ use dolphin_timeseries::{
 use dolphin_unwrap::{unwrap, CostMode, InitMethod, UnwrapConfig};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
-use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo};
+use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
 use crate::dates::decimal_days;
-use crate::sequential::{run_sequential, SequentialConfig};
+use crate::sequential::{run_sequential, SequentialConfig, SequentialOutput};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -44,6 +44,15 @@ pub struct DisplacementOutput {
     /// Temporal coherence per pixel in `[0, 1]`, averaged across ministacks
     /// (dolphin's `temporal_coherence_average`); a phase-quality mask, `(rows, cols)`.
     pub temporal_coherence: Array2<f64>,
+    /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
+    /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
+    /// feeds GroundPulse's `confidence_score`. `None` when `phase_linking.write_crlb`
+    /// is off. Present by default (dolphin defaults `write_crlb = true`).
+    pub crlb_sigma: Option<Array3<f64>>,
+    /// Per-triplet nearest-neighbour closure phase (radians), band-major; the
+    /// non-closure diagnostic. `None` unless `phase_linking.write_closure_phase`
+    /// is on (dolphin defaults it off).
+    pub closure_phase: Option<Array3<f64>>,
     /// Acquisition dates as decimal days from acquisition 0, length `n_dates`.
     pub acquisition_days: Vec<f64>,
     /// EPSG code of the output grid (`None` if neither the CSLC metadata nor the
@@ -90,7 +99,12 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
-    let (pl, temporal_coherence, geo) = stitch_bursts(bursts)?;
+    let stitched = stitch_bursts(bursts)?;
+    let pl = stitched.pl;
+    let temporal_coherence = stitched.temp_coh;
+    let crlb_sigma = stitched.crlb_sigma;
+    let closure_phase = stitched.closure_phase;
+    let geo = stitched.geo;
     let epsg = (geo.epsg != 0).then_some(geo.epsg);
     let geotransform = geo.geotransform;
     anyhow::ensure!(
@@ -133,11 +147,16 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     let velocity = vel_rad.mapv(|v| v * phase_to_disp);
     let velocity_mm_yr = vel_rad.mapv(|v| v * mm);
 
+    let quality = QualityLayers {
+        crlb_sigma: crlb_sigma.as_ref(),
+        closure_phase: closure_phase.as_ref(),
+    };
     write_outputs(
         cfg,
         displacement.view(),
         velocity.view(),
         temporal_coherence.view(),
+        quality,
         epsg,
         geotransform,
     )?;
@@ -146,6 +165,8 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
         velocity,
         velocity_mm_yr,
         temporal_coherence,
+        crlb_sigma,
+        closure_phase,
         acquisition_days: days,
         epsg,
         geotransform,
@@ -159,6 +180,10 @@ struct BurstLink {
     pl: Array3<Cf64>,
     /// Temporal coherence `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
+    /// Per-date CRLB σ `(n_dates, out_rows, out_cols)`, if enabled.
+    crlb_sigma: Option<Array3<f64>>,
+    /// Per-triplet closure phase (band-major), if enabled.
+    closure_phase: Option<Array3<f64>>,
     /// Burst footprint on the output grid.
     geo: BurstGeo,
     /// Acquisition decimal-days for this burst's dates.
@@ -178,7 +203,8 @@ fn link_one_burst(
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
     let stack = read_stack_files(cfg, &files)?;
-    let (pl, temp_coh) = phase_link(cfg, stack.view(), engine)?;
+    let out = phase_link(cfg, stack.view(), engine)?;
+    let pl = out.cpx_phase;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -189,19 +215,41 @@ fn link_one_burst(
     let geo = resolve_burst_geo(cfg, &files[0], rows, cols);
     Ok(BurstLink {
         pl,
-        temp_coh,
+        temp_coh: out.temporal_coherence,
+        crlb_sigma: out.crlb_sigma,
+        closure_phase: out.closure_phase,
         geo,
         days,
     })
 }
 
-/// Mosaic the per-burst linked phase + temporal coherence onto the frame grid.
-/// A single burst is returned as-is (identity path).
-fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<(Array3<Cf64>, Array2<f64>, GeoInfo)> {
+/// The frame-grid mosaic of the per-burst phase-linking products.
+struct Stitched {
+    /// Linked phase history `(n_dates, rows, cols)`.
+    pl: Array3<Cf64>,
+    /// Temporal coherence `(rows, cols)`.
+    temp_coh: Array2<f64>,
+    /// Per-date CRLB σ `(n_dates, rows, cols)`, if enabled.
+    crlb_sigma: Option<Array3<f64>>,
+    /// Per-triplet closure phase (band-major), if enabled.
+    closure_phase: Option<Array3<f64>>,
+    /// Frame grid georeferencing.
+    geo: GeoInfo,
+}
+
+/// Mosaic the per-burst phase-linking products onto the frame grid. A single
+/// burst is returned as-is (identity path).
+fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
         let b = bursts.remove(0);
-        return Ok((b.pl, b.temp_coh, b.geo.geo));
+        return Ok(Stitched {
+            pl: b.pl,
+            temp_coh: b.temp_coh,
+            crlb_sigma: b.crlb_sigma,
+            closure_phase: b.closure_phase,
+            geo: b.geo.geo,
+        });
     }
     let geos: Vec<BurstGeo> = bursts.iter().map(|b| b.geo).collect();
     let frame = frame_grid(&geos)?;
@@ -214,7 +262,31 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<(Array3<Cf64>, Array2<f64
         paste3(&mut pl, &b.pl, off);
         paste2(&mut temp_coh, &b.temp_coh, off);
     }
-    Ok((pl, temp_coh, frame.geo))
+    let crlb_sigma = stitch_layer(&bursts, &frame, |b| b.crlb_sigma.as_ref());
+    let closure_phase = stitch_layer(&bursts, &frame, |b| b.closure_phase.as_ref());
+    Ok(Stitched {
+        pl,
+        temp_coh,
+        crlb_sigma,
+        closure_phase,
+        geo: frame.geo,
+    })
+}
+
+/// Mosaic an optional per-burst band-major layer onto the frame grid; `None`
+/// when the layer is disabled (no burst carries it).
+fn stitch_layer(
+    bursts: &[BurstLink],
+    frame: &FrameGrid,
+    pick: impl Fn(&BurstLink) -> Option<&Array3<f64>>,
+) -> Option<Array3<f64>> {
+    let bands = pick(bursts.first()?)?.dim().0;
+    let mut out = Array3::<f64>::zeros((bands, frame.rows, frame.cols));
+    for b in bursts {
+        let layer = pick(b)?;
+        paste3(&mut out, layer, burst_offset(frame, &b.geo));
+    }
+    Some(out)
 }
 
 /// Burst footprint on the output grid: the CSLC geotransform (scaled by the
@@ -264,13 +336,13 @@ fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Arr
     Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
 }
 
-/// Sequential phase linking over the stack; returns the linked phase history and
-/// the averaged temporal-coherence quality layer.
+/// Sequential phase linking over the stack; returns the linked phase history,
+/// the averaged temporal coherence, and the optional CRLB / closure layers.
 fn phase_link(
     cfg: &DisplacementWorkflow,
     stack: ArrayView3<Cf64>,
     engine: &ComputeEngine,
-) -> Result<(Array3<Cf64>, Array2<f64>)> {
+) -> Result<SequentialOutput> {
     let scfg = SequentialConfig {
         ministack_size: cfg.phase_linking.ministack_size,
         max_num_compressed: cfg.phase_linking.max_num_compressed,
@@ -281,9 +353,11 @@ fn phase_link(
         zero_correlation_threshold: cfg.phase_linking.zero_correlation_threshold,
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
+        compute_crlb: cfg.phase_linking.write_crlb,
+        compute_closure_phase: cfg.phase_linking.write_closure_phase,
     };
     let out = run_sequential(stack, &scfg, engine).map_err(anyhow::Error::msg)?;
-    Ok((out.cpx_phase, out.temporal_coherence))
+    Ok(out)
 }
 
 /// Build the interferogram index pairs from the config and real baselines.
@@ -372,13 +446,15 @@ fn velocity_of(displacement: ArrayView3<f64>, days: &[f64]) -> Array2<f64> {
     estimate_velocity(days, series.view(), None)
 }
 
-/// Write the velocity, temporal-coherence, and per-date displacement rasters as
-/// GeoTIFFs, all sharing the resolved geotransform + EPSG.
+/// Write the velocity, temporal-coherence, per-date displacement, and (when
+/// enabled) per-band CRLB σ + closure-phase rasters as GeoTIFFs, all sharing the
+/// resolved geotransform + EPSG.
 fn write_outputs(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     velocity: ArrayView2<f64>,
     temporal_coherence: ArrayView2<f64>,
+    quality: QualityLayers,
     epsg: Option<u32>,
     gt: [f64; 6],
 ) -> Result<()> {
@@ -389,9 +465,31 @@ fn write_outputs(
     };
     write_f32("velocity.tif", velocity)?;
     write_f32("temporal_coherence.tif", temporal_coherence)?;
-    for t in 0..displacement.dim().0 {
-        let band = displacement.index_axis(ndarray::Axis(0), t);
-        write_f32(&format!("displacement_{t:02}.tif"), band)?;
+    write_bands(&write_f32, displacement, "displacement")?;
+    if let Some(crlb) = quality.crlb_sigma {
+        write_bands(&write_f32, crlb.view(), "crlb_sigma")?;
+    }
+    if let Some(closure) = quality.closure_phase {
+        write_bands(&write_f32, closure.view(), "closure_phase")?;
+    }
+    Ok(())
+}
+
+/// The optional per-pixel quality layers written alongside displacement.
+struct QualityLayers<'a> {
+    crlb_sigma: Option<&'a Array3<f64>>,
+    closure_phase: Option<&'a Array3<f64>>,
+}
+
+/// Write each band of a `(bands, rows, cols)` layer as `{prefix}_NN.tif`.
+fn write_bands(
+    write_f32: &impl Fn(&str, ArrayView2<f64>) -> dolphin_io::Result<()>,
+    layer: ArrayView3<f64>,
+    prefix: &str,
+) -> Result<()> {
+    for t in 0..layer.dim().0 {
+        let band = layer.index_axis(ndarray::Axis(0), t);
+        write_f32(&format!("{prefix}_{t:02}.tif"), band)?;
     }
     Ok(())
 }

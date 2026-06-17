@@ -8,9 +8,11 @@
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{compress, estimate_temp_coh, ComputeEngine};
+use dolphin_phaselink::{
+    compress, estimate_closure_phases, estimate_crlb, estimate_temp_coh, ComputeEngine,
+};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
-use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
+use ndarray::{concatenate, s, Array2, Array3, ArrayView3, ArrayView4, Axis};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +35,10 @@ pub struct SequentialConfig {
     pub output_reference_idx: usize,
     /// Strategy for choosing each ministack's compressed-SLC reference.
     pub compressed_slc_plan: CompressedSlcPlan,
+    /// Produce the per-date CRLB σ layer (dolphin `write_crlb`).
+    pub compute_crlb: bool,
+    /// Produce the per-triplet closure-phase layer (dolphin `write_closure_phase`).
+    pub compute_closure_phase: bool,
 }
 
 /// Output of a sequential run.
@@ -44,6 +50,12 @@ pub struct SequentialOutput {
     /// Temporal coherence averaged across ministacks, `(out_rows, out_cols)`
     /// (dolphin's `temporal_coherence_average`). 1.0 = perfect phase consistency.
     pub temporal_coherence: Array2<f64>,
+    /// Per-date CRLB σ (radians), `(nslc, out_rows, out_cols)` — real dates only,
+    /// concatenated across ministacks. `None` when `compute_crlb` is off.
+    pub crlb_sigma: Option<Array3<f64>>,
+    /// Per-ministack nearest-neighbour closure phase (radians), band-major,
+    /// concatenated across ministacks. `None` when `compute_closure_phase` is off.
+    pub closure_phase: Option<Array3<f64>>,
 }
 
 /// Run the sequential estimator over `slc_stack` `(nslc, rows, cols)`.
@@ -66,12 +78,20 @@ pub fn run_sequential(
     let mut compressed_slcs: Vec<Array2<Cf64>> = Vec::new();
     let mut real_phases: Vec<Array3<Cf64>> = Vec::new();
     let mut temp_cohs: Vec<Array2<f64>> = Vec::new();
+    let mut crlbs: Vec<Array3<f64>> = Vec::new();
+    let mut closures: Vec<Array3<f64>> = Vec::new();
     for ms in plans {
         let combined = assemble(&compressed_slcs, slc_stack, ms);
         let r = link_and_compress(combined.view(), ms, cfg, engine)?;
         real_phases.push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
         compressed_slcs.push(r.compressed);
         temp_cohs.push(r.temp_coh);
+        if let Some(s) = r.crlb_sigma {
+            crlbs.push(s);
+        }
+        if let Some(s) = r.closure_phase {
+            closures.push(s);
+        }
     }
 
     let views: Vec<ArrayView3<Cf64>> = real_phases.iter().map(Array3::view).collect();
@@ -81,7 +101,21 @@ pub fn run_sequential(
         cpx_phase,
         compressed_slcs,
         temporal_coherence,
+        crlb_sigma: concat_bands(crlbs)?,
+        closure_phase: concat_bands(closures)?,
     })
+}
+
+/// Concatenate per-ministack band-major layers along the date/triplet axis;
+/// `None` when the layer was not produced.
+fn concat_bands(layers: Vec<Array3<f64>>) -> Result<Option<Array3<f64>>, &'static str> {
+    if layers.is_empty() {
+        return Ok(None);
+    }
+    let views: Vec<ArrayView3<f64>> = layers.iter().map(Array3::view).collect();
+    concatenate(Axis(0), &views)
+        .map(Some)
+        .map_err(|_| "quality-layer concat failed")
 }
 
 /// Equal-weight mean of the per-ministack temporal coherence layers
@@ -118,10 +152,14 @@ struct MinistackResult {
     compressed: Array2<Cf64>,
     /// Temporal coherence, `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
+    /// CRLB σ for this ministack's real dates, `(num_real, out_rows, out_cols)`.
+    crlb_sigma: Option<Array3<f64>>,
+    /// Closure phase for this ministack, `(num_combined-2, out_rows, out_cols)`.
+    closure_phase: Option<Array3<f64>>,
 }
 
 /// Phase-link a combined ministack and compress it to one SLC, plus its
-/// temporal coherence.
+/// temporal coherence and (optionally) the CRLB / closure-phase quality layers.
 fn link_and_compress(
     combined: ArrayView3<Cf64>,
     ms: MiniStack,
@@ -149,7 +187,28 @@ fn link_and_compress(
         cpx,
         compressed,
         temp_coh,
+        crlb_sigma: cfg.compute_crlb.then(|| crlb_real_dates(c.view(), ms, cfg)),
+        closure_phase: cfg
+            .compute_closure_phase
+            .then(|| estimate_closure_phases(c.view())),
     })
+}
+
+/// CRLB σ for the ministack's **real** dates only (drops carried compressed
+/// layers), matching the phase-history concatenation. `num_looks` is dolphin's
+/// conservative `sqrt(half_y · half_x)`; the CRLB reference is the last
+/// compressed date (dolphin's `max(first_real_slc_idx − 1, 0)`).
+fn crlb_real_dates(c: ArrayView4<Cf64>, ms: MiniStack, cfg: &SequentialConfig) -> Array3<f64> {
+    let num_looks = (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt();
+    let reference_idx = ms.num_compressed.saturating_sub(1);
+    let sigma = estimate_crlb(
+        c,
+        cfg.beta,
+        cfg.zero_correlation_threshold,
+        reference_idx,
+        num_looks,
+    );
+    sigma.slice(s![ms.num_compressed.., .., ..]).to_owned()
 }
 
 /// Unit-magnitude phasor `exp(j∠z)` (dolphin's `exp(1j*angle(cpx_phase))`).

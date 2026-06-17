@@ -9,6 +9,7 @@ date: **2026-06-16**. Reproduce with `validation/run.sh <speckle>`.
 | Component | Version | Role |
 |---|---|---|
 | Python `dolphin` | **0.35.0** (`e567e55`) | reference oracle (resolves Open question #1) |
+| Python `dolphin` | **0.42.0** | forward oracle — **only** for the v1.2.0 CRLB + closure layers (`oracle/.venv-v042`) |
 | dolphinRust | 1.0.0 | engine under test |
 | GDAL | 3.12.2 | raster I/O (both) |
 | HDF5 | 2.1.1 | CSLC read (both) |
@@ -69,6 +70,7 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 | blocks, config (`dolphin-core`) | blocks_contract, config_contract | 3, 4 | PASS |
 | phase-linking EVD/EMI (`dolphin-phaselink`) | phaselink_contract | 7 | PASS (`\|⟨v,v_oracle⟩\|`>0.999, cov<1e-4) |
 | quality / temp_coh (`dolphin-phaselink`) | quality_contract | 6 | PASS |
+| CRLB σ + closure phase (`dolphin-phaselink`) | quality_v042_contract | 6 | PASS vs **v0.42.0** (σ + closure max \|Δ\| <1e-4; singular-Γ NaN matches) |
 | SHP GLRT/KS (`dolphin-shp`) | shp_contract | 5 | PASS |
 | PS selection (`dolphin-ps`) | ps_contract | 4 | PASS |
 | ministack planner + sequential (`dolphin-stack`) | planner_contract, sequential_contract | 3, 1 | PASS |
