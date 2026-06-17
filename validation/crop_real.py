@@ -27,16 +27,19 @@ def main() -> None:
     ap.add_argument("--row0", type=int, default=2200)
     ap.add_argument("--col0", type=int, default=9700)
     ap.add_argument("--size", type=int, default=384)
+    ap.add_argument("--burst", default="", help="substring filter (e.g. T005) when real_data holds multiple bursts")
+    ap.add_argument("--out", type=Path, default=OUT, help="output dir for cropped granules")
     args = ap.parse_args()
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(SRC.glob("OPERA_*.h5"))
+    files = sorted(p for p in SRC.glob("OPERA_*.h5") if args.burst in p.name)
     if not files:
         raise SystemExit("no source granules — run validation/fetch_real.py first")
     r0, c0, n = args.row0, args.col0, args.size
 
     for src in files:
-        dst = OUT / src.name
+        dst = out / src.name
         with h5py.File(src, "r") as f:
             vv = f["/data/VV"][r0 : r0 + n, c0 : c0 + n]
             xc = f["/data/x_coordinates"][c0 : c0 + n]
@@ -54,7 +57,7 @@ def main() -> None:
         print(f"{src.name}: {vv.shape} epsg={epsg} -> {dst}")
 
     print(f"\nwavelength (m): {wavelength}")
-    print(f"cropped {len(files)} files to {OUT}")
+    print(f"cropped {len(files)} files to {out}")
 
 
 if __name__ == "__main__":

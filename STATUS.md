@@ -10,7 +10,7 @@ single source of truth for build progress across sessions. Phase details in PLAY
 | A1 velocity mm/yr via real temporal baselines + wavelength | ✅ done (oracle scale a=1.0000) |
 | A2 L1/ADMM inversion, config-driven default | ✅ done (oracle <1.5e-6) |
 | A3 multi-burst frame stitching | ✅ done (2-burst frame stitch contract) |
-| B4 real OPERA CSLC validation tier | ✅ tier built; engine agreement on real OPERA confirmed (RMS ≤0.008 rad, velocity magnitude + temp_coh match). Strong-signal velocity *scale* = synthetic-confirmed; high-coherence deforming scene is a narrow follow-up (see VALIDATION.md) |
+| B4 real OPERA CSLC validation tier | ✅ tier built; engine agreement on real OPERA confirmed (RMS ≤0.008 rad, velocity magnitude + temp_coh match). Strong-signal velocity *scale* now **confirmed on real data** (Mexico City T005-008704-IW1, TLS slope ≈1.03, v1.1.0) — see VALIDATION.md |
 | C5 typed sync public API (+temp coh, CRS/geotransform) | ✅ done |
 | C6 COG outputs + documented schema | ✅ done (LAYOUT=COG verified) |
 | C7 `#![warn(missing_docs)]` all crates, doc clean | ✅ done |

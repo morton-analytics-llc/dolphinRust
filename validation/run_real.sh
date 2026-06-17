@@ -12,8 +12,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/oracle/.venv/bin"
 RUST_BIN="$ROOT/target/release/dolphin"
-DATA="$ROOT/validation/real_data/cropped"
-RUN="$ROOT/validation/runs/real_T144-308011-IW2"
+# Optional args: <cropped_dir> <run_tag> (default: the T144 coastal/land burst).
+DATA="${1:-$ROOT/validation/real_data/cropped}"
+RUN="$ROOT/validation/runs/${2:-real_T144-308011-IW2}"
 
 [ -n "$(ls "$DATA"/OPERA_*.h5 2>/dev/null)" ] || {
   echo "no cropped real data — run fetch_real.py then crop_real.py" >&2; exit 1; }
