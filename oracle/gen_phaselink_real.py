@@ -48,6 +48,7 @@ def main() -> None:
         c_arrays, use_evd=False, reference_idx=REF_IDX
     )
 
+    np.save(OUT / "real_slc_stack.npy", stack.astype(np.complex64))
     np.save(OUT / "real_cov_C.npy", c_arrays.astype(np.complex64))
     np.save(OUT / "real_phase_emi.npy", np.asarray(phase_emi).astype(np.complex64))
 

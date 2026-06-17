@@ -1,42 +1,49 @@
-//! GPU phase-linking accuracy + speed harness for the R4 spike.
+//! GPU phase-linking accuracy + speed harness (first-class backend).
 //!
 //! Accuracy: loads the real Mexico stack's dolphin v0.35.0 coherence + EMI phase
-//! (`oracle/fixtures/real_cov_C.npy`, `real_phase_emi.npy`; produced by
-//! `oracle/gen_phaselink_real.py`) and reports GPU(f32) vs CPU(f64) vs oracle
-//! referenced-phase deltas in radians and millimeters.
+//! (`oracle/fixtures/real_cov_C.npy`, `real_phase_emi.npy`) and reports the **GPU
+//! hybrid** EMI (f32 kernel + f64 CPU recompute of flagged pixels) vs CPU(f64) vs
+//! oracle referenced-phase deltas across *all* pixels — showing the raw-f32 π-rad
+//! tail and that the hybrid removes it.
 //!
-//! Speed: times CPU vs GPU phase-linking on the real 384² stack and on a
-//! synthetic size sweep to locate the crossover where the GPU starts to win.
+//! Speed: times the **end-to-end** path (covariance, phase-linking, host↔device
+//! transfer, and the hybrid recompute) for GPU vs CPU, on the real 384² stack and
+//! a synthetic size sweep, to locate the crossover where the GPU starts to win.
 //!
-//! Run: `cargo run -p dolphin-phaselink --features gpu --release --example gpu_bench`
+//! Run: `cargo run -p dolphin-phaselink --release --example gpu_bench`
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use dolphin_core::{Cf32, Cf64};
-use dolphin_phaselink::gpu::{process_coherence_matrices_gpu, GpuContext, DEFAULT_LINK_ITERS};
-use dolphin_phaselink::{process_coherence_matrices, StackEstimate};
+use dolphin_core::{Cf32, Cf64, HalfWindow, Strides};
+use dolphin_phaselink::gpu::{
+    estimate_stack_covariance_gpu, process_coherence_matrices_gpu,
+    process_coherence_matrices_gpu_hybrid, unreliable_count, GpuContext, DEFAULT_LINK_ITERS,
+};
+use dolphin_phaselink::{estimate_stack_covariance, process_coherence_matrices, StackEstimate};
 use ndarray::{Array3, Array4};
 
 /// Sentinel-1 C-band: |displacement| = λ/(4π)·|Δφ|.
 const MM_PER_RAD: f64 = 55.465_76 / (4.0 * std::f64::consts::PI);
 const REPS: usize = 5;
+/// Real Mexico config: dolphin `HalfWindow(y=5, x=11)`, strides (1, 1).
+const REAL_HALF: HalfWindow = HalfWindow { y: 5, x: 11 };
+const STRIDES: Strides = Strides { y: 1, x: 1 };
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
 }
 
-fn to_c64(a: &Array4<Cf32>) -> Array4<Cf64> {
+fn to_c64_4(a: &Array4<Cf32>) -> Array4<Cf64> {
     a.mapv(|z| Cf64::new(z.re.into(), z.im.into()))
 }
 
-/// Distribution of referenced-phase deltas (rad) between two phase cubes,
-/// weighted to the pixels where `ref` has signal (|coherence-driven| phase).
-struct PhaseDelta {
-    median_rad: f64,
-    p99_rad: f64,
-    max_rad: f64,
-    overlap_min: f64,
+fn to_c64_3(a: &Array3<Cf32>) -> Array3<Cf64> {
+    a.mapv(|z| Cf64::new(z.re.into(), z.im.into()))
+}
+
+fn to_c32_3(a: &Array3<Cf64>) -> Array3<Cf32> {
+    a.mapv(|z| Cf32::new(z.re as f32, z.im as f32))
 }
 
 fn wrap(d: f64) -> f64 {
@@ -60,31 +67,20 @@ fn cos_sim(a: &[Cf32], b: &[Cf32]) -> f64 {
     let na = a.iter().map(|z| z.norm_sqr() as f64).sum::<f64>().sqrt();
     let nb = b.iter().map(|z| z.norm_sqr() as f64).sum::<f64>().sqrt();
     match na * nb > 0.0 {
-        // Both zero ⇒ trivially aligned; exactly one zero ⇒ genuine mismatch.
         true => inner.norm() / (na * nb),
         false if na + nb == 0.0 => 1.0,
         false => 0.0,
     }
 }
 
-/// Mean off-diagonal `|C_ij|` per pixel — a temporal-coherence proxy used to
-/// restrict the accuracy check to pixels where displacement is meaningful.
-fn coherence_proxy(c: &Array4<Cf32>) -> ndarray::Array2<f64> {
-    let (rows, cols, n, _) = c.dim();
-    ndarray::Array2::from_shape_fn((rows, cols), |(r, cc)| {
-        let mut sum = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                if i != j {
-                    sum += f64::from(c[(r, cc, i, j)].norm());
-                }
-            }
-        }
-        sum / (n * (n - 1)) as f64
-    })
+/// Distribution of referenced-phase deltas (rad) between two phase cubes.
+struct PhaseDelta {
+    median_rad: f64,
+    p99_rad: f64,
+    max_rad: f64,
+    overlap_min: f64,
 }
 
-/// Compare two `(nslc, rows, cols)` phase cubes over the pixels passing `keep`.
 fn phase_delta(a: &Array3<Cf32>, b: &Array3<Cf32>, keep: impl Fn(usize) -> bool) -> PhaseDelta {
     let (nslc, rows, cols) = a.dim();
     let mut deltas = Vec::new();
@@ -109,7 +105,7 @@ fn phase_delta(a: &Array3<Cf32>, b: &Array3<Cf32>, keep: impl Fn(usize) -> bool)
 
 fn report(label: &str, d: &PhaseDelta) {
     println!(
-        "  {label:<26} overlap≥{:.4}  median {:.2e} rad ({:.2e} mm)  p99 {:.2e} rad ({:.3} mm)  max {:.2e} rad ({:.3} mm)",
+        "  {label:<28} overlap≥{:.4}  median {:.2e} rad ({:.2e} mm)  p99 {:.2e} rad ({:.3} mm)  max {:.2e} rad ({:.3} mm)",
         d.overlap_min,
         d.median_rad,
         d.median_rad * MM_PER_RAD,
@@ -149,94 +145,119 @@ fn accuracy(ctx: &GpuContext) {
     }
     let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("real_cov_C.npy")).unwrap();
     let oracle: Array3<Cf32> = ndarray_npy::read_npy(dir.join("real_phase_emi.npy")).unwrap();
-    // oracle npy is (rows, cols, nslc); transpose to (nslc, rows, cols).
     let oracle = oracle
         .permuted_axes([2, 0, 1])
         .as_standard_layout()
         .to_owned();
+    let c64 = to_c64_4(&c);
 
-    let cpu_emi = cpu_phase(&process_coherence_matrices(
-        to_c64(&c).view(),
-        false,
-        0.0,
-        0.0,
-        0,
-    ));
-    let cpu_evd = cpu_phase(&process_coherence_matrices(
-        to_c64(&c).view(),
-        true,
-        0.0,
-        0.0,
-        0,
-    ));
-    let gpu_emi =
-        process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
-            .unwrap()
-            .cpx_phase;
+    let cpu_emi = cpu_phase(&process_coherence_matrices(c64.view(), false, 0.0, 0.0, 0));
+    let cpu_evd = cpu_phase(&process_coherence_matrices(c64.view(), true, 0.0, 0.0, 0));
     let gpu_evd =
         process_coherence_matrices_gpu(ctx, c.view(), true, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
-            .unwrap()
-            .cpx_phase;
+            .unwrap();
+    let gpu_raw =
+        process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+            .unwrap();
+    let gpu_hybrid = cpu_phase(
+        &process_coherence_matrices_gpu_hybrid(
+            ctx,
+            c64.view(),
+            false,
+            0.0,
+            0.0,
+            0,
+            DEFAULT_LINK_ITERS,
+        )
+        .unwrap(),
+    );
+    let n_pix = gpu_raw.reliable.len();
+    let n_flag = unreliable_count(&gpu_raw);
 
-    // Coherent mask: γ̄ > 0.6 — where displacement is physically meaningful and
-    // the least eigenvector (EMI) is well defined.
-    let gamma = coherence_proxy(&c);
-    let coh: Vec<bool> = gamma.iter().map(|&g| g > 0.6).collect();
-    let n_coh = coh.iter().filter(|&&b| b).count();
     let all = |_: usize| true;
-    let keep = |p: usize| coh[p];
     println!(
-        "ACCURACY — real Mexico stack (13 acqs, 384², half_window 11×5); coherent (γ̄>0.6) = {}/{} px ({:.0}%):",
-        n_coh,
-        coh.len(),
-        100.0 * n_coh as f64 / coh.len() as f64
+        "ACCURACY — real Mexico stack (13 acqs, 384², half_window 11×5), ALL {n_pix} px; \
+         hybrid recomputed {n_flag} px ({:.1}%) on the f64 CPU:",
+        100.0 * n_flag as f64 / n_pix as f64
     );
     report(
-        "EVD GPU vs CPU [all px]",
-        &phase_delta(&gpu_evd, &cpu_evd, all),
+        "EVD GPU(f32) vs CPU [all]",
+        &phase_delta(&cpu_evd, &gpu_evd.cpx_phase, all),
     );
     report(
-        "EMI GPU vs CPU [all px]",
-        &phase_delta(&gpu_emi, &cpu_emi, all),
+        "EMI raw GPU(f32) vs CPU [all]",
+        &phase_delta(&cpu_emi, &gpu_raw.cpx_phase, all),
     );
     report(
-        "EMI GPU vs CPU [coherent]",
-        &phase_delta(&gpu_emi, &cpu_emi, keep),
+        "EMI hybrid vs CPU [all]",
+        &phase_delta(&cpu_emi, &gpu_hybrid, all),
     );
     report(
-        "EMI GPU vs oracle [coherent]",
-        &phase_delta(&gpu_emi, &oracle, keep),
+        "EMI hybrid vs oracle [all]",
+        &phase_delta(&oracle, &gpu_hybrid, all),
     );
     report(
-        "EMI CPU vs oracle [coherent]",
-        &phase_delta(&cpu_emi, &oracle, keep),
+        "EMI CPU vs oracle [all]",
+        &phase_delta(&oracle, &cpu_emi, all),
     );
 }
 
-/// Synthetic KMS coherence stack `(s, s, nslc, nslc)` — PD, exercises EMI.
-fn synth_stack(s: usize, nslc: usize) -> Array4<Cf32> {
-    let gamma = 0.85_f32;
-    Array4::from_shape_fn((s, s, nslc, nslc), |(r, c, i, j)| {
-        let theta = 0.1 * (r + c) as f32;
-        let mag = gamma.powi((i as i32 - j as i32).abs());
-        Cf32::from_polar(mag, theta * (i as f32 - j as f32))
+/// End-to-end CPU phase linking: f64 covariance + EMI.
+fn e2e_cpu(stack: &Array3<Cf64>) -> StackEstimate {
+    let c = estimate_stack_covariance(stack.view(), REAL_HALF, STRIDES, None).unwrap();
+    process_coherence_matrices(c.view(), false, 0.0, 0.0, 0)
+}
+
+/// End-to-end GPU phase linking through the engine path: f32 covariance →
+/// upcast → hybrid (f32 kernel + f64 CPU recompute of flagged pixels).
+fn e2e_gpu(ctx: &GpuContext, stack32: &Array3<Cf32>) -> StackEstimate {
+    let c32 = estimate_stack_covariance_gpu(ctx, stack32.view(), REAL_HALF, STRIDES, None).unwrap();
+    let c64 = to_c64_4(&c32);
+    process_coherence_matrices_gpu_hybrid(ctx, c64.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap()
+}
+
+/// A realistic distributed-scatterer SLC stack `(nslc, s, s)` at coherence ≈ 0.8.
+fn synth_slc(s: usize, nslc: usize) -> Array3<Cf64> {
+    let gamma = 0.8_f64;
+    let (cs, cn) = (gamma.sqrt(), (1.0 - gamma).sqrt());
+    Array3::from_shape_fn((nslc, s, s), |(slc, r, c)| {
+        let theta = 0.7 * slc as f64;
+        let k = (slc as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((r as u32).wrapping_mul(40_503))
+            .wrapping_add((c as u32).wrapping_mul(2_246_822_519));
+        let psi = f64::from(k) / f64::from(u32::MAX) * std::f64::consts::TAU;
+        Cf64::from_polar(cs, theta) + Cf64::from_polar(cn, psi)
     })
 }
 
 fn speed(ctx: &GpuContext) {
-    println!("\nSPEED — phase-linking wall-clock, median of {REPS} warm reps (nslc=13):");
+    println!("\nSPEED — END-TO-END (covariance + phase-link + readback + hybrid recompute), median of {REPS} warm reps:");
+
+    if let Ok(real) =
+        ndarray_npy::read_npy::<_, Array3<Cf32>>(fixtures().join("real_slc_stack.npy"))
+    {
+        let real64 = to_c64_3(&real);
+        let cpu_s = time_warm(|| e2e_cpu(&real64));
+        let gpu_s = time_warm(|| e2e_gpu(ctx, &real));
+        println!(
+            "  real 384² nslc=13:  CPU {cpu_s:.4}s  GPU {gpu_s:.4}s  speedup {:.2}×",
+            cpu_s / gpu_s
+        );
+    }
+
+    println!("\n  synthetic sweep (nslc=13):");
     println!(
         "  {:>7}  {:>10}  {:>10}  {:>8}",
         "size", "CPU (s)", "GPU (s)", "speedup"
     );
     let mut crossover = None;
     for &s in &[64_usize, 128, 192, 256, 384, 512] {
-        let c = synth_stack(s, 13);
-        let cpu_s = time_warm(|| process_coherence_matrices(to_c64(&c).view(), false, 0.0, 0.0, 0));
-        let gpu_s = time_warm(|| {
-            process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
-                .unwrap()
-        });
+        let stack = synth_slc(s, 13);
+        let stack32 = to_c32_3(&stack);
+        let cpu_s = time_warm(|| e2e_cpu(&stack));
+        let gpu_s = time_warm(|| e2e_gpu(ctx, &stack32));
         let speedup = cpu_s / gpu_s;
         if speedup >= 1.0 && crossover.is_none() {
             crossover = Some(s);
@@ -244,8 +265,8 @@ fn speed(ctx: &GpuContext) {
         println!("  {s:>5}²  {cpu_s:>10.4}  {gpu_s:>10.4}  {speedup:>7.2}×");
     }
     match crossover {
-        Some(s) => println!("  crossover: GPU wins at ≥ {s}² pixels"),
-        None => println!("  crossover: CPU wins at every tested size"),
+        Some(s) => println!("  crossover: GPU wins end-to-end at ≥ {s}² pixels"),
+        None => println!("  crossover: CPU wins end-to-end at every tested size"),
     }
 }
 
