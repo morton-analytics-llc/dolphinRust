@@ -9,5 +9,9 @@ license.workspace = true
 dolphin-core.workspace = true
 chrono.workspace = true
 
+[dev-dependencies]
+ndarray.workspace = true
+ndarray-npy = { version = "0.9", default-features = false }
+
 [lints]
 workspace = true

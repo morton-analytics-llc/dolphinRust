@@ -446,6 +446,8 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "dolphin-core",
+ "ndarray",
+ "ndarray-npy",
 ]
 
 [[package]]
@@ -481,6 +483,9 @@ dependencies = [
  "dolphin-stack",
  "dolphin-timeseries",
  "dolphin-unwrap",
+ "ndarray",
+ "ndarray-npy",
+ "num-complex",
  "rayon",
  "serde",
  "serde_yaml",
