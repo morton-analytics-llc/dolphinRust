@@ -10,6 +10,7 @@ name = "dolphin"
 path = "src/main.rs"
 
 [dependencies]
+dolphin-core.workspace = true
 dolphin-workflows.workspace = true
 clap.workspace = true
 anyhow.workspace = true

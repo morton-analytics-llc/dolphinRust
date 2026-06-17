@@ -2,8 +2,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use dolphin_core::config::DisplacementWorkflow;
+use dolphin_workflows::run_displacement;
 
 #[derive(Parser)]
 #[command(
@@ -33,11 +35,20 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config } => {
-            let _yaml = std::fs::read_to_string(&config)
-                .with_context(|| format!("reading config {}", config.display()))?;
-            // Pipeline stages are not yet wired; see PLAYBOOK.md for the port plan.
-            bail!("displacement pipeline is not yet implemented (scaffold only) — see PLAYBOOK.md");
-        }
+        Command::Run { config } => run(&config),
     }
+}
+
+/// Parse the YAML config and run the displacement workflow.
+fn run(config: &PathBuf) -> Result<()> {
+    let yaml = std::fs::read_to_string(config)
+        .with_context(|| format!("reading config {}", config.display()))?;
+    let cfg = DisplacementWorkflow::from_yaml(&yaml).context("parsing displacement config")?;
+    let out = run_displacement(&cfg)?;
+    let (dates, rows, cols) = out.displacement.dim();
+    println!(
+        "displacement: {dates} dates x {rows}x{cols}; outputs written to {}",
+        cfg.work_directory.display()
+    );
+    Ok(())
 }

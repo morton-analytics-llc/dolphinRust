@@ -21,7 +21,18 @@ single source of truth for build progress across sessions. Phase details in PLAY
       geotransform — not on the v1.0.0 local-run critical path.
 - [x] 9 — Unwrapping dispatch (`dolphin-unwrap`) — SNAPHU subprocess wrapper
       (tophu/spurt/whirlwind = documented gaps, not built)
-- [ ] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
+- [x] 10 — Pipeline orchestration + CLI (`dolphin-workflows` + `dolphin-cli`)
+      `dolphin run --config <yaml>`: read CSLC → sequential phase-link → ifg network →
+      SNAPHU unwrap → SBAS L2 invert → velocity → GeoTIFF outputs. Single-burst
+      (multi-burst stitching deferred); end-to-end matches the dolphin oracle.
+
+## ✅ v1.0.0 — first complete build
+All phases green. `dolphin run --config <yaml>` produces a displacement time series +
+velocity from a CSLC stack, matching the dolphin v0.35.0 oracle within §Correctness
+tolerances (displacement <1e-3, velocity <1e-2). Workspace: clippy/fmt clean, 37 test
+groups pass. Deferred (off the v1.0.0 critical path, tracked above): CRLB/closure phase,
+L1/ADMM (6b), EagerLoader, complex-GeoTIFF writer, NISAR geotransform, multi-burst
+stitch, tophu/spurt/whirlwind unwrappers.
 
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.

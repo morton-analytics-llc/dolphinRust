@@ -15,8 +15,17 @@ Correctness is validated against analytic fixtures and dolphin as a reference or
 
 ## Status
 
-Scaffold. No pipeline stages implemented yet. See [PLAYBOOK.md](PLAYBOOK.md) for the
-phased implementation plan and the correctness/validation strategy.
+**v1.0.0 — first complete build.** `dolphin run --config <yaml>` produces an end-to-end
+displacement time series + velocity from a CSLC stack (read → sequential phase-linking →
+interferogram network → SNAPHU unwrap → SBAS L2 inversion → velocity → GeoTIFF outputs),
+validated against Python dolphin **v0.35.0** as a reference oracle within physically
+meaningful tolerances. All numerical phases carry green analytic + oracle contract tests.
+
+Known deferrals (off the v1.0.0 critical path): CRLB / closure-phase rasters and L1/ADMM
+inversion (not in the pinned v0.35.0 / deferred to 6b), `EagerLoader` prefetch,
+complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform, multi-burst stitching, and
+the tophu/spurt/whirlwind unwrappers. See [STATUS.md](STATUS.md) and
+[PLAYBOOK.md](PLAYBOOK.md).
 
 ## Workspace layout
 
@@ -42,8 +51,16 @@ cargo build
 cargo test
 ```
 
-The scaffold builds with a pure-Rust dependency set. System-library bindings
-(GDAL, HDF5, LAPACK) are introduced in Phase 8 — see the playbook for setup.
+The numerical crates build with a pure-Rust dependency set. The I/O and unwrap layers
+need system libraries: **GDAL ≥ 3.4** (`gdal` 0.19), **HDF5** (`hdf5-metno` 0.12), and the
+**SNAPHU** binary on `PATH` for unwrapping. `cargo test` runs analytic contracts always;
+oracle/SNAPHU-dependent tests skip cleanly when fixtures or the binary are absent.
+
+Run the pipeline:
+
+```sh
+dolphin run --config workflow.yaml   # accepts dolphin's displacement-workflow YAML
+```
 
 ## License
 
