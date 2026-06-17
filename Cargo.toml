@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dolphin-core",
+    "crates/dolphin-io",
+    "crates/dolphin-phaselink",
+    "crates/dolphin-shp",
+    "crates/dolphin-ps",
+    "crates/dolphin-stack",
+    "crates/dolphin-timeseries",
+    "crates/dolphin-filtering",
+    "crates/dolphin-unwrap",
+    "crates/dolphin-workflows",
+    "crates/dolphin-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/mortonanalytics/dolphinRust"
+authors = ["Morton Analytics"]
+
+[workspace.dependencies]
+# Pure-Rust numerics (compile without system libs)
+ndarray = "0.16"
+num-complex = "0.4"
+faer = "0.20"
+rayon = "1.10"
+rustfft = "6.2"
+statrs = "0.17"
+# Error / config / logging
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+# Internal crates
+dolphin-core = { path = "crates/dolphin-core" }
+dolphin-io = { path = "crates/dolphin-io" }
+dolphin-phaselink = { path = "crates/dolphin-phaselink" }
+dolphin-shp = { path = "crates/dolphin-shp" }
+dolphin-ps = { path = "crates/dolphin-ps" }
+dolphin-stack = { path = "crates/dolphin-stack" }
+dolphin-timeseries = { path = "crates/dolphin-timeseries" }
+dolphin-filtering = { path = "crates/dolphin-filtering" }
+dolphin-unwrap = { path = "crates/dolphin-unwrap" }
+dolphin-workflows = { path = "crates/dolphin-workflows" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

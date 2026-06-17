@@ -1,0 +1,22 @@
+[package]
+name = "dolphin-workflows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolphin-core.workspace = true
+dolphin-io.workspace = true
+dolphin-phaselink.workspace = true
+dolphin-shp.workspace = true
+dolphin-ps.workspace = true
+dolphin-stack.workspace = true
+dolphin-timeseries.workspace = true
+dolphin-filtering.workspace = true
+dolphin-unwrap.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rayon.workspace = true

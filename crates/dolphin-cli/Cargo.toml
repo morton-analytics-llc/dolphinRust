@@ -1,0 +1,17 @@
+[package]
+name = "dolphin-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dolphin"
+path = "src/main.rs"
+
+[dependencies]
+dolphin-workflows.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

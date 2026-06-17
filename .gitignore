@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+# Local InSAR test data / outputs
+/data
+/scratch
+*.tif
+*.h5
+*.nc
+*.vrt
