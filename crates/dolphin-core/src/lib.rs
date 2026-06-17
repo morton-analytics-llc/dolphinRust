@@ -1,13 +1,17 @@
-//! Shared types for the dolphin Rust port.
+//! Shared types for the dolphin Rust rebuild.
 //!
-//! Mirrors the cross-cutting primitives in the Python `dolphin` package:
-//! complex SLC element types, the `HalfWindow`/`Strides` look geometry, the
-//! `StridedBlockManager` tiling scheme (`dolphin/io/_blocks.py`), and the
-//! pydantic workflow config models (`dolphin/workflows/config/`).
-//!
-//! Planned modules (see PLAYBOOK.md): `types`, `blocks`, `config`, `error`.
+//! Cross-cutting primitives every downstream crate depends on: complex SLC
+//! element types and the `HalfWindow`/`Strides` look geometry ([`types`]), the
+//! `StridedBlockManager` tiling scheme ([`blocks`], port of
+//! `dolphin/io/_blocks.py`), the workflow config tree ([`config`], mirroring
+//! dolphin's pydantic `DisplacementWorkflow`), and the crate error type
+//! ([`error`]).
 
-/// Complex SLC sample (single-precision), matching dolphin's `complex64`.
-pub type Cf32 = num_complex::Complex<f32>;
-/// Double-precision complex, used inside covariance/eigensolver kernels.
-pub type Cf64 = num_complex::Complex<f64>;
+pub mod blocks;
+pub mod config;
+pub mod error;
+pub mod types;
+
+pub use blocks::{iter_blocks, BlockIndices, StridedBlockManager, TileBlocks, Trim};
+pub use error::{CoreError, Result};
+pub use types::{Cf32, Cf64, HalfWindow, Strides};

@@ -55,22 +55,24 @@ a displacement time series on a real CSLC burst stack matching the dolphin oracl
 
 ## Launching with elevated permissions
 
-Interactive, dynamic (recommended) — the model self-paces the loop:
+Two separate steps. **Step 2 is a slash command typed inside Claude Code — NOT a shell
+command. Do not paste it into your terminal.**
+
+1. In your terminal, launch an elevated session (this one line only):
 
 ```sh
 cd /Users/ryanemorton/Documents/GitHub/dolphinRust
 claude --dangerously-skip-permissions
-# then, in the session:
-/loop <paste the Prompt section above>
+```
+
+2. Wait for the Claude Code prompt to appear, then type this at it:
+
+```
+/loop read BUILD_PROMPT.md and execute its build loop to v1.0.0, one phase at a time
 ```
 
 `--dangerously-skip-permissions` bypasses every tool-permission prompt so the loop runs
-unattended (cargo, git, file writes). `/loop` with no interval = dynamic self-pacing.
-
-Headless / one-shot:
-
-```sh
-claude --dangerously-skip-permissions -p "$(sed -n '/^## Prompt$/,/^## Launching/p' BUILD_PROMPT.md)"
-```
+unattended (cargo, git, file writes). `/loop` with no interval = dynamic self-pacing; the
+agent reads the Prompt section above and follows it — no need to paste the whole thing.
 
 Less-elevated alternative (still prompts for shell commands): `--permission-mode acceptEdits`.

@@ -4,7 +4,7 @@ Target: **v1.0.0** (first complete build). Update this file as phases land — i
 single source of truth for build progress across sessions. Phase details in PLAYBOOK.md.
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
-- [ ] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
+- [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [ ] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★
 - [ ] 2 — SHP selection (`dolphin-shp`)
 - [ ] 3 — PS selection (`dolphin-ps`)

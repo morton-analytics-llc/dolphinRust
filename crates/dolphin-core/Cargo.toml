@@ -9,6 +9,7 @@ license.workspace = true
 ndarray.workspace = true
 num-complex.workspace = true
 serde.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 
