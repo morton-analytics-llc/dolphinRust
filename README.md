@@ -56,11 +56,25 @@ See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
 | GDAL | ≥ 3.4 (tested 3.12) | GeoTIFF/COG I/O (`gdal` 0.19) |
 | HDF5 | 1.10+ (tested 2.x) | CSLC reading (`hdf5-metno` 0.12) |
 | SNAPHU | binary on `PATH` (tested 2.0.7) | phase unwrapping |
+| GPU (optional) | any `wgpu` adapter — Metal / Vulkan / DX12 | GPU phase-linking backend (default-on) |
 
 The numerical crates (`dolphin-core/-phaselink/-shp/-ps/-stack/-timeseries/-filtering`) build
 with a pure-Rust dependency set; only the I/O, unwrap, and workflow layers need the system
 libraries above. `cargo test` runs analytic contracts always; oracle/SNAPHU-dependent tests
 skip cleanly when fixtures or the binary are absent.
+
+### GPU backend (first-class, default-on)
+
+Phase linking has a `wgpu` GPU backend compiled into the **default build**, selected at
+runtime by `worker_settings.compute_backend`: `auto` (GPU at/above the ~128² crossover, CPU
+below), `cpu`, or `gpu`. With **no GPU adapter** the run falls back to the CPU automatically
+with a warning — never a crash. The CPU (`faer`, f64) path is the correctness reference; the
+GPU runs single precision (`f32`) and recomputes the small set of ill-conditioned EMI pixels
+on the f64 CPU, so EMI matches the CPU reference **sub-mm on every pixel** (EVD too). On an
+integrated Apple GPU the end-to-end win is marginal (often CPU-favoured) — the payoff is
+portability to discrete NVIDIA/AMD, where the same shaders run unchanged. Build CPU-only (no
+wgpu link) with `cargo build --no-default-features --features no-gpu`. See
+[bench/GPU.md](bench/GPU.md).
 
 ## Quickstart — CLI
 

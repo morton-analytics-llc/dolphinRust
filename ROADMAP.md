@@ -124,16 +124,22 @@ non-closure on a long series; unwrap interface ready for a 3D backend.
 
 - **spurt 3D unwrapping port** — spurt is v0.1.x, pre-production, and dolphin hasn't adopted
   it. Design the interface (R4); port only once it stabilizes or dolphin integrates it.
-- **GPU acceleration** — Rust GPU stack (cudarc/wgpu/rust-gpu) isn't yet worth the platform
-  complexity for per-pixel small-matrix EVD. A tuned faer+rayon CPU path closes most of the
-  JAX/CPU gap. Revisit post-R4 / rust-gpu maturity.
-  - **Spike done** (branch `gpu-phaselink`, `gpu` feature, wgpu/Metal; see `bench/GPU.md`).
-    GPU **EVD** is production-accurate on a real 384² stack (f32 vs f64, ≤0.18 mm worst-case,
-    overlap 1.0). GPU **EMI** is sub-mm for the bulk but has a π-rad tail on ill-conditioned
-    pixels (least-eigenvector degeneracy) — so EVD on GPU, EMI stays on the f64 CPU. Speed on
-    the *integrated* M2 Pro GPU is **~1.5–1.6×** above ~128² (crossover ≈128², CPU wins below);
-    modest by design (integrated GPU, strong faer+rayon baseline). The same WGSL ports
-    unchanged to discrete NVIDIA, where the real headroom is. Unpushed.
+- **GPU acceleration — SHIPPED as a first-class backend** (branch `gpu-first-class`, wgpu/Metal,
+  compiled into the **default build**; see `bench/GPU.md`, `VALIDATION.md`). Runtime-selected via
+  `worker_settings.compute_backend` (`auto`/`cpu`/`gpu`); no adapter / unsupported / `no-gpu`
+  build → automatic CPU fallback, never a panic. The CPU (faer, f64) path stays the correctness
+  reference. Closed every spike gap:
+  - **EMI is now all-pixel-accurate** via a hybrid — the GPU kernel flags ill-conditioned /
+    near-degenerate / borderline-PD pixels and the host recomputes that 5.9% minority on f64
+    faer. Real Mexico 384² stack: **max Δφ 0.607 mm across all pixels, no π-rad tail** (raw f32
+    was 13.85 mm). EVD remains 0.176 mm.
+  - `MAX_NSLC` 16→32 with deterministic threadgroup scratch; GPU covariance gained SHP masking
+    + β regularization; wired end-to-end through `run_displacement`.
+  - **Honest speed:** end-to-end on the *integrated* M2 Pro the GPU is **0.66× on the real stack
+    (slower)** and ~1.09× on clean synthetic stacks above ~192² — readback + f64 round-trip +
+    CPU recompute outweigh the kernel saving against a strong faer+rayon baseline. The value is
+    **correctness + portability**: the same WGSL runs unchanged on discrete NVIDIA/AMD, where the
+    FP32 headroom is. Unpushed.
 - **Native RAiDER reimplementation** — ray-tracing NWP interpolation; subprocess dispatch is
   correct, a rewrite is not.
 - **oxigdal / pure-Rust GDAL** — too new (v0.1.x) for production.

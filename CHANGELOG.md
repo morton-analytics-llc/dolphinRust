@@ -7,6 +7,22 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased] — v1.1.0
 
 ### Added
+- **GPU compute backend — first-class** (`wgpu`/Metal, f32; compiled into the **default
+  build**). Runtime-selected via `worker_settings.compute_backend` (`auto` / `cpu` / `gpu`):
+  `auto` uses the GPU at/above the ~128² crossover and the CPU below; **no GPU adapter,
+  unsupported `nslc`, or a `no-gpu` build → automatic CPU fallback with a warning, never a
+  panic.** The CPU (`faer`, f64) path stays the correctness reference. Covariance + EVD/EMI
+  run in-shader (one thread per pixel); GPU covariance supports the SHP neighbor mask and the
+  EMI β regularization. EMI uses an **all-pixel-accurate hybrid**: the kernel flags
+  ill-conditioned / near-degenerate / borderline-PD pixels (bottom eigengap, Rayleigh
+  wrong-mode guard, coherence floor, min Cholesky pivot) and the host recomputes that minority
+  on f64 `faer`. Real Mexico 384² stack: **max Δφ 0.607 mm across every pixel, no π-rad tail**
+  (EVD 0.176 mm). `MAX_NSLC` lifted 16→32 via deterministic threadgroup scratch (bit-identical
+  run-to-run). Wired through `run_displacement` (`dolphin_phaselink::ComputeEngine`). Build
+  CPU-only with `--no-default-features --features no-gpu`. Honest speed: end-to-end on an
+  *integrated* M2 Pro the GPU is ~0.66× on the real stack (slower) and ~1.09× on synthetic
+  stacks above ~192² — the value is correctness + portability to discrete NVIDIA/AMD (same WGSL,
+  unchanged). See `bench/GPU.md` and `VALIDATION.md`.
 - **Auto spatial reference-point selection** (dolphin v0.36 center-of-mass): the displacement
   series is referenced to a stable pixel — `timeseries_options.reference_point` if set, else
   the quality-weighted center of mass of the largest high-coherence region
