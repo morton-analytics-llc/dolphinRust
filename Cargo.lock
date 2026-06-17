@@ -422,6 +422,8 @@ version = "1.0.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
+ "ndarray-npy",
+ "num-complex",
  "rayon",
 ]
 
