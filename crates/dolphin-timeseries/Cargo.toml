@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SBAS L1/L2 network inversion and linear velocity estimation for dolphinRust."
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
 dolphin-core.workspace = true
