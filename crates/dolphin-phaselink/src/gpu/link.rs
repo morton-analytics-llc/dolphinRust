@@ -51,10 +51,13 @@ struct Params {
     n_pix: u32,
     ref_idx: u32,
     iters: u32,
+    beta: f32,
+    zero_corr: f32,
 }
 
 /// Phase-link a coherence stack on the GPU. `use_evd` selects EVD; otherwise EMI
-/// (with per-pixel EVD fallback). Compare to the CPU path within f32 tolerance.
+/// (with per-pixel EVD fallback) using the `beta` Γ regularization and
+/// `zero_correlation_threshold`. Compare to the CPU path within f32 tolerance.
 ///
 /// # Errors
 /// Returns [`GpuError`] if `nslc > MAX_NSLC` or a GPU dispatch/readback fails.
@@ -62,6 +65,8 @@ pub fn process_coherence_matrices_gpu(
     ctx: &GpuContext,
     c_arrays: ArrayView4<Cf32>,
     use_evd: bool,
+    beta: f32,
+    zero_correlation_threshold: f32,
     reference_idx: usize,
     iters: u32,
 ) -> Result<GpuStackEstimate, GpuError> {
@@ -77,6 +82,8 @@ pub fn process_coherence_matrices_gpu(
         n_pix: n_pix as u32,
         ref_idx: reference_idx as u32,
         iters,
+        beta,
+        zero_corr: zero_correlation_threshold,
     };
     let flat: Vec<[f32; 2]> = c_arrays
         .as_standard_layout()
@@ -108,7 +115,15 @@ pub fn process_coherence_matrices_gpu_hybrid(
     iters: u32,
 ) -> Result<StackEstimate, GpuError> {
     let c32 = c_arrays.mapv(|z| Cf32::new(z.re as f32, z.im as f32));
-    let gpu = process_coherence_matrices_gpu(ctx, c32.view(), use_evd, reference_idx, iters)?;
+    let gpu = process_coherence_matrices_gpu(
+        ctx,
+        c32.view(),
+        use_evd,
+        beta as f32,
+        zero_correlation_threshold as f32,
+        reference_idx,
+        iters,
+    )?;
     let mut out = upcast(&gpu);
     if !use_evd {
         recompute_unreliable(

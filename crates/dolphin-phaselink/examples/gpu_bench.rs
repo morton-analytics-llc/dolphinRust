@@ -169,12 +169,14 @@ fn accuracy(ctx: &GpuContext) {
         0.0,
         0,
     ));
-    let gpu_emi = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS)
-        .unwrap()
-        .cpx_phase;
-    let gpu_evd = process_coherence_matrices_gpu(ctx, c.view(), true, 0, DEFAULT_LINK_ITERS)
-        .unwrap()
-        .cpx_phase;
+    let gpu_emi =
+        process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+            .unwrap()
+            .cpx_phase;
+    let gpu_evd =
+        process_coherence_matrices_gpu(ctx, c.view(), true, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+            .unwrap()
+            .cpx_phase;
 
     // Coherent mask: γ̄ > 0.6 — where displacement is physically meaningful and
     // the least eigenvector (EMI) is well defined.
@@ -232,7 +234,8 @@ fn speed(ctx: &GpuContext) {
         let c = synth_stack(s, 13);
         let cpu_s = time_warm(|| process_coherence_matrices(to_c64(&c).view(), false, 0.0, 0.0, 0));
         let gpu_s = time_warm(|| {
-            process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap()
+            process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+                .unwrap()
         });
         let speedup = cpu_s / gpu_s;
         if speedup >= 1.0 && crossover.is_none() {

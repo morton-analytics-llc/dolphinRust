@@ -1,7 +1,7 @@
 //! GPU sliding-window coherence — host side for `covariance.wgsl`.
 
 use dolphin_core::{Cf32, HalfWindow, Strides};
-use ndarray::{Array4, ArrayView3};
+use ndarray::{Array4, ArrayView3, ArrayView4};
 
 use super::context::{GpuContext, GpuError};
 use super::dispatch::{dispatch_compute, input_buffer, output_buffer, readback, uniform_buffer};
@@ -24,15 +24,16 @@ struct Params {
     out_cols: u32,
     win_h: u32,
     win_w: u32,
-    _pad: u32,
+    has_mask: u32,
 }
 
-/// Estimate the per-pixel coherence matrix on the GPU (f32, maskless).
+/// Estimate the per-pixel coherence matrix on the GPU (f32).
 ///
-/// Mirrors [`crate::estimate_stack_covariance`] with `neighbors = None`: `stack`
-/// is `(nslc, rows, cols)`, the output is `(out_rows, out_cols, nslc, nslc)`
-/// decimated by `strides`. Single precision — compare to the CPU path within an
-/// f32 tolerance, not bit-exactly.
+/// Mirrors [`crate::estimate_stack_covariance`]: `stack` is `(nslc, rows, cols)`,
+/// the output is `(out_rows, out_cols, nslc, nslc)` decimated by `strides`. When
+/// `neighbors` is given (the SHP `(out_rows, out_cols, win_h, win_w)` mask), only
+/// flagged window samples contribute, matching the CPU path. Single precision —
+/// compare to the CPU path within an f32 tolerance, not bit-exactly.
 ///
 /// # Errors
 /// Returns [`GpuError`] if the window exceeds the stack, `nslc > MAX_NSLC`, or a
@@ -42,6 +43,7 @@ pub fn estimate_stack_covariance_gpu(
     stack: ArrayView3<Cf32>,
     half: HalfWindow,
     strides: Strides,
+    neighbors: Option<ArrayView4<bool>>,
 ) -> Result<Array4<Cf32>, GpuError> {
     let (nslc, rows, cols) = stack.dim();
     let (win_h, win_w) = (2 * half.y + 1, 2 * half.x + 1);
@@ -56,11 +58,33 @@ pub fn estimate_stack_covariance_gpu(
         )));
     }
     let (out_rows, out_cols) = strides.out_shape((rows, cols));
-    let params = build_params((nslc, rows, cols), half, strides, (out_rows, out_cols));
+    let mask = mask_buffer(neighbors);
+    let params = build_params(
+        (nslc, rows, cols),
+        half,
+        strides,
+        (out_rows, out_cols),
+        &mask,
+    );
 
     let flat = flatten(stack);
-    let out = run(ctx, &flat, &params, out_rows * out_cols * nslc * nslc)?;
+    let out = run(
+        ctx,
+        &flat,
+        &mask,
+        &params,
+        out_rows * out_cols * nslc * nslc,
+    )?;
     pack(out, (out_rows, out_cols, nslc))
+}
+
+/// Flatten the SHP neighbor mask to `u32` (1 = keep), or a 1-element dummy when
+/// no mask is given (the binding must always exist).
+fn mask_buffer(neighbors: Option<ArrayView4<bool>>) -> Vec<u32> {
+    match neighbors {
+        Some(n) => n.iter().map(|&keep| u32::from(keep)).collect(),
+        None => vec![0_u32],
+    }
 }
 
 fn build_params(
@@ -68,6 +92,7 @@ fn build_params(
     half: HalfWindow,
     strides: Strides,
     out: (usize, usize),
+    mask: &[u32],
 ) -> Params {
     let (nslc, rows, cols) = dims;
     Params {
@@ -82,7 +107,7 @@ fn build_params(
         out_cols: out.1 as u32,
         win_h: (2 * half.y + 1) as u32,
         win_w: (2 * half.x + 1) as u32,
-        _pad: 0,
+        has_mask: u32::from(mask.len() > 1),
     }
 }
 
@@ -96,11 +121,13 @@ fn flatten(stack: ArrayView3<Cf32>) -> Vec<[f32; 2]> {
 fn run(
     ctx: &GpuContext,
     stack: &[[f32; 2]],
+    mask: &[u32],
     params: &Params,
     out_len: usize,
 ) -> Result<Vec<[f32; 2]>, GpuError> {
     let stack_buf = input_buffer(ctx, "stack", stack);
     let param_buf = uniform_buffer(ctx, "params", params);
+    let mask_buf = input_buffer(ctx, "neighbors", mask);
     let out_buf = output_buffer(
         ctx,
         "cov-out",
@@ -111,7 +138,7 @@ fn run(
         ctx,
         include_str!("covariance.wgsl"),
         "covariance",
-        &[&stack_buf, &param_buf, &out_buf],
+        &[&stack_buf, &param_buf, &out_buf, &mask_buf],
         n_pix.div_ceil(64),
     );
     readback(ctx, &out_buf, out_len)

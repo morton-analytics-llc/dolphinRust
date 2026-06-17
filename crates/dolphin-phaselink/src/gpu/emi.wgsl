@@ -48,6 +48,8 @@ struct Params {
     n_pix: u32,
     ref_idx: u32,
     iters: u32,
+    beta: f32,       // Γ regularization weight: Γ ← (1−β)|C| + βI
+    zero_corr: f32,  // coherence magnitudes below this snap to 0
 };
 
 @group(0) @binding(0) var<storage, read> cmat: array<vec2<f32>>;
@@ -199,13 +201,19 @@ fn main(
     if (pix >= p.n_pix) { return; }
     let base = pix * n * n;
 
-    // Γ = |C|, mean off-diagonal coherence, Cholesky-invert (EVD fallback if non-PD).
+    // Γ = regularized |C| (Γ ← (1−β)|C| + βI, then snap < zero_corr to 0), mean
+    // off-diagonal raw coherence, Cholesky-invert (EVD fallback if non-PD).
     var coh_sum = 0.0;
     for (var i = 0u; i < n; i = i + 1u) {
         for (var j = 0u; j < n; j = j + 1u) {
             let mag = length(cmat[base + i * n + j]);
-            gam_wg[goff + i * n + j] = mag;
             if (i != j) { coh_sum = coh_sum + mag; }
+            var g = mag;
+            if (p.beta > 0.0) {
+                g = (1.0 - p.beta) * mag + p.beta * select(0.0, 1.0, i == j);
+            }
+            if (g < p.zero_corr) { g = 0.0; }
+            gam_wg[goff + i * n + j] = g;
         }
     }
     let off = max(1.0, f32(n * (n - 1u)));

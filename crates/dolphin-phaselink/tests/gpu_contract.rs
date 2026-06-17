@@ -68,7 +68,8 @@ fn to_c64(a: &Array4<Cf32>) -> Array4<Cf64> {
 fn compare_link(ctx: &GpuContext, c32: &Array4<Cf32>, use_evd: bool) -> (f64, f64) {
     let cpu = process_coherence_matrices(to_c64(c32).view(), use_evd, 0.0, 0.0, 0);
     let gpu =
-        process_coherence_matrices_gpu(ctx, c32.view(), use_evd, 0, DEFAULT_LINK_ITERS).unwrap();
+        process_coherence_matrices_gpu(ctx, c32.view(), use_evd, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+            .unwrap();
     let (nslc, rows, cols) = cpu.cpx_phase.dim();
 
     let mut min_sim = 1.0_f64;
@@ -134,7 +135,7 @@ fn gpu_covariance_matches_cpu() {
 
     let guard = gpu();
     let ctx = &*guard;
-    let gpu = estimate_stack_covariance_gpu(ctx, stack.view(), half, strides).unwrap();
+    let gpu = estimate_stack_covariance_gpu(ctx, stack.view(), half, strides, None).unwrap();
     assert_eq!(cpu.dim(), gpu.dim());
 
     let max_err = cpu
@@ -146,6 +147,40 @@ fn gpu_covariance_matches_cpu() {
     assert!(
         max_err < 1e-4,
         "GPU covariance f32 delta {max_err} exceeds 1e-4"
+    );
+}
+
+/// Item 3: GPU covariance with the SHP neighbor mask must match the dolphin
+/// v0.35.0 SHP oracle (`cov_C_shp.npy` = covariance of `slc_stack` masked by
+/// `glrt_neighbors`) within f32 tolerance.
+#[test]
+fn gpu_covariance_shp_matches_oracle() {
+    let dir = fixtures();
+    if !dir.join("cov_C_shp.npy").exists() {
+        eprintln!("skipping gpu_covariance_shp_matches_oracle: no fixtures");
+        return;
+    }
+    let stack: Array3<Cf32> = ndarray_npy::read_npy(dir.join("slc_stack.npy")).unwrap();
+    let neighbors: Array4<bool> = ndarray_npy::read_npy(dir.join("glrt_neighbors.npy")).unwrap();
+    let oracle: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C_shp.npy")).unwrap();
+    let (half, strides) = (HalfWindow { y: 2, x: 2 }, Strides { y: 1, x: 1 });
+
+    let guard = gpu();
+    let ctx = &*guard;
+    let gpu =
+        estimate_stack_covariance_gpu(ctx, stack.view(), half, strides, Some(neighbors.view()))
+            .unwrap();
+    assert_eq!(oracle.dim(), gpu.dim());
+
+    let max_err = oracle
+        .iter()
+        .zip(gpu.iter())
+        .map(|(a, b)| (a - b).norm() as f64)
+        .fold(0.0_f64, f64::max);
+    eprintln!("gpu SHP covariance vs oracle max |Δ| = {max_err:.3e}");
+    assert!(
+        max_err < 1e-4,
+        "GPU SHP covariance delta {max_err} exceeds 1e-4"
     );
 }
 
@@ -211,6 +246,39 @@ fn gpu_emi_matches_cpu_on_oracle_ds() {
     );
 }
 
+/// Item 3: GPU EMI with the `beta` Γ regularization on must match CPU EMI (same
+/// β) within f32 tolerance — the spike only ran β=0.
+#[test]
+fn gpu_emi_beta_matches_cpu() {
+    let dir = fixtures();
+    if !dir.join("cov_C.npy").exists() {
+        eprintln!("skipping gpu_emi_beta_matches_cpu: no fixtures");
+        return;
+    }
+    let c32: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
+    let c64 = to_c64(&c32);
+    let (beta, zct) = (0.1, 0.0);
+    let guard = gpu();
+    let ctx = &*guard;
+    let cpu = process_coherence_matrices(c64.view(), false, beta, zct, 0);
+    let hybrid = process_coherence_matrices_gpu_hybrid(
+        ctx,
+        c64.view(),
+        false,
+        beta,
+        zct,
+        0,
+        DEFAULT_LINK_ITERS,
+    )
+    .unwrap();
+    let max_mm = max_dphi_all(&cpu, &hybrid) * MM_PER_RAD;
+    eprintln!("β=0.1 hybrid EMI vs CPU: max Δφ = {max_mm:.4} mm");
+    assert!(
+        max_mm < 1.0,
+        "β=0.1 hybrid max Δφ {max_mm:.4} mm not sub-mm"
+    );
+}
+
 /// Max referenced-phase Δ (rad) over ALL pixels between two f64 stack estimates.
 fn max_dphi_all(a: &StackEstimate, b: &StackEstimate) -> f64 {
     let (nslc, rows, cols) = a.cpx_phase.dim();
@@ -255,7 +323,8 @@ fn gpu_emi_hybrid_no_pi_tail_on_real_stack() {
 
     // Diagnostic: how many pixels the kernel flagged for CPU recompute.
     let raw =
-        process_coherence_matrices_gpu(ctx, c32.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+        process_coherence_matrices_gpu(ctx, c32.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+            .unwrap();
     let n_pix = raw.reliable.len();
     let n_flag = unreliable_count(&raw);
 
@@ -298,8 +367,10 @@ fn gpu_emi_deterministic_nslc32() {
     let c = synth_coh(128, 32);
     let guard = gpu();
     let ctx = &*guard;
-    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
-    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap();
+    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap();
     assert!(
         phase_bit_identical(&a.cpx_phase, &b.cpx_phase),
         "nslc=32 EMI phase differs run-to-run — scratch not deterministic"
@@ -313,8 +384,10 @@ fn gpu_emi_deterministic_384() {
     let c = synth_coh(384, 13);
     let guard = gpu();
     let ctx = &*guard;
-    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
-    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let a = process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap();
+    let b = process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap();
     assert!(
         phase_bit_identical(&a.cpx_phase, &b.cpx_phase),
         "384² EMI phase differs run-to-run"
@@ -360,7 +433,8 @@ fn gpu_emi_falls_back_to_evd_on_singular_gamma() {
     }
     let guard = gpu();
     let ctx = &*guard;
-    let gpu = process_coherence_matrices_gpu(ctx, c.view(), false, 0, DEFAULT_LINK_ITERS).unwrap();
+    let gpu = process_coherence_matrices_gpu(ctx, c.view(), false, 0.0, 0.0, 0, DEFAULT_LINK_ITERS)
+        .unwrap();
     assert_eq!(gpu.estimator[(0, 0)], 0, "singular Γ must fall back to EVD");
     let (min_sim, max_dphi) = compare_link(ctx, &c, true);
     eprintln!("EMI→EVD fallback: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");

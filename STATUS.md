@@ -40,7 +40,7 @@ CPU (faer, f64) stays the correctness reference and automatic fallback.
 |---|---|
 | 1. EMI GPU↔CPU hybrid — no π-rad tail | ✅ done — kernel emits a per-pixel `reliable` flag (bottom eigengap via Hotelling deflation + Rayleigh wrong-mode guard + coherence floor); host recomputes the flagged minority on f64 faer. Real Mexico stack (384², 13 acqs): **max Δφ 0.61 mm over ALL 147,456 px** (was 13.9 mm / π-rad), 5.6% CPU-recomputed. Contract `gpu_emi_hybrid_no_pi_tail_on_real_stack` green |
 | 2. MAX_NSLC ≥ 32, deterministic scratch | ✅ done — EMI nslc² scratch (Γ, Γ⁻¹) moved from per-thread private (spilled → nondeterministic at nslc 32 / 384²) to **threadgroup memory**, sized by pipeline overrides (`WG`, `GAM_LEN`) so 2·WG·nslc²·4 ≤ 24 KiB budget (WG≈18 at nslc 13, 3 at nslc 32). `MAX_NSLC` 16→32. Determinism contracts green (bit-identical run-to-run) at 384²/nslc13 and nslc32; accuracy at nslc32 sub-mm. Suite shares one locked GpuContext (concurrent contexts were the flakiness, not the kernel) |
-| 3. GPU covariance SHP mask + β | ⏳ |
+| 3. GPU covariance SHP mask + β | ✅ done — GPU covariance gained the SHP neighbor-array mask (per-pixel win_h×win_w keep-factor on the window reduction); GPU EMI Γ construction gained `beta` regularization + `zero_correlation_threshold`, threaded through `process_coherence_matrices_gpu`/hybrid. Contracts: `gpu_covariance_shp_matches_oracle` vs dolphin SHP oracle (`cov_C_shp` / `glrt_neighbors`, max |Δ| 5.4e-7), `gpu_emi_beta_matches_cpu` (β=0.1, sub-mm) |
 | 4. Runtime backend selection (default build) + no-adapter fallback + `no-gpu` | ⏳ |
 | 5. Wire selected backend through `run_displacement` | ⏳ |
 | 6. End-to-end validation + honest speedup/crossover | ⏳ |
