@@ -12,6 +12,8 @@
 
 pub mod covariance;
 pub mod estimator;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod quality;
 
 pub use covariance::estimate_stack_covariance;

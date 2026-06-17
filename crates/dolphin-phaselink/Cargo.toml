@@ -17,6 +17,14 @@ ndarray.workspace = true
 num-complex.workspace = true
 faer.workspace = true
 rayon.workspace = true
+# GPU phase-linking path (R4 spike) — wgpu/Metal, behind the `gpu` feature.
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Off by default: the CPU (faer, f64) path stays the build default and reference.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
