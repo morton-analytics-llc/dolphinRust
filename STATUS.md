@@ -34,6 +34,17 @@ groups pass. Deferred (off the v1.0.0 critical path, tracked above): CRLB/closur
 L1/ADMM (6b), EagerLoader, complex-GeoTIFF writer, NISAR geotransform, multi-burst
 stitch, tophu/spurt/whirlwind unwrappers.
 
+## ✅ End-to-end validation (2026-06-16) — see VALIDATION.md
+Full `dolphin run` (Python, pinned v0.35.0, snaphu-py 0.4.1) vs `dolphinRust` (snaphu
+binary v2.0.7) on **one** genuine `dolphin config` YAML, synthetic single-burst stack.
+- **Config compatibility: PASS** — dolphinRust runs a real dolphin DisplacementWorkflow YAML unchanged.
+- **Displacement: PASS** — noise-free agreement max 1.1e-3 rad (corr 1.0000); residual
+  scales linearly with speckle ⇒ sanctioned faer-vs-jax eigensolver divergence, not a bug.
+- **Velocity: FINDING** — `DT_DAYS=12.0` hardcoded (`dolphin-workflows/.../displacement.rs:23`)
+  ignores filename dates; absolute scale off by the cadence ratio for non-12-day stacks
+  (pattern still corr ≥0.97). Fix tracked in VALIDATION.md; product code left untouched.
+- **Pending:** real OPERA CSLC validation (no Earthdata creds here — synthetic only).
+
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.
 - ~~SNAPHU binary MISSING~~ — **built v2.0.7 from Stanford source, at
