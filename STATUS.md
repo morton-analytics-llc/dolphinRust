@@ -21,6 +21,9 @@ single source of truth for build progress across sessions. Phase details in PLAY
 
 ## Awaiting input (see PLAYBOOK.md questions)
 - ~~Pin the dolphin reference version~~ — **pinned: `v0.35.0` (`e567e55`)**.
+- **SNAPHU binary MISSING** — required for Phase 9 (unwrapping) and the Phase 10
+  end-to-end run. Install (e.g. `conda install -c conda-forge snaphu`, or build from
+  the Stanford source) before Phase 9. GDAL 3.12.2 / HDF5 2.1.1 / OpenBLAS present.
 - Packaging: workspace member of `eo` vs. separate crate dependency — before Phase 10.
 
 ## Scaffold (done)
