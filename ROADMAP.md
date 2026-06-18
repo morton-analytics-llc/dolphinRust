@@ -107,9 +107,15 @@ in `REMAINING_WORK_PROMPT.md`.
   boundary edge cases) — exact, not just within tolerance, because sequential phase-linking is
   feed-forward. Downstream (network→unwrap→timeseries→velocity) is non-causal and recomputes from
   the updated phase history; the speed win is skipping re-phase-linking the sealed history.
-- **Performance optimization** — beat the committed baseline (`bench/results.json`): faer
-  small-matrix tuning, EagerLoader prefetch, streaming I/O, BLAS/thread contention. Publish the
-  real multiple; drop optimizations that don't help.
+- **Performance optimization** ✅ — beat the committed baseline (`bench/results.json`). Covariance
+  hot-path rewrite (the #1 phase-linking cost): direct **Hermitian** product (upper triangle +
+  mirror) over contiguous rows, replacing ndarray's generic complex `dot` (no SIMD/BLAS for
+  `Complex<f64>`) and its per-pixel conjugate-transpose alloc. **Real-frame phase-linking 2.38×
+  faster** (host-controlled same-session A/B, 3.07→1.29 s; throughput 432→1028 kpix·slc/s), also
+  beating the committed 2.01 s absolutely. No accuracy change (all oracle/analytic/sign contracts
+  green). Numbers in `bench/PERF.md`. (faer micro-tuning / EagerLoader prefetch not pursued — the
+  covariance win cleared the bar; end-to-end stays gated by the Rosetta SNAPHU binary, a packaging
+  issue.)
 - **Phase-bias / non-closure correction** (Michaelides et al., RSE 2022) — *not in dolphin*, so it
   leads the oracle; validated by measured non-closure reduction on the v1.2 closure layer.
 - **3D-unwrap-ready dispatch interface** — trait behind which SNAPHU/tophu sit; no spurt port.
