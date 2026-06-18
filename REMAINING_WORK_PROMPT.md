@@ -17,9 +17,12 @@ frame is deferred. The ifg sign convention is fixed and guarded (`tests/sign_con
 - Contract test FIRST (red), then make it green. A phase is done only when its contract is green.
 - Gate every step: `cargo fmt` + `cargo clippy --all-targets -- -D warnings` + `cargo test` +
   `cargo doc --no-deps`, on **default (== gpu)** and **`--features no-gpu`**.
-- One branch per landed unit (`v1.3-tropo-warp`, `v1.4-nrt`, `v1.4-perf`, `v1.4-phasebias`,
-  `v1.4-unwrap-iface`). **Push nothing and tag nothing without my sign-off** — at each unit's
-  completion, stop, report, and wait. After I approve, merge `--no-ff` to `main`, push, continue.
+- One branch per landed unit (`v1.4-phasebias`, `v1.4-unwrap-iface`). **Run your own checkpoints
+  and land autonomously** — when a unit's gates + contracts are green (verified, not assumed),
+  merge `--no-ff` to `main`, push, and continue to the next phase without stopping for sign-off.
+  Tag `v1.4.0` once Phase 5 and Phase 2b are both in. Only stop and report on a genuine blocker
+  (an ambiguous contract, a benchmark that won't clear its bar, an unreachable source) or when the
+  whole sprint is done.
 - Honesty rule: report real numbers. Never weaken a tolerance, fake a benchmark win, or stub a
   dependency. If something can't meet its bar, stop and report with a hypothesis.
 - Elevate genuine blockers: if a phase needs an architecture/contract decision not answerable

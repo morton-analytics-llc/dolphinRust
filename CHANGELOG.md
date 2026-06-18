@@ -18,6 +18,15 @@ All notable changes to dolphinRust are documented here. The format follows
   analytic/quality/GPU/sign contracts stay green. Measurements + methodology in `bench/PERF.md`.
 
 ### Added
+- **Phase-bias / non-closure correction** (Phase 4), `dolphin-phaselink::phasebias` — Michaelides
+  et al. (RSE 2022). **Not in Python dolphin** (leads the oracle). The nearest-neighbour closure of
+  the coherence matrix satisfies `Ξ_k = β_k + β_{k+1}`; a per-pixel first-order constant
+  bias-velocity `β̄ = mean_k(Ξ_k)/2` is subtracted from the linked series (`θ_n ← θ_n·e^{−j n β̄}`)
+  before the interferogram network. Opt-in via `phase_linking.correct_phase_bias` (**off by
+  default** → default output and the oracle/sign contracts are unchanged; forces closure
+  computation when on). Validated by an analytic fixture (constant bias recovered to <1e-9, zero
+  residual) and a **measured non-closure reduction 0.800 → 0.095 rad (8.4×)** on a 100-date series;
+  wired end-to-end (`run_displacement`). Numbers in VALIDATION.md.
 - **NRT incremental displacement — end-to-end front door** (Phase 2b). `run_displacement_resumable`
   returns a `DisplacementState` (per-burst resumable phase-linking state + the files consumed);
   `update_displacement` folds newly-arrived acquisitions into the series — re-phase-linking only

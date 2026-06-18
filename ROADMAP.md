@@ -120,8 +120,12 @@ in `REMAINING_WORK_PROMPT.md`.
   green). Numbers in `bench/PERF.md`. (faer micro-tuning / EagerLoader prefetch not pursued — the
   covariance win cleared the bar; end-to-end stays gated by the Rosetta SNAPHU binary, a packaging
   issue.)
-- **Phase-bias / non-closure correction** (Michaelides et al., RSE 2022) — *not in dolphin*, so it
-  leads the oracle; validated by measured non-closure reduction on the v1.2 closure layer.
+- **Phase-bias / non-closure correction** ✅ (Michaelides et al., RSE 2022) — *not in dolphin*, so
+  it leads the oracle. `dolphin-phaselink::phasebias`, opt-in (`correct_phase_bias`, off by
+  default). First-order constant-bias-velocity model `β̄ = mean_k(Ξ_k)/2` (from the v1.2 closure
+  layer), `θ_n ← θ_n·e^{−j n β̄}`. Analytic contract exact (constant bias recovered to <1e-9);
+  **measured non-closure reduction 0.800 → 0.095 rad (8.4×)** on a 100-date series; wired
+  end-to-end. Numbers in VALIDATION.md.
 - **3D-unwrap-ready dispatch interface** — trait behind which SNAPHU/tophu sit; no spurt port.
 
 **Exit:** NRT == full rerun within tolerance; published speedup vs baseline; phase-bias reduces

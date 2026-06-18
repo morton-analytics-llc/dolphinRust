@@ -452,6 +452,36 @@ SIGN_REF_PROD_IFG=validation/runs/real_F38502_T144_bowl \
 cargo test -p dolphin-workflows --test sign_convention -- --nocapture
 ```
 
+## Phase-bias / non-closure correction (2026-06-18, v1.4.0 Phase 4)
+
+Michaelides et al. (RSE 2022). **Not in Python dolphin — this leads the oracle**, so there
+is no parity target; validated by an analytic fixture (exact known-answer) plus a measured
+reduction in non-closure. `dolphin-phaselink::phasebias`; opt-in via
+`phase_linking.correct_phase_bias` (**off by default**, so default output is unchanged and the
+oracle/sign contracts are untouched).
+
+Model (first-order). The nearest-neighbour closure of the coherence matrix satisfies
+`Ξ_k = β_k + β_{k+1} = B_{k+2} − B_k`, where `β_n` is the connection-1 fading bias and `B_n` the
+cumulative bias the linked phase carries. A per-pixel **constant bias velocity**
+`β̄ = mean_k(Ξ_k)/2`, cumulative `B_n = n·β̄`, is subtracted from the linked series
+(`θ_n ← θ_n·e^{−j n β̄}`) before the interferogram network. One parameter per pixel — removes
+the systematic part without over-fitting noise. Time-varying bias is a documented future
+refinement.
+
+- **Analytic contract — PASS** (`constant_bias_is_recovered_exactly`, `residual_is_zero_for_constant_bias`):
+  a constant injected bias `c` gives closures `Ξ = 2c`; the estimate is exactly `c`, the
+  corrected series `θ_n = φ_n + n·c` recovers `φ_n` to `< 1e-9`, and the residual closure is `0`.
+- **Measured non-closure reduction — PASS** (`reduces_nonclosure_on_long_noisy_series`): a
+  100-date series whose closures are a constant systematic bias plus deterministic zero-mean
+  noise has its mean non-closure cut **0.800 → 0.095 rad (8.4×)** after the correction.
+- **End-to-end wiring — PASS** (`phase_bias_correction_runs_end_to_end`, snaphu-gated): enabling
+  `correct_phase_bias` runs through unwrap + SBAS and yields a finite displacement of the right
+  shape. Default-off parity is the existing `end_to_end_displacement_matches_oracle` contract.
+
+```sh
+cargo test -p dolphin-phaselink --lib phasebias -- --nocapture   # analytic + reduction
+```
+
 ## Open / pending
 
 - **Real-data velocity absolute scale under strong signal** — RESOLVED (2026-06-17, v1.1.0):
