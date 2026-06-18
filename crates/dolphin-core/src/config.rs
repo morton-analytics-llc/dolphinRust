@@ -3,8 +3,8 @@
 //!
 //! Field names and defaults match dolphin so an existing dolphin displacement
 //! YAML deserializes unchanged. Unknown fields are ignored (not denied), so the
-//! deeply-nested unwrap solver options dolphin emits (tophu/spurt/whirlwind —
-//! documented Phase 9 gaps) pass through harmlessly without being modeled here.
+//! deeply-nested unwrap solver options dolphin emits we don't model (spurt) pass
+//! through harmlessly; `snaphu_options`/`tophu_options` are modeled and round-trip.
 
 use std::path::PathBuf;
 
@@ -46,6 +46,12 @@ pub enum UnwrapMethod {
     /// SNAPHU statistical-cost network-flow unwrapper.
     #[default]
     Snaphu,
+    /// tophu multi-scale driver over the SNAPHU per-tile solver (coarse init →
+    /// overlapping tiled SNAPHU → 2π-reconciled merge). dolphin reserves its
+    /// `multiscale_unwrap` for the ICU/PHASS solvers; dolphinRust exposes it as a
+    /// first-class method driving SNAPHU, the solver we ship. Configured by
+    /// [`TophuOptions`].
+    Tophu,
     /// ISCE ICU (residue-cut) unwrapper.
     Icu,
     /// ISCE PHASS unwrapper.
@@ -219,6 +225,32 @@ impl Default for SnaphuOptions {
     }
 }
 
+/// tophu multi-scale unwrap options. dolphin `TophuOptions` (same field names,
+/// so a real dolphin YAML's `tophu_options` block round-trips).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TophuOptions {
+    /// Number of tiles (row, col) to split the full-res grid into for the fine pass.
+    pub ntiles: (usize, usize),
+    /// Extra multilook factor (row, col) for the coarse-pass downsample.
+    pub downsample_factor: (usize, usize),
+    /// SNAPHU initialization method (`mcf` or `mst`).
+    pub init_method: String,
+    /// SNAPHU statistical cost mode (`defo` or `smooth`).
+    pub cost: String,
+}
+
+impl Default for TophuOptions {
+    fn default() -> Self {
+        Self {
+            ntiles: (1, 1),
+            downsample_factor: (1, 1),
+            init_method: "mcf".into(),
+            cost: "smooth".into(),
+        }
+    }
+}
+
 /// Pre-unwrap filtering/interpolation. dolphin `PreprocessOptions`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -268,6 +300,8 @@ pub struct UnwrapOptions {
     pub preprocess_options: PreprocessOptions,
     /// SNAPHU subprocess options.
     pub snaphu_options: SnaphuOptions,
+    /// tophu multi-scale options (used when `unwrap_method` is `tophu`).
+    pub tophu_options: TophuOptions,
 }
 
 impl Default for UnwrapOptions {
@@ -281,6 +315,7 @@ impl Default for UnwrapOptions {
             zero_where_masked: false,
             preprocess_options: PreprocessOptions::default(),
             snaphu_options: SnaphuOptions::default(),
+            tophu_options: TophuOptions::default(),
         }
     }
 }

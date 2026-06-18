@@ -54,6 +54,10 @@ fn enum_yaml_values_match_dolphin() {
         "snaphu"
     );
     assert_eq!(
+        serde_yaml::to_string(&UnwrapMethod::Tophu).unwrap().trim(),
+        "tophu"
+    );
+    assert_eq!(
         serde_yaml::to_string(&TimeseriesMethod::L1).unwrap().trim(),
         "L1"
     );
@@ -67,9 +71,9 @@ fn default_config_round_trips() {
     assert_eq!(original, parsed);
 }
 
-/// A dolphin-style YAML: partial fields set, plus an unwrap solver block
-/// (`tophu_options`) we deliberately don't model. Unspecified fields must take
-/// dolphin defaults; the unmodeled block must be ignored, not rejected.
+/// A dolphin-style YAML: partial fields set, plus the `tophu_options` solver
+/// block. Modeled fields (now including `tophu_options`) must parse; unspecified
+/// fields must take dolphin defaults; the YAML must round-trip.
 #[test]
 fn real_dolphin_yaml_deserializes_with_defaults() {
     let yaml = r#"
@@ -112,6 +116,8 @@ work_directory: /work/run1
         "write_closure_phase: true parsed"
     );
     assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Spurt);
+    assert_eq!(c.unwrap_options.tophu_options.ntiles, (2, 2));
+    assert_eq!(c.unwrap_options.tophu_options.downsample_factor, (3, 3));
 
     // The quality flags survive a serialize → parse round-trip.
     let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod};
+use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod, UnwrapMethod};
 use dolphin_core::{Cf32, Cf64};
 use dolphin_io::{read_cslc_stack, read_geotransform, write_raster, GeoInfo};
 use dolphin_phaselink::ComputeEngine;
@@ -17,7 +17,7 @@ use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
-use dolphin_unwrap::{unwrap, CostMode, InitMethod, UnwrapConfig};
+use dolphin_unwrap::{unwrap, unwrap_multiscale, CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
@@ -371,7 +371,31 @@ fn network(cfg: &DisplacementWorkflow, days: &[f64]) -> Vec<(usize, usize)> {
     build_network(days.len(), days, &net)
 }
 
-/// Form each ifg from the linked phase and unwrap it with SNAPHU.
+/// Selected unwrap backend: SNAPHU (default) or the tophu multi-scale driver.
+enum UnwrapDriver {
+    /// Raw single-pass SNAPHU.
+    Snaphu(UnwrapConfig),
+    /// tophu coarse→fine multi-scale over the SNAPHU per-tile solver.
+    Tophu(TophuConfig),
+}
+
+impl UnwrapDriver {
+    /// Unwrap one wrapped ifg, returning the unwrapped phase in radians.
+    fn run(
+        &self,
+        ifg: ArrayView2<Cf32>,
+        corr: ArrayView2<f32>,
+        scratch: &Path,
+    ) -> Result<Array2<f64>> {
+        let result = match self {
+            UnwrapDriver::Snaphu(cfg) => unwrap(ifg, corr, cfg, scratch)?,
+            UnwrapDriver::Tophu(cfg) => unwrap_multiscale(ifg, corr, cfg, scratch)?,
+        };
+        Ok(result.unwrapped.mapv(f64::from))
+    }
+}
+
+/// Form each ifg from the linked phase and unwrap it with the selected backend.
 fn unwrap_network(
     cfg: &DisplacementWorkflow,
     pl: ArrayView3<Cf64>,
@@ -380,12 +404,12 @@ fn unwrap_network(
     let (_, rows, cols) = pl.dim();
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let ucfg = unwrap_config(cfg);
+    let driver = unwrap_driver(cfg);
     let correlation = Array2::<f32>::from_elem((rows, cols), 1.0);
 
     let layers = pairs
         .iter()
-        .map(|&pair| unwrap_pair(pl, pair, &correlation, &ucfg, &scratch))
+        .map(|&pair| unwrap_pair(pl, pair, &correlation, &driver, &scratch))
         .collect::<Result<Vec<_>>>()?;
     let views: Vec<_> = layers.iter().map(Array2::view).collect();
     ndarray::stack(ndarray::Axis(0), &views).context("stacking unwrapped ifgs")
@@ -396,7 +420,7 @@ fn unwrap_pair(
     pl: ArrayView3<Cf64>,
     (i, j): (usize, usize),
     correlation: &Array2<f32>,
-    ucfg: &UnwrapConfig,
+    driver: &UnwrapDriver,
     scratch: &Path,
 ) -> Result<Array2<f64>> {
     let (_, rows, cols) = pl.dim();
@@ -404,28 +428,58 @@ fn unwrap_pair(
         let z = pl[(j, r, c)] * pl[(i, r, c)].conj();
         Cf32::from_polar(1.0, z.arg() as f32)
     });
-    let result = unwrap(ifg.view(), correlation.view(), ucfg, scratch)?;
-    Ok(result.unwrapped.mapv(f64::from))
+    driver.run(ifg.view(), correlation.view(), scratch)
+}
+
+/// Build the unwrap backend from the config: tophu when selected, else SNAPHU.
+fn unwrap_driver(cfg: &DisplacementWorkflow) -> UnwrapDriver {
+    match cfg.unwrap_options.unwrap_method {
+        UnwrapMethod::Tophu => UnwrapDriver::Tophu(tophu_config(cfg)),
+        _ => UnwrapDriver::Snaphu(unwrap_config(cfg)),
+    }
 }
 
 /// Map the config's SNAPHU options to the unwrap wrapper config.
 fn unwrap_config(cfg: &DisplacementWorkflow) -> UnwrapConfig {
     let snaphu = &cfg.unwrap_options.snaphu_options;
     UnwrapConfig {
-        cost: if snaphu.cost == "defo" {
-            CostMode::Defo
-        } else {
-            CostMode::Smooth
-        },
-        init: if snaphu.init_method == "mst" {
-            InitMethod::Mst
-        } else {
-            InitMethod::Mcf
-        },
+        cost: cost_mode(&snaphu.cost),
+        init: init_method(&snaphu.init_method),
         ntiles: snaphu.ntiles,
         tile_overlap: snaphu.tile_overlap,
         nproc: snaphu.n_parallel_tiles,
         snaphu_path: "snaphu".to_string(),
+    }
+}
+
+/// Map the config's tophu options to the multi-scale driver config. dolphin's
+/// `TophuOptions` carries no tile overlap; we add a fixed halo (clamped per tile)
+/// so the fine pass has boundary context for the 2π-reconciled merge.
+fn tophu_config(cfg: &DisplacementWorkflow) -> TophuConfig {
+    let t = &cfg.unwrap_options.tophu_options;
+    TophuConfig {
+        downsample_factor: t.downsample_factor,
+        ntiles: t.ntiles,
+        tile_overlap: TophuConfig::default().tile_overlap,
+        cost: cost_mode(&t.cost),
+        init: init_method(&t.init_method),
+        snaphu_path: "snaphu".to_string(),
+    }
+}
+
+/// SNAPHU cost mode from the config string (`defo` → deformation, else smooth).
+fn cost_mode(cost: &str) -> CostMode {
+    match cost {
+        "defo" => CostMode::Defo,
+        _ => CostMode::Smooth,
+    }
+}
+
+/// SNAPHU init method from the config string (`mst` → MST, else MCF).
+fn init_method(init: &str) -> InitMethod {
+    match init {
+        "mst" => InitMethod::Mst,
+        _ => InitMethod::Mcf,
     }
 }
 
