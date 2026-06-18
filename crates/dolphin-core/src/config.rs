@@ -320,21 +320,43 @@ impl Default for UnwrapOptions {
     }
 }
 
+/// Input-product reader selection. **Forward divergence:** dolphin v0.35.0 has
+/// no product-type field on `InputOptions` (it dispatches by workflow entry
+/// point), so this field is dolphinRust-only. It deserializes to the OPERA
+/// default when absent, so an existing dolphin YAML round-trips unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputType {
+    /// OPERA S1 CSLC: complex-f32 `(r, i)` HDF5 grids (the dolphin default).
+    #[default]
+    OperaCslc,
+    /// NISAR L-band geocoded SLC: complex-`f32` `{r, i}` compound grids in the
+    /// NISAR product group layout (camelCase coordinates + `epsg_code`
+    /// attribute). Differs from OPERA only in the geocoding-grid metadata.
+    NisarGslc,
+}
+
 /// Input granule discovery. dolphin `InputOptions`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputOptions {
-    /// Subdataset to use from HDF5/NetCDF CSLC files.
+    /// Input-product reader to use (OPERA CSLC vs NISAR GSLC). Forward
+    /// divergence from dolphin v0.35.0 (see [`InputType`]).
+    pub input_type: InputType,
+    /// Subdataset to use from HDF5/NetCDF CSLC files. For NISAR this is the
+    /// polarization grid path, e.g. `/science/LSAR/GSLC/grids/frequencyA/HH`.
     pub subdataset: Option<String>,
     /// Format of dates contained in CSLC filenames.
     pub cslc_date_fmt: String,
     /// Radar wavelength (meters); used to convert timeseries radians to meters.
+    /// S1 C-band ≈ 0.0555; NISAR L-band ≈ 0.24.
     pub wavelength: Option<f64>,
 }
 
 impl Default for InputOptions {
     fn default() -> Self {
         Self {
+            input_type: InputType::default(),
             subdataset: None,
             cslc_date_fmt: "%Y%m%d".into(),
             wavelength: None,

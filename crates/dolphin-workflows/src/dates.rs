@@ -77,6 +77,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_nisar_granule_name() {
+        // NISAR GSLC granule: the acquisition datetime token carries the date;
+        // the leading frame/track/product counters must not parse as a date.
+        let name =
+            "NISAR_L2_PR_GSLC_001_005_A_219_2000_SHNA_A_20240601T120000_20240601T120010_P01101_M_F_J_001.h5";
+        let d = parse_date(Path::new(name), "%Y%m%d").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2024, 6, 1).unwrap());
+    }
+
+    #[test]
     fn parses_separated_format() {
         let d = parse_date(Path::new("burst_2022-11-19.tif"), "%Y-%m-%d").unwrap();
         assert_eq!(d, NaiveDate::from_ymd_opt(2022, 11, 19).unwrap());

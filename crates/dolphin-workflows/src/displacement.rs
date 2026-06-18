@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod, UnwrapMethod};
+use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
 use dolphin_core::{Cf32, Cf64};
-use dolphin_io::{read_cslc_stack, read_geotransform, write_raster, GeoInfo};
+use dolphin_io::{
+    read_cslc_stack, read_geotransform, read_nisar_geotransform, read_nisar_stack, write_raster,
+    GeoInfo,
+};
 use dolphin_phaselink::ComputeEngine;
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
@@ -299,11 +302,15 @@ fn resolve_burst_geo(
     cols: usize,
 ) -> BurstGeo {
     let identity = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+    let geo_reader = match cfg.input_options.input_type {
+        InputType::OperaCslc => read_geotransform,
+        InputType::NisarGslc => read_nisar_geotransform,
+    };
     let read = cfg
         .input_options
         .subdataset
         .as_deref()
-        .and_then(|sds| read_geotransform(path, sds).ok());
+        .and_then(|sds| geo_reader(path, sds).ok());
     let (epsg, gt) = match read {
         Some(g) => (g.epsg, g.geotransform),
         None => (cfg.output_options.epsg.unwrap_or(0), identity),
@@ -329,11 +336,16 @@ fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Arr
         .subdataset
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let pairs: Vec<(PathBuf, String)> = files
-        .iter()
-        .map(|p| (p.clone(), subdataset.clone()))
-        .collect();
-    let stack = read_cslc_stack(&pairs)?;
+    let stack = match cfg.input_options.input_type {
+        InputType::OperaCslc => {
+            let pairs: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|p| (p.clone(), subdataset.clone()))
+                .collect();
+            read_cslc_stack(&pairs)?
+        }
+        InputType::NisarGslc => read_nisar_stack(files, &subdataset)?,
+    };
     Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
 }
 
@@ -577,6 +589,40 @@ mod tests {
         assert!(
             (got_mm_yr - injected_mm_yr).abs() < 1e-6,
             "recovered {got_mm_yr} mm/yr, injected {injected_mm_yr}"
+        );
+    }
+
+    /// NISAR L-band center wavelength (m): c / 1.2575 GHz ≈ 0.2384.
+    const NISAR_WAVELENGTH_M: f64 = 0.238_403_545;
+
+    /// Contract (DoD #3): the velocity→mm/yr scaling uses the configured NISAR
+    /// L-band λ, not the S1 default. A known LOS rate is recovered only when
+    /// `mm_per_rad` is fed the NISAR wavelength; feeding the S1 default mis-scales
+    /// it by the λ ratio (≈4.3×).
+    #[test]
+    fn velocity_uses_nisar_wavelength() {
+        let injected_mm_yr = -8.0; // subsidence, LOS
+        let days = [0.0, 12.0, 24.0, 36.0, 48.0, 60.0];
+        let phase_per_m = -4.0 * std::f64::consts::PI / NISAR_WAVELENGTH_M;
+        let rate_m_yr = injected_mm_yr / 1000.0;
+        let bands: Vec<f64> = days[1..]
+            .iter()
+            .map(|&d| rate_m_yr * (d / 365.25) * phase_per_m)
+            .collect();
+        let disp = Array3::from_shape_fn((bands.len(), 1, 1), |(t, _, _)| bands[t]);
+        let vel_rad = velocity_of(disp.view(), &days);
+
+        let got_nisar = vel_rad[(0, 0)] * mm_per_rad(Some(NISAR_WAVELENGTH_M));
+        assert!(
+            (got_nisar - injected_mm_yr).abs() < 1e-6,
+            "NISAR λ recovers {injected_mm_yr}, got {got_nisar}"
+        );
+        // mm_per_rad ∝ λ, so the S1 default mis-scales by λ_S1 / λ_NISAR ≈ 0.23×.
+        let got_s1_default = vel_rad[(0, 0)] * mm_per_rad(None);
+        let ratio = SENTINEL1_WAVELENGTH_M / NISAR_WAVELENGTH_M;
+        assert!(
+            (got_s1_default / got_nisar - ratio).abs() < 1e-6,
+            "S1-default scaling differs from NISAR by the λ ratio"
         );
     }
 

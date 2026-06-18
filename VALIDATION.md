@@ -264,6 +264,49 @@ silicon, prefer `compute_backend = auto` (CPU below the crossover) or `cpu`.
 `no-gpu` build → automatic CPU fallback with a warning, never a panic (contract:
 `engine_contract::no_adapter_falls_back_to_cpu_without_panic`).
 
+## NISAR / L-band ingest validation (2026-06-17, v1.3.0 part 1)
+
+Real-data validation of the NISAR/L-band ingest path (NISAR_INGEST_PROMPT.md). **The
+reader is validated against a real granule; full multi-date displacement is deferred.**
+
+**Granule.** `NISAR_L2_PR_GSLC_010_165_D_100_2005_DHDH_M_20260120T155930_..._001.h5`
+(collection `NISAR_L2_GSLC_BETA_V1`, 7.24 GB), fetched from ASF/Earthdata
+(`nisar.asf.earthdatacloud.nasa.gov`) with the `validation/creds.sh` bearer token. The
+collection has 23,450 granules — real NISAR data is plentiful and reachable.
+
+**De-risk correction (load-bearing).** The prompt's central assumption — NISAR is a
+*complex-int16* compound — **does not hold**. `h5dump` on the real granule shows
+`/science/LSAR/GSLC/grids/frequencyA/HH` is `H5T_COMPOUND { F32 "r"; F32 "i" }`
+(complex64), i.e. the **same h5py `(r,i)` layout as OPERA CSLC**. `xCoordinates`/
+`yCoordinates` are F64; `projection.epsg_code` is an I64 attribute (= 32736). Consequence:
+the complex read needs no NISAR-specific decoding (reads as `Cf32`); the *only* NISAR-specific
+code is the geocoding-metadata geotransform reader. The reader was corrected from int16 to
+f32 accordingly. **(Flagged for sign-off — this overrides the prompt's "don't re-litigate
+int16" instruction because the real data contradicts it.)**
+
+**Reader result — PASS** (`dolphin-io` test `nisar_real_data`, gated on `NISAR_REAL_H5`):
+
+| Check | Result |
+|---|---|
+| HH complex decode (center 256×256 block, `{r,i}` f32 → `Cf32`) | **65536/65536 finite** samples |
+| EPSG (from `projection.epsg_code` attribute) | **32736** (WGS84 / UTM 36S) |
+| Grid origin (upper-left) | (290880.0, 7611840.0) m |
+| Pixel posting (dx, dy) | (10.0, −5.0) m |
+
+(The grid corners are NaN fill outside the swath footprint — the geocoded grid is larger
+than the imaged area — so the validation samples the grid center.)
+
+**Deferred — full real-data displacement.** A real velocity/displacement product needs ≥2
+co-located repeat-pass acquisitions over one frame (~15 GB+ to download, plus coherent
+repeat coverage). Not attempted this run; the end-to-end pipeline is instead proven on a
+synthesized multi-acquisition NISAR stack (`nisar_e2e_contract`). **Where to look next:** CMR
+`short_name=NISAR_L2_GSLC_BETA_V1` filtered to a single `track/frame` with ≥2 dates.
+
+**Limitation — atmospheric correction.** This is a geometrically-correct but
+*atmospherically-uncorrected* L-band product. Ionospheric delay is ~16× the C-band effect
+and is mandatory for a *usable* L-band displacement product; ionospheric + tropospheric
+corrections are the separate later half of v1.3.0.
+
 ## Open / pending
 
 - **Real-data velocity absolute scale under strong signal** — RESOLVED (2026-06-17, v1.1.0):

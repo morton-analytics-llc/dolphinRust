@@ -5,7 +5,7 @@
 //! groups we don't model) must deserialize, and our own emit must round-trip.
 
 use dolphin_core::config::{
-    CompressedSlcPlan, DisplacementWorkflow, ShpMethod, TimeseriesMethod, UnwrapMethod,
+    CompressedSlcPlan, DisplacementWorkflow, InputType, ShpMethod, TimeseriesMethod, UnwrapMethod,
 };
 
 #[test]
@@ -69,6 +69,43 @@ fn default_config_round_trips() {
     let yaml = original.to_yaml().unwrap();
     let parsed = DisplacementWorkflow::from_yaml(&yaml).unwrap();
     assert_eq!(original, parsed);
+}
+
+/// Forward divergence: `input_options.input_type` is dolphinRust-only. A legacy
+/// dolphin YAML (no `input_type`) must default to OPERA CSLC; a NISAR config must
+/// parse the `nisar_gslc` value and round-trip. The enum string is `snake_case`.
+#[test]
+fn nisar_input_type_round_trips_and_defaults_to_opera() {
+    assert_eq!(
+        DisplacementWorkflow::default().input_options.input_type,
+        InputType::OperaCslc
+    );
+    assert_eq!(
+        serde_yaml::to_string(&InputType::NisarGslc).unwrap().trim(),
+        "nisar_gslc"
+    );
+
+    // Legacy dolphin YAML with no input_type → OPERA default (round-trips).
+    let legacy = DisplacementWorkflow::from_yaml("cslc_file_list: [/data/a.h5]").unwrap();
+    assert_eq!(legacy.input_options.input_type, InputType::OperaCslc);
+
+    // A NISAR config parses and round-trips with the L-band wavelength + grid path.
+    let yaml = r#"
+input_options:
+  input_type: nisar_gslc
+  subdataset: /science/LSAR/GSLC/grids/frequencyA/HH
+  wavelength: 0.238403545
+cslc_file_list: [/data/nisar_20240601.h5]
+"#;
+    let c = DisplacementWorkflow::from_yaml(yaml).unwrap();
+    assert_eq!(c.input_options.input_type, InputType::NisarGslc);
+    assert_eq!(
+        c.input_options.subdataset.as_deref(),
+        Some("/science/LSAR/GSLC/grids/frequencyA/HH")
+    );
+    assert_eq!(c.input_options.wavelength, Some(0.238_403_545));
+    let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();
+    assert_eq!(reparsed, c, "NISAR config round-trips");
 }
 
 /// A dolphin-style YAML: partial fields set, plus the `tophu_options` solver

@@ -4,6 +4,31 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v1.3.0
+
+### Added
+- **NISAR / L-band geocoded-SLC ingest path** (first half of v1.3.0) — reads a NISAR L-band
+  GSLC stack end-to-end into a displacement product.
+  - `dolphin-io::nisar` — `read_nisar_rslc` / `read_nisar_stack` read the NISAR complex-`f32`
+    `{r, i}` compound grid as `Cf32`; `read_nisar_geotransform` derives the affine transform
+    from the NISAR `xCoordinates`/`yCoordinates` arrays and the `projection.epsg_code`
+    attribute (GDAL returns identity for this layout). Contract test vs a synthesized
+    NISAR-layout fixture (pixel values, grid shape, geotransform, EPSG).
+  - **De-risk correction:** the prompt assumed NISAR was a *complex-int16* compound; the real
+    `NISAR_L2_GSLC_BETA_V1` granule is **complex-`f32` `{r, i}`** (same layout as OPERA), so
+    the only NISAR-specific code is the geocoding metadata reader. Validated end-to-end on a
+    real 7.2 GB granule (reader + geotransform/EPSG) — see `VALIDATION.md`.
+  - `input_options.input_type: InputType { opera_cslc (default) | nisar_gslc }` selects the
+    reader. **Forward divergence** — dolphin v0.35.0 has no product-type field (it dispatches
+    by workflow entrypoint); legacy YAML round-trips to `opera_cslc`.
+  - L-band wavelength (≈0.2384 m) threads through `input_options.wavelength` to the `−λ/4π`
+    velocity scaling (`velocity_uses_nisar_wavelength` proves the NISAR λ is used, not the S1
+    default). No new solver — L-band is a parameter change.
+  - End-to-end contract (`nisar_e2e_contract`): a multi-acquisition synthesized NISAR stack
+    runs through `run_displacement` → typed output + COGs, grid/EPSG/geotransform correct.
+  - **Limitation:** geometrically correct but **atmospherically uncorrected**. Ionospheric
+    (~16× the C-band effect) + tropospheric corrections are a separate later v1.3.0 loop.
+
 ## [Unreleased] — v1.2.0
 
 ### Added

@@ -82,6 +82,23 @@ Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, tes
 --no-deps`. **v1.2.0 complete.** **Nothing pushed** — committed on branch `v1.2-unwrap`,
 awaiting sign-off.
 
+## v1.3.0 NISAR / L-band ingest progress (branch `v1.3-nisar`, per NISAR_INGEST_PROMPT.md)
+
+First half of v1.3.0 — a NISAR L-band GSLC stack read end-to-end into displacement.
+Atmospheric (ionospheric/tropospheric) corrections are the *other* half, a separate later loop.
+
+| Item | State |
+|---|---|
+| NISAR reader (complex-f32 compound → Cf32) + custom geotransform/EPSG | ✅ done — `dolphin-io::nisar`: `read_nisar_rslc`/`read_nisar_stack` read the `{r,i}` **f32** compound as `Cf32`; `read_nisar_geotransform` from NISAR `xCoordinates`/`yCoordinates` + `projection.epsg_code` attribute. Contract `reads_synthesized_nisar_fixture` (pixels, shape, geotransform, EPSG). **⚠️ De-risk correction:** the prompt assumed complex-int16; the real granule is **complex-f32 `{r,i}`** (same layout as OPERA — only the geocoding metadata is NISAR-specific). hdf5-metno reads it cleanly |
+| Config + product detection | ✅ done — `input_options.input_type: {opera_cslc | nisar_gslc}` (forward divergence; legacy YAML → opera_cslc), NISAR subdataset/granule-date parse; reader + geotransform dispatch in `run_displacement`. Contracts: `nisar_input_type_round_trips_and_defaults_to_opera`, `parses_nisar_granule_name` |
+| L-band λ end-to-end | ✅ done — NISAR λ ≈ 0.2384 m threads via `input_options.wavelength` to `−λ/4π`; `velocity_uses_nisar_wavelength` proves the NISAR λ is used (not the S1 default). No new solver |
+| End-to-end on a synthesized NISAR stack | ✅ done — `nisar_e2e_contract`: multi-acquisition NISAR fixture → `run_displacement` → typed output + COGs, grid/EPSG/geotransform correct |
+| Real/sample NISAR granule | ✅ reader validated on real data / ⏳ full stack deferred — one real 7.2 GB `NISAR_L2_GSLC_BETA_V1` granule fetched via Earthdata/ASF; `nisar_real_data` test reads a center HH block (65536/65536 finite f32 samples) + geotransform (EPSG 32736, 10×5 m posting). **Full multi-date displacement deferred** — a real velocity needs ≥2 co-located repeat-pass dates (~15 GB+); single granule = single acquisition. See VALIDATION.md |
+| Atmospheric correction (ionosphere/troposphere) | ⛔ out of scope this loop — the product is geometrically correct but **atmospherically uncorrected**; ionosphere ~16× C-band, mandatory for *usable* L-band. Separate later v1.3.0 loop |
+
+Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, test, `cargo doc
+--no-deps`. **Nothing pushed** — committed on branch `v1.3-nisar`, awaiting sign-off.
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★

@@ -97,8 +97,12 @@ per-ministack stitching matches the oracle ✅; dolphinRust running in eo's work
 
 ## v1.3.0 — 2026-11-01 · "NISAR / L-band + atmosphere"
 
-- **NISAR RSLC reader** (~1–2 wks). HDF5 + complex-int16 compound types (de-risk the
-  hdf5-metno ergonomics early — it blocks everything L-band). NISAR product group structure.
+- **NISAR RSLC reader** ✅ (v1.3 part 1). HDF5 + complex-int16 compound types — hdf5-metno
+  reads the `{r,i}` int16 compound via a derived `H5Type` (de-risk cleared). NISAR product
+  group structure + custom geotransform/EPSG (`epsg_code` attribute). `input_type: nisar_gslc`
+  selector (forward divergence); L-band λ threads to mm/yr. End-to-end on a synthesized NISAR
+  stack (typed output + COGs). **Atmospheric corrections still pending** (below) — the product
+  is geometrically correct but atmospherically uncorrected.
 - **L-band ionospheric correction** (~1–2 wks). TEC/IONEx — ionosphere is ~16× the C-band
   effect, so this is mandatory for usable L-band, not optional.
 - **OPERA L4 tropospheric product ingest** (~3–5 days). Free public netCDF aligned to

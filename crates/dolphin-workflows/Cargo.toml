@@ -39,6 +39,8 @@ no-gpu = ["dolphin-phaselink/no-gpu"]
 num-complex.workspace = true
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
+# Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.
+dolphin-io = { workspace = true, features = ["nisar-fixture"] }
 
 [[example]]
 name = "run_synthetic"
