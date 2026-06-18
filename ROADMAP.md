@@ -54,7 +54,7 @@ driven by the six factors above.
 | v1.1.0 | 2026-06-16 | ✅ shipped | eo adoption + velocity scale + auto ref-point |
 | v1.2.0 | 2026-06-17 | ✅ shipped | Quality layers (CRLB/closure) + tophu unwrapping + stitching |
 | v1.3.0 | 2026-06-17 | ✅ complete, pending tag | NISAR/L-band ingest + atmospheric corrections (incl. tropo 4326→UTM warp) |
-| v1.4.0 | 2026-06-17 | 🔄 in flight today | Performance + NRT incremental + phase-bias + 3D-unwrap interface |
+| v1.4.0 | 2026-06-18 | ✅ shipped | Performance (PL 2.38×) + NRT incremental (bit-identical) + phase-bias + 3D-unwrap interface |
 | v1.5.0+ | 2026-H2 → 2027 | ⏳ gated | Capability-gated: real-data validation, discrete-GPU, lead-dolphin |
 
 The original speed **baseline** is committed (`bench/results.json`, `bench/runs/`) — it gates
@@ -133,8 +133,21 @@ in `REMAINING_WORK_PROMPT.md`.
   bit-identical (the end-to-end oracle contract still passes through the new dispatch). No spurt
   port.
 
-**Exit:** NRT == full rerun within tolerance; published speedup vs baseline; phase-bias reduces
-non-closure on a long series; unwrap interface ready for a 3D backend.
+**Exit (met, v1.4.0 — 2026-06-18):** NRT incremental update is **bit-identical** to a full rerun —
+both at the phase-linking core (`update_sequential`) and end-to-end (`update_displacement` + the
+`dolphin stream` CLI), max|Δ| = 0 through SNAPHU + SBAS. **Published speedup:** covariance
+Hermitian rewrite makes real-frame phase-linking **2.38× faster** (host-controlled A/B; beats the
+committed baseline absolutely; `bench/PERF.md`). **Phase-bias** correction (leads the oracle)
+reduces non-closure **0.800 → 0.095 rad (8.4×)** on a 100-date series, analytic-exact for constant
+bias. **Unwrap interface** is behind the network-level `UnwrapBackend` trait, 3D-ready, output
+unchanged.
+
+Remaining deferrals (honest): **GPU CRLB** (CRLB stays CPU/faer-f64; GPU port is a follow-up);
+**NISAR multi-date real displacement** (needs ≥2 co-located calibrated repeat-pass dates, ~2026-07+
+— reader + L-band path validated on a single granule); **spurt 3D-unwrap port** (interface ready;
+port only once spurt stabilizes or dolphin adopts it); **time-varying phase bias** (the shipped
+model is first-order constant-rate); **native arm64 SNAPHU** (end-to-end is still gated by the
+Rosetta-emulated binary — a packaging fix, not algorithm).
 
 ---
 

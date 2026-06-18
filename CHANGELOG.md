@@ -4,7 +4,7 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v1.4.0
+## [v1.4.0] — 2026-06-18
 
 ### Changed
 - **Phase-linking covariance — ~2.4× faster** (Phase 3), no accuracy change. The per-pixel
