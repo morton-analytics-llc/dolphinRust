@@ -126,7 +126,12 @@ in `REMAINING_WORK_PROMPT.md`.
   layer), `θ_n ← θ_n·e^{−j n β̄}`. Analytic contract exact (constant bias recovered to <1e-9);
   **measured non-closure reduction 0.800 → 0.095 rad (8.4×)** on a 100-date series; wired
   end-to-end. Numbers in VALIDATION.md.
-- **3D-unwrap-ready dispatch interface** — trait behind which SNAPHU/tophu sit; no spurt port.
+- **3D-unwrap-ready dispatch interface** ✅ — `dolphin-workflows::unwrap_backend::UnwrapBackend`,
+  a **network-level** trait (receives the linked phase + date pairs, not pre-formed 2D ifgs) so a
+  spurt-style 3D spatiotemporal solver drops in as a new backend with no pipeline change. SNAPHU
+  (`SnaphuBackend`) and tophu (`TophuBackend`) implement it via the unchanged per-ifg loop; output
+  bit-identical (the end-to-end oracle contract still passes through the new dispatch). No spurt
+  port.
 
 **Exit:** NRT == full rerun within tolerance; published speedup vs baseline; phase-bias reduces
 non-closure on a long series; unwrap interface ready for a 3D backend.
