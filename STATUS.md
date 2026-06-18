@@ -123,7 +123,8 @@ the deferred step is done: `warp_to_frame` reprojects the global EPSG:4326 L4 pr
 UTM frame; `build_troposphere` dispatches to it on CRS mismatch (bilinear when same-CRS).
 `DelayGrid` carries the source CRS WKT; a CRS-less L4 grid spanning geographic-degree ranges
 is assigned EPSG:4326 (plate-carrée product spec). Fixture + real-frame contracts green; gates
-green (default + `no-gpu`); sign guard green. **Awaiting sign-off to merge `--no-ff` + tag v1.3.0.**
+green (default + `no-gpu`); sign guard green. **Merged `--no-ff` to `main` and tagged `v1.3.0`
+(2026-06-17).** v1.3.0 complete.
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
