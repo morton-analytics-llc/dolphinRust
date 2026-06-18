@@ -592,6 +592,40 @@ mod tests {
         );
     }
 
+    /// NISAR L-band center wavelength (m): c / 1.2575 GHz ≈ 0.2384.
+    const NISAR_WAVELENGTH_M: f64 = 0.238_403_545;
+
+    /// Contract (DoD #3): the velocity→mm/yr scaling uses the configured NISAR
+    /// L-band λ, not the S1 default. A known LOS rate is recovered only when
+    /// `mm_per_rad` is fed the NISAR wavelength; feeding the S1 default mis-scales
+    /// it by the λ ratio (≈4.3×).
+    #[test]
+    fn velocity_uses_nisar_wavelength() {
+        let injected_mm_yr = -8.0; // subsidence, LOS
+        let days = [0.0, 12.0, 24.0, 36.0, 48.0, 60.0];
+        let phase_per_m = -4.0 * std::f64::consts::PI / NISAR_WAVELENGTH_M;
+        let rate_m_yr = injected_mm_yr / 1000.0;
+        let bands: Vec<f64> = days[1..]
+            .iter()
+            .map(|&d| rate_m_yr * (d / 365.25) * phase_per_m)
+            .collect();
+        let disp = Array3::from_shape_fn((bands.len(), 1, 1), |(t, _, _)| bands[t]);
+        let vel_rad = velocity_of(disp.view(), &days);
+
+        let got_nisar = vel_rad[(0, 0)] * mm_per_rad(Some(NISAR_WAVELENGTH_M));
+        assert!(
+            (got_nisar - injected_mm_yr).abs() < 1e-6,
+            "NISAR λ recovers {injected_mm_yr}, got {got_nisar}"
+        );
+        // mm_per_rad ∝ λ, so the S1 default mis-scales by λ_S1 / λ_NISAR ≈ 0.23×.
+        let got_s1_default = vel_rad[(0, 0)] * mm_per_rad(None);
+        let ratio = SENTINEL1_WAVELENGTH_M / NISAR_WAVELENGTH_M;
+        assert!(
+            (got_s1_default / got_nisar - ratio).abs() < 1e-6,
+            "S1-default scaling differs from NISAR by the λ ratio"
+        );
+    }
+
     /// The old bug: assuming a 12-day cadence on a non-12-day stack mis-scales the
     /// rate by the cadence ratio. Real baselines must make the result cadence-free.
     #[test]
