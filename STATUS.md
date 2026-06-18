@@ -126,6 +126,15 @@ is assigned EPSG:4326 (plate-carrée product spec). Fixture + real-frame contrac
 green (default + `no-gpu`); sign guard green. **Merged `--no-ff` to `main` and tagged `v1.3.0`
 (2026-06-17).** v1.3.0 complete.
 
+## v1.4.0 progress (per REMAINING_WORK_PROMPT.md Phases 2–5)
+
+| Phase | Status |
+|---|---|
+| 2. NRT incremental ministack updates (branch `v1.4-nrt`) | ✅ phase-linking stage — `run_sequential_resumable` + `update_sequential` fold new acquisitions via the carried compressed SLC, re-phase-linking only the open trailing ministack + new ones. **Bit-identical to a full rerun** (max\|Δ\| = 0 across cpx_phase/compressed/temp_coh/CRLB/closure; `nrt_incremental_contract.rs`: block, one-at-a-time streaming, sealed-boundary). `MiniStackPlanner::plan_with_offset` resumes the carry. Feed-forward causality ⇒ exact, not just tolerant. Downstream (network→unwrap→timeseries→velocity) recomputes from the updated phase history (non-causal); end-to-end `update_displacement` + CLI streaming intentionally deferred (plumbing, not algorithm). Gates green (default + `no-gpu`); sign guard green. **Awaiting sign-off to merge.** |
+| 3. Performance vs baseline | ⏳ next |
+| 4. Phase-bias / non-closure correction | ⏳ |
+| 5. 3D-unwrap-ready dispatch interface | ⏳ |
+
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
 - [x] 1 — Covariance + EMI/EVD phase linking (`dolphin-phaselink`) ★

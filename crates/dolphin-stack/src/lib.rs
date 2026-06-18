@@ -53,13 +53,34 @@ impl MiniStackPlanner {
     /// # Errors
     /// Returns `Err` if `ministack_size < 2` (dolphin's minimum).
     pub fn plan(&self, ministack_size: usize) -> Result<Vec<MiniStack>, &'static str> {
+        self.plan_with_offset(ministack_size, 0)
+    }
+
+    /// Plan ministacks for a stack that **resumes** an earlier run, where
+    /// `batch_offset` ministacks have already been sealed and compressed. The
+    /// batch index (which sets `num_compressed` and the reference indices) is
+    /// shifted by `batch_offset` so the carried-compressed accounting continues
+    /// the prior sequence, while `real_start` stays relative to this (tail) stack.
+    /// `plan` is the special case `batch_offset = 0`.
+    ///
+    /// The resumed tail must begin on a ministack boundary — guaranteed because a
+    /// sealed ministack is always full, so `batch_offset · ministack_size` real
+    /// SLCs precede the tail.
+    ///
+    /// # Errors
+    /// Returns `Err` if `ministack_size < 2` (dolphin's minimum).
+    pub fn plan_with_offset(
+        &self,
+        ministack_size: usize,
+        batch_offset: usize,
+    ) -> Result<Vec<MiniStack>, &'static str> {
         if ministack_size < 2 {
             return Err("cannot create ministacks with size < 2");
         }
         let ministacks = (0..self.num_slc)
             .step_by(ministack_size)
             .enumerate()
-            .map(|(batch, start)| self.batch(batch, start, ministack_size))
+            .map(|(batch, start)| self.batch(batch + batch_offset, start, ministack_size))
             .collect();
         Ok(ministacks)
     }

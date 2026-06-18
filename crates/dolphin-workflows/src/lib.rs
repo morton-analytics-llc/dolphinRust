@@ -14,4 +14,7 @@ pub mod displacement;
 pub mod sequential;
 
 pub use displacement::{run_displacement, DisplacementOutput};
-pub use sequential::{run_sequential, SequentialConfig, SequentialOutput};
+pub use sequential::{
+    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    SequentialOutput, SequentialState,
+};
