@@ -15,6 +15,7 @@ readme = "README.md"
 dolphin-core.workspace = true
 ndarray.workspace = true
 num-complex.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
