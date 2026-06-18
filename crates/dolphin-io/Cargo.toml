@@ -11,6 +11,11 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 
+[features]
+# Exposes the NISAR-layout HDF5 fixture generator (`nisar_fixture`) for the
+# reader contract test and the workflows end-to-end NISAR stack test.
+nisar-fixture = []
+
 [dependencies]
 dolphin-core.workspace = true
 ndarray.workspace = true
