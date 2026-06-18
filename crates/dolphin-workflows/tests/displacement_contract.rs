@@ -74,6 +74,35 @@ fn end_to_end_displacement_matches_oracle() {
     assert!(out.closure_phase.is_none(), "closure off by default");
 }
 
+/// Enabling the phase-bias correction (Michaelides 2022) runs end-to-end through
+/// unwrap + inversion and produces a finite displacement of the right shape. The
+/// correction leads Python dolphin (no oracle), so this guards the wiring; the
+/// numeric behaviour is validated by `dolphin-phaselink`'s analytic + reduction
+/// contracts. Default-off parity is covered by the oracle test above.
+#[test]
+fn phase_bias_correction_runs_end_to_end() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping phase-bias end-to-end: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg =
+        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    cfg.phase_linking.correct_phase_bias = true;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_phasebias_e2e");
+    let out = run_displacement(&cfg).unwrap();
+    assert!(
+        out.displacement.iter().all(|v| v.is_finite()),
+        "phase-bias-corrected displacement must be finite"
+    );
+    let (rows, cols) = out.temporal_coherence.dim();
+    assert_eq!(
+        (out.displacement.dim().1, out.displacement.dim().2),
+        (rows, cols)
+    );
+}
+
 /// Enabling `write_closure_phase` produces the closure layer end-to-end, with
 /// `n_dates - 2` bands; the layer matches the kernel's per-triplet output.
 #[test]

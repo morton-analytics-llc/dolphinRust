@@ -15,7 +15,7 @@ use dolphin_io::{
     read_cslc_stack, read_geotransform, read_nisar_geotransform, read_nisar_stack, write_raster,
     GeoInfo,
 };
-use dolphin_phaselink::ComputeEngine;
+use dolphin_phaselink::{correct_phase_bias, estimate_bias_velocity, ComputeEngine};
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
@@ -128,7 +128,10 @@ fn finish_displacement(
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
     let stitched = stitch_bursts(bursts)?;
-    let pl = stitched.pl;
+    let mut pl = stitched.pl;
+    if cfg.phase_linking.correct_phase_bias {
+        apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
+    }
     let temporal_coherence = stitched.temp_coh;
     let crlb_sigma = stitched.crlb_sigma;
     let closure_phase = stitched.closure_phase;
@@ -561,6 +564,16 @@ fn phase_link(
     run_sequential(stack, &sequential_config(cfg), engine).map_err(anyhow::Error::msg)
 }
 
+/// Subtract the phase-bias (non-closure) cumulative bias from the stitched linked
+/// phase, estimated from the closure-phase layer (Michaelides et al. 2022). Opt-in
+/// via `phase_linking.correct_phase_bias`; the closure layer is forced on with it.
+fn apply_phase_bias(pl: &mut Array3<Cf64>, closure: Option<&Array3<f64>>) -> Result<()> {
+    let closure = closure.context("phase-bias correction requires the closure-phase layer")?;
+    let beta = estimate_bias_velocity(closure.view());
+    correct_phase_bias(pl, beta.view());
+    Ok(())
+}
+
 /// Map the workflow config onto the sequential-estimator config (shared by the
 /// batch and incremental phase-linking paths).
 fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
@@ -575,7 +588,10 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
         compute_crlb: cfg.phase_linking.write_crlb,
-        compute_closure_phase: cfg.phase_linking.write_closure_phase,
+        // The phase-bias correction consumes the closure layer, so force it on
+        // when the correction is enabled even if the raster isn't written.
+        compute_closure_phase: cfg.phase_linking.write_closure_phase
+            || cfg.phase_linking.correct_phase_bias,
     }
 }
 

@@ -120,6 +120,11 @@ pub struct PhaseLinkingOptions {
     pub write_crlb: bool,
     /// Write the closure-phase raster.
     pub write_closure_phase: bool,
+    /// Apply the phase-bias / non-closure correction (Michaelides et al. 2022) to
+    /// the linked-phase series before the interferogram network. **Off by default**
+    /// (this leads Python dolphin, which has no such correction; enabling it changes
+    /// the output). Forces closure-phase computation when on. Forward divergence.
+    pub correct_phase_bias: bool,
 }
 
 impl Default for PhaseLinkingOptions {
@@ -139,6 +144,7 @@ impl Default for PhaseLinkingOptions {
             compressed_slc_plan: CompressedSlcPlan::default(),
             write_crlb: true,
             write_closure_phase: false,
+            correct_phase_bias: false,
         }
     }
 }
