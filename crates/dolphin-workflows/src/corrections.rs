@@ -14,7 +14,7 @@ use dolphin_core::config::CorrectionOptions;
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
-    read_l4_netcdf, read_l4_total, resample_bilinear, DelayGrid,
+    read_l4_netcdf, read_l4_total, resample_bilinear, warp_to_frame, DelayGrid,
 };
 use dolphin_io::grid_centroid_lonlat;
 use ndarray::{Array3, Axis};
@@ -156,8 +156,7 @@ fn build_troposphere(
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
         let grid = read_tropo(nc, &opts.troposphere_variable)?;
-        check_epsg(grid.epsg, epsg, nc);
-        let band = resample_bilinear(grid.data.view(), grid.geotransform, gt, (rows, cols));
+        let band = resample_to_frame(&grid, gt, epsg, (rows, cols), nc)?;
         out.index_axis_mut(Axis(0), t).assign(&(band * slant));
     }
     Ok(Some(out))
@@ -173,16 +172,42 @@ fn read_tropo(nc: &Path, var: &str) -> Result<DelayGrid> {
     grid.map_err(anyhow::Error::msg)
 }
 
-/// Warn (don't fail) if a tropospheric product carries a CRS differing from the
-/// frame; resampling assumes a shared CRS.
-fn check_epsg(src: Option<u32>, frame: u32, path: &Path) {
-    if matches!(src, Some(e) if e != frame) {
-        tracing::warn!(
-            file = %path.display(),
-            src_epsg = src,
-            frame_epsg = frame,
-            "tropospheric product CRS differs from frame; resampling assumes a shared CRS"
-        );
+/// Resample a tropospheric delay grid onto the frame. When the source CRS matches
+/// the frame this is the plain bilinear resample; when it differs (e.g. a global
+/// EPSG:4326 OPERA L4 product onto a UTM frame) it reprojects via GDAL warp. With
+/// no source CRS at all it falls back to bilinear under the shared-CRS assumption,
+/// with a warning.
+fn resample_to_frame(
+    grid: &DelayGrid,
+    gt: [f64; 6],
+    frame_epsg: u32,
+    shape: (usize, usize),
+    path: &Path,
+) -> Result<ndarray::Array2<f64>> {
+    let (rows, cols) = shape;
+    match grid.epsg {
+        Some(e) if e == frame_epsg => Ok(resample_bilinear(
+            grid.data.view(),
+            grid.geotransform,
+            gt,
+            (rows, cols),
+        )),
+        _ if grid.srs_wkt.is_some() || grid.epsg.is_some() => {
+            warp_to_frame(grid, gt, frame_epsg, (rows, cols)).map_err(anyhow::Error::msg)
+        }
+        _ => {
+            tracing::warn!(
+                file = %path.display(),
+                frame_epsg,
+                "tropospheric product carries no CRS; resampling assumes a shared CRS"
+            );
+            Ok(resample_bilinear(
+                grid.data.view(),
+                grid.geotransform,
+                gt,
+                (rows, cols),
+            ))
+        }
     }
 }
 
@@ -217,6 +242,88 @@ fn parse_time_token(w: &[char]) -> Option<f64> {
 mod tests {
     use super::*;
     use ndarray::Array3;
+
+    /// Write a single-band EPSG:4326 OPERA-L4-format netCDF (variable `Band1`).
+    fn write_4326_netcdf(path: &Path, field: &ndarray::Array2<f64>, gt: [f64; 6]) {
+        use gdal::raster::Buffer;
+        use gdal::spatial_ref::SpatialRef;
+        use gdal::DriverManager;
+        let (rows, cols) = field.dim();
+        let mem = DriverManager::get_driver_by_name("MEM").unwrap();
+        let mut src = mem
+            .create_with_band_type::<f64, _>("", cols, rows, 1)
+            .unwrap();
+        src.set_geo_transform(&gt).unwrap();
+        src.set_spatial_ref(&SpatialRef::from_epsg(4326).unwrap())
+            .unwrap();
+        {
+            let mut band = src.rasterband(1).unwrap();
+            let mut buf = Buffer::new((cols, rows), field.iter().copied().collect());
+            band.write((0, 0), (cols, rows), &mut buf).unwrap();
+        }
+        let nc = DriverManager::get_driver_by_name("netCDF").unwrap();
+        src.create_copy(&nc, path, &Default::default()).unwrap();
+    }
+
+    /// End-to-end (Phase 1): two synthesized **4326** OPERA-L4 netCDFs resampled
+    /// through `build_troposphere` onto a **UTM 32610** frame land the analytic
+    /// per-date zenith delay at known frame pixels — the warp dispatch, proven
+    /// through the pipeline stage, not just the bare warp fn.
+    #[test]
+    fn build_troposphere_warps_4326_onto_utm_frame() {
+        use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+
+        let tmp = std::env::temp_dir();
+        let f0 = tmp.join("dolphin_tropo_warp_d0.nc");
+        let f1 = tmp.join("dolphin_tropo_warp_d1.nc");
+        // date0 = 1.0 constant; date1 = 1.0 + g(lon,lat), g linear in (lon,lat).
+        let g = |lon: f64, lat: f64| 0.10 * (lon + 123.0) + 0.05 * (lat - 38.0);
+        let src_gt = [-124.0, 0.1, 0.0, 39.0, 0.0, -0.1];
+        let d0 = ndarray::Array2::<f64>::from_elem((21, 21), 1.0);
+        let d1 = ndarray::Array2::from_shape_fn((21, 21), |(r, col)| {
+            let lon = src_gt[0] + (col as f64 + 0.5) * src_gt[1];
+            let lat = src_gt[3] + (r as f64 + 0.5) * src_gt[5];
+            1.0 + g(lon, lat)
+        });
+        write_4326_netcdf(&f0, &d0, src_gt);
+        write_4326_netcdf(&f1, &d1, src_gt);
+
+        let (rows, cols) = (5_usize, 5_usize);
+        let dst_gt = [495_000.0, 2_000.0, 0.0, 4_211_000.0, 0.0, -2_000.0];
+        let opts = CorrectionOptions {
+            troposphere_files: vec![f0.clone(), f1.clone()],
+            troposphere_variable: "Band1".to_string(),
+            incidence_angle_deg: 0.0, // slant = 1, so zenith delay lands unscaled
+            ..Default::default()
+        };
+        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610)
+            .unwrap()
+            .expect("troposphere layers present");
+
+        let mut utm = SpatialRef::from_epsg(32610).unwrap();
+        let mut wgs = SpatialRef::from_epsg(4326).unwrap();
+        utm.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        wgs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        let ct = CoordTransform::new(&utm, &wgs).unwrap();
+        for (r, cc) in [(0_usize, 0_usize), (2, 2), (4, 4)] {
+            let x = dst_gt[0] + (cc as f64 + 0.5) * dst_gt[1];
+            let y = dst_gt[3] + (r as f64 + 0.5) * dst_gt[5];
+            let (mut xs, mut ys, mut zs) = ([x], [y], []);
+            ct.transform_coords(&mut xs, &mut ys, &mut zs).unwrap();
+            let expected = 1.0 + g(xs[0], ys[0]);
+            assert!(
+                (layers[(0, r, cc)] - 1.0).abs() < 5e-3,
+                "date0 should be 1.0"
+            );
+            assert!(
+                (layers[(1, r, cc)] - expected).abs() < 5e-3,
+                "date1 ({r},{cc}): {} vs {expected}",
+                layers[(1, r, cc)]
+            );
+        }
+        let _ = std::fs::remove_file(&f0);
+        let _ = std::fs::remove_file(&f1);
+    }
 
     /// Corrections off → no layers, displacement untouched (DoD #1).
     #[test]

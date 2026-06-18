@@ -18,11 +18,17 @@ All notable changes to dolphinRust are documented here. The format follows
     `(f_C/f_L)² ≈ 18×` C-band for the same TEC. Closed-form contract green; **validated on a
     real IGS final GIM from CDDIS** — 56.5 TECU → 14.4 m L-band delay (18.5× C-band).
   - **Troposphere (`dolphin-corrections::troposphere`)** — OPERA L4 (`OPERA_L4_TROPO-ZENITH_V1`)
-    netCDF ingest via GDAL's `NETCDF:` driver, bilinear resample to the frame grid, zenith→slant
-    by `1/cos(inc)`. Synthesized-fixture contract green; **real granule ingested (ASF, 2 GB)** —
-    total ZTD = `hydrostatic_delay` + `wet_delay` (the real product exposes two fields, not one)
-    ≈ 2.79 m centre. Full real-frame application (global EPSG:4326 → UTM warp) is the remaining
-    deferred step (see `VALIDATION.md`).
+    netCDF ingest via GDAL's `NETCDF:` driver, then a **reprojecting resample**: same-CRS grids
+    take the bilinear path, cross-CRS grids (global EPSG:4326 product → UTM frame) take the new
+    `warp_to_frame` (GDAL bilinear `reproject`), zenith→slant by `1/cos(inc)`. Synthesized-fixture
+    and 4326→UTM warp contracts green (analytic delay recovered at known frame pixels `< 5e-3 m`,
+    bare-warp + end-to-end through `build_troposphere`); the old CRS-mismatch `warn!` path is gone.
+    **Real granule validated end-to-end on a real UTM frame** — the global EPSG:4326
+    `OPERA_L4_TROPO-ZENITH_V1` granule warps onto the real Mexico City UTM 32614 384² frame:
+    applied zenith mean **2.553 m** (slant@39° ≈ 3.285 m), physically consistent with the city's
+    ~2.2 km altitude vs the 2.79 m sea-level centre. `DelayGrid` now carries the source CRS WKT;
+    a CRS-less L4 grid spanning geographic-degree ranges is assigned EPSG:4326 (the plate-carrée
+    product spec). See `VALIDATION.md`.
   - **RAiDER fallback (`dolphin-corrections::raider`)** — subprocess + GDAL ingest, **gated
     behind a `raider_available()` check like SNAPHU**; returns `RaiderUnavailable` rather than
     being stubbed when RAiDER is absent. The L4 path is primary.

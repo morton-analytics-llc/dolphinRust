@@ -25,6 +25,9 @@ pub struct DelayGrid {
     pub geotransform: [f64; 6],
     /// EPSG of the grid, if carried.
     pub epsg: Option<u32>,
+    /// Full source CRS as WKT, if carried. Drives the 4326→UTM warp when the real
+    /// OPERA L4 product reports no EPSG authority code but is georeferenced.
+    pub srs_wkt: Option<String>,
 }
 
 /// Read a tropospheric range-delay band (meters) from an OPERA L4 netCDF variable.
@@ -44,16 +47,44 @@ pub fn read_l4_netcdf(path: &Path, var: &str) -> Result<DelayGrid> {
     let data = Array2::from_shape_vec((rows, cols), values)
         .map_err(|e| CorrectionError::Shape(e.to_string()))?;
     let geotransform = ds.geo_transform()?;
-    let epsg = ds
-        .spatial_ref()
-        .ok()
-        .and_then(|sr| sr.auth_code().ok())
-        .map(|c| c as u32);
+    let (epsg, srs_wkt) = source_crs(ds.spatial_ref().ok(), geotransform);
     Ok(DelayGrid {
         data,
         geotransform,
         epsg,
+        srs_wkt,
     })
+}
+
+/// Resolve the source CRS for a delay grid. Prefers the netCDF's embedded SRS;
+/// when absent (the real OPERA L4 TROPO-ZENITH product exposes its per-variable
+/// grids with **no CRS** through GDAL's NETCDF driver) it falls back to EPSG:4326
+/// **only** if the geotransform spans geographic-degree ranges — which the global
+/// plate-carrée L4 product does (origin ≈ −180°, ±90° latitude). A projected grid
+/// with no SRS stays unset rather than being mislabeled geographic.
+fn source_crs(
+    srs: Option<gdal::spatial_ref::SpatialRef>,
+    gt: [f64; 6],
+) -> (Option<u32>, Option<String>) {
+    if let Some(sr) = srs {
+        let epsg = sr.auth_code().ok().map(|c| c as u32);
+        return (epsg, sr.to_wkt().ok());
+    }
+    if !is_geographic_degrees(gt) {
+        return (None, None);
+    }
+    let wgs84 = gdal::spatial_ref::SpatialRef::from_epsg(4326);
+    (Some(4326), wgs84.ok().and_then(|sr| sr.to_wkt().ok()))
+}
+
+/// Whether a geotransform's pixel-centre extent lies within longitude/latitude
+/// degree bounds (a cheap geographic-CRS heuristic for a CRS-less grid).
+fn is_geographic_degrees(gt: [f64; 6]) -> bool {
+    let [ox, dx, _, oy, _, dy] = gt;
+    (-181.0..=181.0).contains(&ox)
+        && (-91.0..=91.0).contains(&oy)
+        && dx.abs() < 5.0
+        && dy.abs() < 5.0
 }
 
 /// The two OPERA L4 TROPO-ZENITH variables whose sum is the total zenith
@@ -81,7 +112,72 @@ pub fn read_l4_total(path: &Path) -> Result<DelayGrid> {
         data: hydro.data + wet.data,
         geotransform: hydro.geotransform,
         epsg: hydro.epsg,
+        srs_wkt: hydro.srs_wkt,
     })
+}
+
+/// Reproject (warp) a source delay grid onto a destination frame grid that may be
+/// in a **different CRS** (e.g. a global EPSG:4326 OPERA L4 product onto a UTM
+/// NISAR/DISP-S1 frame). Builds in-memory GDAL datasets carrying each grid's CRS
+/// and geotransform and calls GDAL's bilinear reproject; out-of-coverage frame
+/// pixels come back as the band no-data (0.0 here). Use this in place of
+/// [`resample_bilinear`] whenever the source and frame CRS differ.
+///
+/// # Errors
+/// [`CorrectionError::NoSourceCrs`] if the source carries neither a WKT nor an
+/// EPSG to reproject from; [`CorrectionError::Gdal`] on a GDAL failure.
+pub fn warp_to_frame(
+    src: &DelayGrid,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<Array2<f64>> {
+    use gdal::raster::reproject;
+    use gdal::raster::Buffer;
+    use gdal::spatial_ref::{AxisMappingStrategy, SpatialRef};
+    use gdal::DriverManager;
+
+    let src_srs = source_srs(src)?;
+    let (src_rows, src_cols) = src.data.dim();
+    let mem = DriverManager::get_driver_by_name("MEM")?;
+
+    let mut src_ds = mem.create_with_band_type::<f64, _>("", src_cols, src_rows, 1)?;
+    src_ds.set_geo_transform(&src.geotransform)?;
+    src_ds.set_spatial_ref(&src_srs)?;
+    {
+        let mut band = src_ds.rasterband(1)?;
+        let mut buf = Buffer::new((src_cols, src_rows), src.data.iter().copied().collect());
+        band.write((0, 0), (src_cols, src_rows), &mut buf)?;
+    }
+
+    let (dst_rows, dst_cols) = dst_shape;
+    let mut dst_srs = SpatialRef::from_epsg(dst_epsg)?;
+    dst_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let mut dst_ds = mem.create_with_band_type::<f64, _>("", dst_cols, dst_rows, 1)?;
+    dst_ds.set_geo_transform(&dst_gt)?;
+    dst_ds.set_spatial_ref(&dst_srs)?;
+
+    reproject(&src_ds, &dst_ds)?;
+
+    let band = dst_ds.rasterband(1)?;
+    let buf: Buffer<f64> =
+        band.read_as((0, 0), (dst_cols, dst_rows), (dst_cols, dst_rows), None)?;
+    let (_, values) = buf.into_shape_and_vec();
+    Array2::from_shape_vec((dst_rows, dst_cols), values)
+        .map_err(|e| CorrectionError::Shape(e.to_string()))
+}
+
+/// Reconstruct the source CRS for the warp: prefer the carried WKT (the real L4
+/// product reports a CRS but no EPSG authority code), falling back to the EPSG.
+fn source_srs(src: &DelayGrid) -> Result<gdal::spatial_ref::SpatialRef> {
+    use gdal::spatial_ref::{AxisMappingStrategy, SpatialRef};
+    let mut srs = match (&src.srs_wkt, src.epsg) {
+        (Some(wkt), _) => SpatialRef::from_wkt(wkt)?,
+        (None, Some(epsg)) => SpatialRef::from_epsg(epsg)?,
+        (None, None) => return Err(CorrectionError::NoSourceCrs),
+    };
+    srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    Ok(srs)
 }
 
 /// Resample a source delay grid onto a destination frame grid by bilinear
@@ -194,6 +290,60 @@ mod tests {
             (1.0..4.0).contains(&ztd),
             "centre total ZTD {ztd} m should be meters-scale"
         );
+    }
+
+    /// Contract (Phase 1): a synthesized **EPSG:4326** L4 delay field, linear in
+    /// (lon, lat), warped onto a **UTM (32610)** frame recovers the analytic delay
+    /// at known frame pixels — proving the 4326→UTM reprojecting resample, not the
+    /// shared-CRS bilinear path. Tolerance is tight because bilinear interpolation
+    /// of a field linear in (lon, lat) is exact in the source's uniform-degree
+    /// index space.
+    #[test]
+    fn warps_4326_field_onto_utm_frame() {
+        use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+
+        // Analytic 4326 delay field: delay(lon, lat) = a + b·(lon+123) + c·(lat−38).
+        let (a, b, c) = (2.0_f64, 0.10_f64, 0.05_f64);
+        let field = |lon: f64, lat: f64| a + b * (lon + 123.0) + c * (lat - 38.0);
+
+        // Source 4326 grid: lon ∈ [−124, −122], lat ∈ [37, 39] at 0.1°, top-left origin.
+        let (src_rows, src_cols) = (21_usize, 21_usize);
+        let src_gt = [-124.0, 0.1, 0.0, 39.0, 0.0, -0.1];
+        let src = Array2::from_shape_fn((src_rows, src_cols), |(r, col)| {
+            let lon = src_gt[0] + (col as f64 + 0.5) * src_gt[1];
+            let lat = src_gt[3] + (r as f64 + 0.5) * src_gt[5];
+            field(lon, lat)
+        });
+        let grid = DelayGrid {
+            data: src,
+            geotransform: src_gt,
+            epsg: Some(4326),
+            srs_wkt: SpatialRef::from_epsg(4326).unwrap().to_wkt().ok(),
+        };
+
+        // UTM 10N frame interior to the source: 5×5 at 2 km around the zone centre.
+        let (rows, cols) = (5_usize, 5_usize);
+        let dst_gt = [495_000.0, 2_000.0, 0.0, 4_211_000.0, 0.0, -2_000.0];
+        let warped = warp_to_frame(&grid, dst_gt, 32610, (rows, cols)).unwrap();
+
+        // Expected: transform each frame pixel centre 32610→4326 and evaluate the field.
+        let mut utm = SpatialRef::from_epsg(32610).unwrap();
+        let mut wgs = SpatialRef::from_epsg(4326).unwrap();
+        utm.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        wgs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        let ct = CoordTransform::new(&utm, &wgs).unwrap();
+        for (r, cc) in [(0_usize, 0_usize), (2, 2), (4, 4), (0, 4), (4, 0)] {
+            let x = dst_gt[0] + (cc as f64 + 0.5) * dst_gt[1];
+            let y = dst_gt[3] + (r as f64 + 0.5) * dst_gt[5];
+            let (mut xs, mut ys, mut zs) = ([x], [y], []);
+            ct.transform_coords(&mut xs, &mut ys, &mut zs).unwrap();
+            let expected = field(xs[0], ys[0]);
+            let got = warped[(r, cc)];
+            assert!(
+                (got - expected).abs() < 5e-3,
+                "pixel ({r},{cc}): warped {got} vs analytic {expected}"
+            );
+        }
     }
 
     /// Resampling a grid onto its own geotransform is the identity.
