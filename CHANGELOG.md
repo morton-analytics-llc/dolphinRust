@@ -4,7 +4,24 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v1.3.0
+## [Unreleased] — v1.4.0
+
+### Added
+- **NRT incremental ministack updates** (Phase 2), in `dolphin-workflows::sequential`. Sequential
+  phase-linking is feed-forward — a ministack reads only the compressed SLCs of prior ministacks
+  and its own real SLCs — so a ministack that has filled to `ministack_size` ("sealed") never
+  changes when later acquisitions arrive. `run_sequential_resumable` returns a `SequentialState`
+  (sealed ministacks' products + the open trailing ministack's raw SLCs); `update_sequential`
+  folds in newly-arrived acquisitions by re-phase-linking **only** the open ministack and any new
+  ones, carrying the sealed compressed SLCs. The result is **bit-identical** to a full rerun of
+  the extended stack — `cpx_phase`, compressed SLCs, stitched temporal coherence, CRLB, and
+  closure all match with max|Δ| = 0 (`tests/nrt_incremental_contract.rs`: block update,
+  one-at-a-time streaming, and the sealed-boundary edge case). `MiniStackPlanner::plan_with_offset`
+  resumes the carry-forward batch accounting for the tail. The non-causal downstream (ifg network
+  → unwrap → timeseries → velocity) recomputes from the updated phase history; the operational
+  speedup is in skipping re-phase-linking the sealed history of a long stack.
+
+## [v1.3.0] — 2026-06-17
 
 ### Added
 - **Atmospheric corrections — ionospheric + tropospheric** (second half of v1.3.0), in the new

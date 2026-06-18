@@ -100,9 +100,13 @@ Both parts landed and merged; **the deferred tropo warp now lands — ready to t
 
 Effort-bound; expect it within days, landing as units with sign-off. Per-phase scope and bars are
 in `REMAINING_WORK_PROMPT.md`.
-- **NRT incremental ministack updates** — fold a new acquisition into an existing series via the
-  carried compressed SLC, no full reprocess; validated against a full rerun. The operational lead
-  over batch dolphin and the payoff of the speed edge.
+- **NRT incremental ministack updates** ✅ (phase-linking stage) — `run_sequential_resumable` +
+  `update_sequential` fold new acquisitions into an existing series via the carried compressed SLC,
+  re-phase-linking only the open trailing ministack + new ones. **Bit-identical to a full rerun**
+  (max|Δ| = 0 across phase/compressed/temp-coh/CRLB/closure; block + one-at-a-time streaming +
+  boundary edge cases) — exact, not just within tolerance, because sequential phase-linking is
+  feed-forward. Downstream (network→unwrap→timeseries→velocity) is non-causal and recomputes from
+  the updated phase history; the speed win is skipping re-phase-linking the sealed history.
 - **Performance optimization** — beat the committed baseline (`bench/results.json`): faer
   small-matrix tuning, EagerLoader prefetch, streaming I/O, BLAS/thread contention. Publish the
   real multiple; drop optimizations that don't help.

@@ -5,6 +5,19 @@
 //! over `[carried compressed SLCs] ++ [real SLCs]`, then compressed to one SLC
 //! carried into the next ministack. The per-real-date linked phases are
 //! concatenated into the end-to-end phase history.
+//!
+//! ## NRT incremental updates
+//! Because the loop is feed-forward — ministack `N` reads only the compressed
+//! SLCs of ministacks `< N` and its own real SLCs, never future data — a
+//! ministack that has filled to `ministack_size` ("sealed") never changes when
+//! later acquisitions arrive. [`run_sequential_resumable`] returns a
+//! [`SequentialState`] capturing the sealed ministacks' products plus the raw
+//! SLCs of the still-open trailing ministack; [`update_sequential`] folds in new
+//! acquisitions by re-phase-linking only the open ministack and any new ones,
+//! producing a [`SequentialOutput`] **bit-identical** to a full rerun of the
+//! extended stack (verified by `tests/nrt_incremental_contract.rs`). This is the
+//! phase-linking-stage half of NRT; the non-causal downstream (ifg network →
+//! unwrap → timeseries → velocity) recomputes from the updated phase history.
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
@@ -59,6 +72,99 @@ pub struct SequentialOutput {
     pub closure_phase: Option<Array3<f64>>,
 }
 
+/// Persisted state for an NRT incremental update: the outputs of the **sealed**
+/// (full) ministacks of a prior run, plus the raw real SLCs of the still-open
+/// trailing ministack. Sequential phase-linking is feed-forward — a sealed
+/// ministack never changes when later acquisitions arrive — so carrying this
+/// state lets [`update_sequential`] fold in new SLCs without re-phase-linking the
+/// sealed history, yielding a result **bit-identical** to a full rerun.
+///
+/// Opaque by design; obtain it from [`run_sequential_resumable`] and thread it
+/// through [`update_sequential`]. The same [`SequentialConfig`] must be used
+/// across the resumed sequence.
+#[derive(Clone)]
+pub struct SequentialState {
+    /// Compressed SLC of each sealed ministack, in order (the carry-forward).
+    sealed_compressed: Vec<Array2<Cf64>>,
+    /// Per-real-date linked phase of each sealed ministack.
+    sealed_phases: Vec<Array3<Cf64>>,
+    /// Temporal coherence of each sealed ministack (kept per-ministack so the
+    /// cross-ministack `nanmean` stitch stays exact under incremental updates).
+    sealed_temp_coh: Vec<Array2<f64>>,
+    /// Per-sealed-ministack CRLB σ layers (empty when CRLB is off).
+    sealed_crlb: Vec<Array3<f64>>,
+    /// Per-sealed-ministack closure-phase layers (empty when closure is off).
+    sealed_closure: Vec<Array3<f64>>,
+    /// Raw real SLCs of the open trailing ministack, `(n_open, rows, cols)`;
+    /// `n_open = 0` when the prior run ended exactly on a ministack boundary.
+    open_real_slcs: Array3<Cf64>,
+}
+
+/// Per-ministack products accumulated by [`drive`] over a (sub)sequence.
+struct Drive {
+    compressed: Vec<Array2<Cf64>>,
+    phases: Vec<Array3<Cf64>>,
+    temp_coh: Vec<Array2<f64>>,
+    crlb: Vec<Array3<f64>>,
+    closure: Vec<Array3<f64>>,
+}
+
+/// Phase-link + compress each planned ministack of `real_stack`, carrying the
+/// compressed SLCs forward (seeded with `seed_compressed` from already-sealed
+/// ministacks). Returns only the products of the ministacks it processed.
+fn drive(
+    plans: &[MiniStack],
+    real_stack: ArrayView3<Cf64>,
+    seed_compressed: &[Array2<Cf64>],
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<Drive, &'static str> {
+    let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
+    let mut out = Drive {
+        compressed: Vec::new(),
+        phases: Vec::new(),
+        temp_coh: Vec::new(),
+        crlb: Vec::new(),
+        closure: Vec::new(),
+    };
+    for &ms in plans {
+        let combined = assemble(&carry, real_stack, ms);
+        let r = link_and_compress(combined.view(), ms, cfg, engine)?;
+        out.phases
+            .push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
+        carry.push(r.compressed.clone());
+        out.compressed.push(r.compressed);
+        out.temp_coh.push(r.temp_coh);
+        if let Some(s) = r.crlb_sigma {
+            out.crlb.push(s);
+        }
+        if let Some(s) = r.closure_phase {
+            out.closure.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// Assemble a [`SequentialOutput`] from the full per-ministack product lists
+/// (sealed prefix already chained in by the caller).
+fn build_output(
+    phases: &[Array3<Cf64>],
+    compressed: Vec<Array2<Cf64>>,
+    temp_coh: &[Array2<f64>],
+    crlb: Vec<Array3<f64>>,
+    closure: Vec<Array3<f64>>,
+) -> Result<SequentialOutput, &'static str> {
+    let views: Vec<ArrayView3<Cf64>> = phases.iter().map(Array3::view).collect();
+    let cpx_phase = concatenate(Axis(0), &views).map_err(|_| "phase-history concat failed")?;
+    Ok(SequentialOutput {
+        cpx_phase,
+        compressed_slcs: compressed,
+        temporal_coherence: stitch_temp_coh(temp_coh),
+        crlb_sigma: concat_bands(crlb)?,
+        closure_phase: concat_bands(closure)?,
+    })
+}
+
 /// Run the sequential estimator over `slc_stack` `(nslc, rows, cols)`.
 ///
 /// # Errors
@@ -68,43 +174,150 @@ pub fn run_sequential(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<SequentialOutput, &'static str> {
-    let planner = MiniStackPlanner {
-        num_slc: slc_stack.dim().0,
+    Ok(run_sequential_resumable(slc_stack, cfg, engine)?.0)
+}
+
+/// Run the sequential estimator and also return the [`SequentialState`] needed to
+/// fold in later acquisitions incrementally via [`update_sequential`]. The
+/// [`SequentialOutput`] is identical to [`run_sequential`]'s.
+///
+/// # Errors
+/// Returns `Err` if planning fails or a covariance window exceeds the stack.
+pub fn run_sequential_resumable(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    let planner = planner_for(slc_stack.dim().0, cfg);
+    let plans = planner.plan(cfg.ministack_size)?;
+    let d = drive(&plans, slc_stack, &[], cfg, engine)?;
+    let output = build_output(
+        &d.phases,
+        d.compressed.clone(),
+        &d.temp_coh,
+        d.crlb.clone(),
+        d.closure.clone(),
+    )?;
+    let state = seal_state(&plans, slc_stack, cfg.ministack_size, d);
+    Ok((output, state))
+}
+
+/// Fold newly-arrived real SLCs into an existing sequential series. Only the open
+/// trailing ministack and any new ministacks are phase-linked (carrying the
+/// sealed compressed SLCs from `state`); the result is the same
+/// [`SequentialOutput`] a full rerun of the extended stack would produce, and a
+/// fresh [`SequentialState`] for the next update. `cfg` must match the run that
+/// produced `state`.
+///
+/// # Errors
+/// Returns `Err` if `new_slcs` is empty, its grid differs from `state`'s, or
+/// planning / phase-linking fails.
+pub fn update_sequential(
+    state: &SequentialState,
+    new_slcs: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    let (n_open, rows, cols) = state.open_real_slcs.dim();
+    let (n_new, nrows, ncols) = new_slcs.dim();
+    if n_new == 0 {
+        return Err("update_sequential: no new acquisitions");
+    }
+    if (nrows, ncols) != (rows, cols) {
+        return Err("update_sequential: new SLC grid differs from the series");
+    }
+    // Tail = open trailing real SLCs ++ the new acquisitions, owned.
+    let tail = Array3::from_shape_fn((n_open + n_new, rows, cols), |(k, r, c)| match k < n_open {
+        true => state.open_real_slcs[(k, r, c)],
+        false => new_slcs[(k - n_open, r, c)],
+    });
+    let num_sealed = state.sealed_compressed.len();
+    let tail_plans =
+        planner_for(tail.dim().0, cfg).plan_with_offset(cfg.ministack_size, num_sealed)?;
+    let d = drive(
+        &tail_plans,
+        tail.view(),
+        &state.sealed_compressed,
+        cfg,
+        engine,
+    )?;
+
+    let phases = chain(&state.sealed_phases, &d.phases);
+    let temp_coh = chain(&state.sealed_temp_coh, &d.temp_coh);
+    let compressed = chain(&state.sealed_compressed, &d.compressed);
+    let crlb = chain(&state.sealed_crlb, &d.crlb);
+    let closure = chain(&state.sealed_closure, &d.closure);
+    let output = build_output(&phases, compressed, &temp_coh, crlb, closure)?;
+    let next =
+        seal_state(&tail_plans, tail.view(), cfg.ministack_size, d).with_sealed_prefix(state);
+    Ok((output, next))
+}
+
+/// The [`MiniStackPlanner`] for a stack of `num_slc` real SLCs under `cfg`.
+fn planner_for(num_slc: usize, cfg: &SequentialConfig) -> MiniStackPlanner {
+    MiniStackPlanner {
+        num_slc,
         max_num_compressed: cfg.max_num_compressed,
         output_reference_idx: cfg.output_reference_idx as isize,
         compressed_slc_plan: cfg.compressed_slc_plan,
-    };
-    let plans = planner.plan(cfg.ministack_size)?;
-
-    let mut compressed_slcs: Vec<Array2<Cf64>> = Vec::new();
-    let mut real_phases: Vec<Array3<Cf64>> = Vec::new();
-    let mut temp_cohs: Vec<Array2<f64>> = Vec::new();
-    let mut crlbs: Vec<Array3<f64>> = Vec::new();
-    let mut closures: Vec<Array3<f64>> = Vec::new();
-    for ms in plans {
-        let combined = assemble(&compressed_slcs, slc_stack, ms);
-        let r = link_and_compress(combined.view(), ms, cfg, engine)?;
-        real_phases.push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
-        compressed_slcs.push(r.compressed);
-        temp_cohs.push(r.temp_coh);
-        if let Some(s) = r.crlb_sigma {
-            crlbs.push(s);
-        }
-        if let Some(s) = r.closure_phase {
-            closures.push(s);
-        }
     }
+}
 
-    let views: Vec<ArrayView3<Cf64>> = real_phases.iter().map(Array3::view).collect();
-    let cpx_phase = concatenate(Axis(0), &views).map_err(|_| "phase-history concat failed")?;
-    let temporal_coherence = stitch_temp_coh(&temp_cohs);
-    Ok(SequentialOutput {
-        cpx_phase,
-        compressed_slcs,
-        temporal_coherence,
-        crlb_sigma: concat_bands(crlbs)?,
-        closure_phase: concat_bands(closures)?,
-    })
+/// Partition `drive` products into the sealed (full) ministacks vs the open
+/// trailing one, building the resumable state for *this* (sub)sequence. The only
+/// possibly-open ministack is the last `plan`; its raw real SLCs are sliced from
+/// `real_stack` so a later update can recompute it exactly.
+fn seal_state(
+    plans: &[MiniStack],
+    real_stack: ArrayView3<Cf64>,
+    ministack_size: usize,
+    d: Drive,
+) -> SequentialState {
+    let (_, rows, cols) = real_stack.dim();
+    let last = plans.last();
+    let open = last.is_some_and(|ms| ms.num_real < ministack_size);
+    let sealed = plans.len() - usize::from(open);
+    let open_real_slcs = match (open, last) {
+        (true, Some(ms)) => real_stack
+            .slice(s![ms.real_start..ms.real_start + ms.num_real, .., ..])
+            .to_owned(),
+        _ => Array3::zeros((0, rows, cols)),
+    };
+    SequentialState {
+        sealed_compressed: d.compressed[..sealed].to_vec(),
+        sealed_phases: d.phases[..sealed].to_vec(),
+        sealed_temp_coh: d.temp_coh[..sealed].to_vec(),
+        sealed_crlb: take_prefix(&d.crlb, sealed),
+        sealed_closure: take_prefix(&d.closure, sealed),
+        open_real_slcs,
+    }
+}
+
+impl SequentialState {
+    /// Prepend a prior run's sealed products (the part `seal_state` didn't see in
+    /// an incremental update) so the state describes the whole series.
+    fn with_sealed_prefix(mut self, prev: &SequentialState) -> Self {
+        self.sealed_compressed = chain(&prev.sealed_compressed, &self.sealed_compressed);
+        self.sealed_phases = chain(&prev.sealed_phases, &self.sealed_phases);
+        self.sealed_temp_coh = chain(&prev.sealed_temp_coh, &self.sealed_temp_coh);
+        self.sealed_crlb = chain(&prev.sealed_crlb, &self.sealed_crlb);
+        self.sealed_closure = chain(&prev.sealed_closure, &self.sealed_closure);
+        self
+    }
+}
+
+/// Quality layers are empty when the layer is disabled; otherwise take the first
+/// `n` (the sealed ministacks).
+fn take_prefix(v: &[Array3<f64>], n: usize) -> Vec<Array3<f64>> {
+    match v.is_empty() {
+        true => Vec::new(),
+        false => v[..n].to_vec(),
+    }
+}
+
+/// Concatenate two per-ministack product lists (sealed prefix ++ tail).
+fn chain<T: Clone>(a: &[T], b: &[T]) -> Vec<T> {
+    a.iter().chain(b).cloned().collect()
 }
 
 /// Concatenate per-ministack band-major layers along the date/triplet axis;
