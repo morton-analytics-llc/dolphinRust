@@ -43,9 +43,9 @@ burst (T063-133231-IW1) and three land bursts — Mojave (T071-151223-IW1), Las 
 
 The config is a genuine `dolphin config`-generated `DisplacementWorkflow` YAML (the canonical
 pydantic schema, ~15 KB), one per engine differing only in `work_directory`. **dolphinRust
-parses and runs it unchanged** through the full pipeline (`#[serde(default)]` + ignore-unknown
-absorbs the tophu/spurt/whirlwind solver blocks it does not model). This is the
-drop-in-config requirement and it holds.
+parses and runs it unchanged** through the full pipeline (`#[serde(default)]` + ignore-unknown;
+`snaphu_options`/`tophu_options` are modeled and round-trip, the spurt/whirlwind solver blocks
+it does not model are absorbed). This is the drop-in-config requirement and it holds.
 
 ## Tiers run
 
@@ -73,11 +73,12 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 | CRLB σ + closure phase (`dolphin-phaselink`) | quality_v042_contract | 6 | PASS vs **v0.42.0** (σ + closure max \|Δ\| <1e-4; singular-Γ NaN matches) |
 | SHP GLRT/KS (`dolphin-shp`) | shp_contract | 5 | PASS |
 | PS selection (`dolphin-ps`) | ps_contract | 4 | PASS |
-| ministack planner + sequential (`dolphin-stack`) | planner_contract, sequential_contract | 3, 1 | PASS |
+| ministack planner + sequential (`dolphin-stack`/`dolphin-workflows`) | planner_contract, sequential_contract | 3, 2 | PASS (incl. multi-ministack stitched temp_coh + concatenated CRLB/closure <1e-3 vs **v0.42.0**) |
 | network + SBAS L2 **and L1/ADMM** (`dolphin-timeseries`) | timeseries_contract | 6 | PASS (L1 vs dolphin oracle <1.5e-6) |
 | filters (`dolphin-filtering`) | filtering_contract | 4 | PASS |
 | I/O round-trip (`dolphin-io`) | io_contract | 5 | PASS |
 | SNAPHU dispatch (`dolphin-unwrap`) | unwrap_contract | 1 | PASS |
+| tophu multi-scale unwrap (`dolphin-unwrap`) | tophu_contract + lib units | 2 + 4 | PASS (ramp within SNAPHU envelope; planted inter-tile 2π jump resolved) |
 | pipeline (`dolphin-workflows`) | displacement_contract | 1 | PASS |
 
 ### B. End-to-end CLI equivalence (new — full `dolphin run` vs dolphinRust)
@@ -136,6 +137,38 @@ divergence #1.
    reports the affine slope.) The typed API additionally exposes `velocity_mm_yr`, converting
    LOS phase rate via `−λ/4π` (config wavelength, else Sentinel-1 default). Contract tests:
    `displacement::tests::recovers_injected_rate_in_mm_per_yr`, `rate_is_independent_of_cadence`.
+
+3. **Per-ministack temporal-coherence "stitching" is `numpy.nanmean`, not a richer
+   algorithm — clarified.** dolphin v0.41 added *retention + spatial stitching* of the
+   per-ministack `temporal_coherence_<dates>` files, but the **consumed** full-span layer
+   stays `temporal_coherence_average` = `numpy.nanmean(A, axis=0)` across ministacks
+   (`workflows/sequential.py::_average_or_rename`, fed to unwrapping/reference/quality in
+   `displacement.py`). There is no separate scalar reduction to adopt; the v0.35 source even
+   carries a `# Currently ignoring to not stitch:` marker on the per-ministack files. Our fix
+   replaces a plain mean with that NaN-aware mean (`sequential.rs::stitch_temp_coh`): equal on
+   all-finite layers (prior parity held), but a pixel masked/decorrelated (NaN) in some
+   ministacks now averages only the finite ones instead of being diluted toward zero. Oracle
+   `oracle/gen_stitch_v042.py` composes the v0.42 kernels over a 2-ministack stack exactly as
+   `sequential.rs` does; `stitching_and_quality_match_oracle_multiministack` confirms stitched
+   temp_coh + concatenated CRLB + closure all agree <1e-3. This closes the CRLB/closure
+   many-ministack concatenation caveat (all three layers now combine per-ministack results
+   with consistent NaN semantics).
+
+4. **tophu multi-scale unwrap now beats raw SNAPHU on low-coherence scenes — measured on
+   the frozen scenes.** On the same 512×512 subsidence-bowl scenes with known truth under
+   vegetation-style coherence loss where raw SNAPHU genuinely struggles (gross-cycle-error
+   0.13–0.17), tophu is now **≤ raw SNAPHU on all three metrics on both scenes**:
+   discontinuities −9 % on both, gross-cycle-error −10 % on the steep+decorr-ring scene, and
+   rms ≤ raw on both (−3.5 % gentle, −0.7 % steep). The earlier honest *loss* (this same item)
+   had two named causes; both were fixed in the algorithm — (a) a **coherence-weighted** coarse
+   multilook with low-trust blocks masked + filled, so decorrelated phasors no longer poison
+   the coarse anchor, and (b) **overlap-region inter-tile cycle reconciliation** via a
+   maximum-reliability spanning forest plus a **feathered tile merge**, replacing the per-tile
+   snap-to-coarse that injected the cross-tile cycle errors. The scenes, noise model, seeds and
+   metric definitions are byte-for-byte unchanged from the loss measurement — only the
+   algorithm changed; the win was **not** manufactured by tuning the scene or a tolerance.
+   SNAPHU remains the default (simpler, sufficient for small/coherent scenes). Numbers,
+   margins + reproduction in `bench/UNWRAP.md`.
 
 ## Real-data results (OPERA CSLC, both engines)
 

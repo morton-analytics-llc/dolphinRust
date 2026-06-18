@@ -7,5 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod snaphu;
+pub mod tophu;
 
 pub use snaphu::{unwrap, CostMode, InitMethod, UnwrapConfig, UnwrapError, UnwrapResult};
+pub use tophu::{unwrap_multiscale, TophuConfig};
