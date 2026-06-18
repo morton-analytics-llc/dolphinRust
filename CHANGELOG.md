@@ -6,6 +6,17 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased] — v1.4.0
 
+### Changed
+- **Phase-linking covariance — ~2.4× faster** (Phase 3), no accuracy change. The per-pixel
+  sample-coherence matrix (`dolphin-phaselink::covariance`, the #1 hot path) now reduces via a
+  direct **Hermitian** product — summing only the upper triangle over contiguous sample rows and
+  mirroring the lower — instead of ndarray's generic complex `dot` (which has no SIMD/BLAS path for
+  `Complex<f64>`) plus a per-pixel conjugate-transpose allocation. Real-frame phase-linking is
+  **2.38× faster** (host-controlled same-session A/B: 3.07 → 1.29 s; throughput 432 → 1028
+  kpix·slc/s) and beats the committed pre-R1 baseline (2.01 s) absolutely. The coherence matrix is
+  Hermitian by construction so the result is identical; `covariance_matches_oracle` (≤1e-4) and all
+  analytic/quality/GPU/sign contracts stay green. Measurements + methodology in `bench/PERF.md`.
+
 ### Added
 - **NRT incremental ministack updates** (Phase 2), in `dolphin-workflows::sequential`. Sequential
   phase-linking is feed-forward — a ministack reads only the compressed SLCs of prior ministacks

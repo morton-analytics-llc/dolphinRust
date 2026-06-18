@@ -8,7 +8,7 @@
 //! `vmap(vmap(f))`. All math in `Cf64`.
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use ndarray::{s, Array1, Array2, Array4, ArrayView2, ArrayView3, ArrayView4};
+use ndarray::{s, Array1, Array2, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4};
 use rayon::prelude::*;
 
 /// Amplitude floor below which a coherence entry is set to 0 (dolphin uses 1e-6).
@@ -96,9 +96,31 @@ fn coh_mat(window: ArrayView3<Cf64>, nslc: usize, mask: Option<ArrayView2<bool>>
         zero_unflagged_columns(&mut masked, &flags);
     }
 
-    let conj_t = masked.t().mapv(|z| z.conj());
-    let numer = masked.dot(&conj_t);
-    normalize(numer.view())
+    normalize(hermitian_product(&masked, nslc).view())
+}
+
+/// Cross-correlation `numer[i][j] = Σ_s z_i[s] · conj(z_j[s])` from the masked
+/// `(nslc, nsamps)` sample matrix. The result is Hermitian, so only the upper
+/// triangle is summed and the lower mirrored — half the work of a full matmul,
+/// and a tight contiguous-row loop instead of ndarray's generic complex `dot`
+/// (which has no SIMD/BLAS path for `Complex<f64>`) plus its conjugate-transpose
+/// allocation.
+fn hermitian_product(masked: &Array2<Cf64>, nslc: usize) -> Array2<Cf64> {
+    let mut numer = Array2::<Cf64>::zeros((nslc, nslc));
+    for i in 0..nslc {
+        let zi = masked.row(i);
+        for j in i..nslc {
+            let dot = row_conj_dot(zi, masked.row(j));
+            numer[(i, j)] = dot;
+            numer[(j, i)] = dot.conj();
+        }
+    }
+    numer
+}
+
+/// `Σ_s a[s] · conj(b[s])` over two contiguous sample rows.
+fn row_conj_dot(a: ArrayView1<Cf64>, b: ArrayView1<Cf64>) -> Cf64 {
+    a.iter().zip(b).map(|(x, y)| x * y.conj()).sum()
 }
 
 /// Replace non-finite samples (NaN/Inf) with zero, matching dolphin's masking.

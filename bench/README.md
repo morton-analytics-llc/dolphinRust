@@ -6,6 +6,12 @@ in one run; nothing is estimated. Reproduce with the commands at the bottom.
 
 Run date: **2026-06-17**. Raw numbers: [`results.json`](results.json).
 
+> **v1.4.0 Phase 3 update:** the phase-linking stage has since been optimized — a
+> covariance hot-path rewrite makes the real-frame estimator **2.38× faster**
+> (host-controlled same-session A/B), beating this baseline with no accuracy
+> change. See [`PERF.md`](PERF.md). This baseline is left unchanged as the
+> reference target.
+
 ## Environment (pinned)
 
 | Component | Version / detail |
