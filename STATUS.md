@@ -126,7 +126,7 @@ is assigned EPSG:4326 (plate-carrée product spec). Fixture + real-frame contrac
 green (default + `no-gpu`); sign guard green. **Merged `--no-ff` to `main` and tagged `v1.3.0`
 (2026-06-17).** v1.3.0 complete.
 
-## v1.4.0 progress (per REMAINING_WORK_PROMPT.md Phases 2–5)
+## v1.4.0 progress (per REMAINING_WORK_PROMPT.md Phases 2–5) — ✅ SHIPPED, tagged `v1.4.0` (2026-06-18)
 
 | Phase | Status |
 |---|---|
