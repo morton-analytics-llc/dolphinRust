@@ -24,20 +24,26 @@ All notable changes to dolphinRust are documented here. The format follows
   - Contracts: `quality_v042_contract` (CRLB σ + closure max |Δ| < 1e-4 vs v0.42.0;
     singular-Γ NaN matches; analytic consistency checks). GPU CRLB is a later follow-up.
 - **tophu-style multi-scale unwrapping** (`dolphin-unwrap::unwrap_multiscale`) — OPERA's
-  production multi-scale strategy driven over the existing SNAPHU wrapper: coarse downsample
-  → single SNAPHU unwrap → nearest upsample → overlapping tiled SNAPHU (rayon) → integer-2π
-  merge anchored to the coarse solution. **Opt-in** via `unwrap_method: tophu`; **SNAPHU
-  stays the default and the default build is behaviourally unchanged.**
+  production multi-scale strategy driven over the existing SNAPHU wrapper: **coherence-weighted**
+  coarse multilook (low-trust blocks masked + filled from trusted neighbours) → single SNAPHU
+  unwrap → nearest upsample → overlapping tiled SNAPHU (rayon) → **overlap-based inter-tile
+  cycle reconciliation** (maximum-reliability spanning forest over the coherent overlaps) →
+  **feathered tile merge**. **Opt-in** via `unwrap_method: tophu`; **SNAPHU stays the default
+  and the default build is behaviourally unchanged.**
   - Config: dolphin's `tophu_options` block (`ntiles`, `downsample_factor`, `init_method`,
     `cost`) is now modeled, so a real dolphin YAML round-trips it; new `UnwrapMethod::Tophu`
     routes the unwrap network through it (dolphin reserves its `multiscale_unwrap` for
     ICU/PHASS — we expose it driving the SNAPHU solver we ship).
   - Contracts: ramp recovery within the raw-SNAPHU envelope, coarse-pass round-trip, planted
-    inter-tile 2π jump resolved, tile-cover / cycle-snap / down-up round-trip unit tests.
-  - **Honest measurement** (`bench/UNWRAP.md`): on large low-coherence scenes tophu does
-    **not** beat raw SNAPHU — it is modestly worse (unreliable coarse anchor in decorrelated
-    ground; mean-cycle merge cruder than SNAPHU's global MCF). Reported, not hidden; scene
-    and tolerances not tuned to manufacture a win. Prefer SNAPHU for low-coherence scenes.
+    inter-tile 2π jump resolved, 2×2-grid loop-consistency, coherence-weighted-coarse-tracks-
+    truth, fill, tile-cover, and up-sample unit tests.
+  - **Measured win** (`bench/UNWRAP.md`): on the frozen large low-coherence scenes tophu now
+    **beats** raw SNAPHU on all three metrics on both scenes — discontinuities −9 % on both,
+    gross-cycle-error −10 % on the steep+decorr-ring scene, rms ≤ raw on both. The scenes,
+    noise model, seeds and metrics are unchanged from the earlier honest-loss measurement;
+    only the algorithm changed (coherence-weighted coarse + overlap-graph merge + feathered
+    seams replacing the per-tile snap-to-coarse). Prefer tophu for large partly-decorrelated
+    scenes; SNAPHU stays the simpler default for small/coherent scenes.
 - **Per-ministack temporal-coherence stitching** (`dolphin-workflows::sequential`) — the
   cross-ministack temporal-coherence reduction is now dolphin's NaN-aware mean
   (`numpy.nanmean`, `_average_or_rename`) rather than a plain mean. Equal on all-finite

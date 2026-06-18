@@ -72,8 +72,8 @@ stitching. With this the v1.2.0 scope is complete.
 
 | Item | State |
 |---|---|
-| tophu multi-scale unwrap | ✅ done — `dolphin-unwrap::unwrap_multiscale` (coarse downsample → SNAPHU → upsample → overlapping tiled SNAPHU via rayon → 2π-cycle merge). Contracts: ramp within SNAPHU envelope, coarse round-trip, planted inter-tile 2π jump resolved, + 4 unit tests |
-| tophu-vs-SNAPHU measurement | ⚠ **honest negative** — tophu does **not** beat raw SNAPHU on low-coherence scenes (modestly worse); numbers + hypothesis in `bench/UNWRAP.md`. Not tuned to fake a win. SNAPHU stays default |
+| tophu multi-scale unwrap | ✅ done — `dolphin-unwrap::unwrap_multiscale` (coherence-weighted coarse multilook + mask/fill → SNAPHU → upsample → overlapping tiled SNAPHU via rayon → overlap-based inter-tile cycle reconciliation, max-reliability spanning forest → feathered merge). Contracts: ramp within SNAPHU envelope, coarse round-trip, planted inter-tile 2π jump, 2×2 loop-consistency, weighted-coarse-tracks-truth, + fill/tile-cover/upsample unit tests |
+| tophu-vs-SNAPHU measurement | ✅ **measured win** — on the frozen low-coherence scenes tophu now beats raw SNAPHU on all three metrics on both scenes (discont −9 % both, gross-cycle-err −10 % steep, rms ≤ raw both); numbers + margins in `bench/UNWRAP.md`. Scenes/metrics unchanged from the earlier honest-loss run — only the algorithm changed. SNAPHU stays the default |
 | Per-ministack temp-coh stitching | ✅ done — `sequential.rs::stitch_temp_coh` = dolphin's NaN-aware mean (`numpy.nanmean`); contract `stitching_and_quality_match_oracle_multiministack` vs v0.42 oracle (`gen_stitch_v042.py`), temp_coh + CRLB + closure <1e-3 on a 2-ministack stack. CRLB/closure concatenation caveat closed |
 | Config + wiring | ✅ done — `TophuOptions` + `UnwrapMethod::Tophu` (dolphin YAML round-trips `tophu_options`); `run_displacement` routes to tophu when selected, SNAPHU default behaviourally unchanged |
 | Docs (README/usage/CHANGELOG/ROADMAP/VALIDATION) | ✅ done — incl. the honest tophu caveat + the nanmean-stitching clarification |

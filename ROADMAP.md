@@ -71,14 +71,15 @@ dolphinRust produces a displacement product end-to-end from a `gp-tasks` job on 
   `DisplacementOutput.closure_phase` + per-band COGs (default off, matching dolphin); the
   prerequisite signal for phase-bias work in R4.
 - **tophu-style multi-scale tiled unwrapping** — **SHIPPED** (branch `v1.2-unwrap`,
-  `dolphin-unwrap::unwrap_multiscale`): coarse downsample → single SNAPHU → nearest upsample
-  → overlapping tiled SNAPHU (rayon) → integer-2π-cycle merge anchored to the coarse
-  reference. Opt-in via `unwrap_method: tophu`; **SNAPHU stays the default path.** Correct
-  (contract tests: ramp recovery within the SNAPHU envelope, planted inter-tile 2π jump
-  resolved). **Honest caveat: it does NOT beat raw SNAPHU on the low-coherence test scenes —
-  it is modestly worse** (coarse multilook of decorrelated phasors → unreliable anchor; the
-  constant mean-cycle merge is cruder than SNAPHU's global MCF). Numbers + hypothesis in
-  `bench/UNWRAP.md`. Not tuned to fake a win.
+  `dolphin-unwrap::unwrap_multiscale`): coherence-weighted coarse multilook (low-trust blocks
+  masked + filled) → single SNAPHU → nearest upsample → overlapping tiled SNAPHU (rayon) →
+  overlap-based inter-tile cycle reconciliation (max-reliability spanning forest) → feathered
+  merge. Opt-in via `unwrap_method: tophu`; **SNAPHU stays the default path.** Correct
+  (contract tests: ramp recovery within the SNAPHU envelope, planted 2π jump, 2×2
+  loop-consistency, weighted-coarse-tracks-truth). **Now beats raw SNAPHU on the frozen
+  low-coherence scenes on all three metrics on both scenes** (discont −9 % both,
+  gross-cycle-err −10 % steep, rms ≤ raw both) — scenes/metrics unchanged from the earlier
+  honest-loss run, only the algorithm changed. Numbers + margins in `bench/UNWRAP.md`.
 - **Per-ministack temporal-coherence stitching** (dolphin v0.41) — **SHIPPED** (same branch):
   cross-ministack reduction is now dolphin's NaN-aware mean (`numpy.nanmean`) instead of a
   zero-diluting plain mean, matching the layer the per-band CRLB/closure concatenate against
@@ -87,10 +88,10 @@ dolphinRust produces a displacement product end-to-end from a `gp-tasks` job on 
 - **Finish eo integration** to production (PostGIS summary rows + COG, behind a gp-tasks
   task) if not completed in R1.
 
-**Exit:** CRLB + closure rasters match the v0.4x oracle ✅; tophu implemented + correct, but
-**did not beat SNAPHU on the low-coherence scene** (measured, reported in `bench/UNWRAP.md` —
-SNAPHU remains the recommended default) ⚠; per-ministack stitching matches the oracle ✅;
-dolphinRust running in eo's worker (R1).
+**Exit:** CRLB + closure rasters match the v0.4x oracle ✅; tophu implemented + correct and
+**now beats SNAPHU on the frozen low-coherence scenes on all three metrics** (measured,
+reported in `bench/UNWRAP.md`; SNAPHU stays the default for small/coherent scenes) ✅;
+per-ministack stitching matches the oracle ✅; dolphinRust running in eo's worker (R1).
 
 ---
 

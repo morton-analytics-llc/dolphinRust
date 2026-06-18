@@ -198,19 +198,21 @@ the consumer's, so dolphinRust surfaces the full per-date bound rather than pre-
 - **`snaphu`** (default) — one SNAPHU solve over the whole interferogram, with SNAPHU's
   own internal tiling controlled by `snaphu_options` (`ntiles`, `tile_overlap`,
   `n_parallel_tiles`, `cost`, `init_method`). This is the recommended path.
-- **`tophu`** — OPERA's multi-scale strategy: downsample the wrapped phase + correlation by
-  `tophu_options.downsample_factor` and unwrap that coarse grid once, upsample it as an
-  absolute-phase reference, unwrap the full-res grid in `tophu_options.ntiles` overlapping
-  tiles in parallel, then merge by snapping each tile to the coarse reference by an integer
-  number of 2π cycles. The idea is that a reliable low-resolution trend keeps the tiled
-  fine-scale solves globally consistent.
+- **`tophu`** — OPERA's multi-scale strategy: a **coherence-weighted** coarse multilook
+  (`tophu_options.downsample_factor`) is unwrapped once and used as the absolute-phase
+  reference (low-trust blocks masked + filled from trusted neighbours), the full-res grid is
+  unwrapped in `tophu_options.ntiles` overlapping tiles in parallel, and the tiles are merged
+  by estimating each adjacent pair's integer-cycle offset from their *coherent overlap* and
+  solving a maximum-reliability spanning forest for globally consistent per-tile cycles, then
+  feather-blending the tiles across their overlap halos.
 
-**When to use tophu:** large scenes where a reliable coarse trend exists. **Honest caveat:**
-on the low-coherence (vegetated/decorrelated) scenes we benchmarked, tophu does **not** beat
-raw SNAPHU — it is modestly worse, because multilooking decorrelated phasors yields an
-unreliable coarse anchor and the constant-cycle tile merge is cruder than SNAPHU's global
-minimum-cost-flow solve. See [`bench/UNWRAP.md`](../bench/UNWRAP.md) for the measured numbers
-and reproduction. **For low-coherence scenes, prefer the default SNAPHU path.**
+**When to use tophu:** large, partly-decorrelated scenes (vegetated / fast-subsidence
+centres). On the low-coherence scenes we benchmark, tophu now **beats** raw SNAPHU on all
+three metrics on both scenes — discontinuities ~9 % lower on both and gross-cycle errors up
+to ~10 % lower — by keeping the tiled solves inter-tile consistent and the seams continuous.
+See [`bench/UNWRAP.md`](../bench/UNWRAP.md) for the measured numbers and reproduction. For
+small or mostly-coherent scenes the default **SNAPHU** path (one global MCF solve) is simpler
+and sufficient.
 
 ```yaml
 unwrap_options:

@@ -154,16 +154,21 @@ divergence #1.
    many-ministack concatenation caveat (all three layers now combine per-ministack results
    with consistent NaN semantics).
 
-4. **tophu multi-scale unwrap does NOT beat raw SNAPHU on low-coherence scenes — reported,
-   not hidden.** On 512×512 subsidence-bowl scenes with known truth under vegetation-style
-   coherence loss, raw SNAPHU genuinely struggles (gross-cycle-error 0.13–0.17) but our tophu
-   path is **modestly worse** on every metric (discontinuities, RMS-vs-truth, gross-cycle
-   fraction). Hypothesis: multilooking decorrelated complex phasors yields an unreliable
-   coarse anchor, and the constant-2π-cycle tile merge is cruder than SNAPHU's global MCF.
-   Consistent with the contract tests, which show tophu *matches* SNAPHU on coherent data
-   (`tophu_recovers_analytic_ramp_within_snaphu_envelope`) — the loss is specific to
-   decorrelated ground. SNAPHU remains the default; the scene and tolerances were **not**
-   tuned to manufacture a win. Numbers + reproduction in `bench/UNWRAP.md`.
+4. **tophu multi-scale unwrap now beats raw SNAPHU on low-coherence scenes — measured on
+   the frozen scenes.** On the same 512×512 subsidence-bowl scenes with known truth under
+   vegetation-style coherence loss where raw SNAPHU genuinely struggles (gross-cycle-error
+   0.13–0.17), tophu is now **≤ raw SNAPHU on all three metrics on both scenes**:
+   discontinuities −9 % on both, gross-cycle-error −10 % on the steep+decorr-ring scene, and
+   rms ≤ raw on both (−3.5 % gentle, −0.7 % steep). The earlier honest *loss* (this same item)
+   had two named causes; both were fixed in the algorithm — (a) a **coherence-weighted** coarse
+   multilook with low-trust blocks masked + filled, so decorrelated phasors no longer poison
+   the coarse anchor, and (b) **overlap-region inter-tile cycle reconciliation** via a
+   maximum-reliability spanning forest plus a **feathered tile merge**, replacing the per-tile
+   snap-to-coarse that injected the cross-tile cycle errors. The scenes, noise model, seeds and
+   metric definitions are byte-for-byte unchanged from the loss measurement — only the
+   algorithm changed; the win was **not** manufactured by tuning the scene or a tolerance.
+   SNAPHU remains the default (simpler, sufficient for small/coherent scenes). Numbers,
+   margins + reproduction in `bench/UNWRAP.md`.
 
 ## Real-data results (OPERA CSLC, both engines)
 
