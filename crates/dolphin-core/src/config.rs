@@ -330,8 +330,9 @@ pub enum InputType {
     /// OPERA S1 CSLC: complex-f32 `(r, i)` HDF5 grids (the dolphin default).
     #[default]
     OperaCslc,
-    /// NISAR L-band geocoded SLC: `{r: i16, i: i16}` compound grids in the NISAR
-    /// product group layout, decoded to complex-f32 on read.
+    /// NISAR L-band geocoded SLC: complex-`f32` `{r, i}` compound grids in the
+    /// NISAR product group layout (camelCase coordinates + `epsg_code`
+    /// attribute). Differs from OPERA only in the geocoding-grid metadata.
     NisarGslc,
 }
 

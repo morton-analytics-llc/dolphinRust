@@ -1,9 +1,9 @@
 //! End-to-end NISAR / L-band contract (DoD #4).
 //!
-//! A multi-acquisition synthesized NISAR-layout stack (`{r,i}` int16 compound
-//! grids in the NISAR product group, dated granule names, a smooth LOS ramp) is
-//! run through `run_displacement` with `input_type = nisar_gslc` and the NISAR
-//! L-band wavelength. The pipeline must read the int16 compound, derive the
+//! A multi-acquisition synthesized NISAR-layout stack (complex-`f32` `{r,i}`
+//! compound grids in the NISAR product group, dated granule names, a smooth LOS
+//! ramp) is run through `run_displacement` with `input_type = nisar_gslc` and the
+//! NISAR L-band wavelength. The pipeline must read the NISAR grid, derive the
 //! custom geotransform/EPSG, and produce a displacement product (typed output +
 //! COG files on disk) on the correct grid. Proves the L-band wiring without a
 //! real granule. Skips without `snaphu` on PATH.
@@ -15,8 +15,8 @@ use std::path::Path;
 
 use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_core::types::{HalfWindow, Strides};
+use dolphin_core::Cf32;
 use dolphin_io::nisar_fixture::{write_nisar_fixture, FREQUENCY_A_GROUP};
-use dolphin_io::ComplexI16;
 use dolphin_workflows::run_displacement;
 use ndarray::Array2;
 
@@ -27,7 +27,6 @@ const DX: f64 = 20.0; // NISAR posting (m)
 const ORIGIN_X: f64 = 300_000.0;
 const ORIGIN_Y: f64 = 4_100_000.0;
 const EPSG: u32 = 32610;
-const AMP: f64 = 2000.0; // quantization magnitude for the int16 phasor
 const NISAR_WAVELENGTH_M: f64 = 0.238_403_545;
 
 fn snaphu_available() -> bool {
@@ -37,14 +36,11 @@ fn snaphu_available() -> bool {
         .is_ok()
 }
 
-/// Smooth column-wise ramp, growing with acquisition index, quantized to an
-/// `i16` phasor of magnitude `AMP` — cycle-free so unwrapping is exact.
-fn sample(t: usize, col: usize) -> ComplexI16 {
+/// Smooth column-wise ramp, growing with acquisition index — cycle-free so
+/// unwrapping is exact.
+fn sample(t: usize, col: usize) -> Cf32 {
     let phase = 0.3 * t as f64 * (col as f64 / COLS as f64);
-    ComplexI16 {
-        r: (AMP * phase.cos()).round() as i16,
-        i: (AMP * phase.sin()).round() as i16,
-    }
+    Cf32::from_polar(1.0, phase as f32)
 }
 
 fn write_stack(dir: &Path) -> Vec<std::path::PathBuf> {

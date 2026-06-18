@@ -46,8 +46,15 @@ tolerances (not bit-exactness):
 - **tophu multi-scale unwrapping** is implemented and opt-in (`unwrap_method: tophu`), but on
   low-coherence scenes it does **not** beat the default SNAPHU path — see
   [bench/UNWRAP.md](bench/UNWRAP.md). SNAPHU remains the recommended default.
-- `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform, and the
-  spurt/whirlwind unwrappers are deferred.
+- **NISAR / L-band geocoded-SLC ingest** is implemented (`input_type: nisar_gslc`) and
+  **validated against a real NISAR GSLC granule**: reads the NISAR complex-`f32` `{r,i}`
+  compound + custom geotransform/EPSG (camelCase coords + `epsg_code` attribute), threads the
+  L-band wavelength through to mm/yr. The product is geometrically correct but
+  **atmospherically uncorrected** —
+  ionospheric/tropospheric corrections are a separate later v1.3.0 loop, and are mandatory for
+  a *usable* L-band product. See [docs/usage.md](docs/usage.md) §2.
+- `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, and the spurt/whirlwind unwrappers
+  are deferred.
 
 See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
 

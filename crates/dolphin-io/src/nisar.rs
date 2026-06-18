@@ -1,26 +1,27 @@
 //! NISAR / L-band geocoded-SLC reading from HDF5.
 //!
-//! NISAR products differ from OPERA S1 CSLC in two ways that GDAL's HDF5 driver
-//! does not handle, so this module reads them directly:
+//! **Verified against a real NISAR GSLC granule** (`NISAR_L2_GSLC_BETA_V1`, see
+//! `VALIDATION.md`). NISAR products differ from OPERA S1 CSLC in exactly one way
+//! that GDAL's HDF5 driver does not handle — the geocoding-grid metadata — so
+//! that is the only NISAR-specific reader here:
 //!
-//! 1. **Complex samples are a compound `{r: i16, i: i16}` type**, not the
-//!    h5py-compatible `Complex<f32>` `(r, i)` layout `read_cslc` relies on. They
-//!    are decoded to [`Cf32`] on read (the pipeline is f32 complex throughout).
-//! 2. **The geocoding grid lives in a NISAR product group** (e.g.
-//!    `/science/LSAR/GSLC/grids/frequencyA/`) with camelCase coordinate datasets
-//!    (`xCoordinates`, `yCoordinates`) and the EPSG carried as an `epsg_code`
-//!    attribute on the `projection` dataset — not as the scalar dataset value
-//!    OPERA uses. GDAL returns an identity geotransform for this, so the affine
-//!    transform is derived from the coordinate spacing directly.
+//! - **Complex samples are an `{r: f32, i: f32}` compound** (complex64), the same
+//!   h5py-compatible `(r, i)` layout `read_cslc` already reads as [`Cf32`]. The
+//!   prompt's "complex-int16" assumption did **not** hold on real data; real NISAR
+//!   GSLC is float32, so [`read_nisar_rslc`] reads `Cf32` directly.
+//! - **The geocoding grid lives in a NISAR product group** (e.g.
+//!   `/science/LSAR/GSLC/grids/frequencyA/`) with camelCase coordinate datasets
+//!   (`xCoordinates` F64, `yCoordinates` F64) and the EPSG carried as an
+//!   `epsg_code` attribute (I64) on the `projection` dataset — not as the scalar
+//!   dataset value OPERA uses. GDAL returns an identity geotransform for this, so
+//!   the affine transform is derived from the coordinate spacing directly.
 //!
 //! Atmospheric (ionospheric/tropospheric) corrections are **out of scope** here:
 //! this path yields a geometrically-correct but atmospherically-uncorrected
 //! L-band product. Ionosphere is ~16× the C-band effect and is mandatory for a
 //! *usable* L-band displacement product; it lands in a later loop.
 
-use std::path::Path;
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dolphin_core::Cf32;
 use ndarray::{Array2, Array3, Axis};
@@ -28,34 +29,15 @@ use ndarray::{Array2, Array3, Axis};
 use crate::error::{IoError, Result};
 use crate::geo::GeoInfo;
 
-/// NISAR complex sample as stored on disk: a compound type with `i16` real and
-/// imaginary members named `r` and `i` (the h5py/ISCE3 member names). Decoded to
-/// [`Cf32`] immediately on read.
-#[derive(hdf5::H5Type, Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct ComplexI16 {
-    /// Real part.
-    pub r: i16,
-    /// Imaginary part.
-    pub i: i16,
-}
-
-impl From<ComplexI16> for Cf32 {
-    fn from(z: ComplexI16) -> Self {
-        Cf32::new(f32::from(z.r), f32::from(z.i))
-    }
-}
-
-/// Read a 2D NISAR complex grid at `dataset`, decoding the `{r, i}` `i16`
-/// compound to [`Cf32`].
+/// Read a 2D NISAR complex grid at `dataset` as [`Cf32`] from the `{r: f32, i:
+/// f32}` compound.
 ///
 /// # Errors
 /// Returns `Err` if the HDF5 read fails or the dataset is not the expected
-/// `{r: i16, i: i16}` compound type.
+/// complex-float32 compound type.
 pub fn read_nisar_rslc(path: &Path, dataset: &str) -> Result<Array2<Cf32>> {
     let file = hdf5::File::open(path)?;
-    let raw = file.dataset(dataset)?.read_2d::<ComplexI16>()?;
-    Ok(raw.mapv(Cf32::from))
+    Ok(file.dataset(dataset)?.read_2d::<Cf32>()?)
 }
 
 /// Read a date-ordered set of NISAR files into an `(n_slc, rows, cols)` stack,
@@ -133,26 +115,18 @@ mod tests {
     use super::*;
     use crate::nisar_fixture::{write_nisar_fixture, FREQUENCY_A_GROUP};
 
-    #[test]
-    fn complex_i16_decodes_to_cf32() {
-        assert_eq!(Cf32::from(ComplexI16 { r: -3, i: 7 }), Cf32::new(-3.0, 7.0));
-    }
-
     /// Contract: the reader recovers the known pixel values, grid shape, and
     /// geotransform/EPSG from a synthesized NISAR-layout fixture — the de-risk
-    /// that `hdf5-metno` handles the `{r,i}` `i16` compound and that the custom
+    /// that `hdf5-metno` reads the `{r,i}` f32 compound and that the custom
     /// geotransform reader replaces GDAL's identity transform.
     #[test]
     fn reads_synthesized_nisar_fixture() {
         let path = std::env::temp_dir().join("dolphin_nisar_contract.h5");
         let _ = std::fs::remove_file(&path);
-        // 2x3 grid with distinct, signed int16 samples.
+        // 2x3 grid with distinct, signed samples.
         let cpx = Array2::from_shape_fn((2, 3), |(r, c)| {
-            let n = (r * 3 + c) as i16;
-            ComplexI16 {
-                r: n - 2,
-                i: 10 + n,
-            }
+            let n = (r * 3 + c) as f32;
+            Cf32::new(n - 2.0, 10.0 + n)
         });
         let x = [300_000.0_f64, 300_020.0, 300_040.0]; // dx = 20, centers
         let y = [4_100_000.0_f64, 4_099_980.0]; // dy = -20

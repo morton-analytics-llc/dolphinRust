@@ -1,32 +1,33 @@
 //! Synthesized NISAR-layout HDF5 fixtures (feature `nisar-fixture`).
 //!
-//! Writes a minimal but structurally faithful NISAR geocoded-SLC product: a
-//! `{r: i16, i: i16}` compound grid under a `frequencyA` group with camelCase
-//! `xCoordinates`/`yCoordinates` arrays and a `projection` dataset carrying the
-//! EPSG as an `epsg_code` attribute. Used by the `dolphin-io` reader contract
-//! test and the `dolphin-workflows` end-to-end NISAR stack test, so the wiring is
-//! provable without a real granule.
+//! Writes a minimal but structurally faithful NISAR geocoded-SLC product
+//! (matching a real `NISAR_L2_GSLC_BETA_V1` granule's layout): a complex-`f32`
+//! `{r, i}` compound grid under a `frequencyA` group with camelCase
+//! `xCoordinates`/`yCoordinates` F64 arrays and a `projection` dataset carrying
+//! the EPSG as an `epsg_code` I64 attribute. Used by the `dolphin-io` reader
+//! contract test and the `dolphin-workflows` end-to-end NISAR stack test, so the
+//! wiring is provable without a real granule.
 
 use std::path::Path;
 
+use dolphin_core::Cf32;
 use ndarray::ArrayView2;
 
 use crate::error::Result;
-use crate::nisar::ComplexI16;
 
 /// The NISAR group holding the geocoded grid in these fixtures.
 pub const FREQUENCY_A_GROUP: &str = "/science/LSAR/GSLC/grids/frequencyA";
 
-/// Write a NISAR-layout fixture to `path`: the `i16`-compound complex grid
-/// `cpx` at `<FREQUENCY_A_GROUP>/<pol>`, with pixel-center `x`/`y` coordinate
-/// arrays and `projection.epsg_code = epsg`.
+/// Write a NISAR-layout fixture to `path`: the complex-`f32` `{r, i}` compound
+/// grid `cpx` at `<FREQUENCY_A_GROUP>/<pol>`, with pixel-center `x`/`y`
+/// coordinate arrays and `projection.epsg_code = epsg`.
 ///
 /// # Errors
 /// Returns `Err` on any HDF5 write failure.
 pub fn write_nisar_fixture(
     path: &Path,
     pol: &str,
-    cpx: ArrayView2<ComplexI16>,
+    cpx: ArrayView2<Cf32>,
     x: &[f64],
     y: &[f64],
     epsg: u32,

@@ -41,6 +41,35 @@ acquisition per HDF5 file), all on the same grid:
   falls back to an identity geotransform and `output_options.epsg`.
 - **Ordering:** list files in acquisition order in `cslc_file_list`.
 
+### NISAR / L-band input (`input_type: nisar_gslc`)
+
+dolphinRust also reads **NISAR L-band geocoded SLC (GSLC)** stacks. NISAR penetrates
+canopy where C-band fails (forested/vegetated terrain). Differences from the OPERA path,
+all handled by the NISAR reader:
+
+- **Complex samples are a complex-`float32` `{r, i}` compound** — the same h5py-style layout
+  as OPERA (verified against a real `NISAR_L2_GSLC_BETA_V1` granule; the "complex-int16" found
+  in some NISAR notes does **not** apply to GSLC). So NISAR differs from OPERA only in the
+  grid metadata below.
+- **Grid lives in the NISAR product group**, e.g.
+  `/science/LSAR/GSLC/grids/frequencyA/HH` (set this as `subdataset`), with camelCase
+  `xCoordinates`/`yCoordinates` arrays and the EPSG carried as the `epsg_code` **attribute**
+  of the `projection` dataset. GDAL returns an identity geotransform for this layout, so it
+  is read directly.
+- **Wavelength is L-band** ≈ `0.238403545` m (vs S1 C-band `0.05546576`); set
+  `input_options.wavelength` so velocity comes out in mm/yr.
+- **Granule names** (`NISAR_L2_PR_GSLC_..._20240601T120000_...h5`) parse with the default
+  `cslc_date_fmt: "%Y%m%d"`.
+
+Select it with `input_options.input_type: nisar_gslc` (default `opera_cslc`). This is a
+forward divergence from dolphin v0.35.0, which has no product-type field.
+
+> **Atmospheric correction is NOT applied (v1.3.0).** This is a geometrically-correct but
+> **atmospherically-uncorrected** L-band product. Ionospheric delay is ~16× the C-band
+> effect and is mandatory for a *usable* L-band displacement product; ionospheric +
+> tropospheric corrections land in a later v1.3.0 loop. Treat NISAR displacement as
+> provisional until then.
+
 Single-burst only in v1.0.0 — multi-burst frame mosaics are not yet stitched.
 
 ## 3. Configuration
