@@ -26,7 +26,10 @@ use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::dates::decimal_days;
-use crate::sequential::{run_sequential, SequentialConfig, SequentialOutput};
+use crate::sequential::{
+    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    SequentialOutput, SequentialState,
+};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -108,6 +111,18 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
             .map(|idxs| link_one_burst(cfg, idxs, &engine))
             .collect::<Result<Vec<_>>>()
     })?;
+    finish_displacement(cfg, bursts)
+}
+
+/// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
+/// inversion → reference → atmospheric corrections → velocity → write COGs.
+/// Identical for a full run and an incremental update — both feed it the same
+/// per-burst phase-linking products, so both produce the same output.
+fn finish_displacement(
+    cfg: &DisplacementWorkflow,
+    bursts: Vec<BurstLink>,
+) -> Result<DisplacementOutput> {
+    let groups = group_by_burst(&cfg.cslc_file_list);
     let days = bursts
         .first()
         .map(|b| b.days.clone())
@@ -225,31 +240,193 @@ fn link_one_burst(
     idxs: &[usize],
     engine: &ComputeEngine,
 ) -> Result<BurstLink> {
-    let files: Vec<PathBuf> = idxs
-        .iter()
-        .map(|&i| cfg.cslc_file_list[i].clone())
-        .collect();
+    let files = burst_files(cfg, idxs);
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
     let stack = read_stack_files(cfg, &files)?;
     let out = phase_link(cfg, stack.view(), engine)?;
-    let pl = out.cpx_phase;
+    burst_link(cfg, out, days, &files[0])
+}
+
+/// Build a [`BurstLink`] from a burst's sequential output, validating the
+/// date/acquisition count and resolving its footprint on the output grid.
+fn burst_link(
+    cfg: &DisplacementWorkflow,
+    out: SequentialOutput,
+    days: Vec<f64>,
+    first_file: &Path,
+) -> Result<BurstLink> {
+    let (_, rows, cols) = out.cpx_phase.dim();
     anyhow::ensure!(
-        days.len() == pl.dim().0,
+        days.len() == out.cpx_phase.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
         days.len(),
-        pl.dim().0
+        out.cpx_phase.dim().0
     );
-    let (_, rows, cols) = pl.dim();
-    let geo = resolve_burst_geo(cfg, &files[0], rows, cols);
     Ok(BurstLink {
-        pl,
+        pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
-        geo,
+        geo: resolve_burst_geo(cfg, first_file, rows, cols),
         days,
     })
+}
+
+/// Persisted state for an NRT incremental displacement update: per-burst
+/// resumable phase-linking state and the files consumed so far. Obtain it from
+/// [`run_displacement_resumable`] and thread it through [`update_displacement`].
+///
+/// Opaque; the same config (phase-linking parameters, strides, input type) must
+/// be used across the resumed series.
+pub struct DisplacementState {
+    bursts: Vec<BurstState>,
+}
+
+/// One burst's resumable state.
+struct BurstState {
+    /// Burst id (the `group_by_burst` key).
+    id: String,
+    /// CSLC files consumed so far, in date order.
+    files: Vec<PathBuf>,
+    /// Footprint on the output grid (stable across updates).
+    geo: BurstGeo,
+    /// Sequential phase-linking carry (sealed ministacks + open trailing SLCs).
+    seq: SequentialState,
+}
+
+/// Phase-link a single burst, also returning its resumable [`SequentialState`].
+fn link_one_burst_resumable(
+    cfg: &DisplacementWorkflow,
+    idxs: &[usize],
+    engine: &ComputeEngine,
+) -> Result<(BurstLink, SequentialState)> {
+    let files = burst_files(cfg, idxs);
+    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+        .context("parsing acquisition dates from CSLC filenames")?;
+    let stack = read_stack_files(cfg, &files)?;
+    let (out, state) = run_sequential_resumable(stack.view(), &sequential_config(cfg), engine)
+        .map_err(anyhow::Error::msg)?;
+    let link = burst_link(cfg, out, days, &files[0])?;
+    Ok((link, state))
+}
+
+/// The CSLC files for a burst's indices into `cfg.cslc_file_list`.
+fn burst_files(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Vec<PathBuf> {
+    idxs.iter()
+        .map(|&i| cfg.cslc_file_list[i].clone())
+        .collect()
+}
+
+/// Run the displacement workflow and also return the [`DisplacementState`] needed
+/// to fold in later acquisitions via [`update_displacement`]. The
+/// [`DisplacementOutput`] is identical to [`run_displacement`]'s.
+///
+/// # Errors
+/// Same as [`run_displacement`].
+pub fn run_displacement_resumable(
+    cfg: &DisplacementWorkflow,
+) -> Result<(DisplacementOutput, DisplacementState)> {
+    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    let groups = group_by_burst(&cfg.cslc_file_list);
+    let mut bursts = Vec::with_capacity(groups.len());
+    let mut states = Vec::with_capacity(groups.len());
+    let linked = timed("phase_linking", || -> Result<Vec<_>> {
+        groups
+            .iter()
+            .map(|(id, idxs)| {
+                let (link, seq) = link_one_burst_resumable(cfg, idxs, &engine)?;
+                Ok((id.clone(), burst_files(cfg, idxs), link, seq))
+            })
+            .collect()
+    })?;
+    for (id, files, link, seq) in linked {
+        states.push(BurstState {
+            id,
+            files,
+            geo: link.geo,
+            seq,
+        });
+        bursts.push(link);
+    }
+    let output = finish_displacement(cfg, bursts)?;
+    Ok((output, DisplacementState { bursts: states }))
+}
+
+/// Fold newly-arrived acquisitions into an existing displacement series. `cfg`
+/// carries the **full extended** `cslc_file_list` (the prior files as a prefix
+/// plus the new ones); `update_displacement` re-phase-links only each burst's
+/// open trailing ministack + new ministacks (carrying the sealed compressed SLCs
+/// in `state`), then recomputes the non-causal downstream. The result equals
+/// [`run_displacement`] on the extended stack.
+///
+/// A streaming update must extend **every** burst by ≥1 acquisition (a new SAR
+/// pass yields one CSLC per burst), and the prior files must be a date-ordered
+/// prefix of the new list. `cfg` must match the run that produced `state`.
+///
+/// # Errors
+/// Returns `Err` if a burst is missing/empty/not-a-prefix in the new list, or on
+/// the usual I/O / phase-linking / unwrap / date-parsing failures.
+pub fn update_displacement(
+    state: &DisplacementState,
+    cfg: &DisplacementWorkflow,
+) -> Result<(DisplacementOutput, DisplacementState)> {
+    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    let groups = group_by_burst(&cfg.cslc_file_list);
+    let scfg = sequential_config(cfg);
+    let mut bursts = Vec::with_capacity(groups.len());
+    let mut states = Vec::with_capacity(groups.len());
+    let updated = timed("phase_linking", || -> Result<Vec<_>> {
+        groups
+            .iter()
+            .map(|(id, idxs)| update_one_burst(state, cfg, &scfg, id, idxs, &engine))
+            .collect()
+    })?;
+    for (link, st) in updated {
+        states.push(st);
+        bursts.push(link);
+    }
+    let output = finish_displacement(cfg, bursts)?;
+    Ok((output, DisplacementState { bursts: states }))
+}
+
+/// Fold new acquisitions into one burst, returning its extended link + new state.
+fn update_one_burst(
+    state: &DisplacementState,
+    cfg: &DisplacementWorkflow,
+    scfg: &SequentialConfig,
+    id: &str,
+    idxs: &[usize],
+    engine: &ComputeEngine,
+) -> Result<(BurstLink, BurstState)> {
+    let files = burst_files(cfg, idxs);
+    let prev = state
+        .bursts
+        .iter()
+        .find(|b| b.id == id)
+        .with_context(|| format!("burst {id} is new; updates must not introduce bursts"))?;
+    anyhow::ensure!(
+        files.starts_with(&prev.files),
+        "burst {id}: prior files must be a date-ordered prefix of the updated list"
+    );
+    let new_files = &files[prev.files.len()..];
+    anyhow::ensure!(
+        !new_files.is_empty(),
+        "burst {id}: no new acquisitions; an update must extend every burst"
+    );
+    let new_stack = read_stack_files(cfg, new_files)?;
+    let (out, seq) =
+        update_sequential(&prev.seq, new_stack.view(), scfg, engine).map_err(anyhow::Error::msg)?;
+    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+        .context("parsing acquisition dates from CSLC filenames")?;
+    let link = burst_link(cfg, out, days, &files[0])?;
+    let next = BurstState {
+        id: id.to_string(),
+        files,
+        geo: prev.geo,
+        seq,
+    };
+    Ok((link, next))
 }
 
 /// The frame-grid mosaic of the per-burst phase-linking products.
@@ -381,7 +558,13 @@ fn phase_link(
     stack: ArrayView3<Cf64>,
     engine: &ComputeEngine,
 ) -> Result<SequentialOutput> {
-    let scfg = SequentialConfig {
+    run_sequential(stack, &sequential_config(cfg), engine).map_err(anyhow::Error::msg)
+}
+
+/// Map the workflow config onto the sequential-estimator config (shared by the
+/// batch and incremental phase-linking paths).
+fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
+    SequentialConfig {
         ministack_size: cfg.phase_linking.ministack_size,
         max_num_compressed: cfg.phase_linking.max_num_compressed,
         half_window: cfg.phase_linking.half_window,
@@ -393,9 +576,7 @@ fn phase_link(
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
         compute_crlb: cfg.phase_linking.write_crlb,
         compute_closure_phase: cfg.phase_linking.write_closure_phase,
-    };
-    let out = run_sequential(stack, &scfg, engine).map_err(anyhow::Error::msg)?;
-    Ok(out)
+    }
 }
 
 /// Build the interferogram index pairs from the config and real baselines.
