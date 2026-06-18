@@ -18,6 +18,16 @@ All notable changes to dolphinRust are documented here. The format follows
   analytic/quality/GPU/sign contracts stay green. Measurements + methodology in `bench/PERF.md`.
 
 ### Added
+- **NRT incremental displacement — end-to-end front door** (Phase 2b). `run_displacement_resumable`
+  returns a `DisplacementState` (per-burst resumable phase-linking state + the files consumed);
+  `update_displacement` folds newly-arrived acquisitions into the series — re-phase-linking only
+  each burst's open trailing ministack + new ones via the carried compressed SLC, then recomputing
+  the non-causal downstream (ifg network → SNAPHU unwrap → SBAS → velocity) from the updated phase
+  history. The result is **bit-identical to a full `run_displacement`** of the extended stack
+  (max|Δ| = 0 through unwrap + inversion; `nrt_displacement_contract.rs`). Exposed as a
+  `dolphin stream --config <yaml> --initial <N>` CLI subcommand (process an initial window, then
+  fold each later acquisition in, rewriting outputs). An update must extend every burst (a SAR pass
+  yields one CSLC per burst) and the prior files must be a date-ordered prefix.
 - **NRT incremental ministack updates** (Phase 2), in `dolphin-workflows::sequential`. Sequential
   phase-linking is feed-forward — a ministack reads only the compressed SLCs of prior ministacks
   and its own real SLCs — so a ministack that has filled to `ministack_size` ("sealed") never

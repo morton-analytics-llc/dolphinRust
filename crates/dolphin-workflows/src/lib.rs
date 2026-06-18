@@ -13,7 +13,10 @@ pub mod dates;
 pub mod displacement;
 pub mod sequential;
 
-pub use displacement::{run_displacement, DisplacementOutput};
+pub use displacement::{
+    run_displacement, run_displacement_resumable, update_displacement, DisplacementOutput,
+    DisplacementState,
+};
 pub use sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
