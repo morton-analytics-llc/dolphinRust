@@ -41,8 +41,9 @@ pub struct DisplacementOutput {
     /// scoring). Derived from the LOS phase rate via `-λ/4π`, using the config
     /// wavelength or the Sentinel-1 default, `(rows, cols)`.
     pub velocity_mm_yr: Array2<f64>,
-    /// Temporal coherence per pixel in `[0, 1]`, averaged across ministacks
-    /// (dolphin's `temporal_coherence_average`); a phase-quality mask, `(rows, cols)`.
+    /// Temporal coherence per pixel in `[0, 1]`, stitched across ministacks by
+    /// NaN-aware mean (dolphin's `temporal_coherence_average` = `numpy.nanmean`);
+    /// a phase-quality mask, `(rows, cols)`.
     pub temporal_coherence: Array2<f64>,
     /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
     /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
