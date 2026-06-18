@@ -55,6 +55,21 @@ physical tolerance (state it). ⛔ If the compressed-SLC carry/handoff contract 
 the phase-linking code, stop and ask before designing it. **Done bar:** incremental update ==
 full rerun within tolerance; contract green; gates green.
 
+*(Phase 2 status: the incremental phase-linking **core** is ✅ done and bit-identical to a full
+rerun — `run_sequential_resumable` / `update_sequential`, merged to main. Phase 2b below carries
+it to a usable front door.)*
+
+## Phase 2b — End-to-end NRT front door (v1.4.0, REQUIRED before tag)
+
+The incremental core is not operationally "done" until eo can call it: wire an end-to-end
+`update_displacement` (incremental phase-linking core + the non-causal downstream recompute) and a
+CLI streaming entry point, so a newly arrived acquisition produces an updated displacement product
+without re-phase-linking the sealed history. Sequence this **after Phase 3** so it builds on the
+optimized streaming-I/O path. **Done bar:** an end-to-end incremental update from a new acquisition
+matches a full `run_displacement` of the extended stack (within the same tolerance as Phase 2);
+exposed via a public API + CLI entry; contract green; gates green. **This is a required v1.4 unit —
+not a gated-phase deferral; v1.4.0 does not tag without it.**
+
 ## Phase 3 — Performance optimization vs the baseline (v1.4.0)
 
 Beat the committed pre-R1 baseline (`bench/results.json`, dolphinRust vs Python dolphin v0.35.0).
@@ -90,7 +105,9 @@ remaining deferrals (GPU CRLB, NISAR multi-date real displacement, spurt port) h
 
 **Overall Definition of Done:**
 - [ ] Phase 1: tropo warp end-to-end on a UTM frame; `v1.3.0` tagged (on sign-off).
-- [ ] Phase 2: NRT incremental update == full rerun within tolerance; contract green.
+- [ ] Phase 2: NRT incremental update == full rerun within tolerance; contract green. ✅ (core)
+- [ ] Phase 2b: end-to-end `update_displacement` + CLI streaming entry; matches a full
+      `run_displacement` of the extended stack; public API/CLI exposed. **Required before v1.4.0 tag.**
 - [ ] Phase 3: documented, reproduced speedup vs the committed baseline; no accuracy regression.
 - [ ] Phase 4: phase-bias correction reduces non-closure (measured); analytic contract green.
 - [ ] Phase 5: unwrap dispatch behind a trait; SNAPHU + tophu implement it; output unchanged.
