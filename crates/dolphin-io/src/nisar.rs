@@ -20,8 +20,10 @@
 
 use std::path::Path;
 
+use std::path::PathBuf;
+
 use dolphin_core::Cf32;
-use ndarray::Array2;
+use ndarray::{Array2, Array3, Axis};
 
 use crate::error::{IoError, Result};
 use crate::geo::GeoInfo;
@@ -54,6 +56,21 @@ pub fn read_nisar_rslc(path: &Path, dataset: &str) -> Result<Array2<Cf32>> {
     let file = hdf5::File::open(path)?;
     let raw = file.dataset(dataset)?.read_2d::<ComplexI16>()?;
     Ok(raw.mapv(Cf32::from))
+}
+
+/// Read a date-ordered set of NISAR files into an `(n_slc, rows, cols)` stack,
+/// all from the same `dataset` (polarization grid) path. Mirrors
+/// [`crate::read_cslc_stack`] for the OPERA path.
+///
+/// # Errors
+/// Returns `Err` on any read failure or if the grids differ in shape.
+pub fn read_nisar_stack(files: &[PathBuf], dataset: &str) -> Result<Array3<Cf32>> {
+    let layers = files
+        .iter()
+        .map(|path| read_nisar_rslc(path, dataset))
+        .collect::<Result<Vec<_>>>()?;
+    let views: Vec<_> = layers.iter().map(Array2::view).collect();
+    ndarray::stack(Axis(0), &views).map_err(|e| IoError::Shape(e.to_string()))
 }
 
 /// Read the geotransform + EPSG for a NISAR geocoded grid from its HDF5 metadata.

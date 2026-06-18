@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{DisplacementWorkflow, TimeseriesMethod, UnwrapMethod};
+use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
 use dolphin_core::{Cf32, Cf64};
-use dolphin_io::{read_cslc_stack, read_geotransform, write_raster, GeoInfo};
+use dolphin_io::{
+    read_cslc_stack, read_geotransform, read_nisar_geotransform, read_nisar_stack, write_raster,
+    GeoInfo,
+};
 use dolphin_phaselink::ComputeEngine;
 use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
@@ -299,11 +302,15 @@ fn resolve_burst_geo(
     cols: usize,
 ) -> BurstGeo {
     let identity = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+    let geo_reader = match cfg.input_options.input_type {
+        InputType::OperaCslc => read_geotransform,
+        InputType::NisarGslc => read_nisar_geotransform,
+    };
     let read = cfg
         .input_options
         .subdataset
         .as_deref()
-        .and_then(|sds| read_geotransform(path, sds).ok());
+        .and_then(|sds| geo_reader(path, sds).ok());
     let (epsg, gt) = match read {
         Some(g) => (g.epsg, g.geotransform),
         None => (cfg.output_options.epsg.unwrap_or(0), identity),
@@ -329,11 +336,16 @@ fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Arr
         .subdataset
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let pairs: Vec<(PathBuf, String)> = files
-        .iter()
-        .map(|p| (p.clone(), subdataset.clone()))
-        .collect();
-    let stack = read_cslc_stack(&pairs)?;
+    let stack = match cfg.input_options.input_type {
+        InputType::OperaCslc => {
+            let pairs: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|p| (p.clone(), subdataset.clone()))
+                .collect();
+            read_cslc_stack(&pairs)?
+        }
+        InputType::NisarGslc => read_nisar_stack(files, &subdataset)?,
+    };
     Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
 }
 
