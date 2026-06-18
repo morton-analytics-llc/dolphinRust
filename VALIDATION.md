@@ -86,9 +86,17 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 Displacement series + velocity, compared on the common finite mask after removing a per-date
 constant (the global phase reference the spec permits). dolphin auto-picks a spatial
 reference point and masks low-coherence/edge pixels to nodata; dolphinRust references only
-temporally (date 0) and fills all pixels — handled by demeaning on the shared mask. Sign is
-`+1` (engines agree in sign after demean). **Stated physical tolerance: corr ≥ 0.95 and
-demeaned per-pixel RMS ≤ 0.10 rad (< 0.016 cycle).**
+temporally (date 0) and fills all pixels — handled by demeaning on the shared mask. **Stated
+physical tolerance: corr ≥ 0.95 and demeaned per-pixel RMS ≤ 0.10 rad (< 0.016 cycle).**
+
+> **Sign correction (2026-06-17).** This section originally read "Sign is +1 (engines agree
+> in sign after demean)." That agreement was **real but blind**: the oracle generator
+> (`oracle/gen_displacement.py`) formed the ifg in the *same* reversed order
+> (`sec·conj(ref)`) that dolphinRust used, so both engines were inverted in lockstep relative
+> to dolphin **production** (`interferogram.py` forms `ref·conj(sec)`). The contracts proved
+> Rust agreed with a flipped oracle, not with production. v1.0.0–v1.2.0 therefore shipped
+> displacement *and* velocity with a globally inverted LOS sign. Fixed in v1.3.0 (commit
+> `e1db05a`); proven against production on real data in "Interferogram sign convention" below.
 
 Speckle sweep (max |deviation| in rad), strongest-signal date `displacement[3]`:
 
@@ -372,6 +380,63 @@ gunzip -f /tmp/gim.inx.gz
 IONEX_REAL=/tmp/gim.inx cargo test -p dolphin-corrections real_ionex -- --nocapture
 # OPERA L4 (real, ~2 GB) — granule URL from CMR short_name=OPERA_L4_TROPO-ZENITH_V1
 OPERA_L4_REAL=/path/opera_l4_tropo.nc cargo test -p dolphin-corrections real_opera_l4 -- --nocapture
+```
+
+## Interferogram sign convention (2026-06-17, v1.3.0)
+
+The interferogram is formed `ref·conj(sec)` = `pl[i]·conj(pl[j])` for pair `(i=ref, j=sec)`
+(`displacement.rs::unwrap_pair`), matching dolphin production `interferogram.py`. The earlier
+`sec·conj(ref)` order **globally inverted the LOS displacement and velocity sign of every
+release v1.0.0–v1.2.0**. It was invisible because `oracle/gen_displacement.py` carried the
+identical inversion, so the sign-sensitive contracts proved Rust agreed with a *flipped*
+oracle, not with production. This section brings the fix to the IONEX/NISAR real-data bar:
+an always-on analytic guard plus a gated real-data test against a full production `dolphin run`.
+
+**Always-on analytic guard — PASS** (`dolphin-workflows` test
+`sign_convention::displacement_sign_matches_ref_conj_sec_convention`, no network, no oracle
+fixture). A noise-free single-burst stack carries a positive, monotonic, cycle-free LOS ramp
+(range *increasing* in time away from a zero-phase reference column). Under `ref·conj(sec)`
+the recovered displacement at the far column is **+4.65 mm** (positive); reverting `unwrap_pair`
+to `sec·conj(ref)` makes it **−4.65 mm** (exact negation) and the test **goes red** — verified
+by flipping the order locally, watching it fail, and flipping back. This locks the convention
+in CI regardless of data availability.
+
+**Gated real-data test — PASS** (`dolphin-workflows` test
+`sign_real_data::rust_displacement_sign_matches_production_on_corcoran_bowl`, gated on
+`SIGN_REF_PROD_IFG`, skips when unset — same pattern as `real_ionex_parses_to_physical_delay`
+/ `reads_real_nisar_granule`). Scene: OPERA CSLC-S1 frame **F38502 / burst T144-308015-IW2**,
+the **Corcoran / Tulare-basin subsidence bowl** (lon −119.443, lat 36.021), 15 acquisitions
+**2016-07-24 … 2017-01-20**, 12-day cadence, cropped 1024². dolphinRust runs the fixed pipeline
+on the real stack; its displacement on the longest-baseline date (`20170120`) is compared
+against the production `dolphin run` displacement (`work_oracle/timeseries/20160724_20170120.tif`),
+demeaned, coherence-gated, with a vertical flip reconciling row order (dolphin's `timeseries/`
+rasters carry an identity geotransform; dolphinRust writes north-up COGs — orientation is
+orthogonal to per-pixel sign).
+
+| measurement | before fix (`sec·conj(ref)`) | after fix (`ref·conj(sec)`) |
+|---|---|---|
+| rust vs production displacement corr, coh>0.7 | **−0.95** | **+0.95** (live test, 323,107 px) |
+| rust vs production displacement corr, coh>0.9 | −0.99 | **+0.99** |
+| production unwrapped ifg vs `arg(ref·conj(sec))` (strong px) | −1.0000 | **+1.0000** |
+| bowl-pixel velocity sign (subsidence) | +0.136 (wrong: uplift) | **−0.136** (correct: subsidence) |
+
+The two ifg orders are an exact pixelwise negation (`arg(conj z) = −arg(z)`), so the production
+unwrapped ifg correlating **+1.0000** with `arg(ref·conj(sec))` and **−1.0000** with the reverse
+is the conclusive localization. The eo-relevant `velocity_mm_yr` (subsidence vs uplift, which
+drives risk tiers) now carries the correct sign.
+
+**Reproduce.**
+
+```sh
+source validation/creds.sh
+oracle/.venv/bin/python validation/fetch_real.py --burst T144_308015_IW2 --n 15 \
+    --start 2016-07-01 --end 2017-02-01                       # F38502/Corcoran bowl
+oracle/.venv/bin/python validation/crop_real.py --size 1024 --out /tmp/cv_cropped
+validation/run_real.sh validation/runs/real_F38502_T144_bowl  # full dolphin run -> work_oracle/
+SIGN_REF_PROD_IFG=validation/runs/real_F38502_T144_bowl \
+  cargo test -p dolphin-workflows --test sign_real_data -- --nocapture
+# always-on guard (no data needed):
+cargo test -p dolphin-workflows --test sign_convention -- --nocapture
 ```
 
 ## Open / pending

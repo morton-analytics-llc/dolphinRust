@@ -56,6 +56,22 @@ All notable changes to dolphinRust are documented here. The format follows
   - **Limitation:** geometrically correct but **atmospherically uncorrected**. Ionospheric
     (~16× the C-band effect) + tropospheric corrections are a separate later v1.3.0 loop.
 
+### Fixed
+- **Interferogram sign convention — inverted LOS sign in v1.0.0–v1.2.0, now corrected.**
+  `displacement.rs::unwrap_pair` formed the ifg as `sec·conj(ref)`; dolphin **production**
+  (`interferogram.py`) forms `ref·conj(sec)`. The reversed order **globally inverted the LOS
+  displacement *and* velocity sign of every release v1.0.0–v1.2.0** — subsidence read as uplift
+  and vice-versa. It was invisible because the oracle generator (`oracle/gen_displacement.py`)
+  carried the *same* inversion, so the sign-sensitive contracts proved Rust agreed with a
+  flipped oracle, not with production. **Impact for eo:** the `velocity_mm_yr` sign (subsidence
+  vs uplift) that drives GroundPulse risk tiers was inverted in v1.0–v1.2 and is now correct.
+  Fixed in `e1db05a`; the oracle was corrected in lockstep (`2c85a79`). Backfilled this release
+  with an **always-on analytic sign guard** (`sign_convention`, proven to go red if `unwrap_pair`
+  is reverted) and a **gated real-data test** (`sign_real_data`, `SIGN_REF_PROD_IFG`) confirming
+  dolphinRust matches a full production `dolphin run` on the F38502/Corcoran subsidence bowl —
+  displacement correlation **−0.97 → +0.99** before/after the fix. See `VALIDATION.md`
+  §"Interferogram sign convention".
+
 ## [Unreleased] — v1.2.0
 
 ### Added
