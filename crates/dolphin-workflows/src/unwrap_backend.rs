@@ -1,0 +1,104 @@
+//! Pluggable phase-unwrapping backend for the interferogram network.
+//!
+//! The pipeline dispatches unwrapping through the [`UnwrapBackend`] trait. Its
+//! signature is **network-level** — it receives the linked phase history and the
+//! date pairs, not pre-formed independent 2D interferograms — so a future
+//! spurt-style **3D spatiotemporal** solver can implement the same trait and
+//! unwrap the whole stack jointly without any pipeline change. The two shipped
+//! backends ([`SnaphuBackend`], [`TophuBackend`]) are 2D: they form each ifg and
+//! unwrap it independently, exactly as before, so their output is unchanged.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use dolphin_core::{Cf32, Cf64};
+use dolphin_unwrap::{unwrap, unwrap_multiscale, TophuConfig, UnwrapConfig};
+use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
+
+/// A phase-unwrapping backend for the interferogram network: maps the linked
+/// phase `pl` `(n_dates, rows, cols)` and the `(i, j)` date `pairs` to the
+/// unwrapped phase per ifg `(n_pairs, rows, cols)` in radians.
+///
+/// 2D backends unwrap each ifg independently; a 3D backend may use the full
+/// spatiotemporal structure of `pl` + `pairs`. Implement this trait to add a
+/// backend — no other pipeline code changes.
+pub trait UnwrapBackend {
+    /// Unwrap the whole network, returning `(n_pairs, rows, cols)` radians.
+    ///
+    /// # Errors
+    /// Backend-specific (solver failure, scratch I/O, stacking).
+    fn unwrap_network(
+        &self,
+        pl: ArrayView3<Cf64>,
+        pairs: &[(usize, usize)],
+        correlation: ArrayView2<f32>,
+        scratch: &Path,
+    ) -> Result<Array3<f64>>;
+}
+
+/// Single-pass SNAPHU (the default backend).
+pub struct SnaphuBackend(pub UnwrapConfig);
+
+/// tophu coarse→fine multi-scale over the SNAPHU per-tile solver.
+pub struct TophuBackend(pub TophuConfig);
+
+impl UnwrapBackend for SnaphuBackend {
+    fn unwrap_network(
+        &self,
+        pl: ArrayView3<Cf64>,
+        pairs: &[(usize, usize)],
+        correlation: ArrayView2<f32>,
+        scratch: &Path,
+    ) -> Result<Array3<f64>> {
+        unwrap_each_ifg(pl, pairs, correlation, |ifg, corr| {
+            Ok(unwrap(ifg, corr, &self.0, scratch)?
+                .unwrapped
+                .mapv(f64::from))
+        })
+    }
+}
+
+impl UnwrapBackend for TophuBackend {
+    fn unwrap_network(
+        &self,
+        pl: ArrayView3<Cf64>,
+        pairs: &[(usize, usize)],
+        correlation: ArrayView2<f32>,
+        scratch: &Path,
+    ) -> Result<Array3<f64>> {
+        unwrap_each_ifg(pl, pairs, correlation, |ifg, corr| {
+            Ok(unwrap_multiscale(ifg, corr, &self.0, scratch)?
+                .unwrapped
+                .mapv(f64::from))
+        })
+    }
+}
+
+/// Form each ifg from the linked phase and unwrap it with a 2D solver, stacking
+/// the results in `pairs` order. Shared by the 2D backends.
+fn unwrap_each_ifg(
+    pl: ArrayView3<Cf64>,
+    pairs: &[(usize, usize)],
+    correlation: ArrayView2<f32>,
+    solve: impl Fn(ArrayView2<Cf32>, ArrayView2<f32>) -> Result<Array2<f64>>,
+) -> Result<Array3<f64>> {
+    let layers = pairs
+        .iter()
+        .map(|&pair| solve(form_ifg(pl, pair).view(), correlation))
+        .collect::<Result<Vec<_>>>()?;
+    let views: Vec<_> = layers.iter().map(Array2::view).collect();
+    ndarray::stack(Axis(0), &views).context("stacking unwrapped ifgs")
+}
+
+/// Form the wrapped ifg `(i, j)` as `exp(j∠(pl_i · conj(pl_j)))` — dolphin's
+/// production convention `ref · conj(sec)` (`interferogram.py`, `_create_vrt_conj`):
+/// for the single-reference network `i` is the reference/earlier date and `j` the
+/// secondary/later one. The opposite order globally inverts the displacement sign
+/// (guarded by `tests/sign_convention.rs`); keep `pl_i · conj(pl_j)`.
+fn form_ifg(pl: ArrayView3<Cf64>, (i, j): (usize, usize)) -> Array2<Cf32> {
+    let (_, rows, cols) = pl.dim();
+    Array2::from_shape_fn((rows, cols), |(r, c)| {
+        let z = pl[(i, r, c)] * pl[(j, r, c)].conj();
+        Cf32::from_polar(1.0, z.arg() as f32)
+    })
+}

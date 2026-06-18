@@ -12,6 +12,7 @@ pub mod corrections;
 pub mod dates;
 pub mod displacement;
 pub mod sequential;
+pub mod unwrap_backend;
 
 pub use displacement::{
     run_displacement, run_displacement_resumable, update_displacement, DisplacementOutput,
@@ -21,3 +22,4 @@ pub use sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
 };
+pub use unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};

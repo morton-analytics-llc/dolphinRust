@@ -18,6 +18,15 @@ All notable changes to dolphinRust are documented here. The format follows
   analytic/quality/GPU/sign contracts stay green. Measurements + methodology in `bench/PERF.md`.
 
 ### Added
+- **3D-unwrap-ready dispatch interface** (Phase 5), `dolphin-workflows::unwrap_backend`. The unwrap
+  backend is now behind a **network-level** `UnwrapBackend` trait — it receives the linked phase +
+  date pairs (not pre-formed independent 2D interferograms), so a future spurt-style 3D
+  spatiotemporal solver can implement the trait and unwrap the whole stack jointly without any
+  pipeline change. The shipped backends `SnaphuBackend` and `TophuBackend` implement it via the
+  unchanged per-ifg loop; **output is bit-identical** (the end-to-end oracle contract still passes
+  through the new dispatch; trait seam covered by `unwrap_backend_contract.rs`). No spurt port — the
+  interface only. The `ref·conj(sec)` ifg sign convention is preserved (guarded by
+  `sign_convention.rs`).
 - **Phase-bias / non-closure correction** (Phase 4), `dolphin-phaselink::phasebias` — Michaelides
   et al. (RSE 2022). **Not in Python dolphin** (leads the oracle). The nearest-neighbour closure of
   the coherence matrix satisfies `Ξ_k = β_k + β_{k+1}`; a per-pixel first-order constant

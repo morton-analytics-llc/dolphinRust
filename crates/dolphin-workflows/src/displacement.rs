@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
-use dolphin_core::{Cf32, Cf64};
+use dolphin_core::Cf64;
 use dolphin_io::{
     read_cslc_stack, read_geotransform, read_nisar_geotransform, read_nisar_stack, write_raster,
     GeoInfo,
@@ -20,7 +20,7 @@ use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
-use dolphin_unwrap::{unwrap, unwrap_multiscale, CostMode, InitMethod, TophuConfig, UnwrapConfig};
+use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
@@ -30,6 +30,7 @@ use crate::sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
 };
+use crate::unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -606,31 +607,9 @@ fn network(cfg: &DisplacementWorkflow, days: &[f64]) -> Vec<(usize, usize)> {
     build_network(days.len(), days, &net)
 }
 
-/// Selected unwrap backend: SNAPHU (default) or the tophu multi-scale driver.
-enum UnwrapDriver {
-    /// Raw single-pass SNAPHU.
-    Snaphu(UnwrapConfig),
-    /// tophu coarse→fine multi-scale over the SNAPHU per-tile solver.
-    Tophu(TophuConfig),
-}
-
-impl UnwrapDriver {
-    /// Unwrap one wrapped ifg, returning the unwrapped phase in radians.
-    fn run(
-        &self,
-        ifg: ArrayView2<Cf32>,
-        corr: ArrayView2<f32>,
-        scratch: &Path,
-    ) -> Result<Array2<f64>> {
-        let result = match self {
-            UnwrapDriver::Snaphu(cfg) => unwrap(ifg, corr, cfg, scratch)?,
-            UnwrapDriver::Tophu(cfg) => unwrap_multiscale(ifg, corr, cfg, scratch)?,
-        };
-        Ok(result.unwrapped.mapv(f64::from))
-    }
-}
-
-/// Form each ifg from the linked phase and unwrap it with the selected backend.
+/// Unwrap the interferogram network with the configured backend (dispatched
+/// through the [`UnwrapBackend`] trait — a 3D spatiotemporal solver can drop in
+/// as a new backend without changing this code).
 fn unwrap_network(
     cfg: &DisplacementWorkflow,
     pl: ArrayView3<Cf64>,
@@ -639,43 +618,15 @@ fn unwrap_network(
     let (_, rows, cols) = pl.dim();
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let driver = unwrap_driver(cfg);
     let correlation = Array2::<f32>::from_elem((rows, cols), 1.0);
-
-    let layers = pairs
-        .iter()
-        .map(|&pair| unwrap_pair(pl, pair, &correlation, &driver, &scratch))
-        .collect::<Result<Vec<_>>>()?;
-    let views: Vec<_> = layers.iter().map(Array2::view).collect();
-    ndarray::stack(ndarray::Axis(0), &views).context("stacking unwrapped ifgs")
-}
-
-/// Unwrap one ifg `(i, j)` formed as `exp(j∠(pl_i · conj(pl_j)))` — dolphin's
-/// production convention `ref · conj(sec)` (`interferogram.py`, `_create_vrt_conj`):
-/// for the single-reference network `i` is the reference/earlier date and `j` the
-/// secondary/later one. Verified against OPERA + a full `dolphin run` on the
-/// F38502/Corcoran bowl: the opposite order (`pl_j · conj(pl_i)`) globally inverts
-/// the displacement sign (corr −1.0000 vs production unwrapped ifg).
-fn unwrap_pair(
-    pl: ArrayView3<Cf64>,
-    (i, j): (usize, usize),
-    correlation: &Array2<f32>,
-    driver: &UnwrapDriver,
-    scratch: &Path,
-) -> Result<Array2<f64>> {
-    let (_, rows, cols) = pl.dim();
-    let ifg = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        let z = pl[(i, r, c)] * pl[(j, r, c)].conj();
-        Cf32::from_polar(1.0, z.arg() as f32)
-    });
-    driver.run(ifg.view(), correlation.view(), scratch)
+    unwrap_backend(cfg).unwrap_network(pl, pairs, correlation.view(), &scratch)
 }
 
 /// Build the unwrap backend from the config: tophu when selected, else SNAPHU.
-fn unwrap_driver(cfg: &DisplacementWorkflow) -> UnwrapDriver {
+fn unwrap_backend(cfg: &DisplacementWorkflow) -> Box<dyn UnwrapBackend> {
     match cfg.unwrap_options.unwrap_method {
-        UnwrapMethod::Tophu => UnwrapDriver::Tophu(tophu_config(cfg)),
-        _ => UnwrapDriver::Snaphu(unwrap_config(cfg)),
+        UnwrapMethod::Tophu => Box::new(TophuBackend(tophu_config(cfg))),
+        _ => Box::new(SnaphuBackend(unwrap_config(cfg))),
     }
 }
 
