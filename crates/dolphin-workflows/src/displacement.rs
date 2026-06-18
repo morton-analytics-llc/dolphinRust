@@ -428,7 +428,12 @@ fn unwrap_network(
     ndarray::stack(ndarray::Axis(0), &views).context("stacking unwrapped ifgs")
 }
 
-/// Unwrap one ifg `(i, j)` formed as `exp(j∠(pl_j · conj(pl_i)))`.
+/// Unwrap one ifg `(i, j)` formed as `exp(j∠(pl_i · conj(pl_j)))` — dolphin's
+/// production convention `ref · conj(sec)` (`interferogram.py`, `_create_vrt_conj`):
+/// for the single-reference network `i` is the reference/earlier date and `j` the
+/// secondary/later one. Verified against OPERA + a full `dolphin run` on the
+/// F38502/Corcoran bowl: the opposite order (`pl_j · conj(pl_i)`) globally inverts
+/// the displacement sign (corr −1.0000 vs production unwrapped ifg).
 fn unwrap_pair(
     pl: ArrayView3<Cf64>,
     (i, j): (usize, usize),
@@ -438,7 +443,7 @@ fn unwrap_pair(
 ) -> Result<Array2<f64>> {
     let (_, rows, cols) = pl.dim();
     let ifg = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        let z = pl[(j, r, c)] * pl[(i, r, c)].conj();
+        let z = pl[(i, r, c)] * pl[(j, r, c)].conj();
         Cf32::from_polar(1.0, z.arg() as f32)
     });
     driver.run(ifg.view(), correlation.view(), scratch)
