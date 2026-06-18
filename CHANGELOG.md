@@ -7,6 +7,33 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased] — v1.3.0
 
 ### Added
+- **Atmospheric corrections — ionospheric + tropospheric** (second half of v1.3.0), in the new
+  `dolphin-corrections` crate. Both produce a per-acquisition range delay (meters) on the frame
+  grid; the apply stage subtracts the per-date delay (relative to acquisition 0) from the
+  inverted LOS-phase series **before velocity**. **Off by default** (opt-in via correction
+  files, matching dolphin) — with none configured, `run_displacement` output is unchanged.
+  - **Ionosphere (`dolphin-corrections::ionosphere`)** — IONEX GNSS TEC maps → L-band range
+    delay via the closed-form `delay = TEC_LOS·K/f²` (`K = 40.31`; Yunjun et al. 2022 / Chen &
+    Zebker 2012), **scaled to the configured carrier** (`1/f²`). The dominant L-band term:
+    `(f_C/f_L)² ≈ 18×` C-band for the same TEC. Closed-form contract green; **validated on a
+    real IGS final GIM from CDDIS** — 56.5 TECU → 14.4 m L-band delay (18.5× C-band).
+  - **Troposphere (`dolphin-corrections::troposphere`)** — OPERA L4 (`OPERA_L4_TROPO-ZENITH_V1`)
+    netCDF ingest via GDAL's `NETCDF:` driver, bilinear resample to the frame grid, zenith→slant
+    by `1/cos(inc)`. Synthesized-fixture contract green; **real granule ingested (ASF, 2 GB)** —
+    total ZTD = `hydrostatic_delay` + `wet_delay` (the real product exposes two fields, not one)
+    ≈ 2.79 m centre. Full real-frame application (global EPSG:4326 → UTM warp) is the remaining
+    deferred step (see `VALIDATION.md`).
+  - **RAiDER fallback (`dolphin-corrections::raider`)** — subprocess + GDAL ingest, **gated
+    behind a `raider_available()` check like SNAPHU**; returns `RaiderUnavailable` rather than
+    being stubbed when RAiDER is absent. The L4 path is primary.
+  - `correction_options` config mirrors dolphin's `ionosphere_files` / `geometry_files` /
+    `dem_file` (a dolphin YAML round-trips); `troposphere_files` (direct OPERA-L4 ingest),
+    `incidence_angle_deg`, and `troposphere_variable` (default `"total"` = hydrostatic + wet)
+    are **forward divergences** — dolphin derives troposphere from a DEM via RAiDER and has no
+    `troposphere_files`. Layers surface on `DisplacementOutput.{ionosphere_delay,
+    troposphere_delay}` and as `ionosphere_NN.tif` / `troposphere_NN.tif` COGs.
+  - `dolphin-io::grid_centroid_lonlat` — frame-centre (lon, lat) via a CRS transform, to sample
+    the coarse global IONEX grid at the frame.
 - **NISAR / L-band geocoded-SLC ingest path** (first half of v1.3.0) — reads a NISAR L-band
   GSLC stack end-to-end into a displacement product.
   - `dolphin-io::nisar` — `read_nisar_rslc` / `read_nisar_stack` read the NISAR complex-`f32`
@@ -28,6 +55,22 @@ All notable changes to dolphinRust are documented here. The format follows
     runs through `run_displacement` → typed output + COGs, grid/EPSG/geotransform correct.
   - **Limitation:** geometrically correct but **atmospherically uncorrected**. Ionospheric
     (~16× the C-band effect) + tropospheric corrections are a separate later v1.3.0 loop.
+
+### Fixed
+- **Interferogram sign convention — inverted LOS sign in v1.0.0–v1.2.0, now corrected.**
+  `displacement.rs::unwrap_pair` formed the ifg as `sec·conj(ref)`; dolphin **production**
+  (`interferogram.py`) forms `ref·conj(sec)`. The reversed order **globally inverted the LOS
+  displacement *and* velocity sign of every release v1.0.0–v1.2.0** — subsidence read as uplift
+  and vice-versa. It was invisible because the oracle generator (`oracle/gen_displacement.py`)
+  carried the *same* inversion, so the sign-sensitive contracts proved Rust agreed with a
+  flipped oracle, not with production. **Impact for eo:** the `velocity_mm_yr` sign (subsidence
+  vs uplift) that drives GroundPulse risk tiers was inverted in v1.0–v1.2 and is now correct.
+  Fixed in `e1db05a`; the oracle was corrected in lockstep (`2c85a79`). Backfilled this release
+  with an **always-on analytic sign guard** (`sign_convention`, proven to go red if `unwrap_pair`
+  is reverted) and a **gated real-data test** (`sign_real_data`, `SIGN_REF_PROD_IFG`) confirming
+  dolphinRust matches a full production `dolphin run` on the F38502/Corcoran subsidence bowl —
+  displacement correlation **−0.97 → +0.99** before/after the fix. See `VALIDATION.md`
+  §"Interferogram sign convention".
 
 ## [Unreleased] — v1.2.0
 

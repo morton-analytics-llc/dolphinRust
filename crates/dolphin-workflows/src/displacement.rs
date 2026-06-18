@@ -24,6 +24,7 @@ use dolphin_unwrap::{unwrap, unwrap_multiscale, CostMode, InitMethod, TophuConfi
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
+use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::dates::decimal_days;
 use crate::sequential::{run_sequential, SequentialConfig, SequentialOutput};
 
@@ -69,6 +70,14 @@ pub struct DisplacementOutput {
     /// configured `timeseries_options.reference_point`, else the auto-selected
     /// center-of-mass point, or `None` if no coherent pixel was found.
     pub reference_point: Option<(usize, usize)>,
+    /// Per-date ionospheric range delay (meters), `(n_dates, rows, cols)`, that was
+    /// subtracted from the series. `None` unless `correction_options.ionosphere_files`
+    /// were supplied. The dominant L-band atmospheric term (`1/f²`-scaled).
+    pub ionosphere_delay: Option<Array3<f64>>,
+    /// Per-date tropospheric range delay (meters), `(n_dates, rows, cols)`, that was
+    /// subtracted from the series. `None` unless `correction_options.troposphere_files`
+    /// were supplied.
+    pub troposphere_delay: Option<Array3<f64>>,
 }
 
 /// Run `f`, emitting its wall-clock under `stage` at INFO (`stage` + `elapsed_s`
@@ -139,6 +148,19 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     if let Some(point) = reference_point {
         reference_to_point(&mut disp_rad, point);
     }
+    // Atmospheric corrections subtract per-date delay from the inverted series,
+    // before velocity (opt-in; no-op when no correction files are configured).
+    let date_files = first_burst_files(cfg, &groups);
+    let corrections = timed("corrections", || {
+        apply_corrections(
+            &cfg.correction_options,
+            cfg.input_options.wavelength,
+            &mut disp_rad,
+            &date_files,
+            epsg.unwrap_or(0),
+            geotransform,
+        )
+    })?;
     let vel_rad = timed("velocity", || velocity_of(disp_rad.view(), &days));
 
     let phase_to_disp = cfg
@@ -164,6 +186,7 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
         epsg,
         geotransform,
     )?;
+    write_correction_outputs(cfg, &corrections, epsg, geotransform)?;
     Ok(DisplacementOutput {
         displacement,
         velocity,
@@ -175,6 +198,8 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
         epsg,
         geotransform,
         reference_point,
+        ionosphere_delay: corrections.ionosphere,
+        troposphere_delay: corrections.troposphere,
     })
 }
 
@@ -428,7 +453,12 @@ fn unwrap_network(
     ndarray::stack(ndarray::Axis(0), &views).context("stacking unwrapped ifgs")
 }
 
-/// Unwrap one ifg `(i, j)` formed as `exp(j∠(pl_j · conj(pl_i)))`.
+/// Unwrap one ifg `(i, j)` formed as `exp(j∠(pl_i · conj(pl_j)))` — dolphin's
+/// production convention `ref · conj(sec)` (`interferogram.py`, `_create_vrt_conj`):
+/// for the single-reference network `i` is the reference/earlier date and `j` the
+/// secondary/later one. Verified against OPERA + a full `dolphin run` on the
+/// F38502/Corcoran bowl: the opposite order (`pl_j · conj(pl_i)`) globally inverts
+/// the displacement sign (corr −1.0000 vs production unwrapped ifg).
 fn unwrap_pair(
     pl: ArrayView3<Cf64>,
     (i, j): (usize, usize),
@@ -438,7 +468,7 @@ fn unwrap_pair(
 ) -> Result<Array2<f64>> {
     let (_, rows, cols) = pl.dim();
     let ifg = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        let z = pl[(j, r, c)] * pl[(i, r, c)].conj();
+        let z = pl[(i, r, c)] * pl[(j, r, c)].conj();
         Cf32::from_polar(1.0, z.arg() as f32)
     });
     driver.run(ifg.view(), correlation.view(), scratch)
@@ -538,6 +568,44 @@ fn write_outputs(
     }
     if let Some(closure) = quality.closure_phase {
         write_bands(&write_f32, closure.view(), "closure_phase")?;
+    }
+    Ok(())
+}
+
+/// The first burst's input files in date order (the dates the series is built on),
+/// used to time-stamp the IONEX lookup. Mirrors how `days` is taken from the first
+/// burst; `groups` is a `BTreeMap`, so `.values().next()` is the first burst.
+fn first_burst_files(
+    cfg: &DisplacementWorkflow,
+    groups: &std::collections::BTreeMap<String, Vec<usize>>,
+) -> Vec<PathBuf> {
+    groups
+        .values()
+        .next()
+        .map(|idxs| {
+            idxs.iter()
+                .map(|&i| cfg.cslc_file_list[i].clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the per-date correction-delay layers (meters) as `{kind}_NN.tif` COGs.
+fn write_correction_outputs(
+    cfg: &DisplacementWorkflow,
+    corrections: &CorrectionLayers,
+    epsg: Option<u32>,
+    gt: [f64; 6],
+) -> Result<()> {
+    let dir = &cfg.work_directory;
+    let write_f32 = |name: &str, a: ArrayView2<f64>| {
+        write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
+    };
+    if let Some(iono) = &corrections.ionosphere {
+        write_bands(&write_f32, iono.view(), "ionosphere")?;
+    }
+    if let Some(tropo) = &corrections.troposphere {
+        write_bands(&write_f32, tropo.view(), "troposphere")?;
     }
     Ok(())
 }

@@ -9,11 +9,37 @@
 use std::path::Path;
 
 use gdal::raster::{Buffer, GdalType, RasterCreationOptions};
-use gdal::spatial_ref::SpatialRef;
+use gdal::spatial_ref::{CoordTransform, SpatialRef};
 use gdal::{Dataset, DriverManager};
 use ndarray::{Array2, ArrayView2};
 
 use crate::error::{IoError, Result};
+
+/// Geographic (lon, lat) in degrees of a grid's centre pixel, transforming the
+/// projected geotransform centre through `epsg` → EPSG:4326. Used to sample
+/// coarse global atmospheric products (e.g. IONEX TEC maps) at the frame.
+///
+/// # Errors
+/// Returns `Err` if the CRS or the coordinate transform cannot be built.
+pub fn grid_centroid_lonlat(
+    gt: [f64; 6],
+    rows: usize,
+    cols: usize,
+    epsg: u32,
+) -> Result<(f64, f64)> {
+    let cx = gt[0] + (cols as f64 / 2.0) * gt[1] + (rows as f64 / 2.0) * gt[2];
+    let cy = gt[3] + (cols as f64 / 2.0) * gt[4] + (rows as f64 / 2.0) * gt[5];
+    let mut src = SpatialRef::from_epsg(epsg)?;
+    let mut dst = SpatialRef::from_epsg(4326)?;
+    src.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    dst.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    let ct = CoordTransform::new(&src, &dst)?;
+    let mut x = [cx];
+    let mut y = [cy];
+    let mut z = [0.0];
+    ct.transform_coords(&mut x, &mut y, &mut z)?;
+    Ok((x[0], y[0]))
+}
 
 /// A raster with its georeferencing.
 pub struct RasterData<T> {

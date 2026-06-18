@@ -21,6 +21,7 @@ dolphin-stack.workspace = true
 dolphin-timeseries.workspace = true
 dolphin-filtering.workspace = true
 dolphin-unwrap.workspace = true
+dolphin-corrections.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true

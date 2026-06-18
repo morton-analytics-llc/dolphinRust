@@ -169,3 +169,41 @@ work_directory: /work/run1
     assert_eq!(c.timeseries_options.method, TimeseriesMethod::L1);
     assert_eq!(c.unwrap_options.snaphu_options.init_method, "mcf");
 }
+
+/// A dolphin `correction_options` block (dolphin's `ionosphere_files` /
+/// `geometry_files` / `dem_file` names) deserializes into [`CorrectionOptions`],
+/// and corrections are off by default. The dolphinRust-only `troposphere_files`
+/// forward divergence parses alongside.
+#[test]
+fn dolphin_correction_options_round_trips() {
+    // Default: corrections disabled (no files).
+    let bare = DisplacementWorkflow::default();
+    assert!(!bare.correction_options.is_enabled(), "off by default");
+    assert_eq!(bare.correction_options.incidence_angle_deg, 37.0);
+
+    let yaml = r#"
+work_directory: /work/run1
+correction_options:
+  ionosphere_files:
+    - /aux/jplg0010.23i
+    - /aux/jplg0130.23i
+  geometry_files:
+    - /aux/los_east.tif
+  dem_file: /aux/dem.tif
+  troposphere_files:
+    - /aux/l4_20230101.nc
+    - /aux/l4_20230113.nc
+"#;
+    let c = DisplacementWorkflow::from_yaml(yaml).unwrap();
+    assert_eq!(c.correction_options.ionosphere_files.len(), 2);
+    assert_eq!(c.correction_options.geometry_files.len(), 1);
+    assert_eq!(
+        c.correction_options.dem_file.as_deref(),
+        Some(std::path::Path::new("/aux/dem.tif"))
+    );
+    assert_eq!(c.correction_options.troposphere_files.len(), 2);
+    assert!(c.correction_options.is_enabled(), "files → enabled");
+    // Round-trips through serialize → parse.
+    let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();
+    assert_eq!(reparsed, c, "correction_options round-trips");
+}

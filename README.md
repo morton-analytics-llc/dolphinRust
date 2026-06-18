@@ -49,10 +49,12 @@ tolerances (not bit-exactness):
 - **NISAR / L-band geocoded-SLC ingest** is implemented (`input_type: nisar_gslc`) and
   **validated against a real NISAR GSLC granule**: reads the NISAR complex-`f32` `{r,i}`
   compound + custom geotransform/EPSG (camelCase coords + `epsg_code` attribute), threads the
-  L-band wavelength through to mm/yr. The product is geometrically correct but
-  **atmospherically uncorrected** —
-  ionospheric/tropospheric corrections are a separate later v1.3.0 loop, and are mandatory for
-  a *usable* L-band product. See [docs/usage.md](docs/usage.md) §2.
+  L-band wavelength through to mm/yr.
+- **Atmospheric corrections** (`dolphin-corrections`, opt-in) make the L-band product *usable*:
+  ionospheric (IONEX TEC → `1/f²`-scaled L-band delay — ~18× C-band, **validated on a real IGS
+  TEC map: 56.5 TECU → 14 m**) and tropospheric (OPERA L4 netCDF ingest — **real granule
+  validated**, total ZTD ≈ 2.8 m), subtracted per date from the time series before velocity,
+  with RAiDER as a gated fallback. Off by default. See [docs/usage.md](docs/usage.md) §3a.
 - `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, and the spurt/whirlwind unwrappers
   are deferred.
 
@@ -66,6 +68,7 @@ See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
 | GDAL | ≥ 3.4 (tested 3.12) | GeoTIFF/COG I/O (`gdal` 0.19) |
 | HDF5 | 1.10+ (tested 2.x) | CSLC reading (`hdf5-metno` 0.12) |
 | SNAPHU | binary on `PATH` (tested 2.0.7) | phase unwrapping |
+| RAiDER (optional) | `python -c "import RAiDER"` or `raider.py` on `PATH` | tropospheric-delay *fallback* (gated; OPERA L4 netCDF is the primary path) |
 | GPU (optional) | any `wgpu` adapter — Metal / Vulkan / DX12 | GPU phase-linking backend (opt-in; CPU is the default) |
 
 The numerical crates (`dolphin-core/-phaselink/-shp/-ps/-stack/-timeseries/-filtering`) build
@@ -150,6 +153,7 @@ config reference, and output schema: **[docs/usage.md](docs/usage.md)**.
 | `dolphin-timeseries` | `dolphin/timeseries.py` | SBAS L1/L2 network inversion, velocity |
 | `dolphin-filtering` | `dolphin/filtering.py` | Long-wavelength / Goldstein FFT filters |
 | `dolphin-unwrap` | `dolphin/unwrap/` | Dispatch to external unwrappers (SNAPHU) |
+| `dolphin-corrections` | `dolphin/atmosphere/` | Ionospheric (IONEX) + tropospheric (OPERA L4 / RAiDER) delay corrections |
 | `dolphin-ingest` | — | Concurrent S3 read-staging (feature `s3`, off by default) |
 | `dolphin-workflows` | `dolphin/workflows/` | Displacement pipeline orchestration + config |
 | `dolphin-cli` | `dolphin` CLI | `dolphin run --config <yaml>` |

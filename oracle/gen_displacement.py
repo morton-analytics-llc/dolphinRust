@@ -80,9 +80,13 @@ def main() -> None:
     # Phase linking (single ministack), referenced to date 0.
     pl = np.asarray(run_phase_linking(stack, HALF, STRIDES, use_evd=False, reference_idx=0).cpx_phase)
 
-    # Single-reference network + ifgs + unwrap.
+    # Single-reference network + ifgs + unwrap. Form the ifg as dolphin's
+    # production `interferogram.py` does — `ref * conj(sec)` = pl[i] * conj(pl[j])
+    # for pair (i=ref, j=sec). The earlier `pl[j] * conj(pl[i])` order silently
+    # inverted the displacement sign and matched dolphinRust's own (buggy) order,
+    # so the contract could not see the global sign flip (verified on F38502).
     pairs = [(0, j) for j in range(1, N)]
-    dphi = np.stack([snaphu_unwrap(np.exp(1j * np.angle(pl[j] * np.conj(pl[i])))) for i, j in pairs])
+    dphi = np.stack([snaphu_unwrap(np.exp(1j * np.angle(pl[i] * np.conj(pl[j])))) for i, j in pairs])
 
     a = get_incidence_matrix(pairs).astype(np.float64)
     disp, _ = invert_stack(a, dphi)

@@ -103,15 +103,23 @@ per-ministack stitching matches the oracle ✅; dolphinRust running in eo's work
   selector (forward divergence); L-band λ threads to mm/yr. End-to-end on a synthesized NISAR
   stack (typed output + COGs). **Atmospheric corrections still pending** (below) — the product
   is geometrically correct but atmospherically uncorrected.
-- **L-band ionospheric correction** (~1–2 wks). TEC/IONEx — ionosphere is ~16× the C-band
-  effect, so this is mandatory for usable L-band, not optional.
-- **OPERA L4 tropospheric product ingest** (~3–5 days). Free public netCDF aligned to
-  DISP-S1 frames; lowest-effort, user-expected atmospheric path.
-- **RAiDER dispatch** (subprocess + GDAL ingest) (~1–2 wks) for scenes without an L4 product.
-- L-band spectral parameters in covariance estimation.
+- **L-band ionospheric correction** ✅ (v1.3 part 2). IONEX TEC → `1/f²`-scaled L-band range
+  delay (`K=40.31`, Yunjun 2022), in the new `dolphin-corrections` crate. Closed-form contract
+  green; **validated on a real IGS GIM from CDDIS — 56.5 TECU → 14.4 m L-band delay (18.5×
+  C-band)**. Mandatory for usable L-band, confirmed on real data.
+- **OPERA L4 tropospheric product ingest** ✅ (v1.3 part 2). GDAL `NETCDF:` ingest + bilinear
+  resample + zenith→slant. Synthesized-fixture contract green; **real `OPERA_L4_TROPO-ZENITH_V1`
+  granule ingested (ASF, 2 GB): total ZTD = hydrostatic + wet ≈ 2.79 m centre.** Full real-frame
+  application (global 4326 → UTM warp) deferred-with-receipts; see VALIDATION.md.
+- **RAiDER dispatch** ✅ wired behind an availability check (subprocess + GDAL ingest), gated
+  like SNAPHU; deferred this run (RAiDER not installed) — never stubbed. L4 is the primary path.
+- L-band spectral parameters in covariance estimation. *(deferred to v1.4 — not required for the
+  atmospheric-correction exit.)*
 
-**Exit:** dolphinRust ingests a NISAR RSLC stack and produces displacement; tropospheric +
-ionospheric corrections applied and validated against an OPERA correction layer.
+**Exit:** dolphinRust ingests a NISAR RSLC stack and produces displacement ✅; tropospheric +
+ionospheric corrections applied and **validated against real OPERA/IGS atmospheric layers** ✅
+(real IONEX + real OPERA L4 both reachable and validated; full real-frame tropo warp deferred).
+**v1.3.0 complete** (both corrections fixture-proven, wired, real-source-validated).
 
 ---
 
