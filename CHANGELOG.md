@@ -22,8 +22,30 @@ All notable changes to dolphinRust are documented here. The format follows
   - Config flags match dolphin: `phase_linking.write_crlb` (default **on**),
     `phase_linking.write_closure_phase` (default **off**) — a real dolphin YAML round-trips.
   - Contracts: `quality_v042_contract` (CRLB σ + closure max |Δ| < 1e-4 vs v0.42.0;
-    singular-Γ NaN matches; analytic consistency checks). GPU CRLB is a later follow-up;
-    tophu unwrapping + per-ministack coherence stitching remain for the rest of v1.2.0.
+    singular-Γ NaN matches; analytic consistency checks). GPU CRLB is a later follow-up.
+- **tophu-style multi-scale unwrapping** (`dolphin-unwrap::unwrap_multiscale`) — OPERA's
+  production multi-scale strategy driven over the existing SNAPHU wrapper: coarse downsample
+  → single SNAPHU unwrap → nearest upsample → overlapping tiled SNAPHU (rayon) → integer-2π
+  merge anchored to the coarse solution. **Opt-in** via `unwrap_method: tophu`; **SNAPHU
+  stays the default and the default build is behaviourally unchanged.**
+  - Config: dolphin's `tophu_options` block (`ntiles`, `downsample_factor`, `init_method`,
+    `cost`) is now modeled, so a real dolphin YAML round-trips it; new `UnwrapMethod::Tophu`
+    routes the unwrap network through it (dolphin reserves its `multiscale_unwrap` for
+    ICU/PHASS — we expose it driving the SNAPHU solver we ship).
+  - Contracts: ramp recovery within the raw-SNAPHU envelope, coarse-pass round-trip, planted
+    inter-tile 2π jump resolved, tile-cover / cycle-snap / down-up round-trip unit tests.
+  - **Honest measurement** (`bench/UNWRAP.md`): on large low-coherence scenes tophu does
+    **not** beat raw SNAPHU — it is modestly worse (unreliable coarse anchor in decorrelated
+    ground; mean-cycle merge cruder than SNAPHU's global MCF). Reported, not hidden; scene
+    and tolerances not tuned to manufacture a win. Prefer SNAPHU for low-coherence scenes.
+- **Per-ministack temporal-coherence stitching** (`dolphin-workflows::sequential`) — the
+  cross-ministack temporal-coherence reduction is now dolphin's NaN-aware mean
+  (`numpy.nanmean`, `_average_or_rename`) rather than a plain mean. Equal on all-finite
+  layers (parity preserved), but a pixel masked/decorrelated in some ministacks now averages
+  only the finite ones instead of being diluted toward zero — matching dolphin on
+  many-ministack frames and closing the per-band CRLB/closure concatenation caveat. Contract
+  `stitching_and_quality_match_oracle_multiministack` vs v0.42 oracle (`gen_stitch_v042.py`)
+  on a 2-ministack stack: stitched temp_coh + concatenated CRLB + closure all < 1e-3.
 
 ## [Unreleased] — v1.1.0
 

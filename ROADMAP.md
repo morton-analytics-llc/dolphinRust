@@ -70,16 +70,27 @@ dolphinRust produces a displacement product end-to-end from a `gp-tasks` job on 
   closure max |Δ| < 1e-4). Nearest-neighbour triplet non-closure on
   `DisplacementOutput.closure_phase` + per-band COGs (default off, matching dolphin); the
   prerequisite signal for phase-bias work in R4.
-- **tophu-style multi-scale tiled unwrapping** (~2–3 wks). OPERA's *production* unwrapper —
-  coarse-resolution init feeding tiled SNAPHU, merged. Materially better than raw SNAPHU on
-  large, low-coherence (vegetated) scenes. Keep SNAPHU as the simple path.
-- **Per-ministack temporal-coherence stitching** (dolphin v0.41) (~3–5 days). Full ministack
-  correctness for frame mosaics.
+- **tophu-style multi-scale tiled unwrapping** — **SHIPPED** (branch `v1.2-unwrap`,
+  `dolphin-unwrap::unwrap_multiscale`): coarse downsample → single SNAPHU → nearest upsample
+  → overlapping tiled SNAPHU (rayon) → integer-2π-cycle merge anchored to the coarse
+  reference. Opt-in via `unwrap_method: tophu`; **SNAPHU stays the default path.** Correct
+  (contract tests: ramp recovery within the SNAPHU envelope, planted inter-tile 2π jump
+  resolved). **Honest caveat: it does NOT beat raw SNAPHU on the low-coherence test scenes —
+  it is modestly worse** (coarse multilook of decorrelated phasors → unreliable anchor; the
+  constant mean-cycle merge is cruder than SNAPHU's global MCF). Numbers + hypothesis in
+  `bench/UNWRAP.md`. Not tuned to fake a win.
+- **Per-ministack temporal-coherence stitching** (dolphin v0.41) — **SHIPPED** (same branch):
+  cross-ministack reduction is now dolphin's NaN-aware mean (`numpy.nanmean`) instead of a
+  zero-diluting plain mean, matching the layer the per-band CRLB/closure concatenate against
+  (caveat closed). Contract vs v0.42 oracle on a 2-ministack stack (`gen_stitch_v042.py`):
+  stitched temp_coh + concatenated CRLB + closure all < 1e-3.
 - **Finish eo integration** to production (PostGIS summary rows + COG, behind a gp-tasks
   task) if not completed in R1.
 
-**Exit:** CRLB + closure rasters match the v0.4x oracle; tophu beats SNAPHU on a
-low-coherence scene (fewer unwrap errors, measured); dolphinRust running in eo's worker.
+**Exit:** CRLB + closure rasters match the v0.4x oracle ✅; tophu implemented + correct, but
+**did not beat SNAPHU on the low-coherence scene** (measured, reported in `bench/UNWRAP.md` —
+SNAPHU remains the recommended default) ⚠; per-ministack stitching matches the oracle ✅;
+dolphinRust running in eo's worker (R1).
 
 ---
 

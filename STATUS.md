@@ -62,8 +62,25 @@ coherence stitching are the *other* half — a separate later loop.
 | Docs (README/usage/CHANGELOG/ROADMAP) | ✅ done — incl. the CRLB→`confidence_score` note |
 
 Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, test (default 42
-groups), `cargo doc --no-deps`. GPU CRLB + tophu + stitching remain. **Nothing pushed** —
-committed on branch `v1.2-quality`, awaiting sign-off.
+groups), `cargo doc --no-deps`. **Nothing pushed** — committed on branch `v1.2-quality`,
+awaiting sign-off.
+
+## v1.2.0 unwrap + stitching progress (branch `v1.2-unwrap`, per UNWRAP_STITCH_PROMPT.md)
+
+The *other* half of v1.2.0 — tophu multi-scale unwrapping + per-ministack temporal-coherence
+stitching. With this the v1.2.0 scope is complete.
+
+| Item | State |
+|---|---|
+| tophu multi-scale unwrap | ✅ done — `dolphin-unwrap::unwrap_multiscale` (coarse downsample → SNAPHU → upsample → overlapping tiled SNAPHU via rayon → 2π-cycle merge). Contracts: ramp within SNAPHU envelope, coarse round-trip, planted inter-tile 2π jump resolved, + 4 unit tests |
+| tophu-vs-SNAPHU measurement | ⚠ **honest negative** — tophu does **not** beat raw SNAPHU on low-coherence scenes (modestly worse); numbers + hypothesis in `bench/UNWRAP.md`. Not tuned to fake a win. SNAPHU stays default |
+| Per-ministack temp-coh stitching | ✅ done — `sequential.rs::stitch_temp_coh` = dolphin's NaN-aware mean (`numpy.nanmean`); contract `stitching_and_quality_match_oracle_multiministack` vs v0.42 oracle (`gen_stitch_v042.py`), temp_coh + CRLB + closure <1e-3 on a 2-ministack stack. CRLB/closure concatenation caveat closed |
+| Config + wiring | ✅ done — `TophuOptions` + `UnwrapMethod::Tophu` (dolphin YAML round-trips `tophu_options`); `run_displacement` routes to tophu when selected, SNAPHU default behaviourally unchanged |
+| Docs (README/usage/CHANGELOG/ROADMAP/VALIDATION) | ✅ done — incl. the honest tophu caveat + the nanmean-stitching clarification |
+
+Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, test, `cargo doc
+--no-deps`. **v1.2.0 complete.** **Nothing pushed** — committed on branch `v1.2-unwrap`,
+awaiting sign-off.
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error

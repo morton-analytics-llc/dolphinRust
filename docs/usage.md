@@ -70,7 +70,9 @@ interferogram_network:
 timeseries_options:
   method: L1                   # L1 (dolphin default, ADMM/LAD) or L2 (weighted least squares)
 unwrap_options:
+  unwrap_method: snaphu        # default; or `tophu` for multi-scale (see below)
   snaphu_options: { cost: smooth, init_method: mcf, ntiles: [1, 1] }
+  tophu_options: { ntiles: [4, 4], downsample_factor: [3, 3], init_method: mcf, cost: smooth }
 output_options:
   strides: { y: 1, x: 1 }      # output multilooking
   epsg: 32611                  # fallback CRS when the CSLC carries none
@@ -155,7 +157,7 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 | `displacement` | `Array3<f64>` `(n_dates-1, rows, cols)` | meters (if `wavelength`) else radians | cumulative LOS vs acquisition 0 |
 | `velocity` | `Array2<f64>` `(rows, cols)` | m/yr (if `wavelength`) else rad/yr | raster-unit linear rate |
 | `velocity_mm_yr` | `Array2<f64>` `(rows, cols)` | **mm/yr** | LOS rate via `−λ/4π`; config λ or Sentinel-1 default |
-| `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | ministack-averaged phase quality (unmasked) |
+| `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | per-ministack-stitched phase quality (dolphin's NaN-aware mean across ministacks; unmasked) |
 | `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-date Cramér–Rao σ lower bound; band 0 = reference (σ=0), singular-Γ pixels `NaN`. `Some` by default (`write_crlb`) |
 | `closure_phase` | `Option<Array3<f64>>` `(n_dates-2, rows, cols)` | radians | per-triplet nearest-neighbour non-closure; `Some` only when `write_closure_phase` |
 | `acquisition_days` | `Vec<f64>` length `n_dates` | days | decimal days from acquisition 0 |
@@ -187,6 +189,34 @@ velocity; a high-σ or `NaN` (singular-Γ, fully decorrelated) pixel should be d
 masked. To reduce the per-date layer to one scalar per pixel for scoring, take a
 baseline-appropriate summary (e.g. the last date's σ, or the RMS across dates); the choice is
 the consumer's, so dolphinRust surfaces the full per-date bound rather than pre-collapsing it.
+
+## 5b. Phase unwrapping: SNAPHU (default) vs tophu multi-scale
+
+`unwrap_options.unwrap_method` selects the unwrapper. Both drive the SNAPHU binary
+(`snaphu` on `PATH`); only the strategy differs.
+
+- **`snaphu`** (default) — one SNAPHU solve over the whole interferogram, with SNAPHU's
+  own internal tiling controlled by `snaphu_options` (`ntiles`, `tile_overlap`,
+  `n_parallel_tiles`, `cost`, `init_method`). This is the recommended path.
+- **`tophu`** — OPERA's multi-scale strategy: downsample the wrapped phase + correlation by
+  `tophu_options.downsample_factor` and unwrap that coarse grid once, upsample it as an
+  absolute-phase reference, unwrap the full-res grid in `tophu_options.ntiles` overlapping
+  tiles in parallel, then merge by snapping each tile to the coarse reference by an integer
+  number of 2π cycles. The idea is that a reliable low-resolution trend keeps the tiled
+  fine-scale solves globally consistent.
+
+**When to use tophu:** large scenes where a reliable coarse trend exists. **Honest caveat:**
+on the low-coherence (vegetated/decorrelated) scenes we benchmarked, tophu does **not** beat
+raw SNAPHU — it is modestly worse, because multilooking decorrelated phasors yields an
+unreliable coarse anchor and the constant-cycle tile merge is cruder than SNAPHU's global
+minimum-cost-flow solve. See [`bench/UNWRAP.md`](../bench/UNWRAP.md) for the measured numbers
+and reproduction. **For low-coherence scenes, prefer the default SNAPHU path.**
+
+```yaml
+unwrap_options:
+  unwrap_method: tophu
+  tophu_options: { ntiles: [4, 4], downsample_factor: [3, 3], init_method: mcf, cost: smooth }
+```
 
 ## 6. Known limitations (v1.0.0)
 

@@ -43,8 +43,11 @@ tolerances (not bit-exactness):
   synthetic tier (a = 1.0000); a high-coherence *deforming* scene is the narrow follow-up.
 - **Multi-burst frame stitching** is implemented (frame mosaic by burst geotransform); not yet
   exercised on a real multi-burst OPERA frame.
-- CRLB / closure-phase rasters, `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer,
-  NISAR custom geotransform, and the tophu/spurt/whirlwind unwrappers are deferred.
+- **tophu multi-scale unwrapping** is implemented and opt-in (`unwrap_method: tophu`), but on
+  low-coherence scenes it does **not** beat the default SNAPHU path — see
+  [bench/UNWRAP.md](bench/UNWRAP.md). SNAPHU remains the recommended default.
+- `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform, and the
+  spurt/whirlwind unwrappers are deferred.
 
 See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
 
