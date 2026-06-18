@@ -27,7 +27,11 @@ modelling + raster subtraction, no solver.
 
 - **Troposphere (non-dispersive).** Same delay in meters for L- and C-band. Primary
   source: the public OPERA L4 tropospheric netCDF (DISP-S1-aligned), read via GDAL's
-  `NETCDF:` driver and bilinearly resampled onto the frame grid. Fallback: RAiDER
+  `NETCDF:` driver and resampled onto the frame grid — `resample_bilinear` when the
+  product shares the frame CRS, `warp_to_frame` (GDAL bilinear `reproject`) when it
+  differs (the global EPSG:4326 L4 product → a UTM frame). The L4 grid carries no CRS
+  through GDAL's NETCDF driver, so a geographic-degree-range geotransform is assigned
+  EPSG:4326 (the plate-carrée product). Fallback: RAiDER
   (`raider.py` subprocess) — **gated behind an availability check like SNAPHU, never
   stubbed**; absent ⇒ `RaiderUnavailable` and the path is skipped (deferred), not faked.
 

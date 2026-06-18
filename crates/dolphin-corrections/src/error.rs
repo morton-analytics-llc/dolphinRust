@@ -32,6 +32,10 @@ pub enum CorrectionError {
         /// Number of correction files supplied.
         got: usize,
     },
+    /// A 4326→frame warp was requested but the source delay grid carries neither
+    /// a WKT nor an EPSG to reproject from.
+    #[error("tropospheric source grid has no CRS (WKT/EPSG) to warp from")]
+    NoSourceCrs,
     /// RAiDER was requested but is not installed (no `python -c 'import RAiDER'`
     /// and no `raider.py` on PATH). Gated like SNAPHU — never stubbed.
     #[error("RAiDER is not installed; install it or supply troposphere_files (OPERA L4)")]

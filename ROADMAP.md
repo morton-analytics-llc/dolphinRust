@@ -53,7 +53,7 @@ driven by the six factors above.
 | v1.0.0 | 2026-06-16 | ✅ shipped | Full end-to-end displacement pipeline |
 | v1.1.0 | 2026-06-16 | ✅ shipped | eo adoption + velocity scale + auto ref-point |
 | v1.2.0 | 2026-06-17 | ✅ shipped | Quality layers (CRLB/closure) + tophu unwrapping + stitching |
-| v1.3.0 | 2026-06-17 | 🔄 in flight today | NISAR/L-band ingest + atmospheric corrections (tropo warp pending) |
+| v1.3.0 | 2026-06-17 | ✅ complete, pending tag | NISAR/L-band ingest + atmospheric corrections (incl. tropo 4326→UTM warp) |
 | v1.4.0 | 2026-06-17 | 🔄 in flight today | Performance + NRT incremental + phase-bias + 3D-unwrap interface |
 | v1.5.0+ | 2026-H2 → 2027 | ⏳ gated | Capability-gated: real-data validation, discrete-GPU, lead-dolphin |
 
@@ -78,18 +78,19 @@ Tagged on `main`. Details (kept as record):
 
 ---
 
-## v1.3.0 — 🔄 nearly complete (target 2026-06-18) · "NISAR / L-band + atmosphere"
+## v1.3.0 — ✅ complete, pending tag sign-off · "NISAR / L-band + atmosphere"
 
-Both parts landed and merged; **one deferred step remains before tagging.**
+Both parts landed and merged; **the deferred tropo warp now lands — ready to tag.**
 - **NISAR/L-band GSLC reader** ✅ — real NISAR GSLC is complex-**f32** `{r,i}` (the prompt's int16
   assumption was wrong; corrected against a real granule). Custom geocoding geotransform/EPSG;
   `input_type: nisar_gslc`; L-band λ end-to-end. Reader validated on a real
   `NISAR_L2_GSLC_BETA_V1` granule.
 - **Ionospheric correction** ✅ — IONEX TEC → `1/f²` L-band delay; validated on a real IGS GIM
   (56.5 TECU → 14.4 m, 18.5× C-band).
-- **Tropospheric correction** ✅ ingest — OPERA L4 netCDF; real granule ingested (ZTD ≈ 2.79 m).
-- **▶ Remaining: tropo 4326→UTM warp** — the global L4 grid isn't yet warped onto a UTM frame, so
-  real-frame tropo isn't end-to-end. One loop. **Tag v1.3.0 when it lands.**
+- **Tropospheric correction** ✅ — OPERA L4 netCDF ingest + **4326→UTM warp** (`warp_to_frame`,
+  GDAL bilinear `reproject`). Synthesized + 4326→UTM warp contracts green; **real granule applied
+  end-to-end on the real Mexico City UTM 32614 frame: zenith mean 2.553 m (slant@39° ≈ 3.285 m).**
+  The CRS-mismatch `warn!` path is gone. **v1.3.0 is ready to tag.**
 - **Deferred (data-gated):** NISAR multi-date real displacement — needs ≥2 co-located repeat-pass
   dates; moves to the capability-gated phase below.
 

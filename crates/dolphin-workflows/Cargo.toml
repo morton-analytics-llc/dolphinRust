@@ -38,6 +38,8 @@ no-gpu = ["dolphin-phaselink/no-gpu"]
 
 [dev-dependencies]
 num-complex.workspace = true
+# Writes synthesized 4326 OPERA-L4 netCDF fixtures for the tropo 4326→UTM warp test.
+gdal = "0.19"
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.

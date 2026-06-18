@@ -336,9 +336,18 @@ Contract green vs the closed-form relation; the L/C ratio is `(f_C/f_L)²`.
   apparent LOS displacement if uncorrected. This is why the correction is mandatory at
   L-band, confirmed on real data, not just analytically.
 
-**Troposphere — OPERA L4 netCDF ingest.** GDAL `NETCDF:` ingest, bilinear resample to the
-frame grid, zenith→slant by `1/cos(inc)`. Contract green vs a synthesized L4-format netCDF
+**Troposphere — OPERA L4 netCDF ingest + 4326→UTM warp.** GDAL `NETCDF:` ingest, then a
+**reprojecting resample**: same-CRS grids take the bilinear `resample_bilinear` path,
+cross-CRS grids (global EPSG:4326 product → UTM frame) take `warp_to_frame` (GDAL bilinear
+`reproject`), zenith→slant by `1/cos(inc)`. Contract green vs a synthesized L4-format netCDF
 fixture (`ingests_synthesized_l4_netcdf`, written via GDAL's netCDF driver).
+
+- **4326→UTM warp contract — PASS** (`warps_4326_field_onto_utm_frame`,
+  `build_troposphere_warps_4326_onto_utm_frame`). A synthesized EPSG:4326 delay field linear
+  in (lon, lat) warps onto a UTM (32610) frame and recovers the analytic delay at known frame
+  pixels to `< 5e-3 m` (bilinear of a field linear in the source's uniform-degree index space
+  is exact). Proven both at the bare-warp level and end-to-end through the `build_troposphere`
+  pipeline stage. The old CRS-mismatch `warn!` path is gone — a known mismatch now reprojects.
 
 - **Real OPERA L4 — PASS** (test `real_opera_l4_total_is_physical`, gated on `OPERA_L4_REAL`).
   Collection `OPERA_L4_TROPO-ZENITH_V1` (CMR: **15,274 granules**), fetched from ASF
@@ -350,12 +359,16 @@ fixture (`ingests_synthesized_l4_netcdf`, written via GDAL's netCDF driver).
   total ZTD = **2.79 m** (hydrostatic mean 2.38 m + wet). `troposphere_variable` defaults to
   `"total"`; the divergence from the prompt's single-`troposphere` assumption is documented.
 
-- **Deferred — full real-frame tropo application.** The L4 product is a *global lat/lon*
-  grid; applying it to a *UTM* NISAR/DISP-S1 frame needs a CRS warp (4326→UTM) that the
-  bilinear resampler — which assumes a shared CRS — does not perform (it `warn!`s on
-  mismatch). Ingest + total-ZTD magnitude are validated; warping the real global grid onto a
-  real UTM frame is the remaining step. **Where to look next:** add a GDAL warp (or a
-  4326-frame test scene); the same `OPERA_L4_TROPO-ZENITH_V1` granules are reachable.
+- **Real full-frame tropo application — PASS** (test `real_l4_warps_onto_real_utm_frame`,
+  `crates/dolphin-workflows/tests/tropo_real_warp.rs`, skips when local real fixtures absent).
+  The real global EPSG:4326 `OPERA_L4_TROPO-ZENITH_V1` granule warps onto the **real Mexico
+  City UTM frame** (EPSG:32614, 384², `gt=[485770, 5, 0, 2143510, 0, -10]`, read from a real
+  cropped CSLC via `read_geotransform`). Applied zenith delay over the frame: **mean 2.553 m**
+  (min 2.548, max 2.558); slant at a Sentinel-1 IW incidence of 39° ≈ **3.285 m**. Lower than
+  the sea-level centre (2.79 m) because Mexico City sits at ~2.2 km altitude — physically
+  consistent. The L4 variables carry no embedded CRS through GDAL's NETCDF driver, so the
+  reader assigns EPSG:4326 when the geotransform spans geographic-degree ranges (the global
+  plate-carrée product); a projected CRS-less grid stays unset rather than mislabeled.
 
 **RAiDER fallback — deferred (not installed).** `python -c "import RAiDER"` fails and no
 `raider.py` on `PATH` here, so the fallback is **gated behind `raider_available()`** (like

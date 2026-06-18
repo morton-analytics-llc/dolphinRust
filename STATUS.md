@@ -110,15 +110,20 @@ default** (output unchanged when no correction files configured).
 |---|---|
 | Apply stage + typed API + COGs | ✅ done — `subtract_delay` (φ = d·(−4π/λ)); `DisplacementOutput.{ionosphere_delay,troposphere_delay}` + `ionosphere_NN.tif`/`troposphere_NN.tif` COGs. Contracts: zero-delay identity, exact subtraction, constant-delay cancels |
 | Ionosphere (IONEX → L-band `1/f²`) | ✅ done + **real-data validated** — closed-form `delay=vtec·1e16·K/f²` (K=40.31); IONEX parser. Real IGS GIM from CDDIS: 56.5 TECU → **14.4 m** L-band delay (**18.5×** C-band). `closed_form_vertical_delay`, `l_band_dwarfs_c_band_by_freq_squared`, `real_ionex_parses_to_physical_delay` (gated `IONEX_REAL`) |
-| Troposphere (OPERA L4 netCDF) | ✅ ingest done + **real-data validated** — GDAL `NETCDF:` read + bilinear resample + zenith→slant. Synthesized-fixture contract (`ingests_synthesized_l4_netcdf`). Real `OPERA_L4_TROPO-ZENITH_V1` (ASF, 2 GB): total ZTD = `hydrostatic_delay`+`wet_delay` = **2.79 m** centre (`real_opera_l4_total_is_physical`, gated `OPERA_L4_REAL`). ⏳ full real-frame application (global 4326 → UTM warp) deferred-with-receipts |
+| Troposphere (OPERA L4 netCDF + 4326→UTM warp) | ✅ done + **real-data validated end-to-end** — GDAL `NETCDF:` read + reprojecting resample (`warp_to_frame`, GDAL bilinear `reproject`, for cross-CRS; bilinear for same-CRS) + zenith→slant. Synthesized + **4326→UTM warp contracts** (`warps_4326_field_onto_utm_frame`, `build_troposphere_warps_4326_onto_utm_frame`, analytic delay `<5e-3 m`). Real `OPERA_L4_TROPO-ZENITH_V1` (ASF, 2 GB) ingest = **2.79 m** centre; **warped onto the real Mexico City UTM 32614 384² frame: zenith mean 2.553 m, slant@39° ≈ 3.285 m** (`real_l4_warps_onto_real_utm_frame`). CRS-mismatch `warn!` path gone |
 | RAiDER fallback | ✅ wired, gated like SNAPHU — `raider_available()` check; `RaiderUnavailable` (not stubbed) when absent. Deferred this run (RAiDER not installed). L4 is primary |
 | Config (dolphin parity + round-trip) | ✅ done — `correction_options` mirrors dolphin `ionosphere_files`/`geometry_files`/`dem_file`; `troposphere_files`/`incidence_angle_deg`/`troposphere_variable` forward divergence. `dolphin_correction_options_round_trips` |
 | **Ifg sign-convention fix + backfilled evidence** | ✅ done + **real-data validated** — `unwrap_pair` forms `ref·conj(sec)` (production `interferogram.py`); the old `sec·conj(ref)` **inverted LOS displacement + velocity sign of v1.0.0–v1.2.0** (oracle was inverted in lockstep, so contracts were blind). Fixed `e1db05a`/`2c85a79`. Always-on analytic guard `sign_convention` (proven red on revert); gated real-data test `sign_real_data` (`SIGN_REF_PROD_IFG`) vs a full production `dolphin run` on the F38502/Corcoran bowl: displacement corr **−0.97 → +0.99**. eo `velocity_mm_yr` (subsidence vs uplift) sign now correct. See VALIDATION.md §"Interferogram sign convention" |
 
 Gates green (default, `no-gpu`): fmt, clippy -D warnings, test, `cargo doc --no-deps`.
-**Merged to `main` (`--no-ff`) and pushed once the real-data sign gate confirmed green.** Not
-tagged v1.3.0 — the tropospheric 4326→UTM warp is still deferred (real-frame tropo not yet
-end-to-end), so v1.3.0 is incomplete.
+**Merged to `main` (`--no-ff`) and pushed once the real-data sign gate confirmed green.**
+
+**Tropo 4326→UTM warp (branch `v1.3-tropo-warp`, per REMAINING_WORK_PROMPT.md Phase 1)** —
+the deferred step is done: `warp_to_frame` reprojects the global EPSG:4326 L4 product onto a
+UTM frame; `build_troposphere` dispatches to it on CRS mismatch (bilinear when same-CRS).
+`DelayGrid` carries the source CRS WKT; a CRS-less L4 grid spanning geographic-degree ranges
+is assigned EPSG:4326 (plate-carrée product spec). Fixture + real-frame contracts green; gates
+green (default + `no-gpu`); sign guard green. **Awaiting sign-off to merge `--no-ff` + tag v1.3.0.**
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
