@@ -10,6 +10,7 @@ members = [
     "crates/dolphin-timeseries",
     "crates/dolphin-filtering",
     "crates/dolphin-unwrap",
+    "crates/dolphin-corrections",
     "crates/dolphin-ingest",
     "crates/dolphin-workflows",
     "crates/dolphin-cli",
@@ -53,6 +54,7 @@ dolphin-stack = { path = "crates/dolphin-stack", version = "1.0.0" }
 dolphin-timeseries = { path = "crates/dolphin-timeseries", version = "1.0.0" }
 dolphin-filtering = { path = "crates/dolphin-filtering", version = "1.0.0" }
 dolphin-unwrap = { path = "crates/dolphin-unwrap", version = "1.0.0" }
+dolphin-corrections = { path = "crates/dolphin-corrections", version = "1.0.0" }
 dolphin-ingest = { path = "crates/dolphin-ingest", version = "1.0.0" }
 dolphin-workflows = { path = "crates/dolphin-workflows", version = "1.0.0", default-features = false }
 

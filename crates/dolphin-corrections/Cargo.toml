@@ -1,0 +1,21 @@
+[package]
+name = "dolphin-corrections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atmospheric (ionospheric + tropospheric) phase corrections for the dolphinRust InSAR displacement pipeline."
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+dolphin-core.workspace = true
+dolphin-io.workspace = true
+ndarray.workspace = true
+thiserror.workspace = true
+gdal = "0.19"
+
+[lints]
+workspace = true

@@ -105,6 +105,9 @@ unwrap_options:
 output_options:
   strides: { y: 1, x: 1 }      # output multilooking
   epsg: 32611                  # fallback CRS when the CSLC carries none
+correction_options:           # atmospheric corrections — OFF by default (see §3a)
+  ionosphere_files: []         # IONEX TEC maps, one per date → ionospheric delay
+  troposphere_files: []        # OPERA L4 netCDF, one per date → tropospheric delay
 worker_settings:
   compute_backend: cpu         # default; phase-linking backend: cpu | auto | gpu (see below)
 work_directory: /out           # outputs are written here
@@ -112,6 +115,49 @@ work_directory: /out           # outputs are written here
 
 The complete config tree, with every field documented, is the rustdoc for
 `dolphin_core::config::DisplacementWorkflow` (`cargo doc --no-deps -p dolphin-core --open`).
+
+### 3a. Atmospheric corrections (ionospheric + tropospheric)
+
+Mandatory for *usable* L-band: the dispersive ionospheric delay scales as `1/f²`, so at the
+NISAR L-band carrier it is ~18× the Sentinel-1 C-band effect for the same TEC — a real IGS
+TEC map of 56.5 TECU is **14 m** of apparent LOS range delay. Corrections are **opt-in** (off
+by default, matching dolphin); supply correction files to enable them. Each produces a
+per-acquisition range delay in meters, subtracted (relative to acquisition 0) from the LOS
+series **before velocity**, and written as `ionosphere_NN.tif` / `troposphere_NN.tif` COGs.
+**Enabling corrections requires `input_options.wavelength`** (needed to convert meters↔phase).
+
+```yaml
+input_options:
+  input_type: nisar_gslc
+  wavelength: 0.238403545       # REQUIRED when corrections are enabled (L-band carrier)
+correction_options:
+  # Ionosphere — GNSS IONEX TEC maps, one per acquisition date (in date order).
+  # Source: https://cddis.nasa.gov/archive/gnss/products/ionex/  (Earthdata bearer token).
+  ionosphere_files:
+    - /aux/IGS0OPSFIN_20230010000_01D_02H_GIM.INX
+    - /aux/IGS0OPSFIN_20230130000_01D_02H_GIM.INX
+  # Troposphere — OPERA L4 TROPO-ZENITH netCDF, one per date. Source: ASF/PODAAC
+  # (short_name OPERA_L4_TROPO-ZENITH_V1). `troposphere_variable: total` sums the
+  # product's hydrostatic_delay + wet_delay zenith fields.
+  troposphere_files:
+    - /aux/OPERA_L4_TROPO-ZENITH_20230101.nc
+    - /aux/OPERA_L4_TROPO-ZENITH_20230113.nc
+  troposphere_variable: total   # default; or a single netCDF variable name
+  incidence_angle_deg: 37.0     # zenith→slant projection when no geometry file is given
+```
+
+Config-name parity: `ionosphere_files`, `geometry_files`, `dem_file` match dolphin (a dolphin
+YAML round-trips). `troposphere_files` / `incidence_angle_deg` / `troposphere_variable` are
+dolphinRust additions — dolphin instead derives troposphere from a DEM via **RAiDER**.
+
+**RAiDER (optional dependency)** is the tropospheric *fallback* for scenes without an L4
+product, dispatched as a subprocess like SNAPHU. It is **gated behind an availability check**
+(`python -c "import RAiDER"` or `raider.py` on `PATH`); absent, the tropospheric path is
+skipped rather than failing. Install RAiDER to enable it; the OPERA L4 path is primary.
+
+**Limitation.** The OPERA L4 product is a *global EPSG:4326* grid; applying it to a *UTM*
+frame currently requires the grids to share a CRS (a 4326→UTM warp is the remaining step —
+see `VALIDATION.md`). The ionospheric path and L4 *ingest* are validated on real data.
 
 ### Compute backend (CPU / GPU)
 
@@ -189,6 +235,8 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 | `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | per-ministack-stitched phase quality (dolphin's NaN-aware mean across ministacks; unmasked) |
 | `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-date Cramér–Rao σ lower bound; band 0 = reference (σ=0), singular-Γ pixels `NaN`. `Some` by default (`write_crlb`) |
 | `closure_phase` | `Option<Array3<f64>>` `(n_dates-2, rows, cols)` | radians | per-triplet nearest-neighbour non-closure; `Some` only when `write_closure_phase` |
+| `ionosphere_delay` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | meters | per-date ionospheric range delay subtracted; `Some` only when `ionosphere_files` supplied |
+| `troposphere_delay` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | meters | per-date tropospheric range delay subtracted; `Some` only when `troposphere_files` supplied |
 | `acquisition_days` | `Vec<f64>` length `n_dates` | days | decimal days from acquisition 0 |
 | `epsg` | `Option<u32>` | — | output CRS (CSLC metadata, else config) |
 | `geotransform` | `[f64; 6]` | — | GDAL `[origin_x, dx, 0, origin_y, 0, dy]` |
@@ -205,6 +253,8 @@ DEFLATE-compressed, overviews) sharing `epsg` + `geotransform`:
 | `displacement_NN.tif` | cumulative displacement at date `NN+1` | meters or radians |
 | `crlb_sigma_NN.tif` | CRLB σ at date `NN` (band 0 = reference) | radians |
 | `closure_phase_NN.tif` | nearest-neighbour closure of triplet `NN` (only if `write_closure_phase`) | radians |
+| `ionosphere_NN.tif` | ionospheric range delay at date `NN` (only if `ionosphere_files`) | meters |
+| `troposphere_NN.tif` | tropospheric range delay at date `NN` (only if `troposphere_files`) | meters |
 
 No-data is unset (the typed layers are filled, not masked); threshold on
 `temporal_coherence` to mask low-quality pixels downstream.

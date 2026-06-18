@@ -463,6 +463,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolphin-corrections"
+version = "1.0.0"
+dependencies = [
+ "dolphin-core",
+ "dolphin-io",
+ "gdal",
+ "ndarray",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "dolphin-filtering"
 version = "1.0.0"
 dependencies = [
@@ -581,6 +592,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dolphin-core",
+ "dolphin-corrections",
  "dolphin-filtering",
  "dolphin-io",
  "dolphin-phaselink",

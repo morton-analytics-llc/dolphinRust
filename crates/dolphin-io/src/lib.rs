@@ -20,5 +20,5 @@ pub mod nisar_fixture;
 pub use cslc::{read_cslc, read_cslc_stack};
 pub use error::{IoError, Result};
 pub use geo::{read_geotransform, GeoInfo};
-pub use geotiff::{read_raster, write_raster, RasterData};
+pub use geotiff::{grid_centroid_lonlat, read_raster, write_raster, RasterData};
 pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack};

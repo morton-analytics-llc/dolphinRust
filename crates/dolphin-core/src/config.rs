@@ -364,6 +364,61 @@ impl Default for InputOptions {
     }
 }
 
+/// Auxiliary atmospheric-correction options. dolphin `CorrectionOptions`
+/// (`ionosphere_files`, `geometry_files`, `dem_file`). Corrections are **opt-in**:
+/// with every file list empty (the default) the displacement output is unchanged.
+///
+/// **Forward divergence:** dolphin derives the tropospheric delay from a DEM via
+/// RAiDER and has no `troposphere_files` field; dolphinRust adds `troposphere_files`
+/// for direct ingest of the public OPERA L4 tropospheric product (one netCDF per
+/// date), with RAiDER as the fallback. `incidence_angle_deg` and
+/// `troposphere_variable` are dolphinRust-only knobs for the delay projection and
+/// the L4 netCDF variable name. dolphin's keys deserialize unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CorrectionOptions {
+    /// GNSS-derived IONEX TEC maps for ionospheric correction (one per date).
+    /// Source: <https://cddis.nasa.gov/archive/gnss/products/ionex/>. dolphin name.
+    pub ionosphere_files: Vec<PathBuf>,
+    /// OPERA L4 tropospheric netCDF products (one per date). dolphinRust forward
+    /// divergence (dolphin uses `dem_file` + RAiDER instead).
+    pub troposphere_files: Vec<PathBuf>,
+    /// Line-of-sight geometry files for the correction computations. dolphin name
+    /// (carried for YAML round-trip; the delay projection uses
+    /// `incidence_angle_deg` when no geometry is resolved).
+    pub geometry_files: Vec<PathBuf>,
+    /// DEM file for tropospheric/topographic corrections (RAiDER path). dolphin name.
+    pub dem_file: Option<PathBuf>,
+    /// Incidence angle (degrees) used to project zenith delay to line-of-sight when
+    /// no geometry file is supplied. dolphinRust-only; default 37° (NISAR nominal).
+    pub incidence_angle_deg: f64,
+    /// netCDF variable to read from the OPERA L4 product. dolphinRust-only.
+    /// `"total"` (the default) sums the real product's `hydrostatic_delay` +
+    /// `wet_delay` zenith fields; any other value reads that single variable.
+    pub troposphere_variable: String,
+}
+
+impl Default for CorrectionOptions {
+    fn default() -> Self {
+        Self {
+            ionosphere_files: Vec::new(),
+            troposphere_files: Vec::new(),
+            geometry_files: Vec::new(),
+            dem_file: None,
+            incidence_angle_deg: 37.0,
+            troposphere_variable: "total".into(),
+        }
+    }
+}
+
+impl CorrectionOptions {
+    /// Whether any correction is enabled (any correction file supplied).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.ionosphere_files.is_empty() || !self.troposphere_files.is_empty()
+    }
+}
+
 /// Output grid + raster options. dolphin `OutputOptions`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -470,6 +525,8 @@ pub struct DisplacementWorkflow {
     pub unwrap_options: UnwrapOptions,
     /// Timeseries inversion and velocity options.
     pub timeseries_options: TimeseriesOptions,
+    /// Auxiliary atmospheric (ionospheric/tropospheric) correction options.
+    pub correction_options: CorrectionOptions,
     /// Mask file used to ignore low-correlation/bad data (0 = invalid, 1 = good).
     pub mask_file: Option<PathBuf>,
     /// Sub-directory for writing output files.
@@ -494,6 +551,7 @@ impl Default for DisplacementWorkflow {
             interferogram_network: InterferogramNetwork::default(),
             unwrap_options: UnwrapOptions::default(),
             timeseries_options: TimeseriesOptions::default(),
+            correction_options: CorrectionOptions::default(),
             mask_file: None,
             work_directory: PathBuf::from("."),
             worker_settings: WorkerSettings::default(),

@@ -305,7 +305,74 @@ synthesized multi-acquisition NISAR stack (`nisar_e2e_contract`). **Where to loo
 **Limitation — atmospheric correction.** This is a geometrically-correct but
 *atmospherically-uncorrected* L-band product. Ionospheric delay is ~16× the C-band effect
 and is mandatory for a *usable* L-band displacement product; ionospheric + tropospheric
-corrections are the separate later half of v1.3.0.
+corrections are the separate later half of v1.3.0 (added below).
+
+## Atmospheric corrections validation (2026-06-17, v1.3.0 part 2)
+
+Ionospheric + tropospheric corrections (`ATMO_CORRECTIONS_PROMPT.md`), in the new
+`dolphin-corrections` crate. Corrections produce a per-acquisition range delay in meters,
+subtracted (relative to date 0) from the inverted LOS-phase series before velocity, off by
+default. **Correction math is fixture-proven; both real sources were reachable and
+validated on real data this run.**
+
+**Ionosphere — TEC/IONEX → L-band delay (`1/f²`).** Closed-form `delay = vtec·1e16·K/f²`
+(`K = 40.31`, Yunjun et al. 2022 / Chen & Zebker 2012), scaled to the *configured* carrier.
+Contract green vs the closed-form relation; the L/C ratio is `(f_C/f_L)²`.
+
+- **Real IONEX — PASS** (`dolphin-corrections` test `real_ionex_parses_to_physical_delay`,
+  gated on `IONEX_REAL`). Fetched a real IGS final GIM from CDDIS with the
+  `validation/creds.sh` bearer token (the `~/.netrc` is stale; the token authorizes):
+  `https://cddis.nasa.gov/archive/gnss/products/ionex/2023/001/IGS0OPSFIN_20230010000_01D_02H_GIM.INX.gz`.
+  Parsed to a `(13, 71, 73)` VTEC cube (2-hourly, 2.5°×5°). Equatorial-noon VTEC = **56.5
+  TECU** → **L-band range delay 14.40 m** vs C-band 0.78 m = **18.5×** — i.e. ~14 m of
+  apparent LOS displacement if uncorrected. This is why the correction is mandatory at
+  L-band, confirmed on real data, not just analytically.
+
+**Troposphere — OPERA L4 netCDF ingest.** GDAL `NETCDF:` ingest, bilinear resample to the
+frame grid, zenith→slant by `1/cos(inc)`. Contract green vs a synthesized L4-format netCDF
+fixture (`ingests_synthesized_l4_netcdf`, written via GDAL's netCDF driver).
+
+- **Real OPERA L4 — PASS** (test `real_opera_l4_total_is_physical`, gated on `OPERA_L4_REAL`).
+  Collection `OPERA_L4_TROPO-ZENITH_V1` (CMR: **15,274 granules**), fetched from ASF
+  (`cumulus.asf.earthdatacloud.nasa.gov`, ~2.0 GB) with the bearer token. **Real-product
+  facts discovered:** the total zenith delay is **two** variables — `hydrostatic_delay` +
+  `wet_delay` (meters), not a single `troposphere` field; the grid is a **global EPSG:4326**
+  raster (2560×5120, 0.07°, time-stepped bands), with **no EPSG authority code** on the CRS
+  and a `9.96921e36` no-data fill. The reader reads + sums both (`read_l4_total`); centre
+  total ZTD = **2.79 m** (hydrostatic mean 2.38 m + wet). `troposphere_variable` defaults to
+  `"total"`; the divergence from the prompt's single-`troposphere` assumption is documented.
+
+- **Deferred — full real-frame tropo application.** The L4 product is a *global lat/lon*
+  grid; applying it to a *UTM* NISAR/DISP-S1 frame needs a CRS warp (4326→UTM) that the
+  bilinear resampler — which assumes a shared CRS — does not perform (it `warn!`s on
+  mismatch). Ingest + total-ZTD magnitude are validated; warping the real global grid onto a
+  real UTM frame is the remaining step. **Where to look next:** add a GDAL warp (or a
+  4326-frame test scene); the same `OPERA_L4_TROPO-ZENITH_V1` granules are reachable.
+
+**RAiDER fallback — deferred (not installed).** `python -c "import RAiDER"` fails and no
+`raider.py` on `PATH` here, so the fallback is **gated behind `raider_available()`** (like
+SNAPHU) and returns `RaiderUnavailable` rather than being stubbed; the subprocess + GDAL
+ingest path is implemented for when it is installed. The OPERA L4 path is primary.
+
+**Apply stage / typed API.** `subtract_delay` removes the per-date delay (relative to date 0)
+in radians via `φ = d·(-4π/λ)`; exact-subtraction + zero-delay-identity + constant-delay-
+cancels contracts green. Layers surface on `DisplacementOutput.{ionosphere_delay,
+troposphere_delay}` and as `ionosphere_NN.tif` / `troposphere_NN.tif` COGs. A dolphin
+`correction_options` YAML (`ionosphere_files`/`geometry_files`/`dem_file`) round-trips
+(`dolphin_correction_options_round_trips`); corrections are off by default (output unchanged).
+
+**Reproduce.**
+
+```sh
+source validation/creds.sh
+# IONEX (real, ~170 KB)
+curl -sL -H "Authorization: Bearer $GP_EARTHDATA_TOKEN" -o /tmp/gim.inx.gz \
+  https://cddis.nasa.gov/archive/gnss/products/ionex/2023/001/IGS0OPSFIN_20230010000_01D_02H_GIM.INX.gz
+gunzip -f /tmp/gim.inx.gz
+IONEX_REAL=/tmp/gim.inx cargo test -p dolphin-corrections real_ionex -- --nocapture
+# OPERA L4 (real, ~2 GB) — granule URL from CMR short_name=OPERA_L4_TROPO-ZENITH_V1
+OPERA_L4_REAL=/path/opera_l4_tropo.nc cargo test -p dolphin-corrections real_opera_l4 -- --nocapture
+```
 
 ## Open / pending
 

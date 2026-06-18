@@ -94,10 +94,28 @@ Atmospheric (ionospheric/tropospheric) corrections are the *other* half, a separ
 | L-band λ end-to-end | ✅ done — NISAR λ ≈ 0.2384 m threads via `input_options.wavelength` to `−λ/4π`; `velocity_uses_nisar_wavelength` proves the NISAR λ is used (not the S1 default). No new solver |
 | End-to-end on a synthesized NISAR stack | ✅ done — `nisar_e2e_contract`: multi-acquisition NISAR fixture → `run_displacement` → typed output + COGs, grid/EPSG/geotransform correct |
 | Real/sample NISAR granule | ✅ reader validated on real data / ⏳ full stack deferred — one real 7.2 GB `NISAR_L2_GSLC_BETA_V1` granule fetched via Earthdata/ASF; `nisar_real_data` test reads a center HH block (65536/65536 finite f32 samples) + geotransform (EPSG 32736, 10×5 m posting). **Full multi-date displacement deferred** — a real velocity needs ≥2 co-located repeat-pass dates (~15 GB+); single granule = single acquisition. See VALIDATION.md |
-| Atmospheric correction (ionosphere/troposphere) | ⛔ out of scope this loop — the product is geometrically correct but **atmospherically uncorrected**; ionosphere ~16× C-band, mandatory for *usable* L-band. Separate later v1.3.0 loop |
+| Atmospheric correction (ionosphere/troposphere) | ✅ done (v1.3 part 2, below) |
 
 Gates green (default == gpu build, *and* `no-gpu`): fmt, clippy -D warnings, test, `cargo doc
 --no-deps`. **Nothing pushed** — committed on branch `v1.3-nisar`, awaiting sign-off.
+
+## v1.3.0 atmospheric corrections progress (branch `v1.3-atmo`, per ATMO_CORRECTIONS_PROMPT.md)
+
+Second half of v1.3.0 — ionospheric + tropospheric corrections that make L-band *usable*. New
+crate `dolphin-corrections` (per-crate CLAUDE.md with the delay math). Corrections subtract a
+per-date range delay (relative to date 0) from the inverted LOS series before velocity; **off by
+default** (output unchanged when no correction files configured).
+
+| Item | State |
+|---|---|
+| Apply stage + typed API + COGs | ✅ done — `subtract_delay` (φ = d·(−4π/λ)); `DisplacementOutput.{ionosphere_delay,troposphere_delay}` + `ionosphere_NN.tif`/`troposphere_NN.tif` COGs. Contracts: zero-delay identity, exact subtraction, constant-delay cancels |
+| Ionosphere (IONEX → L-band `1/f²`) | ✅ done + **real-data validated** — closed-form `delay=vtec·1e16·K/f²` (K=40.31); IONEX parser. Real IGS GIM from CDDIS: 56.5 TECU → **14.4 m** L-band delay (**18.5×** C-band). `closed_form_vertical_delay`, `l_band_dwarfs_c_band_by_freq_squared`, `real_ionex_parses_to_physical_delay` (gated `IONEX_REAL`) |
+| Troposphere (OPERA L4 netCDF) | ✅ ingest done + **real-data validated** — GDAL `NETCDF:` read + bilinear resample + zenith→slant. Synthesized-fixture contract (`ingests_synthesized_l4_netcdf`). Real `OPERA_L4_TROPO-ZENITH_V1` (ASF, 2 GB): total ZTD = `hydrostatic_delay`+`wet_delay` = **2.79 m** centre (`real_opera_l4_total_is_physical`, gated `OPERA_L4_REAL`). ⏳ full real-frame application (global 4326 → UTM warp) deferred-with-receipts |
+| RAiDER fallback | ✅ wired, gated like SNAPHU — `raider_available()` check; `RaiderUnavailable` (not stubbed) when absent. Deferred this run (RAiDER not installed). L4 is primary |
+| Config (dolphin parity + round-trip) | ✅ done — `correction_options` mirrors dolphin `ionosphere_files`/`geometry_files`/`dem_file`; `troposphere_files`/`incidence_angle_deg`/`troposphere_variable` forward divergence. `dolphin_correction_options_round_trips` |
+
+Gates green (default, `no-gpu`): fmt, clippy -D warnings, test, `cargo doc --no-deps`.
+**Nothing pushed** — committed on branch `v1.3-atmo`, awaiting sign-off.
 
 ## Phases (build in dependency order, per PLAYBOOK.md DAG)
 - [x] 0 — Foundation (`dolphin-core`): types, `StridedBlockManager`, config, error
