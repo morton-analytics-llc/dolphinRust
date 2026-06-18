@@ -1,190 +1,187 @@
-# dolphinRust — 12-month roadmap (2026-07 → 2027-06)
+# dolphinRust — roadmap (rebased to dynamic-workflow velocity, 2026-06-17)
 
-Four releases on a **~2-month cadence** (compressed from the original quarterly plan). The
-throughline: **get adopted in GroundPulse, reach parity with Python dolphin v0.4x, then lead
-it.** dolphinRust's only real competitor is dolphin itself, so correctness parity is table
-stakes — the differentiation is throughput (a compiled binary with no JAX JIT warm-up) and
-being *ahead* on phase-bias and near-real-time.
+**North star: make NASA jealous.** dolphin/DISP-S1 is JPL's own work and the scientific
+reference — the ambition here is to be the implementation they wish they'd built: bit-for-bit
+*scientifically* faithful, materially faster (compiled, no JAX JIT warm-up), self-contained
+(dependencies pulled in-house), honest about its own error bars (per-pixel CRLB), and **ahead**
+on phase-bias, near-real-time, and uncertainty. Parity is table stakes; the goal is to lead.
 
-Three strategic bets drive the sequencing:
-- **Benchmark now, not as a milestone.** Establish the dolphinRust-vs-Python-dolphin speed
-  baseline immediately — both engines and the validation stacks are already in place. It
-  gates nothing and shouldn't occupy a release; *optimizing to beat it* is R4.
-- **CRLB is a product feature.** GroundPulse scores asset risk from velocity + a
-  `confidence_score`; per-pixel CRLB uncertainty is the missing physical input to that. → R2.
-- **NISAR is the growth surface.** L-band DISP-NI penetrates canopy where C-band fails —
-  exactly eo's forested pipeline/dam assets. Calibrated NISAR data lands mid-2026. → R3.
+The throughline is unchanged: **get adopted in GroundPulse, reach parity with Python dolphin
+v0.4x, then lead it** on throughput, phase-bias, and near-real-time. What changed is the
+**schedule model**. This roadmap was originally scoped in human-engineering-weeks on a ~2-month
+release cadence. Observed velocity under Claude Code (Max, dynamic `/loop` workflow) makes those
+estimates obsolete, so the schedule below is rebased on what actually paces the work now.
 
-Validate every release against the pinned dolphin oracle; keep fmt/clippy/test/doc green;
-semver throughout.
+## Velocity model — today as the baseline
 
-| Release | Date | Theme |
-|---|---|---|
-| baseline | now (pre-R1) | dolphinRust-vs-dolphin speed benchmark committed under `bench/` |
-| v1.1.0 | 2026-07-01 | Close v1.0 residual + eo adoption + parity quick wins |
-| v1.2.0 | 2026-09-01 | Quality layers (CRLB/closure) + production unwrapping (tophu) |
-| v1.3.0 | 2026-11-01 | NISAR / L-band + atmospheric corrections |
-| v1.4.0 | 2027-01-01 | Performance push + phase-bias + NRT incremental updates |
+On **2026-06-16 → 17**, in dynamic-workflow sessions, the following shipped and was independently
+verified (gates green, oracle/contract-validated, merged): **v1.0.0** (full end-to-end pipeline),
+**v1.1.0** (eo integration + velocity-scale + auto ref-point), **v1.2.0** (CRLB + closure quality
+layers; tophu unwrapping incl. a deliberate honest-loss → coherence-weighted-coarse + spanning-
+forest-merge fix that *then* beat SNAPHU; per-ministack stitching), **v1.3.0 parts 1–2** (NISAR/
+L-band GSLC ingest validated on a real granule; ionospheric + tropospheric corrections validated
+on real IGS/OPERA layers), **and** the catch+fix+evidence of a global LOS sign-inversion bug the
+self-consistent oracle had masked.
 
----
+That is ~**2.5 releases / day**, where the original plan budgeted ~2 months each. The unit of
+progress is now **one dynamic-workflow loop ≈ one release-half or substantial feature**, landing
+in tens of minutes of autonomous work plus verification and a sign-off pause.
 
-## Baseline — now (before R1)
+**Implication: engineering effort is no longer the schedule driver.** The full original four-
+release year (v1.1–v1.4) completes inside **June 2026 — days, not quarters.** What genuinely
+takes calendar time from here is *external*:
 
-**Speed benchmark** (~2 days). Per-frame wall-clock and phase-linking throughput,
-dolphinRust vs Python dolphin v0.35.0, on the existing validation stacks; commit a
-reproducible `bench/` with the numbers. This is the figure that justifies the rebuild and
-sells NRT/throughput to eo — it's a measurement we already have everything to take, so it
-runs ahead of the release train rather than inside it. It also sets the target R4 must beat.
+1. **External data arrival** — NISAR calibrated repeat-pass stacks (≥2 co-located dates) for real
+   multi-date displacement validation; expected ~2026-07+, the hard gate on real NISAR claims.
+2. **Real-world validation campaigns** — deforming scenes with ground truth to confirm
+   phase-bias, NRT, and absolute-scale claims against reality, not just the oracle.
+3. **Hardware access** — discrete NVIDIA/AMD GPU (e.g. rented) to validate the GPU path where the
+   FP32 headroom actually pays off; the integrated-M2 result is marginal by design.
+4. **Upstream dolphin & ecosystem cadence** — new dolphin releases to parity/lead against; spurt
+   3D-unwrap maturing enough to adopt.
+5. **eo operational feedback** — real frames flowing through the worker, surfacing what production
+   actually needs.
+6. **Human review/sign-off cadence** — the one in-loop throttle, deliberately kept (each merge/tag
+   waits on sign-off).
 
----
+So the schedule has two regimes: a **near-term build sprint** (effort-bound, days) that finishes
+the planned feature set, then a **capability-gated phase** (calendar-bound, the rest of the year)
+driven by the six factors above.
 
-## v1.1.0 — 2026-07-01 · "Close out v1.0, get into eo"
+| Release | Date (rebased) | Status | Theme |
+|---|---|---|---|
+| v1.0.0 | 2026-06-16 | ✅ shipped | Full end-to-end displacement pipeline |
+| v1.1.0 | 2026-06-16 | ✅ shipped | eo adoption + velocity scale + auto ref-point |
+| v1.2.0 | 2026-06-17 | ✅ shipped | Quality layers (CRLB/closure) + tophu unwrapping + stitching |
+| v1.3.0 | 2026-06-17 | 🔄 in flight today | NISAR/L-band ingest + atmospheric corrections (tropo warp pending) |
+| v1.4.0 | 2026-06-17 | 🔄 in flight today | Performance + NRT incremental + phase-bias + 3D-unwrap interface |
+| v1.5.0+ | 2026-H2 → 2027 | ⏳ gated | Capability-gated: real-data validation, discrete-GPU, lead-dolphin |
 
-Short runway (~2 weeks) — with the benchmark already taken, scope is the v1.0 loose ends
-plus the work that gets dolphinRust running inside GroundPulse.
-
-- **Close the velocity-scale residual** (~2 days). One PS-rich, high-coherence subsidence
-  scene (Mexico City or Las Vegas Valley) run through both engines to pin velocity absolute
-  scale at real magnitude. Closes the one documented B4 gap in VALIDATION.md.
-- **eo integration** (~1 wk). On an `eo` branch: a `gp-dolphin` crate calling
-  `run_displacement` via `spawn_blocking`, wired as a `gp-tasks` task that lands a COG via
-  `gp-storage` and summary rows in PostGIS. Aim for a working frame run, not just a skeleton
-  (the benchmark moving out frees the time R1 would have spent on it).
-- **Auto reference-point selection** (center-of-mass, dolphin v0.36.0) (~2–3 days). Cheap
-  correctness/parity fix.
-
-**Exit:** velocity scale confirmed on a deforming scene; ref-point matches oracle;
-dolphinRust produces a displacement product end-to-end from a `gp-tasks` job on one frame.
-
----
-
-## v1.2.0 — 2026-09-01 · "Quality layers + production-grade unwrapping"
-
-- **CRLB uncertainty rasters** (dolphin v0.40) — **SHIPPED** (branch `v1.2-quality`,
-  validated vs forward oracle dolphin v0.42.0, σ max |Δ| < 1e-4, singular-Γ NaN matches).
-  Per-pixel per-date phase-estimate σ from the Fisher information of the coherence model,
-  CPU `faer`/f64; on `DisplacementOutput.crlb_sigma` + per-band COGs, default on. *Feeds
-  GroundPulse `confidence_score`/risk tiers a real physical uncertainty — a product
-  capability, not just parity.* GPU CRLB is a later follow-up.
-- **Sequential closure-phase rasters** (dolphin v0.41) — **SHIPPED** (same branch/oracle,
-  closure max |Δ| < 1e-4). Nearest-neighbour triplet non-closure on
-  `DisplacementOutput.closure_phase` + per-band COGs (default off, matching dolphin); the
-  prerequisite signal for phase-bias work in R4.
-- **tophu-style multi-scale tiled unwrapping** — **SHIPPED** (branch `v1.2-unwrap`,
-  `dolphin-unwrap::unwrap_multiscale`): coherence-weighted coarse multilook (low-trust blocks
-  masked + filled) → single SNAPHU → nearest upsample → overlapping tiled SNAPHU (rayon) →
-  overlap-based inter-tile cycle reconciliation (max-reliability spanning forest) → feathered
-  merge. Opt-in via `unwrap_method: tophu`; **SNAPHU stays the default path.** Correct
-  (contract tests: ramp recovery within the SNAPHU envelope, planted 2π jump, 2×2
-  loop-consistency, weighted-coarse-tracks-truth). **Now beats raw SNAPHU on the frozen
-  low-coherence scenes on all three metrics on both scenes** (discont −9 % both,
-  gross-cycle-err −10 % steep, rms ≤ raw both) — scenes/metrics unchanged from the earlier
-  honest-loss run, only the algorithm changed. Numbers + margins in `bench/UNWRAP.md`.
-- **Per-ministack temporal-coherence stitching** (dolphin v0.41) — **SHIPPED** (same branch):
-  cross-ministack reduction is now dolphin's NaN-aware mean (`numpy.nanmean`) instead of a
-  zero-diluting plain mean, matching the layer the per-band CRLB/closure concatenate against
-  (caveat closed). Contract vs v0.42 oracle on a 2-ministack stack (`gen_stitch_v042.py`):
-  stitched temp_coh + concatenated CRLB + closure all < 1e-3.
-- **Finish eo integration** to production (PostGIS summary rows + COG, behind a gp-tasks
-  task) if not completed in R1.
-
-**Exit:** CRLB + closure rasters match the v0.4x oracle ✅; tophu implemented + correct and
-**now beats SNAPHU on the frozen low-coherence scenes on all three metrics** (measured,
-reported in `bench/UNWRAP.md`; SNAPHU stays the default for small/coherent scenes) ✅;
-per-ministack stitching matches the oracle ✅; dolphinRust running in eo's worker (R1).
+The original speed **baseline** is committed (`bench/results.json`, `bench/runs/`) — it gates
+nothing and is the target v1.4.0 performance work must beat.
 
 ---
 
-## v1.3.0 — 2026-11-01 · "NISAR / L-band + atmosphere"
+## v1.0.0–v1.2.0 — ✅ SHIPPED (2026-06-16/17)
 
-- **NISAR RSLC reader** ✅ (v1.3 part 1). HDF5 + complex-int16 compound types — hdf5-metno
-  reads the `{r,i}` int16 compound via a derived `H5Type` (de-risk cleared). NISAR product
-  group structure + custom geotransform/EPSG (`epsg_code` attribute). `input_type: nisar_gslc`
-  selector (forward divergence); L-band λ threads to mm/yr. End-to-end on a synthesized NISAR
-  stack (typed output + COGs). **Atmospheric corrections still pending** (below) — the product
-  is geometrically correct but atmospherically uncorrected.
-- **L-band ionospheric correction** ✅ (v1.3 part 2). IONEX TEC → `1/f²`-scaled L-band range
-  delay (`K=40.31`, Yunjun 2022), in the new `dolphin-corrections` crate. Closed-form contract
-  green; **validated on a real IGS GIM from CDDIS — 56.5 TECU → 14.4 m L-band delay (18.5×
-  C-band)**. Mandatory for usable L-band, confirmed on real data.
-- **OPERA L4 tropospheric product ingest** ✅ (v1.3 part 2). GDAL `NETCDF:` ingest + bilinear
-  resample + zenith→slant. Synthesized-fixture contract green; **real `OPERA_L4_TROPO-ZENITH_V1`
-  granule ingested (ASF, 2 GB): total ZTD = hydrostatic + wet ≈ 2.79 m centre.** Full real-frame
-  application (global 4326 → UTM warp) deferred-with-receipts; see VALIDATION.md.
-- **RAiDER dispatch** ✅ wired behind an availability check (subprocess + GDAL ingest), gated
-  like SNAPHU; deferred this run (RAiDER not installed) — never stubbed. L4 is the primary path.
-- L-band spectral parameters in covariance estimation. *(deferred to v1.4 — not required for the
-  atmospheric-correction exit.)*
-
-**Exit:** dolphinRust ingests a NISAR RSLC stack and produces displacement ✅; tropospheric +
-ionospheric corrections applied and **validated against real OPERA/IGS atmospheric layers** ✅
-(real IONEX + real OPERA L4 both reachable and validated; full real-frame tropo warp deferred).
-**v1.3.0 complete** (both corrections fixture-proven, wired, real-source-validated).
+Tagged on `main`. Details (kept as record):
+- **v1.0.0** — read CSLC HDF5 → sequential phase-linking → ifg network → SNAPHU → SBAS → velocity
+  → COGs. Validated vs dolphin v0.35.0 oracle. *(Note: v1.0–v1.2 carried an inverted LOS sign vs
+  dolphin, masked by a lockstep-inverted oracle; caught and fixed 2026-06-17 — see VALIDATION.md /
+  CHANGELOG. Re-run any pre-fix eo output.)*
+- **v1.1.0** — eo `gp-dolphin` integration (one real frame end-to-end), velocity-scale residual
+  closed, auto center-of-mass reference point.
+- **v1.2.0** — CRLB σ (feeds eo `confidence_score`) + closure-phase rasters vs forward v0.42
+  oracle (<1e-4); **tophu multi-scale unwrapping that beats raw SNAPHU on the frozen low-coherence
+  scenes** (discont −9%, gross-cycle −10%; `bench/UNWRAP.md`), SNAPHU still default; per-ministack
+  NaN-aware stitching (closes the CRLB/closure many-ministack caveat).
 
 ---
 
-## v1.4.0 — 2027-01-01 · "Performance + near-real-time + lead dolphin"
+## v1.3.0 — 🔄 nearly complete (target 2026-06-18) · "NISAR / L-band + atmosphere"
 
-- **NRT incremental ministack updates** (NEW) (~3–4 wks). A streaming mode that folds a newly
-  arrived acquisition into an existing time series using the carried compressed SLC — no full
-  reprocessing. *Rationale: this is the capability that turns the compiled-binary / no-JIT
-  speed edge into an operational one. dolphin's model is batch; eo monitors continuously
-  (new Sentinel-1/NISAR frame → updated displacement in minutes, not a full rerun). It's both
-  a lead over dolphin and the natural payoff of the baseline benchmark.*
-- **Performance optimization** (beat the pre-R1 baseline) (~3–4 wks): faer small-matrix
-  (N×N covariance, N≈10–30) tuning, `EagerLoader`-style block prefetch, streaming I/O,
-  thread-pool/BLAS contention. Target a documented multiple over Python dolphin/CPU.
-- **Phase-bias / non-closure correction** (Michaelides et al., RSE 2022) (~4–6 wks). *Not in
-  Python dolphin* — puts dolphinRust ahead of the oracle on correctness. Uses the
-  closure-phase layer from R2. High value for slow long-baseline signals (the regime eo
-  cares about).
-- **3D-unwrap-ready dispatch interface** (~1 wk). Abstract the unwrap backend so a spurt-style
-  3D spatiotemporal solver can drop in later without a refactor. Monitor spurt maturity; do
-  not port it yet.
+Both parts landed and merged; **one deferred step remains before tagging.**
+- **NISAR/L-band GSLC reader** ✅ — real NISAR GSLC is complex-**f32** `{r,i}` (the prompt's int16
+  assumption was wrong; corrected against a real granule). Custom geocoding geotransform/EPSG;
+  `input_type: nisar_gslc`; L-band λ end-to-end. Reader validated on a real
+  `NISAR_L2_GSLC_BETA_V1` granule.
+- **Ionospheric correction** ✅ — IONEX TEC → `1/f²` L-band delay; validated on a real IGS GIM
+  (56.5 TECU → 14.4 m, 18.5× C-band).
+- **Tropospheric correction** ✅ ingest — OPERA L4 netCDF; real granule ingested (ZTD ≈ 2.79 m).
+- **▶ Remaining: tropo 4326→UTM warp** — the global L4 grid isn't yet warped onto a UTM frame, so
+  real-frame tropo isn't end-to-end. One loop. **Tag v1.3.0 when it lands.**
+- **Deferred (data-gated):** NISAR multi-date real displacement — needs ≥2 co-located repeat-pass
+  dates; moves to the capability-gated phase below.
 
-**Exit:** an incoming frame updates an existing time series incrementally (validated against
-a full rerun); published speedup figure vs the pre-R1 baseline; phase-bias correction reduces
+---
+
+## v1.4.0 — ▶ next build sprint (target ~2026-06-20) · "Performance + NRT + lead dolphin"
+
+Effort-bound; expect it within days, landing as units with sign-off. Per-phase scope and bars are
+in `REMAINING_WORK_PROMPT.md`.
+- **NRT incremental ministack updates** — fold a new acquisition into an existing series via the
+  carried compressed SLC, no full reprocess; validated against a full rerun. The operational lead
+  over batch dolphin and the payoff of the speed edge.
+- **Performance optimization** — beat the committed baseline (`bench/results.json`): faer
+  small-matrix tuning, EagerLoader prefetch, streaming I/O, BLAS/thread contention. Publish the
+  real multiple; drop optimizations that don't help.
+- **Phase-bias / non-closure correction** (Michaelides et al., RSE 2022) — *not in dolphin*, so it
+  leads the oracle; validated by measured non-closure reduction on the v1.2 closure layer.
+- **3D-unwrap-ready dispatch interface** — trait behind which SNAPHU/tophu sit; no spurt port.
+
+**Exit:** NRT == full rerun within tolerance; published speedup vs baseline; phase-bias reduces
 non-closure on a long series; unwrap interface ready for a 3D backend.
+
+---
+
+## After v1.4.0 — the job is done; keep it accurate and fast
+
+dolphinRust's job is narrow and, once v1.4.0 lands (today), substantially complete: **do the
+InSAR processing, provide per-pixel uncertainty (CRLB), and produce accurate output — fast.**
+There is no feature backlog to invent. The only ongoing work serves that mission, and it is
+gated by external events, not coding effort:
+
+- **Accuracy on real data** *(gate: data as it arrives)* — validate against reality, not just the
+  oracle: NISAR multi-date displacement when calibrated repeat-pass stacks land (~2026-07+), and
+  real deforming-scene/ground-truth checks of velocity scale, phase-bias non-closure, and
+  NRT-vs-rerun equivalence. Standing lesson from the sign-inversion bug: a self-consistent oracle
+  can't catch a shared-convention error — real-production comparison is the check.
+- **Hold parity with upstream dolphin** *(gate: dolphin releases)* — bump the pinned oracle per
+  cycle and re-validate. Cheap now.
+- **Performance** *(gate: real bottlenecks / hardware)* — continue beating the baseline only where
+  profiling shows a genuine hotspot; discrete-GPU validation when that hardware is available (the
+  wgpu path already runs unchanged — a measurement, not a build). No speculative tuning.
+- **Bring dependencies in-house** *(gate: payoff vs. risk per dependency)* — reduce reliance on
+  external C libraries and subprocesses where it makes the core job more self-contained, portable,
+  and accurate. This is hardening, not feature work. Highest-value candidates, in order:
+  - **Native phase unwrapper** — replace the **SNAPHU** subprocess (PATH/binary fragility, flat-
+    binary round-trips). A pure-Rust MCF/network-flow unwrapper removes the only runtime external
+    binary and lets tophu tile in-process. Validate against current SNAPHU output before switching
+    the default.
+  - **Native HDF5/CSLC reader** — the `hdf5-metno` system-lib link is the exact constraint that
+    forced `gp-dolphin` into its own workspace + worker in eo (two `links="hdf5"` crates can't
+    coexist). A pure-Rust reader of the CSLC/GSLC layout we actually consume would dissolve that
+    and simplify eo integration. Scope to the layouts we read, not all of HDF5.
+  - **Native raster I/O (GDAL)** — track pure-Rust GeoTIFF/COG read+write to drop `gdal`/`gdal-sys`
+    eventually; gated on maturity (oxigdal is still v0.1.x). Lower priority than the above two.
+  - RAiDER stays a subprocess fallback — a native NWP ray-tracer is the lowest-payoff in-housing
+    and only if the subprocess proves insufficient.
+
+That's it. No fixed dates: each item's Claude-cost is small but cannot start until its gate opens
+or a dependency's in-house payoff clears its risk. *(An R interface over `run_displacement` is
+possible later, but it's consumer reach, not the processing job — out of scope unless a real R
+consumer needs it.)*
 
 ---
 
 ## Deferred (with rationale)
 
-- **spurt 3D unwrapping port** — spurt is v0.1.x, pre-production, and dolphin hasn't adopted
-  it. Design the interface (R4); port only once it stabilizes or dolphin integrates it.
-- **GPU acceleration — SHIPPED as a first-class backend** (branch `gpu-first-class`, wgpu/Metal,
-  compiled into the **default build**; see `bench/GPU.md`, `VALIDATION.md`). Runtime-selected via
-  `worker_settings.compute_backend` (`auto`/`cpu`/`gpu`); no adapter / unsupported / `no-gpu`
-  build → automatic CPU fallback, never a panic. The CPU (faer, f64) path stays the correctness
-  reference. Closed every spike gap:
-  - **EMI is now all-pixel-accurate** via a hybrid — the GPU kernel flags ill-conditioned /
-    near-degenerate / borderline-PD pixels and the host recomputes that 5.9% minority on f64
-    faer. Real Mexico 384² stack: **max Δφ 0.607 mm across all pixels, no π-rad tail** (raw f32
-    was 13.85 mm). EVD remains 0.176 mm.
-  - `MAX_NSLC` 16→32 with deterministic threadgroup scratch; GPU covariance gained SHP masking
-    + β regularization; wired end-to-end through `run_displacement`.
-  - **Honest speed:** end-to-end on the *integrated* M2 Pro the GPU is **0.66× on the real stack
-    (slower)** and ~1.09× on clean synthetic stacks above ~192² — readback + f64 round-trip +
-    CPU recompute outweigh the kernel saving against a strong faer+rayon baseline. The value is
-    **correctness + portability**: the same WGSL runs unchanged on discrete NVIDIA/AMD, where the
-    FP32 headroom is. Unpushed.
-- **Native RAiDER reimplementation** — ray-tracing NWP interpolation; subprocess dispatch is
-  correct, a rewrite is not.
-- **oxigdal / pure-Rust GDAL** — too new (v0.1.x) for production.
+- **GPU acceleration — SHIPPED first-class** (wgpu/Metal, default build; `bench/GPU.md`). Runtime-
+  selected `compute_backend` (`auto`/`cpu`/`gpu`), automatic CPU fallback. EMI all-pixel-accurate
+  via the f64-recompute hybrid (max Δφ 0.607 mm, no π-rad tail; EVD 0.176 mm). Honest speed: on the
+  *integrated* M2 Pro the GPU is ~0.66× on the real stack — the value is correctness + portability
+  to discrete hardware. Discrete-GPU validation is in the capability-gated phase.
+- **GPU CRLB** — CRLB is CPU/faor f64 only; a GPU port is a later follow-up, not required.
+- **spurt 3D unwrapping** — external project still v0.1.x; design the interface (v1.4), port only
+  once it stabilizes or dolphin adopts it.
+- **Native GDAL (oxigdal) / native RAiDER** — moved from "rejected" to **in-housing candidates**
+  (see "Bring dependencies in-house" above): gated on maturity/payoff, not off the table.
 
 ## Risks & dependencies
 
-- **NISAR calibrated-data timing** — fully-calibrated global products expected ~2026-07; if
-  it slips, R3 NISAR work uses provisional products and re-validates later.
-- **hdf5-metno complex-int16** — no ergonomic `Complex<i16>` reader; manual compound types.
-  Prototype in R2 downtime so R3 isn't blocked.
-- **eo integration is cross-repo** — needs sign-off to modify `eo`; treat as a paired PR.
-- **Oracle drift** — bump the pinned dolphin version per release and re-validate; new dolphin
-  features (CRLB/closure) become the R2 oracle.
+- **NISAR calibrated-data timing** — the binding external gate (~2026-07); the reader + L-band path
+  are ready and validated on a single real granule, so this is purely a multi-date-validation wait.
+- **Oracle drift** — bump the pinned dolphin version per cycle and re-validate; CRLB/closure use a
+  forward v0.42 oracle while existing kernels stay pinned at v0.35.0.
+- **eo integration is cross-repo** — paired-PR with sign-off; the sign-fix re-run is a live action
+  item there.
+- **Self-consistent-oracle blind spots** — the sign-inversion bug proved a self-generated oracle
+  can't catch a shared-convention error; prefer real-production comparison for convention/sign
+  claims (now guarded by `tests/sign_convention.rs`).
 
 ## Sources
 
-dolphin changelog v0.35→v0.42 (readthedocs); opera-adt/disp-s1 + tophu; isce-framework/spurt
-v0.1.1; NASA Earthdata DISP-S1 + L4-Tropo + NISAR-100K-release; arXiv 2511.12051;
-Michaelides et al. RSE 2022; faer JOSS / rustfft / hdf5-metno crate status. Full citations in
-the research brief backing this roadmap.
+dolphin changelog v0.35→v0.42; opera-adt/disp-s1 + tophu; isce-framework/spurt v0.1.1; NASA
+Earthdata DISP-S1 + L4-Tropo + NISAR; Michaelides et al. RSE 2022; faer / rustfft / hdf5-metno.
+Schedule model rebased on observed 2026-06-16/17 dynamic-workflow throughput (this repo's git
+history + VALIDATION.md).
