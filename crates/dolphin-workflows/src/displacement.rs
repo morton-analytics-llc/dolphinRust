@@ -768,7 +768,27 @@ fn unwrap_network(
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
     let correlation = Array2::<f32>::from_elem((rows, cols), 1.0);
-    unwrap_backend(cfg).unwrap_network(pl, pairs, correlation.view(), &scratch)
+    let backend = unwrap_backend(cfg);
+    // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
+    // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
+    let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
+    pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch))
+}
+
+/// Rayon pool sizing the ifg-network unwrap fan-out. `n_parallel_jobs` is
+/// dolphin's knob: `<= 0` means all available cores, else clamp to the core count.
+fn unwrap_pool(n_parallel_jobs: i64) -> Result<rayon::ThreadPool> {
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n = match n_parallel_jobs {
+        j if j <= 0 => avail,
+        j => (j as usize).min(avail),
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build()
+        .context("building unwrap thread pool")
 }
 
 /// Build the unwrap backend from the config: tophu when selected, else SNAPHU.
