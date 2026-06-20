@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use dolphin_core::BlockIndices;
 use gdal::raster::{Buffer, GdalType, RasterCreationOptions};
 use gdal::spatial_ref::{CoordTransform, SpatialRef};
 use gdal::{Dataset, DriverManager};
@@ -103,4 +104,59 @@ pub fn read_raster<T: Copy + GdalType>(path: &Path) -> Result<RasterData<T>> {
         geotransform,
         epsg,
     })
+}
+
+/// Read a rectangular `block` window of a single-band GeoTIFF into an
+/// `(block.height(), block.width())` array via GDAL's windowed `read_as` — the
+/// raster mirror of [`crate::read_cslc_window`], bit-identical to [`read_raster`]
+/// sliced to the same rectangle.
+pub fn read_raster_window<T: Copy + GdalType>(
+    path: &Path,
+    block: BlockIndices,
+) -> Result<Array2<T>> {
+    let ds = Dataset::open(path)?;
+    let band = ds.rasterband(1)?;
+    let (w, h) = (block.width(), block.height());
+    let buffer = band.read_as::<T>(
+        (block.col_start as isize, block.row_start as isize),
+        (w, h),
+        (w, h),
+        None,
+    )?;
+    let ((width, height), values) = buffer.into_shape_and_vec();
+    Array2::from_shape_vec((height, width), values).map_err(|e| IoError::Shape(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::s;
+
+    /// Contract: a windowed GeoTIFF read equals the full read sliced to the same
+    /// rectangle (the raster half of the block-tiled bit-identity invariant).
+    #[test]
+    fn raster_window_matches_full_read_sliced() {
+        let path = std::env::temp_dir().join("dolphin_raster_window_contract.tif");
+        let _ = std::fs::remove_file(&path);
+        let full = Array2::from_shape_fn((30, 40), |(r, c)| (r * 40 + c) as f32);
+        write_raster(
+            &path,
+            full.view(),
+            [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let block = BlockIndices {
+            row_start: 5,
+            row_stop: 22,
+            col_start: 9,
+            col_stop: 33,
+        };
+        let win = read_raster_window::<f32>(&path, block).unwrap();
+        let expected = full.slice(s![block.rows(), block.cols()]).to_owned();
+        assert_eq!(win, expected);
+        let _ = std::fs::remove_file(&path);
+    }
 }

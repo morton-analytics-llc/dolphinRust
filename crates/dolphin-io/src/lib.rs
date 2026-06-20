@@ -17,8 +17,10 @@ pub mod nisar;
 #[cfg(any(test, feature = "nisar-fixture"))]
 pub mod nisar_fixture;
 
-pub use cslc::{read_cslc, read_cslc_stack};
+pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use error::{IoError, Result};
 pub use geo::{read_geotransform, GeoInfo};
-pub use geotiff::{grid_centroid_lonlat, read_raster, write_raster, RasterData};
-pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack};
+pub use geotiff::{
+    grid_centroid_lonlat, read_raster, read_raster_window, write_raster, RasterData,
+};
+pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack, read_nisar_window};

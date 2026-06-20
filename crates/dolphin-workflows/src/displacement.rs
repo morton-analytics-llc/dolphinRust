@@ -10,10 +10,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
-use dolphin_core::Cf64;
+use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
-    read_cslc_stack, read_geotransform, read_nisar_geotransform, read_nisar_stack, write_raster,
-    GeoInfo,
+    read_cslc_shape, read_cslc_stack, read_cslc_window, read_geotransform, read_nisar_geotransform,
+    read_nisar_stack, read_nisar_window, write_raster, GeoInfo,
 };
 use dolphin_phaselink::{correct_phase_bias, estimate_bias_velocity, ComputeEngine};
 use dolphin_timeseries::{
@@ -21,7 +21,7 @@ use dolphin_timeseries::{
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
-use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
+use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
@@ -30,6 +30,7 @@ use crate::sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
 };
+use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
@@ -239,6 +240,11 @@ struct BurstLink {
 }
 
 /// Phase-link a single burst from the CSLC files at `idxs` in `cfg.cslc_file_list`.
+///
+/// Block-tiled: the burst is read and phase-linked one tile at a time (see
+/// [`crate::tiling`]) so peak memory is bounded by a tile (block + halo) and its
+/// `N×N` coherence cube, never the whole stack. The result is bit-identical to a
+/// whole-burst run.
 fn link_one_burst(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
@@ -247,9 +253,152 @@ fn link_one_burst(
     let files = burst_files(cfg, idxs);
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
-    let stack = read_stack_files(cfg, &files)?;
-    let out = phase_link(cfg, stack.view(), engine)?;
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .clone()
+        .context("input_options.subdataset is required to read CSLC HDF5")?;
+    let full_shape = read_cslc_shape(&files[0], &subdataset)?;
+    let out = phase_link_tiled(cfg, full_shape, files.len(), engine, |block| {
+        read_burst_tile(cfg.input_options.input_type, &files, &subdataset, block)
+    })?;
     burst_link(cfg, out, days, &files[0])
+}
+
+/// Phase-link a burst tile-by-tile, assembling the per-tile sequential outputs
+/// into the whole-burst [`SequentialOutput`]. `read_tile` fetches one tile's
+/// input (block + halo) across all epochs as `Cf64`; tiling guarantees each
+/// output pixel sees the same window it would in a whole-burst run, so the
+/// assembled result is bit-identical.
+fn phase_link_tiled(
+    cfg: &DisplacementWorkflow,
+    full_shape: (usize, usize),
+    nslc: usize,
+    engine: &ComputeEngine,
+    read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
+) -> Result<SequentialOutput> {
+    let strides = cfg.output_options.strides;
+    let half = cfg.phase_linking.half_window;
+    let out_shape = strides.out_shape(full_shape);
+    let (bh, bw) = cfg.worker_settings.block_shape;
+    let out_block = ((bh / strides.y).max(1), (bw / strides.x).max(1));
+    // A written pixel's data dependency cone spans `num_ministacks` half-windows
+    // (each ministack's carried compressed SLC is itself window-based); the halo
+    // must cover that or interior seams corrupt. div_ceil is an exact upper bound
+    // on the planner's ministack count.
+    let depth = nslc.div_ceil(cfg.phase_linking.ministack_size.max(1));
+    let mut acc = TiledOutput::new(nslc, out_shape, cfg.phase_linking.write_crlb);
+    for plan in plan_tiles(full_shape, strides, half, depth, out_block) {
+        let stack = read_tile(plan.read)?;
+        let out = phase_link(cfg, stack.view(), engine)?;
+        acc.place(&plan, &out)?;
+    }
+    Ok(acc.into_output())
+}
+
+/// Read one tile's input (`block`, including halo) across all `files` epochs as a
+/// `(nslc, h, w)` `Cf64` stack. Each epoch is read as a `Cf32` window and upcast
+/// in place — the global `Cf32→Cf64` doubling of the whole-burst load is gone;
+/// only one tile (plus one transient `Cf32` window) is ever resident.
+fn read_burst_tile(
+    input_type: InputType,
+    files: &[std::path::PathBuf],
+    subdataset: &str,
+    block: BlockIndices,
+) -> Result<Array3<Cf64>> {
+    let reader = match input_type {
+        InputType::OperaCslc => read_cslc_window,
+        InputType::NisarGslc => read_nisar_window,
+    };
+    let mut tile = Array3::<Cf64>::zeros((files.len(), block.height(), block.width()));
+    for (k, path) in files.iter().enumerate() {
+        let window = reader(path, subdataset, block)?;
+        upcast_into(tile.index_axis_mut(Axis(0), k), window.view());
+    }
+    Ok(tile)
+}
+
+/// Upcast a `Cf32` window into a `Cf64` destination view (the only place the
+/// stack is widened — per tile, not per whole burst).
+fn upcast_into(dst: ArrayViewMut2<Cf64>, src: ndarray::ArrayView2<Cf32>) {
+    ndarray::Zip::from(dst)
+        .and(src)
+        .for_each(|d, z| *d = Cf64::new(z.re as f64, z.im as f64));
+}
+
+/// Accumulates per-tile sequential outputs into the whole-burst grid. The
+/// per-tile compressed SLCs are not assembled (the batch path never consumes
+/// them); the closure layer is allocated lazily once its band count is known.
+struct TiledOutput {
+    cpx: Array3<Cf64>,
+    temp_coh: Array2<f64>,
+    crlb: Option<Array3<f64>>,
+    closure: Option<Array3<f64>>,
+    out_shape: (usize, usize),
+}
+
+impl TiledOutput {
+    fn new(nslc: usize, out_shape: (usize, usize), want_crlb: bool) -> Self {
+        let (or, oc) = out_shape;
+        Self {
+            cpx: Array3::zeros((nslc, or, oc)),
+            temp_coh: Array2::zeros((or, oc)),
+            crlb: want_crlb.then(|| Array3::zeros((nslc, or, oc))),
+            closure: None,
+            out_shape,
+        }
+    }
+
+    /// Copy the (halo-trimmed) tile output into its global output rectangle.
+    fn place(&mut self, plan: &TilePlan, out: &SequentialOutput) -> Result<()> {
+        let (h, w) = (plan.out.height(), plan.out.width());
+        let g = (plan.out.row_start, plan.out.col_start);
+        let l = (plan.local_row0, plan.local_col0);
+        let (_, lor, loc) = out.cpx_phase.dim();
+        anyhow::ensure!(
+            l.0 + h <= lor && l.1 + w <= loc,
+            "tile kernel output smaller than its written region"
+        );
+        assign_block3(&mut self.cpx, &out.cpx_phase, g, l, (h, w));
+        self.temp_coh
+            .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
+            .assign(&out.temporal_coherence.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
+        if let (Some(dst), Some(src)) = (self.crlb.as_mut(), out.crlb_sigma.as_ref()) {
+            assign_block3(dst, src, g, l, (h, w));
+        }
+        if let Some(src) = out.closure_phase.as_ref() {
+            let (or, oc) = self.out_shape;
+            let dst = self
+                .closure
+                .get_or_insert_with(|| Array3::zeros((src.dim().0, or, oc)));
+            assign_block3(dst, src, g, l, (h, w));
+        }
+        Ok(())
+    }
+
+    fn into_output(self) -> SequentialOutput {
+        SequentialOutput {
+            cpx_phase: self.cpx,
+            compressed_slcs: Vec::new(),
+            temporal_coherence: self.temp_coh,
+            crlb_sigma: self.crlb,
+            closure_phase: self.closure,
+        }
+    }
+}
+
+/// Assign a `(h, w)` block of a band-major `(bands, rows, cols)` array from the
+/// `l`-offset region of `src` into the `g`-offset region of `dst`.
+fn assign_block3<T: Clone>(
+    dst: &mut Array3<T>,
+    src: &Array3<T>,
+    g: (usize, usize),
+    l: (usize, usize),
+    hw: (usize, usize),
+) {
+    let (h, w) = hw;
+    dst.slice_mut(s![.., g.0..g.0 + h, g.1..g.1 + w])
+        .assign(&src.slice(s![.., l.0..l.0 + h, l.1..l.1 + w]));
 }
 
 /// Build a [`BurstLink`] from a burst's sequential output, validating the
@@ -780,6 +929,137 @@ fn write_bands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dolphin_core::config::ComputeBackend;
+    use dolphin_core::{HalfWindow, Strides};
+
+    /// A deterministic complex stack with spatial + temporal structure, so the
+    /// coherence estimate is non-degenerate and tile boundaries actually matter.
+    fn synth_stack(nslc: usize, rows: usize, cols: usize) -> Array3<Cf64> {
+        Array3::from_shape_fn((nslc, rows, cols), |(t, r, c)| {
+            let phase = 0.20 * t as f64 * (c as f64 / cols as f64)
+                + 0.05 * r as f64
+                + 0.30 * ((r * 7 + c * 3 + t) % 5) as f64;
+            let amp = 1.0 + 0.1 * ((r + c + t) % 3) as f64;
+            Cf64::from_polar(amp, phase)
+        })
+    }
+
+    /// Config exercising both quality layers, with a small block so the burst
+    /// tiles into several interior + edge tiles in both axes.
+    fn tiled_cfg(
+        strides: Strides,
+        half: HalfWindow,
+        block: (usize, usize),
+    ) -> DisplacementWorkflow {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.ministack_size = 4;
+        cfg.phase_linking.half_window = half;
+        cfg.phase_linking.write_crlb = true;
+        cfg.phase_linking.write_closure_phase = true;
+        cfg.output_options.strides = strides;
+        cfg.worker_settings.block_shape = block;
+        cfg.worker_settings.compute_backend = ComputeBackend::Cpu;
+        cfg
+    }
+
+    fn assert_c64_eq(a: ArrayView3<Cf64>, b: ArrayView3<Cf64>, what: &str) {
+        assert_eq!(a.dim(), b.dim(), "{what}: shape");
+        let (_, nr, nc) = a.dim();
+        let mut diffs = 0;
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            if x == y {
+                continue;
+            }
+            let (band, r, c) = (i / (nr * nc), (i / nc) % nr, i % nc);
+            if diffs < 12 {
+                eprintln!("{what} @ band {band} ({r},{c}): {x} != {y}");
+            }
+            diffs += 1;
+        }
+        assert_eq!(diffs, 0, "{what}: {diffs} differing elements");
+    }
+
+    fn assert_f64_eq(a: ArrayView3<f64>, b: ArrayView3<f64>, what: &str) {
+        assert_eq!(a.dim(), b.dim(), "{what}: shape");
+        let bit = |v: f64| v.to_bits();
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(x == y || bit(*x) == bit(*y), "{what}: {x} != {y}");
+        }
+    }
+
+    /// Config exercising both quality layers. `block` is small so the burst
+    /// tiles into many interior + edge seams in both axes.
+    fn run_case(
+        nslc: usize,
+        dims: (usize, usize),
+        strides: Strides,
+        half: HalfWindow,
+        block: (usize, usize),
+    ) {
+        let cfg = tiled_cfg(strides, half, block);
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let whole = phase_link(&cfg, stack.view(), &engine).unwrap();
+        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |b| {
+            Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned())
+        })
+        .unwrap();
+        assert_c64_eq(tiled.cpx_phase.view(), whole.cpx_phase.view(), "cpx_phase");
+        assert_f64_eq(
+            tiled.temporal_coherence.view().insert_axis(Axis(0)),
+            whole.temporal_coherence.view().insert_axis(Axis(0)),
+            "temporal_coherence",
+        );
+        assert_f64_eq(
+            tiled.crlb_sigma.as_ref().unwrap().view(),
+            whole.crlb_sigma.as_ref().unwrap().view(),
+            "crlb_sigma",
+        );
+        assert_f64_eq(
+            tiled.closure_phase.as_ref().unwrap().view(),
+            whole.closure_phase.as_ref().unwrap().view(),
+            "closure_phase",
+        );
+    }
+
+    /// Contract (the load-bearing one): block-tiled phase linking is BIT-IDENTICAL
+    /// to a whole-burst run for every output layer, including the clamped raster
+    /// border. The halo/trim math makes tiling a pure refactor; any drift is an
+    /// indexing bug, not tolerance. Stressed across strides (border margin sizes),
+    /// ministack depth (compressed-SLC dependency cone), and tiny blocks (many
+    /// seams).
+    #[test]
+    fn tiled_phase_link_is_bit_identical_to_whole_burst() {
+        // ministack_size is 4 (see tiled_cfg); nslc spans 1..=4 ministacks.
+        run_case(
+            6,
+            (40, 50),
+            Strides { y: 1, x: 1 },
+            HalfWindow { y: 3, x: 4 },
+            (16, 16),
+        );
+        run_case(
+            8,
+            (90, 110),
+            Strides { y: 2, x: 2 },
+            HalfWindow { y: 3, x: 5 },
+            (12, 12),
+        );
+        run_case(
+            10,
+            (90, 110),
+            Strides { y: 1, x: 1 },
+            HalfWindow { y: 4, x: 6 },
+            (20, 20),
+        );
+        run_case(
+            14,
+            (96, 96),
+            Strides { y: 3, x: 3 },
+            HalfWindow { y: 2, x: 4 },
+            (18, 18),
+        );
+    }
 
     /// Contract: a noise-free phase series carrying a known LOS rate is recovered
     /// as exactly that rate in mm/yr, using the real temporal baselines — not the

@@ -23,8 +23,8 @@
 
 use std::path::{Path, PathBuf};
 
-use dolphin_core::Cf32;
-use ndarray::{Array2, Array3, Axis};
+use dolphin_core::{BlockIndices, Cf32};
+use ndarray::{s, Array2, Array3, Axis};
 
 use crate::error::{IoError, Result};
 use crate::geo::GeoInfo;
@@ -38,6 +38,20 @@ use crate::geo::GeoInfo;
 pub fn read_nisar_rslc(path: &Path, dataset: &str) -> Result<Array2<Cf32>> {
     let file = hdf5::File::open(path)?;
     Ok(file.dataset(dataset)?.read_2d::<Cf32>()?)
+}
+
+/// Read a rectangular `block` window of a NISAR complex grid via HDF5 hyperslab
+/// selection — the NISAR mirror of [`crate::read_cslc_window`], bit-identical to
+/// [`read_nisar_rslc`] sliced to the same rectangle.
+///
+/// # Errors
+/// Returns `Err` if the HDF5 read fails or the dataset is not the expected
+/// complex-float32 compound type.
+pub fn read_nisar_window(path: &Path, dataset: &str, block: BlockIndices) -> Result<Array2<Cf32>> {
+    let file = hdf5::File::open(path)?;
+    Ok(file
+        .dataset(dataset)?
+        .read_slice_2d::<Cf32, _>(s![block.rows(), block.cols()])?)
 }
 
 /// Read a date-ordered set of NISAR files into an `(n_slc, rows, cols)` stack,
@@ -144,6 +158,30 @@ mod tests {
         assert!((geo.geotransform[1] - 20.0).abs() < 1e-9);
         assert!((geo.geotransform[3] - 4_100_010.0).abs() < 1e-6); // 4100000 + 20/2
         assert!((geo.geotransform[5] + 20.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contract: the windowed NISAR read equals the full read sliced to the same
+    /// rectangle (the NISAR half of the block-tiled bit-identity invariant).
+    #[test]
+    fn nisar_window_matches_full_read_sliced() {
+        let path = std::env::temp_dir().join("dolphin_nisar_window_contract.h5");
+        let _ = std::fs::remove_file(&path);
+        let full = Array2::from_shape_fn((12, 16), |(r, c)| Cf32::new(r as f32, c as f32 - 4.0));
+        let x: Vec<f64> = (0..16).map(|i| 300_000.0 + 20.0 * i as f64).collect();
+        let y: Vec<f64> = (0..12).map(|i| 4_100_000.0 - 20.0 * i as f64).collect();
+        write_nisar_fixture(&path, "HH", full.view(), &x, &y, 32610).unwrap();
+
+        let dataset = format!("{FREQUENCY_A_GROUP}/HH");
+        let block = BlockIndices {
+            row_start: 3,
+            row_stop: 10,
+            col_start: 5,
+            col_stop: 14,
+        };
+        let win = read_nisar_window(&path, &dataset, block).unwrap();
+        let expected = full.slice(s![block.rows(), block.cols()]).to_owned();
+        assert_eq!(win, expected);
         let _ = std::fs::remove_file(&path);
     }
 }

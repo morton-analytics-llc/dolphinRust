@@ -12,6 +12,7 @@ pub mod corrections;
 pub mod dates;
 pub mod displacement;
 pub mod sequential;
+pub mod tiling;
 pub mod unwrap_backend;
 
 pub use displacement::{
