@@ -81,7 +81,9 @@ pub fn unwrap_native(
 
     let psi = wrapped.mapv(|z| z.arg() as f64);
     let unwrapped = match cfg.tile {
-        Some(tiles) => tile::unwrap_tiled(&psi, correlation, cfg.cost, tiles),
+        Some(tiles) => {
+            tile::unwrap_tiled(&psi, correlation, cfg.cost, tiles, cfg.conncomp_min_corr)
+        }
         None => unwrap_grid(&psi, correlation, cfg.cost),
     };
     let conncomp = conncomp::segment(correlation, cfg.conncomp_min_corr, cfg.conncomp_min_frac);

@@ -8,4 +8,10 @@ fixtures/*
 !fixtures/unwdense_ci_corr.npy
 !fixtures/unwdense_ci_oracle.npy
 !fixtures/unwdense_ci_conncomp.npy
+# Compact adversarial multi-component seam-robustness golden (160², 25 SNAPHU
+# components) — gates the inter-tile reconciliation across tile counts in CI.
+!fixtures/unwseam_ci_ifg.npy
+!fixtures/unwseam_ci_corr.npy
+!fixtures/unwseam_ci_oracle.npy
+!fixtures/unwseam_ci_conncomp.npy
 __pycache__/
