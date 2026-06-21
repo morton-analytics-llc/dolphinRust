@@ -15,6 +15,9 @@ use ndarray::{Array2, ArrayView2};
 
 use crate::snaphu::{CostMode, UnwrapError, UnwrapResult};
 
+mod cost;
+mod mcf;
+
 const TAU: f64 = std::f64::consts::TAU;
 
 /// Native unwrapper configuration.
@@ -62,13 +65,11 @@ pub fn unwrap_native(
         )));
     }
 
-    let _ = (correlation, cfg);
     let psi = wrapped.mapv(|z| z.arg() as f64);
     let (ax, ay) = wrapped_gradients(&psi);
-    // Phase 2 baseline: zero flow (exact for residue-free fields). Phases 3-4
-    // replace this with the statistical-cost MCF correction.
-    let kx = Array2::zeros(ax.dim());
-    let ky = Array2::zeros(ay.dim());
+    // Statistical-cost MCF routes branch cuts so the corrected gradients are
+    // curl-free; zero flow for residue-free fields.
+    let (kx, ky) = mcf::solve(&ax, &ay, correlation, cfg.cost);
     let unwrapped = integrate(&psi, &ax, &ay, &kx, &ky);
     let conncomp = Array2::from_elem((rows, cols), 1u32);
     Ok(UnwrapResult {
