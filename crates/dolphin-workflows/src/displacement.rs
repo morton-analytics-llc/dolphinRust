@@ -130,7 +130,7 @@ fn finish_displacement(
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
-    let stitched = stitch_bursts(bursts)?;
+    let stitched = timed("stitch", || stitch_bursts(bursts))?;
     let mut pl = stitched.pl;
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
@@ -147,7 +147,7 @@ fn finish_displacement(
         days.len(),
         pl.dim().0
     );
-    let pairs = network(cfg, &days);
+    let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
     let dphi_rad = timed("unwrap", || unwrap_network(cfg, pl.view(), &pairs))?;
@@ -198,16 +198,18 @@ fn finish_displacement(
         crlb_sigma: crlb_sigma.as_ref(),
         closure_phase: closure_phase.as_ref(),
     };
-    write_outputs(
-        cfg,
-        displacement.view(),
-        velocity.view(),
-        temporal_coherence.view(),
-        quality,
-        epsg,
-        geotransform,
-    )?;
-    write_correction_outputs(cfg, &corrections, epsg, geotransform)?;
+    timed("write", || -> Result<()> {
+        write_outputs(
+            cfg,
+            displacement.view(),
+            velocity.view(),
+            temporal_coherence.view(),
+            quality,
+            epsg,
+            geotransform,
+        )?;
+        write_correction_outputs(cfg, &corrections, epsg, geotransform)
+    })?;
     Ok(DisplacementOutput {
         displacement,
         velocity,
@@ -289,11 +291,19 @@ fn phase_link_tiled(
     // on the planner's ministack count.
     let depth = nslc.div_ceil(cfg.phase_linking.ministack_size.max(1));
     let mut acc = TiledOutput::new(nslc, out_shape, cfg.phase_linking.write_crlb);
+    let (mut read_s, mut compute_s) = (0.0_f64, 0.0_f64);
     for plan in plan_tiles(full_shape, strides, half, depth, out_block) {
+        let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
+        read_s += t_read.elapsed().as_secs_f64();
+        let t_pl = Instant::now();
         let out = phase_link(cfg, stack.view(), engine)?;
+        compute_s += t_pl.elapsed().as_secs_f64();
         acc.place(&plan, &out)?;
     }
+    // Sub-breakdown of the `phase_linking` stage: windowed CSLC read vs the
+    // covariance+estimator compute, summed across tiles (wall, not exclusive CPU).
+    tracing::info!(stage = "pl_breakdown", read_s, compute_s, "stage complete");
     Ok(acc.into_output())
 }
 
