@@ -1,4 +1,11 @@
 .venv/
 .venv-v042/
-fixtures/
+# Goldens are regenerated locally and stay out of git — EXCEPT the compact
+# residue-dense parity golden, which is committed so CI actually guards native
+# unwrap parity (the larger unwdense_* scene stays ignored).
+fixtures/*
+!fixtures/unwdense_ci_ifg.npy
+!fixtures/unwdense_ci_corr.npy
+!fixtures/unwdense_ci_oracle.npy
+!fixtures/unwdense_ci_conncomp.npy
 __pycache__/
