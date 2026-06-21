@@ -533,6 +533,63 @@ network-simplex MCF / conncomp masking work until a redistribution requirement
 (bundled on-prem/edge/GovCloud appliance handed to a customer) actually materializes.
 That requirement is the explicit re-entry gate for this branch.
 
+**SOLVER REVISION — network simplex + conncomp; perf INVERTS BACK to a WIN (2026-06-20).**
+Re-entered (decision to invest the IP-clean alternative was made) and rebuilt the two
+gating items. Design note: `crates/dolphin-unwrap/docs/native_mcf_solver.md`. Clean-room
+throughout (Cunningham 1973, Kovács 2012; CS2 never read). One commit per unit on
+`feat/native-unwrap`.
+
+- **Solver:** replaced unit-augmenting SSP with a hand-rolled **primal network simplex**
+  (`native/simplex.rs`: artificial-root strongly-feasible init, ancestor-marking apex,
+  children-adjacency subtree updates, block-search pricing). Runtime decoupled from total
+  flow `F`. Verified: SSP kept as a `cfg(test)` reference oracle — NS matches its *optimal
+  cost* and leaves the field residue-free on 40 random grids; a perf-regression contract
+  asserts NS ≥3× faster than SSP (true margin ~10×+).
+- **Conncomp:** `native/conncomp.rs` — coherence-mask (`conncomp_min_corr=0.15`) +
+  4-connected components + min-size drop, numbered by descending size. Closes the
+  `native.rs:78` mask-IoU 0.0 gap.
+- **Opt-in wired:** `UnwrapMethod::Native` added (config.rs) + dispatch
+  (`displacement.rs unwrap_backend`). Now config-selectable (YAML `unwrap_method: native`).
+
+**Accuracy — held per-component, conncomp now real** (gate ≤0.5%):
+
+| scene | residues | path | per-comp disagree | mask-IoU | partition-IoU |
+|-------|----------|------|-------------------|----------|---------------|
+| 160² (committed `unwdense_ci`) | 914 | global | 0.1107% | 0.844 | 0.984 |
+| 256² | 2 347 | global | 0.0303% | 0.910 | — |
+| 1024² | 36 843 | global | **0.0108%** | 0.977 | — |
+| 1024² | 36 843 | tiled 4×4 | 0.3253% | 0.977 | — |
+
+**Perf — native now BEATS subprocess SNAPHU** (same 1024² ifg, `/usr/bin/time -l`, 12-core):
+
+| backend | config | wall | ~CPU-s | max RSS |
+|---------|--------|------|--------|---------|
+| SNAPHU | 1 core, single-tile | 10.0 s | 10 | — |
+| SNAPHU | 4×4 tiles, nproc 12 | 17.4 s | — | — |
+| native | global MCF (NS) | 239 s | 239 | — |
+| native | tiled 4×4, 1T | 28.1 s | 28 | 79 MB |
+| native | tiled 4×4, 4T | 8.3 s | ~33 | 140 MB |
+| native | tiled 4×4, 8T | **4.86 s** | ~39 | 221 MB |
+| native | tiled 4×4, 12T | 4.46 s | ~54 | 293 MB |
+
+Native tiled 4×4 @8T = **4.86 s = 2.06× faster** than SNAPHU's 10.0 s (was 3.7× *slower*
+under SSP). **CPU/ifg ~3.9× SNAPHU, down from ~30× — ~85% of the gap closed.** Parallel
+SNAPHU is *slower* here (tiling overhead), so the bar is the 10 s single-core. Scaling
+flattens past 8T (memory-bandwidth bound). RSS 79–293 MB, all far under the 1.08 GB
+ceiling; native@12T 293 MB < SNAPHU. Global NS (239 s) is now feasible and most accurate
+(0.011%) but non-competitive on wall-clock — tiling is the burst-scale path.
+
+**Standing: FLIP-ELIGIBLE on this scene** — native 4×4 wins on speed + per-component
+parity + RSS simultaneously. **One remaining gap:** the modal-offset tiled stitch is
+parity-sensitive to where seams land at high residue density (even tile counts align with
+the scene's central low-coherence moat → within gate; odd counts bisect coherent regions →
+can exceed 0.5%). Reliable settings today: global (0.011%, slow) or 2×2/4×4 (within gate).
+Tried coherence-guided seam placement (snap seams to low-coherence lines) — mixed (helped
+5×5, hurt 6×6/8×8, unbalanced load); reverted. Robust arbitrary-fine-tiling needs the
+**Chen-2002 secondary inter-tile MCF** (reconcile per-component offsets across seams) — the
+single recommended next step before defaulting `UnwrapMethod::Native`. `SnaphuBackend`
+stays the wired default until that lands and a host flip is requested.
+
 ---
 
 ## Out of scope (initial)
