@@ -69,13 +69,16 @@ pub fn process_coherence_matrix(
     zero_correlation_threshold: f64,
     reference_idx: usize,
 ) -> PixelEstimate {
-    let evd = evd_eigenvector(c);
     if use_evd {
-        return reference(evd, 0, reference_idx);
+        return reference(evd_eigenvector(c), 0, reference_idx);
     }
+    // EMI is the common, successful case; compute the EVD eigendecomposition
+    // only when EMI's `Γ` is singular and the EVD fallback is actually needed
+    // (dolphin's NaN-triggered fallback). Eager EVD on every pixel was a wasted
+    // second selfadjoint eigendecomposition — ~half the estimator's CPU.
     match emi_eigenvector(c, beta, zero_correlation_threshold) {
         Some(emi) => reference(emi, 1, reference_idx),
-        None => reference(evd, 0, reference_idx),
+        None => reference(evd_eigenvector(c), 0, reference_idx),
     }
 }
 

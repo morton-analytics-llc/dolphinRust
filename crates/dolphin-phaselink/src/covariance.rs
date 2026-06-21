@@ -53,7 +53,7 @@ pub fn estimate_stack_covariance(
 }
 
 /// Coherence matrix for a single output pixel `out = (out_r, out_c)`.
-fn pixel_coh(
+pub(crate) fn pixel_coh(
     stack: ArrayView3<Cf64>,
     out: (usize, usize),
     half: HalfWindow,

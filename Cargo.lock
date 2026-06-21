@@ -564,6 +564,7 @@ dependencies = [
  "bytemuck",
  "dolphin-core",
  "faer",
+ "libc",
  "ndarray",
  "ndarray-npy",
  "num-complex",

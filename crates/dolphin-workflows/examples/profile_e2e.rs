@@ -86,9 +86,14 @@ impl Visit for Fields {
     }
 }
 
-/// Tracing layer that records a getrusage snapshot on every `stage complete` event.
+/// Tracing layer that records a getrusage snapshot on every `stage complete`
+/// event **and prints the per-stage line immediately**, so a stage's numbers are
+/// observable even if a *later* stage hangs (e.g. the x86_64-via-Rosetta SNAPHU
+/// unwrap stalls on synthetic full-res data). `prev` carries the previous event's
+/// (cpu_s, maxrss_b) so the live line shows the same Δ the final table does.
 struct ProfLayer {
     samples: Arc<Mutex<Vec<Sample>>>,
+    prev: Arc<Mutex<(f64, i64)>>,
 }
 
 impl<S: tracing::Subscriber> Layer<S> for ProfLayer {
@@ -99,6 +104,22 @@ impl<S: tracing::Subscriber> Layer<S> for ProfLayer {
             return;
         };
         let (cpu_s, maxrss_b) = rusage();
+        let mb = |b: i64| b as f64 / 1.048_576e6;
+        if stage == "pl_breakdown" {
+            eprintln!(
+                "  [live] pl split: read={:.3}s compute={:.3}s",
+                f.read_s, f.compute_s
+            );
+        } else {
+            let (pc, pr) = *self.prev.lock().unwrap();
+            let cpu = cpu_s - pc;
+            let cores = if f.wall_s > 1e-6 { cpu / f.wall_s } else { 0.0 };
+            eprintln!(
+                "  [live] {:<14} wall={:>8.3}s cpu={:>8.3}s cores={:>5.2} rss_hwm={:>8.1}MB drss={:>+8.1}MB",
+                stage, f.wall_s, cpu, cores, mb(maxrss_b), mb(maxrss_b - pr)
+            );
+            *self.prev.lock().unwrap() = (cpu_s, maxrss_b);
+        }
         self.samples.lock().unwrap().push(Sample {
             stage,
             wall_s: f.wall_s,
@@ -213,6 +234,7 @@ fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(ProfLayer {
             samples: samples.clone(),
+            prev: Arc::new(Mutex::new(rusage())),
         })
         .init();
 

@@ -1,5 +1,17 @@
 # End-to-end DisplacementWorkflow profile (native-unwrap default)
 
+> **Phase-linking perf update (branch `feat/phaselink-perf`).** The
+> phase-linking stage — the bottleneck the table below identifies — was
+> optimized in two levers. The measured PL-stage before→after is in
+> [§Phase-linking optimization](#phase-linking-optimization-feat-phaselink-perf)
+> at the end of this file; the original full-stack table below is the
+> **pre-change** baseline reference. The e2e *tail* (unwrap → SBAS → write)
+> could not be re-measured on the optimization host: `main` defaults to the
+> x86_64-via-Rosetta SNAPHU unwrap, which hangs indefinitely on the synthetic
+> full-res ramp here, so PL-stage numbers are captured live (the profiling layer
+> prints each stage as it completes) and the run is stopped at the unwrap hang.
+> PL timing is independent of the unwrap backend, so the tail rows below stand.
+
 Full `run_displacement` profiled at burst scale, **2048²**, at **12 and 30
 epochs**, single-reference network, `half_window=5` (11×11), `strides=1×1` (full
 res), `ministack_size=15`, native auto-tiled unwrap (the shipped default). macOS,
@@ -170,3 +182,78 @@ platform, so the quantitative per-stage numbers above come from `getrusage`
 
 Net: the profile's measured claims rest on `getrusage` + `time -l`; the two
 sampling tools are recorded as attempted with their platform limits, not faked.
+
+## Phase-linking optimization (`feat/phaselink-perf`)
+
+Two levers, each accuracy-gated (every phaselink + displacement/sequential/NRT
+parity contract stays green; both changes are **bit-identical** to the prior
+output, not merely within-tolerance):
+
+- **Lever 1 — fuse covariance → estimator → quality per pixel.** The staged path
+  materialized the full `(out_rows, out_cols, nslc, nslc)` `Cf64` coherence cube
+  in covariance, then re-read it from the estimator / temp_coh / CRLB / closure.
+  `link_fused` (in `dolphin-phaselink`) computes each pixel's `N×N` matrix once,
+  runs every consumer against it, and **discards the matrix before the next
+  pixel** — the cube is never retained. `ComputeEngine::link` routes the CPU path
+  here. Removes the `nslc²·area` allocation with zero math change.
+- **Lever 2 — lazy EVD fallback.** In EMI mode (default) the per-pixel estimator
+  computed a full selfadjoint eigendecomposition for the EVD *fallback* on every
+  pixel, then a second for EMI; the EVD is consumed only when `Γ` is singular.
+  Deferred it into the failure arm → one eigendecomposition per EMI-success pixel
+  instead of two.
+
+### Intra-PL breakdown (controlled microbench, `examples/pl_bench.rs`)
+
+512²×16 tile, `half=5` (11×11), `strides=1`, EMI + CRLB, getrusage CPU·s, median
+of 3 iters. This is the repeatable measure (the e2e wall is noisy under host
+load); it isolates which sub-stage drives CPU and the lever deltas:
+
+| sub-stage | baseline CPU·s | cores | after L1+L2 | note |
+|---|--:|--:|--:|---|
+| covariance | 11.0 | **7.6** | — | memory-bandwidth-bound cube build; the parallel-efficiency laggard |
+| estimator (faer eig) | 17.7 | 10.6 | **9.2** | the CPU driver; **−48%** from lazy EVD |
+| temp_coh | 1.1 | 11.1 | — | |
+| crlb | 2.1 | 10.2 | — | |
+| **staged total** | **31.9** | — | — | |
+| **`link_fused` (all)** | 30.7 | 10.6 | **22.8** | fusing lifts covariance's 7.6 cores → 10.9 |
+
+So PL CPU per tile drops **31.9 → 22.8 CPU·s (−29%)**; fusion is CPU-neutral and
+fixes covariance's parallel imbalance, lazy EVD halves the estimator.
+
+### PL stage, full-res 2048² e2e (before → after, this host, no-gpu)
+
+Captured live at the `phase_linking` stage event (the `[live]` line), CRLB/closure
+off (workflow default), before vs. after both levers:
+
+| | 12 ep before | 12 ep after | 30 ep before | 30 ep after |
+|---|--:|--:|--:|--:|
+| PL wall (s) | 39.66 | **27.42** (−31%) | 87.94 | **70.50** (−20%) |
+| PL CPU·s | 344.4 | **276.1** (−20%) | 750.1 | **732** (−2.4%) |
+| PL cores (eff.) | 8.68 | **10.07** | 8.53 | **10.41** |
+| PL stage rss_hwm (MiB) | 2908 | **1574 (−46%)** | 5851 | **3793 (−35%)** |
+
+- **Memory floor broken.** PL-stage high-water drops 2908→1574 MiB (12 ep) and
+  5851→3793 MiB (30 ep). The new floor is the **retained `Cf64` linked-phase
+  cube** (`N·2048²·16 B` = 805 MiB at 12 ep / 2.01 GiB at 30 ep) plus the
+  per-tile `Vec<PixelFused>` and input tile — the `nslc²·area` coherence cube is
+  gone. The retained cpx cube (driver #2 in the timeline above) is now the
+  single largest PL allocation, as predicted.
+- **CPU win is epoch-dependent.** −20% at 12 ep (one ministack, EMI succeeds
+  ~everywhere → lazy EVD fires). At 30 ep the −2.4% is small: the second
+  ministack carries a compressed SLC whose coherence matrices more often hit the
+  EMI→EVD fallback on this synthetic ramp, so the EVD is computed anyway there;
+  the 30 ep **wall** win (−20%) instead comes from Lever 1 lifting parallel
+  efficiency (8.5 → 10.4 effective cores). On oracle-like data where EMI succeeds
+  everywhere (`oracle_estimator_flag_is_emi`), the CPU win tracks the 12 ep figure.
+
+### Highest-leverage next optimization
+
+With the estimator halved and its cube gone, **covariance is now the dominant PL
+sub-stage and the parallel-efficiency laggard** (11 CPU·s at only ~7.6 cores in
+isolation). The per-pixel `hermitian_product` re-reads the same `11×11` window
+samples every output pixel at `strides=1`; a separable / running-sum accumulation
+of `Σ z_i z_j*` over the sliding window (reuse overlapping-window partial sums
+instead of recomputing the full `O(N²·win²)` product per pixel) is the next
+target. The other retained cost is the `Cf64` linked-phase cube — storing it
+`Cf32` (8 B/px) would halve the remaining PL floor, gated on the CRLB/v0.42
+conditioning history.

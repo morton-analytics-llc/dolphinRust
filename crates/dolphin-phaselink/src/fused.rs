@@ -1,0 +1,211 @@
+//! Fused covariance → estimator → quality pass (Lever 1: break the memory floor).
+//!
+//! The separate-stage path materializes the whole
+//! `(out_rows, out_cols, nslc, nslc)` `Cf64` coherence cube in
+//! [`crate::estimate_stack_covariance`], then re-reads it from
+//! [`crate::process_coherence_matrices`], [`crate::estimate_temp_coh`],
+//! [`crate::estimate_crlb`] and [`crate::estimate_closure_phases`]. That cube
+//! (`nslc²·area·16 B`) is the phase-linking memory floor.
+//!
+//! This pass computes each output pixel's coherence matrix once, runs every
+//! consumer against it, and retains only the per-date phase + scalar quality +
+//! per-date CRLB + per-triplet closure — **discarding the `N×N` matrix before
+//! moving to the next pixel**. The math is identical to the separate stages
+//! (same kernels, same pixel/`idx` ordering), so the result is bit-identical;
+//! only the cube is never held. Parallelized over output pixels with `rayon`,
+//! exactly as the stages it replaces.
+
+use dolphin_core::{Cf64, HalfWindow, Strides};
+use ndarray::{Array1, Array2, Array3, ArrayView3, ArrayView4};
+use rayon::prelude::*;
+
+use crate::closure::triplet_closure;
+use crate::covariance::pixel_coh;
+use crate::crlb::crlb_pixel;
+use crate::estimator::process_coherence_matrix;
+use crate::quality::temp_coh_single;
+
+/// Estimator + quality parameters for a fused pass (mirrors the separate-stage
+/// call arguments). Grouped to keep the per-pixel signature small.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedParams {
+    /// Use EVD instead of EMI for the linked phase.
+    pub use_evd: bool,
+    /// EMI regularization weight `β`.
+    pub beta: f64,
+    /// Coherence values at or below this are treated as zero.
+    pub zero_correlation_threshold: f64,
+    /// Reference date for the output linked phase.
+    pub reference_idx: usize,
+    /// Produce the per-date CRLB σ layer.
+    pub compute_crlb: bool,
+    /// CRLB reference date (dolphin's last carried compressed date — may differ
+    /// from `reference_idx`).
+    pub crlb_reference_idx: usize,
+    /// CRLB look count `L` (`sqrt(half_y·half_x)`).
+    pub num_looks: f64,
+    /// Produce the per-triplet closure-phase layer.
+    pub compute_closure: bool,
+}
+
+/// Fused phase-linking output over the strided `(out_rows, out_cols)` grid.
+/// Identical fields to what the separate stages produce, minus the retained
+/// coherence cube.
+pub struct FusedEstimate {
+    /// Linked phase (unit magnitude), `(nslc, out_rows, out_cols)`.
+    pub cpx_phase: Array3<Cf64>,
+    /// Temporal coherence, `(out_rows, out_cols)`.
+    pub temporal_coherence: Array2<f64>,
+    /// Per-date CRLB σ, `(nslc, out_rows, out_cols)`; `None` unless requested.
+    pub crlb_sigma: Option<Array3<f64>>,
+    /// Per-triplet closure phase (band-major), `(nslc-2, out_rows, out_cols)`;
+    /// `None` unless requested.
+    pub closure_phase: Option<Array3<f64>>,
+}
+
+/// One output pixel's fused products — the only thing retained per pixel.
+struct PixelFused {
+    phase: Array1<Cf64>,
+    temp_coh: f64,
+    crlb: Option<Array1<f64>>,
+    closure: Option<Vec<f64>>,
+}
+
+/// Run the fused covariance + estimator + quality pass over `stack`
+/// `(nslc, rows, cols)`. `neighbors` is the optional SHP mask
+/// `(out_rows, out_cols, win_h, win_w)`.
+///
+/// # Errors
+/// Returns `Err` if the covariance window is larger than the stack.
+pub fn link_fused(
+    stack: ArrayView3<Cf64>,
+    half: HalfWindow,
+    strides: Strides,
+    neighbors: Option<ArrayView4<bool>>,
+    params: FusedParams,
+) -> Result<FusedEstimate, &'static str> {
+    let (nslc, rows, cols) = stack.dim();
+    let (win_h, win_w) = (2 * half.y + 1, 2 * half.x + 1);
+    if win_h > rows || win_w > cols {
+        return Err("covariance window larger than stack");
+    }
+    let (out_rows, out_cols) = strides.out_shape((rows, cols));
+
+    let pixels: Vec<PixelFused> = (0..out_rows * out_cols)
+        .into_par_iter()
+        .map(|idx| {
+            fused_pixel(
+                stack,
+                (idx / out_cols, idx % out_cols),
+                half,
+                strides,
+                neighbors,
+                params,
+            )
+        })
+        .collect();
+
+    Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
+}
+
+/// Fused per-pixel work: build the coherence matrix once, run every consumer,
+/// drop the matrix. Mirrors the separate stages' per-pixel kernels exactly.
+fn fused_pixel(
+    stack: ArrayView3<Cf64>,
+    out: (usize, usize),
+    half: HalfWindow,
+    strides: Strides,
+    neighbors: Option<ArrayView4<bool>>,
+    p: FusedParams,
+) -> PixelFused {
+    let c = pixel_coh(stack, out, half, strides, neighbors);
+    let est = process_coherence_matrix(
+        c.view(),
+        p.use_evd,
+        p.beta,
+        p.zero_correlation_threshold,
+        p.reference_idx,
+    );
+    let phase = est.phase.mapv(unit_phasor);
+    let temp_coh = temp_coh_single(phase.view(), c.view());
+    let crlb = p.compute_crlb.then(|| {
+        crlb_pixel(
+            c.view(),
+            p.beta,
+            p.zero_correlation_threshold,
+            p.crlb_reference_idx,
+            p.num_looks,
+        )
+    });
+    let ntri = c.nrows().saturating_sub(2);
+    let closure = p
+        .compute_closure
+        .then(|| (0..ntri).map(|k| triplet_closure(c.view(), k)).collect());
+    PixelFused {
+        phase,
+        temp_coh,
+        crlb,
+        closure,
+    }
+}
+
+/// Unit-magnitude phasor `exp(j∠z)` (dolphin's `exp(1j*angle(cpx_phase))`).
+fn unit_phasor(z: Cf64) -> Cf64 {
+    Cf64::from_polar(1.0, z.arg())
+}
+
+/// Pack per-pixel fused products into the stacked output arrays, idx-ordered the
+/// same way the separate stages assemble theirs (`r = idx/out_cols`).
+fn pack(
+    pixels: Vec<PixelFused>,
+    shape: (usize, usize, usize),
+    params: &FusedParams,
+) -> FusedEstimate {
+    let (out_rows, out_cols, nslc) = shape;
+    let ntri = nslc.saturating_sub(2);
+    let mut cpx_phase = Array3::zeros((nslc, out_rows, out_cols));
+    let mut temporal_coherence = Array2::zeros((out_rows, out_cols));
+    let mut crlb = params
+        .compute_crlb
+        .then(|| Array3::<f64>::zeros((nslc, out_rows, out_cols)));
+    let mut closure = params
+        .compute_closure
+        .then(|| Array3::<f64>::zeros((ntri, out_rows, out_cols)));
+
+    for (idx, px) in pixels.into_iter().enumerate() {
+        let (r, c) = (idx / out_cols, idx % out_cols);
+        temporal_coherence[(r, c)] = px.temp_coh;
+        px.phase
+            .iter()
+            .enumerate()
+            .for_each(|(t, &z)| cpx_phase[(t, r, c)] = z);
+        write_band(crlb.as_mut(), px.crlb, (r, c));
+        write_closure(closure.as_mut(), px.closure, (r, c));
+    }
+    FusedEstimate {
+        cpx_phase,
+        temporal_coherence,
+        crlb_sigma: crlb,
+        closure_phase: closure,
+    }
+}
+
+/// Write a per-date σ vector into the band-major CRLB array at `(r, c)`.
+fn write_band(dst: Option<&mut Array3<f64>>, src: Option<Array1<f64>>, rc: (usize, usize)) {
+    let (Some(dst), Some(src)) = (dst, src) else {
+        return;
+    };
+    src.iter()
+        .enumerate()
+        .for_each(|(t, &v)| dst[(t, rc.0, rc.1)] = v);
+}
+
+/// Write a per-triplet closure vector into the band-major closure array at `(r, c)`.
+fn write_closure(dst: Option<&mut Array3<f64>>, src: Option<Vec<f64>>, rc: (usize, usize)) {
+    let (Some(dst), Some(src)) = (dst, src) else {
+        return;
+    };
+    src.iter()
+        .enumerate()
+        .for_each(|(k, &v)| dst[(k, rc.0, rc.1)] = v);
+}

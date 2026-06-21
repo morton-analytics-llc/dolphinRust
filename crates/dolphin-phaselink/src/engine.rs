@@ -13,7 +13,10 @@ use dolphin_core::config::ComputeBackend;
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use ndarray::{Array4, ArrayView3, ArrayView4};
 
-use crate::{estimate_stack_covariance, process_coherence_matrices, StackEstimate};
+use crate::{
+    estimate_stack_covariance, link_fused, process_coherence_matrices, FusedEstimate, FusedParams,
+    StackEstimate,
+};
 
 /// `Auto` uses the GPU at/above this output-pixel count (≈128²); below it, the
 /// CPU wins (the spike's measured crossover — dispatch + readback dominate).
@@ -148,6 +151,34 @@ impl ComputeEngine {
         )
     }
 
+    /// Fused covariance → estimator → quality over `stack` (Lever 1): one pass
+    /// that retains only the per-date phase + scalar coherence + per-date CRLB +
+    /// per-triplet closure, never the `(out_rows, out_cols, nslc, nslc)` cube.
+    /// On the CPU this routes to [`crate::link_fused`]; when the GPU is resolved
+    /// (cube materialized there anyway) it falls back to the staged covariance +
+    /// estimator + per-stage quality, producing the identical [`FusedEstimate`].
+    ///
+    /// # Errors
+    /// Returns `Err` if the covariance window exceeds the stack.
+    pub fn link(
+        &self,
+        stack: ArrayView3<Cf64>,
+        half: HalfWindow,
+        strides: Strides,
+        neighbors: Option<ArrayView4<bool>>,
+        params: FusedParams,
+    ) -> Result<FusedEstimate, &'static str> {
+        #[cfg(feature = "gpu")]
+        {
+            let (nslc, rows, cols) = stack.dim();
+            let (out_rows, out_cols) = strides.out_shape((rows, cols));
+            if self.gpu_ready(out_rows * out_cols, nslc) {
+                return self.link_staged(stack, half, strides, neighbors, params);
+            }
+        }
+        link_fused(stack, half, strides, neighbors, params)
+    }
+
     /// Whether a GPU context exists and the resolved mode + problem size pick it.
     fn gpu_ready(&self, n_pix: usize, nslc: usize) -> bool {
         #[cfg(feature = "gpu")]
@@ -188,6 +219,48 @@ fn acquire_gpu() -> Option<crate::gpu::GpuContext> {
 
 #[cfg(feature = "gpu")]
 impl ComputeEngine {
+    /// Staged fused path for the GPU-resolved case: covariance + estimator (both
+    /// GPU-routed) then per-stage quality on the materialized cube. Produces the
+    /// same [`FusedEstimate`] as [`crate::link_fused`].
+    fn link_staged(
+        &self,
+        stack: ArrayView3<Cf64>,
+        half: HalfWindow,
+        strides: Strides,
+        neighbors: Option<ArrayView4<bool>>,
+        params: FusedParams,
+    ) -> Result<FusedEstimate, &'static str> {
+        use crate::{estimate_closure_phases, estimate_crlb, estimate_temp_coh};
+        let c = self.covariance(stack, half, strides, neighbors)?;
+        let est = self.estimate(
+            c.view(),
+            params.use_evd,
+            params.beta,
+            params.zero_correlation_threshold,
+            params.reference_idx,
+        );
+        let cpx = est.cpx_phase.mapv(|z| Cf64::from_polar(1.0, z.arg()));
+        let temporal_coherence = estimate_temp_coh(cpx.view().permuted_axes([1, 2, 0]), c.view());
+        let crlb_sigma = params.compute_crlb.then(|| {
+            estimate_crlb(
+                c.view(),
+                params.beta,
+                params.zero_correlation_threshold,
+                params.crlb_reference_idx,
+                params.num_looks,
+            )
+        });
+        let closure_phase = params
+            .compute_closure
+            .then(|| estimate_closure_phases(c.view()));
+        Ok(FusedEstimate {
+            cpx_phase: cpx,
+            temporal_coherence,
+            crlb_sigma,
+            closure_phase,
+        })
+    }
+
     /// GPU covariance (f32), upcast to f64; `None` on dispatch error (→ CPU).
     fn covariance_gpu(
         &self,

@@ -638,6 +638,54 @@ Four commits on `feat/native-unwrap` (`dc16b96` seam reconciliation, `f512197` b
 
 ---
 
+### Phase-linking optimization (`feat/phaselink-perf`, 2026-06-21)
+
+With unwrap parallelized/native, phase-linking became the bottleneck (72–84% of
+CPU, and the memory floor: the retained `(out_rows,out_cols,nslc,nslc)` `Cf64`
+coherence cube). Two accuracy-gated levers (2 commits), each **bit-identical** to
+the prior output — verified against the staged path (`fused_contract.rs`) and
+every phaselink/displacement/sequential/NRT parity contract:
+
+- **Lever 1 — fuse covariance → estimator → quality per pixel.** `link_fused`
+  (dolphin-phaselink) computes each pixel's `N×N` coherence matrix once, runs the
+  estimator + temp_coh + CRLB + closure against it, retains only the per-date
+  phase + scalar quality, and **discards the matrix before the next pixel**. The
+  `nslc²·area` cube is never materialized. `ComputeEngine::link` routes the CPU
+  path here; the GPU-resolved path keeps the staged cube.
+- **Lever 2 — lazy EVD fallback.** The EMI estimator computed a full
+  eigendecomposition for the EVD fallback on every pixel, then a second for EMI;
+  the EVD is used only on singular `Γ`. Deferred to the failure arm → one
+  eigendecomposition per EMI-success pixel.
+
+**Measured** (2048² e2e PL stage, no-gpu, this host; CPU·s from getrusage, RSS =
+`ru_maxrss` high-water; e2e tail not re-measurable here — Rosetta SNAPHU hangs on
+synthetic full-res, so PL is captured live and the run stopped at the hang):
+
+| | 12 ep | 30 ep |
+|---|--|--|
+| PL wall | 39.7 → **27.4 s** (−31%) | 87.9 → **70.5 s** (−20%) |
+| PL CPU·s | 344 → **276** (−20%) | 750 → **732** (−2.4%) |
+| PL eff. cores | 8.7 → **10.1** | 8.5 → **10.4** |
+| PL stage rss_hwm | 2908 → **1574 MiB** (−46%) | 5851 → **3793 MiB** (−35%) |
+
+The memory floor is broken: the new PL floor is the retained `Cf64` linked-phase
+cube (`N·2048²·16 B`). CPU win is epoch-dependent — 12 ep (one ministack, EMI
+succeeds everywhere) gets the full lazy-EVD benefit; 30 ep's second ministack
+carries a compressed SLC whose matrices more often hit the EMI→EVD fallback on
+synthetic data, so its wall win comes from Lever 1's parallel-efficiency gain.
+Controlled microbench (`examples/pl_bench.rs`, 512²×16): estimator **17.7 → 9.2
+CPU·s (−48%)**, fused PL **31.9 → 22.8 CPU·s (−29%)**. `gp-dolphin` builds clean
+against the patched vendor copy (no-gpu, system HDF5).
+
+**Next (measured → next lever):** with the estimator halved and its cube gone,
+**covariance is now the dominant PL sub-stage** and the parallel-efficiency
+laggard (~7.6 cores in isolation; it re-reads overlapping window samples per
+output pixel at `strides=1`). A running-sum / separable sliding-window covariance
+accumulation is the next target; storing the retained linked-phase cube as `Cf32`
+would halve the remaining floor (gated on the CRLB/v0.42 conditioning history).
+
+---
+
 ## Out of scope (initial)
 
 - `atmosphere/` tropospheric corrections (wraps external delay models) — defer.

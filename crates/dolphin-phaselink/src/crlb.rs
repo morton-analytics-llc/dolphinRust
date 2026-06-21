@@ -53,7 +53,7 @@ pub fn estimate_crlb(
 }
 
 /// CRLB σ vector (length `nslc`) for one pixel's coherence matrix.
-fn crlb_pixel(
+pub(crate) fn crlb_pixel(
     c: ArrayView2<Cf64>,
     beta: f64,
     zero_correlation_threshold: f64,
