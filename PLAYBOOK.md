@@ -369,6 +369,273 @@ cargo run --release --example unwrap_bench`.
 (eliminate SNAPHU subprocess + flat-binary scratch I/O per ifg) or **Tier 3 3D
 spatiotemporal backend** (the `UnwrapBackend` trait seam already exists).
 
+### Native in-process unwrapper (Tier-2, 2026-06-20)
+
+Clean-room phase-unwrapping engine — commercial-clean replacement for the
+noncommercial SNAPHU binary, behind the same `UnwrapBackend` trait. **IP
+firewall:** derived solely from Costantini 1998 (MCF formulation), Chen & Zebker
+2001 (statistical network costs) and 2002 (tiling); no SNAPHU/CS2 source read.
+SNAPHU is retained only as a black-box validation oracle. Branch
+`feat/native-unwrap` (Phases 1–7, one commit per unit; unmerged).
+
+**Algorithm.** `dolphin-unwrap/src/native/`: wrapped row/col gradients → residues
+(discrete curl) → statistical-cost min-cost-flow over the dual grid graph
+(successive shortest paths, Johnson potentials — `mcf.rs`) routes integer
+branch-cut corrections so the corrected gradients are curl-free → raster
+integration. Edge cost = CRLB interferometric-phase precision γ²/(1−γ²)
+(`cost.rs`), so cuts route through decorrelated pixels. Residue-free ifgs (the
+high-coherence common case) short-circuit: no graph, no flow allocation. Optional
+Chen-2002 overlapping tiling with modal inter-tile offset reconciliation
+(`tile.rs`, `NativeConfig.tile`, default off).
+
+**Accuracy — SNAPHU parity on EVERY golden-suite class** (`oracle/gen_unwrap_suite.py`,
+`tests/native_unwrap_contract.rs`). Parity = same integer-cycle field up to a
+global constant; metric is per-pixel cycle disagreement on conncomp>0 pixels.
+
+| class | cycle-disagree | sub-cycle resid |
+|-------|----------------|------------------|
+| smooth | 0.0000% | ≤1e-4 rad |
+| steep (near-aliasing) | 0.0000% | ≤1e-4 rad |
+| discont (fault step) | 0.0000% | 0 |
+| lowcoh (95 residues, masked band) | 0.0769% (3/3900 px) | 0 |
+| multitile (160²) | 0.0000% | 0 |
+
+Four classes are residue-free → unique solution up to a constant. Only `lowcoh`
+exercises the MCF; 3 boundary pixels tie-break differently from SNAPHU, far
+under the 0.5% gate.
+
+**CPU — ~90–107× faster than SNAPHU** at matched threads (512², single-ref,
+12-core; `BACKEND=native cargo run --release --example unwrap_bench`):
+
+| epochs | snaphu 1T | native 1T | snaphu 8T | native 8T | native 12T (scaling) |
+|--------|-----------|-----------|-----------|-----------|----------------------|
+| 12 | 9.08 s | 91.7 ms | 2.06 s | 23.6 ms | 27.9 ms (3.3×, regresses — work too small) |
+| 30 | 23.1 s | 199.9 ms | 4.77 s | 45.8 ms | 49.2 ms (4.4×) |
+
+**New ceiling.** With the subprocess+scratch ceiling removed, native's own
+thread-scaling tops out at ~4.4× (8–12T, 30ep) — now bound by ifg formation +
+memory bandwidth + rayon overhead, not the solver (per-ifg solve ~7 ms at 512²).
+At 12 epochs it regresses past 8T (too little work to amortize).
+
+**Memory — Pareto, not a regression.** Parent-process max-RSS (30ep, `/usr/bin/time -l`):
+serial native 271 MB ≈ snaphu 270 MB; 8-thread native 311 MB vs snaphu 272 MB
+(+15%). The +15% is structural: in-process execution holds N concurrent f64
+working sets, whereas SNAPHU offloads each ifg to a **child process whose RSS the
+parent metric never counts** (peak 8 concurrent ~30 MB children ≈ +240 MB of
+real, uncounted memory). The decisive comparison: **native serial (200 ms,
+271 MB) beats snaphu 8-thread (4557 ms, 272 MB) on both axes — 22× faster at
+equal RAM.** Native spends the extra 15% RAM only to scale to 100×; no operating
+point lets SNAPHU win both. Tune via the existing `n_parallel_jobs` knob.
+
+**Status.** Default-eligible on accuracy (every class) + CPU (100×) + matched-RAM
+speed. `SnaphuBackend` stays the wired default until the host flips it. GP: the
+`dolphin-unwrap` crate is pure compute (no GPU/HDF5 deps), builds under
+`--no-default-features --features no-gpu`; the native solver is pure-functional
+(no statics/unsafe/interior mutability) → safe under GP's `spawn_blocking`.
+
+#### Default-flip gate on REAL residue density — NO-FLIP (2026-06-20)
+
+The Tier-2 100× / "default-eligible" numbers above were measured on the synthetic
+suite, where 4/5 classes are residue-free (Phase-7 fast path, no MCF) and the one
+residue case (`lowcoh`) has just **95 residues** — 2–4 orders of magnitude below
+real Sentinel-1 burst density (10⁴–10⁶). Gating the flip required re-measuring
+with the MCF solver actually loaded at real density.
+
+**Test scene (realistic-synthetic — no real CSLC burst was on disk; only 48×64
+toy fixtures).** `oracle/gen_unwrap_dense.py`: decorrelation-driven CRLB phase
+noise over a spatially varying coherence field, near-zero-corr moats + a masked
+band splitting the scene into disconnected coherent regions, a steep subsidence
+cone. 1024² scene = **36,843 residues (3.5% of px) → 388× the 95-residue
+fixture**; SNAPHU produces **6 connected components + 10% masked**. Committed
+compact guard `unwdense_ci` (160², 914 residues = 9.6× the fixture, 6 components).
+
+**Accuracy — per-component cycle parity HOLDS at real density.** SNAPHU assigns an
+independent integer offset per component, so parity is measured per-component (the
+global-mode metric is meaningless on a multi-component scene). Gate ≤0.5%
+disagreement on conncomp>0 px:
+
+| scene | residues | path | per-component disagree | sub-cycle resid |
+|-------|----------|------|------------------------|-----------------|
+| 160² (committed `unwdense_ci`) | 914 | global MCF | **0.0511%** | 0 |
+| 256² | 2 347 | global MCF | 0.0421% | 0 |
+| 1024² | 36 843 | tiled 4×4 | **0.3261%** | 2e-4 rad |
+
+Native is **scientifically correct on trusted pixels** even at 36k residues. The
+1024² tiled run drifts to 0.33% (still passing) and shows 29% *global-mode*
+disagreement — the modal inter-tile reconciliation assigns per-region offsets that
+differ from SNAPHU's per-component offsets (expected; only breaks if a consumer
+needs a single globally-consistent field, see below).
+
+**Conncomp partition — native does NOT reproduce it.** `unwrap_native` returns a
+trivial single-component label array (`native.rs:78`); it performs no coherence
+masking / segmentation. mask-IoU vs SNAPHU = **0.0**. The production
+`UnwrapBackend::unwrap_network` trait returns only the unwrapped field (conncomp
+is discarded for *all* backends), so this does not corrupt displacement output —
+but it is a real capability gap and the tiled per-region offset drift would
+surface as inter-region 2π steps for any future single-field consumer.
+
+**Perf — the 100× INVERTS to a slowdown at real density.** Same 1024² ifg
+(`/usr/bin/time -l`, 12-core):
+
+| backend | config | wall | ~CPU-s | max RSS |
+|---------|--------|------|--------|---------|
+| SNAPHU | single-tile, 1 core | **10.1 s** | 10 | 423 MB |
+| native | global MCF, 1 core | **>660 s** (killed >11 min) | >660 | — |
+| native | tiled 4×4, 2T | 97.1 s | ~194 | 115 MB |
+| native | tiled 4×4, 4T | 61.2 s | ~245 | 187 MB |
+| native | tiled 4×4, 8T | **36.9 s** (best) | ~295 | 308 MB |
+| native | tiled 4×4, 12T | 38.0 s | ~456 | 428 MB |
+
+Native's best wall (37 s @8T) is **3.7× slower** than SNAPHU's single-core 10 s,
+and **~30× more CPU per ifg**. The synthetic advantage was an artifact of the
+residue-free fast path; once the hand-rolled successive-shortest-paths MCF is
+actually exercised it is far slower than SNAPHU's optimized CS2. The untiled
+global MCF is **non-viable at burst scale** (>11 min/ifg) — tiling is mandatory,
+and tiling erodes parity + injects inter-region offset drift. **RSS: no
+regression** — native tiled 115–428 MB scales with thread count (the
+`n_parallel_jobs` dial: lower concurrency where RAM-bound), all well under the
+1.08 GB block-tiled OOM-fix ceiling; native@12T 428 MB ≈ SNAPHU 423 MB.
+
+**Decision — NO-FLIP.** `SnaphuBackend` stays the wired default; the native
+backend stays implemented-behind-the-trait but is **not** worth flipping: it wins
+nothing on accuracy it doesn't already have, and loses decisively on speed/CPU at
+the residue density that actually matters. Its value is **IP-clean / commercial
+licensing**, not performance. **Standing CI guard:** `tests/native_dense_parity.rs`
+gates per-component parity on the committed residue-dense golden and **FAILS (not
+skips)** when the golden is missing — closing the silent-pass gap (the prior
+`native_unwrap_contract` skips because `oracle/fixtures/` is git-ignored
+wholesale; only `unwdense_ci_*.npy` is now committed).
+
+**Boundary (remaining-work gate).** Native is competitive only below ~10³
+residues/ifg. To make it a viable opt-in at burst scale it needs: (1) a real
+connected-component / coherence-masking pass (currently trivial), (2) a faster MCF
+(optimized network-simplex / cost-scaling, not hand-rolled SSP) to recover the
+CPU gap, and (3) tiled-path parity hardening where residues straddle seams. Until
+then it is not config-selectable (`UnwrapMethod` exposes only Snaphu/Tophu); wiring
+`UnwrapMethod::Native` is deferred behind those three items.
+
+**Phase-0 licensing determination — native UNJUSTIFIED → branch PARKED (2026-06-20).**
+Before spending the solver effort to close the three remaining-work items above, the
+gating question is whether native's *only* payoff — IP-clean redistribution — is
+needed at all. It is not. GroundPulse's unwrapper distribution model is
+**subprocess-at-operator-site**, which the SNAPHU noncommercial clause does not
+touch. Evidence in `../eo`: SNAPHU is compiled from source only into the internal
+worker image (`Dockerfile.dolphin:62-73`, launched per-job via ECS RunTask from
+Morton's private ECR `782664968309…/gp-dolphin-worker`); the customer-facing image
+(`Dockerfile`) contains **zero** SNAPHU; GroundPulse is explicitly SaaS-only with no
+on-prem/edge appliance ("Can we host on-prem? No — and that's by design",
+`docs/design/montana-bridge-rfp-demo-release.md:340`); the NSF SBIR pitch frames its
+artifacts as "proof-of-method … not customer deployments". No artifact containing
+SNAPHU is ever shipped to a third party, so there is no redistribution and native
+buys nothing. **Decision:** keep `feat/native-unwrap` parked (implemented behind the
+trait, NO-FLIP default already recorded above); do **not** invest in the
+network-simplex MCF / conncomp masking work until a redistribution requirement
+(bundled on-prem/edge/GovCloud appliance handed to a customer) actually materializes.
+That requirement is the explicit re-entry gate for this branch.
+
+**SOLVER REVISION — network simplex + conncomp; perf INVERTS BACK to a WIN (2026-06-20).**
+Re-entered (decision to invest the IP-clean alternative was made) and rebuilt the two
+gating items. Design note: `crates/dolphin-unwrap/docs/native_mcf_solver.md`. Clean-room
+throughout (Cunningham 1973, Kovács 2012; CS2 never read). One commit per unit on
+`feat/native-unwrap`.
+
+- **Solver:** replaced unit-augmenting SSP with a hand-rolled **primal network simplex**
+  (`native/simplex.rs`: artificial-root strongly-feasible init, ancestor-marking apex,
+  children-adjacency subtree updates, block-search pricing). Runtime decoupled from total
+  flow `F`. Verified: SSP kept as a `cfg(test)` reference oracle — NS matches its *optimal
+  cost* and leaves the field residue-free on 40 random grids; a perf-regression contract
+  asserts NS ≥3× faster than SSP (true margin ~10×+).
+- **Conncomp:** `native/conncomp.rs` — coherence-mask (`conncomp_min_corr=0.15`) +
+  4-connected components + min-size drop, numbered by descending size. Closes the
+  `native.rs:78` mask-IoU 0.0 gap.
+- **Opt-in wired:** `UnwrapMethod::Native` added (config.rs) + dispatch
+  (`displacement.rs unwrap_backend`). Now config-selectable (YAML `unwrap_method: native`).
+
+**Accuracy — held per-component, conncomp now real** (gate ≤0.5%):
+
+| scene | residues | path | per-comp disagree | mask-IoU | partition-IoU |
+|-------|----------|------|-------------------|----------|---------------|
+| 160² (committed `unwdense_ci`) | 914 | global | 0.1107% | 0.844 | 0.984 |
+| 256² | 2 347 | global | 0.0303% | 0.910 | — |
+| 1024² | 36 843 | global | **0.0108%** | 0.977 | — |
+| 1024² | 36 843 | tiled 4×4 | 0.3253% | 0.977 | — |
+
+**Perf — native now BEATS subprocess SNAPHU** (same 1024² ifg, `/usr/bin/time -l`, 12-core):
+
+| backend | config | wall | ~CPU-s | max RSS |
+|---------|--------|------|--------|---------|
+| SNAPHU | 1 core, single-tile | 10.0 s | 10 | — |
+| SNAPHU | 4×4 tiles, nproc 12 | 17.4 s | — | — |
+| native | global MCF (NS) | 239 s | 239 | — |
+| native | tiled 4×4, 1T | 28.1 s | 28 | 79 MB |
+| native | tiled 4×4, 4T | 8.3 s | ~33 | 140 MB |
+| native | tiled 4×4, 8T | **4.86 s** | ~39 | 221 MB |
+| native | tiled 4×4, 12T | 4.46 s | ~54 | 293 MB |
+
+Native tiled 4×4 @8T = **4.86 s = 2.06× faster** than SNAPHU's 10.0 s (was 3.7× *slower*
+under SSP). **CPU/ifg ~3.9× SNAPHU, down from ~30× — ~85% of the gap closed.** Parallel
+SNAPHU is *slower* here (tiling overhead), so the bar is the 10 s single-core. Scaling
+flattens past 8T (memory-bandwidth bound). RSS 79–293 MB, all far under the 1.08 GB
+ceiling; native@12T 293 MB < SNAPHU. Global NS (239 s) is now feasible and most accurate
+(0.011%) but non-competitive on wall-clock — tiling is the burst-scale path.
+
+**Standing: FLIP-ELIGIBLE on this scene** — native 4×4 wins on speed + per-component
+parity + RSS simultaneously. **One remaining gap:** the modal-offset tiled stitch is
+parity-sensitive to where seams land at high residue density (even tile counts align with
+the scene's central low-coherence moat → within gate; odd counts bisect coherent regions →
+can exceed 0.5%). Reliable settings today: global (0.011%, slow) or 2×2/4×4 (within gate).
+Tried coherence-guided seam placement (snap seams to low-coherence lines) — mixed (helped
+5×5, hurt 6×6/8×8, unbalanced load); reverted. Robust arbitrary-fine-tiling needs the
+**Chen-2002 secondary inter-tile MCF** (reconcile per-component offsets across seams) — the
+single recommended next step before defaulting `UnwrapMethod::Native`. `SnaphuBackend`
+stays the wired default until that lands and a host flip is requested.
+
+**SEAM-MCF + THROUGHPUT + DEFAULT FLIP → Native is now the default (2026-06-20).**
+Closed the seam gap, settled throughput at production concurrency, and flipped the default.
+Four commits on `feat/native-unwrap` (`dc16b96` seam reconciliation, `f512197` bench,
+`598b8d8` fine tiling, `c63d72d` flip).
+
+- **PUSH 1 — seam gap killed.** Replaced the per-tile modal-offset stitch with **per-region
+  reconciliation** (`native/tile.rs`): partition into reliable regions = coherence-components
+  ∩ tile cores (a component spanning tiles → one region per tile); each cross-seam pixel pair
+  votes the coherence-weighted integer offset; assign one offset per region along a
+  **maximum-reliability spanning forest** of the region graph (Chen-2002's reconciliation in
+  its provably-optimal-on-trees form; disconnected groups seed independently, mirroring
+  SNAPHU's per-component offsets). Overlap 8→16 so straddling dipoles route correctly.
+  *Adversarial sweep* (`examples/seam_sweep.rs`, `oracle/gen_seam_sweep.py`): 96 scenes
+  (6 coherence structures × densities 0.1–23% × seeds) × tile counts **2..8 odd AND even** —
+  modal stitch failed **140/252 cells, worst 38.4%**; per-region passes **0/672, worst
+  0.314%**. Committed CI golden `unwseam_ci` (160², 25 components) gates tiled-vs-global
+  ≤0.5% across tile counts in `native_tiling_contract.rs`.
+- **PUSH 2 — throughput settled, native wins decisively.** The prior "native loses CPU·s"
+  was measured at tile=4 (the wrong granularity) and against a residue-free smooth bench.
+  Re-measured with a realistic dense bench (27.6k residues @1024²) + production-concurrency
+  harness (`bench_unwrap_throughput.sh`: K concurrent frame-processes = GP's per-job model;
+  CPU·s via `/usr/bin/time -l`, verified to roll up reaped SNAPHU children). The crossover is
+  **tile granularity** — native's per-tile network simplex is superlinear in residues/tile:
+
+  | tiles @1024² | t2 | t4 | t8 | t16 | t24 | t32 | SNAPHU |
+  |---|---|---|---|---|---|---|---|
+  | CPU·s / frame | 502 | 168 | 41 | 14 | **9.0** | 16 | 70 |
+
+  Minimum at ~48 px cores. *Actual frames/hour at concurrency* (12 cores, 1024² frames):
+  SNAPHU saturates at **~600**; native climbs to **~6300 (~10×)**. Single-frame latency
+  ~14× lower. **No regime where SNAPHU wins** once native tiles finely.
+- **PUSH 3 — lead widened + scaled.** Native-specific fine auto-tiling (`native_tiling`,
+  ~48 px cores; replaces SNAPHU's coarse `auto_tiling` for the native path). Accuracy is
+  flat across granularity vs the 1024² SNAPHU oracle: global 0.011% / t4 0.029% / t16 0.028%
+  / t32 0.013% — all ≪0.5%. **Full-burst 2048²** (3 ifgs, 8T): native **6.8 s / 30.3 CPU·s /
+  1041 MB** vs SNAPHU **75.2 s / 219.8 / 1543 MB** — Pareto-better and under the 1.08 GB
+  ceiling SNAPHU exceeds.
+- **DEFAULT FLIP.** `UnwrapMethod::default()` Snaphu→**Native** (`config.rs`); `snaphu`
+  selectable as fallback; `config_contract` pins the new default + fallback spelling. A
+  deliberate divergence from dolphin's `snaphu` default. The per-frame thread count (rayon
+  pool / `n_parallel_jobs`) is the latency↔throughput dial: high threads/frame → low latency,
+  more concurrent frames with fewer threads each → max throughput. `gp-dolphin` verified to
+  build no-gpu/system-HDF5 against the patched vendor copy; its explicit-YAML path honors
+  `unwrap_method: snaphu`, its default-config path now inherits Native. **Human-gated:** push
+  branch, open PR, bump `../eo` submodule. Patch: `/tmp/native-unwrap-default-flip.patch`.
+
 ---
 
 ## Out of scope (initial)

@@ -30,7 +30,10 @@ fn defaults_match_dolphin() {
     assert_eq!(c.output_options.strides.y, 1);
     assert_eq!(c.output_options.strides.x, 1);
     assert_eq!(c.output_options.overview_levels, vec![4, 8, 16, 32, 64]);
-    assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Snaphu);
+    // Deliberate divergence from dolphin's `snaphu` default: dolphinRust defaults
+    // to the in-process clean-room Native unwrapper (SNAPHU-parity <=0.5%, ~10x
+    // throughput, IP-clean). `unwrap_method: snaphu` restores the dolphin backend.
+    assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Native);
     assert_eq!(c.unwrap_options.snaphu_options.init_method, "mcf");
     assert_eq!(c.unwrap_options.snaphu_options.cost, "smooth");
     assert_eq!(c.worker_settings.block_shape, (512, 512));
@@ -56,6 +59,14 @@ fn enum_yaml_values_match_dolphin() {
     assert_eq!(
         serde_yaml::to_string(&UnwrapMethod::Tophu).unwrap().trim(),
         "tophu"
+    );
+    assert_eq!(
+        serde_yaml::to_string(&UnwrapMethod::Native).unwrap().trim(),
+        "native"
+    );
+    assert_eq!(
+        serde_yaml::from_str::<UnwrapMethod>("native").unwrap(),
+        UnwrapMethod::Native
     );
     assert_eq!(
         serde_yaml::to_string(&TimeseriesMethod::L1).unwrap().trim(),

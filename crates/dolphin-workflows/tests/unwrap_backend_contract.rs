@@ -7,8 +7,9 @@
 //! end-to-end oracle contract, which still passes through this dispatch.)
 
 use dolphin_core::Cf64;
+use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{TophuConfig, UnwrapConfig};
-use dolphin_workflows::{SnaphuBackend, TophuBackend, UnwrapBackend};
+use dolphin_workflows::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
 use ndarray::{Array2, Array3};
 
 fn snaphu_available() -> bool {
@@ -58,4 +59,43 @@ fn both_backends_unwrap_through_the_trait() {
             "finite unwrapped phase"
         );
     }
+}
+
+/// The native backend unwraps the network in-process (no SNAPHU) and, on a
+/// residue-free ramp, matches the SNAPHU backend to integer-cycle parity (equal
+/// up to a global constant). The native path needs no `snaphu`; the parity leg
+/// is checked only when the oracle binary is present.
+#[test]
+fn native_backend_matches_snaphu_network() {
+    let (rows, cols) = (24, 24);
+    let pl = ramp_pl(rows, cols);
+    let pairs = [(0_usize, 1_usize)];
+    let corr = Array2::<f32>::from_elem((rows, cols), 1.0);
+    let scratch = std::env::temp_dir().join("dolphinrust_unwrap_native");
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    let native = NativeUnwrapBackend(NativeConfig::default())
+        .unwrap_network(pl.view(), &pairs, corr.view(), &scratch)
+        .unwrap();
+    assert_eq!(native.dim(), (1, rows, cols));
+    assert!(native.iter().all(|v: &f64| v.is_finite()));
+
+    if !snaphu_available() {
+        return;
+    }
+    let snaphu = SnaphuBackend(UnwrapConfig::default())
+        .unwrap_network(pl.view(), &pairs, corr.view(), &scratch)
+        .unwrap();
+    let tau = std::f64::consts::TAU;
+    let cycles: Vec<i64> = native
+        .iter()
+        .zip(snaphu.iter())
+        .map(|(n, s)| ((n - s) / tau).round() as i64)
+        .collect();
+    let mode = cycles[0];
+    let disagree = cycles.iter().filter(|&&k| k != mode).count();
+    assert_eq!(
+        disagree, 0,
+        "native network must match SNAPHU up to a constant"
+    );
 }

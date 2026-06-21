@@ -43,8 +43,10 @@ pub enum CompressedSlcPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UnwrapMethod {
-    /// SNAPHU statistical-cost network-flow unwrapper.
-    #[default]
+    /// SNAPHU statistical-cost network-flow unwrapper. Selectable fallback; the
+    /// default is [`UnwrapMethod::Native`], which matches SNAPHU per-component to
+    /// <=0.5% but unwraps in-process (no subprocess) and wins frames/hour ~10x at
+    /// production concurrency.
     Snaphu,
     /// tophu multi-scale driver over the SNAPHU per-tile solver (coarse init →
     /// overlapping tiled SNAPHU → 2π-reconciled merge). dolphin reserves its
@@ -60,6 +62,15 @@ pub enum UnwrapMethod {
     Spurt,
     /// Whirlwind unwrapper.
     Whirlwind,
+    /// Clean-room in-process native unwrapper (Costantini MCF via network
+    /// simplex, no SNAPHU subprocess) — **the default**. Fine auto-tiling makes
+    /// its per-component parity match SNAPHU to <=0.5% across tile counts while
+    /// winning latency (~14x) and throughput (~10x at concurrency) with lower
+    /// RSS. `unwrap_options.snaphu_options.ntiles` overrides the auto tiling;
+    /// per-frame thread count (`n_parallel_jobs`/the rayon pool) is the
+    /// latency-vs-throughput dial. Set `unwrap_method: snaphu` to fall back.
+    #[default]
+    Native,
 }
 
 /// Timeseries inversion norm. dolphin `TimeseriesOptions.method`.

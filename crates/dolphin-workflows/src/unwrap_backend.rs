@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dolphin_core::{Cf32, Cf64};
+use dolphin_unwrap::native::{unwrap_native, NativeConfig};
 use dolphin_unwrap::{
     unwrap_multiscale, unwrap_with_corr, write_correlation, TophuConfig, UnwrapConfig,
 };
@@ -44,6 +45,11 @@ pub struct SnaphuBackend(pub UnwrapConfig);
 
 /// tophu coarse→fine multi-scale over the SNAPHU per-tile solver.
 pub struct TophuBackend(pub TophuConfig);
+
+/// Clean-room in-process native unwrapper (MCF branch cuts). No subprocess and
+/// no scratch round-trip: each ifg is unwrapped from in-memory arrays, so the
+/// per-pair `par_iter` parallelizes with neither a fork nor flat-binary I/O.
+pub struct NativeUnwrapBackend(pub NativeConfig);
 
 impl UnwrapBackend for SnaphuBackend {
     fn unwrap_network(
@@ -91,6 +97,37 @@ impl UnwrapBackend for TophuBackend {
             },
         )
     }
+}
+
+impl UnwrapBackend for NativeUnwrapBackend {
+    fn unwrap_network(
+        &self,
+        pl: ArrayView3<Cf64>,
+        pairs: &[(usize, usize)],
+        correlation: ArrayView2<f32>,
+        _scratch: &Path,
+    ) -> Result<Array3<f64>> {
+        // In-process: form each ifg and unwrap from memory — no scratch dirs,
+        // no subprocess. `par_iter().collect()` keeps the stack in `pairs` order.
+        let layers = pairs
+            .par_iter()
+            .map(|&pair| solve_native(pl, pair, correlation, &self.0))
+            .collect::<Result<Vec<_>>>()?;
+        let views: Vec<_> = layers.iter().map(Array2::view).collect();
+        ndarray::stack(Axis(0), &views).context("stacking unwrapped ifgs")
+    }
+}
+
+/// Form one ifg from the linked phase and unwrap it with the native solver.
+fn solve_native(
+    pl: ArrayView3<Cf64>,
+    pair: (usize, usize),
+    correlation: ArrayView2<f32>,
+    cfg: &NativeConfig,
+) -> Result<Array2<f64>> {
+    let ifg = form_ifg(pl, pair);
+    let out = unwrap_native(ifg.view(), correlation, cfg).context("native unwrap")?;
+    Ok(out.unwrapped.mapv(f64::from))
 }
 
 /// Form each ifg from the linked phase and unwrap it with a 2D solver, stacking

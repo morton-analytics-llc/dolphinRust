@@ -20,6 +20,7 @@ use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
+use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
@@ -31,7 +32,7 @@ use crate::sequential::{
     SequentialOutput, SequentialState,
 };
 use crate::tiling::{plan_tiles, TilePlan};
-use crate::unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};
+use crate::unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -129,7 +130,7 @@ fn finish_displacement(
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
-    let stitched = stitch_bursts(bursts)?;
+    let stitched = timed("stitch", || stitch_bursts(bursts))?;
     let mut pl = stitched.pl;
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
@@ -146,7 +147,7 @@ fn finish_displacement(
         days.len(),
         pl.dim().0
     );
-    let pairs = network(cfg, &days);
+    let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
     let dphi_rad = timed("unwrap", || unwrap_network(cfg, pl.view(), &pairs))?;
@@ -197,16 +198,18 @@ fn finish_displacement(
         crlb_sigma: crlb_sigma.as_ref(),
         closure_phase: closure_phase.as_ref(),
     };
-    write_outputs(
-        cfg,
-        displacement.view(),
-        velocity.view(),
-        temporal_coherence.view(),
-        quality,
-        epsg,
-        geotransform,
-    )?;
-    write_correction_outputs(cfg, &corrections, epsg, geotransform)?;
+    timed("write", || -> Result<()> {
+        write_outputs(
+            cfg,
+            displacement.view(),
+            velocity.view(),
+            temporal_coherence.view(),
+            quality,
+            epsg,
+            geotransform,
+        )?;
+        write_correction_outputs(cfg, &corrections, epsg, geotransform)
+    })?;
     Ok(DisplacementOutput {
         displacement,
         velocity,
@@ -288,11 +291,19 @@ fn phase_link_tiled(
     // on the planner's ministack count.
     let depth = nslc.div_ceil(cfg.phase_linking.ministack_size.max(1));
     let mut acc = TiledOutput::new(nslc, out_shape, cfg.phase_linking.write_crlb);
+    let (mut read_s, mut compute_s) = (0.0_f64, 0.0_f64);
     for plan in plan_tiles(full_shape, strides, half, depth, out_block) {
+        let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
+        read_s += t_read.elapsed().as_secs_f64();
+        let t_pl = Instant::now();
         let out = phase_link(cfg, stack.view(), engine)?;
+        compute_s += t_pl.elapsed().as_secs_f64();
         acc.place(&plan, &out)?;
     }
+    // Sub-breakdown of the `phase_linking` stage: windowed CSLC read vs the
+    // covariance+estimator compute, summed across tiles (wall, not exclusive CPU).
+    tracing::info!(stage = "pl_breakdown", read_s, compute_s, "stage complete");
     Ok(acc.into_output())
 }
 
@@ -796,8 +807,39 @@ fn unwrap_pool(n_parallel_jobs: i64) -> Result<rayon::ThreadPool> {
 fn unwrap_backend(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> Box<dyn UnwrapBackend> {
     match cfg.unwrap_options.unwrap_method {
         UnwrapMethod::Tophu => Box::new(TophuBackend(tophu_config(cfg))),
+        UnwrapMethod::Native => Box::new(NativeUnwrapBackend(native_config(cfg, grid))),
         _ => Box::new(SnaphuBackend(unwrap_config(cfg, grid))),
     }
+}
+
+/// Map the config to the native unwrapper. Native auto-tiles *finely* by default
+/// (`native_tiling`): unlike SNAPHU, its per-tile network simplex is superlinear
+/// in residues-per-tile, so small tiles slash CPU·s (~8x at 1024^2) with no
+/// accuracy loss (the per-region seam reconciliation holds). An explicit
+/// `snaphu_options.ntiles` override still wins; conncomp masking uses the
+/// `NativeConfig` defaults.
+fn native_config(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> NativeConfig {
+    let snaphu = &cfg.unwrap_options.snaphu_options;
+    let tile = match snaphu.ntiles {
+        (1, 1) => native_tiling(grid),
+        ntiles => Some(ntiles),
+    };
+    NativeConfig {
+        cost: cost_mode(&snaphu.cost),
+        tile,
+        ..NativeConfig::default()
+    }
+}
+
+/// Native fine auto-tiling: split each axis into ~`TARGET_TILE`-pixel cores, the
+/// throughput optimum (measured CPU·s minimum at ~48 px; finer than that and the
+/// fixed seam overlap dominates, coarser and the network simplex's superlinear
+/// residue cost dominates). Grids below `2 * TARGET_TILE` per axis stay untiled.
+fn native_tiling((rows, cols): (usize, usize)) -> Option<(usize, usize)> {
+    const TARGET_TILE: usize = 48;
+    let per_axis = |n: usize| (n / TARGET_TILE).max(1);
+    let tiles = (per_axis(rows), per_axis(cols));
+    (tiles != (1, 1)).then_some(tiles)
 }
 
 /// Map the config's SNAPHU options to the unwrap wrapper config. When
