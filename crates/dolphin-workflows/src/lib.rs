@@ -23,4 +23,4 @@ pub use sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
 };
-pub use unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};
+pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};

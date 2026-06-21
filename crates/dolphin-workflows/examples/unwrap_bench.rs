@@ -4,16 +4,18 @@
 //!         cargo run --release --example unwrap_bench
 //!
 //! Builds an `EPOCHS`-date smooth-ramp linked-phase stack + single-reference
-//! network (EPOCHS-1 ifgs) and times one `SnaphuBackend::unwrap_network`. The
-//! backend uses the global rayon pool, so `RAYON_NUM_THREADS=1` is the serial
-//! baseline and 2/4/8 the parallel sweep. Requires `snaphu` on PATH.
+//! network (EPOCHS-1 ifgs) and times one `unwrap_network`. The backend uses the
+//! global rayon pool, so `RAYON_NUM_THREADS=1` is the serial baseline and 2/4/8
+//! the parallel sweep. `BACKEND=snaphu` (default, needs `snaphu` on PATH) times
+//! the subprocess path; `BACKEND=native` times the in-process clean-room MCF.
 
 use std::time::Instant;
 
 use anyhow::Result;
 use dolphin_core::Cf64;
+use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::UnwrapConfig;
-use dolphin_workflows::{SnaphuBackend, UnwrapBackend};
+use dolphin_workflows::{NativeUnwrapBackend, SnaphuBackend, UnwrapBackend};
 use ndarray::{Array2, Array3};
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -39,14 +41,18 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch)?;
 
-    let backend = SnaphuBackend(UnwrapConfig::default());
+    let name = std::env::var("BACKEND").unwrap_or_else(|_| "snaphu".to_string());
+    let backend: Box<dyn UnwrapBackend> = match name.as_str() {
+        "native" => Box::new(NativeUnwrapBackend(NativeConfig::default())),
+        _ => Box::new(SnaphuBackend(UnwrapConfig::default())),
+    };
     let t0 = Instant::now();
     let out = backend.unwrap_network(pl.view(), &pairs, corr.view(), &scratch)?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let checksum = out.iter().copied().fold(0.0_f64, |a, b| a + b);
     println!(
-        "epochs={epochs} ifgs={} grid={rows}x{cols} threads={threads} wall_ms={wall_ms:.1} checksum={checksum:.3}",
+        "backend={name} epochs={epochs} ifgs={} grid={rows}x{cols} threads={threads} wall_ms={wall_ms:.1} checksum={checksum:.3}",
         pairs.len()
     );
     Ok(())
