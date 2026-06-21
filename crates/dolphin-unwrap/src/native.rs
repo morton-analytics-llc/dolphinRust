@@ -36,6 +36,11 @@ pub struct NativeConfig {
     /// Minimum component size as a fraction of the scene; smaller components are
     /// dropped to the masked label, mirroring SNAPHU's `minconncompfrac`.
     pub conncomp_min_frac: f64,
+    /// Connected-component **regrow** radius (px): a morphological closing of the
+    /// reliable mask that bridges sub-threshold corridors up to `2*r` px wide,
+    /// mirroring SNAPHU keeping a thin low-coherence bridge inside one component
+    /// instead of severing it. `0` is the plain coherence threshold.
+    pub conncomp_regrow: usize,
 }
 
 impl Default for NativeConfig {
@@ -45,6 +50,7 @@ impl Default for NativeConfig {
             tile: None,
             conncomp_min_corr: 0.15,
             conncomp_min_frac: 0.001,
+            conncomp_regrow: 2,
         }
     }
 }
@@ -81,9 +87,14 @@ pub fn unwrap_native(
 
     let psi = wrapped.mapv(|z| z.arg() as f64);
     let unwrapped = match cfg.tile {
-        Some(tiles) => {
-            tile::unwrap_tiled(&psi, correlation, cfg.cost, tiles, cfg.conncomp_min_corr)
-        }
+        Some(tiles) => tile::unwrap_tiled(
+            &psi,
+            correlation,
+            cfg.cost,
+            tiles,
+            cfg.conncomp_min_corr,
+            cfg.conncomp_regrow,
+        ),
         None => unwrap_grid(&psi, correlation, cfg.cost),
     };
     let conncomp = conncomp::segment(correlation, cfg.conncomp_min_corr, cfg.conncomp_min_frac);

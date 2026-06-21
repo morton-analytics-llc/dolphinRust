@@ -45,6 +45,7 @@ pub fn unwrap_tiled(
     cost: CostMode,
     tiles: (usize, usize),
     min_corr: f32,
+    regrow: usize,
 ) -> Array2<f64> {
     let (rows, cols) = psi.dim();
     let row_layout = tile_layout(rows, tiles.0);
@@ -59,8 +60,18 @@ pub fn unwrap_tiled(
         .map(|spec| solve_tile(psi, corr, cost, *spec))
         .collect();
 
+    // Region cores are the raw coherence threshold; we then *grow* each region's
+    // label into the masked bridge (not merge masks). A thin sub-threshold
+    // corridor — the kind SNAPHU's regrow keeps inside one component — is closed
+    // from both sides until the two regions abut, so reconciliation finds a seam
+    // and votes their true relative offset (from the per-tile field), instead of
+    // leaving them disconnected with independent offsets. Merging the masks would
+    // force the offset *equal*, which is wrong where the field has a branch cut
+    // through the bridge.
+    let reliable = corr.mapv(|c| c >= min_corr);
     let owner = Ownership::build(rows, cols, &solved);
-    let regions = segment_regions(corr, min_corr, &owner);
+    let mut regions = segment_regions(&reliable, &owner);
+    grow_regions(&mut regions.label, &owner, regrow);
     let offsets = reconcile(psi, corr, &owner, &regions);
     compose(&owner, &regions, &offsets)
 }
@@ -154,17 +165,17 @@ fn claim_core(t: u32, tile: &Tile, owner: &mut Array2<u32>, val: &mut Array2<f64
 /// Reliable-region labels (`0` = unreliable/masked): 4-connected coherent pixels
 /// sharing the same owning tile. A coherent component spanning tiles splits into
 /// one region per tile, each independently reconciled.
-fn segment_regions(corr: ArrayView2<f32>, min_corr: f32, own: &Ownership) -> Regions {
-    let (rows, cols) = corr.dim();
+fn segment_regions(reliable: &Array2<bool>, own: &Ownership) -> Regions {
+    let (rows, cols) = reliable.dim();
     let mut label = Array2::<u32>::zeros((rows, cols));
     let mut sizes = vec![0usize]; // index 0 = masked
     let mut tile_of = vec![u32::MAX]; // owning tile per region label
     let mut next = 1u32;
     for seed in (0..rows).flat_map(|i| (0..cols).map(move |j| (i, j))) {
-        if corr[seed] < min_corr || label[seed] != 0 {
+        if !reliable[seed] || label[seed] != 0 {
             continue;
         }
-        let size = flood_region(corr, min_corr, own, &mut label, seed, next);
+        let size = flood_region(reliable, own, &mut label, seed, next);
         sizes.push(size);
         tile_of.push(own.owner[seed]);
         next += 1;
@@ -183,16 +194,15 @@ struct Regions {
     tile_of: Vec<u32>,
 }
 
-/// Flood a region from `seed`: 4-connected coherent pixels with the same owner.
+/// Flood a region from `seed`: 4-connected reliable pixels with the same owner.
 fn flood_region(
-    corr: ArrayView2<f32>,
-    min_corr: f32,
+    reliable: &Array2<bool>,
     own: &Ownership,
     label: &mut Array2<u32>,
     seed: (usize, usize),
     id: u32,
 ) -> usize {
-    let (rows, cols) = corr.dim();
+    let (rows, cols) = reliable.dim();
     let mine = own.owner[seed];
     let mut stack = vec![seed];
     label[seed] = id;
@@ -200,8 +210,7 @@ fn flood_region(
     while let Some((i, j)) = stack.pop() {
         size += 1;
         for (ni, nj) in neighbors(i, j, rows, cols) {
-            let ok =
-                corr[(ni, nj)] >= min_corr && label[(ni, nj)] == 0 && own.owner[(ni, nj)] == mine;
+            let ok = reliable[(ni, nj)] && label[(ni, nj)] == 0 && own.owner[(ni, nj)] == mine;
             if ok {
                 label[(ni, nj)] = id;
                 stack.push((ni, nj));
@@ -209,6 +218,39 @@ fn flood_region(
         }
     }
     size
+}
+
+/// Grow region labels into adjacent masked pixels by `r` 4-connected steps,
+/// each masked pixel adopting a same-owner neighbour's region. Two regions
+/// flanking a sub-threshold corridor ≤ `2r` px wide thus grow until they abut,
+/// giving reconciliation a seam (and the correct relative offset) between them
+/// instead of leaving them disconnected. Mirrors SNAPHU's component regrow, but
+/// keeps the regions distinct so the offset is *voted*, not forced equal.
+fn grow_regions(label: &mut Array2<u32>, own: &Ownership, r: usize) {
+    for _ in 0..r {
+        let prev = label.clone();
+        let masked = prev
+            .indexed_iter()
+            .filter(|&(_, &l)| l == 0)
+            .map(|(ix, _)| ix);
+        for ix in masked {
+            label[ix] = adopt_label(&prev, own, ix);
+        }
+    }
+}
+
+/// The label a masked pixel adopts when growing: the smallest same-owner
+/// 4-neighbour region label, or `0` if it has no labelled same-owner neighbour
+/// (so isolated masked pixels stay masked). The smallest-label tie-break keeps
+/// growth deterministic and order-independent.
+fn adopt_label(label: &Array2<u32>, own: &Ownership, (i, j): (usize, usize)) -> u32 {
+    let (rows, cols) = label.dim();
+    let mine = own.owner[(i, j)];
+    neighbors(i, j, rows, cols)
+        .filter(|&n| label[n] != 0 && own.owner[n] == mine)
+        .map(|n| label[n])
+        .min()
+        .unwrap_or(0)
 }
 
 /// In-bounds 4-neighbours of `(i, j)`.

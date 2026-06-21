@@ -126,12 +126,12 @@ fn tiling_seam_robust_on_adversarial_multicomponent() {
     //   * vs-global isolates the TILE SEAM logic — the untiled global solve is
     //     SNAPHU-parity (≤0.5% baseline below), so tiled-vs-global ≤ gate proves
     //     tiling adds no per-component seam error. This is PUSH-1's gate.
-    //   * vs-SNAPHU is printed for context only. It runs higher on this scene
-    //     because native and SNAPHU segment the thin-decorrelation lattice into
-    //     different components (native masks bridges SNAPHU's regrow keeps), so a
-    //     SNAPHU component can span two independently-offset native regions. That
-    //     is a conncomp-segmentation difference, not a seam defect — the trait
-    //     discards conncomp, and tiled-vs-global stays ~0.
+    //   * vs-SNAPHU now also gates at ≤0.5%. It previously ran ~1.1–2.4% because
+    //     native masked the thin-decorrelation bridges SNAPHU's regrow keeps, so a
+    //     SNAPHU component spanned two *independently-offset* native regions. The
+    //     conncomp-regrow alignment (`tile::grow_regions`) closes those bridges in
+    //     the offset reconciliation, so the two halves abut and are reconciled to
+    //     one relative offset — tiled-vs-SNAPHU collapses onto the global baseline.
     let global = unwrap_native(ifg.view(), corr.view(), &NativeConfig::default()).unwrap();
     let base = per_component_disagreement(&global.unwrapped, &oracle, &cc);
     eprintln!(
@@ -157,6 +157,13 @@ fn tiling_seam_robust_on_adversarial_multicomponent() {
             vs_global <= GATE,
             "adversarial seam {t}x{t} vs-global {:.4}% > {:.2}% — tiling not seam-robust",
             vs_global * 100.0,
+            GATE * 100.0
+        );
+        assert!(
+            vs_oracle <= GATE,
+            "adversarial seam {t}x{t} vs-SNAPHU {:.4}% > {:.2}% — conncomp-regrow \
+             alignment regressed (was ~1.1–2.4% before per-region bridge growth)",
+            vs_oracle * 100.0,
             GATE * 100.0
         );
     }

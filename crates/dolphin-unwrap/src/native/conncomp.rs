@@ -8,6 +8,12 @@
 //! the scene are dropped to 0. Labels are numbered by descending size to mirror
 //! SNAPHU's convention. This replaces the prior trivial single-component output;
 //! it agrees with SNAPHU's partition to high IoU on the residue-dense golden.
+//!
+//! These output labels stay at the raw coherence threshold (no regrow): SNAPHU's
+//! connected-component *regrow* — keeping a thin low-coherence corridor inside one
+//! component — is reproduced where it actually matters, in the tiled solver's
+//! per-region offset reconciliation (`tile::grow_regions`), not by coarsening the
+//! emitted partition (which would over-merge components SNAPHU keeps separate).
 
 use ndarray::{Array2, ArrayView2};
 
