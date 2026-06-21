@@ -329,6 +329,48 @@ drop-in replacement** — same algorithms, same workflow surface, faster. This s
 
 ---
 
+## Optimization log
+
+### Unwrap-network parallelization (Tier-1, 2026-06-20)
+
+Unwrap was ~76% of full-res compute and ran the ifg network serially. Shipped on
+`feat/unwrap-parallel` (3 commits, one per unit):
+
+- **#1 parallelize + per-pair scratch isolation.** `unwrap_each_ifg` `.iter()` →
+  `.par_iter()`; each pair solves into its own `pair_NNNN` scratch subdir so
+  SNAPHU's fixed-name files (`ifg.c8`/`unw.f4`/`conncomp.u4`) never collide.
+  `par_iter().collect()` is order-stable → output matches `pairs` order. **Bit-identical**
+  to the serial golden (`tests/unwrap_parallel_contract.rs`, red→green). Concurrency
+  is bounded by the existing `unwrap_options.n_parallel_jobs` knob (≤0 = all cores)
+  via a pinned rayon pool.
+- **#3 hoist shared correlation write.** corr.f4 is identical across pairs; written
+  once into shared scratch + reused (`write_correlation` + `unwrap_with_corr`).
+  Bit-identical.
+- **#2 opt-in auto-tiling** (`snaphu_options.auto_tile`, default **off**). Changes
+  SNAPHU numerics; **held opt-in** — smooth-ramp deviation 7.06e-5 rad (~3e-4 mm),
+  but noisy-scene tiling has no large oracle fixture. #1 already saturates cores on
+  deep networks, so #2's marginal value is low.
+
+**Measured** (512×512 single-ref network, macOS 12-core, smooth synthetic):
+
+| epochs | ifgs | 1T | 2T | 4T | 8T |
+|--------|------|----|----|----|----|
+| 12 | 11 | 5.89 s | 3.44 s (1.71×) | 2.00 s (2.95×) | 1.50 s (3.92×) |
+| 30 | 29 | 15.33 s | 8.96 s (1.71×) | 5.07 s (3.02×) | 3.23 s (4.75×) |
+
+Speedup flattens past 4 threads (~3×), reaching **3.9–4.75× at 8** (deeper networks
+scale better; ceiling = per-ifg rust/I-O + SNAPHU process overhead). **RSS flat across
+thread counts** (125→132 MB @12ep; 269→272 MB @30ep) — parallelism adds ~7 MB, no
+regression vs the block-tiled win. Reproduce: `EPOCHS=12 RAYON_NUM_THREADS=4
+cargo run --release --example unwrap_bench`.
+
+**Next (measured ceiling → next lever):** the inter-process/scratch-I/O ceiling caps
+2D per-ifg parallelism at ~4–5×. The next win is **Tier 2 in-process unwrapping**
+(eliminate SNAPHU subprocess + flat-binary scratch I/O per ifg) or **Tier 3 3D
+spatiotemporal backend** (the `UnwrapBackend` trait seam already exists).
+
+---
+
 ## Out of scope (initial)
 
 - `atmosphere/` tropospheric corrections (wraps external delay models) — defer.
