@@ -12,7 +12,9 @@
 # A "frame" = one unwrap_network over EPOCHS-1 ifgs at ROWS x COLS, DENSE (real
 # residue density ~2.6% at 1024^2). Env: ROWS COLS EPOCHS (frame size), TILES
 # (native tile grid), KS (concurrency points for part B).
-set -euo pipefail
+# No `set -e`: the bench uses `[ cond ] && action` guards that return non-zero
+# when the condition is false, which would abort under -e. -u/-o pipefail stay.
+set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BIN=target/release/examples/unwrap_bench
@@ -39,7 +41,7 @@ for spec in "snaphu:0" $(for t in $TILES; do echo "native:$t"; done); do
   b=${spec%%:*}; tile=${spec##*:}
   read -r wall cpu rss < <(RAYON_NUM_THREADS=8 BACKEND=$b TILE=$tile timed "$BIN")
   fph=$(echo "scale=0; $NCPU*3600/$cpu" | bc)
-  label="$b"; [ "$tile" != 0 ] && label="$b(tile$tile)"
+  label="$b"; [ "$tile" = 0 ] || label="$b(tile$tile)"
   printf "%-22s %8s %8s %8s %12s\n" "$label" "$wall" "$cpu" "$rss" "$fph"
 done
 
@@ -48,17 +50,21 @@ printf "%-22s %4s %4s %8s %12s\n" backend K T batch_s frames_per_hr
 NTOTAL=${NTOTAL:-6}   # frames per batch point (>= max K so a wave fully saturates)
 for spec in "snaphu:0" $(for t in $TILES; do echo "native:$t"; done); do
   b=${spec%%:*}; tile=${spec##*:}
-  label="$b"; [ "$tile" != 0 ] && label="$b(tile$tile)"
+  label="$b"; [ "$tile" = 0 ] || label="$b(tile$tile)"
   for K in ${KS:-"1 2 3 4 6"}; do
     T=$(( NCPU / K )); [ "$T" -lt 1 ] && T=1
+    # Launch frames in waves of K (bash 3.2 has no `wait -n`); each wave is a
+    # barrier, a slight conservative bias applied equally to both backends.
     start=$(date +%s.%N)
-    running=0
-    for ((f=0; f<NTOTAL; f++)); do
-      RAYON_NUM_THREADS=$T BACKEND=$b TILE=$tile "$BIN" >/dev/null 2>&1 &
-      running=$((running+1))
-      if [ "$running" -ge "$K" ]; then wait -n; running=$((running-1)); fi
+    done_frames=0
+    while [ "$done_frames" -lt "$NTOTAL" ]; do
+      this=$K; [ $((done_frames + this)) -gt "$NTOTAL" ] && this=$((NTOTAL - done_frames))
+      for ((w=0; w<this; w++)); do
+        RAYON_NUM_THREADS=$T BACKEND=$b TILE=$tile "$BIN" >/dev/null 2>&1 &
+      done
+      wait
+      done_frames=$((done_frames + this))
     done
-    wait
     end=$(date +%s.%N)
     batch=$(echo "$end - $start" | bc)
     fph=$(echo "scale=0; $NTOTAL*3600/$batch" | bc)

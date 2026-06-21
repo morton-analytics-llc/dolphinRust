@@ -39,7 +39,7 @@ fn noise(seed: u64, t: usize, r: usize, c: usize) -> f64 {
     let mut x = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add((t as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))
-        .wrapping_add((r as u64).wrapping_mul(0xA0761_D6478_BD642F))
+        .wrapping_add((r as u64).wrapping_mul(0xA076_1D64_78BD_642F))
         .wrapping_add((c as u64).wrapping_mul(0xE703_7ED1_A0B4_28DB));
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
