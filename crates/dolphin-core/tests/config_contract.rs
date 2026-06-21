@@ -58,6 +58,14 @@ fn enum_yaml_values_match_dolphin() {
         "tophu"
     );
     assert_eq!(
+        serde_yaml::to_string(&UnwrapMethod::Native).unwrap().trim(),
+        "native"
+    );
+    assert_eq!(
+        serde_yaml::from_str::<UnwrapMethod>("native").unwrap(),
+        UnwrapMethod::Native
+    );
+    assert_eq!(
         serde_yaml::to_string(&TimeseriesMethod::L1).unwrap().trim(),
         "L1"
     );
