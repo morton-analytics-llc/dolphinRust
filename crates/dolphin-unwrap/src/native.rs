@@ -17,6 +17,7 @@ use crate::snaphu::{CostMode, UnwrapError, UnwrapResult};
 
 mod cost;
 mod mcf;
+mod simplex;
 mod tile;
 
 const TAU: f64 = std::f64::consts::TAU;
