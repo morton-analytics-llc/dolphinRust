@@ -369,6 +369,70 @@ cargo run --release --example unwrap_bench`.
 (eliminate SNAPHU subprocess + flat-binary scratch I/O per ifg) or **Tier 3 3D
 spatiotemporal backend** (the `UnwrapBackend` trait seam already exists).
 
+### Native in-process unwrapper (Tier-2, 2026-06-20)
+
+Clean-room phase-unwrapping engine — commercial-clean replacement for the
+noncommercial SNAPHU binary, behind the same `UnwrapBackend` trait. **IP
+firewall:** derived solely from Costantini 1998 (MCF formulation), Chen & Zebker
+2001 (statistical network costs) and 2002 (tiling); no SNAPHU/CS2 source read.
+SNAPHU is retained only as a black-box validation oracle. Branch
+`feat/native-unwrap` (Phases 1–7, one commit per unit; unmerged).
+
+**Algorithm.** `dolphin-unwrap/src/native/`: wrapped row/col gradients → residues
+(discrete curl) → statistical-cost min-cost-flow over the dual grid graph
+(successive shortest paths, Johnson potentials — `mcf.rs`) routes integer
+branch-cut corrections so the corrected gradients are curl-free → raster
+integration. Edge cost = CRLB interferometric-phase precision γ²/(1−γ²)
+(`cost.rs`), so cuts route through decorrelated pixels. Residue-free ifgs (the
+high-coherence common case) short-circuit: no graph, no flow allocation. Optional
+Chen-2002 overlapping tiling with modal inter-tile offset reconciliation
+(`tile.rs`, `NativeConfig.tile`, default off).
+
+**Accuracy — SNAPHU parity on EVERY golden-suite class** (`oracle/gen_unwrap_suite.py`,
+`tests/native_unwrap_contract.rs`). Parity = same integer-cycle field up to a
+global constant; metric is per-pixel cycle disagreement on conncomp>0 pixels.
+
+| class | cycle-disagree | sub-cycle resid |
+|-------|----------------|------------------|
+| smooth | 0.0000% | ≤1e-4 rad |
+| steep (near-aliasing) | 0.0000% | ≤1e-4 rad |
+| discont (fault step) | 0.0000% | 0 |
+| lowcoh (95 residues, masked band) | 0.0769% (3/3900 px) | 0 |
+| multitile (160²) | 0.0000% | 0 |
+
+Four classes are residue-free → unique solution up to a constant. Only `lowcoh`
+exercises the MCF; 3 boundary pixels tie-break differently from SNAPHU, far
+under the 0.5% gate.
+
+**CPU — ~90–107× faster than SNAPHU** at matched threads (512², single-ref,
+12-core; `BACKEND=native cargo run --release --example unwrap_bench`):
+
+| epochs | snaphu 1T | native 1T | snaphu 8T | native 8T | native 12T (scaling) |
+|--------|-----------|-----------|-----------|-----------|----------------------|
+| 12 | 9.08 s | 91.7 ms | 2.06 s | 23.6 ms | 27.9 ms (3.3×, regresses — work too small) |
+| 30 | 23.1 s | 199.9 ms | 4.77 s | 45.8 ms | 49.2 ms (4.4×) |
+
+**New ceiling.** With the subprocess+scratch ceiling removed, native's own
+thread-scaling tops out at ~4.4× (8–12T, 30ep) — now bound by ifg formation +
+memory bandwidth + rayon overhead, not the solver (per-ifg solve ~7 ms at 512²).
+At 12 epochs it regresses past 8T (too little work to amortize).
+
+**Memory — Pareto, not a regression.** Parent-process max-RSS (30ep, `/usr/bin/time -l`):
+serial native 271 MB ≈ snaphu 270 MB; 8-thread native 311 MB vs snaphu 272 MB
+(+15%). The +15% is structural: in-process execution holds N concurrent f64
+working sets, whereas SNAPHU offloads each ifg to a **child process whose RSS the
+parent metric never counts** (peak 8 concurrent ~30 MB children ≈ +240 MB of
+real, uncounted memory). The decisive comparison: **native serial (200 ms,
+271 MB) beats snaphu 8-thread (4557 ms, 272 MB) on both axes — 22× faster at
+equal RAM.** Native spends the extra 15% RAM only to scale to 100×; no operating
+point lets SNAPHU win both. Tune via the existing `n_parallel_jobs` knob.
+
+**Status.** Default-eligible on accuracy (every class) + CPU (100×) + matched-RAM
+speed. `SnaphuBackend` stays the wired default until the host flips it. GP: the
+`dolphin-unwrap` crate is pure compute (no GPU/HDF5 deps), builds under
+`--no-default-features --features no-gpu`; the native solver is pure-functional
+(no statics/unsafe/interior mutability) → safe under GP's `spawn_blocking`.
+
 ---
 
 ## Out of scope (initial)
