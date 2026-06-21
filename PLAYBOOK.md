@@ -514,6 +514,25 @@ CPU gap, and (3) tiled-path parity hardening where residues straddle seams. Unti
 then it is not config-selectable (`UnwrapMethod` exposes only Snaphu/Tophu); wiring
 `UnwrapMethod::Native` is deferred behind those three items.
 
+**Phase-0 licensing determination — native UNJUSTIFIED → branch PARKED (2026-06-20).**
+Before spending the solver effort to close the three remaining-work items above, the
+gating question is whether native's *only* payoff — IP-clean redistribution — is
+needed at all. It is not. GroundPulse's unwrapper distribution model is
+**subprocess-at-operator-site**, which the SNAPHU noncommercial clause does not
+touch. Evidence in `../eo`: SNAPHU is compiled from source only into the internal
+worker image (`Dockerfile.dolphin:62-73`, launched per-job via ECS RunTask from
+Morton's private ECR `782664968309…/gp-dolphin-worker`); the customer-facing image
+(`Dockerfile`) contains **zero** SNAPHU; GroundPulse is explicitly SaaS-only with no
+on-prem/edge appliance ("Can we host on-prem? No — and that's by design",
+`docs/design/montana-bridge-rfp-demo-release.md:340`); the NSF SBIR pitch frames its
+artifacts as "proof-of-method … not customer deployments". No artifact containing
+SNAPHU is ever shipped to a third party, so there is no redistribution and native
+buys nothing. **Decision:** keep `feat/native-unwrap` parked (implemented behind the
+trait, NO-FLIP default already recorded above); do **not** invest in the
+network-simplex MCF / conncomp masking work until a redistribution requirement
+(bundled on-prem/edge/GovCloud appliance handed to a customer) actually materializes.
+That requirement is the explicit re-entry gate for this branch.
+
 ---
 
 ## Out of scope (initial)
