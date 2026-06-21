@@ -20,6 +20,7 @@ use dolphin_timeseries::{
     build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
     reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
+use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
@@ -31,7 +32,7 @@ use crate::sequential::{
     SequentialOutput, SequentialState,
 };
 use crate::tiling::{plan_tiles, TilePlan};
-use crate::unwrap_backend::{SnaphuBackend, TophuBackend, UnwrapBackend};
+use crate::unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -796,7 +797,25 @@ fn unwrap_pool(n_parallel_jobs: i64) -> Result<rayon::ThreadPool> {
 fn unwrap_backend(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> Box<dyn UnwrapBackend> {
     match cfg.unwrap_options.unwrap_method {
         UnwrapMethod::Tophu => Box::new(TophuBackend(tophu_config(cfg))),
+        UnwrapMethod::Native => Box::new(NativeUnwrapBackend(native_config(cfg, grid))),
         _ => Box::new(SnaphuBackend(unwrap_config(cfg, grid))),
+    }
+}
+
+/// Map the config to the native unwrapper. Reuses the SNAPHU cost mode and tile
+/// knobs (`auto_tile` derives the tile grid from the scene + cores) so one YAML
+/// drives both backends; conncomp masking uses the `NativeConfig` defaults.
+fn native_config(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> NativeConfig {
+    let snaphu = &cfg.unwrap_options.snaphu_options;
+    let tile = match (snaphu.auto_tile, snaphu.ntiles) {
+        (true, _) => Some(auto_tiling(grid).0),
+        (false, (1, 1)) => None,
+        (false, ntiles) => Some(ntiles),
+    };
+    NativeConfig {
+        cost: cost_mode(&snaphu.cost),
+        tile,
+        ..NativeConfig::default()
     }
 }
 

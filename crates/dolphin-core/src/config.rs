@@ -60,6 +60,9 @@ pub enum UnwrapMethod {
     Spurt,
     /// Whirlwind unwrapper.
     Whirlwind,
+    /// Clean-room in-process native unwrapper (Costantini MCF via network
+    /// simplex, no SNAPHU subprocess). Opt-in IP-clean alternative to SNAPHU.
+    Native,
 }
 
 /// Timeseries inversion norm. dolphin `TimeseriesOptions.method`.
