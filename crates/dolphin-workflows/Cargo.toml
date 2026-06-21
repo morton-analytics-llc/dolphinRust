@@ -49,5 +49,9 @@ dolphin-io = { workspace = true, features = ["nisar-fixture"] }
 name = "run_synthetic"
 path = "examples/run_synthetic.rs"
 
+[[example]]
+name = "unwrap_bench"
+path = "examples/unwrap_bench.rs"
+
 [lints]
 workspace = true
