@@ -433,6 +433,87 @@ speed. `SnaphuBackend` stays the wired default until the host flips it. GP: the
 `--no-default-features --features no-gpu`; the native solver is pure-functional
 (no statics/unsafe/interior mutability) → safe under GP's `spawn_blocking`.
 
+#### Default-flip gate on REAL residue density — NO-FLIP (2026-06-20)
+
+The Tier-2 100× / "default-eligible" numbers above were measured on the synthetic
+suite, where 4/5 classes are residue-free (Phase-7 fast path, no MCF) and the one
+residue case (`lowcoh`) has just **95 residues** — 2–4 orders of magnitude below
+real Sentinel-1 burst density (10⁴–10⁶). Gating the flip required re-measuring
+with the MCF solver actually loaded at real density.
+
+**Test scene (realistic-synthetic — no real CSLC burst was on disk; only 48×64
+toy fixtures).** `oracle/gen_unwrap_dense.py`: decorrelation-driven CRLB phase
+noise over a spatially varying coherence field, near-zero-corr moats + a masked
+band splitting the scene into disconnected coherent regions, a steep subsidence
+cone. 1024² scene = **36,843 residues (3.5% of px) → 388× the 95-residue
+fixture**; SNAPHU produces **6 connected components + 10% masked**. Committed
+compact guard `unwdense_ci` (160², 914 residues = 9.6× the fixture, 6 components).
+
+**Accuracy — per-component cycle parity HOLDS at real density.** SNAPHU assigns an
+independent integer offset per component, so parity is measured per-component (the
+global-mode metric is meaningless on a multi-component scene). Gate ≤0.5%
+disagreement on conncomp>0 px:
+
+| scene | residues | path | per-component disagree | sub-cycle resid |
+|-------|----------|------|------------------------|-----------------|
+| 160² (committed `unwdense_ci`) | 914 | global MCF | **0.0511%** | 0 |
+| 256² | 2 347 | global MCF | 0.0421% | 0 |
+| 1024² | 36 843 | tiled 4×4 | **0.3261%** | 2e-4 rad |
+
+Native is **scientifically correct on trusted pixels** even at 36k residues. The
+1024² tiled run drifts to 0.33% (still passing) and shows 29% *global-mode*
+disagreement — the modal inter-tile reconciliation assigns per-region offsets that
+differ from SNAPHU's per-component offsets (expected; only breaks if a consumer
+needs a single globally-consistent field, see below).
+
+**Conncomp partition — native does NOT reproduce it.** `unwrap_native` returns a
+trivial single-component label array (`native.rs:78`); it performs no coherence
+masking / segmentation. mask-IoU vs SNAPHU = **0.0**. The production
+`UnwrapBackend::unwrap_network` trait returns only the unwrapped field (conncomp
+is discarded for *all* backends), so this does not corrupt displacement output —
+but it is a real capability gap and the tiled per-region offset drift would
+surface as inter-region 2π steps for any future single-field consumer.
+
+**Perf — the 100× INVERTS to a slowdown at real density.** Same 1024² ifg
+(`/usr/bin/time -l`, 12-core):
+
+| backend | config | wall | ~CPU-s | max RSS |
+|---------|--------|------|--------|---------|
+| SNAPHU | single-tile, 1 core | **10.1 s** | 10 | 423 MB |
+| native | global MCF, 1 core | **>660 s** (killed >11 min) | >660 | — |
+| native | tiled 4×4, 2T | 97.1 s | ~194 | 115 MB |
+| native | tiled 4×4, 4T | 61.2 s | ~245 | 187 MB |
+| native | tiled 4×4, 8T | **36.9 s** (best) | ~295 | 308 MB |
+| native | tiled 4×4, 12T | 38.0 s | ~456 | 428 MB |
+
+Native's best wall (37 s @8T) is **3.7× slower** than SNAPHU's single-core 10 s,
+and **~30× more CPU per ifg**. The synthetic advantage was an artifact of the
+residue-free fast path; once the hand-rolled successive-shortest-paths MCF is
+actually exercised it is far slower than SNAPHU's optimized CS2. The untiled
+global MCF is **non-viable at burst scale** (>11 min/ifg) — tiling is mandatory,
+and tiling erodes parity + injects inter-region offset drift. **RSS: no
+regression** — native tiled 115–428 MB scales with thread count (the
+`n_parallel_jobs` dial: lower concurrency where RAM-bound), all well under the
+1.08 GB block-tiled OOM-fix ceiling; native@12T 428 MB ≈ SNAPHU 423 MB.
+
+**Decision — NO-FLIP.** `SnaphuBackend` stays the wired default; the native
+backend stays implemented-behind-the-trait but is **not** worth flipping: it wins
+nothing on accuracy it doesn't already have, and loses decisively on speed/CPU at
+the residue density that actually matters. Its value is **IP-clean / commercial
+licensing**, not performance. **Standing CI guard:** `tests/native_dense_parity.rs`
+gates per-component parity on the committed residue-dense golden and **FAILS (not
+skips)** when the golden is missing — closing the silent-pass gap (the prior
+`native_unwrap_contract` skips because `oracle/fixtures/` is git-ignored
+wholesale; only `unwdense_ci_*.npy` is now committed).
+
+**Boundary (remaining-work gate).** Native is competitive only below ~10³
+residues/ifg. To make it a viable opt-in at burst scale it needs: (1) a real
+connected-component / coherence-masking pass (currently trivial), (2) a faster MCF
+(optimized network-simplex / cost-scaling, not hand-rolled SSP) to recover the
+CPU gap, and (3) tiled-path parity hardening where residues straddle seams. Until
+then it is not config-selectable (`UnwrapMethod` exposes only Snaphu/Tophu); wiring
+`UnwrapMethod::Native` is deferred behind those three items.
+
 ---
 
 ## Out of scope (initial)
