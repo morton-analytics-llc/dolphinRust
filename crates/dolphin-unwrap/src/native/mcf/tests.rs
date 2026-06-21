@@ -6,6 +6,8 @@
 //! the *same optimal cost*. Both solvers are clean-room (Costantini 1998); the
 //! SSP reference is the same algorithm the production path used before this phase.
 
+use std::time::Instant;
+
 use super::*;
 use ndarray::Array2;
 
@@ -60,6 +62,33 @@ fn ns_matches_ssp_optimal_cost() {
             "seed {seed}: corrected field must be residue-free"
         );
     }
+}
+
+/// Perf-regression guard: network simplex must finish at least 3x faster than
+/// the unit-augmenting SSP reference on a residue-dense grid. The true margin is
+/// ~10x+, so the 3x assertion is robust to CI timing noise while still tripping
+/// if a change reintroduces flow-scaling (the gap that motivated this solver).
+#[test]
+fn network_simplex_outpaces_ssp_reference() {
+    let (ax, ay, corr) = random_field(7, 56, 60);
+    let res = residues(&ax, &ay);
+    let n_res = res.iter().filter(|&&r| r != 0).count();
+    assert!(n_res > 250, "need a residue-dense instance, got {n_res}");
+    let (wx, wy) = edge_costs(corr.view(), CostMode::Smooth);
+
+    let t = Instant::now();
+    let ssp_cost = ssp_ref::optimal_cost(&res, &wx, &wy);
+    let ssp = t.elapsed();
+
+    let t = Instant::now();
+    let (kx, ky) = solve(&ax, &ay, corr.view(), CostMode::Smooth).expect("residues present");
+    let ns = t.elapsed();
+
+    assert_eq!(flow_cost(&kx, &ky, &wx, &wy), ssp_cost, "must stay optimal");
+    assert!(
+        ns.saturating_mul(3) < ssp,
+        "network simplex {ns:?} not >=3x faster than SSP {ssp:?} ({n_res} residues)"
+    );
 }
 
 /// Total routing cost `sum w * |k|`, the objective both solvers minimize.
