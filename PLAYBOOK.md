@@ -590,6 +590,52 @@ Tried coherence-guided seam placement (snap seams to low-coherence lines) — mi
 single recommended next step before defaulting `UnwrapMethod::Native`. `SnaphuBackend`
 stays the wired default until that lands and a host flip is requested.
 
+**SEAM-MCF + THROUGHPUT + DEFAULT FLIP → Native is now the default (2026-06-20).**
+Closed the seam gap, settled throughput at production concurrency, and flipped the default.
+Four commits on `feat/native-unwrap` (`dc16b96` seam reconciliation, `f512197` bench,
+`598b8d8` fine tiling, `c63d72d` flip).
+
+- **PUSH 1 — seam gap killed.** Replaced the per-tile modal-offset stitch with **per-region
+  reconciliation** (`native/tile.rs`): partition into reliable regions = coherence-components
+  ∩ tile cores (a component spanning tiles → one region per tile); each cross-seam pixel pair
+  votes the coherence-weighted integer offset; assign one offset per region along a
+  **maximum-reliability spanning forest** of the region graph (Chen-2002's reconciliation in
+  its provably-optimal-on-trees form; disconnected groups seed independently, mirroring
+  SNAPHU's per-component offsets). Overlap 8→16 so straddling dipoles route correctly.
+  *Adversarial sweep* (`examples/seam_sweep.rs`, `oracle/gen_seam_sweep.py`): 96 scenes
+  (6 coherence structures × densities 0.1–23% × seeds) × tile counts **2..8 odd AND even** —
+  modal stitch failed **140/252 cells, worst 38.4%**; per-region passes **0/672, worst
+  0.314%**. Committed CI golden `unwseam_ci` (160², 25 components) gates tiled-vs-global
+  ≤0.5% across tile counts in `native_tiling_contract.rs`.
+- **PUSH 2 — throughput settled, native wins decisively.** The prior "native loses CPU·s"
+  was measured at tile=4 (the wrong granularity) and against a residue-free smooth bench.
+  Re-measured with a realistic dense bench (27.6k residues @1024²) + production-concurrency
+  harness (`bench_unwrap_throughput.sh`: K concurrent frame-processes = GP's per-job model;
+  CPU·s via `/usr/bin/time -l`, verified to roll up reaped SNAPHU children). The crossover is
+  **tile granularity** — native's per-tile network simplex is superlinear in residues/tile:
+
+  | tiles @1024² | t2 | t4 | t8 | t16 | t24 | t32 | SNAPHU |
+  |---|---|---|---|---|---|---|---|
+  | CPU·s / frame | 502 | 168 | 41 | 14 | **9.0** | 16 | 70 |
+
+  Minimum at ~48 px cores. *Actual frames/hour at concurrency* (12 cores, 1024² frames):
+  SNAPHU saturates at **~600**; native climbs to **~6300 (~10×)**. Single-frame latency
+  ~14× lower. **No regime where SNAPHU wins** once native tiles finely.
+- **PUSH 3 — lead widened + scaled.** Native-specific fine auto-tiling (`native_tiling`,
+  ~48 px cores; replaces SNAPHU's coarse `auto_tiling` for the native path). Accuracy is
+  flat across granularity vs the 1024² SNAPHU oracle: global 0.011% / t4 0.029% / t16 0.028%
+  / t32 0.013% — all ≪0.5%. **Full-burst 2048²** (3 ifgs, 8T): native **6.8 s / 30.3 CPU·s /
+  1041 MB** vs SNAPHU **75.2 s / 219.8 / 1543 MB** — Pareto-better and under the 1.08 GB
+  ceiling SNAPHU exceeds.
+- **DEFAULT FLIP.** `UnwrapMethod::default()` Snaphu→**Native** (`config.rs`); `snaphu`
+  selectable as fallback; `config_contract` pins the new default + fallback spelling. A
+  deliberate divergence from dolphin's `snaphu` default. The per-frame thread count (rayon
+  pool / `n_parallel_jobs`) is the latency↔throughput dial: high threads/frame → low latency,
+  more concurrent frames with fewer threads each → max throughput. `gp-dolphin` verified to
+  build no-gpu/system-HDF5 against the patched vendor copy; its explicit-YAML path honors
+  `unwrap_method: snaphu`, its default-config path now inherits Native. **Human-gated:** push
+  branch, open PR, bump `../eo` submodule. Patch: `/tmp/native-unwrap-default-flip.patch`.
+
 ---
 
 ## Out of scope (initial)
