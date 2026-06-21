@@ -216,6 +216,12 @@ pub struct SnaphuOptions {
     pub cost: String,
     /// After multi-tile unwrapping, re-optimize the phase using a single tile.
     pub single_tile_reoptimize: bool,
+    /// **dolphinRust-only, opt-in.** When set, derive `ntiles`/`n_parallel_tiles`
+    /// from the grid size and available cores instead of the explicit values
+    /// above. Changes SNAPHU numerics (tile boundaries/reconciliation), so it is
+    /// off by default and gated against the oracle; absent in dolphin YAML it
+    /// deserializes to `false` and the config round-trips unchanged.
+    pub auto_tile: bool,
 }
 
 impl Default for SnaphuOptions {
@@ -227,6 +233,7 @@ impl Default for SnaphuOptions {
             init_method: "mcf".into(),
             cost: "smooth".into(),
             single_tile_reoptimize: false,
+            auto_tile: false,
         }
     }
 }

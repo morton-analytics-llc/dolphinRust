@@ -9,5 +9,8 @@
 pub mod snaphu;
 pub mod tophu;
 
-pub use snaphu::{unwrap, CostMode, InitMethod, UnwrapConfig, UnwrapError, UnwrapResult};
+pub use snaphu::{
+    unwrap, unwrap_with_corr, write_correlation, CostMode, InitMethod, UnwrapConfig, UnwrapError,
+    UnwrapResult,
+};
 pub use tophu::{unwrap_multiscale, TophuConfig};

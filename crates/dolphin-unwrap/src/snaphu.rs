@@ -6,7 +6,7 @@
 //! labels are read back. Flat-binary I/O assumes a little-endian host (matches
 //! SNAPHU's native-endian format and numpy's `.tofile`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use dolphin_core::Cf32;
@@ -98,15 +98,44 @@ pub fn unwrap(
     cfg: &UnwrapConfig,
     scratch: &Path,
 ) -> Result<UnwrapResult> {
+    let corr_path = write_correlation(scratch, correlation)?;
+    unwrap_with_corr(wrapped, &corr_path, cfg, scratch)
+}
+
+/// Serialize the correlation raster to `corr.f4` in `dir`, returning its path.
+///
+/// The network unwrap hoists this out of the per-ifg loop: the correlation is
+/// identical across every pair, so it is written once and the file reused for
+/// all ifgs (Tier-1 #3).
+///
+/// # Errors
+/// Returns `Err` if the write fails.
+pub fn write_correlation(dir: &Path, correlation: ArrayView2<f32>) -> Result<PathBuf> {
+    let corr_path = dir.join("corr.f4");
+    std::fs::write(&corr_path, f32_bytes(correlation))?;
+    Ok(corr_path)
+}
+
+/// Unwrap a wrapped interferogram with SNAPHU, reusing a correlation raster
+/// already written to `corr_path`. The ifg + outputs live in `scratch`; only the
+/// shared correlation file is supplied externally.
+///
+/// # Errors
+/// Returns `Err` if scratch I/O fails, SNAPHU exits non-zero, or the outputs are
+/// the wrong size.
+pub fn unwrap_with_corr(
+    wrapped: ArrayView2<Cf32>,
+    corr_path: &Path,
+    cfg: &UnwrapConfig,
+    scratch: &Path,
+) -> Result<UnwrapResult> {
     let (rows, cols) = wrapped.dim();
     let ifg_path = scratch.join("ifg.c8");
-    let corr_path = scratch.join("corr.f4");
     let unw_path = scratch.join("unw.f4");
     let cc_path = scratch.join("conncomp.u4");
 
     std::fs::write(&ifg_path, complex_bytes(wrapped))?;
-    std::fs::write(&corr_path, f32_bytes(correlation))?;
-    run_snaphu(cfg, &ifg_path, &corr_path, &unw_path, &cc_path, cols)?;
+    run_snaphu(cfg, &ifg_path, corr_path, &unw_path, &cc_path, cols)?;
 
     let unwrapped = read_f32(&unw_path, (rows, cols))?;
     let conncomp = read_u32(&cc_path, (rows, cols))?;

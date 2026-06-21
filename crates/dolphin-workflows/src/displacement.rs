@@ -768,28 +768,69 @@ fn unwrap_network(
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
     let correlation = Array2::<f32>::from_elem((rows, cols), 1.0);
-    unwrap_backend(cfg).unwrap_network(pl, pairs, correlation.view(), &scratch)
+    let backend = unwrap_backend(cfg, (rows, cols));
+    // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
+    // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
+    let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
+    pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch))
+}
+
+/// Rayon pool sizing the ifg-network unwrap fan-out. `n_parallel_jobs` is
+/// dolphin's knob: `<= 0` means all available cores, else clamp to the core count.
+fn unwrap_pool(n_parallel_jobs: i64) -> Result<rayon::ThreadPool> {
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n = match n_parallel_jobs {
+        j if j <= 0 => avail,
+        j => (j as usize).min(avail),
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build()
+        .context("building unwrap thread pool")
 }
 
 /// Build the unwrap backend from the config: tophu when selected, else SNAPHU.
-fn unwrap_backend(cfg: &DisplacementWorkflow) -> Box<dyn UnwrapBackend> {
+/// `grid` is the unwrap grid `(rows, cols)`, used only for opt-in auto-tiling.
+fn unwrap_backend(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> Box<dyn UnwrapBackend> {
     match cfg.unwrap_options.unwrap_method {
         UnwrapMethod::Tophu => Box::new(TophuBackend(tophu_config(cfg))),
-        _ => Box::new(SnaphuBackend(unwrap_config(cfg))),
+        _ => Box::new(SnaphuBackend(unwrap_config(cfg, grid))),
     }
 }
 
-/// Map the config's SNAPHU options to the unwrap wrapper config.
-fn unwrap_config(cfg: &DisplacementWorkflow) -> UnwrapConfig {
+/// Map the config's SNAPHU options to the unwrap wrapper config. When
+/// `auto_tile` is set, `ntiles`/`nproc` are derived from the grid + cores
+/// (opt-in; changes numerics), otherwise the explicit config values are used.
+fn unwrap_config(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> UnwrapConfig {
     let snaphu = &cfg.unwrap_options.snaphu_options;
+    let (ntiles, nproc) = match snaphu.auto_tile {
+        true => auto_tiling(grid),
+        false => (snaphu.ntiles, snaphu.n_parallel_tiles),
+    };
     UnwrapConfig {
         cost: cost_mode(&snaphu.cost),
         init: init_method(&snaphu.init_method),
-        ntiles: snaphu.ntiles,
+        ntiles,
         tile_overlap: snaphu.tile_overlap,
-        nproc: snaphu.n_parallel_tiles,
+        nproc,
         snaphu_path: "snaphu".to_string(),
     }
+}
+
+/// Conservative auto-tiling: split a large grid so each tile stays `>= MIN_TILE`
+/// pixels per side, capping the tile count per axis at the core count, and run
+/// the tiles in parallel (`nproc = ntiles_row * ntiles_col`). Grids smaller than
+/// `2 * MIN_TILE` on an axis are left untiled, so small scenes are unchanged.
+fn auto_tiling((rows, cols): (usize, usize)) -> ((usize, usize), usize) {
+    const MIN_TILE: usize = 512;
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let per_axis = |n: usize| (n / MIN_TILE).clamp(1, avail);
+    let ntiles = (per_axis(rows), per_axis(cols));
+    (ntiles, ntiles.0 * ntiles.1)
 }
 
 /// Map the config's tophu options to the multi-scale driver config. dolphin's
