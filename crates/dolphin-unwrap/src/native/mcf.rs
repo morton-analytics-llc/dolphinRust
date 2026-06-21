@@ -68,7 +68,13 @@ struct Grid {
 
 impl Grid {
     /// Wire faces, supplies, and dual arcs from the residues and edge costs.
-    fn build(rows: usize, cols: usize, res: &Array2<i32>, wx: &Array2<i64>, wy: &Array2<i64>) -> Self {
+    fn build(
+        rows: usize,
+        cols: usize,
+        res: &Array2<i32>,
+        wx: &Array2<i64>,
+        wy: &Array2<i64>,
+    ) -> Self {
         let ground = (rows - 1) * (cols - 1);
         let cap = res.iter().map(|&r| r.unsigned_abs() as i64).sum::<i64>() + 1;
         let mut mcf = MinCostFlow::new(ground + 1);
@@ -79,7 +85,10 @@ impl Grid {
         }
         mcf.set_supply(ground, ground_supply);
 
-        let mut grid = Self { mcf, handles: Vec::new() };
+        let mut grid = Self {
+            mcf,
+            handles: Vec::new(),
+        };
         grid.add_x_edges(rows, cols, wx, cap);
         grid.add_y_edges(rows, cols, wy, cap);
         grid

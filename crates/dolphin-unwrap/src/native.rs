@@ -15,6 +15,7 @@ use ndarray::{Array2, ArrayView2};
 
 use crate::snaphu::{CostMode, UnwrapError, UnwrapResult};
 
+mod conncomp;
 mod cost;
 mod mcf;
 mod simplex;
@@ -30,6 +31,11 @@ pub struct NativeConfig {
     /// Optional `(rows, cols)` tile grid for large interferograms; `None`
     /// unwraps the whole grid with one global MCF (the default).
     pub tile: Option<(usize, usize)>,
+    /// Coherence below which a pixel is masked (connected-component 0).
+    pub conncomp_min_corr: f32,
+    /// Minimum component size as a fraction of the scene; smaller components are
+    /// dropped to the masked label, mirroring SNAPHU's `minconncompfrac`.
+    pub conncomp_min_frac: f64,
 }
 
 impl Default for NativeConfig {
@@ -37,6 +43,8 @@ impl Default for NativeConfig {
         Self {
             cost: CostMode::Smooth,
             tile: None,
+            conncomp_min_corr: 0.15,
+            conncomp_min_frac: 0.001,
         }
     }
 }
@@ -76,7 +84,7 @@ pub fn unwrap_native(
         Some(tiles) => tile::unwrap_tiled(&psi, correlation, cfg.cost, tiles),
         None => unwrap_grid(&psi, correlation, cfg.cost),
     };
-    let conncomp = Array2::from_elem((rows, cols), 1u32);
+    let conncomp = conncomp::segment(correlation, cfg.conncomp_min_corr, cfg.conncomp_min_frac);
     Ok(UnwrapResult {
         unwrapped: unwrapped.mapv(|v| v as f32),
         conncomp,

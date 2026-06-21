@@ -36,6 +36,10 @@ const MAX_CYCLE_DISAGREE: f64 = 0.005;
 /// Max sub-cycle (fractional) residual in radians on agreeing pixels.
 const MAX_FRAC_RESIDUAL: f64 = 0.20;
 const TAG: &str = "unwdense_ci";
+/// Min IoU of native's masked (label-0) set vs SNAPHU's.
+const MIN_MASK_IOU: f64 = 0.70;
+/// Min size-weighted best-match IoU of native components vs SNAPHU's.
+const MIN_PART_IOU: f64 = 0.90;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
@@ -127,4 +131,61 @@ fn native_matches_snaphu_per_component_at_real_residue_density() {
         max_frac <= MAX_FRAC_RESIDUAL,
         "sub-cycle residual {max_frac:.4} rad > {MAX_FRAC_RESIDUAL} rad",
     );
+
+    // Connected-component partition agreement (closes the prior mask-IoU 0.0):
+    // native now produces a real coherence-based segmentation.
+    let mask_iou = iou(&cc.mapv(|l| l == 0), &out.conncomp.mapv(|l| l == 0));
+    let part_iou = partition_iou(&cc, &out.conncomp);
+    eprintln!("[{TAG}] conncomp mask-IoU={mask_iou:.4} partition-IoU={part_iou:.4}");
+    assert!(
+        mask_iou >= MIN_MASK_IOU,
+        "conncomp mask-IoU {mask_iou:.4} < {MIN_MASK_IOU}"
+    );
+    assert!(
+        part_iou >= MIN_PART_IOU,
+        "conncomp partition-IoU {part_iou:.4} < {MIN_PART_IOU}"
+    );
+}
+
+/// Intersection-over-union of two boolean masks.
+fn iou(a: &Array2<bool>, b: &Array2<bool>) -> f64 {
+    let inter = a.iter().zip(b).filter(|&(&x, &y)| x && y).count();
+    let union = a.iter().zip(b).filter(|&(&x, &y)| x || y).count();
+    inter as f64 / union.max(1) as f64
+}
+
+/// Size-weighted mean, over each SNAPHU component, of the best IoU against any
+/// native component — measures whether the two partitions carve the same regions.
+fn partition_iou(snaphu: &Array2<u32>, native: &Array2<u32>) -> f64 {
+    let mut comps: HashMap<u32, Vec<bool>> = HashMap::new();
+    for &s in snaphu.iter() {
+        if s > 0 {
+            comps.entry(s).or_default();
+        }
+    }
+    let (mut weighted, mut total) = (0.0f64, 0usize);
+    for (&label, _) in comps.iter() {
+        let s_mask = snaphu.mapv(|x| x == label);
+        let size = s_mask.iter().filter(|&&x| x).count();
+        let best = native_labels_over(&s_mask, native)
+            .into_iter()
+            .map(|nl| iou(&s_mask, &native.mapv(|x| x == nl)))
+            .fold(0.0, f64::max);
+        weighted += size as f64 * best;
+        total += size;
+    }
+    weighted / total.max(1) as f64
+}
+
+/// Distinct nonzero native labels appearing under a SNAPHU component mask.
+fn native_labels_over(mask: &Array2<bool>, native: &Array2<u32>) -> Vec<u32> {
+    let mut set: Vec<u32> = mask
+        .iter()
+        .zip(native)
+        .filter(|&(&m, &n)| m && n > 0)
+        .map(|(_, &n)| n)
+        .collect();
+    set.sort_unstable();
+    set.dedup();
+    set
 }
