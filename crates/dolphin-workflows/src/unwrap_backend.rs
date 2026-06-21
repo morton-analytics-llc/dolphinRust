@@ -12,7 +12,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dolphin_core::{Cf32, Cf64};
-use dolphin_unwrap::{unwrap, unwrap_multiscale, TophuConfig, UnwrapConfig};
+use dolphin_unwrap::{
+    unwrap_multiscale, unwrap_with_corr, write_correlation, TophuConfig, UnwrapConfig,
+};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
 
@@ -51,13 +53,17 @@ impl UnwrapBackend for SnaphuBackend {
         correlation: ArrayView2<f32>,
         scratch: &Path,
     ) -> Result<Array3<f64>> {
+        // #3: the correlation is identical across every pair — serialize it once
+        // into the shared scratch and reuse the file for all ifgs instead of
+        // re-writing corr.f4 per pair.
+        let corr_path = write_correlation(scratch, correlation)?;
         unwrap_each_ifg(
             pl,
             pairs,
             correlation,
             scratch,
-            |ifg, corr, pair_scratch| {
-                Ok(unwrap(ifg, corr, &self.0, pair_scratch)?
+            |ifg, _corr, pair_scratch| {
+                Ok(unwrap_with_corr(ifg, &corr_path, &self.0, pair_scratch)?
                     .unwrapped
                     .mapv(f64::from))
             },
