@@ -17,6 +17,7 @@ use crate::snaphu::{CostMode, UnwrapError, UnwrapResult};
 
 mod cost;
 mod mcf;
+mod tile;
 
 const TAU: f64 = std::f64::consts::TAU;
 
@@ -25,12 +26,16 @@ const TAU: f64 = std::f64::consts::TAU;
 pub struct NativeConfig {
     /// Statistical cost model used to weight branch-cut routing.
     pub cost: CostMode,
+    /// Optional `(rows, cols)` tile grid for large interferograms; `None`
+    /// unwraps the whole grid with one global MCF (the default).
+    pub tile: Option<(usize, usize)>,
 }
 
 impl Default for NativeConfig {
     fn default() -> Self {
         Self {
             cost: CostMode::Smooth,
+            tile: None,
         }
     }
 }
@@ -66,16 +71,24 @@ pub fn unwrap_native(
     }
 
     let psi = wrapped.mapv(|z| z.arg() as f64);
-    let (ax, ay) = wrapped_gradients(&psi);
-    // Statistical-cost MCF routes branch cuts so the corrected gradients are
-    // curl-free; zero flow for residue-free fields.
-    let (kx, ky) = mcf::solve(&ax, &ay, correlation, cfg.cost);
-    let unwrapped = integrate(&psi, &ax, &ay, &kx, &ky);
+    let unwrapped = match cfg.tile {
+        Some(tiles) => tile::unwrap_tiled(&psi, correlation, cfg.cost, tiles),
+        None => unwrap_grid(&psi, correlation, cfg.cost),
+    };
     let conncomp = Array2::from_elem((rows, cols), 1u32);
     Ok(UnwrapResult {
         unwrapped: unwrapped.mapv(|v| v as f32),
         conncomp,
     })
+}
+
+/// Unwrap one whole grid: wrapped gradients, statistical-cost MCF branch-cut
+/// correction (zero flow when residue-free), then integration. The shared core
+/// of both the global and per-tile paths.
+fn unwrap_grid(psi: &Array2<f64>, corr: ArrayView2<f32>, cost: CostMode) -> Array2<f64> {
+    let (ax, ay) = wrapped_gradients(psi);
+    let (kx, ky) = mcf::solve(&ax, &ay, corr, cost);
+    integrate(psi, &ax, &ay, &kx, &ky)
 }
 
 /// Wrapped row/column gradients: `ax[i,j] = W(psi[i,j+1]-psi[i,j])` of shape
