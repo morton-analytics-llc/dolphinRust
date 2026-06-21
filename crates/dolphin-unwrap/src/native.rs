@@ -87,8 +87,10 @@ pub fn unwrap_native(
 /// of both the global and per-tile paths.
 fn unwrap_grid(psi: &Array2<f64>, corr: ArrayView2<f32>, cost: CostMode) -> Array2<f64> {
     let (ax, ay) = wrapped_gradients(psi);
-    let (kx, ky) = mcf::solve(&ax, &ay, corr, cost);
-    integrate(psi, &ax, &ay, &kx, &ky)
+    // `None` for the residue-free fast path: no branch-cut corrections are
+    // allocated at all, so high-coherence ifgs carry no flow-array overhead.
+    let flow = mcf::solve(&ax, &ay, corr, cost);
+    integrate(psi, &ax, &ay, flow.as_ref())
 }
 
 /// Wrapped row/column gradients: `ax[i,j] = W(psi[i,j+1]-psi[i,j])` of shape
@@ -105,24 +107,26 @@ fn wrapped_gradients(psi: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
 }
 
 /// Integrate the corrected gradients `a + 2pi*k` by a raster scan from `(0,0)`.
-/// With curl-free corrected gradients the result is path-independent.
+/// `flow` is `None` for residue-free fields (no correction, no allocation);
+/// with curl-free corrected gradients the result is path-independent.
 fn integrate(
     psi: &Array2<f64>,
     ax: &Array2<f64>,
     ay: &Array2<f64>,
-    kx: &Array2<f64>,
-    ky: &Array2<f64>,
+    flow: Option<&(Array2<f64>, Array2<f64>)>,
 ) -> Array2<f64> {
     let (rows, cols) = psi.dim();
+    let cx = |i: usize, j: usize| flow.map_or(0.0, |(kx, _)| TAU * kx[(i, j)]);
+    let cy = |i: usize, j: usize| flow.map_or(0.0, |(_, ky)| TAU * ky[(i, j)]);
     let mut phi = Array2::zeros((rows, cols));
     phi[(0, 0)] = psi[(0, 0)];
     for j in 1..cols {
-        phi[(0, j)] = phi[(0, j - 1)] + ax[(0, j - 1)] + TAU * kx[(0, j - 1)];
+        phi[(0, j)] = phi[(0, j - 1)] + ax[(0, j - 1)] + cx(0, j - 1);
     }
     for i in 1..rows {
-        phi[(i, 0)] = phi[(i - 1, 0)] + ay[(i - 1, 0)] + TAU * ky[(i - 1, 0)];
+        phi[(i, 0)] = phi[(i - 1, 0)] + ay[(i - 1, 0)] + cy(i - 1, 0);
         for j in 1..cols {
-            phi[(i, j)] = phi[(i, j - 1)] + ax[(i, j - 1)] + TAU * kx[(i, j - 1)];
+            phi[(i, j)] = phi[(i, j - 1)] + ax[(i, j - 1)] + cx(i, j - 1);
         }
     }
     phi

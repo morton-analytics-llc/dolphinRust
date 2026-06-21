@@ -16,27 +16,27 @@ use super::CostMode;
 const TAU: f64 = std::f64::consts::TAU;
 
 /// Solve the branch-cut flow, returning integer corrections `(kx, ky)` (as
-/// `f64`) aligned with the `ax`/`ay` gradient grids. Residue-free fields short-
-/// circuit to zero flow.
+/// `f64`) aligned with the `ax`/`ay` gradient grids. Residue-free fields return
+/// `None` — no correction arrays are allocated.
 pub fn solve(
     ax: &Array2<f64>,
     ay: &Array2<f64>,
     corr: ArrayView2<f32>,
     mode: CostMode,
-) -> (Array2<f64>, Array2<f64>) {
+) -> Option<(Array2<f64>, Array2<f64>)> {
     let res = residues(ax, ay);
+    if res.iter().all(|&r| r == 0) {
+        return None;
+    }
     let mut kx = Array2::zeros(ax.dim());
     let mut ky = Array2::zeros(ay.dim());
-    if res.iter().all(|&r| r == 0) {
-        return (kx, ky);
-    }
     let (wx, wy) = edge_costs(corr, mode);
     let (rows, cols) = (ax.dim().0, ay.dim().1); // pixel grid
     let mut net = Network::new(rows, cols, &res);
     net.add_edges(rows, cols, &wx, &wy);
     net.solve();
     net.recover(&mut kx, &mut ky);
-    (kx, ky)
+    Some((kx, ky))
 }
 
 /// Discrete curl of the wrapped gradients per `(rows-1, cols-1)` face, in
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(before.iter().sum::<i32>(), 0);
 
         let corr = Array2::<f32>::from_elem((3, 3), 0.9);
-        let (kx, ky) = solve(&ax, &ay, corr.view(), CostMode::Smooth);
+        let (kx, ky) = solve(&ax, &ay, corr.view(), CostMode::Smooth).expect("residues present");
         ax.zip_mut_with(&kx, |a, &k| *a += TAU * k);
         ay.zip_mut_with(&ky, |a, &k| *a += TAU * k);
 
