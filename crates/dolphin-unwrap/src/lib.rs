@@ -6,6 +6,7 @@
 //! components. Not a reimplementation target.
 #![warn(missing_docs)]
 
+pub mod native;
 pub mod snaphu;
 pub mod tophu;
 
