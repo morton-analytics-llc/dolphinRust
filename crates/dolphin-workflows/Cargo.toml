@@ -30,11 +30,18 @@ rayon.workspace = true
 ndarray.workspace = true
 chrono.workspace = true
 
+[dependencies.dhat]
+# Optional heap profiler (enabled only via the `dhat-heap` feature for profiling).
+version = "0.3"
+optional = true
+
 [features]
 # GPU first-class by default; `--no-default-features --features no-gpu` for CPU-only hosts.
 default = ["gpu"]
 gpu = ["dolphin-phaselink/gpu"]
 no-gpu = ["dolphin-phaselink/no-gpu"]
+# Heap allocation-site profiling for the profile_e2e harness (dhat global allocator).
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 num-complex.workspace = true
@@ -44,10 +51,18 @@ ndarray-npy = { version = "0.9", default-features = false, features = ["num-comp
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.
 dolphin-io = { workspace = true, features = ["nisar-fixture"] }
+# Per-stage CPU·s + max-RSS sampling (getrusage) and tracing capture for the
+# end-to-end profiling harness (`examples/profile_e2e.rs`).
+libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "run_synthetic"
 path = "examples/run_synthetic.rs"
+
+[[example]]
+name = "profile_e2e"
+path = "examples/profile_e2e.rs"
 
 [[example]]
 name = "unwrap_bench"
