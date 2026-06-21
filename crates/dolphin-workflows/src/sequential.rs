@@ -21,11 +21,9 @@
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{
-    compress, estimate_closure_phases, estimate_crlb, estimate_temp_coh, ComputeEngine,
-};
+use dolphin_phaselink::{compress, ComputeEngine, FusedParams};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
-use ndarray::{concatenate, s, Array2, Array3, ArrayView3, ArrayView4, Axis};
+use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
@@ -397,54 +395,49 @@ fn link_and_compress(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<MinistackResult, &'static str> {
-    let c = engine.covariance(combined, cfg.half_window, cfg.strides, None)?;
-    let est = engine.estimate(
-        c.view(),
-        cfg.use_evd,
-        cfg.beta,
-        cfg.zero_correlation_threshold,
-        ms.output_reference_idx as usize,
-    );
-    let cpx = est.cpx_phase.mapv(unit_phasor);
-    // estimate_temp_coh wants (rows, cols, nslc); cpx is (nslc, rows, cols).
-    let temp_coh = estimate_temp_coh(cpx.view().permuted_axes([1, 2, 0]), c.view());
+    let fused = engine.link(
+        combined,
+        cfg.half_window,
+        cfg.strides,
+        None,
+        fused_params(ms, cfg),
+    )?;
+    let cpx = fused.cpx_phase;
     let compressed = compress(
         combined,
         cpx.view(),
         ms.num_compressed,
         Some(ms.compressed_reference_idx as usize),
     );
+    // CRLB is produced for the full combined stack; keep only the real dates,
+    // matching the phase-history concatenation (drops carried compressed layers).
+    let crlb_sigma = fused
+        .crlb_sigma
+        .map(|s| s.slice(s![ms.num_compressed.., .., ..]).to_owned());
     Ok(MinistackResult {
         cpx,
         compressed,
-        temp_coh,
-        crlb_sigma: cfg.compute_crlb.then(|| crlb_real_dates(c.view(), ms, cfg)),
-        closure_phase: cfg
-            .compute_closure_phase
-            .then(|| estimate_closure_phases(c.view())),
+        temp_coh: fused.temporal_coherence,
+        crlb_sigma,
+        closure_phase: fused.closure_phase,
     })
 }
 
-/// CRLB σ for the ministack's **real** dates only (drops carried compressed
-/// layers), matching the phase-history concatenation. `num_looks` is dolphin's
-/// conservative `sqrt(half_y · half_x)`; the CRLB reference is the last
-/// compressed date (dolphin's `max(first_real_slc_idx − 1, 0)`).
-fn crlb_real_dates(c: ArrayView4<Cf64>, ms: MiniStack, cfg: &SequentialConfig) -> Array3<f64> {
-    let num_looks = (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt();
-    let reference_idx = ms.num_compressed.saturating_sub(1);
-    let sigma = estimate_crlb(
-        c,
-        cfg.beta,
-        cfg.zero_correlation_threshold,
-        reference_idx,
-        num_looks,
-    );
-    sigma.slice(s![ms.num_compressed.., .., ..]).to_owned()
-}
-
-/// Unit-magnitude phasor `exp(j∠z)` (dolphin's `exp(1j*angle(cpx_phase))`).
-fn unit_phasor(z: Cf64) -> Cf64 {
-    Cf64::from_polar(1.0, z.arg())
+/// Build the fused-pass parameters. `num_looks` is dolphin's conservative
+/// `sqrt(half_y · half_x)`; the CRLB reference is the last compressed date
+/// (dolphin's `max(first_real_slc_idx − 1, 0)`), which may differ from the
+/// output reference.
+fn fused_params(ms: MiniStack, cfg: &SequentialConfig) -> FusedParams {
+    FusedParams {
+        use_evd: cfg.use_evd,
+        beta: cfg.beta,
+        zero_correlation_threshold: cfg.zero_correlation_threshold,
+        reference_idx: ms.output_reference_idx as usize,
+        compute_crlb: cfg.compute_crlb,
+        crlb_reference_idx: ms.num_compressed.saturating_sub(1),
+        num_looks: (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt(),
+        compute_closure: cfg.compute_closure_phase,
+    }
 }
 
 #[cfg(test)]

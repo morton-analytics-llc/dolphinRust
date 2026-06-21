@@ -31,6 +31,6 @@ pub fn estimate_closure_phases(c_arrays: ArrayView4<Cf64>) -> Array3<f64> {
 }
 
 /// Wrapped non-closure of the triplet `(k, k+1, k+2)`.
-fn triplet_closure(c: ArrayView2<Cf64>, k: usize) -> f64 {
+pub(crate) fn triplet_closure(c: ArrayView2<Cf64>, k: usize) -> f64 {
     (c[(k, k + 1)] * c[(k + 1, k + 2)] * c[(k, k + 2)].conj()).arg()
 }

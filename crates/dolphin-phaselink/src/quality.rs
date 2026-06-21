@@ -35,7 +35,7 @@ pub fn estimate_temp_coh(cpx_phase: ArrayView3<Cf64>, c_arrays: ArrayView4<Cf64>
 }
 
 /// Temporal coherence for one pixel (equal weights, upper triangle).
-fn temp_coh_single(phase: ArrayView1<Cf64>, c: ArrayView2<Cf64>) -> f64 {
+pub(crate) fn temp_coh_single(phase: ArrayView1<Cf64>, c: ArrayView2<Cf64>) -> f64 {
     let n = phase.len();
     let pairs: Vec<(usize, usize)> = (0..n)
         .flat_map(|i| ((i + 1)..n).map(move |j| (i, j)))
