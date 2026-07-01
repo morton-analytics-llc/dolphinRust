@@ -21,6 +21,29 @@ All notable changes to dolphinRust are documented here. The format follows
   extending beyond the supplied STATIC footprint (or a NaN/nodata hole) is a hard error, never
   a silent 0°/nadir pixel. Design: `md/design/per-pixel-los-geometry.md`; follow-up harness:
   `md/research/gps-feasibility-spike.md` §3.
+- **Geometry-provenance artifact for GroundPulse asc/desc gating** (issue #1). dolphinRust
+  now emits a machine-readable provenance record alongside each displacement run
+  (orbit_direction, incidence_angle_deg, heading_deg, native range/azimuth spacing, the
+  phase-linking coherence artifact key, and a `geometry_provenance` block naming source
+  metadata keys + method version), sourced from real CSLC/product metadata — no guessed
+  defaults. Absent provenance is represented explicitly so a consumer keeps asc/desc
+  decomposition disabled when either geometry side lacks incidence/heading. New
+  `dolphin-io::cslc_metadata` reader + `dolphin-workflows::provenance`; fixture-backed
+  contract test. Design: `md/design/geometry-provenance.md`.
+
+### Changed
+- **Phase-linking covariance — row-separable box-sum** (`dolphin-phaselink::covariance`).
+  The unmasked rectangular-window path (the entire production path — `neighbors: None`)
+  now reuses per-output-row vertical sums across the row's output columns and sums each
+  window directly in fixed left-to-right order, instead of re-reading the full
+  `win_h×win_w` window per pixel. Targets the overlapping-window redundancy
+  (~`win_w/strides.x`, ≈3.8× at dolphin defaults). The SHP-masked path is unchanged
+  (retained direct kernel). Accumulation order differs from the direct kernel, so the
+  result matches to the crate's coherence tolerance (~1e-4), **not** bit-exactly; the
+  new `covariance_sliding_contract` pins that. Both the staged and fused unmasked paths
+  share the one kernel, and each window's numerator depends only on its own samples, so
+  `fused==staged` and `tiled==whole` stay **bit-identical**. Wall-clock speedup asserted
+  by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
 - **Flaky HDF5 unit tests in `dolphin-io`.** `hdf5-metno` links a non-thread-safe HDF5, so

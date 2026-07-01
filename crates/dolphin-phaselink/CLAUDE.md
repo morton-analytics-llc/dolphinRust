@@ -7,8 +7,15 @@ optimize. All math in `Cf64`.
 ## Domain
 - **Covariance:** sliding-window sample coherence matrix
   `C_ij = Σ(z_i z_j*) / sqrt(Σ|z_i|² · Σ|z_j|²)`, optionally masked by the SHP neighbor
-  array. The #1 hot path — parallelize over output pixels with rayon (the Rust analogue of
-  dolphin's `vmap(vmap(f))`), each closure solving one N×N matrix via faer.
+  array. The #1 hot path. Two kernels: the **direct** per-pixel path (`_direct`,
+  parallel over output pixels — the SHP-masked implementation and the tolerance oracle)
+  and the **row-separable box-sum** (default for the unmasked rectangular window,
+  `neighbors: None` = the production path): parallel over output *rows*, reusing each
+  row's per-column vertical sums across its output columns and summing each window in
+  fixed left-to-right order. The sliding kernel matches direct to coherence ~1e-4 (order
+  differs), **not** bit-exactly; but `fused==staged` and `tiled==whole` stay bit-identical
+  because both share the one `sliding_row_numerators` and each window depends only on its
+  own samples. Do **not** materialize an `nslc²·area` cube — per-row buffers only.
 - **EVD:** largest eigenvector of `C ⊙ |C|` (power iteration).
 - **EMI (default):** smallest eigenvector of `Γ⁻¹ ⊙ C`, where `Γ = |C|`. Regularize
   `Γ ← (1−β)Γ + βI`, threshold near-zero entries, Cholesky-invert with 1e-6 jitter,

@@ -20,7 +20,7 @@ use ndarray::{Array1, Array2, Array3, ArrayView3, ArrayView4};
 use rayon::prelude::*;
 
 use crate::closure::triplet_closure;
-use crate::covariance::pixel_coh;
+use crate::covariance::{normalize_numerator, pixel_coh, sliding_row_numerators};
 use crate::crlb::crlb_pixel;
 use crate::estimator::process_coherence_matrix;
 use crate::quality::temp_coh_single;
@@ -90,35 +90,72 @@ pub fn link_fused(
         return Err("covariance window larger than stack");
     }
     let (out_rows, out_cols) = strides.out_shape((rows, cols));
+    let pixels = match neighbors {
+        Some(_) => fused_pixels_masked(
+            stack,
+            half,
+            strides,
+            neighbors,
+            params,
+            (out_rows, out_cols),
+        ),
+        None => fused_pixels_sliding(stack, half, strides, params, (out_rows, out_cols)),
+    };
+    Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
+}
 
-    let pixels: Vec<PixelFused> = (0..out_rows * out_cols)
+/// SHP-masked path: flat per-output-pixel, each pixel builds its own coherence
+/// matrix via the direct `pixel_coh` kernel. Unchanged from the previous fused pass.
+fn fused_pixels_masked(
+    stack: ArrayView3<Cf64>,
+    half: HalfWindow,
+    strides: Strides,
+    neighbors: Option<ArrayView4<bool>>,
+    params: FusedParams,
+    out_shape: (usize, usize),
+) -> Vec<PixelFused> {
+    let (out_rows, out_cols) = out_shape;
+    (0..out_rows * out_cols)
         .into_par_iter()
         .map(|idx| {
-            fused_pixel(
+            let coh = pixel_coh(
                 stack,
                 (idx / out_cols, idx % out_cols),
                 half,
                 strides,
                 neighbors,
-                params,
-            )
+            );
+            fused_from_coh(coh, params)
         })
-        .collect();
-
-    Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
+        .collect()
 }
 
-/// Fused per-pixel work: build the coherence matrix once, run every consumer,
-/// drop the matrix. Mirrors the separate stages' per-pixel kernels exactly.
-fn fused_pixel(
+/// Unmasked path: parallel over output rows using the shared row-separable
+/// sliding numerators, then normalize and run the shared consumer per pixel.
+/// Same idx ordering (`idx = r*out_cols + c`) as the staged/masked paths.
+fn fused_pixels_sliding(
     stack: ArrayView3<Cf64>,
-    out: (usize, usize),
     half: HalfWindow,
     strides: Strides,
-    neighbors: Option<ArrayView4<bool>>,
-    p: FusedParams,
-) -> PixelFused {
-    let c = pixel_coh(stack, out, half, strides, neighbors);
+    params: FusedParams,
+    out_shape: (usize, usize),
+) -> Vec<PixelFused> {
+    let (out_rows, _) = out_shape;
+    let rows_of_pixels: Vec<Vec<PixelFused>> = (0..out_rows)
+        .into_par_iter()
+        .map(|orow| {
+            sliding_row_numerators(stack, orow, half, strides)
+                .into_iter()
+                .map(|numer| fused_from_coh(normalize_numerator(numer.view()), params))
+                .collect()
+        })
+        .collect();
+    rows_of_pixels.into_iter().flatten().collect()
+}
+
+/// Run every fused consumer against a precomputed coherence matrix, retaining
+/// only the per-pixel products. Shared by the masked and unmasked paths.
+fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
     let est = process_coherence_matrix(
         c.view(),
         p.use_evd,
