@@ -135,6 +135,7 @@ mod tests {
     /// geotransform reader replaces GDAL's identity transform.
     #[test]
     fn reads_synthesized_nisar_fixture() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
         let path = std::env::temp_dir().join("dolphin_nisar_contract.h5");
         let _ = std::fs::remove_file(&path);
         // 2x3 grid with distinct, signed samples.
@@ -165,6 +166,7 @@ mod tests {
     /// rectangle (the NISAR half of the block-tiled bit-identity invariant).
     #[test]
     fn nisar_window_matches_full_read_sliced() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
         let path = std::env::temp_dir().join("dolphin_nisar_window_contract.h5");
         let _ = std::fs::remove_file(&path);
         let full = Array2::from_shape_fn((12, 16), |(r, c)| Cf32::new(r as f32, c as f32 - 4.0));

@@ -67,6 +67,13 @@ crop.
    and the asc-vs-desc ambiguity here is unresolved because track direction was never read from
    the burst HDF5. Add an OPERA CSLC local-incidence + orbit-heading reader before any
    mm-tolerance ENU→LOS projection.
+   > **DONE (unmerged, on working tree — see `md/design/per-pixel-los-geometry.md`).** Reads the
+   > per-pixel LOS unit vector from the **CSLC-S1-STATIC** companion (not the main granule, which
+   > has no LOS rasters), resolves `LosGeometry{east,north,up}` onto the frame grid, exposed on
+   > `DisplacementOutput.los_geometry`. Asc/desc is resolved for free (the signed LOS vector
+   > encodes it — no separate heading read). ENU→LOS: `d_los = d_e·east + d_n·north + d_u·up`
+   > (ground→sensor; sign reconciliation with the `−λ/4π·φ` displacement convention is this
+   > harness's job). Deferred: iono ground→ionospheric-shell mapping.
 2. **Pick a GPS-colocated AOI** centered on MMX1 (19.432, −99.068) — strong linear signal —
    as the primary, ICMX as a stalled/near-null control. Re-run `fetch_real.py --burst
    T005_008704_IW1 ...` → `crop_real.py --burst T005 --row0 <r> --col0 <c> --size <n>` with a

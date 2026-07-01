@@ -78,6 +78,7 @@ mod tests {
 
     #[test]
     fn derives_geotransform_from_opera_layout() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
         let path = std::env::temp_dir().join("dolphin_geo_contract.h5");
         let _ = std::fs::remove_file(&path);
         {

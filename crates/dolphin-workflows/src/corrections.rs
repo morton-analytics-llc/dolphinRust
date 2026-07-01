@@ -11,13 +11,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dolphin_core::config::CorrectionOptions;
+use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
     read_l4_netcdf, read_l4_total, resample_bilinear, warp_to_frame, DelayGrid,
 };
-use dolphin_io::grid_centroid_lonlat;
-use ndarray::{Array3, Axis};
+use dolphin_io::{grid_centroid_lonlat, read_los_layers, GeoInfo};
+use ndarray::{Array2, Array3, Axis};
 
 /// Per-date correction delay layers (meters, `(n_dates, rows, cols)`), returned
 /// for the typed API and per-band COG output.
@@ -27,16 +28,11 @@ pub struct CorrectionLayers {
     pub ionosphere: Option<Array3<f64>>,
     /// Tropospheric range delay, present when `troposphere_files` were supplied.
     pub troposphere: Option<Array3<f64>>,
-}
-
-impl CorrectionLayers {
-    /// No corrections applied (the opt-out default).
-    fn none() -> Self {
-        Self {
-            ionosphere: None,
-            troposphere: None,
-        }
-    }
+    /// Per-pixel LOS geometry, present when `geometry_files` (CSLC-S1-STATIC) were
+    /// supplied. Independent of the atmospheric terms — the front door for the GPS
+    /// ground-truth harness's ENU→LOS projection. When present it also drives the
+    /// per-pixel zenith→slant incidence for the iono/tropo delays.
+    pub los_geometry: Option<LosGeometry>,
 }
 
 /// Build and subtract the configured corrections from `disp_rad` in place.
@@ -56,17 +52,29 @@ pub fn apply_corrections(
     epsg: u32,
     gt: [f64; 6],
 ) -> Result<CorrectionLayers> {
+    let (bands, rows, cols) = disp_rad.dim();
+    // LOS geometry is resolved independently of the atmospheric opt-in: a
+    // geometry-only config (for the GPS harness) needs it even with no iono/tropo.
+    let los_geometry = resolve_geometry(opts, epsg, gt, (rows, cols))?;
     if !opts.is_enabled() {
-        return Ok(CorrectionLayers::none());
+        return Ok(CorrectionLayers {
+            ionosphere: None,
+            troposphere: None,
+            los_geometry,
+        });
     }
     let wavelength =
         wavelength.context("atmospheric corrections require input_options.wavelength")?;
-    let (bands, rows, cols) = disp_rad.dim();
     let n_dates = bands + 1;
     let freq = SPEED_OF_LIGHT / wavelength;
+    let los = los_geometry.as_ref();
 
-    let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), gt, epsg, freq)?;
-    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg)?;
+    let geo = GeoInfo {
+        epsg,
+        geotransform: gt,
+    };
+    let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), geo, freq, los)?;
+    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los)?;
 
     let total = sum_layers(
         ionosphere.as_ref(),
@@ -78,7 +86,30 @@ pub fn apply_corrections(
     Ok(CorrectionLayers {
         ionosphere,
         troposphere,
+        los_geometry,
     })
+}
+
+/// Load + resolve per-pixel LOS geometry from the configured CSLC-S1-STATIC
+/// granules (one per burst), or `None` when none are configured.
+fn resolve_geometry(
+    opts: &CorrectionOptions,
+    epsg: u32,
+    gt: [f64; 6],
+    shape: (usize, usize),
+) -> Result<Option<LosGeometry>> {
+    if opts.geometry_files.is_empty() {
+        return Ok(None);
+    }
+    let layers = opts
+        .geometry_files
+        .iter()
+        .map(|p| {
+            read_los_layers(p, "/data")
+                .with_context(|| format!("reading CSLC-S1-STATIC geometry {}", p.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(resolve_los_geometry(&layers, gt, epsg, shape)?))
 }
 
 /// Sum the present delay layers (either may be absent) into one `(n_dates, rows,
@@ -107,9 +138,9 @@ fn build_ionosphere(
     date_files: &[PathBuf],
     n_dates: usize,
     (rows, cols): (usize, usize),
-    gt: [f64; 6],
-    epsg: u32,
+    geo: GeoInfo,
     freq: f64,
+    los: Option<&LosGeometry>,
 ) -> Result<Option<Array3<f64>>> {
     if opts.ionosphere_files.is_empty() {
         return Ok(None);
@@ -119,7 +150,10 @@ fn build_ionosphere(
         "expected {n_dates} ionosphere_files (one per date), got {}",
         opts.ionosphere_files.len()
     );
-    let (lon, lat) = grid_centroid_lonlat(gt, rows, cols, epsg)?;
+    let (lon, lat) = grid_centroid_lonlat(geo.geotransform, rows, cols, geo.epsg)?;
+    // Per-pixel incidence from geometry when supplied; else the scalar knob (whose
+    // uniform layer is numerically identical to the pre-geometry `.fill(delay)`).
+    let inc_grid = los.map(LosGeometry::incidence_deg);
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, ionex_path) in opts.ionosphere_files.iter().enumerate() {
         let utc_sec = date_files.get(t).map_or(43200.0, |p| acq_utc_sec(p));
@@ -127,10 +161,32 @@ fn build_ionosphere(
             .with_context(|| format!("reading IONEX {}", ionex_path.display()))?;
         let maps = read_ionex(&content).map_err(anyhow::Error::msg)?;
         let vtec = maps.value(utc_sec, lat, lon);
-        let delay = vtec_to_range_delay(vtec, opts.incidence_angle_deg, freq);
-        out.index_axis_mut(Axis(0), t).fill(delay);
+        let layer = iono_delay_layer(
+            vtec,
+            freq,
+            opts.incidence_angle_deg,
+            inc_grid.as_ref(),
+            (rows, cols),
+        );
+        out.index_axis_mut(Axis(0), t).assign(&layer);
     }
     Ok(Some(out))
+}
+
+/// One date's ionospheric delay layer: per-pixel incidence from `inc_grid` when
+/// present, else the scalar `inc_scalar_deg` filled uniformly (bit-identical to the
+/// pre-geometry path).
+fn iono_delay_layer(
+    vtec: f64,
+    freq: f64,
+    inc_scalar_deg: f64,
+    inc_grid: Option<&Array2<f64>>,
+    shape: (usize, usize),
+) -> Array2<f64> {
+    match inc_grid {
+        Some(inc) => inc.mapv(|i| vtec_to_range_delay(vtec, i, freq)),
+        None => Array2::from_elem(shape, vtec_to_range_delay(vtec, inc_scalar_deg, freq)),
+    }
 }
 
 /// Build the per-date tropospheric delay grid by resampling each OPERA L4 netCDF
@@ -141,6 +197,7 @@ fn build_troposphere(
     (rows, cols): (usize, usize),
     gt: [f64; 6],
     epsg: u32,
+    los: Option<&LosGeometry>,
 ) -> Result<Option<Array3<f64>>> {
     if opts.troposphere_files.is_empty() {
         return Ok(None);
@@ -150,16 +207,30 @@ fn build_troposphere(
         "expected {n_dates} troposphere_files (one per date), got {}",
         opts.troposphere_files.len()
     );
-    // ZTD is a zenith delay; project to line-of-sight by 1/cos(incidence), the
-    // same geometry the ionospheric term uses.
-    let slant = 1.0 / opts.incidence_angle_deg.to_radians().cos();
+    // ZTD is a zenith delay; project to line-of-sight by 1/cos(incidence) — per pixel
+    // (1/up) from geometry when supplied, else the scalar knob (bit-identical fill).
+    let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
         let grid = read_tropo(nc, &opts.troposphere_variable)?;
         let band = resample_to_frame(&grid, gt, epsg, (rows, cols), nc)?;
-        out.index_axis_mut(Axis(0), t).assign(&(band * slant));
+        out.index_axis_mut(Axis(0), t).assign(&(&band * &slant));
     }
     Ok(Some(out))
+}
+
+/// Per-pixel zenith→slant factor `1/cos(incidence)`: `1/up` from geometry when
+/// present, else the scalar factor filled uniformly (numerically identical to the
+/// pre-geometry `band * scalar_slant`).
+fn slant_grid(
+    inc_scalar_deg: f64,
+    los: Option<&LosGeometry>,
+    shape: (usize, usize),
+) -> Array2<f64> {
+    match los {
+        Some(g) => g.up.mapv(|u| 1.0 / u),
+        None => Array2::from_elem(shape, 1.0 / inc_scalar_deg.to_radians().cos()),
+    }
 }
 
 /// Read a tropospheric delay grid: `"total"` sums the real OPERA L4
@@ -296,7 +367,7 @@ mod tests {
             incidence_angle_deg: 0.0, // slant = 1, so zenith delay lands unscaled
             ..Default::default()
         };
-        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610)
+        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610, None)
             .unwrap()
             .expect("troposphere layers present");
 
@@ -354,6 +425,134 @@ mod tests {
         let mut disp = Array3::<f64>::zeros((1, 1, 1));
         let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
         assert!(err.to_string().contains("wavelength"));
+    }
+
+    /// Serialize HDF5 access across parallel tests in this crate's test binary —
+    /// `hdf5-metno` is not thread-safe (mirrors `dolphin_io`'s own test lock, which
+    /// is `pub(crate)` and so unreachable from here).
+    static HDF5_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hdf5_guard() -> std::sync::MutexGuard<'static, ()> {
+        HDF5_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Write a minimal CSLC-S1-STATIC HDF5 with *uniform* LOS (incidence θ, az 30°)
+    /// so a per-pixel resolve reproduces the scalar-incidence path.
+    fn write_uniform_static(path: &Path, inc_deg: f64, gt: [f64; 6], shape: (usize, usize)) {
+        let (rows, cols) = shape;
+        let inc = inc_deg.to_radians();
+        let az = 30.0_f64.to_radians();
+        let east = ndarray::Array2::from_elem((rows, cols), (-inc.sin() * az.sin()) as f32);
+        let north = ndarray::Array2::from_elem((rows, cols), (-inc.sin() * az.cos()) as f32);
+        let x: Vec<f64> = (0..cols)
+            .map(|c| gt[0] + (c as f64 + 0.5) * gt[1])
+            .collect();
+        let y: Vec<f64> = (0..rows)
+            .map(|r| gt[3] + (r as f64 + 0.5) * gt[5])
+            .collect();
+        let _ = std::fs::remove_file(path);
+        let f = hdf5::File::create(path).unwrap();
+        let g = f.create_group("data").unwrap();
+        g.new_dataset_builder()
+            .with_data(&east)
+            .create("los_east")
+            .unwrap();
+        g.new_dataset_builder()
+            .with_data(&north)
+            .create("los_north")
+            .unwrap();
+        g.new_dataset_builder()
+            .with_data(&x)
+            .create("x_coordinates")
+            .unwrap();
+        g.new_dataset_builder()
+            .with_data(&y)
+            .create("y_coordinates")
+            .unwrap();
+        g.new_dataset::<i64>()
+            .create("projection")
+            .unwrap()
+            .write_scalar(&32610_i64)
+            .unwrap();
+    }
+
+    /// Bar #3: a STATIC product encoding a *uniform* incidence θ, driving the
+    /// per-pixel iono+tropo path, reproduces the scalar `incidence_angle_deg = θ`
+    /// path to the LOS **f32 quantization** floor (~5e-8; the product stores
+    /// los_east/north as float32, so this is the tightest honest bound — not 1e-9,
+    /// and NOT literal bit-equality). The exact-to-roundoff invariant is the *None*
+    /// path (`from_elem(scalar)` == the old `fill(scalar)`), covered by
+    /// `disabled_is_noop` / `build_troposphere_warps_*`. This test guards the *Some*
+    /// path: a future "simplify" that breaks the geometry derivation blows 1e-6.
+    #[test]
+    fn uniform_geometry_matches_scalar_path() {
+        let _hdf5 = hdf5_guard();
+        let theta = 38.5_f64;
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_uniform_bar3.h5");
+        write_uniform_static(&path, theta, gt, (4, 4));
+        let layers = vec![read_los_layers(&path, "/data").unwrap()];
+        let los = resolve_los_geometry(&layers, gt, 32610, (4, 4)).unwrap();
+
+        // Tropo slant: per-pixel 1/up vs scalar 1/cos(theta).
+        let scalar = 1.0 / theta.to_radians().cos();
+        let per_pixel = slant_grid(theta, Some(&los), (4, 4));
+        for &v in per_pixel.iter() {
+            assert!((v - scalar).abs() < 1e-6, "slant {v} vs {scalar}");
+        }
+        // Iono delay: per-pixel incidence vs scalar, at a representative TEC/freq.
+        let (vtec, freq) = (25.0, SPEED_OF_LIGHT / 0.055);
+        let inc_grid = los.incidence_deg();
+        let pp = iono_delay_layer(vtec, freq, theta, Some(&inc_grid), (4, 4));
+        let sc = iono_delay_layer(vtec, freq, theta, None, (4, 4));
+        for (a, b) in pp.iter().zip(sc.iter()) {
+            let tol = 1e-6 * b.abs().max(1.0);
+            assert!((a - b).abs() < tol, "iono {a} vs {b}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bar #5: a geometry-only config (no iono/tropo, no wavelength) still resolves
+    /// and returns `LosGeometry`, leaving displacement untouched — proves the gate
+    /// decoupling from `is_enabled()`/wavelength.
+    #[test]
+    fn geometry_only_config_resolves_without_wavelength() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_geom_only_bar5.h5");
+        write_uniform_static(&path, 34.0, gt, (3, 3));
+        let opts = CorrectionOptions {
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, r, c)| (t + r + c) as f64);
+        let original = disp.clone();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32610, gt).unwrap();
+
+        assert!(layers.ionosphere.is_none() && layers.troposphere.is_none());
+        let los = layers.los_geometry.expect("geometry present");
+        assert!((los.incidence_deg()[(1, 1)] - 34.0).abs() < 1e-3);
+        assert_eq!(disp, original, "geometry-only must not touch displacement");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A missing geometry file surfaces a contextual error (not a panic), naming the
+    /// offending path — the `resolve_geometry` read-error path.
+    #[test]
+    fn missing_geometry_file_errors_with_context() {
+        let opts = CorrectionOptions {
+            geometry_files: vec![PathBuf::from("/nonexistent/static_geometry.h5")],
+            ..Default::default()
+        };
+        let mut disp = Array3::<f64>::zeros((1, 2, 2));
+        let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
+        assert!(
+            err.to_string().contains("CSLC-S1-STATIC geometry")
+                || format!("{err:#}").contains("static_geometry.h5"),
+            "expected contextual geometry read error, got: {err:#}"
+        );
     }
 
     /// Time token parsing: OPERA-style stamp → seconds of day; date-only → noon.

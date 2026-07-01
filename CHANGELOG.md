@@ -4,6 +4,36 @@ All notable changes to dolphinRust are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Per-pixel LOS geometry ingest from OPERA CSLC-S1-STATIC.** The atmospheric-correction
+  stage no longer projects zenith→line-of-sight with a single scalar `incidence_angle_deg`:
+  when `correction_options.geometry_files` are supplied (per-burst CSLC-S1-STATIC granules),
+  `dolphin-io::read_los_layers` reads the ground→sensor LOS unit-vector components
+  (`/data/los_east`, `/data/los_north`), and `dolphin-corrections::resolve_los_geometry`
+  reprojects + mosaics them onto the frame grid (first-covered-burst wins), deriving
+  `up = sqrt(max(0, 1−e²−n²))` and per-pixel incidence `acos(up)` — character-identical to
+  dolphin `atmosphere/ionosphere.py`. The iono/tropo slant then uses per-pixel `1/up`; with
+  no geometry files the scalar path is **exactly bit-identical** to before. The resolved
+  `LosGeometry{east,north,up}` is exposed on `DisplacementOutput.los_geometry` as the front
+  door for the MMX1-colocated GPS ground-truth harness. Coverage is **fail-loud**: a frame
+  extending beyond the supplied STATIC footprint (or a NaN/nodata hole) is a hard error, never
+  a silent 0°/nadir pixel. Design: `md/design/per-pixel-los-geometry.md`; follow-up harness:
+  `md/research/gps-feasibility-spike.md` §3.
+
+### Fixed
+- **Flaky HDF5 unit tests in `dolphin-io`.** `hdf5-metno` links a non-thread-safe HDF5, so
+  parallel test threads creating/opening HDF5 fixtures raced and corrupted global library
+  state (intermittent `geo`/`nisar`/geometry failures). HDF5-touching unit tests now serialize
+  through a shared test lock.
+
+### Deferred
+- iono **ground→ionospheric-shell (450 km) incidence mapping** (pre-existing divergence from
+  dolphin, not introduced here; the per-pixel path reproduces today's *ground*-incidence
+  behavior); `local_incidence_angle` ingest; nearest-vs-bilinear resample at burst seams
+  (single-burst consumer unaffected). See the design doc's Deferred section.
+
 ## [v1.4.0] — 2026-06-18
 
 ### Changed

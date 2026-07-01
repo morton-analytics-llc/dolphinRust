@@ -36,6 +36,11 @@ pub enum CorrectionError {
     /// a WKT nor an EPSG to reproject from.
     #[error("tropospheric source grid has no CRS (WKT/EPSG) to warp from")]
     NoSourceCrs,
+    /// The supplied CSLC-S1-STATIC geometry granules do not cover the whole frame
+    /// (or none were supplied) — resolving LOS geometry would leave silent 0°/nadir
+    /// pixels, so it is a hard error instead.
+    #[error("los geometry coverage: {0}")]
+    GeometryCoverage(String),
     /// RAiDER was requested but is not installed (no `python -c 'import RAiDER'`
     /// and no `raider.py` on PATH). Gated like SNAPHU — never stubbed.
     #[error("RAiDER is not installed; install it or supply troposphere_files (OPERA L4)")]

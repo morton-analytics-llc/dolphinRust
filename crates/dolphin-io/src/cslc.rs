@@ -80,6 +80,7 @@ mod tests {
     /// relies on for whole-burst bit-identity.
     #[test]
     fn window_read_matches_full_read_sliced() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
         let path = std::env::temp_dir().join("dolphin_cslc_window_contract.h5");
         let full = Array2::from_shape_fn((40, 50), |(r, c)| {
             Cf32::new(r as f32 - 3.0, (c * 2) as f32 + 0.5)

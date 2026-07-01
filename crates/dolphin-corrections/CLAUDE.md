@@ -35,6 +35,23 @@ modelling + raster subtraction, no solver.
   (`raider.py` subprocess) — **gated behind an availability check like SNAPHU, never
   stubbed**; absent ⇒ `RaiderUnavailable` and the path is skipped (deferred), not faked.
 
+- **Per-pixel LOS geometry (`geometry.rs`).** Ingests the OPERA **CSLC-S1-STATIC** companion
+  product's ground→sensor LOS unit-vector components (`/data/los_east`, `/data/los_north`, f32,
+  read by `dolphin-io::read_los_layers`) and resolves them onto the frame grid, replacing the
+  scalar `incidence_angle_deg` when supplied. `up = +sqrt(max(0, 1−e²−n²))`, ellipsoidal
+  incidence `= acos(up)·180/π` (character-identical to dolphin `atmosphere/ionosphere.py`; this
+  is the ellipsoid-normal angle the zenith→slant `1/cos` mapping needs — **not**
+  `local_incidence_angle`, which is terrain-relative). Atmospheric slant is then per-pixel
+  `1/up`. **CSLC-S1-STATIC is per-burst**, so a multi-burst frame needs the per-burst granule
+  list, mosaicked (first-covered-burst wins). **Nodata rule matches dolphin (`nodata=0`):** every
+  component is reprojected via `warp_to_frame` (GDAL fills off-coverage with exactly 0), so a
+  frame pixel is valid iff `east≠0 || north≠0` and finite; for S1 (incidence 30–46°) a valid
+  pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Partial coverage is a
+  **hard `GeometryCoverage` error, never a silent 0°/nadir pixel.** The resolved
+  `LosGeometry{east,north,up}` is also the front door for the GPS ENU→LOS harness
+  (`d_los = d_e·east + d_n·north + d_u·up`, ground→sensor). Design + deferrals (iono ground→shell
+  mapping, seam nearest-resample): `md/design/per-pixel-los-geometry.md`.
+
 ## Config (dolphin parity + forward divergence)
 
 `CorrectionOptions` mirrors dolphin's `ionosphere_files` / `geometry_files` / `dem_file`

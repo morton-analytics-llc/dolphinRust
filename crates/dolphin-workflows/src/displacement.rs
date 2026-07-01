@@ -33,6 +33,7 @@ use crate::sequential::{
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
+use dolphin_corrections::LosGeometry;
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
@@ -84,6 +85,10 @@ pub struct DisplacementOutput {
     /// subtracted from the series. `None` unless `correction_options.troposphere_files`
     /// were supplied.
     pub troposphere_delay: Option<Array3<f64>>,
+    /// Per-pixel LOS unit-vector geometry (east/north/up) on the output grid. `None`
+    /// unless `correction_options.geometry_files` (CSLC-S1-STATIC) were supplied. The
+    /// front door for the GPS ground-truth harness's ENU→LOS projection.
+    pub los_geometry: Option<LosGeometry>,
 }
 
 /// Run `f`, emitting its wall-clock under `stage` at INFO (`stage` + `elapsed_s`
@@ -223,6 +228,7 @@ fn finish_displacement(
         reference_point,
         ionosphere_delay: corrections.ionosphere,
         troposphere_delay: corrections.troposphere,
+        los_geometry: corrections.los_geometry,
     })
 }
 

@@ -18,11 +18,13 @@
 
 pub mod apply;
 pub mod error;
+pub mod geometry;
 pub mod ionosphere;
 pub mod raider;
 pub mod troposphere;
 
 pub use apply::subtract_delay;
 pub use error::{CorrectionError, Result};
+pub use geometry::{resolve_los_geometry, LosGeometry};
 pub use ionosphere::{read_ionex, vtec_to_range_delay, IonexMaps, K_IONO, SPEED_OF_LIGHT};
 pub use troposphere::{read_l4_netcdf, resample_bilinear, DelayGrid};
