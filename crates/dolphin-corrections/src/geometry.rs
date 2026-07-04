@@ -39,6 +39,42 @@ impl LosGeometry {
     pub fn incidence_deg(&self) -> Array2<f64> {
         self.up.mapv(|u| u.acos().to_degrees())
     }
+
+    /// Spatial statistics of the ellipsoidal incidence angle over finite pixels
+    /// (full frame coverage is already enforced by [`resolve_los_geometry`], so the
+    /// finite filter is defensive, not load-bearing). `None` when no pixel is
+    /// finite. Std is the population std (numpy `ddof=0`).
+    #[must_use]
+    pub fn incidence_stats(&self) -> Option<IncidenceStats> {
+        let inc = self.incidence_deg();
+        let finite: Vec<f64> = inc.iter().copied().filter(|d| d.is_finite()).collect();
+        if finite.is_empty() {
+            return None;
+        }
+        let count = finite.len() as f64;
+        let mean_deg = finite.iter().sum::<f64>() / count;
+        let sum_sq = finite.iter().map(|d| d * d).sum::<f64>();
+        let variance = (sum_sq / count - mean_deg * mean_deg).max(0.0);
+        Some(IncidenceStats {
+            mean_deg,
+            std_deg: variance.sqrt(),
+            min_deg: finite.iter().copied().fold(f64::INFINITY, f64::min),
+            max_deg: finite.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
+    }
+}
+
+/// Spatial statistics of the per-pixel ellipsoidal incidence angle, degrees.
+#[derive(Debug, Clone, Copy)]
+pub struct IncidenceStats {
+    /// Mean over finite pixels.
+    pub mean_deg: f64,
+    /// Population standard deviation (numpy `ddof=0`).
+    pub std_deg: f64,
+    /// Minimum.
+    pub min_deg: f64,
+    /// Maximum.
+    pub max_deg: f64,
 }
 
 /// Resolve per-pixel LOS geometry onto the frame grid from one-or-more per-burst
