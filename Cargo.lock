@@ -657,6 +657,7 @@ dependencies = [
  "num-complex",
  "rayon",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tracing",
  "tracing-subscriber",

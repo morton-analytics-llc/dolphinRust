@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod cslc;
+pub mod cslc_metadata;
 pub mod error;
 pub mod geo;
 pub mod geometry;
@@ -19,6 +20,10 @@ pub mod nisar;
 pub mod nisar_fixture;
 
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
+pub use cslc_metadata::{
+    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, CslcBurstMetadata,
+    CslcIdentification, CslcOrbit,
+};
 pub use error::{IoError, Result};
 pub use geo::{read_geotransform, GeoInfo};
 pub use geometry::{read_los_layers, LosLayers};

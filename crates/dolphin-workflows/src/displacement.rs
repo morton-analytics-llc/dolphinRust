@@ -27,6 +27,7 @@ use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::dates::decimal_days;
+use crate::provenance::GeometryProvenance;
 use crate::sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
@@ -89,6 +90,10 @@ pub struct DisplacementOutput {
     /// unless `correction_options.geometry_files` (CSLC-S1-STATIC) were supplied. The
     /// front door for the GPS ground-truth harness's ENU→LOS projection.
     pub los_geometry: Option<LosGeometry>,
+    /// Geometry provenance for asc/desc decomposition gating (dolphinRust #1 /
+    /// eo #120), mirrored on disk as `geometry_provenance.json`. Always present;
+    /// unsourceable fields are explicitly absent inside it, never defaulted.
+    pub geometry_provenance: GeometryProvenance,
 }
 
 /// Run `f`, emitting its wall-clock under `stage` at INFO (`stage` + `elapsed_s`
@@ -203,6 +208,8 @@ fn finish_displacement(
         crlb_sigma: crlb_sigma.as_ref(),
         closure_phase: closure_phase.as_ref(),
     };
+    let geometry_provenance =
+        crate::provenance::assemble_geometry_provenance(cfg, corrections.los_geometry.as_ref());
     timed("write", || -> Result<()> {
         write_outputs(
             cfg,
@@ -213,7 +220,8 @@ fn finish_displacement(
             epsg,
             geotransform,
         )?;
-        write_correction_outputs(cfg, &corrections, epsg, geotransform)
+        write_correction_outputs(cfg, &corrections, epsg, geotransform)?;
+        crate::provenance::write_geometry_provenance(&cfg.work_directory, &geometry_provenance)
     })?;
     Ok(DisplacementOutput {
         displacement,
@@ -229,6 +237,7 @@ fn finish_displacement(
         ionosphere_delay: corrections.ionosphere,
         troposphere_delay: corrections.troposphere,
         los_geometry: corrections.los_geometry,
+        geometry_provenance,
     })
 }
 
