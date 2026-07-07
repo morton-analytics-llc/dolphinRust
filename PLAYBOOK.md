@@ -303,13 +303,18 @@ integration glue (bindings + subprocess) and can proceed in parallel once core t
 GroundPulse is the consumer — a Rust monorepo (Axum/tokio/sqlx, PostGIS + TimescaleDB,
 Postgres `SKIP LOCKED` task queue; S3 via `gp-storage`/aws-sdk-s3; GDAL + HDF5).
 
-**GroundPulse is adopting the Python `dolphin` now.** dolphinRust is its **optimized Rust
-drop-in replacement** — same algorithms, same workflow surface, faster. This sets the bar:
+**GroundPulse consumes dolphinRust in production:** eo vendors this repo as a git
+submodule (`vendor/dolphinRust`), and its standalone `gp-dolphin` worker crate links
+`dolphin-workflows` (`no-gpu` feature — CPU path for GPU-less Fargate). Merging here is
+**not** deployment — GP picks up changes only when its submodule pin is bumped
+(human-gated). dolphinRust is the Python `dolphin`'s **optimized Rust drop-in
+replacement** — same algorithms, same workflow surface, faster. This sets the bar:
 
-- **Match the Python dolphin GP runs, end to end.** Since GP runs Python dolphin in
-  production, the cleanest oracle is GP's own production output: dolphinRust must reproduce
-  it within the §Correctness tolerances. Migration = "swap `dolphin run` for dolphinRust,
-  confirm equivalent displacement."
+- **Match the pinned Python dolphin, end to end.** GP runs dolphinRust in production,
+  so the oracle is the pinned upstream dolphin v0.35.0: dolphinRust must reproduce its
+  output within the §Correctness tolerances. The migration ("swap `dolphin run` for
+  dolphinRust, confirm equivalent displacement") is complete; the pinned oracle remains
+  the parity bar for every change.
 - **Full scope, not just the front half.** Mirror dolphin's whole pipeline including
   timeseries/SBAS (Phase 6). GP's existing `gp-displacement` SBAS (`sbas.rs`, Berardino
   2002) becomes legacy once it moves to dolphin; dolphinRust replaces *dolphin's*

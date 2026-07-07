@@ -5,8 +5,9 @@ performance. This is **not a port**: the Python `dolphin` library is the algorit
 reference (the scientific spec), not a line-by-line target. We choose the data layouts,
 solvers, and parallelism that are fastest in Rust, and validate that results are
 *scientifically correct* — against analytic fixtures and dolphin as a reference oracle, to
-physically-meaningful tolerances, not bit-exactness. **v1.0.0 is the first complete build**
-— end-to-end displacement from a real CSLC burst stack.
+physically-meaningful tolerances, not bit-exactness. **v1.0.0 (2026-06-16) was the first
+complete build** — end-to-end displacement from a real CSLC burst stack; see CHANGELOG.md
+for releases since.
 
 Domain knowledge is **dispersed**: each crate carries its own `CLAUDE.md` with the InSAR
 math and conventions specific to it. Read the crate's `CLAUDE.md` before working in it. The
@@ -52,8 +53,10 @@ parity/contract test. Report failures with output; never claim success unverifie
 
 ## Host app
 
-GroundPulse (`../eo`) is adopting the Python `dolphin` now; dolphinRust is its **optimized
-Rust drop-in replacement** — same algorithms and workflow surface, faster. It is consumed
-as a synchronous library; GroundPulse bridges to its tokio runtime via `spawn_blocking`.
-The cleanest correctness oracle is GP's own production dolphin output. See PLAYBOOK.md
-§GroundPulse integration.
+GroundPulse (`../eo`) consumes dolphinRust **in production**: eo vendors this repo as a git
+submodule (`vendor/dolphinRust`), and its standalone `gp-dolphin` worker crate links
+`dolphin-workflows` (`no-gpu` feature — CPU path for GPU-less Fargate) as a synchronous
+library, bridging to its tokio runtime via `spawn_blocking`. Merging here is **not**
+deployment — GP picks up changes only when its submodule pin is bumped (human-gated). The
+cleanest correctness oracle is GP's own production output. See PLAYBOOK.md §GroundPulse
+integration.
