@@ -524,3 +524,80 @@ validation/run_real.sh validation/real_data/cropped_mexico real_mexico_T005     
 oracle/.venv/bin/python validation/velocity_scale.py \
     --run validation/runs/real_mexico_T005                                        # OLS + TLS scale
 ```
+
+## Independent GNSS ground truth — MMX1/ICMX harness (2026-07-09)
+
+The validation harness is implemented under `validation/` with a tracked, versioned recipe at
+`validation/gps_mmx1.json`. It does not use Python dolphin, native MCF, or SNAPHU as truth. NGL
+IGS20 daily-final ENU is projected with the actual per-pixel CSLC-S1-STATIC ground-to-sensor LOS,
+then compared with both unwrap backends in millimeters.
+
+The pipeline spatially references every epoch. Therefore the 384×384 MMX1 core fixture is a
+data/coherence/sign smoke gate only. The magnitude gate requires the second common frame and
+compares `MMX1 - ICMX` on both sides; a common InSAR reference offset cancels exactly. The harness
+rejects magnitude scoring on the core crop.
+
+Implemented surfaces:
+
+- `fetch_real.py`: exact 13-epoch selection, matching `CSLC-STATIC`, dry-run, idempotent hashes,
+  fail-loud HDF5 checks, credential-safe `--static-only` preflight.
+- `crop_real.py`: backward-compatible pixel crops plus coordinate-driven core/common fixtures,
+  paired CSLC/STATIC bounds on their own grids, preserved identification/metadata, fixture hashes.
+- `gps_ground_truth.py`: documented 23-column tenv3 parser, bounded/labeled date interpolation,
+  exact ENU dot LOS projection, fixed window sensitivity, reference cancellation, OLS/TLS and
+  residual metrics, versioned JSON/CSV/SVG artifacts.
+- `run_gps_ground_truth.py`: native/SNAPHU configs derived from one base and asserted identical
+  except backend/work directory, sourced-geometry checks, run receipts, common-frame scoring.
+- `validation/tests/test_gps_*.py`: 22 synthetic contracts covering acquisition, crops, GNSS,
+  projection/sign, reference cancellation, metrics, artifacts, and config identity.
+
+Current verification is deliberately split:
+
+- **Local/synthetic — PASS:** 22 GNSS harness contracts; Python compile; config generation and
+  ruamel YAML round-trip against the existing 13-file T005 crop.
+- **Live acquisition preflight — PASS:** ASF resolves exactly the declared 13 CSLC v1.1 epochs
+  plus one T005 CSLC-S1-STATIC v1.0 product. `GP_EARTHDATA_TOKEN` authenticated a real 161.6 MB
+  STATIC transfer; HDF5 datasets and SHA-256 were validated. The STATIC identity is
+  `t005_008704_iw1`, **Ascending**, EPSG:32614, shape 4866×19818. Both stations are covered and
+  have valid unit LOS: MMX1 `[-0.521388, -0.102801, +0.847105]`; ICMX
+  `[-0.510045, -0.100897, +0.854210]`.
+- **Live GNSS preflight — PASS:** all ICMX epochs are exact daily solutions; MMX1 has 12 exact
+  epochs and one declared linear interpolation for 2023-03-05 between 2023-03-03/07. Projected
+  endpoints are MMX1 −101.839 mm, ICMX +2.424 mm, and common differential −104.262 mm. This is
+  GNSS/geometry evidence only, not an InSAR pass.
+- **Full live pipeline/scoring — NOT RUN:** the cataloged HDF5 source transfer is 3.55 GB before
+  crops and four backend runs, while the host currently has only about 12 GiB free at 99% disk
+  utilization. No native/SNAPHU ground-truth result is claimed until safe headroom is available.
+
+Reproduce the verified contracts and preflight:
+
+```sh
+oracle/.venv/bin/python -m unittest discover -s validation/tests -p 'test_gps_*.py'
+oracle/.venv/bin/python -m compileall validation
+source validation/creds.sh
+oracle/.venv/bin/python validation/fetch_real.py \
+    --recipe validation/gps_mmx1.json --with-static --dry-run
+oracle/.venv/bin/python validation/fetch_real.py \
+    --recipe validation/gps_mmx1.json --static-only
+```
+
+Once disk headroom exists, run the full gate in order:
+
+```sh
+source validation/creds.sh
+oracle/.venv/bin/python validation/fetch_real.py \
+    --recipe validation/gps_mmx1.json --with-static
+oracle/.venv/bin/python validation/crop_real.py \
+    --recipe validation/gps_mmx1.json --fixture mmx1_core
+oracle/.venv/bin/python validation/run_gps_ground_truth.py \
+    --recipe validation/gps_mmx1.json --fixture mmx1_core --build
+oracle/.venv/bin/python validation/crop_real.py \
+    --recipe validation/gps_mmx1.json --fixture mmx1_icmx_common
+oracle/.venv/bin/python validation/run_gps_ground_truth.py \
+    --recipe validation/gps_mmx1.json --fixture mmx1_icmx_common --score
+```
+
+Initial result bars remain provisional: endpoint sign agreement, absolute endpoint residual
+≤20 mm, TLS slope 0.85–1.15, and correlation ≥0.90. Atmospheric corrections are held identical
+between backends; if left off, the GNSS residual includes atmosphere and must not be attributed
+solely to unwrapping. One station pair is not sufficient evidence to change the default backend.

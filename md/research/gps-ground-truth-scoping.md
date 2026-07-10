@@ -4,6 +4,12 @@
 **Scope:** research only — no pipeline code, no test stubs written.
 **Question:** can we close the "no absolute ground truth" gap on the Mexico T005 burst fixture, and is it worth doing now?
 
+> **Implementation update (2026-07-09):** the recommended follow-on harness is implemented;
+> see `md/plans/gps-mmx1-aoi-harness.md` and `VALIDATION.md`. It adds an MMX1-centered core crop
+> plus a shared MMX1/ICMX frame: the station-pair differential cancels the displacement
+> pipeline's spatial reference, which a single MMX1-only crop cannot. Synthetic contracts and
+> live acquisition/GNSS preflight pass; the full real pipeline run remains data/disk-gated.
+
 ## Executive summary
 
 The Mexico T005 fixture sits in the single most extreme, best-instrumented subsidence

@@ -7,6 +7,15 @@ if sign+order-of-magnitude agree, build the full harness on a **new GPS-colocate
 data/geometry, not algorithm.
 **Fixture window:** 2023-01-04 (epoch 0) .. 2023-06-09 (epoch 12), burst T005-008704-IW1.
 
+> **Implementation update (2026-07-09):** the harness is implemented in
+> `validation/{fetch_real.py,crop_real.py,gps_ground_truth.py,run_gps_ground_truth.py}`
+> with its tracked contract in `validation/gps_mmx1.json`; see
+> `md/plans/gps-mmx1-aoi-harness.md` and `VALIDATION.md`. Live ASF catalog and bearer-token
+> authentication pass, and the matching 161.6 MB STATIC transferred and validated. Its actual
+> `/identification/orbit_pass_direction` is **Ascending**, so the spike's approximate descending
+> projection below is historical context only; the harness uses the signed per-pixel STATIC LOS.
+> Full CSLC acquisition and InSAR scoring are still unrun due local disk headroom.
+
 ## 1. What the spike found
 
 Both sides are available. GNSS acquired live/clean; InSAR product already on disk.
