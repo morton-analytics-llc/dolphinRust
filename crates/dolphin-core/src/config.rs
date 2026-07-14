@@ -45,8 +45,8 @@ pub enum CompressedSlcPlan {
 pub enum UnwrapMethod {
     /// SNAPHU statistical-cost network-flow unwrapper. Selectable fallback; the
     /// default is [`UnwrapMethod::Native`], which matches SNAPHU per-component to
-    /// <=0.5% but unwraps in-process (no subprocess) and wins frames/hour ~10x at
-    /// production concurrency.
+    /// <=0.5% but unwraps in-process with lower subprocess and scratch-I/O
+    /// overhead.
     Snaphu,
     /// tophu multi-scale driver over the SNAPHU per-tile solver (coarse init →
     /// overlapping tiled SNAPHU → 2π-reconciled merge). dolphin reserves its
@@ -63,12 +63,12 @@ pub enum UnwrapMethod {
     /// Whirlwind unwrapper.
     Whirlwind,
     /// Clean-room in-process native unwrapper (Costantini MCF via network
-    /// simplex, no SNAPHU subprocess) — **the default**. Fine auto-tiling makes
-    /// its per-component parity match SNAPHU to <=0.5% across tile counts while
-    /// winning latency (~14x) and throughput (~10x at concurrency) with lower
-    /// RSS. `unwrap_options.snaphu_options.ntiles` overrides the auto tiling;
-    /// per-frame thread count (`n_parallel_jobs`/the rayon pool) is the
-    /// latency-vs-throughput dial. Set `unwrap_method: snaphu` to fall back.
+    /// simplex, no SNAPHU subprocess) — **the default**. Auto-tiling keeps a
+    /// 64-pixel core floor, which holds the <=0.5% SNAPHU-parity contract on the
+    /// MMX1 live common frame while remaining faster there. Explicit
+    /// `unwrap_options.snaphu_options.ntiles` overrides auto-tiling; per-frame
+    /// thread count (`n_parallel_jobs`/the rayon pool) is the latency/throughput
+    /// dial. Set `unwrap_method: snaphu` to fall back.
     #[default]
     Native,
 }

@@ -28,15 +28,15 @@ routing through noise, not a clean analytic field.
 `cargo run --release --example real_burst_validation -p dolphin-unwrap`
 (`REAL_IFG_DIR` selects the fixture). For each fixture the harness runs a **fresh
 SNAPHU oracle subprocess** (smooth cost, MCF init, single tile — black-box, never
-linked/read) and the native solver in two configs: the production fine-tiled
-default (~48 px cores → 8×8 here) and the global single-MCF solve. Metric is the
+linked/read) and the native solver in two configs: the production tiled default
+(at least 64 px per core → 6×6 here) and the global single-MCF solve. Metric is the
 same per-connected-component cycle disagreement the seam contracts use — grouped
 by the **SNAPHU** component labels, modal integer offset per component, fraction
 of pixels deviating — reported over all component pixels and restricted to
 **trusted** pixels (coherence ≥ 0.5). Connected-component agreement is the
 reliable-mask IoU vs SNAPHU.
 
-## Results (measured)
+## Results (measured with the former 48-pixel / 8×8 default)
 
 | fixture (baseline) | config | per-comp all-px | per-comp coh≥0.5 | mask-IoU | wall |
 |---|---|---|---|---|---|
@@ -46,6 +46,8 @@ reliable-mask IoU vs SNAPHU.
 | `real_ifg_short` (short) | native-global | 2.296% | **1.588%** | 0.890 | 4.59 s |
 
 SNAPHU found 2 components on the long-baseline scene, 1 on the short.
+The 2026-07-14 MMX1 live gate superseded the 48-pixel production floor with 64
+pixels; rerun this harness before treating the historical timing rows as current.
 
 ## Interpretation — honest
 

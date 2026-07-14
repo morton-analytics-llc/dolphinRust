@@ -324,7 +324,14 @@ fn collect_seams(
     votes
         .into_iter()
         .map(|((lo, hi), tally)| {
-            let (diff, _) = tally.iter().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            let (diff, _) = tally
+                .iter()
+                .max_by(|a, b| {
+                    a.1.total_cmp(b.1)
+                        .then_with(|| b.0.abs().cmp(&a.0.abs()))
+                        .then_with(|| b.0.cmp(a.0))
+                })
+                .unwrap();
             Seam {
                 lo,
                 hi,
@@ -344,7 +351,15 @@ fn wrap_to_pi(x: f64) -> f64 {
 /// from each tree root (offset 0). Returns `offset[region]`, index 0 unused.
 fn spanning_offsets(n_regions: usize, seams: &[Seam]) -> Vec<i64> {
     let mut order: Vec<usize> = (0..seams.len()).collect();
-    order.sort_by(|&a, &b| seams[b].weight.total_cmp(&seams[a].weight));
+    order.sort_by(|&a, &b| {
+        seams[b]
+            .weight
+            .total_cmp(&seams[a].weight)
+            .then_with(|| seams[a].lo.cmp(&seams[b].lo))
+            .then_with(|| seams[a].hi.cmp(&seams[b].hi))
+            .then_with(|| seams[a].diff.abs().cmp(&seams[b].diff.abs()))
+            .then_with(|| seams[a].diff.cmp(&seams[b].diff))
+    });
     let mut uf = UnionFind::new(n_regions);
     let mut adj: Vec<Vec<(u32, i64)>> = vec![Vec::new(); n_regions];
     for &e in &order {
@@ -457,4 +472,59 @@ fn tile_offsets(n_tiles: usize, reg: &Regions, offset: &[i64]) -> Vec<i64> {
         }
     }
     off
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_weight_seams_are_order_independent() {
+        let seams = [
+            Seam {
+                lo: 1,
+                hi: 2,
+                diff: 0,
+                weight: 1.0,
+            },
+            Seam {
+                lo: 2,
+                hi: 3,
+                diff: 0,
+                weight: 1.0,
+            },
+            Seam {
+                lo: 1,
+                hi: 3,
+                diff: 1,
+                weight: 1.0,
+            },
+        ];
+        let reversed = [
+            Seam {
+                lo: 1,
+                hi: 3,
+                diff: 1,
+                weight: 1.0,
+            },
+            Seam {
+                lo: 2,
+                hi: 3,
+                diff: 0,
+                weight: 1.0,
+            },
+            Seam {
+                lo: 1,
+                hi: 2,
+                diff: 0,
+                weight: 1.0,
+            },
+        ];
+
+        assert_eq!(
+            spanning_offsets(4, &seams),
+            spanning_offsets(4, &reversed),
+            "equal-reliability seam cycles must not depend on HashMap iteration order"
+        );
+    }
 }

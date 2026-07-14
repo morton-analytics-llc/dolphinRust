@@ -846,12 +846,14 @@ fn native_config(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> NativeConf
     }
 }
 
-/// Native fine auto-tiling: split each axis into ~`TARGET_TILE`-pixel cores, the
-/// throughput optimum (measured CPU·s minimum at ~48 px; finer than that and the
-/// fixed seam overlap dominates, coarser and the network simplex's superlinear
-/// residue cost dominates). Grids below `2 * TARGET_TILE` per axis stay untiled.
+/// Native auto-tiling: keep every core at least `TARGET_TILE` pixels per axis.
+/// The former 48-pixel floor was the microbenchmark throughput optimum, but the
+/// MMX1 common-frame live contract exposed unstable seam-graph branches at that
+/// granularity (2.90-11.73% cycle disagreement). A 64-pixel floor holds the
+/// shipped <=0.5% SNAPHU-parity bar while retaining fine-grained MCF solves.
+/// Grids below `2 * TARGET_TILE` per axis stay untiled.
 fn native_tiling((rows, cols): (usize, usize)) -> Option<(usize, usize)> {
-    const TARGET_TILE: usize = 48;
+    const TARGET_TILE: usize = 64;
     let per_axis = |n: usize| (n / TARGET_TILE).max(1);
     let tiles = (per_axis(rows), per_axis(cols));
     (tiles != (1, 1)).then_some(tiles)
@@ -1029,6 +1031,15 @@ mod tests {
     use super::*;
     use dolphin_core::config::ComputeBackend;
     use dolphin_core::{HalfWindow, Strides};
+
+    #[test]
+    fn native_tiling_keeps_mmx1_common_frame_above_stable_core_floor() {
+        assert_eq!(
+            native_tiling((352, 2217)),
+            Some((5, 34)),
+            "MMX1 live parity fails with the old 7x46 approximately 48px cores"
+        );
+    }
 
     /// A deterministic complex stack with spatial + temporal structure, so the
     /// coherence estimate is non-degenerate and tile boundaries actually matter.

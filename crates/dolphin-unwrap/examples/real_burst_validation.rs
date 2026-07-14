@@ -127,9 +127,9 @@ fn snaphu_oracle(ifg: &Array2<Cf32>, corr: &Array2<f32>) -> UnwrapResult {
     snaphu::unwrap(ifg.view(), corr.view(), &cfg, &scratch).expect("snaphu oracle")
 }
 
-/// Production fine auto-tiling: ~48px cores (matches `dolphin-workflows`).
+/// Production auto-tiling: cores are at least 64 px (matches `dolphin-workflows`).
 fn fine_tiles(n: usize) -> (usize, usize) {
-    let t = (n / 48).max(1);
+    let t = (n / 64).max(1);
     (t, t)
 }
 

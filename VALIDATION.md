@@ -565,9 +565,24 @@ Current verification is deliberately split:
   epochs and one declared linear interpolation for 2023-03-05 between 2023-03-03/07. Projected
   endpoints are MMX1 −101.839 mm, ICMX +2.424 mm, and common differential −104.262 mm. This is
   GNSS/geometry evidence only, not an InSAR pass.
-- **Full live pipeline/scoring — NOT RUN:** the cataloged HDF5 source transfer is 3.55 GB before
-  crops and four backend runs, while the host currently has only about 12 GiB free at 99% disk
-  utilization. No native/SNAPHU ground-truth result is claimed until safe headroom is available.
+- **Full live acquisition/crops — PASS (2026-07-14):** all 13 declared CSLCs plus STATIC were
+  downloaded and hash/HDF5-identity validated. The 384×384 MMX1 core and 352×2217 shared
+  MMX1/ICMX fixtures were built from those full products. Both backends produced fully finite
+  outputs with sourced geometry.
+- **Initial full scoring — native FAIL / SNAPHU PASS:** the former native 48-pixel auto-tile
+  floor used 7×46 tiles. SNAPHU passed all provisional bars. Native agreed through the first 12
+  epochs, then placed MMX1 inside a localized one-cycle (27.733 mm) final-epoch branch and missed
+  the TLS ceiling (1.1545 vs 1.15). Repeated fresh processes varied between 2.90% and 11.73%
+  per-component cycle disagreement because equal-reliability seam ties inherited randomized
+  `HashMap` iteration order.
+- **Corrected full scoring — PASS (2026-07-14):** deterministic seam tie-breaks and a 64-pixel
+  auto-tile floor (5×34) reduce final-epoch native/SNAPHU per-component disagreement to 0.1918%
+  and make four fresh runs identical. Both engines now pass: endpoint truth −104.262 mm; native
+  estimate −94.305 mm (residual +9.958 mm, correlation 0.9375, TLS 1.0357); SNAPHU has the same
+  rounded metrics. Native-minus-SNAPHU endpoint is 0.000033 mm. Native ran in 61.3 s versus
+  SNAPHU's 100.7 s on the shared frame. Artifact:
+  `validation/runs/gps_mmx1/mmx1_icmx_common/gps_ground_truth.json` (external live data,
+  gitignored).
 
 Reproduce the verified contracts and preflight:
 
@@ -581,7 +596,7 @@ oracle/.venv/bin/python validation/fetch_real.py \
     --recipe validation/gps_mmx1.json --static-only
 ```
 
-Once disk headroom exists, run the full gate in order:
+Run the full gate in order:
 
 ```sh
 source validation/creds.sh
@@ -594,7 +609,7 @@ oracle/.venv/bin/python validation/run_gps_ground_truth.py \
 oracle/.venv/bin/python validation/crop_real.py \
     --recipe validation/gps_mmx1.json --fixture mmx1_icmx_common
 oracle/.venv/bin/python validation/run_gps_ground_truth.py \
-    --recipe validation/gps_mmx1.json --fixture mmx1_icmx_common --score
+    --recipe validation/gps_mmx1.json --fixture mmx1_icmx_common --build --score
 ```
 
 Initial result bars remain provisional: endpoint sign agreement, absolute endpoint residual

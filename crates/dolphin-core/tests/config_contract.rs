@@ -31,8 +31,8 @@ fn defaults_match_dolphin() {
     assert_eq!(c.output_options.strides.x, 1);
     assert_eq!(c.output_options.overview_levels, vec![4, 8, 16, 32, 64]);
     // Deliberate divergence from dolphin's `snaphu` default: dolphinRust defaults
-    // to the in-process clean-room Native unwrapper (SNAPHU-parity <=0.5%, ~10x
-    // throughput, IP-clean). `unwrap_method: snaphu` restores the dolphin backend.
+    // to the in-process clean-room Native unwrapper (SNAPHU-parity <=0.5%,
+    // IP-clean). `unwrap_method: snaphu` restores the dolphin backend.
     assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Native);
     assert_eq!(c.unwrap_options.snaphu_options.init_method, "mcf");
     assert_eq!(c.unwrap_options.snaphu_options.cost, "smooth");

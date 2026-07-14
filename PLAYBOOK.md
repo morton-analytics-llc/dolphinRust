@@ -632,6 +632,12 @@ Four commits on `feat/native-unwrap` (`dc16b96` seam reconciliation, `f512197` b
   / t32 0.013% — all ≪0.5%. **Full-burst 2048²** (3 ifgs, 8T): native **6.8 s / 30.3 CPU·s /
   1041 MB** vs SNAPHU **75.2 s / 219.8 / 1543 MB** — Pareto-better and under the 1.08 GB
   ceiling SNAPHU exceeds.
+  **Live correction (2026-07-14):** the 48-pixel floor is retained here as historical
+  benchmark evidence, not the current default. The independent MMX1/ICMX common-frame gate
+  exposed randomized equal-weight seam ordering and a 2.90-11.73% parity failure at 7x46
+  tiles. Deterministic seam tie-breaks plus a 64-pixel floor (5x34) reduce final-epoch
+  per-component disagreement to 0.1918%. On that 352x2217 frame, native ran in 61.3 s versus
+  SNAPHU's 100.7 s; the older 48-pixel throughput claims need re-benchmarking before reuse.
 - **DEFAULT FLIP.** `UnwrapMethod::default()` Snaphu→**Native** (`config.rs`); `snaphu`
   selectable as fallback; `config_contract` pins the new default + fallback spelling. A
   deliberate divergence from dolphin's `snaphu` default. The per-frame thread count (rayon
