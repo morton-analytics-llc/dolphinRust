@@ -1,9 +1,11 @@
 //! Intra-phase-linking microbench: clean, repeatable, in-memory (no I/O, no
 //! SNAPHU). Times the separate-stage path (covariance → estimator → temp_coh →
 //! CRLB) sub-stage by sub-stage, then the fused [`link_fused`] pass, reporting
-//! wall + getrusage CPU·s + max-RSS high-water for each. Answers two questions:
-//! (1) what drives PL CPU vs the cube, and (2) the fused-vs-staged CPU/RSS delta
-//! at a representative shipping tile.
+//! wall + getrusage CPU·s + max-RSS high-water for each. Answers three questions:
+//! (1) what drives PL CPU vs the cube, (2) the fused-vs-staged CPU/RSS delta at a
+//! representative shipping tile, and (3) the box-sum covariance win vs the
+//! pre-optimization direct kernel (`covariance (direct, pre-box-sum)` vs
+//! `covariance`, both at the same window/strides).
 //!
 //!   ROWS=512 NSLC=16 ITERS=3 cargo run --release --example pl_bench \
 //!       -p dolphin-phaselink --no-default-features --features no-gpu
@@ -11,6 +13,7 @@
 use std::time::Instant;
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
+use dolphin_phaselink::covariance::estimate_stack_covariance_direct;
 use dolphin_phaselink::{
     estimate_crlb, estimate_stack_covariance, estimate_temp_coh, link_fused,
     process_coherence_matrices, FusedParams,
@@ -89,6 +92,9 @@ fn main() {
     for it in 0..iters {
         println!("iter {it}:");
         println!(" staged:");
+        timed("covariance (direct, pre-box-sum)", || {
+            estimate_stack_covariance_direct(stack.view(), half, strides, None).unwrap()
+        });
         let c = timed("covariance", || {
             estimate_stack_covariance(stack.view(), half, strides, None).unwrap()
         });

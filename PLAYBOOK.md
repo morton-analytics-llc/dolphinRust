@@ -691,6 +691,66 @@ would halve the remaining floor (gated on the CRLB/v0.42 conditioning history).
 
 ---
 
+### Covariance box-sum follow-ups (2026-07-13, scheduled `backlog-pipeline` run)
+
+Issue #5 named three follow-ups to `89bb5ae` (row-separable box-sum, unmasked path)
+in order: bench the landed win, vertical cross-row incremental accumulation, and
+assess the SHP-masked path. Benched and assessed; the incremental-accumulation
+lever is **blocked on an architecture decision**, not implemented.
+
+- **Bench (done).** `examples/pl_bench.rs` now also times the pre-box-sum direct
+  kernel at the same window/strides for a durable before/after comparison
+  (`ROWS=512 NSLC=16 ITERS=3 cargo run --release --example pl_bench -p
+  dolphin-phaselink --no-default-features --features no-gpu`, this host, steady-state
+  iters 1–2): direct **wall 2.87–2.93 s / cpu 9.1–9.2 s** → box-sum **wall 1.42–1.43 s
+  / cpu 3.36–3.37 s** — **~2.0–2.7× wall/CPU**, real but well under the ~3.8–11×
+  floated unbenched at landing (`win_w/strides.x` at strides=1 would suggest ~11×).
+  The gap is expected: the box-sum only removes the *vertical* redundancy across
+  output columns within a row; each output column still sums its own `win_w`-wide
+  window of already-vertically-summed values fresh (`expand_hermitian`/`window_sum`),
+  so the realized win is closer to `win_h·win_w / (win_h·strides.y + win_w)` than to
+  `win_w/strides.x`.
+- **SHP-masked path (assessed, direct kernel stays).** `dolphin-shp` has no caller in
+  `dolphin-workflows` today — grep confirms zero references to `dolphin_shp`/`shp::`
+  in the orchestration crate, so `neighbors` is always `None` in the current pipeline
+  regardless of the config's `shp_method` default (`Glrt`). The masked direct kernel
+  is dead code on the production path until SHP selection is wired into
+  `wrapped_phase` orchestration (Phase 2 is implemented and contract-tested in
+  isolation, but not yet called from Phase 10). A masked box-sum is also structurally
+  harder than the unmasked one — the SHP mask is a different arbitrary boolean
+  pattern per output pixel, not a fixed window shape, so the vertical/horizontal
+  sums don't separably reuse across neighboring pixels the way the unmasked
+  rectangular window does. **Decision: do not build a masked box-sum now** — no
+  production path exercises it, and the separability that makes the unmasked case
+  cheap doesn't transfer. Revisit once SHP selection is wired into orchestration.
+- **Vertical cross-row incremental accumulation (blocked — architecture decision
+  needed, not implemented).** The commit's own bit-identity argument is exact:
+  "each window's numerator depends only on its own samples" is *why*
+  `fused==staged` and `tiled==whole` hold today (`tiled_phase_link_is_bit_identical_to_whole_burst`
+  in `dolphin-workflows/src/displacement.rs` — the load-bearing contract for the
+  whole block-tiled memory-bounding scheme). Carrying vertical sums incrementally
+  across output rows (subtract the row leaving the window, add the row entering)
+  makes a row's numerator depend on the *previous output row's* accumulated state,
+  not only its own samples. That state is call-local: a block-tiled run
+  (`phase_link_tiled`/`plan_tiles`) computes each tile from its own local row 0, so
+  for any output row that isn't the very first row of the whole burst, the tiled
+  path would reach it via a short incremental chain from that tile's own local
+  reset, while the whole-burst path reaches the same absolute row via a long
+  incremental chain from global row 0 — different floating-point accumulation
+  paths, so **not bit-identical**, breaking the load-bearing contract. (The same
+  conflict applies transposed to horizontal incremental accumulation across output
+  columns, since `plan_tiles` tiles both axes.) Closing this gap for real needs tiles
+  to redo the incremental chain from a *shared* reset point — e.g. extend each
+  tile's halo to the nearest earlier row/col that is a multiple of a fixed global
+  chunk period, so both the whole-burst run and every tile recompute the identical
+  accumulation prefix from that shared anchor. That changes the tile halo/memory
+  contract system-wide (larger reads, a new global constant) and is exactly the
+  kind of decision this project's workflow reserves for a human call, not an
+  unattended one. **Elevated to PLAYBOOK §Elevated questions.** Not implemented in
+  this run; issue #5 stays open on this item only.
+
+---
+
 ## Out of scope (initial)
 
 - `atmosphere/` tropospheric corrections (wraps external delay models) — defer.
@@ -706,6 +766,21 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
 
 1. **Packaging (before Phase 10).** Does dolphinRust ship as a workspace member of `eo` or
    as a separately versioned crate dependency?
+2. **Covariance vertical cross-row incremental accumulation (surfaced by issue #5,
+   2026-07-13).** Removing the remaining ~vertical redundancy in the box-sum covariance
+   kernel requires carrying per-column running sums across output *rows* (and, by the same
+   argument, output columns). That makes a row/column's numerator depend on the previous
+   output row/column's accumulated state instead of only its own samples — the exact
+   property `tiled_phase_link_is_bit_identical_to_whole_burst`
+   (`dolphin-workflows/src/displacement.rs`) relies on today. Preserving that bit-identical
+   contract under incremental accumulation needs each tile to redo the accumulation chain
+   from a *shared* reset point with the whole-burst run (e.g. extend tile halos to the
+   nearest earlier row/col that's a multiple of a fixed global chunk period) — a real
+   change to the tile halo/memory contract, not a local kernel tweak. Is the added halo
+   memory/compute cost worth the ~win_h/strides.y-ish further covariance speedup, or should
+   covariance perf work stop at the current box-sum (measured ~2.0–2.7× over direct,
+   PLAYBOOK §Optimization log)? See `md/intake/idea-scout-ledger.md` / issue #5 for the
+   full analysis.
 
 ## Open questions (technical, resolve before Phase 1)
 
