@@ -351,14 +351,14 @@ fn wrap_to_pi(x: f64) -> f64 {
 /// from each tree root (offset 0). Returns `offset[region]`, index 0 unused.
 fn spanning_offsets(n_regions: usize, seams: &[Seam]) -> Vec<i64> {
     let mut order: Vec<usize> = (0..seams.len()).collect();
+    // `(lo, hi)` is unique per seam (one `Seam` per `votes` key), so weight
+    // then endpoints is already a total order.
     order.sort_by(|&a, &b| {
         seams[b]
             .weight
             .total_cmp(&seams[a].weight)
             .then_with(|| seams[a].lo.cmp(&seams[b].lo))
             .then_with(|| seams[a].hi.cmp(&seams[b].hi))
-            .then_with(|| seams[a].diff.abs().cmp(&seams[b].diff.abs()))
-            .then_with(|| seams[a].diff.cmp(&seams[b].diff))
     });
     let mut uf = UnionFind::new(n_regions);
     let mut adj: Vec<Vec<(u32, i64)>> = vec![Vec::new(); n_regions];
@@ -477,6 +477,31 @@ fn tile_offsets(n_tiles: usize, reg: &Regions, offset: &[i64]) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_weight_seam_votes_prefer_smaller_cycle_offset() {
+        // Two regions split by a vertical seam; row 0 votes diff=0, row 1
+        // votes diff=1 (val jump of TAU), equal coherence weight — the tied
+        // vote must resolve to the smaller |diff|, not HashMap order.
+        let psi = Array2::<f64>::zeros((2, 2));
+        let corr = Array2::<f32>::from_elem((2, 2), 1.0);
+        let own = Ownership {
+            owner: Array2::<u32>::zeros((2, 2)),
+            val: Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, TAU]).unwrap(),
+            n_tiles: 2,
+        };
+        let label = Array2::from_shape_vec((2, 2), vec![1u32, 2, 1, 2]).unwrap();
+
+        let seams = collect_seams(&psi, corr.view(), &own, &label);
+
+        assert_eq!(seams.len(), 1);
+        assert_eq!((seams[0].lo, seams[0].hi), (1, 2));
+        assert_eq!(
+            seams[0].diff, 0,
+            "tied vote {{0: 1.0, 1: 1.0}} must deterministically pick diff 0"
+        );
+        assert_eq!(seams[0].weight, 2.0);
+    }
 
     #[test]
     fn equal_weight_seams_are_order_independent() {

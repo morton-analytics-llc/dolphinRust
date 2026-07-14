@@ -575,9 +575,11 @@ Current verification is deliberately split:
   the TLS ceiling (1.1545 vs 1.15). Repeated fresh processes varied between 2.90% and 11.73%
   per-component cycle disagreement because equal-reliability seam ties inherited randomized
   `HashMap` iteration order.
-- **Corrected full scoring — PASS (2026-07-14):** deterministic seam tie-breaks and a 64-pixel
-  auto-tile floor (5×34) reduce final-epoch native/SNAPHU per-component disagreement to 0.1918%
-  and make four fresh runs identical. Both engines now pass: endpoint truth −104.262 mm; native
+- **Corrected full scoring — PASS (2026-07-14):** a 64-pixel auto-tile floor (5×34) reduces
+  final-epoch native/SNAPHU per-component disagreement to 0.1918%, and deterministic seam
+  tie-breaks make fresh runs identical. Isolated A/B on this fixture: the floor alone accounts
+  for the 0.1918% (no seam ties occur at the 5×34 grid); the tie-breaks are what remove the
+  up-to-11.73% HashMap-iteration-order excursions seen at 7×46. Both engines now pass: endpoint truth −104.262 mm; native
   estimate −94.305 mm (residual +9.958 mm, correlation 0.9375, TLS 1.0357); SNAPHU has the same
   rounded metrics. Native-minus-SNAPHU endpoint is 0.000033 mm. Native ran in 61.3 s versus
   SNAPHU's 100.7 s on the shared frame. Artifact:

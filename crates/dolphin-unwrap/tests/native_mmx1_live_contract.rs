@@ -14,6 +14,9 @@ use ndarray::Array2;
 
 const ROWS: usize = 352;
 const COLS: usize = 2217;
+// Must track `dolphin_workflows::displacement::native_tiling((352, 2217))`,
+// pinned there by `native_tiling_keeps_mmx1_common_frame_above_stable_core_floor`
+// (no dep edge from dolphin-unwrap to dolphin-workflows, so duplicated here).
 const PRODUCTION_TILES: (usize, usize) = (5, 34);
 const MAX_CYCLE_DISAGREE: f64 = 0.005;
 const TWO_PI: f64 = std::f64::consts::TAU;
@@ -59,9 +62,15 @@ fn dominant(cycles: &[i64]) -> i64 {
     for &cycle in cycles {
         *counts.entry(cycle).or_insert(0usize) += 1;
     }
+    // Deterministic tie-break (mirrors `collect_seams`): HashMap iteration
+    // order must not decide the dominant offset when counts tie.
     counts
         .into_iter()
-        .max_by_key(|&(_, count)| count)
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.0.abs().cmp(&a.0.abs()))
+                .then_with(|| b.0.cmp(&a.0))
+        })
         .map_or(0, |(cycle, _)| cycle)
 }
 
