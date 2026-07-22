@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
-    read_cslc_shape, read_cslc_stack, read_cslc_window, read_geotransform, read_nisar_geotransform,
-    read_nisar_stack, read_nisar_window, write_raster, GeoInfo,
+    read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
+    read_nisar_geotransform, read_nisar_window, write_raster, GeoInfo,
 };
 use dolphin_phaselink::{correct_phase_bias, estimate_bias_velocity, ComputeEngine};
 use dolphin_timeseries::{
@@ -26,6 +26,7 @@ use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
 use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
+use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
 use crate::dates::decimal_days;
 use crate::provenance::GeometryProvenance;
 use crate::sequential::{
@@ -39,6 +40,26 @@ use dolphin_corrections::LosGeometry;
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
 /// when the config carries no explicit `input_options.wavelength`.
 const SENTINEL1_WAVELENGTH_M: f64 = 0.055_465_76;
+const MIN_SEAM_SUPPORT: usize = 4;
+const MIN_SEAM_COHERENCE: f64 = 0.5;
+
+/// Typed failure from multi-burst phase-offset reconciliation.
+#[derive(Debug, thiserror::Error)]
+pub enum StitchError {
+    /// A burst overlap exists geometrically but does not contain enough stable,
+    /// coherent, finite samples to estimate a phase offset for one acquisition.
+    #[error("burst {burst_index} acquisition {acquisition_index} has only {support} stable overlap samples; at least {required} are required")]
+    InsufficientOffsetSupport {
+        /// Zero-based burst index in stitch order.
+        burst_index: usize,
+        /// Zero-based acquisition index.
+        acquisition_index: usize,
+        /// Valid overlap sample count.
+        support: usize,
+        /// Required sample count.
+        required: usize,
+    },
+}
 
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
 pub struct DisplacementOutput {
@@ -99,14 +120,41 @@ pub struct DisplacementOutput {
     pub geometry_provenance: GeometryProvenance,
 }
 
-/// Run `f`, emitting its wall-clock under `stage` at INFO (`stage` + `elapsed_s`
-/// fields) so the benchmark and host app can read per-stage timing via `RUST_LOG`.
+/// Current and high-water resident memory from Linux procfs, in KiB. Zeros mean
+/// the platform does not expose procfs; diagnostics remain portable and safe.
+fn memory_kib() -> (u64, u64) {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .map_or((0, 0), |status| parse_memory_kib(&status))
+}
+
+fn parse_memory_kib(status: &str) -> (u64, u64) {
+    let value = |key: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    (value("VmRSS:").unwrap_or(0), value("VmHWM:").unwrap_or(0))
+}
+
+/// Run `f`, emitting start/completion wall-clock and RSS breadcrumbs under
+/// `stage` at INFO so native termination can be assigned to a stage.
 fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
+    let (rss_kib, peak_rss_kib) = memory_kib();
+    tracing::info!(stage, event = "start", rss_kib, peak_rss_kib, "stage start");
     let t0 = Instant::now();
     let out = f();
+    let (rss_kib, peak_rss_kib) = memory_kib();
     tracing::info!(
         stage,
+        event = "complete",
         elapsed_s = t0.elapsed().as_secs_f64(),
+        rss_kib,
+        peak_rss_kib,
         "stage complete"
     );
     out
@@ -118,16 +166,25 @@ fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
+    let layouts = source_layouts(cfg, &groups)?;
+    let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
+    let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     // One compute engine for the whole run: it acquires a single GPU context (if
     // selected and available) and is reused across every burst + ministack.
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
     let bursts = timed("phase_linking", || {
         groups
             .values()
-            .map(|idxs| link_one_burst(cfg, idxs, &engine))
+            .enumerate()
+            .filter_map(|(index, idxs)| {
+                let window = crop
+                    .as_ref()
+                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
+                Some(link_one_burst(cfg, idxs, &engine, window))
+            })
             .collect::<Result<Vec<_>>>()
     })?;
-    finish_displacement(cfg, bursts)
+    finish_displacement(cfg, bursts, crop.as_ref())
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
@@ -137,6 +194,7 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
 fn finish_displacement(
     cfg: &DisplacementWorkflow,
     bursts: Vec<BurstLink>,
+    crop: Option<&BoundedPlan>,
 ) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
     let days = bursts
@@ -149,9 +207,6 @@ fn finish_displacement(
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
     let temporal_coherence = stitched.temp_coh;
-    let phase_linking_coherence = stitched.phase_linking_coherence;
-    let crlb_sigma = stitched.crlb_sigma;
-    let closure_phase = stitched.closure_phase;
     let geo = stitched.geo;
     let epsg = (geo.epsg != 0).then_some(geo.epsg);
     let geotransform = geo.geotransform;
@@ -164,7 +219,9 @@ fn finish_displacement(
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
-    let dphi_rad = timed("unwrap", || unwrap_network(cfg, pl.view(), &pairs))?;
+    let dphi_rad = timed("unwrap", || {
+        unwrap_network(cfg, pl.view(), &pairs, geotransform, epsg)
+    })?;
     let incidence = get_incidence_matrix(&pairs);
     let mut disp_rad = timed("timeseries", || match cfg.timeseries_options.method {
         TimeseriesMethod::L1 => {
@@ -174,13 +231,18 @@ fn finish_displacement(
     });
     // Spatially reference the series to a stable pixel (dolphin parity): the
     // configured point, else the center-of-mass of the high-coherence region.
-    let reference_point = cfg.timeseries_options.reference_point.or_else(|| {
+    let configured_reference = configured_analysis_reference(
+        cfg.timeseries_options.reference_point,
+        crop,
+        temporal_coherence.dim(),
+    )?;
+    let analysis_reference_point = configured_reference.or_else(|| {
         select_reference_point(
             temporal_coherence.view(),
             cfg.timeseries_options.correlation_threshold,
         )
     });
-    if let Some(point) = reference_point {
+    if let Some(point) = analysis_reference_point {
         reference_to_point(&mut disp_rad, point);
     }
     // Atmospheric corrections subtract per-date delay from the inverted series,
@@ -197,54 +259,140 @@ fn finish_displacement(
         )
     })?;
     let vel_rad = timed("velocity", || velocity_of(disp_rad.view(), &days));
+    let spatial = SpatialProducts {
+        disp_rad,
+        vel_rad,
+        temporal_coherence,
+        phase_linking_coherence: stitched.phase_linking_coherence,
+        crlb_sigma: stitched.crlb_sigma,
+        closure_phase: stitched.closure_phase,
+        corrections,
+        geotransform,
+        reference_point: analysis_reference_point,
+    };
+    emit_displacement(cfg, days, epsg, crop, spatial)
+}
 
+struct SpatialProducts {
+    disp_rad: Array3<f64>,
+    vel_rad: Array2<f64>,
+    temporal_coherence: Array2<f64>,
+    phase_linking_coherence: Option<Array2<f64>>,
+    crlb_sigma: Option<Array3<f64>>,
+    closure_phase: Option<Array3<f64>>,
+    corrections: CorrectionLayers,
+    geotransform: [f64; 6],
+    reference_point: Option<(usize, usize)>,
+}
+
+fn emit_displacement(
+    cfg: &DisplacementWorkflow,
+    days: Vec<f64>,
+    epsg: Option<u32>,
+    crop: Option<&BoundedPlan>,
+    mut spatial: SpatialProducts,
+) -> Result<DisplacementOutput> {
+    if let Some(plan) = crop {
+        spatial.trim(
+            plan.target_in_analysis,
+            &days,
+            cfg.timeseries_options.correlation_threshold,
+        )?;
+    }
     let phase_to_disp = cfg
         .input_options
         .wavelength
         .map_or(1.0, |w| -w / (4.0 * std::f64::consts::PI));
-    let mm = mm_per_rad(cfg.input_options.wavelength);
-
-    let displacement = disp_rad.mapv(|p| p * phase_to_disp);
-    let velocity = vel_rad.mapv(|v| v * phase_to_disp);
-    let velocity_mm_yr = vel_rad.mapv(|v| v * mm);
-
+    let displacement = spatial.disp_rad.mapv(|phase| phase * phase_to_disp);
+    let velocity = spatial.vel_rad.mapv(|rate| rate * phase_to_disp);
+    let velocity_mm_yr = spatial
+        .vel_rad
+        .mapv(|rate| rate * mm_per_rad(cfg.input_options.wavelength));
     let quality = QualityLayers {
-        phase_linking_coherence: phase_linking_coherence.as_ref(),
-        crlb_sigma: crlb_sigma.as_ref(),
-        closure_phase: closure_phase.as_ref(),
+        phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
+        crlb_sigma: spatial.crlb_sigma.as_ref(),
+        closure_phase: spatial.closure_phase.as_ref(),
     };
-    let geometry_provenance =
-        crate::provenance::assemble_geometry_provenance(cfg, corrections.los_geometry.as_ref());
+    let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_bounds(
+        cfg,
+        spatial.corrections.los_geometry.as_ref(),
+        crop.map(|plan| plan.provenance.clone()),
+    );
     timed("write", || -> Result<()> {
         write_outputs(
             cfg,
             displacement.view(),
             velocity.view(),
-            temporal_coherence.view(),
+            spatial.temporal_coherence.view(),
             quality,
             epsg,
-            geotransform,
+            spatial.geotransform,
         )?;
-        write_correction_outputs(cfg, &corrections, epsg, geotransform)?;
+        write_correction_outputs(cfg, &spatial.corrections, epsg, spatial.geotransform)?;
         crate::provenance::write_geometry_provenance(&cfg.work_directory, &geometry_provenance)
     })?;
     Ok(DisplacementOutput {
         displacement,
         velocity,
         velocity_mm_yr,
-        temporal_coherence,
-        phase_linking_coherence,
-        crlb_sigma,
-        closure_phase,
+        temporal_coherence: spatial.temporal_coherence,
+        phase_linking_coherence: spatial.phase_linking_coherence,
+        crlb_sigma: spatial.crlb_sigma,
+        closure_phase: spatial.closure_phase,
         acquisition_days: days,
         epsg,
-        geotransform,
-        reference_point,
-        ionosphere_delay: corrections.ionosphere,
-        troposphere_delay: corrections.troposphere,
-        los_geometry: corrections.los_geometry,
+        geotransform: spatial.geotransform,
+        reference_point: spatial.reference_point,
+        ionosphere_delay: spatial.corrections.ionosphere,
+        troposphere_delay: spatial.corrections.troposphere,
+        los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
+}
+
+impl SpatialProducts {
+    fn trim(
+        &mut self,
+        target: BlockIndices,
+        days: &[f64],
+        correlation_threshold: f64,
+    ) -> Result<()> {
+        // A halo reference is scientifically valid for analysis but cannot be
+        // represented by a target-local coordinate. Re-reference to a coherent
+        // target pixel before trimming so the emitted reference is always real.
+        if self.reference_point.is_none_or(|(row, col)| {
+            row < target.row_start
+                || row >= target.row_stop
+                || col < target.col_start
+                || col >= target.col_stop
+        }) {
+            let target_coherence = self.temporal_coherence.slice(s![
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let local = select_reference_point(target_coherence, correlation_threshold).context(
+                "bounded target has no pixel meeting the configured reference coherence threshold",
+            )?;
+            let global = (target.row_start + local.0, target.col_start + local.1);
+            reference_to_point(&mut self.disp_rad, global);
+            self.vel_rad = velocity_of(self.disp_rad.view(), days);
+            self.reference_point = Some(global);
+        }
+        self.disp_rad = trim3(&self.disp_rad, target);
+        self.vel_rad = trim2(&self.vel_rad, target);
+        self.temporal_coherence = trim2(&self.temporal_coherence, target);
+        self.phase_linking_coherence = self
+            .phase_linking_coherence
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.crlb_sigma = self.crlb_sigma.take().map(|layer| trim3(&layer, target));
+        self.closure_phase = self.closure_phase.take().map(|layer| trim3(&layer, target));
+        trim_corrections(&mut self.corrections, target);
+        self.reference_point = trim_reference(self.reference_point, target);
+        self.geotransform =
+            offset_geotransform(self.geotransform, target.row_start, target.col_start);
+        Ok(())
+    }
 }
 
 /// One burst's phase-linking products, carried until stitched onto the frame.
@@ -275,6 +423,7 @@ fn link_one_burst(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
     engine: &ComputeEngine,
+    bounded: Option<BurstWindow>,
 ) -> Result<BurstLink> {
     let files = burst_files(cfg, idxs);
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
@@ -285,10 +434,36 @@ fn link_one_burst(
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
     let full_shape = read_cslc_shape(&files[0], &subdataset)?;
-    let out = phase_link_tiled(cfg, full_shape, files.len(), engine, |block| {
-        read_burst_tile(cfg.input_options.input_type, &files, &subdataset, block)
-    })?;
-    burst_link(cfg, out, days, &files[0])
+    let source = bounded.map_or(
+        BlockIndices {
+            row_start: 0,
+            row_stop: full_shape.0,
+            col_start: 0,
+            col_stop: full_shape.1,
+        },
+        |window| window.source,
+    );
+    let out = phase_link_tiled(
+        cfg,
+        (source.height(), source.width()),
+        files.len(),
+        engine,
+        |block| {
+            read_burst_tile(
+                cfg.input_options.input_type,
+                &files,
+                &subdataset,
+                offset_block(block, source.row_start, source.col_start),
+            )
+        },
+    )?;
+    burst_link(
+        cfg,
+        out,
+        days,
+        &files[0],
+        (source.row_start, source.col_start),
+    )
 }
 
 /// Phase-link a burst tile-by-tile, assembling the per-tile sequential outputs
@@ -320,14 +495,65 @@ fn phase_link_tiled(
         cfg.phase_linking.calc_average_coh,
     );
     let (mut read_s, mut compute_s) = (0.0_f64, 0.0_f64);
-    for plan in plan_tiles(full_shape, strides, half, depth, out_block) {
+    let plans = plan_tiles(full_shape, strides, half, depth, out_block);
+    let tile_count = plans.len();
+    for (tile_offset, plan) in plans.into_iter().enumerate() {
+        let tile_index = tile_offset + 1;
+        let (rss_kib, peak_rss_kib) = memory_kib();
+        tracing::debug!(
+            stage = "phase_linking_tile",
+            event = "start",
+            tile_index,
+            tile_count,
+            nslc,
+            input_rows = plan.read.height(),
+            input_cols = plan.read.width(),
+            output_rows = plan.out.height(),
+            output_cols = plan.out.width(),
+            stride_y = strides.y,
+            stride_x = strides.x,
+            phase_linking_coherence = cfg.phase_linking.calc_average_coh,
+            rss_kib,
+            peak_rss_kib,
+            "phase-linking tile start"
+        );
         let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
         read_s += t_read.elapsed().as_secs_f64();
+        let (rss_kib, peak_rss_kib) = memory_kib();
+        tracing::debug!(
+            stage = "phase_linking_tile",
+            event = "read_complete",
+            tile_index,
+            tile_count,
+            rss_kib,
+            peak_rss_kib,
+            "phase-linking tile read complete"
+        );
         let t_pl = Instant::now();
         let out = phase_link(cfg, stack.view(), engine)?;
         compute_s += t_pl.elapsed().as_secs_f64();
+        let (rss_kib, peak_rss_kib) = memory_kib();
+        tracing::debug!(
+            stage = "phase_linking_tile",
+            event = "compute_complete",
+            tile_index,
+            tile_count,
+            rss_kib,
+            peak_rss_kib,
+            "phase-linking tile compute complete"
+        );
         acc.place(&plan, &out)?;
+        let (rss_kib, peak_rss_kib) = memory_kib();
+        tracing::debug!(
+            stage = "phase_linking_tile",
+            event = "complete",
+            tile_index,
+            tile_count,
+            rss_kib,
+            peak_rss_kib,
+            "phase-linking tile complete"
+        );
     }
     // Sub-breakdown of the `phase_linking` stage: windowed CSLC read vs the
     // covariance+estimator compute, summed across tiles (wall, not exclusive CPU).
@@ -363,6 +589,84 @@ fn upcast_into(dst: ArrayViewMut2<Cf64>, src: ndarray::ArrayView2<Cf32>) {
     ndarray::Zip::from(dst)
         .and(src)
         .for_each(|d, z| *d = Cf64::new(z.re as f64, z.im as f64));
+}
+
+fn offset_block(block: BlockIndices, row_offset: usize, col_offset: usize) -> BlockIndices {
+    BlockIndices {
+        row_start: block.row_start + row_offset,
+        row_stop: block.row_stop + row_offset,
+        col_start: block.col_start + col_offset,
+        col_stop: block.col_stop + col_offset,
+    }
+}
+
+fn trim2<T: Clone>(array: &Array2<T>, block: BlockIndices) -> Array2<T> {
+    array.slice(s![block.rows(), block.cols()]).to_owned()
+}
+
+fn trim3<T: Clone>(array: &Array3<T>, block: BlockIndices) -> Array3<T> {
+    array.slice(s![.., block.rows(), block.cols()]).to_owned()
+}
+
+fn trim_corrections(corrections: &mut CorrectionLayers, block: BlockIndices) {
+    corrections.ionosphere = corrections
+        .ionosphere
+        .take()
+        .map(|layer| trim3(&layer, block));
+    corrections.troposphere = corrections
+        .troposphere
+        .take()
+        .map(|layer| trim3(&layer, block));
+    corrections.los_geometry = corrections.los_geometry.take().map(|geometry| LosGeometry {
+        east: trim2(&geometry.east, block),
+        north: trim2(&geometry.north, block),
+        up: trim2(&geometry.up, block),
+    });
+}
+
+fn trim_reference(point: Option<(usize, usize)>, block: BlockIndices) -> Option<(usize, usize)> {
+    let (row, col) = point?;
+    (block.rows().contains(&row) && block.cols().contains(&col))
+        .then_some((row - block.row_start, col - block.col_start))
+}
+
+fn configured_analysis_reference(
+    point: Option<(usize, usize)>,
+    crop: Option<&BoundedPlan>,
+    analysis_shape: (usize, usize),
+) -> Result<Option<(usize, usize)>> {
+    let Some((row, col)) = point else {
+        return Ok(None);
+    };
+    let Some(plan) = crop else {
+        anyhow::ensure!(
+            row < analysis_shape.0 && col < analysis_shape.1,
+            "timeseries reference_point falls outside the output grid"
+        );
+        return Ok(Some((row, col)));
+    };
+    let [analysis_row, analysis_col] = plan.provenance.analysis_pixel_offset;
+    anyhow::ensure!(
+        row >= analysis_row && col >= analysis_col,
+        "timeseries reference_point falls outside the bounded analysis domain"
+    );
+    let local = (row - analysis_row, col - analysis_col);
+    anyhow::ensure!(
+        local.0 < analysis_shape.0 && local.1 < analysis_shape.1,
+        "timeseries reference_point falls outside the bounded analysis domain"
+    );
+    Ok(Some(local))
+}
+
+fn offset_geotransform(gt: [f64; 6], row: usize, col: usize) -> [f64; 6] {
+    [
+        gt[0] + col as f64 * gt[1] + row as f64 * gt[2],
+        gt[1],
+        gt[2],
+        gt[3] + col as f64 * gt[4] + row as f64 * gt[5],
+        gt[4],
+        gt[5],
+    ]
 }
 
 /// Accumulates per-tile sequential outputs into the whole-burst grid. The
@@ -462,6 +766,7 @@ fn burst_link(
     out: SequentialOutput,
     days: Vec<f64>,
     first_file: &Path,
+    source_offset: (usize, usize),
 ) -> Result<BurstLink> {
     let (_, rows, cols) = out.cpx_phase.dim();
     anyhow::ensure!(
@@ -476,7 +781,7 @@ fn burst_link(
         phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
-        geo: resolve_burst_geo(cfg, first_file, rows, cols),
+        geo: resolve_burst_geo(cfg, first_file, rows, cols, source_offset)?,
         days,
     })
 }
@@ -499,6 +804,8 @@ struct BurstState {
     files: Vec<PathBuf>,
     /// Footprint on the output grid (stable across updates).
     geo: BurstGeo,
+    /// Full-resolution source read window (stable across updates).
+    source_window: BlockIndices,
     /// Sequential phase-linking carry (sealed ministacks + open trailing SLCs).
     seq: SequentialState,
 }
@@ -508,21 +815,66 @@ fn link_one_burst_resumable(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
     engine: &ComputeEngine,
-) -> Result<(BurstLink, SequentialState)> {
+    bounded: Option<BurstWindow>,
+) -> Result<(BurstLink, SequentialState, BlockIndices)> {
     let files = burst_files(cfg, idxs);
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
-    let stack = read_stack_files(cfg, &files)?;
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to read CSLC HDF5")?;
+    let full_shape = read_cslc_shape(&files[0], subdataset)?;
+    let source = bounded.map_or(
+        BlockIndices {
+            row_start: 0,
+            row_stop: full_shape.0,
+            col_start: 0,
+            col_stop: full_shape.1,
+        },
+        |window| window.source,
+    );
+    let stack = read_burst_tile(cfg.input_options.input_type, &files, subdataset, source)?;
     let (out, state) = run_sequential_resumable(stack.view(), &sequential_config(cfg), engine)
         .map_err(anyhow::Error::msg)?;
-    let link = burst_link(cfg, out, days, &files[0])?;
-    Ok((link, state))
+    let link = burst_link(
+        cfg,
+        out,
+        days,
+        &files[0],
+        (source.row_start, source.col_start),
+    )?;
+    Ok((link, state, source))
 }
 
 /// The CSLC files for a burst's indices into `cfg.cslc_file_list`.
 fn burst_files(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Vec<PathBuf> {
     idxs.iter()
         .map(|&i| cfg.cslc_file_list[i].clone())
+        .collect()
+}
+
+fn source_layouts(
+    cfg: &DisplacementWorkflow,
+    groups: &std::collections::BTreeMap<String, Vec<usize>>,
+) -> Result<Vec<BurstGeo>> {
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to inspect CSLC grids")?;
+    groups
+        .values()
+        .map(|indices| {
+            let first = indices
+                .first()
+                .and_then(|&index| cfg.cslc_file_list.get(index))
+                .context("burst has no CSLC files")?;
+            let source_shape = read_cslc_shape(first, subdataset)?;
+            let output_shape = cfg.output_options.strides.out_shape(source_shape);
+            resolve_burst_geo(cfg, first, output_shape.0, output_shape.1, (0, 0))
+        })
         .collect()
 }
 
@@ -537,27 +889,37 @@ pub fn run_displacement_resumable(
 ) -> Result<(DisplacementOutput, DisplacementState)> {
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
     let groups = group_by_burst(&cfg.cslc_file_list);
+    let layouts = source_layouts(cfg, &groups)?;
+    let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
+    let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let linked = timed("phase_linking", || -> Result<Vec<_>> {
         groups
             .iter()
-            .map(|(id, idxs)| {
-                let (link, seq) = link_one_burst_resumable(cfg, idxs, &engine)?;
-                Ok((id.clone(), burst_files(cfg, idxs), link, seq))
+            .enumerate()
+            .filter_map(|(index, (id, idxs))| {
+                let window = crop
+                    .as_ref()
+                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
+                Some((|| {
+                    let (link, seq, source) = link_one_burst_resumable(cfg, idxs, &engine, window)?;
+                    Ok((id.clone(), burst_files(cfg, idxs), link, seq, source))
+                })())
             })
             .collect()
     })?;
-    for (id, files, link, seq) in linked {
+    for (id, files, link, seq, source_window) in linked {
         states.push(BurstState {
             id,
             files,
             geo: link.geo,
+            source_window,
             seq,
         });
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts)?;
+    let output = finish_displacement(cfg, bursts, crop.as_ref())?;
     Ok((output, DisplacementState { bursts: states }))
 }
 
@@ -579,22 +941,40 @@ pub fn update_displacement(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
+    // The finite dependency cone grows when an update adds ministacks. Reusing a
+    // prior bounded state could therefore omit newly-required halo pixels. A
+    // bounded update deliberately recomputes the bounded analysis domain; it is
+    // still memory-bounded and scientifically equivalent to a fresh AOI-local run.
+    if cfg.output_options.bounds.is_some() {
+        return run_displacement_resumable(cfg);
+    }
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
     let groups = group_by_burst(&cfg.cslc_file_list);
+    let layouts = source_layouts(cfg, &groups)?;
+    let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
+    let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     let scfg = sequential_config(cfg);
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let updated = timed("phase_linking", || -> Result<Vec<_>> {
         groups
             .iter()
-            .map(|(id, idxs)| update_one_burst(state, cfg, &scfg, id, idxs, &engine))
+            .enumerate()
+            .filter_map(|(index, (id, idxs))| {
+                let window = crop
+                    .as_ref()
+                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
+                Some(update_one_burst(
+                    state, cfg, &scfg, id, idxs, &engine, window,
+                ))
+            })
             .collect()
     })?;
     for (link, st) in updated {
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts)?;
+    let output = finish_displacement(cfg, bursts, crop.as_ref())?;
     Ok((output, DisplacementState { bursts: states }))
 }
 
@@ -606,6 +986,7 @@ fn update_one_burst(
     id: &str,
     idxs: &[usize],
     engine: &ComputeEngine,
+    bounded: Option<BurstWindow>,
 ) -> Result<(BurstLink, BurstState)> {
     let files = burst_files(cfg, idxs);
     let prev = state
@@ -622,16 +1003,38 @@ fn update_one_burst(
         !new_files.is_empty(),
         "burst {id}: no new acquisitions; an update must extend every burst"
     );
-    let new_stack = read_stack_files(cfg, new_files)?;
+    let planned_window = bounded.map_or(prev.source_window, |window| window.source);
+    anyhow::ensure!(
+        planned_window == prev.source_window,
+        "bounded source window changed during an incremental update"
+    );
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to read CSLC HDF5")?;
+    let new_stack = read_burst_tile(
+        cfg.input_options.input_type,
+        new_files,
+        subdataset,
+        prev.source_window,
+    )?;
     let (out, seq) =
         update_sequential(&prev.seq, new_stack.view(), scfg, engine).map_err(anyhow::Error::msg)?;
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
-    let link = burst_link(cfg, out, days, &files[0])?;
+    let link = burst_link(
+        cfg,
+        out,
+        days,
+        &files[0],
+        (prev.source_window.row_start, prev.source_window.col_start),
+    )?;
     let next = BurstState {
         id: id.to_string(),
         files,
         geo: prev.geo,
+        source_window: prev.source_window,
         seq,
     };
     Ok((link, next))
@@ -673,11 +1076,19 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
     let nslc = bursts[0].pl.dim().0;
     let mut pl = Array3::<Cf64>::zeros((nslc, frame.rows, frame.cols));
     let mut temp_coh = Array2::<f64>::zeros((frame.rows, frame.cols));
-    for b in &bursts {
+    let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
+    for (burst_index, b) in bursts.iter_mut().enumerate() {
         anyhow::ensure!(b.pl.dim().0 == nslc, "bursts have differing date counts");
         let off = burst_offset(&frame, &b.geo);
+        if burst_index > 0 {
+            level_burst_offsets(&pl, &temp_coh, &covered, b, off, burst_index)?;
+        }
         paste3(&mut pl, &b.pl, off);
         paste2(&mut temp_coh, &b.temp_coh, off);
+        let (rows, cols) = b.temp_coh.dim();
+        covered
+            .slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols])
+            .fill(true);
     }
     let crlb_sigma = stitch_layer(&bursts, &frame, |b| b.crlb_sigma.as_ref());
     let closure_phase = stitch_layer(&bursts, &frame, |b| b.closure_phase.as_ref());
@@ -691,6 +1102,61 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         closure_phase,
         geo: frame.geo,
     })
+}
+
+/// Rotate every acquisition of `burst` onto the phase datum already established
+/// in `frame`. The circular mean uses only finite, nonzero samples whose temporal
+/// coherence is stable on both sides of the seam.
+fn level_burst_offsets(
+    frame: &Array3<Cf64>,
+    frame_coherence: &Array2<f64>,
+    covered: &Array2<bool>,
+    burst: &mut BurstLink,
+    offset: (usize, usize),
+    burst_index: usize,
+) -> std::result::Result<(), StitchError> {
+    let (_, rows, cols) = burst.pl.dim();
+    for acquisition_index in 0..burst.pl.dim().0 {
+        let mut sum = Cf64::new(0.0, 0.0);
+        let mut support = 0;
+        for row in 0..rows {
+            for col in 0..cols {
+                let global = (offset.0 + row, offset.1 + col);
+                let existing = frame[(acquisition_index, global.0, global.1)];
+                let candidate = burst.pl[(acquisition_index, row, col)];
+                let stable = covered[global]
+                    && frame_coherence[global].is_finite()
+                    && frame_coherence[global] >= MIN_SEAM_COHERENCE
+                    && burst.temp_coh[(row, col)].is_finite()
+                    && burst.temp_coh[(row, col)] >= MIN_SEAM_COHERENCE;
+                if stable
+                    && existing.re.is_finite()
+                    && existing.im.is_finite()
+                    && candidate.re.is_finite()
+                    && candidate.im.is_finite()
+                    && existing.norm_sqr() > 0.0
+                    && candidate.norm_sqr() > 0.0
+                {
+                    sum += (existing * candidate.conj()) / (existing.norm() * candidate.norm());
+                    support += 1;
+                }
+            }
+        }
+        if support < MIN_SEAM_SUPPORT || sum.norm_sqr() == 0.0 {
+            return Err(StitchError::InsufficientOffsetSupport {
+                burst_index,
+                acquisition_index,
+                support,
+                required: MIN_SEAM_SUPPORT,
+            });
+        }
+        let rotation = Cf64::from_polar(1.0, sum.arg());
+        burst
+            .pl
+            .index_axis_mut(Axis(0), acquisition_index)
+            .mapv_inplace(|value| value * rotation);
+    }
+    Ok(())
 }
 
 /// Mosaic an optional per-burst 2D layer onto the frame grid.
@@ -730,53 +1196,33 @@ fn resolve_burst_geo(
     path: &Path,
     rows: usize,
     cols: usize,
-) -> BurstGeo {
-    let identity = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+    source_offset: (usize, usize),
+) -> Result<BurstGeo> {
     let geo_reader = match cfg.input_options.input_type {
         InputType::OperaCslc => read_geotransform,
         InputType::NisarGslc => read_nisar_geotransform,
     };
-    let read = cfg
+    let geo = cfg
         .input_options
         .subdataset
         .as_deref()
-        .and_then(|sds| geo_reader(path, sds).ok());
-    let (epsg, gt) = match read {
-        Some(g) => (g.epsg, g.geotransform),
-        None => (cfg.output_options.epsg.unwrap_or(0), identity),
-    };
+        .context("input_options.subdataset is required to source the burst georeference")
+        .and_then(|sds| geo_reader(path, sds).context("reading required source georeference"))?;
+    anyhow::ensure!(geo.epsg != 0, "source georeference has no valid EPSG");
+    let (epsg, mut gt) = (geo.epsg, geo.geotransform);
+    gt = offset_geotransform(gt, source_offset.0, source_offset.1);
     let (sx, sy) = (
         cfg.output_options.strides.x as f64,
         cfg.output_options.strides.y as f64,
     );
-    BurstGeo {
+    Ok(BurstGeo {
         geo: GeoInfo {
             epsg,
             geotransform: [gt[0], gt[1] * sx, 0.0, gt[3], 0.0, gt[5] * sy],
         },
         rows,
         cols,
-    }
-}
-
-/// Read the CSLC files into a `(n, rows, cols)` `Cf64` stack.
-fn read_stack_files(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Array3<Cf64>> {
-    let subdataset = cfg
-        .input_options
-        .subdataset
-        .clone()
-        .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let stack = match cfg.input_options.input_type {
-        InputType::OperaCslc => {
-            let pairs: Vec<(PathBuf, String)> = files
-                .iter()
-                .map(|p| (p.clone(), subdataset.clone()))
-                .collect();
-            read_cslc_stack(&pairs)?
-        }
-        InputType::NisarGslc => read_nisar_stack(files, &subdataset)?,
-    };
-    Ok(stack.mapv(|z| Cf64::new(z.re as f64, z.im as f64)))
+    })
 }
 
 /// Sequential phase linking over the stack; returns the linked phase history,
@@ -839,16 +1285,52 @@ fn unwrap_network(
     cfg: &DisplacementWorkflow,
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
+    geotransform: [f64; 6],
+    epsg: Option<u32>,
 ) -> Result<Array3<f64>> {
     let (_, rows, cols) = pl.dim();
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let correlation = Array2::<f32>::from_elem((rows, cols), 1.0);
+    let correlation = analysis_correlation(cfg, geotransform, epsg, (rows, cols))?;
+    let masked_phase = (cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some())
+        .then(|| apply_phase_mask(pl, correlation.view()));
     let backend = unwrap_backend(cfg, (rows, cols));
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
     let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
-    pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch))
+    match masked_phase.as_ref() {
+        Some(values) => pool
+            .install(|| backend.unwrap_network(values.view(), pairs, correlation.view(), &scratch)),
+        None => pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch)),
+    }
+}
+
+fn apply_phase_mask(pl: ArrayView3<Cf64>, mask: ArrayView2<f32>) -> Array3<Cf64> {
+    let mut values = pl.to_owned();
+    for ((row, col), &validity) in mask.indexed_iter() {
+        if validity == 0.0 {
+            values.slice_mut(s![.., row, col]).fill(Cf64::new(0.0, 0.0));
+        }
+    }
+    values
+}
+
+fn analysis_correlation(
+    cfg: &DisplacementWorkflow,
+    geotransform: [f64; 6],
+    epsg: Option<u32>,
+    shape: (usize, usize),
+) -> Result<Array2<f32>> {
+    if !cfg.unwrap_options.zero_where_masked {
+        return Ok(Array2::from_elem(shape, 1.0));
+    }
+    let Some(path) = cfg.mask_file.as_ref() else {
+        return Ok(Array2::from_elem(shape, 1.0));
+    };
+    let epsg = epsg.context("mask_file requires a sourced output EPSG")?;
+    let mask = read_aligned_raster_window::<u8>(path, geotransform, epsg, shape)
+        .context("reading configured aligned mask")?;
+    Ok(mask.mapv(|value| if value == 0 { 0.0 } else { 1.0 }))
 }
 
 /// Rayon pool sizing the ifg-network unwrap fan-out. `n_parallel_jobs` is
@@ -1085,6 +1567,258 @@ mod tests {
     use super::*;
     use dolphin_core::config::ComputeBackend;
     use dolphin_core::{HalfWindow, Strides};
+
+    fn seam_burst(phase_offset: f64, coherence: f64) -> BurstLink {
+        BurstLink {
+            pl: Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
+                Cf64::from_polar(1.0, date as f64 * 0.2 + phase_offset)
+            }),
+            temp_coh: Array2::from_elem((3, 3), coherence),
+            phase_linking_coherence: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            geo: BurstGeo {
+                geo: GeoInfo {
+                    epsg: 32611,
+                    geotransform: [0.0, 30.0, 0.0, 90.0, 0.0, -30.0],
+                },
+                rows: 3,
+                cols: 3,
+            },
+            days: vec![0.0, 12.0],
+        }
+    }
+
+    #[test]
+    fn multiburst_leveling_removes_injected_phase_offset() {
+        let frame = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
+            Cf64::from_polar(1.0, date as f64 * 0.2)
+        });
+        let coherence = Array2::from_elem((3, 3), 0.9);
+        let covered = Array2::from_elem((3, 3), true);
+        let mut burst = seam_burst(0.7, 0.9);
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        for (actual, expected) in burst.pl.iter().zip(frame.iter()) {
+            assert!((*actual - *expected).norm() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn multiburst_leveling_fails_typed_when_stable_support_is_insufficient() {
+        let frame = Array3::from_elem((2, 3, 3), Cf64::new(1.0, 0.0));
+        let coherence = Array2::from_elem((3, 3), 0.9);
+        let covered = Array2::from_elem((3, 3), true);
+        let mut burst = seam_burst(0.7, 0.1);
+        let error =
+            level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap_err();
+        assert!(matches!(
+            error,
+            StitchError::InsufficientOffsetSupport { support: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn multiburst_leveling_skips_nodata_but_uses_remaining_overlap() {
+        let mut frame = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
+            Cf64::from_polar(1.0, date as f64 * 0.2)
+        });
+        frame[(0, 0, 0)] = Cf64::new(f64::NAN, f64::NAN);
+        let coherence = Array2::from_elem((3, 3), 0.9);
+        let covered = Array2::from_elem((3, 3), true);
+        let mut burst = seam_burst(-0.4, 0.9);
+        burst.pl[(1, 0, 1)] = Cf64::new(0.0, 0.0);
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        assert!((burst.pl[(0, 1, 1)] - frame[(0, 1, 1)]).norm() < 1e-12);
+        assert!((burst.pl[(1, 1, 1)] - frame[(1, 1, 1)]).norm() < 1e-12);
+    }
+    #[test]
+    fn proc_status_memory_parser_is_bounded_and_path_free() {
+        let status = "Name:\tdolphin\nVmHWM:\t  65432 kB\nVmRSS:\t  54321 kB\n";
+        assert_eq!(parse_memory_kib(status), (54_321, 65_432));
+        assert_eq!(parse_memory_kib("Name:\tdolphin\n"), (0, 0));
+    }
+
+    #[test]
+    fn bounded_trim_keeps_corrections_and_static_geometry_aligned() {
+        let values = Array3::from_shape_fn((2, 6, 8), |(t, r, c)| (t * 100 + r * 10 + c) as f64);
+        let geometry = LosGeometry {
+            east: Array2::from_shape_fn((6, 8), |(r, c)| (r * 10 + c) as f64),
+            north: Array2::from_shape_fn((6, 8), |(r, c)| -(r as f64 * 10.0 + c as f64)),
+            up: Array2::from_elem((6, 8), 0.8),
+        };
+        let mut corrections = CorrectionLayers {
+            ionosphere: Some(values.clone()),
+            troposphere: Some(values),
+            los_geometry: Some(geometry),
+        };
+        let target = BlockIndices {
+            row_start: 2,
+            row_stop: 5,
+            col_start: 3,
+            col_stop: 7,
+        };
+        trim_corrections(&mut corrections, target);
+        let ionosphere = corrections.ionosphere.unwrap();
+        let los = corrections.los_geometry.unwrap();
+        assert_eq!(ionosphere.dim(), (2, 3, 4));
+        assert_eq!(los.east.dim(), (3, 4));
+        assert_eq!(ionosphere[(1, 0, 0)], 123.0);
+        assert_eq!(los.east[(0, 0)], 23.0);
+        assert_eq!(los.north[(2, 3)], -46.0);
+    }
+
+    #[test]
+    fn bounded_trim_reselects_a_target_valid_reference_when_original_is_in_halo() {
+        let mut products = SpatialProducts {
+            disp_rad: Array3::from_shape_fn((2, 6, 8), |(date, row, col)| {
+                date as f64 + row as f64 * 0.1 + col as f64 * 0.01
+            }),
+            vel_rad: Array2::zeros((6, 8)),
+            temporal_coherence: Array2::from_elem((6, 8), 0.9),
+            phase_linking_coherence: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
+            reference_point: Some((0, 0)),
+        };
+        let target = BlockIndices {
+            row_start: 2,
+            row_stop: 5,
+            col_start: 3,
+            col_stop: 7,
+        };
+        products.trim(target, &[0.0, 12.0, 24.0], 0.5).unwrap();
+        let reference = products.reference_point.expect("target reference");
+        assert!(reference.0 < 3 && reference.1 < 4);
+        assert!(products
+            .disp_rad
+            .slice(s![.., reference.0, reference.1])
+            .iter()
+            .all(|value| value.abs() < 1e-12));
+    }
+
+    #[test]
+    fn bounded_trim_rejects_low_quality_target_when_reference_is_in_halo() {
+        let mut products = SpatialProducts {
+            disp_rad: Array3::zeros((2, 4, 4)),
+            vel_rad: Array2::zeros((4, 4)),
+            temporal_coherence: Array2::from_elem((4, 4), 0.1),
+            phase_linking_coherence: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            reference_point: Some((0, 0)),
+        };
+        let error = products
+            .trim(
+                BlockIndices {
+                    row_start: 1,
+                    row_stop: 4,
+                    col_start: 1,
+                    col_stop: 4,
+                },
+                &[0.0, 12.0, 24.0],
+                0.5,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reference coherence threshold"));
+    }
+
+    #[test]
+    fn configured_reference_translates_from_full_frame_to_analysis() {
+        let plan = BoundedPlan {
+            windows: Vec::new(),
+            target_in_analysis: BlockIndices {
+                row_start: 2,
+                row_stop: 8,
+                col_start: 3,
+                col_stop: 9,
+            },
+            provenance: crate::crop::ProcessingBoundsProvenance {
+                processing_method: crate::crop::AOI_PROCESSING_METHOD.into(),
+                processing_method_version: crate::crop::AOI_PROCESSING_VERSION.into(),
+                requested_target_bounds: [0.0; 4],
+                requested_bounds_epsg: 32611,
+                actual_output_bounds: [0.0; 4],
+                actual_analysis_bounds: [0.0; 4],
+                actual_read_bounds: [0.0; 4],
+                output_epsg: 32611,
+                target_pixel_offset: [12, 23],
+                analysis_pixel_offset: [10, 20],
+                analysis_halo_pixels: [2, 3],
+                halo_policy_version: crate::crop::HALO_POLICY_VERSION.into(),
+                native_reads: Vec::new(),
+            },
+        };
+        assert_eq!(
+            configured_analysis_reference(Some((14, 25)), Some(&plan), (10, 12)).unwrap(),
+            Some((4, 5))
+        );
+        assert!(configured_analysis_reference(Some((9, 25)), Some(&plan), (10, 12)).is_err());
+    }
+
+    #[test]
+    fn aligned_mask_crs_mismatch_fails_explicitly() {
+        let path = std::env::temp_dir().join("dolphin_bounds_wrong_crs_mask.tif");
+        let mask = Array2::from_elem((8, 8), 1_u8);
+        write_raster(
+            &path,
+            mask.view(),
+            [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
+            Some(32610),
+            Some(0.0),
+        )
+        .unwrap();
+        let mut cfg = DisplacementWorkflow {
+            mask_file: Some(path),
+            ..Default::default()
+        };
+        cfg.unwrap_options.zero_where_masked = true;
+        let error = analysis_correlation(
+            &cfg,
+            [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
+            Some(32611),
+            (8, 8),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("differs from target EPSG"));
+    }
+
+    #[test]
+    fn mask_is_not_read_when_zero_where_masked_is_false() {
+        let cfg = DisplacementWorkflow {
+            mask_file: Some(std::env::temp_dir().join("does-not-exist.tif")),
+            ..Default::default()
+        };
+        let correlation = analysis_correlation(
+            &cfg,
+            [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
+            Some(32611),
+            (8, 8),
+        )
+        .unwrap();
+        assert!(correlation.iter().all(|&value| value == 1.0));
+    }
+
+    #[test]
+    fn enabled_mask_zeros_linked_phase_before_wrapped_interferograms() {
+        let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
+        let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
+        let masked = apply_phase_mask(phase.view(), mask.view());
+        assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(1, 0, 1)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(1, 1, 1)], Cf64::new(1.0, 1.0));
+    }
 
     #[test]
     fn native_tiling_keeps_mmx1_common_frame_above_stable_core_floor() {

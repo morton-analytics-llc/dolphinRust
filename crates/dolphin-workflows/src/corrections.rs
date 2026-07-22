@@ -15,9 +15,10 @@ use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
-    read_l4_netcdf, read_l4_total, resample_bilinear, warp_to_frame, DelayGrid,
+    ensure_finite_coverage, read_l4_netcdf_for_grid, read_l4_total_for_grid, resample_bilinear,
+    warp_to_frame, DelayGrid,
 };
-use dolphin_io::{grid_centroid_lonlat, read_los_layers, GeoInfo};
+use dolphin_io::{grid_centroid_lonlat, GeoInfo};
 use ndarray::{Array2, Array3, Axis};
 
 /// Per-date correction delay layers (meters, `(n_dates, rows, cols)`), returned
@@ -101,14 +102,21 @@ fn resolve_geometry(
     if opts.geometry_files.is_empty() {
         return Ok(None);
     }
+    let target_geo = GeoInfo {
+        epsg,
+        geotransform: gt,
+    };
     let layers = opts
         .geometry_files
         .iter()
         .map(|p| {
-            read_los_layers(p, "/data")
-                .with_context(|| format!("reading CSLC-S1-STATIC geometry {}", p.display()))
+            dolphin_io::geometry::read_los_layers_for_grid(p, "/data", target_geo, shape)
+                .context("reading bounded CSLC-S1-STATIC geometry")
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     Ok(Some(resolve_los_geometry(&layers, gt, epsg, shape)?))
 }
 
@@ -212,8 +220,8 @@ fn build_troposphere(
     let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
-        let grid = read_tropo(nc, &opts.troposphere_variable)?;
-        let band = resample_to_frame(&grid, gt, epsg, (rows, cols), nc)?;
+        let grid = read_tropo_for_grid(nc, &opts.troposphere_variable, gt, epsg, (rows, cols))?;
+        let band = resample_to_frame(&grid, gt, epsg, (rows, cols))?;
         out.index_axis_mut(Axis(0), t).assign(&(&band * &slant));
     }
     Ok(Some(out))
@@ -235,10 +243,16 @@ fn slant_grid(
 
 /// Read a tropospheric delay grid: `"total"` sums the real OPERA L4
 /// `hydrostatic_delay` + `wet_delay`, any other name reads that single variable.
-fn read_tropo(nc: &Path, var: &str) -> Result<DelayGrid> {
+fn read_tropo_for_grid(
+    nc: &Path,
+    var: &str,
+    gt: [f64; 6],
+    epsg: u32,
+    shape: (usize, usize),
+) -> Result<DelayGrid> {
     let grid = match var {
-        "total" => read_l4_total(nc),
-        other => read_l4_netcdf(nc, other),
+        "total" => read_l4_total_for_grid(nc, gt, epsg, shape),
+        other => read_l4_netcdf_for_grid(nc, other, gt, epsg, shape),
     };
     grid.map_err(anyhow::Error::msg)
 }
@@ -246,39 +260,27 @@ fn read_tropo(nc: &Path, var: &str) -> Result<DelayGrid> {
 /// Resample a tropospheric delay grid onto the frame. When the source CRS matches
 /// the frame this is the plain bilinear resample; when it differs (e.g. a global
 /// EPSG:4326 OPERA L4 product onto a UTM frame) it reprojects via GDAL warp. With
-/// no source CRS at all it falls back to bilinear under the shared-CRS assumption,
-/// with a warning.
+/// no source CRS at all it fails closed.
 fn resample_to_frame(
     grid: &DelayGrid,
     gt: [f64; 6],
     frame_epsg: u32,
     shape: (usize, usize),
-    path: &Path,
 ) -> Result<ndarray::Array2<f64>> {
     let (rows, cols) = shape;
     match grid.epsg {
-        Some(e) if e == frame_epsg => Ok(resample_bilinear(
-            grid.data.view(),
-            grid.geotransform,
-            gt,
-            (rows, cols),
-        )),
+        Some(e) if e == frame_epsg => {
+            let output = resample_bilinear(grid.data.view(), grid.geotransform, gt, (rows, cols));
+            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
+            Ok(output)
+        }
         _ if grid.srs_wkt.is_some() || grid.epsg.is_some() => {
-            warp_to_frame(grid, gt, frame_epsg, (rows, cols)).map_err(anyhow::Error::msg)
+            let output =
+                warp_to_frame(grid, gt, frame_epsg, (rows, cols)).map_err(anyhow::Error::msg)?;
+            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
+            Ok(output)
         }
-        _ => {
-            tracing::warn!(
-                file = %path.display(),
-                frame_epsg,
-                "tropospheric product carries no CRS; resampling assumes a shared CRS"
-            );
-            Ok(resample_bilinear(
-                grid.data.view(),
-                grid.geotransform,
-                gt,
-                (rows, cols),
-            ))
-        }
+        _ => Err(dolphin_corrections::CorrectionError::NoSourceCrs.into()),
     }
 }
 
@@ -312,6 +314,7 @@ fn parse_time_token(w: &[char]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dolphin_io::read_los_layers;
     use ndarray::Array3;
 
     /// Write a single-band EPSG:4326 OPERA-L4-format netCDF (variable `Band1`).

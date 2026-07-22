@@ -81,6 +81,13 @@ pub fn frame_grid(bursts: &[BurstGeo]) -> Result<FrameGrid> {
                 && b.geo.epsg == epsg,
             "bursts differ in posting/CRS; reprojection is not supported in v1"
         );
+        let col_offset = (b.geo.geotransform[0] - first.geo.geotransform[0]) / dx;
+        let row_offset = (first.geo.geotransform[3] - b.geo.geotransform[3]) / -dy;
+        ensure!(
+            (col_offset - col_offset.round()).abs() < POSTING_TOL
+                && (row_offset - row_offset.round()).abs() < POSTING_TOL,
+            "burst origins are not aligned to the common output pixel grid"
+        );
     }
     let xmin = reduce(bursts, f64::min, |b| b.geo.geotransform[0]);
     let ymax = reduce(bursts, f64::max, |b| b.geo.geotransform[3]);
@@ -191,6 +198,14 @@ mod tests {
         let mut b = geo(300.0, 0.0, 10, 10);
         b.geo.geotransform[1] = 20.0; // different dx
         assert!(frame_grid(&[a, b]).is_err());
+    }
+
+    #[test]
+    fn rejects_subpixel_misaligned_burst_origin() {
+        let a = geo(0.0, 0.0, 10, 10);
+        let b = geo(315.0, 0.0, 10, 10);
+        let error = frame_grid(&[a, b]).unwrap_err();
+        assert!(error.to_string().contains("origins are not aligned"));
     }
 
     #[test]

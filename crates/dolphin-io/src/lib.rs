@@ -25,10 +25,11 @@ pub use cslc_metadata::{
     CslcIdentification, CslcOrbit,
 };
 pub use error::{IoError, Result};
-pub use geo::{read_geotransform, GeoInfo};
+pub use geo::{read_geotransform, transform_bounds, GeoInfo};
 pub use geometry::{read_los_layers, LosLayers};
 pub use geotiff::{
-    grid_centroid_lonlat, read_raster, read_raster_window, write_raster, RasterData,
+    grid_centroid_lonlat, read_aligned_raster_window, read_raster, read_raster_window,
+    write_raster, RasterData,
 };
 pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack, read_nisar_window};
 

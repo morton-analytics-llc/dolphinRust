@@ -59,6 +59,28 @@ fn write_stack(dir: &Path) -> Vec<PathBuf> {
                 .create("VV")
                 .unwrap();
             ds.write(&grid).unwrap();
+            let x = (0..COLS)
+                .map(|col| 500_015.0 + col as f64 * 30.0)
+                .collect::<Vec<_>>();
+            let y = (0..ROWS)
+                .map(|row| 4_200_015.0 - row as f64 * 30.0)
+                .collect::<Vec<_>>();
+            group
+                .new_dataset_builder()
+                .with_data(&x)
+                .create("x_coordinates")
+                .unwrap();
+            group
+                .new_dataset_builder()
+                .with_data(&y)
+                .create("y_coordinates")
+                .unwrap();
+            group
+                .new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611_i64)
+                .unwrap();
             path
         })
         .collect()

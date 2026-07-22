@@ -23,7 +23,7 @@ use crate::closure::triplet_closure;
 use crate::covariance::{normalize_numerator, pixel_coh, sliding_row_numerators};
 use crate::crlb::crlb_pixel;
 use crate::estimator::process_coherence_matrix;
-use crate::quality::{average_coherence_per_date, temp_coh_single};
+use crate::quality::temp_coh_single;
 
 /// Estimator + quality parameters for a fused pass (mirrors the separate-stage
 /// call arguments). Grouped to keep the per-pixel signature small.
@@ -48,6 +48,21 @@ pub struct FusedParams {
     pub compute_closure: bool,
     /// Produce the per-date average coherence-magnitude layer.
     pub compute_average_coherence: bool,
+    /// First real acquisition in the combined stack. Leading compressed SLC
+    /// pseudo-dates are excluded from the aggregate coherence metric.
+    pub average_coherence_start_idx: usize,
+}
+
+/// Finite sum/count of real-date average coherence at every output pixel.
+///
+/// The workflow combines these bounded 2-D aggregates across ministacks and
+/// divides once at the end. This avoids retaining a date-major quality cube.
+#[derive(Clone)]
+pub struct AverageCoherenceAggregate {
+    /// Sum of finite per-real-date coherence magnitudes.
+    pub sum: Array2<f64>,
+    /// Number of finite real-date values contributing to each sum.
+    pub count: Array2<u32>,
 }
 
 /// Fused phase-linking output over the strided `(out_rows, out_cols)` grid.
@@ -63,9 +78,8 @@ pub struct FusedEstimate {
     /// Per-triplet closure phase (band-major), `(nslc-2, out_rows, out_cols)`;
     /// `None` unless requested.
     pub closure_phase: Option<Array3<f64>>,
-    /// Per-date average coherence magnitude, `(nslc, out_rows, out_cols)`;
-    /// `None` unless requested.
-    pub average_coherence_per_date: Option<Array3<f64>>,
+    /// Bounded real-date average-coherence sum/count; `None` unless requested.
+    pub average_coherence: Option<AverageCoherenceAggregate>,
 }
 
 /// One output pixel's fused products — the only thing retained per pixel.
@@ -74,7 +88,7 @@ struct PixelFused {
     temp_coh: f64,
     crlb: Option<Array1<f64>>,
     closure: Option<Vec<f64>>,
-    average_coherence: Option<Array1<f64>>,
+    average_coherence: Option<(f64, u32)>,
 }
 
 /// Run the fused covariance + estimator + quality pass over `stack`
@@ -93,6 +107,9 @@ pub fn link_fused(
     let (nslc, rows, cols) = stack.dim();
     if has_all_non_finite_acquisition(stack) {
         return Err("slc stack contains an all non-finite acquisition");
+    }
+    if params.compute_average_coherence && params.average_coherence_start_idx > nslc {
+        return Err("average coherence start exceeds stack depth");
     }
     let (win_h, win_w) = (2 * half.y + 1, 2 * half.x + 1);
     if win_h > rows || win_w > cols {
@@ -200,7 +217,7 @@ fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
         .then(|| (0..ntri).map(|k| triplet_closure(c.view(), k)).collect());
     let average_coherence = p
         .compute_average_coherence
-        .then(|| average_coherence_per_date(c.view()));
+        .then(|| average_coherence_sum_count(c.view(), p.average_coherence_start_idx));
     PixelFused {
         phase,
         temp_coh,
@@ -232,9 +249,13 @@ fn pack(
     let mut closure = params
         .compute_closure
         .then(|| Array3::<f64>::zeros((ntri, out_rows, out_cols)));
-    let mut average_coherence = params
-        .compute_average_coherence
-        .then(|| Array3::<f64>::zeros((nslc, out_rows, out_cols)));
+    let mut average_coherence =
+        params
+            .compute_average_coherence
+            .then(|| AverageCoherenceAggregate {
+                sum: Array2::zeros((out_rows, out_cols)),
+                count: Array2::zeros((out_rows, out_cols)),
+            });
 
     for (idx, px) in pixels.into_iter().enumerate() {
         let (r, c) = (idx / out_cols, idx % out_cols);
@@ -245,15 +266,33 @@ fn pack(
             .for_each(|(t, &z)| cpx_phase[(t, r, c)] = z);
         write_band(crlb.as_mut(), px.crlb, (r, c));
         write_closure(closure.as_mut(), px.closure, (r, c));
-        write_band(average_coherence.as_mut(), px.average_coherence, (r, c));
+        if let (Some(dst), Some((sum, count))) = (average_coherence.as_mut(), px.average_coherence)
+        {
+            dst.sum[(r, c)] = sum;
+            dst.count[(r, c)] = count;
+        }
     }
     FusedEstimate {
         cpx_phase,
         temporal_coherence,
         crlb_sigma: crlb,
         closure_phase: closure,
-        average_coherence_per_date: average_coherence,
+        average_coherence,
     }
+}
+
+/// Reduce the selected matrix rows directly to a finite sum/count. Each row's
+/// value is dolphin's `abs(C).mean(axis=3)`, including the diagonal.
+pub(crate) fn average_coherence_sum_count(
+    c: ndarray::ArrayView2<Cf64>,
+    start_idx: usize,
+) -> (f64, u32) {
+    let n = c.nrows();
+    debug_assert_eq!(n, c.ncols(), "coherence matrix must be square");
+    (start_idx..n)
+        .map(|date| c.row(date).iter().map(|z| z.norm()).sum::<f64>() / n as f64)
+        .filter(|value| value.is_finite())
+        .fold((0.0, 0_u32), |(sum, count), value| (sum + value, count + 1))
 }
 
 /// Write a per-date σ vector into the band-major CRLB array at `(r, c)`.
@@ -274,4 +313,24 @@ fn write_closure(dst: Option<&mut Array3<f64>>, src: Option<Vec<f64>>, rc: (usiz
     src.iter()
         .enumerate()
         .for_each(|(k, &v)| dst[(k, rc.0, rc.1)] = v);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::average_coherence_sum_count;
+    use dolphin_core::Cf64;
+    use ndarray::Array2;
+
+    #[test]
+    fn average_coherence_aggregate_skips_nan_dates() {
+        let mut coherence = Array2::from_elem((3, 3), Cf64::new(1.0, 0.0));
+        coherence[(1, 0)] = Cf64::new(f64::NAN, 0.0);
+        let (sum, count) = average_coherence_sum_count(coherence.view(), 0);
+        assert_eq!(sum, 2.0);
+        assert_eq!(count, 2);
+
+        let (real_sum, real_count) = average_coherence_sum_count(coherence.view(), 1);
+        assert_eq!(real_sum, 1.0);
+        assert_eq!(real_count, 1);
+    }
 }

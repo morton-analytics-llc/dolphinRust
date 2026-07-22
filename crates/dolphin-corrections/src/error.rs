@@ -36,6 +36,13 @@ pub enum CorrectionError {
     /// a WKT nor an EPSG to reproject from.
     #[error("tropospheric source grid has no CRS (WKT/EPSG) to warp from")]
     NoSourceCrs,
+    /// The requested analysis grid is not completely covered by a tropospheric
+    /// correction source.
+    #[error("tropospheric source does not fully cover the requested analysis grid")]
+    TroposphereCoverage,
+    /// Nodata or an invalid GDAL mask intersects the requested correction grid.
+    #[error("tropospheric source contains nodata within the requested analysis grid")]
+    TroposphereNodata,
     /// The supplied CSLC-S1-STATIC geometry granules do not cover the whole frame
     /// (or none were supplied) — resolving LOS geometry would leave silent 0°/nadir
     /// pixels, so it is a hard error instead.

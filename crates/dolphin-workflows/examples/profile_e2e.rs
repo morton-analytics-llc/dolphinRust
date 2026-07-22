@@ -4,6 +4,7 @@
 //! (getrusage delta → parallel efficiency), and the max-RSS high-water timeline.
 //!
 //!   ROWS=2048 EPOCHS=12 cargo run --release --example profile_e2e -p dolphin-workflows
+//!   BOUNDED=1 ROWS=2048 EPOCHS=12 cargo run --release --example profile_e2e -p dolphin-workflows
 //!   /usr/bin/time -l <the same command>      # authoritative whole-run max-RSS
 //!
 //! The per-stage boundaries are the library's `timed(...)` tracing events; this
@@ -60,6 +61,7 @@ struct Sample {
 #[derive(Default)]
 struct Fields {
     stage: Option<String>,
+    event: Option<String>,
     wall_s: f64,
     read_s: f64,
     compute_s: f64,
@@ -75,13 +77,18 @@ impl Visit for Fields {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "stage" {
-            self.stage = Some(value.to_string());
+        match field.name() {
+            "stage" => self.stage = Some(value.to_string()),
+            "event" => self.event = Some(value.to_string()),
+            _ => {}
         }
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "stage" && self.stage.is_none() {
             self.stage = Some(format!("{value:?}").trim_matches('"').to_string());
+        }
+        if field.name() == "event" && self.event.is_none() {
+            self.event = Some(format!("{value:?}").trim_matches('"').to_string());
         }
     }
 }
@@ -103,6 +110,9 @@ impl<S: tracing::Subscriber> Layer<S> for ProfLayer {
         let Some(stage) = f.stage else {
             return;
         };
+        if stage != "pl_breakdown" && f.event.as_deref() != Some("complete") {
+            return;
+        }
         let (cpu_s, maxrss_b) = rusage();
         let mb = |b: i64| b as f64 / 1.048_576e6;
         if stage == "pl_breakdown" {
@@ -147,26 +157,63 @@ fn synth_slc(t: usize, rows: usize, cols: usize) -> Array2<Complex<f32>> {
     })
 }
 
-fn write_stack(dir: &std::path::Path, n: usize, rows: usize, cols: usize) -> Result<Vec<PathBuf>> {
+fn write_stack(
+    dir: &std::path::Path,
+    n: usize,
+    rows: usize,
+    cols: usize,
+    burst_count: usize,
+    burst_overlap: usize,
+) -> Result<Vec<PathBuf>> {
     let base = chrono::NaiveDate::from_ymd_opt(2022, 11, 19).unwrap();
     let mut files = Vec::new();
-    for t in 0..n {
-        let stamp = (base + chrono::Duration::days(t as i64 * DT_DAYS)).format("%Y%m%d");
-        let path = dir.join(format!("cslc_{stamp}.h5"));
-        if !path.exists() {
-            let file = hdf5::File::create(&path)?;
-            let group = file.create_group("data")?;
-            group
-                .new_dataset_builder()
-                .with_data(&synth_slc(t, rows, cols))
-                .create("VV")?;
+    for burst in 0..burst_count {
+        let col_offset = burst * cols.saturating_sub(burst_overlap);
+        for t in 0..n {
+            let stamp = (base + chrono::Duration::days(t as i64 * DT_DAYS)).format("%Y%m%d");
+            let path = dir.join(format!("OPERA_T064-135518-IW{}_{stamp}.h5", burst + 1));
+            if !path.exists() {
+                let file = hdf5::File::create(&path)?;
+                let group = file.create_group("data")?;
+                group
+                    .new_dataset_builder()
+                    .with_data(&synth_slc(t, rows, cols))
+                    .create("VV")?;
+                // 15 m native range posting becomes 30 m under the benchmark's 1x2
+                // output stride; azimuth is already 30 m.
+                let x: Vec<f64> = (0..cols)
+                    .map(|col| 500_007.5 + (col_offset + col) as f64 * 15.0)
+                    .collect();
+                let y: Vec<f64> = (0..rows)
+                    .map(|row| 4_200_015.0 - row as f64 * 30.0)
+                    .collect();
+                group
+                    .new_dataset_builder()
+                    .with_data(&x)
+                    .create("x_coordinates")?;
+                group
+                    .new_dataset_builder()
+                    .with_data(&y)
+                    .create("y_coordinates")?;
+                group
+                    .new_dataset::<i64>()
+                    .create("projection")?
+                    .write_scalar(&32611_i64)?;
+            }
+            files.push(path);
         }
-        files.push(path);
     }
     Ok(files)
 }
 
-fn build_config(dir: &std::path::Path, files: Vec<PathBuf>) -> DisplacementWorkflow {
+fn build_config(
+    dir: &std::path::Path,
+    files: Vec<PathBuf>,
+    rows: usize,
+    cols: usize,
+    burst_count: usize,
+    burst_overlap: usize,
+) -> DisplacementWorkflow {
     let mut cfg = DisplacementWorkflow {
         cslc_file_list: files,
         work_directory: dir.to_path_buf(),
@@ -174,10 +221,25 @@ fn build_config(dir: &std::path::Path, files: Vec<PathBuf>) -> DisplacementWorkf
     };
     cfg.input_options.subdataset = Some("/data/VV".into());
     cfg.input_options.wavelength = Some(SENTINEL1_WAVELENGTH_M);
-    cfg.phase_linking.ministack_size = 15;
+    cfg.phase_linking.ministack_size = env_usize("MINISTACK", 5);
     cfg.phase_linking.half_window = HalfWindow { y: 5, x: 5 };
-    cfg.output_options.strides = Strides { y: 1, x: 1 };
+    cfg.phase_linking.calc_average_coh = true;
+    cfg.output_options.strides = Strides {
+        y: env_usize("STRIDE_Y", 1),
+        x: env_usize("STRIDE_X", 2),
+    };
     cfg.interferogram_network.reference_idx = Some(0);
+    if env_usize("BOUNDED", 0) == 1 {
+        let frame_cols = cols + burst_count.saturating_sub(1) * cols.saturating_sub(burst_overlap);
+        let margin_rows = 3.0 * rows as f64 / 8.0;
+        let margin_cols = 3.0 * frame_cols as f64 / 8.0;
+        let left = 500_000.0 + margin_cols * 15.0;
+        let right = 500_000.0 + (frame_cols as f64 - margin_cols) * 15.0;
+        let top = 4_200_030.0 - margin_rows * 30.0;
+        let bottom = 4_200_030.0 - (rows as f64 - margin_rows) * 30.0;
+        cfg.output_options.bounds = Some((left, bottom, right, top));
+        cfg.output_options.bounds_epsg = Some(32611);
+    }
     cfg
 }
 
@@ -239,15 +301,30 @@ fn main() -> Result<()> {
         .init();
 
     let rows = env_usize("ROWS", 2048);
+    let cols = env_usize("COLS", rows);
     let epochs = env_usize("EPOCHS", 12);
-    let dir = std::env::temp_dir().join(format!("dolphin_profile_{rows}x{rows}_n{epochs}"));
+    let bursts = env_usize("BURSTS", 1);
+    let overlap = env_usize("BURST_OVERLAP", 64).min(cols.saturating_sub(1));
+    let bounded = env_usize("BOUNDED", 0) == 1;
+    let dir = std::env::temp_dir().join(format!(
+        "dolphin_profile_geo_{rows}x{cols}_n{epochs}_b{bursts}_o{overlap}_s{}x{}_m{}_bounded{bounded}",
+        env_usize("STRIDE_Y", 1),
+        env_usize("STRIDE_X", 2),
+        env_usize("MINISTACK", 5),
+    ));
     std::fs::create_dir_all(&dir)?;
     eprintln!(
-        "synthesizing {epochs}×{rows}² CSLC stack in {}",
+        "synthesizing {bursts} bursts × {epochs} epochs × {rows}×{cols} CSLCs in {}",
         dir.display()
     );
-    let files = write_stack(&dir, epochs, rows, rows)?;
-    let cfg = build_config(&dir, files);
+    let files = write_stack(&dir, epochs, rows, cols, bursts, overlap)?;
+    let cfg = build_config(&dir, files, rows, cols, bursts, overlap);
+    eprintln!(
+        "settings: bounded={bounded} strides={}x{} ministack={} bursts={bursts} overlap_native={overlap} calc_average_coh=true",
+        cfg.output_options.strides.y,
+        cfg.output_options.strides.x,
+        cfg.phase_linking.ministack_size,
+    );
 
     let (cpu0, rss0) = rusage();
     let t0 = std::time::Instant::now();
@@ -256,7 +333,7 @@ fn main() -> Result<()> {
 
     let (nd, r, c) = out.displacement.dim();
     eprintln!(
-        "ran {epochs}×{rows}²: displacement {nd}d × {r}×{c}, temp_coh mean={:.4}",
+        "ran {bursts}×{epochs}×{rows}×{cols}: displacement {nd}d × {r}×{c}, temp_coh mean={:.4}",
         out.temporal_coherence.mean().unwrap_or(0.0)
     );
     report(&samples.lock().unwrap(), cpu0, rss0, total_wall);

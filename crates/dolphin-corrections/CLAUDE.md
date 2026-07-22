@@ -31,7 +31,9 @@ modelling + raster subtraction, no solver.
   product shares the frame CRS, `warp_to_frame` (GDAL bilinear `reproject`) when it
   differs (the global EPSG:4326 L4 product → a UTM frame). The L4 grid carries no CRS
   through GDAL's NETCDF driver, so a geographic-degree-range geotransform is assigned
-  EPSG:4326 (the plate-carrée product). Fallback: RAiDER
+  EPSG:4326 (the plate-carrée product). AOI-local runs transform the densified target
+  envelope into the source CRS and read only its native window plus one bilinear halo;
+  missing CRS, incomplete coverage, and target-intersecting nodata fail closed. Fallback: RAiDER
   (`raider.py` subprocess) — **gated behind an availability check like SNAPHU, never
   stubbed**; absent ⇒ `RaiderUnavailable` and the path is skipped (deferred), not faked.
 

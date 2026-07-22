@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+
 use crate::error::{IoError, Result};
 
 /// Georeferencing for a CSLC grid: EPSG code + GDAL affine geotransform
@@ -20,6 +22,50 @@ pub struct GeoInfo {
     pub epsg: u32,
     /// GDAL geotransform, upper-left-corner referenced.
     pub geotransform: [f64; 6],
+}
+
+/// Transform an axis-aligned `[left, bottom, right, top]` envelope between EPSG
+/// CRSs. Edges are densified before taking the destination envelope so a
+/// projected curve cannot be clipped by a four-corner approximation.
+///
+/// # Errors
+/// Returns [`IoError::Geo`] for invalid/non-finite bounds and propagates GDAL CRS
+/// construction or coordinate-transform failures.
+pub fn transform_bounds(
+    bounds: (f64, f64, f64, f64),
+    source_epsg: u32,
+    destination_epsg: u32,
+) -> Result<(f64, f64, f64, f64)> {
+    let (left, bottom, right, top) = bounds;
+    if ![left, bottom, right, top].iter().all(|v| v.is_finite()) || left >= right || bottom >= top {
+        return Err(IoError::Geo(
+            "bounds must be finite with left < right and bottom < top".into(),
+        ));
+    }
+    if source_epsg == destination_epsg {
+        return Ok(bounds);
+    }
+    let mut source = SpatialRef::from_epsg(source_epsg)?;
+    let mut destination = SpatialRef::from_epsg(destination_epsg)?;
+    source.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    destination.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let transform = CoordTransform::new(&source, &destination)?;
+    // Use GDAL's bounds operation rather than manually transforming corners:
+    // it handles curved edges and geographic wrap semantics. GDAL recommends
+    // 21 densification points per edge.
+    const DENSIFY_POINTS: i32 = 21;
+    let transformed = transform.transform_bounds(&[left, bottom, right, top], DENSIFY_POINTS)?;
+    if transformed.iter().any(|coordinate| !coordinate.is_finite()) {
+        return Err(IoError::Geo(
+            "bounds transform produced non-finite coordinates".into(),
+        ));
+    }
+    Ok((
+        transformed[0],
+        transformed[1],
+        transformed[2],
+        transformed[3],
+    ))
 }
 
 /// Read the geotransform + EPSG for a CSLC grid from its HDF5 metadata.
@@ -105,5 +151,39 @@ mod tests {
         assert!((geo.geotransform[3] - 2015.0).abs() < 1e-9); // 2000 + 30/2
         assert!((geo.geotransform[5] + 30.0).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounds_transform_round_trip_contains_original() {
+        let wgs84 = (-122.51, 37.70, -122.35, 37.84);
+        let utm = transform_bounds(wgs84, 4326, 32610).unwrap();
+        let round_trip = transform_bounds(utm, 32610, 4326).unwrap();
+        assert!(round_trip.0 <= wgs84.0 && round_trip.1 <= wgs84.1);
+        assert!(round_trip.2 >= wgs84.2 && round_trip.3 >= wgs84.3);
+    }
+
+    #[test]
+    fn densified_bounds_cover_high_curvature_and_utm_zone_edge_cases() {
+        for (bounds, projected_epsg) in [
+            ((-48.0, 78.0, -12.0, 84.0), 3413),
+            ((-120.2, 36.0, -116.8, 39.0), 32611),
+        ] {
+            let projected = transform_bounds(bounds, 4326, projected_epsg).unwrap();
+            let round_trip = transform_bounds(projected, projected_epsg, 4326).unwrap();
+            assert!(round_trip.0 <= bounds.0 && round_trip.1 <= bounds.1);
+            assert!(round_trip.2 >= bounds.2 && round_trip.3 >= bounds.3);
+        }
+    }
+
+    #[test]
+    fn invalid_bounds_are_rejected_before_crs_work() {
+        let error = transform_bounds((2.0, 0.0, 1.0, 3.0), 4326, 32610).unwrap_err();
+        assert!(matches!(error, IoError::Geo(_)));
+    }
+
+    #[test]
+    fn invalid_crs_is_reported() {
+        let error = transform_bounds((-122.5, 37.7, -122.4, 37.8), 4326, 999_999).unwrap_err();
+        assert!(matches!(error, IoError::Gdal(_)));
     }
 }

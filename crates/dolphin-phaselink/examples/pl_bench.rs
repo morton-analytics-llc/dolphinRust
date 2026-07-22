@@ -93,6 +93,7 @@ fn main() {
         num_looks: (half.y as f64 * half.x as f64).sqrt(),
         compute_closure: false,
         compute_average_coherence,
+        average_coherence_start_idx: 0,
     };
     let stack = synth(nslc, rows, cols);
     println!(

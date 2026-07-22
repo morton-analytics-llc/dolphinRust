@@ -28,7 +28,7 @@ pub use engine::{ComputeEngine, ResolvedBackend};
 pub use estimator::{
     process_coherence_matrices, process_coherence_matrix, PixelEstimate, StackEstimate,
 };
-pub use fused::{link_fused, FusedEstimate, FusedParams};
+pub use fused::{link_fused, AverageCoherenceAggregate, FusedEstimate, FusedParams};
 pub use phasebias::{
     correct_phase_bias, estimate_bias_velocity, mean_abs_closure, residual_closure,
 };

@@ -21,7 +21,7 @@
 
 use dolphin_core::config::CompressedSlcPlan;
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{compress, ComputeEngine, FusedParams};
+use dolphin_phaselink::{compress, AverageCoherenceAggregate, ComputeEngine, FusedParams};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
 
@@ -96,7 +96,7 @@ pub struct SequentialState {
     /// cross-ministack `nanmean` stitch stays exact under incremental updates).
     sealed_temp_coh: Vec<Array2<f64>>,
     /// Finite sum/count aggregates for sealed ministacks' real-date coherence.
-    sealed_average_coherence: Vec<CoherenceAggregate>,
+    sealed_average_coherence: Vec<AverageCoherenceAggregate>,
     /// Per-sealed-ministack CRLB σ layers (empty when CRLB is off).
     sealed_crlb: Vec<Array3<f64>>,
     /// Per-sealed-ministack closure-phase layers (empty when closure is off).
@@ -111,17 +111,9 @@ struct Drive {
     compressed: Vec<Array2<Cf64>>,
     phases: Vec<Array3<Cf64>>,
     temp_coh: Vec<Array2<f64>>,
-    average_coherence: Vec<CoherenceAggregate>,
+    average_coherence: Vec<AverageCoherenceAggregate>,
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
-}
-
-/// Per-pixel finite sum/count for real-date average coherence. Keeping this
-/// aggregate instead of every date band bounds sequential/NRT memory.
-#[derive(Clone)]
-struct CoherenceAggregate {
-    sum: Array2<f64>,
-    count: Array2<u32>,
 }
 
 /// Phase-link + compress each planned ministack of `real_stack`, carrying the
@@ -170,7 +162,7 @@ fn build_output(
     phases: &[Array3<Cf64>],
     compressed: Vec<Array2<Cf64>>,
     temp_coh: &[Array2<f64>],
-    average_coherence: &[CoherenceAggregate],
+    average_coherence: &[AverageCoherenceAggregate],
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
 ) -> Result<SequentialOutput, &'static str> {
@@ -352,7 +344,7 @@ fn take_prefix<T: Clone>(v: &[T], n: usize) -> Vec<T> {
 
 /// Collapse all real-date coherence aggregates to one 2D mean. `None` means the
 /// optional metric was disabled, not a fabricated zero-valued layer.
-fn finish_average_coherence(layers: &[CoherenceAggregate]) -> Option<Array2<f64>> {
+fn finish_average_coherence(layers: &[AverageCoherenceAggregate]) -> Option<Array2<f64>> {
     let first = layers.first()?;
     Some(Array2::from_shape_fn(first.sum.dim(), |(r, c)| {
         let (sum, count) = layers.iter().fold((0.0, 0_u32), |(sum, count), layer| {
@@ -363,27 +355,6 @@ fn finish_average_coherence(layers: &[CoherenceAggregate]) -> Option<Array2<f64>
             _ => sum / f64::from(count),
         }
     }))
-}
-
-/// Reduce the per-date core result to a real-acquisition-only sum/count. Carried
-/// compressed SLC bands precede `num_compressed` and are intentionally excluded.
-fn aggregate_real_average(layer: Array3<f64>, num_compressed: usize) -> CoherenceAggregate {
-    let real = layer.slice(s![num_compressed.., .., ..]);
-    let (_, rows, cols) = real.dim();
-    let sum = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        real.slice(s![.., r, c])
-            .iter()
-            .filter(|v| v.is_finite())
-            .copied()
-            .sum()
-    });
-    let count = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        real.slice(s![.., r, c])
-            .iter()
-            .filter(|v| v.is_finite())
-            .count() as u32
-    });
-    CoherenceAggregate { sum, count }
 }
 
 /// Concatenate two per-ministack product lists (sealed prefix ++ tail).
@@ -455,7 +426,7 @@ struct MinistackResult {
     /// Temporal coherence, `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
     /// Real-date-only finite sum/count of average coherence.
-    average_coherence: Option<CoherenceAggregate>,
+    average_coherence: Option<AverageCoherenceAggregate>,
     /// CRLB σ for this ministack's real dates, `(num_real, out_rows, out_cols)`.
     crlb_sigma: Option<Array3<f64>>,
     /// Closure phase for this ministack, `(num_combined-2, out_rows, out_cols)`.
@@ -489,9 +460,7 @@ fn link_and_compress(
     let crlb_sigma = fused
         .crlb_sigma
         .map(|s| s.slice(s![ms.num_compressed.., .., ..]).to_owned());
-    let average_coherence = fused
-        .average_coherence_per_date
-        .map(|layer| aggregate_real_average(layer, ms.num_compressed));
+    let average_coherence = fused.average_coherence;
     Ok(MinistackResult {
         cpx,
         compressed,
@@ -517,6 +486,7 @@ fn fused_params(ms: MiniStack, cfg: &SequentialConfig) -> FusedParams {
         num_looks: (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt(),
         compute_closure: cfg.compute_closure_phase,
         compute_average_coherence: cfg.compute_average_coherence,
+        average_coherence_start_idx: ms.num_compressed,
     }
 }
 

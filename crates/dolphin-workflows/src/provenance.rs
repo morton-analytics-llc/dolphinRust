@@ -20,6 +20,8 @@ use dolphin_io::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::crop::ProcessingBoundsProvenance;
+
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
@@ -74,6 +76,9 @@ pub struct GeometryProvenance {
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
+    /// AOI target/analysis/read-window contract; absent for full-frame runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_bounds: Option<ProcessingBoundsProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
 }
@@ -135,6 +140,17 @@ pub fn assemble_geometry_provenance(
     cfg: &DisplacementWorkflow,
     los: Option<&LosGeometry>,
 ) -> GeometryProvenance {
+    assemble_geometry_provenance_with_bounds(cfg, los, None)
+}
+
+/// Assemble geometry provenance with the optional AOI-local processing-window
+/// contract produced by the bounded planner.
+#[must_use]
+pub fn assemble_geometry_provenance_with_bounds(
+    cfg: &DisplacementWorkflow,
+    los: Option<&LosGeometry>,
+    processing_bounds: Option<ProcessingBoundsProvenance>,
+) -> GeometryProvenance {
     let mut fields = BTreeMap::new();
     let cslc = read_granules(cfg, &mut fields);
     let orbit_direction = orbit_direction(&cslc, &mut fields);
@@ -173,6 +189,7 @@ pub fn assemble_geometry_provenance(
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()
             && incidence_ok,
+        processing_bounds,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,

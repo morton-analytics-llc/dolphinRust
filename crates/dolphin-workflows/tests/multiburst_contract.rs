@@ -126,4 +126,35 @@ fn two_bursts_stitch_into_a_frame() {
         out.velocity_mm_yr.iter().all(|v| v.is_finite()),
         "velocity finite"
     );
+
+    // Bounded target crossing the real burst seam at 1x2. The analysis halo
+    // retains both bursts and their overlap; only the returned/written arrays
+    // are trimmed.
+    let mut bounded_1x2 = cfg.clone();
+    bounded_1x2.output_options.strides = Strides { y: 1, x: 2 };
+    bounded_1x2.output_options.bounds = Some((1_600.0, 1_400.0, 2_380.0, 1_880.0));
+    bounded_1x2.output_options.bounds_epsg = Some(EPSG as u32);
+    bounded_1x2.timeseries_options.reference_point = None;
+    bounded_1x2.work_directory = dir.join("bounded_1x2");
+    let cropped_1x2 = run_displacement(&bounded_1x2).unwrap();
+    assert_eq!(cropped_1x2.temporal_coherence.dim(), (16, 13));
+    assert!(cropped_1x2.geometry_provenance.processing_bounds.is_some());
+
+    // A stride-aligned 3x6 two-burst fixture keeps one output-column of seam
+    // overlap (8 pixels), above the explicit four-pixel leveling gate.
+    let stride_dir = std::env::temp_dir().join("dolphin_multiburst_bounds_3x6");
+    std::fs::create_dir_all(&stride_dir).unwrap();
+    let mut stride_files = write_burst(&stride_dir, 1, 0);
+    stride_files.extend(write_burst(&stride_dir, 2, 24));
+    let mut bounded_3x6 = bounded_1x2;
+    bounded_3x6.cslc_file_list = stride_files;
+    bounded_3x6.output_options.strides = Strides { y: 3, x: 6 };
+    bounded_3x6.output_options.bounds = Some((1_540.0, 1_370.0, 2_440.0, 1_820.0));
+    bounded_3x6.work_directory = stride_dir.join("bounded");
+    let cropped_3x6 = run_displacement(&bounded_3x6).unwrap();
+    assert_eq!(cropped_3x6.temporal_coherence.dim(), (5, 5));
+    assert!(cropped_3x6
+        .velocity_mm_yr
+        .iter()
+        .all(|value| value.is_finite()));
 }

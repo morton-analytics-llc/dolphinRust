@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+use ndarray::s;
 use ndarray::Array2;
 
 use crate::error::Result;
@@ -47,6 +48,92 @@ pub fn read_los_layers(path: &Path, group: &str) -> Result<LosLayers> {
         .mapv(f64::from);
     let geo = read_geotransform(path, &format!("{group}/los_east"))?;
     Ok(LosLayers { east, north, geo })
+}
+
+/// Read only the native STATIC pixels intersecting an aligned target grid.
+/// Returns `None` when this granule does not intersect the target. No resampling
+/// is performed; CRS, posting, and pixel alignment must match exactly.
+pub fn read_los_layers_for_grid(
+    path: &Path,
+    group: &str,
+    target_geo: GeoInfo,
+    target_shape: (usize, usize),
+) -> Result<Option<LosLayers>> {
+    const TOLERANCE: f64 = 1e-6;
+    let source_geo = read_geotransform(path, &format!("{group}/los_east"))?;
+    if source_geo.epsg != target_geo.epsg {
+        return Err(crate::error::IoError::Geo(format!(
+            "STATIC EPSG {} differs from target EPSG {}",
+            source_geo.epsg, target_geo.epsg
+        )));
+    }
+    let sg = source_geo.geotransform;
+    let tg = target_geo.geotransform;
+    let col_scale = tg[1] / sg[1];
+    let row_scale = tg[5] / sg[5];
+    if (col_scale - col_scale.round()).abs() > TOLERANCE
+        || (row_scale - row_scale.round()).abs() > TOLERANCE
+        || col_scale < 1.0
+        || row_scale < 1.0
+        || sg[2].abs() > TOLERANCE
+        || sg[4].abs() > TOLERANCE
+        || tg[2].abs() > TOLERANCE
+        || tg[4].abs() > TOLERANCE
+    {
+        return Err(crate::error::IoError::Geo(
+            "STATIC posting is not an integer-aligned native refinement of the target grid".into(),
+        ));
+    }
+    let file = hdf5::File::open(path)?;
+    let east_ds = file.dataset(&format!("{group}/los_east"))?;
+    let north_ds = file.dataset(&format!("{group}/los_north"))?;
+    let shape = east_ds.shape();
+    if shape.len() != 2 || north_ds.shape() != shape {
+        return Err(crate::error::IoError::Shape(
+            "STATIC LOS components must share a two-dimensional shape".into(),
+        ));
+    }
+    let source_row = ((sg[3] - tg[3]) / -sg[5]).round() as isize;
+    let source_col = ((tg[0] - sg[0]) / sg[1]).round() as isize;
+    if (((sg[3] - tg[3]) / -sg[5]) - source_row as f64).abs() > TOLERANCE
+        || (((tg[0] - sg[0]) / sg[1]) - source_col as f64).abs() > TOLERANCE
+    {
+        return Err(crate::error::IoError::Geo(
+            "STATIC origin has a subpixel target offset".into(),
+        ));
+    }
+    let row_start = source_row.max(0) as usize;
+    let col_start = source_col.max(0) as usize;
+    let row_stop =
+        (source_row + (target_shape.0 as f64 * row_scale).round() as isize).min(shape[0] as isize);
+    let col_stop =
+        (source_col + (target_shape.1 as f64 * col_scale).round() as isize).min(shape[1] as isize);
+    if row_stop <= row_start as isize || col_stop <= col_start as isize {
+        return Ok(None);
+    }
+    let row_stop = row_stop as usize;
+    let col_stop = col_stop as usize;
+    let east = east_ds
+        .read_slice_2d::<f32, _>(s![row_start..row_stop, col_start..col_stop])?
+        .mapv(f64::from);
+    let north = north_ds
+        .read_slice_2d::<f32, _>(s![row_start..row_stop, col_start..col_stop])?
+        .mapv(f64::from);
+    Ok(Some(LosLayers {
+        east,
+        north,
+        geo: GeoInfo {
+            epsg: source_geo.epsg,
+            geotransform: [
+                sg[0] + col_start as f64 * sg[1],
+                sg[1],
+                0.0,
+                sg[3] + row_start as f64 * sg[5],
+                0.0,
+                sg[5],
+            ],
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -107,6 +194,35 @@ mod tests {
         assert!((got.east[(1, 2)] - 0.3).abs() < 1e-6);
         assert!((got.north[(3, 4)] - (-0.2 * 4.0 + 0.04)).abs() < 1e-6);
         assert!((got.geo.geotransform[1] - 30.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounded_static_read_uses_native_window_and_offset_georeference() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
+        let path = std::env::temp_dir().join("dolphin_static_window_contract.h5");
+        let east = Array2::from_shape_fn((10, 12), |(r, c)| (r * 12 + c + 1) as f32 / 1000.0);
+        let north = Array2::from_elem((10, 12), -0.2_f32);
+        let x = (0..12)
+            .map(|col| 1_015.0 + col as f64 * 30.0)
+            .collect::<Vec<_>>();
+        let y = (0..10)
+            .map(|row| 1_985.0 - row as f64 * 30.0)
+            .collect::<Vec<_>>();
+        write_static_fixture(&path, &east, &north, &x, &y, 32611);
+        let target = GeoInfo {
+            epsg: 32611,
+            geotransform: [1_060.0, 60.0, 0.0, 1_940.0, 0.0, -60.0],
+        };
+        let got = read_los_layers_for_grid(&path, "/data", target, (3, 4))
+            .unwrap()
+            .expect("intersecting native window");
+        assert_eq!(got.east.dim(), (6, 8));
+        assert_eq!(
+            got.geo.geotransform,
+            [1_060.0, 30.0, 0.0, 1_940.0, 0.0, -30.0]
+        );
+        assert!((got.east[(0, 0)] - east[(2, 2)] as f64).abs() < 1e-8);
         let _ = std::fs::remove_file(&path);
     }
 }

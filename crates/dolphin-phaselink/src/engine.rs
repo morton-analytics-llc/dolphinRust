@@ -152,8 +152,9 @@ impl ComputeEngine {
     }
 
     /// Fused covariance → estimator → quality over `stack` (Lever 1): one pass
-    /// that retains only the per-date phase + scalar coherence + per-date CRLB +
-    /// per-triplet closure, never the `(out_rows, out_cols, nslc, nslc)` cube.
+    /// that retains only the per-date phase + bounded 2-D coherence aggregate +
+    /// per-date CRLB + per-triplet closure, never the
+    /// `(out_rows, out_cols, nslc, nslc)` cube.
     /// On the CPU this routes to [`crate::link_fused`]; when the GPU is resolved
     /// (cube materialized there anyway) it falls back to the staged covariance +
     /// estimator + per-stage quality, producing the identical [`FusedEstimate`].
@@ -168,6 +169,9 @@ impl ComputeEngine {
         neighbors: Option<ArrayView4<bool>>,
         params: FusedParams,
     ) -> Result<FusedEstimate, &'static str> {
+        if params.compute_average_coherence && params.average_coherence_start_idx > stack.dim().0 {
+            return Err("average coherence start exceeds stack depth");
+        }
         #[cfg(feature = "gpu")]
         {
             let (nslc, rows, cols) = stack.dim();
@@ -233,9 +237,7 @@ impl ComputeEngine {
         neighbors: Option<ArrayView4<bool>>,
         params: FusedParams,
     ) -> Result<FusedEstimate, &'static str> {
-        use crate::{
-            estimate_average_coherence, estimate_closure_phases, estimate_crlb, estimate_temp_coh,
-        };
+        use crate::{estimate_closure_phases, estimate_crlb, estimate_temp_coh};
         let c = self.covariance(stack, half, strides, neighbors)?;
         let est = self.estimate(
             c.view(),
@@ -258,15 +260,28 @@ impl ComputeEngine {
         let closure_phase = params
             .compute_closure
             .then(|| estimate_closure_phases(c.view()));
-        let average_coherence_per_date = params
-            .compute_average_coherence
-            .then(|| estimate_average_coherence(c.view()));
+        let average_coherence = params.compute_average_coherence.then(|| {
+            let (rows, cols, _, _) = c.dim();
+            let mut sum = ndarray::Array2::zeros((rows, cols));
+            let mut count = ndarray::Array2::zeros((rows, cols));
+            for r in 0..rows {
+                for col in 0..cols {
+                    let aggregate = crate::fused::average_coherence_sum_count(
+                        c.slice(ndarray::s![r, col, .., ..]),
+                        params.average_coherence_start_idx,
+                    );
+                    sum[(r, col)] = aggregate.0;
+                    count[(r, col)] = aggregate.1;
+                }
+            }
+            crate::AverageCoherenceAggregate { sum, count }
+        });
         Ok(FusedEstimate {
             cpx_phase: cpx,
             temporal_coherence,
             crlb_sigma,
             closure_phase,
-            average_coherence_per_date,
+            average_coherence,
         })
     }
 

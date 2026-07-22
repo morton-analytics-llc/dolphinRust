@@ -52,7 +52,7 @@ fn config() -> SequentialConfig {
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
         compute_crlb: false,
         compute_closure_phase: false,
-        compute_average_coherence: false,
+        compute_average_coherence: true,
     }
 }
 
@@ -81,6 +81,24 @@ fn gpu_backend_matches_cpu_end_to_end() {
     let cpu = run_sequential(stack.view(), &cfg, &ComputeEngine::new(ComputeBackend::Cpu)).unwrap();
     let gpu = run_sequential(stack.view(), &cfg, &gpu_engine).unwrap();
     assert_eq!(cpu.cpx_phase.dim(), gpu.cpx_phase.dim());
+    let cpu_phase_coherence = cpu
+        .phase_linking_coherence
+        .as_ref()
+        .expect("coherence enabled on CPU");
+    let gpu_phase_coherence = gpu
+        .phase_linking_coherence
+        .as_ref()
+        .expect("coherence enabled on GPU");
+    let coherence_max_error = cpu_phase_coherence
+        .iter()
+        .zip(gpu_phase_coherence)
+        .filter(|(cpu, gpu)| cpu.is_finite() && gpu.is_finite())
+        .map(|(cpu, gpu)| (cpu - gpu).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        coherence_max_error < 1e-3,
+        "phase-linking coherence backend error {coherence_max_error}"
+    );
 
     // Per-pixel max wrapped phase delta across dates (unit-magnitude phasors).
     let (nd, rows, cols) = cpu.cpx_phase.dim();

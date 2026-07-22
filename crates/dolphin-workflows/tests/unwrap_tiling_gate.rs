@@ -39,6 +39,41 @@ fn auto_tile_opt_in_holds_oracle_parity() {
         DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
     cfg.unwrap_options.snaphu_options.auto_tile = true;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_autotile_gate");
+    std::fs::create_dir_all(&cfg.work_directory).unwrap();
+    cfg.cslc_file_list = cfg
+        .cslc_file_list
+        .iter()
+        .map(|source| {
+            let target = cfg.work_directory.join(source.file_name().unwrap());
+            std::fs::copy(source, &target).unwrap();
+            let file = hdf5::File::open_rw(&target).unwrap();
+            let group = file.group("data").unwrap();
+            let shape = group.dataset("VV").unwrap().shape();
+            let x = (0..shape[1])
+                .map(|col| 500_015.0 + col as f64 * 30.0)
+                .collect::<Vec<_>>();
+            let y = (0..shape[0])
+                .map(|row| 4_200_015.0 - row as f64 * 30.0)
+                .collect::<Vec<_>>();
+            group
+                .new_dataset_builder()
+                .with_data(&x)
+                .create("x_coordinates")
+                .unwrap();
+            group
+                .new_dataset_builder()
+                .with_data(&y)
+                .create("y_coordinates")
+                .unwrap();
+            group
+                .new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611_i64)
+                .unwrap();
+            target
+        })
+        .collect();
     let out = run_displacement(&cfg).unwrap();
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();

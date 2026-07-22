@@ -24,6 +24,50 @@ fn snaphu_available() -> bool {
         .is_ok()
 }
 
+fn georeferenced_config(label: &str) -> DisplacementWorkflow {
+    let source = fixtures().join("disp/config.yaml");
+    let mut cfg =
+        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(source).unwrap()).unwrap();
+    let dir = std::env::temp_dir().join(format!("dolphin_nrt_georef_{label}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.work_directory = dir.clone();
+    cfg.cslc_file_list = cfg
+        .cslc_file_list
+        .iter()
+        .map(|path| {
+            let target = dir.join(path.file_name().unwrap());
+            std::fs::copy(path, &target).unwrap();
+            let file = hdf5::File::open_rw(&target).unwrap();
+            let group = file.group("data").unwrap();
+            let shape = group.dataset("VV").unwrap().shape();
+            let x = (0..shape[1])
+                .map(|col| 500_015.0 + col as f64 * 30.0)
+                .collect::<Vec<_>>();
+            let y = (0..shape[0])
+                .map(|row| 4_200_015.0 - row as f64 * 30.0)
+                .collect::<Vec<_>>();
+            group
+                .new_dataset_builder()
+                .with_data(&x)
+                .create("x_coordinates")
+                .unwrap();
+            group
+                .new_dataset_builder()
+                .with_data(&y)
+                .create("y_coordinates")
+                .unwrap();
+            group
+                .new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611_i64)
+                .unwrap();
+            target
+        })
+        .collect();
+    cfg
+}
+
 fn max3(a: &Array3<f64>, b: &Array3<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim(), "layer shape mismatch");
     a.iter()
@@ -53,7 +97,7 @@ fn incremental_displacement_matches_full_run() {
         eprintln!("skipping NRT displacement contract: no fixtures / snaphu");
         return;
     }
-    let base = DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let base = georeferenced_config("incremental");
     assert!(base.cslc_file_list.len() >= 5, "fixture needs >=5 dates");
 
     // Full run of the extended stack.
@@ -103,8 +147,7 @@ fn update_without_new_acquisitions_errors() {
         eprintln!("skipping NRT no-op guard: no fixtures / snaphu");
         return;
     }
-    let mut cfg =
-        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let mut cfg = georeferenced_config("noop");
     cfg.phase_linking.ministack_size = 2;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_nrt_noop");
     cfg.cslc_file_list = cfg.cslc_file_list[..3].to_vec();

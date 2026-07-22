@@ -6,10 +6,10 @@
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{
-    estimate_closure_phases, estimate_crlb, estimate_stack_covariance, estimate_temp_coh,
-    link_fused, process_coherence_matrices, FusedParams,
+    estimate_average_coherence, estimate_closure_phases, estimate_crlb, estimate_stack_covariance,
+    estimate_temp_coh, link_fused, process_coherence_matrices, FusedParams,
 };
-use ndarray::{Array3, Array4};
+use ndarray::{s, Array3, Array4};
 
 /// Smooth ramp + per-(slc,row,col) speckle so coherence matrices are non-trivial
 /// and pixels differ (exercises the per-pixel packing).
@@ -79,6 +79,7 @@ fn assert_bit_identical(use_evd: bool, with_mask: bool) {
         num_looks: (half.y as f64 * half.x as f64).sqrt(),
         compute_closure: true,
         compute_average_coherence: true,
+        average_coherence_start_idx: 2,
     };
 
     let (cpx_ref, tc_ref, crlb_ref, clo_ref) = staged(&stack, half, strides, neighbors.as_ref(), p);
@@ -96,10 +97,29 @@ fn assert_bit_identical(use_evd: bool, with_mask: bool) {
         fused.temporal_coherence, tc_ref,
         "temp_coh not bit-identical"
     );
-    assert!(
-        fused.average_coherence_per_date.is_some(),
-        "average coherence requested"
-    );
+    let aggregate = fused
+        .average_coherence
+        .expect("average coherence requested");
+    let cube = estimate_stack_covariance(
+        stack.view(),
+        half,
+        strides,
+        neighbors.as_ref().map(Array4::view),
+    )
+    .unwrap();
+    let per_date = estimate_average_coherence(cube.view());
+    for r in 0..out_rows {
+        for c in 0..out_cols {
+            let expected: Vec<_> = per_date
+                .slice(s![p.average_coherence_start_idx.., r, c])
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .collect();
+            assert_eq!(aggregate.count[(r, c)], expected.len() as u32);
+            assert_eq!(aggregate.sum[(r, c)], expected.iter().sum::<f64>());
+        }
+    }
     let crlb = fused.crlb_sigma.expect("crlb requested");
     nan_aware_eq(&crlb, &crlb_ref, "crlb");
     assert_eq!(
@@ -125,6 +145,7 @@ fn all_non_finite_slc_is_rejected_like_dolphin_v035() {
         num_looks: 1.0,
         compute_closure: false,
         compute_average_coherence: false,
+        average_coherence_start_idx: 0,
     };
     let result = link_fused(
         stack.view(),
@@ -138,6 +159,99 @@ fn all_non_finite_slc_is_rejected_like_dolphin_v035() {
         Err(err) => err,
     };
     assert!(err.contains("all non-finite"), "unexpected error: {err}");
+}
+
+#[test]
+fn disabled_average_coherence_allocates_no_aggregate() {
+    let stack = synth_stack(4, 7, 9);
+    let params = FusedParams {
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        reference_idx: 0,
+        compute_crlb: false,
+        crlb_reference_idx: 0,
+        num_looks: 1.0,
+        compute_closure: false,
+        compute_average_coherence: false,
+        average_coherence_start_idx: 4,
+    };
+    let output = link_fused(
+        stack.view(),
+        HalfWindow { y: 1, x: 1 },
+        Strides { y: 1, x: 2 },
+        None,
+        params,
+    )
+    .unwrap();
+    assert!(output.average_coherence.is_none());
+}
+
+#[test]
+fn average_coherence_flag_does_not_change_primary_outputs() {
+    let stack = synth_stack(7, 10, 12);
+    let mut params = FusedParams {
+        use_evd: false,
+        beta: 0.1,
+        zero_correlation_threshold: 0.0,
+        reference_idx: 0,
+        compute_crlb: true,
+        crlb_reference_idx: 0,
+        num_looks: 2.0,
+        compute_closure: true,
+        compute_average_coherence: false,
+        average_coherence_start_idx: 0,
+    };
+    let run = |params| {
+        link_fused(
+            stack.view(),
+            HalfWindow { y: 2, x: 2 },
+            Strides { y: 1, x: 2 },
+            None,
+            params,
+        )
+        .unwrap()
+    };
+    let disabled = run(params);
+    params.compute_average_coherence = true;
+    let enabled = run(params);
+    assert_eq!(enabled.cpx_phase, disabled.cpx_phase);
+    assert_eq!(enabled.temporal_coherence, disabled.temporal_coherence);
+    nan_aware_eq(
+        enabled.crlb_sigma.as_ref().unwrap(),
+        disabled.crlb_sigma.as_ref().unwrap(),
+        "crlb flag parity",
+    );
+    assert_eq!(enabled.closure_phase, disabled.closure_phase);
+    assert!(disabled.average_coherence.is_none());
+    assert!(enabled.average_coherence.is_some());
+}
+
+#[test]
+fn enabled_average_coherence_rejects_out_of_range_real_date_start() {
+    let stack = synth_stack(4, 7, 9);
+    let params = FusedParams {
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        reference_idx: 0,
+        compute_crlb: false,
+        crlb_reference_idx: 0,
+        num_looks: 1.0,
+        compute_closure: false,
+        compute_average_coherence: true,
+        average_coherence_start_idx: 5,
+    };
+    let error = link_fused(
+        stack.view(),
+        HalfWindow { y: 1, x: 1 },
+        Strides { y: 1, x: 2 },
+        None,
+        params,
+    )
+    .err()
+    .expect("invalid start must fail before allocation");
+    assert!(error.contains("average coherence start"));
 }
 
 /// CRLB can be NaN on singular pixels; compare NaN==NaN and finite bit-identical.

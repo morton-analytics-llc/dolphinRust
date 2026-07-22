@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_core::config::DisplacementWorkflow;
+use dolphin_core::Strides;
+use dolphin_io::write_raster;
 use dolphin_workflows::run_displacement;
 use ndarray::{Array2, Array3};
 
@@ -19,6 +21,53 @@ fn snaphu_available() -> bool {
         .arg("--help")
         .output()
         .is_ok()
+}
+
+/// Copy the historical numeric oracle into a georeferenced fixture stack. The
+/// oracle predates the fail-closed source-georeference contract, so tests add
+/// realistic 30 m UTM coordinate/projection datasets without changing samples.
+fn georeferenced_config(label: &str) -> DisplacementWorkflow {
+    let source = fixtures().join("disp/config.yaml");
+    let mut cfg =
+        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(source).unwrap()).unwrap();
+    let dir = std::env::temp_dir().join(format!("dolphin_georef_oracle_{label}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    cfg.work_directory = dir.clone();
+    cfg.cslc_file_list = cfg
+        .cslc_file_list
+        .iter()
+        .map(|path| {
+            let target = dir.join(path.file_name().unwrap());
+            std::fs::copy(path, &target).unwrap();
+            let file = hdf5::File::open_rw(&target).unwrap();
+            let group = file.group("data").unwrap();
+            let shape = group.dataset("VV").unwrap().shape();
+            let x = (0..shape[1])
+                .map(|col| 500_015.0 + col as f64 * 30.0)
+                .collect::<Vec<_>>();
+            let y = (0..shape[0])
+                .map(|row| 4_200_015.0 - row as f64 * 30.0)
+                .collect::<Vec<_>>();
+            group
+                .new_dataset_builder()
+                .with_data(&x)
+                .create("x_coordinates")
+                .unwrap();
+            group
+                .new_dataset_builder()
+                .with_data(&y)
+                .create("y_coordinates")
+                .unwrap();
+            group
+                .new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611_i64)
+                .unwrap();
+            target
+        })
+        .collect();
+    cfg
 }
 
 #[test]
@@ -34,7 +83,7 @@ fn end_to_end_displacement_matches_oracle() {
         return;
     }
 
-    let cfg = DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let cfg = georeferenced_config("oracle");
     let out = run_displacement(&cfg).unwrap();
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();
@@ -86,8 +135,7 @@ fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
         eprintln!("skipping average-coherence end-to-end: no fixtures / snaphu");
         return;
     }
-    let mut cfg =
-        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let mut cfg = georeferenced_config("average_coherence");
     cfg.phase_linking.calc_average_coh = true;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_average_coherence_e2e");
     let out = run_displacement(&cfg).unwrap();
@@ -120,8 +168,7 @@ fn phase_bias_correction_runs_end_to_end() {
         eprintln!("skipping phase-bias end-to-end: no fixtures / snaphu");
         return;
     }
-    let mut cfg =
-        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let mut cfg = georeferenced_config("phase_bias");
     cfg.phase_linking.correct_phase_bias = true;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_phasebias_e2e");
     let out = run_displacement(&cfg).unwrap();
@@ -146,8 +193,7 @@ fn closure_layer_produced_when_enabled() {
         eprintln!("skipping closure end-to-end: no fixtures / snaphu");
         return;
     }
-    let mut cfg =
-        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let mut cfg = georeferenced_config("closure");
     cfg.phase_linking.write_closure_phase = true;
     // Isolate scratch/outputs from the other end-to-end test (they run in
     // parallel and would otherwise race on a shared SNAPHU scratch directory).
@@ -163,4 +209,83 @@ fn closure_layer_produced_when_enabled() {
         (rows, cols),
         "closure grid"
     );
+}
+
+fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), label: &str) {
+    let mut full = georeferenced_config(&format!("bounded_{label}"));
+    full.output_options.strides = strides;
+    full.output_options.epsg = Some(32611);
+    full.phase_linking.calc_average_coh = true;
+    full.timeseries_options.reference_point =
+        Some(((target.0 + target.1) / 2, (target.2 + target.3) / 2));
+    full.work_directory = std::env::temp_dir().join(format!("dolphinrust_bounds_full_{label}"));
+    let full_output = run_displacement(&full).unwrap();
+    let gt = full_output.geotransform;
+    let (row_start, row_stop, col_start, col_stop) = target;
+    let mut bounded = full.clone();
+    bounded.output_options.bounds_epsg = Some(32611);
+    bounded.output_options.bounds = Some((
+        gt[0] + col_start as f64 * gt[1],
+        gt[3] + row_stop as f64 * gt[5],
+        gt[0] + col_stop as f64 * gt[1],
+        gt[3] + row_start as f64 * gt[5],
+    ));
+    bounded.work_directory =
+        std::env::temp_dir().join(format!("dolphinrust_bounds_target_{label}"));
+    if label == "1x2" {
+        let mask_path = std::env::temp_dir().join("dolphinrust_bounds_aligned_mask.tif");
+        let mask = Array2::from_elem(full_output.temporal_coherence.dim(), 1_u8);
+        write_raster(&mask_path, mask.view(), gt, Some(32611), Some(0.0)).unwrap();
+        bounded.mask_file = Some(mask_path);
+    }
+    let cropped = run_displacement(&bounded).unwrap();
+
+    assert_eq!(
+        cropped.temporal_coherence.dim(),
+        (row_stop - row_start, col_stop - col_start)
+    );
+    assert_eq!(cropped.geotransform[0], gt[0] + col_start as f64 * gt[1]);
+    assert_eq!(cropped.geotransform[3], gt[3] + row_start as f64 * gt[5]);
+    let expected = full_output
+        .phase_linking_coherence
+        .as_ref()
+        .unwrap()
+        .slice(ndarray::s![row_start..row_stop, col_start..col_stop]);
+    let actual = cropped.phase_linking_coherence.as_ref().unwrap();
+    assert_eq!(actual.view(), expected, "phase-link halo parity at {label}");
+    let expected_displacement =
+        full_output
+            .displacement
+            .slice(ndarray::s![.., row_start..row_stop, col_start..col_stop]);
+    let displacement_error = cropped
+        .displacement
+        .iter()
+        .zip(expected_displacement.iter())
+        .filter(|(actual, expected)| actual.is_finite() && expected.is_finite())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        displacement_error < 1e-3,
+        "AOI-local displacement interior error {displacement_error} at {label}"
+    );
+    let provenance = cropped
+        .geometry_provenance
+        .processing_bounds
+        .expect("bounded provenance");
+    assert_eq!(provenance.output_epsg, 32611);
+    assert_eq!(provenance.target_pixel_offset, [row_start, col_start]);
+    if let Some((row, col)) = cropped.reference_point {
+        assert!(row < cropped.temporal_coherence.dim().0);
+        assert!(col < cropped.temporal_coherence.dim().1);
+    }
+}
+
+#[test]
+fn bounded_target_trims_after_analysis_at_both_required_strides() {
+    if !snaphu_available() {
+        eprintln!("skipping bounded displacement contract: snaphu not on PATH");
+        return;
+    }
+    assert_bounded_case(Strides { y: 1, x: 2 }, (8, 30, 6, 24), "1x2");
+    assert_bounded_case(Strides { y: 3, x: 6 }, (2, 13, 1, 9), "3x6");
 }

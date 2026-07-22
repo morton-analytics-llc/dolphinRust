@@ -9,6 +9,7 @@
 
 pub mod burst;
 pub mod corrections;
+pub mod crop;
 pub mod dates;
 pub mod displacement;
 pub mod provenance;
@@ -16,13 +17,14 @@ pub mod sequential;
 pub mod tiling;
 pub mod unwrap_backend;
 
+pub use crop::{BoundsError, ProcessingBoundsProvenance};
 pub use displacement::{
     run_displacement, run_displacement_resumable, update_displacement, DisplacementOutput,
     DisplacementState,
 };
 pub use provenance::{
-    assemble_geometry_provenance, write_geometry_provenance, FieldProvenance, GeometryProvenance,
-    GEOMETRY_PROVENANCE_FILENAME,
+    assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
+    write_geometry_provenance, FieldProvenance, GeometryProvenance, GEOMETRY_PROVENANCE_FILENAME,
 };
 pub use sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,

@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use gdal::raster::Buffer;
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 use gdal::Dataset;
 use ndarray::{Array2, ArrayView2};
 
@@ -54,6 +55,135 @@ pub fn read_l4_netcdf(path: &Path, var: &str) -> Result<DelayGrid> {
         epsg,
         srs_wkt,
     })
+}
+
+/// Read only the native source window needed to cover a destination analysis
+/// grid, including one native pixel of bilinear interpolation support.
+///
+/// # Errors
+/// Fails when either grid lacks a usable CRS, the destination is not fully
+/// covered, or source nodata/mask invalidity intersects the bounded read.
+pub fn read_l4_netcdf_for_grid(
+    path: &Path,
+    var: &str,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<DelayGrid> {
+    let conn = format!("NETCDF:\"{}\":{var}", path.display());
+    let ds = Dataset::open(Path::new(&conn))?;
+    read_dataset_for_grid(&ds, dst_gt, dst_epsg, dst_shape)
+}
+
+fn read_dataset_for_grid(
+    ds: &Dataset,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<DelayGrid> {
+    let src_gt = ds.geo_transform()?;
+    if src_gt[1] <= 0.0
+        || src_gt[5] >= 0.0
+        || src_gt[2] != 0.0
+        || src_gt[4] != 0.0
+        || dst_gt[1] <= 0.0
+        || dst_gt[5] >= 0.0
+        || dst_gt[2] != 0.0
+        || dst_gt[4] != 0.0
+    {
+        return Err(CorrectionError::Shape(
+            "tropospheric bounded reads require north-up non-rotated grids".into(),
+        ));
+    }
+    let (epsg, srs_wkt) = source_crs(ds.spatial_ref().ok(), src_gt);
+    let src = DelayGrid {
+        data: Array2::zeros((0, 0)),
+        geotransform: src_gt,
+        epsg,
+        srs_wkt,
+    };
+    let mut source_srs = source_srs(&src)?;
+    let mut destination_srs = SpatialRef::from_epsg(dst_epsg)?;
+    source_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    destination_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let dst_bounds = grid_bounds(dst_gt, dst_shape);
+    let source_bounds = if source_srs.to_wkt()? == destination_srs.to_wkt()? {
+        dst_bounds
+    } else {
+        let transform = CoordTransform::new(&destination_srs, &source_srs)?;
+        let transformed = transform.transform_bounds(&dst_bounds, 21)?;
+        [
+            transformed[0],
+            transformed[1],
+            transformed[2],
+            transformed[3],
+        ]
+    };
+    let (source_cols, source_rows) = ds.raster_size();
+    let full_bounds = grid_bounds(src_gt, (source_rows, source_cols));
+    let tolerance = src_gt[1].abs().max(src_gt[5].abs()) * 1e-6;
+    if source_bounds[0] < full_bounds[0] - tolerance
+        || source_bounds[1] < full_bounds[1] - tolerance
+        || source_bounds[2] > full_bounds[2] + tolerance
+        || source_bounds[3] > full_bounds[3] + tolerance
+    {
+        return Err(CorrectionError::TroposphereCoverage);
+    }
+    let col_start =
+        (((source_bounds[0] - src_gt[0]) / src_gt[1]).floor() as isize - 1).max(0) as usize;
+    let col_stop = (((source_bounds[2] - src_gt[0]) / src_gt[1]).ceil() as isize + 1)
+        .min(source_cols as isize) as usize;
+    let row_start =
+        (((src_gt[3] - source_bounds[3]) / -src_gt[5]).floor() as isize - 1).max(0) as usize;
+    let row_stop = (((src_gt[3] - source_bounds[1]) / -src_gt[5]).ceil() as isize + 1)
+        .min(source_rows as isize) as usize;
+    if row_start >= row_stop || col_start >= col_stop {
+        return Err(CorrectionError::TroposphereCoverage);
+    }
+    let band = ds.rasterband(1)?;
+    let buffer = band.read_as::<f64>(
+        (col_start as isize, row_start as isize),
+        (col_stop - col_start, row_stop - row_start),
+        (col_stop - col_start, row_stop - row_start),
+        None,
+    )?;
+    let ((width, height), mut values) = buffer.into_shape_and_vec();
+    let mask = band.open_mask_band()?.read_as::<u8>(
+        (col_start as isize, row_start as isize),
+        (width, height),
+        (width, height),
+        None,
+    )?;
+    let nodata = band.no_data_value();
+    for (value, &valid) in values.iter_mut().zip(mask.data()) {
+        if valid == 0 || nodata.is_some_and(|sentinel| *value == sentinel) || !value.is_finite() {
+            *value = f64::NAN;
+        }
+    }
+    let data = Array2::from_shape_vec((height, width), values)
+        .map_err(|error| CorrectionError::Shape(error.to_string()))?;
+    Ok(DelayGrid {
+        data,
+        geotransform: [
+            src_gt[0] + col_start as f64 * src_gt[1],
+            src_gt[1],
+            0.0,
+            src_gt[3] + row_start as f64 * src_gt[5],
+            0.0,
+            src_gt[5],
+        ],
+        epsg: src.epsg,
+        srs_wkt: src.srs_wkt,
+    })
+}
+
+fn grid_bounds(gt: [f64; 6], shape: (usize, usize)) -> [f64; 4] {
+    [
+        gt[0],
+        gt[3] + shape.0 as f64 * gt[5],
+        gt[0] + shape.1 as f64 * gt[1],
+        gt[3],
+    ]
 }
 
 /// Resolve the source CRS for a delay grid. Prefers the netCDF's embedded SRS;
@@ -116,6 +246,28 @@ pub fn read_l4_total(path: &Path) -> Result<DelayGrid> {
     })
 }
 
+/// Bounded counterpart of [`read_l4_total`].
+pub fn read_l4_total_for_grid(
+    path: &Path,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<DelayGrid> {
+    let hydro = read_l4_netcdf_for_grid(path, L4_TOTAL_VARS[0], dst_gt, dst_epsg, dst_shape)?;
+    let wet = read_l4_netcdf_for_grid(path, L4_TOTAL_VARS[1], dst_gt, dst_epsg, dst_shape)?;
+    if hydro.data.dim() != wet.data.dim() || hydro.geotransform != wet.geotransform {
+        return Err(CorrectionError::Shape(
+            "bounded hydrostatic and wet grids differ".into(),
+        ));
+    }
+    Ok(DelayGrid {
+        data: hydro.data + wet.data,
+        geotransform: hydro.geotransform,
+        epsg: hydro.epsg,
+        srs_wkt: hydro.srs_wkt,
+    })
+}
+
 /// Reproject (warp) a source delay grid onto a destination frame grid that may be
 /// in a **different CRS** (e.g. a global EPSG:4326 OPERA L4 product onto a UTM
 /// NISAR/DISP-S1 frame). Builds in-memory GDAL datasets carrying each grid's CRS
@@ -146,6 +298,7 @@ pub fn warp_to_frame(
     src_ds.set_spatial_ref(&src_srs)?;
     {
         let mut band = src_ds.rasterband(1)?;
+        band.set_no_data_value(Some(f64::NAN))?;
         let mut buf = Buffer::new((src_cols, src_rows), src.data.iter().copied().collect());
         band.write((0, 0), (src_cols, src_rows), &mut buf)?;
     }
@@ -156,6 +309,11 @@ pub fn warp_to_frame(
     let mut dst_ds = mem.create_with_band_type::<f64, _>("", dst_cols, dst_rows, 1)?;
     dst_ds.set_geo_transform(&dst_gt)?;
     dst_ds.set_spatial_ref(&dst_srs)?;
+    {
+        let mut band = dst_ds.rasterband(1)?;
+        band.set_no_data_value(Some(f64::NAN))?;
+        band.fill(f64::NAN, None)?;
+    }
 
     reproject(&src_ds, &dst_ds)?;
 
@@ -165,6 +323,15 @@ pub fn warp_to_frame(
     let (_, values) = buf.into_shape_and_vec();
     Array2::from_shape_vec((dst_rows, dst_cols), values)
         .map_err(|e| CorrectionError::Shape(e.to_string()))
+}
+
+/// Reject nodata rather than silently injecting zero/NaN atmospheric delay.
+pub fn ensure_finite_coverage(values: &Array2<f64>) -> Result<()> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(CorrectionError::TroposphereNodata)
+    }
 }
 
 /// Reconstruct the source CRS for the warp: prefer the carried WKT (the real L4
@@ -237,6 +404,37 @@ fn write_netcdf_fixture(
         let mut buffer = Buffer::new((cols, rows), data.iter().copied().collect());
         band.write((0, 0), (cols, rows), &mut buffer)?;
     }
+
+    let nc = DriverManager::get_driver_by_name("netCDF")?;
+    src.create_copy(&nc, path, &Default::default())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_netcdf_fixture_with_validity(
+    path: &Path,
+    data: ArrayView2<f64>,
+    geotransform: [f64; 6],
+    epsg: Option<u32>,
+    nodata: Option<f64>,
+) -> Result<()> {
+    use gdal::raster::Buffer;
+    use gdal::spatial_ref::SpatialRef;
+    use gdal::DriverManager;
+    let _ = std::fs::remove_file(path);
+    let (rows, cols) = data.dim();
+    let mem = DriverManager::get_driver_by_name("MEM")?;
+    let mut src = mem.create_with_band_type::<f64, _>("", cols, rows, 1)?;
+    src.set_geo_transform(&geotransform)?;
+    if let Some(epsg) = epsg {
+        src.set_spatial_ref(&SpatialRef::from_epsg(epsg)?)?;
+    }
+    {
+        let mut band = src.rasterband(1)?;
+        band.set_no_data_value(nodata)?;
+        let mut buffer = Buffer::new((cols, rows), data.iter().copied().collect());
+        band.write((0, 0), (cols, rows), &mut buffer)?;
+    }
     let nc = DriverManager::get_driver_by_name("netCDF")?;
     src.create_copy(&nc, path, &Default::default())?;
     Ok(())
@@ -266,6 +464,78 @@ mod tests {
         let resampled = resample_bilinear(grid.data.view(), grid.geotransform, gt, (2, 3));
         assert!((resampled[(1, 1)] - field[(1, 1)]).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounded_l4_read_is_native_windowed_and_resamples_exactly() {
+        let path = std::env::temp_dir().join("dolphin_l4_bounded_window.nc");
+        let field = Array2::from_shape_fn((100, 120), |(row, col)| {
+            1.0 + row as f64 * 0.001 + col as f64 * 0.002
+        });
+        let source_gt = [300_000.0, 30.0, 0.0, 4_100_000.0, 0.0, -30.0];
+        write_netcdf_fixture_with_validity(
+            &path,
+            field.view(),
+            source_gt,
+            Some(32610),
+            Some(-9999.0),
+        )
+        .unwrap();
+        let target_gt = [300_900.0, 60.0, 0.0, 4_099_100.0, 0.0, -60.0];
+        let grid = read_l4_netcdf_for_grid(&path, "Band1", target_gt, 32610, (10, 12)).unwrap();
+        assert!(
+            grid.data.len() < field.len() / 10,
+            "native read must be bounded"
+        );
+        let output = resample_bilinear(grid.data.view(), grid.geotransform, target_gt, (10, 12));
+        ensure_finite_coverage(&output).unwrap();
+        let expected = 1.0 + 40.5 * 0.001 + 42.5 * 0.002;
+        assert!((output[(5, 6)] - expected).abs() < 1e-12);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_l4_rejects_partial_coverage_nodata_and_missing_crs() {
+        let path = std::env::temp_dir().join("dolphin_l4_bounded_failures.nc");
+        let mut field = Array2::from_elem((20, 20), 2.0_f64);
+        field[(10, 10)] = -9999.0;
+        let gt = [300_000.0, 30.0, 0.0, 4_100_000.0, 0.0, -30.0];
+        write_netcdf_fixture_with_validity(&path, field.view(), gt, Some(32610), Some(-9999.0))
+            .unwrap();
+        let partial = read_l4_netcdf_for_grid(
+            &path,
+            "Band1",
+            [299_970.0, 30.0, 0.0, 4_100_000.0, 0.0, -30.0],
+            32610,
+            (5, 5),
+        )
+        .unwrap_err();
+        assert!(matches!(partial, CorrectionError::TroposphereCoverage));
+        let grid = read_l4_netcdf_for_grid(
+            &path,
+            "Band1",
+            [300_240.0, 30.0, 0.0, 4_099_760.0, 0.0, -30.0],
+            32610,
+            (5, 5),
+        )
+        .unwrap();
+        let output = resample_bilinear(
+            grid.data.view(),
+            grid.geotransform,
+            [300_240.0, 30.0, 0.0, 4_099_760.0, 0.0, -30.0],
+            (5, 5),
+        );
+        assert!(matches!(
+            ensure_finite_coverage(&output),
+            Err(CorrectionError::TroposphereNodata)
+        ));
+
+        let no_crs = std::env::temp_dir().join("dolphin_l4_missing_crs.nc");
+        write_netcdf_fixture_with_validity(&no_crs, field.view(), gt, None, None).unwrap();
+        let error = read_l4_netcdf_for_grid(&no_crs, "Band1", gt, 32610, (5, 5)).unwrap_err();
+        assert!(matches!(error, CorrectionError::NoSourceCrs));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(no_crs);
     }
 
     /// Real-data gate: ingest a real `OPERA_L4_TROPO-ZENITH_V1` granule (path in
