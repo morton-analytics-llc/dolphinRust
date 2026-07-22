@@ -25,8 +25,11 @@ optimize. All math in `Cf64`.
   direct dense eigensolvers if faster, as long as the result converges to the correct
   eigenvector. The N×N systems are small (N = ministack size).
 - **Phase referencing:** `θ ← θ · exp(−j·∠θ[ref_idx])`.
-- **Quality:** temporal coherence `|Σ_{i>j} C_ij e^{−j(θ_i−θ_j)} W_ij| / Σ W_ij`; CRLB
-  from the Fisher matrix; closure phase on nearest triples.
+- **Quality:** temporal coherence `|Σ_{i>j} C_ij e^{−j(θ_i−θ_j)} W_ij| / Σ W_ij`; average
+  coherence magnitude per real SLC date `mean_j |C_ij|` (optionally reduced to the distinct
+  workflow `phase_linking_coherence` raster); CRLB from the Fisher matrix; closure phase on
+  nearest triples. Dolphin v0.35's public `avg_coh` is an argmax date index, so do not expose
+  or name that integer as a coherence value.
 - **Compressed SLC:** `Σ_k z_k e^{−jθ_k} / N` projection (carried forward by dolphin-stack).
 - **Phase-bias correction** (`phasebias`, Michaelides 2022; forward divergence, **not in dolphin**):
   nearest-neighbour closure `Ξ_k = β_k + β_{k+1}` ⇒ first-order constant bias velocity

@@ -52,6 +52,7 @@ fn config() -> SequentialConfig {
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
         compute_crlb: false,
         compute_closure_phase: false,
+        compute_average_coherence: false,
     }
 }
 

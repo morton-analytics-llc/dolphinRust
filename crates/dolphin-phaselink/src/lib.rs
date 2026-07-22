@@ -32,4 +32,6 @@ pub use fused::{link_fused, FusedEstimate, FusedParams};
 pub use phasebias::{
     correct_phase_bias, estimate_bias_velocity, mean_abs_closure, residual_closure,
 };
-pub use quality::{compress, estimate_temp_coh};
+pub use quality::{
+    average_coherence_per_date, compress, estimate_average_coherence, estimate_temp_coh,
+};

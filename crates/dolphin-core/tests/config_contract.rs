@@ -23,6 +23,7 @@ fn defaults_match_dolphin() {
     );
     assert!(c.phase_linking.write_crlb);
     assert!(!c.phase_linking.write_closure_phase);
+    assert!(!c.phase_linking.calc_average_coh);
     assert_eq!(c.ps_options.amp_dispersion_threshold, 0.25);
     assert_eq!(c.timeseries_options.method, TimeseriesMethod::L1);
     assert_eq!(c.timeseries_options.correlation_threshold, 0.2);
@@ -135,6 +136,7 @@ phase_linking:
     x: 5
   write_crlb: false
   write_closure_phase: true
+  calc_average_coh: true
 output_options:
   strides:
     y: 6
@@ -162,6 +164,10 @@ work_directory: /work/run1
     assert!(
         c.phase_linking.write_closure_phase,
         "write_closure_phase: true parsed"
+    );
+    assert!(
+        c.phase_linking.calc_average_coh,
+        "calc_average_coh: true parsed"
     );
     assert_eq!(c.unwrap_options.unwrap_method, UnwrapMethod::Spurt);
     assert_eq!(c.unwrap_options.tophu_options.ntiles, (2, 2));

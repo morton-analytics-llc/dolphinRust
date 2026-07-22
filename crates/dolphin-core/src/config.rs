@@ -131,6 +131,9 @@ pub struct PhaseLinkingOptions {
     pub write_crlb: bool,
     /// Write the closure-phase raster.
     pub write_closure_phase: bool,
+    /// Calculate average coherence magnitude per SLC date (dolphin
+    /// `calc_average_coh`) and emit the distinct phase-linking-coherence raster.
+    pub calc_average_coh: bool,
     /// Apply the phase-bias / non-closure correction (Michaelides et al. 2022) to
     /// the linked-phase series before the interferogram network. **Off by default**
     /// (this leads Python dolphin, which has no such correction; enabling it changes
@@ -155,6 +158,7 @@ impl Default for PhaseLinkingOptions {
             compressed_slc_plan: CompressedSlcPlan::default(),
             write_crlb: true,
             write_closure_phase: false,
+            calc_average_coh: false,
             correct_phase_bias: false,
         }
     }

@@ -78,6 +78,7 @@ fn assert_bit_identical(use_evd: bool, with_mask: bool) {
         crlb_reference_idx: 1,
         num_looks: (half.y as f64 * half.x as f64).sqrt(),
         compute_closure: true,
+        compute_average_coherence: true,
     };
 
     let (cpx_ref, tc_ref, crlb_ref, clo_ref) = staged(&stack, half, strides, neighbors.as_ref(), p);
@@ -95,6 +96,10 @@ fn assert_bit_identical(use_evd: bool, with_mask: bool) {
         fused.temporal_coherence, tc_ref,
         "temp_coh not bit-identical"
     );
+    assert!(
+        fused.average_coherence_per_date.is_some(),
+        "average coherence requested"
+    );
     let crlb = fused.crlb_sigma.expect("crlb requested");
     nan_aware_eq(&crlb, &crlb_ref, "crlb");
     assert_eq!(
@@ -102,6 +107,37 @@ fn assert_bit_identical(use_evd: bool, with_mask: bool) {
         clo_ref,
         "closure not bit-identical"
     );
+}
+
+#[test]
+fn all_non_finite_slc_is_rejected_like_dolphin_v035() {
+    let mut stack = synth_stack(4, 5, 5);
+    stack
+        .index_axis_mut(ndarray::Axis(0), 2)
+        .fill(Cf64::new(f64::NAN, f64::NAN));
+    let p = FusedParams {
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        reference_idx: 0,
+        compute_crlb: false,
+        crlb_reference_idx: 0,
+        num_looks: 1.0,
+        compute_closure: false,
+        compute_average_coherence: false,
+    };
+    let result = link_fused(
+        stack.view(),
+        HalfWindow { y: 1, x: 1 },
+        Strides { y: 1, x: 1 },
+        None,
+        p,
+    );
+    let err = match result {
+        Ok(_) => panic!("an all-non-finite acquisition must fail"),
+        Err(err) => err,
+    };
+    assert!(err.contains("all non-finite"), "unexpected error: {err}");
 }
 
 /// CRLB can be NaN on singular pixels; compare NaN==NaN and finite bit-identical.

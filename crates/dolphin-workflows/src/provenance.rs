@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/1";
-const METHOD_VERSION: &str = "1.0.0";
-/// `temporal_coherence.tif` is the phase-linking quality raster (see
-/// `write_outputs`); this key is relative to `work_directory`.
-const PHASE_LINKING_COHERENCE_KEY: &str = "temporal_coherence.tif";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/2";
+const METHOD_VERSION: &str = "2.0.0";
+/// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
+/// `temporal_coherence.tif`; relative to `work_directory`.
+const PHASE_LINKING_COHERENCE_KEY: &str = "phase_linking_coherence.tif";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 const HEADING_SPREAD_GATE_DEG: f64 = 1.0;
@@ -45,7 +45,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/1`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/2`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -69,8 +69,8 @@ pub struct GeometryProvenance {
     /// Zero-doppler mid-time seconds-of-day (UTC), mean across granules.
     pub acquisition_time_of_day_utc_s: Option<f64>,
     /// Artifact key of the phase-linking coherence raster, relative to
-    /// `work_directory`.
-    pub phase_linking_coherence: String,
+    /// `work_directory`; absent when `calc_average_coh` is disabled.
+    pub phase_linking_coherence: Option<String>,
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
@@ -165,7 +165,10 @@ pub fn assemble_geometry_provenance(
         native_range_spacing_m,
         native_azimuth_spacing_m,
         acquisition_time_of_day_utc_s,
-        phase_linking_coherence: PHASE_LINKING_COHERENCE_KEY.into(),
+        phase_linking_coherence: cfg
+            .phase_linking
+            .calc_average_coh
+            .then(|| PHASE_LINKING_COHERENCE_KEY.into()),
         decomposition_geometry_complete: orbit_direction.is_some()
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()

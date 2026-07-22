@@ -98,6 +98,7 @@ fn two_bursts_stitch_into_a_frame() {
     cfg.input_options.wavelength = Some(0.055_465_76);
     cfg.phase_linking.ministack_size = 15;
     cfg.phase_linking.half_window = HalfWindow { y: 2, x: 2 };
+    cfg.phase_linking.calc_average_coh = true;
     cfg.output_options.strides = Strides { y: 1, x: 1 };
     cfg.interferogram_network.reference_idx = Some(0);
 
@@ -110,6 +111,10 @@ fn two_bursts_stitch_into_a_frame() {
         "frame dims"
     );
     assert_eq!(out.temporal_coherence.dim(), (ROWS, FRAME_COLS));
+    assert_eq!(
+        out.phase_linking_coherence.as_ref().unwrap().dim(),
+        (ROWS, FRAME_COLS)
+    );
     assert_eq!(out.velocity_mm_yr.dim(), (ROWS, FRAME_COLS));
     assert_eq!(out.epsg, Some(EPSG as u32), "frame CRS");
     assert!(

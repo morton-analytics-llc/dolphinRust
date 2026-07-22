@@ -19,8 +19,8 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/1",
-  "method_version": "1.0.0",
+  "schema": "dolphinrust-geometry-provenance/2",
+  "method_version": "2.0.0",
   "orbit_direction": "descending",
   "incidence_angle_deg": 39.27,
   "incidence_angle_spread_deg": 1.57,
@@ -30,7 +30,7 @@ Two surfaces, one type:
   "native_range_spacing_m": 2.329562114715323,
   "native_azimuth_spacing_m": 14.06,
   "acquisition_time_of_day_utc_s": 50428.5,
-  "phase_linking_coherence": "temporal_coherence.tif",
+  "phase_linking_coherence": "phase_linking_coherence.tif",
   "decomposition_geometry_complete": true,
   "geometry_provenance": {
     "fields": {
@@ -69,9 +69,10 @@ Two surfaces, one type:
   leaving the raw stats populated for the consumer's own policy). This is the
   unambiguous "safe to decompose (this side)" bit; eo keeps decomposition disabled
   unless both geometry sides carry it.
-- `phase_linking_coherence` is the artifact key of the phase-linking temporal
-  coherence raster, relative to `work_directory` (always `temporal_coherence.tif`
-  today; eo uploads it and stores the S3 key as `phase_linking_coherence_s3_key`).
+- `phase_linking_coherence` is the optional artifact key of the distinct coherence-matrix-
+  magnitude raster, relative to `work_directory`. It is
+  `"phase_linking_coherence.tif"` only when `phase_linking.calc_average_coh` is enabled and
+  `null` otherwise; it must never alias estimator-fit `temporal_coherence.tif`.
 - `heading_deg` convention: platform velocity azimuth **in the scene-center ENU
   frame**, degrees clockwise from geographic north, normalized to `[0, 360)`.
   Measured on the real T144 descending burst: 189.98°. Note this differs from the
@@ -182,7 +183,7 @@ script produces the committed fixtures `oracle/fixtures/geomprov_ci_{cslc,static
    function of range, so full-burst means don't transfer to crops).
 4. **e2e** — `run_displacement` on the cropped validation stack writes
    `geometry_provenance.json`; it parses; all geometry fields absent (cropped
-   inputs); `phase_linking_coherence == "temporal_coherence.tif"`.
+   inputs); with the default-off quality flag, `phase_linking_coherence == null`.
 5. **Cross-derivation check** — heading from orbit velocity (189.98°) vs heading
    implied by real STATIC LOS signs + `look_direction` (190.09°) agree within 2°
    (measured 0.12°; the gate would catch a ground-track-convention error at 3.2° and
@@ -193,9 +194,10 @@ workspace test suite must stay green.
 
 ## eo-side follow-up (tracked in eo #120, not this repo)
 
-- Bump `vendor/dolphinRust` submodule; read `DisplacementOutput.geometry_provenance`
+- Bump `vendor/dolphinRust` submodule; enable `phase_linking.calc_average_coh`; read
+  `DisplacementOutput.geometry_provenance`
   in `run_frame`; extend `DolphinRunRow`/`upsert_run`/`mark_run_ready` to persist the
-  seven columns (migration already applied); upload `temporal_coherence.tif` →
+  seven columns (migration already applied); upload `phase_linking_coherence.tif` →
   `phase_linking_coherence_s3_key`; regenerate sqlx offline cache.
 - `ParseDolphinOutputTask` (Path A) can read `geometry_provenance.json` from
   `work_dir`.
@@ -219,10 +221,10 @@ workspace test suite must stay green.
   `sin_phi.abs()` — out of contract scope, flagged in eo #120.)
 - A work_dir with no `geometry_provenance.json` (e.g. Python-dolphin container runs)
   must read as all-absent — gate closed, fail-safe.
-- Coherence flavors: for dolphinRust output, `temporal_coherence.tif` **is** the
-  phase-linking quality raster — both `temporal_coherence_mean` and
-  `phase_linking_coherence_mean` derive from this one artifact; there is no second
-  raster to hunt for.
+- Coherence flavors are now distinct: `temporal_coherence.tif` is estimator-fit phase
+  consistency, while optional `phase_linking_coherence.tif` is the real-date-weighted mean
+  coherence-matrix magnitude. Until the optional artifact is enabled and uploaded,
+  `phase_linking_coherence_mean` remains unknown rather than copied from temporal coherence.
 - eo's two exhaustive `DisplacementOutput` struct literals
   (`gp-dolphin/src/lib.rs:651-664, 678-690`) gain a `geometry_provenance` field at
   the submodule bump.

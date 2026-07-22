@@ -72,6 +72,39 @@ fn end_to_end_displacement_matches_oracle() {
         .fold(0.0_f64, f64::max);
     assert_eq!(ref_band_max, 0.0, "CRLB reference band must be 0");
     assert!(out.closure_phase.is_none(), "closure off by default");
+    assert!(
+        out.phase_linking_coherence.is_none(),
+        "average coherence off by default"
+    );
+}
+
+#[test]
+fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping average-coherence end-to-end: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg =
+        DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    cfg.phase_linking.calc_average_coh = true;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_average_coherence_e2e");
+    let out = run_displacement(&cfg).unwrap();
+    let coherence = out
+        .phase_linking_coherence
+        .expect("calc_average_coh enabled");
+    assert_eq!(coherence.dim(), out.temporal_coherence.dim());
+    assert!(coherence.iter().all(|v| (0.0..=1.0).contains(v)));
+    assert!(cfg
+        .work_directory
+        .join("phase_linking_coherence.tif")
+        .exists());
+    assert!(cfg.work_directory.join("temporal_coherence.tif").exists());
+    assert_ne!(
+        coherence, out.temporal_coherence,
+        "metrics must be distinct"
+    );
 }
 
 /// Enabling the phase-bias correction (Michaelides 2022) runs end-to-end through

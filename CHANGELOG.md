@@ -7,6 +7,14 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Distinct phase-linking coherence output** (issues #7 and #9). Optional
+  `phase_linking.calc_average_coh` computes dolphin v0.35.0's bounded internal per-date
+  `mean_j |C_ij|` values inside the fused per-pixel pass, excludes carried compressed-SLC
+  pseudo-dates, and emits their real-date-weighted mean as `phase_linking_coherence.tif`.
+  `DisplacementOutput` and geometry provenance expose the layer separately from estimator-fit
+  `temporal_coherence.tif`; disabled output is explicit rather than an alias. Analytic,
+  pinned-oracle, fused/staged, tiled/whole, multiburst, NRT, raster, and provenance contracts
+  cover the full path.
 - **Per-pixel LOS geometry ingest from OPERA CSLC-S1-STATIC.** The atmospheric-correction
   stage no longer projects zenith→line-of-sight with a single scalar `incidence_angle_deg`:
   when `correction_options.geometry_files` are supplied (per-burst CSLC-S1-STATIC granules),
@@ -46,6 +54,11 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **All-non-finite phase-linking input now fails loudly** (issue #8). A stack containing an
+  acquisition with no finite complex samples returns an error before covariance/estimation,
+  matching pinned dolphin v0.35.0's `PhaseLinkRuntimeError` instead of allowing a zero
+  coherence matrix to masquerade as `temporal_coherence=1.0` / zero displacement. Partially
+  valid inputs retain the existing dolphin-compatible masking behavior.
 - **Flaky HDF5 unit tests in `dolphin-io`.** `hdf5-metno` links a non-thread-safe HDF5, so
   parallel test threads creating/opening HDF5 fixtures raced and corrupted global library
   state (intermittent `geo`/`nisar`/geometry failures). HDF5-touching unit tests now serialize

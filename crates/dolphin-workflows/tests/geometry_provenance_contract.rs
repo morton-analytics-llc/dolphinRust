@@ -109,6 +109,24 @@ fn real_metadata_sample_maps_to_exported_fields() {
     assert!(!prov.decomposition_geometry_complete);
 }
 
+#[test]
+fn phase_linking_coherence_provenance_is_optional_and_never_aliases_temporal() {
+    let mut cfg = DisplacementWorkflow::default();
+    let absent = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(absent.phase_linking_coherence, None);
+
+    cfg.phase_linking.calc_average_coh = true;
+    let present = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(
+        present.phase_linking_coherence.as_deref(),
+        Some("phase_linking_coherence.tif")
+    );
+    assert_ne!(
+        present.phase_linking_coherence.as_deref(),
+        Some("temporal_coherence.tif")
+    );
+}
+
 /// Contract 2a: a /data-only granule (cropped, no metadata groups) yields explicit
 /// absence for every geometry field — never a default.
 #[test]
@@ -293,7 +311,7 @@ fn run_writes_geometry_provenance_artifact() {
     let parsed: GeometryProvenance =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
 
-    assert_eq!(parsed.phase_linking_coherence, "temporal_coherence.tif");
+    assert_eq!(parsed.phase_linking_coherence, None);
     assert_eq!(parsed.orbit_direction, None, "disp fixtures are data-only");
     assert_eq!(parsed.incidence_angle_deg, None);
     assert_eq!(parsed.heading_deg, None);

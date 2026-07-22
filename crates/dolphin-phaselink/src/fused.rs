@@ -23,7 +23,7 @@ use crate::closure::triplet_closure;
 use crate::covariance::{normalize_numerator, pixel_coh, sliding_row_numerators};
 use crate::crlb::crlb_pixel;
 use crate::estimator::process_coherence_matrix;
-use crate::quality::temp_coh_single;
+use crate::quality::{average_coherence_per_date, temp_coh_single};
 
 /// Estimator + quality parameters for a fused pass (mirrors the separate-stage
 /// call arguments). Grouped to keep the per-pixel signature small.
@@ -46,6 +46,8 @@ pub struct FusedParams {
     pub num_looks: f64,
     /// Produce the per-triplet closure-phase layer.
     pub compute_closure: bool,
+    /// Produce the per-date average coherence-magnitude layer.
+    pub compute_average_coherence: bool,
 }
 
 /// Fused phase-linking output over the strided `(out_rows, out_cols)` grid.
@@ -61,6 +63,9 @@ pub struct FusedEstimate {
     /// Per-triplet closure phase (band-major), `(nslc-2, out_rows, out_cols)`;
     /// `None` unless requested.
     pub closure_phase: Option<Array3<f64>>,
+    /// Per-date average coherence magnitude, `(nslc, out_rows, out_cols)`;
+    /// `None` unless requested.
+    pub average_coherence_per_date: Option<Array3<f64>>,
 }
 
 /// One output pixel's fused products — the only thing retained per pixel.
@@ -69,6 +74,7 @@ struct PixelFused {
     temp_coh: f64,
     crlb: Option<Array1<f64>>,
     closure: Option<Vec<f64>>,
+    average_coherence: Option<Array1<f64>>,
 }
 
 /// Run the fused covariance + estimator + quality pass over `stack`
@@ -85,6 +91,9 @@ pub fn link_fused(
     params: FusedParams,
 ) -> Result<FusedEstimate, &'static str> {
     let (nslc, rows, cols) = stack.dim();
+    if has_all_non_finite_acquisition(stack) {
+        return Err("slc stack contains an all non-finite acquisition");
+    }
     let (win_h, win_w) = (2 * half.y + 1, 2 * half.x + 1);
     if win_h > rows || win_w > cols {
         return Err("covariance window larger than stack");
@@ -102,6 +111,17 @@ pub fn link_fused(
         None => fused_pixels_sliding(stack, half, strides, params, (out_rows, out_cols)),
     };
     Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
+}
+
+/// Whether any acquisition contains no finite complex sample. Pinned dolphin
+/// v0.35.0 rejects the same degenerate stack before covariance estimation.
+pub(crate) fn has_all_non_finite_acquisition(stack: ArrayView3<Cf64>) -> bool {
+    (0..stack.dim().0).any(|date| {
+        stack
+            .index_axis(ndarray::Axis(0), date)
+            .iter()
+            .all(|z| !z.re.is_finite() || !z.im.is_finite())
+    })
 }
 
 /// SHP-masked path: flat per-output-pixel, each pixel builds its own coherence
@@ -178,11 +198,15 @@ fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
     let closure = p
         .compute_closure
         .then(|| (0..ntri).map(|k| triplet_closure(c.view(), k)).collect());
+    let average_coherence = p
+        .compute_average_coherence
+        .then(|| average_coherence_per_date(c.view()));
     PixelFused {
         phase,
         temp_coh,
         crlb,
         closure,
+        average_coherence,
     }
 }
 
@@ -208,6 +232,9 @@ fn pack(
     let mut closure = params
         .compute_closure
         .then(|| Array3::<f64>::zeros((ntri, out_rows, out_cols)));
+    let mut average_coherence = params
+        .compute_average_coherence
+        .then(|| Array3::<f64>::zeros((nslc, out_rows, out_cols)));
 
     for (idx, px) in pixels.into_iter().enumerate() {
         let (r, c) = (idx / out_cols, idx % out_cols);
@@ -218,12 +245,14 @@ fn pack(
             .for_each(|(t, &z)| cpx_phase[(t, r, c)] = z);
         write_band(crlb.as_mut(), px.crlb, (r, c));
         write_closure(closure.as_mut(), px.closure, (r, c));
+        write_band(average_coherence.as_mut(), px.average_coherence, (r, c));
     }
     FusedEstimate {
         cpx_phase,
         temporal_coherence,
         crlb_sigma: crlb,
         closure_phase: closure,
+        average_coherence_per_date: average_coherence,
     }
 }
 

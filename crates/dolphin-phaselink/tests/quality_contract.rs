@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_core::{Cf32, Cf64};
-use dolphin_phaselink::{compress, estimate_temp_coh};
+use dolphin_phaselink::{
+    average_coherence_per_date, compress, estimate_average_coherence, estimate_temp_coh,
+};
 use ndarray::{Array2, Array3, Array4};
 
 // ------------------------------- analytic (primary) ---------------------------
@@ -46,6 +48,21 @@ fn temp_coh_below_one_for_imperfect_fit() {
     });
     let coh = estimate_temp_coh(phase.view(), c.view())[(0, 0)];
     assert!(coh > 0.0 && coh < 1.0, "imperfect fit in (0,1), got {coh}");
+}
+
+#[test]
+fn average_coherence_per_date_matches_closed_form_row_means() {
+    let magnitudes = [[1.0, 0.2, 0.4], [0.2, 1.0, 0.8], [0.4, 0.8, 1.0]];
+    let c = Array2::from_shape_fn((3, 3), |(i, j)| Cf64::from_polar(magnitudes[i][j], 0.1));
+    let got = average_coherence_per_date(c.view());
+    let expected = [(1.0 + 0.2 + 0.4) / 3.0, 2.0 / 3.0, 2.2 / 3.0];
+    for (date, (&actual, expected)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "date {date}: {actual} != {expected}"
+        );
+        assert!((0.0..=1.0).contains(&actual));
+    }
 }
 
 #[test]
@@ -109,6 +126,24 @@ fn temp_coh_matches_oracle() {
 #[test]
 fn temp_coh_noisy_matches_oracle() {
     check_temp_coh_oracle("phase_noisy.npy", "temp_coh_noisy.npy");
+}
+
+#[test]
+fn average_coherence_matches_pinned_oracle_intermediate() {
+    let dir = fixtures();
+    if !dir.join("avg_coh_per_date.npy").exists() {
+        eprintln!("skipping average-coherence oracle: no generated fixture");
+        return;
+    }
+    let c: Array4<Cf32> = ndarray_npy::read_npy(dir.join("cov_C.npy")).unwrap();
+    let oracle: Array3<f32> = ndarray_npy::read_npy(dir.join("avg_coh_per_date.npy")).unwrap();
+    let got = estimate_average_coherence(to_c64(c).view());
+    let err = got
+        .iter()
+        .zip(oracle.iter())
+        .map(|(a, b)| (a - f64::from(*b)).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(err < 1e-4, "average-coherence oracle error {err}");
 }
 
 #[test]

@@ -39,6 +39,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_flag(key: &str) -> bool {
+    env_usize(key, 0) == 1
+}
+
 fn synth(nslc: usize, rows: usize, cols: usize) -> Array3<Cf64> {
     Array3::from_shape_fn((nslc, rows, cols), |(t, r, c)| {
         let phase = 0.3 * t as f64 * ((c as f64 + 1.0) / cols as f64)
@@ -71,7 +75,12 @@ fn main() {
     let nslc = env_usize("NSLC", 16);
     let iters = env_usize("ITERS", 3);
     let half = HalfWindow { y: 5, x: 5 };
-    let strides = Strides { y: 1, x: 1 };
+    let strides = Strides {
+        y: env_usize("STRIDE_Y", 1),
+        x: env_usize("STRIDE_X", 1),
+    };
+    let compute_average_coherence = env_flag("AVERAGE_COH");
+    let fused_only = env_flag("FUSED_ONLY");
     let beta = 0.1;
     let zct = 0.0;
     let p = FusedParams {
@@ -83,31 +92,37 @@ fn main() {
         crlb_reference_idx: 0,
         num_looks: (half.y as f64 * half.x as f64).sqrt(),
         compute_closure: false,
+        compute_average_coherence,
     };
     let stack = synth(nslc, rows, cols);
     println!(
-        "PL microbench: {nslc}×{rows}² tile, half=5 (11×11), strides=1, EMI+CRLB, {iters} iters\n"
+        "PL microbench: {nslc}×{rows}² tile, half=5 (11×11), strides={}x{}, EMI+CRLB, average_coh={}, {iters} iters\n",
+        strides.y,
+        strides.x,
+        compute_average_coherence
     );
 
     for it in 0..iters {
         println!("iter {it}:");
-        println!(" staged:");
-        timed("covariance (direct, pre-box-sum)", || {
-            estimate_stack_covariance_direct(stack.view(), half, strides, None).unwrap()
-        });
-        let c = timed("covariance", || {
-            estimate_stack_covariance(stack.view(), half, strides, None).unwrap()
-        });
-        let est = timed("estimator", || {
-            process_coherence_matrices(c.view(), p.use_evd, beta, zct, p.reference_idx)
-        });
-        let cpx = est.cpx_phase.mapv(|z| Cf64::from_polar(1.0, z.arg()));
-        timed("temp_coh", || {
-            estimate_temp_coh(cpx.view().permuted_axes([1, 2, 0]), c.view())
-        });
-        timed("crlb", || {
-            estimate_crlb(c.view(), beta, zct, p.crlb_reference_idx, p.num_looks)
-        });
+        if !fused_only {
+            println!(" staged:");
+            timed("covariance (direct, pre-box-sum)", || {
+                estimate_stack_covariance_direct(stack.view(), half, strides, None).unwrap()
+            });
+            let c = timed("covariance", || {
+                estimate_stack_covariance(stack.view(), half, strides, None).unwrap()
+            });
+            let est = timed("estimator", || {
+                process_coherence_matrices(c.view(), p.use_evd, beta, zct, p.reference_idx)
+            });
+            let cpx = est.cpx_phase.mapv(|z| Cf64::from_polar(1.0, z.arg()));
+            timed("temp_coh", || {
+                estimate_temp_coh(cpx.view().permuted_axes([1, 2, 0]), c.view())
+            });
+            timed("crlb", || {
+                estimate_crlb(c.view(), beta, zct, p.crlb_reference_idx, p.num_looks)
+            });
+        }
         println!(" fused:");
         timed("link_fused (all)", || {
             link_fused(stack.view(), half, strides, None, p).unwrap()

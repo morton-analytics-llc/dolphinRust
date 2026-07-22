@@ -11,8 +11,31 @@
 //! [`crate::crlb`] and [`crate::closure`] (validated against the v0.42.0 oracle).
 
 use dolphin_core::Cf64;
-use ndarray::{s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4};
+use ndarray::{s, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4};
 use rayon::prelude::*;
+
+/// Average coherence magnitude for each SLC date in one square coherence matrix.
+///
+/// This preserves dolphin v0.35.0's bounded internal `abs(C).mean(axis=3)`
+/// values, including the diagonal. Dolphin's public `avg_coh` applies an
+/// `argmax` afterward and is a reference-date index, not a coherence value.
+#[must_use]
+pub fn average_coherence_per_date(c: ArrayView2<Cf64>) -> Array1<f64> {
+    let n = c.nrows();
+    debug_assert_eq!(n, c.ncols(), "coherence matrix must be square");
+    Array1::from_iter((0..n).map(|i| c.row(i).iter().map(|z| z.norm()).sum::<f64>() / n as f64))
+}
+
+/// Per-date average coherence over `(rows, cols, nslc, nslc)` matrices.
+///
+/// Returns a band-major `(nslc, rows, cols)` array.
+#[must_use]
+pub fn estimate_average_coherence(c_arrays: ArrayView4<Cf64>) -> Array3<f64> {
+    let (rows, cols, nslc, _) = c_arrays.dim();
+    Array3::from_shape_fn((nslc, rows, cols), |(date, r, col)| {
+        average_coherence_per_date(c_arrays.slice(s![r, col, .., ..]))[date]
+    })
+}
 
 /// Temporal coherence per pixel from the linked phase and coherence matrices.
 ///

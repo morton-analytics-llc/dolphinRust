@@ -640,8 +640,25 @@ Four commits on `feat/native-unwrap` (`dc16b96` seam reconciliation, `f512197` b
   alone reaches 0.1918% final-epoch per-component disagreement — no seam ties occur at that
   grid — while the deterministic tie-breaks are what eliminate the HashMap-iteration-order
   tail excursions (up to 11.73%) at finer grids. On that 352x2217 frame, native ran in
-  61.3 s versus SNAPHU's 100.7 s; the older 48-pixel throughput claims need re-benchmarking
-  before reuse.
+  61.3 s versus SNAPHU's 100.7 s.
+
+  **64-pixel throughput re-benchmark (2026-07-21):** reran the deterministic residue-dense
+  1024x1024, 7-ifg harness (27,586 residues / 2.63% on the densest ifg) on the same 12-core
+  host with the production-equivalent 16x16 grid (`TILES=16 ROWS=1024 COLS=1024 EPOCHS=8
+  KS='1 2 3 4 6' NTOTAL=6 bash oracle/bench_unwrap_throughput.sh`). At 8 threads, native measured **3.4 s wall /
+  23.7 CPU-s / 543 MiB** versus SNAPHU **21.4 s / 123.9 CPU-s / 453 MiB**: 6.3x lower
+  single-frame latency and 5.2x lower CPU cost. The full six-frame concurrency sweep measured:
+
+  | concurrent frames (K) | 1 | 2 | 3 | 4 | 6 |
+  |---|---:|---:|---:|---:|---:|
+  | SNAPHU frames/hour | 191 | 181 | 201 | 195 | **227** |
+  | native 64px frames/hour | 1,223 | 1,215 | 1,314 | 1,180 | **1,521** |
+
+  Peak measured native throughput is therefore **1,521 frames/hour, 6.7x SNAPHU's 227** at
+  K=6 (2 threads/frame). CPU-s saturation estimates are 1,822 versus 348 frames/hour. These
+  are synthetic harness measurements for backend comparison, not end-to-end GroundPulse frame
+  throughput; they supersede the older ~6,300/~600 figures for the currently deployed 64-pixel
+  floor.
 - **DEFAULT FLIP.** `UnwrapMethod::default()` Snaphu→**Native** (`config.rs`); `snaphu`
   selectable as fallback; `config_contract` pins the new default + fallback spelling. A
   deliberate divergence from dolphin's `snaphu` default. The per-frame thread count (rayon

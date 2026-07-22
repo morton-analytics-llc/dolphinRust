@@ -173,6 +173,9 @@ impl ComputeEngine {
             let (nslc, rows, cols) = stack.dim();
             let (out_rows, out_cols) = strides.out_shape((rows, cols));
             if self.gpu_ready(out_rows * out_cols, nslc) {
+                if crate::fused::has_all_non_finite_acquisition(stack) {
+                    return Err("slc stack contains an all non-finite acquisition");
+                }
                 return self.link_staged(stack, half, strides, neighbors, params);
             }
         }
@@ -230,7 +233,9 @@ impl ComputeEngine {
         neighbors: Option<ArrayView4<bool>>,
         params: FusedParams,
     ) -> Result<FusedEstimate, &'static str> {
-        use crate::{estimate_closure_phases, estimate_crlb, estimate_temp_coh};
+        use crate::{
+            estimate_average_coherence, estimate_closure_phases, estimate_crlb, estimate_temp_coh,
+        };
         let c = self.covariance(stack, half, strides, neighbors)?;
         let est = self.estimate(
             c.view(),
@@ -253,11 +258,15 @@ impl ComputeEngine {
         let closure_phase = params
             .compute_closure
             .then(|| estimate_closure_phases(c.view()));
+        let average_coherence_per_date = params
+            .compute_average_coherence
+            .then(|| estimate_average_coherence(c.view()));
         Ok(FusedEstimate {
             cpx_phase: cpx,
             temporal_coherence,
             crlb_sigma,
             closure_phase,
+            average_coherence_per_date,
         })
     }
 

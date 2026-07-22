@@ -40,6 +40,7 @@ fn cfg() -> SequentialConfig {
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
         compute_crlb: true,
         compute_closure_phase: true,
+        compute_average_coherence: true,
     }
 }
 
@@ -87,6 +88,11 @@ fn assert_outputs_match(
         inc.temporal_coherence.view(),
         full.temporal_coherence.view(),
     );
+    let dphase_coh = match (&inc.phase_linking_coherence, &full.phase_linking_coherence) {
+        (Some(a), Some(b)) => max_r(a.view(), b.view()),
+        (None, None) => 0.0,
+        _ => panic!("phase-linking-coherence presence mismatch"),
+    };
     let dcrlb = match (&inc.crlb_sigma, &full.crlb_sigma) {
         (Some(a), Some(b)) => max_r3(a.view(), b.view()),
         (None, None) => 0.0,
@@ -98,11 +104,15 @@ fn assert_outputs_match(
         _ => panic!("closure presence mismatch"),
     };
     eprintln!(
-        "incremental vs full: dphase={dp:.2e} dcompressed={dc:.2e} dtcoh={dt:.2e} dcrlb={dcrlb:.2e} dclosure={dclos:.2e}"
+        "incremental vs full: dphase={dp:.2e} dcompressed={dc:.2e} dtcoh={dt:.2e} dphasecoh={dphase_coh:.2e} dcrlb={dcrlb:.2e} dclosure={dclos:.2e}"
     );
     assert!(dp < tol, "cpx_phase max|Δ| {dp}");
     assert!(dc < tol, "compressed max|Δ| {dc}");
     assert!(dt < tol, "temporal_coherence max|Δ| {dt}");
+    assert!(
+        dphase_coh < tol,
+        "phase_linking_coherence max|Δ| {dphase_coh}"
+    );
     assert!(dcrlb < tol, "crlb max|Δ| {dcrlb}");
     assert!(dclos < tol, "closure max|Δ| {dclos}");
 }

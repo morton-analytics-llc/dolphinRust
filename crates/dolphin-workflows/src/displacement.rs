@@ -57,6 +57,9 @@ pub struct DisplacementOutput {
     /// NaN-aware mean (dolphin's `temporal_coherence_average` = `numpy.nanmean`);
     /// a phase-quality mask, `(rows, cols)`.
     pub temporal_coherence: Array2<f64>,
+    /// Mean coherence-matrix magnitude across real acquisitions, distinct from
+    /// estimator-fit temporal coherence. `None` unless `calc_average_coh` is on.
+    pub phase_linking_coherence: Option<Array2<f64>>,
     /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
     /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
     /// feeds GroundPulse's `confidence_score`. `None` when `phase_linking.write_crlb`
@@ -146,6 +149,7 @@ fn finish_displacement(
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
     let temporal_coherence = stitched.temp_coh;
+    let phase_linking_coherence = stitched.phase_linking_coherence;
     let crlb_sigma = stitched.crlb_sigma;
     let closure_phase = stitched.closure_phase;
     let geo = stitched.geo;
@@ -205,6 +209,7 @@ fn finish_displacement(
     let velocity_mm_yr = vel_rad.mapv(|v| v * mm);
 
     let quality = QualityLayers {
+        phase_linking_coherence: phase_linking_coherence.as_ref(),
         crlb_sigma: crlb_sigma.as_ref(),
         closure_phase: closure_phase.as_ref(),
     };
@@ -228,6 +233,7 @@ fn finish_displacement(
         velocity,
         velocity_mm_yr,
         temporal_coherence,
+        phase_linking_coherence,
         crlb_sigma,
         closure_phase,
         acquisition_days: days,
@@ -247,6 +253,8 @@ struct BurstLink {
     pl: Array3<Cf64>,
     /// Temporal coherence `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
+    /// Distinct phase-linking coherence `(out_rows, out_cols)`, if enabled.
+    phase_linking_coherence: Option<Array2<f64>>,
     /// Per-date CRLB σ `(n_dates, out_rows, out_cols)`, if enabled.
     crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet closure phase (band-major), if enabled.
@@ -305,7 +313,12 @@ fn phase_link_tiled(
     // must cover that or interior seams corrupt. div_ceil is an exact upper bound
     // on the planner's ministack count.
     let depth = nslc.div_ceil(cfg.phase_linking.ministack_size.max(1));
-    let mut acc = TiledOutput::new(nslc, out_shape, cfg.phase_linking.write_crlb);
+    let mut acc = TiledOutput::new(
+        nslc,
+        out_shape,
+        cfg.phase_linking.write_crlb,
+        cfg.phase_linking.calc_average_coh,
+    );
     let (mut read_s, mut compute_s) = (0.0_f64, 0.0_f64);
     for plan in plan_tiles(full_shape, strides, half, depth, out_block) {
         let t_read = Instant::now();
@@ -358,17 +371,24 @@ fn upcast_into(dst: ArrayViewMut2<Cf64>, src: ndarray::ArrayView2<Cf32>) {
 struct TiledOutput {
     cpx: Array3<Cf64>,
     temp_coh: Array2<f64>,
+    phase_linking_coherence: Option<Array2<f64>>,
     crlb: Option<Array3<f64>>,
     closure: Option<Array3<f64>>,
     out_shape: (usize, usize),
 }
 
 impl TiledOutput {
-    fn new(nslc: usize, out_shape: (usize, usize), want_crlb: bool) -> Self {
+    fn new(
+        nslc: usize,
+        out_shape: (usize, usize),
+        want_crlb: bool,
+        want_average_coherence: bool,
+    ) -> Self {
         let (or, oc) = out_shape;
         Self {
             cpx: Array3::zeros((nslc, or, oc)),
             temp_coh: Array2::zeros((or, oc)),
+            phase_linking_coherence: want_average_coherence.then(|| Array2::zeros((or, oc))),
             crlb: want_crlb.then(|| Array3::zeros((nslc, or, oc))),
             closure: None,
             out_shape,
@@ -389,6 +409,13 @@ impl TiledOutput {
         self.temp_coh
             .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
             .assign(&out.temporal_coherence.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
+        if let (Some(dst), Some(src)) = (
+            self.phase_linking_coherence.as_mut(),
+            out.phase_linking_coherence.as_ref(),
+        ) {
+            dst.slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
+                .assign(&src.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
+        }
         if let (Some(dst), Some(src)) = (self.crlb.as_mut(), out.crlb_sigma.as_ref()) {
             assign_block3(dst, src, g, l, (h, w));
         }
@@ -407,6 +434,7 @@ impl TiledOutput {
             cpx_phase: self.cpx,
             compressed_slcs: Vec::new(),
             temporal_coherence: self.temp_coh,
+            phase_linking_coherence: self.phase_linking_coherence,
             crlb_sigma: self.crlb,
             closure_phase: self.closure,
         }
@@ -445,6 +473,7 @@ fn burst_link(
     Ok(BurstLink {
         pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
+        phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
         geo: resolve_burst_geo(cfg, first_file, rows, cols),
@@ -614,6 +643,8 @@ struct Stitched {
     pl: Array3<Cf64>,
     /// Temporal coherence `(rows, cols)`.
     temp_coh: Array2<f64>,
+    /// Distinct phase-linking coherence `(rows, cols)`, if enabled.
+    phase_linking_coherence: Option<Array2<f64>>,
     /// Per-date CRLB σ `(n_dates, rows, cols)`, if enabled.
     crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet closure phase (band-major), if enabled.
@@ -631,6 +662,7 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         return Ok(Stitched {
             pl: b.pl,
             temp_coh: b.temp_coh,
+            phase_linking_coherence: b.phase_linking_coherence,
             crlb_sigma: b.crlb_sigma,
             closure_phase: b.closure_phase,
             geo: b.geo.geo,
@@ -649,13 +681,30 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
     }
     let crlb_sigma = stitch_layer(&bursts, &frame, |b| b.crlb_sigma.as_ref());
     let closure_phase = stitch_layer(&bursts, &frame, |b| b.closure_phase.as_ref());
+    let phase_linking_coherence =
+        stitch_optional_2d(&bursts, &frame, |b| b.phase_linking_coherence.as_ref());
     Ok(Stitched {
         pl,
         temp_coh,
+        phase_linking_coherence,
         crlb_sigma,
         closure_phase,
         geo: frame.geo,
     })
+}
+
+/// Mosaic an optional per-burst 2D layer onto the frame grid.
+fn stitch_optional_2d(
+    bursts: &[BurstLink],
+    frame: &FrameGrid,
+    pick: impl Fn(&BurstLink) -> Option<&Array2<f64>>,
+) -> Option<Array2<f64>> {
+    pick(bursts.first()?)?;
+    let mut out = Array2::<f64>::zeros((frame.rows, frame.cols));
+    for burst in bursts {
+        paste2(&mut out, pick(burst)?, burst_offset(frame, &burst.geo));
+    }
+    Some(out)
 }
 
 /// Mosaic an optional per-burst band-major layer onto the frame grid; `None`
@@ -768,6 +817,7 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         // when the correction is enabled even if the raster isn't written.
         compute_closure_phase: cfg.phase_linking.write_closure_phase
             || cfg.phase_linking.correct_phase_bias,
+        compute_average_coherence: cfg.phase_linking.calc_average_coh,
     }
 }
 
@@ -959,6 +1009,9 @@ fn write_outputs(
     };
     write_f32("velocity.tif", velocity)?;
     write_f32("temporal_coherence.tif", temporal_coherence)?;
+    if let Some(coherence) = quality.phase_linking_coherence {
+        write_f32("phase_linking_coherence.tif", coherence.view())?;
+    }
     write_bands(&write_f32, displacement, "displacement")?;
     if let Some(crlb) = quality.crlb_sigma {
         write_bands(&write_f32, crlb.view(), "crlb_sigma")?;
@@ -1009,6 +1062,7 @@ fn write_correction_outputs(
 
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
+    phase_linking_coherence: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
 }
@@ -1065,6 +1119,7 @@ mod tests {
         cfg.phase_linking.half_window = half;
         cfg.phase_linking.write_crlb = true;
         cfg.phase_linking.write_closure_phase = true;
+        cfg.phase_linking.calc_average_coh = true;
         cfg.output_options.strides = strides;
         cfg.worker_settings.block_shape = block;
         cfg.worker_settings.compute_backend = ComputeBackend::Cpu;
@@ -1118,6 +1173,21 @@ mod tests {
             tiled.temporal_coherence.view().insert_axis(Axis(0)),
             whole.temporal_coherence.view().insert_axis(Axis(0)),
             "temporal_coherence",
+        );
+        assert_f64_eq(
+            tiled
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            whole
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            "phase_linking_coherence",
         );
         assert_f64_eq(
             tiled.crlb_sigma.as_ref().unwrap().view(),

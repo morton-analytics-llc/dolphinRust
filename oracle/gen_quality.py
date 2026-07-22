@@ -36,6 +36,12 @@ def main() -> None:
     noisy = noisy.astype(np.complex64)
     temp_coh_noisy = np.asarray(estimate_temp_coh(noisy, c_arrays))
 
+    # Dolphin computes these bounded per-date row means internally, then returns
+    # only their argmax as the public `avg_coh` field. Preserve both so Rust can
+    # validate the scientific value without misnaming the integer index.
+    avg_coh_per_date = np.abs(c_arrays).mean(axis=3)
+    avg_coh_reference_idx = np.argmax(avg_coh_per_date, axis=2)
+
     # compress expects (nslc, rows, cols).
     compressed = compress(stack, np.moveaxis(phase, -1, 0))  # strides (1,1): no upsample
 
@@ -43,11 +49,18 @@ def main() -> None:
     np.save(OUT / "phase_noisy.npy", noisy)
     np.save(OUT / "temp_coh_noisy.npy", temp_coh_noisy.astype(np.float32))
     np.save(OUT / "compressed_slc.npy", compressed.astype(np.complex64))
+    np.save(OUT / "avg_coh_per_date.npy", np.moveaxis(avg_coh_per_date, -1, 0).astype(np.float32))
+    np.save(OUT / "avg_coh_reference_idx.npy", avg_coh_reference_idx.astype(np.int64))
 
     print(f"wrote quality fixtures to {OUT}")
     print(f"  temp_coh      {temp_coh.shape}  range=[{temp_coh.min():.3f},{temp_coh.max():.3f}]")
     print(f"  temp_coh_noisy range=[{temp_coh_noisy.min():.3f},{temp_coh_noisy.max():.3f}]")
     print(f"  compressed    {compressed.shape} {compressed.dtype}")
+    print(
+        f"  avg_coh/date  {avg_coh_per_date.shape} "
+        f"range=[{avg_coh_per_date.min():.3f},{avg_coh_per_date.max():.3f}]"
+    )
+    print(f"  avg_coh public argmax {avg_coh_reference_idx.shape} {avg_coh_reference_idx.dtype}")
 
 
 if __name__ == "__main__":

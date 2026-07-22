@@ -57,6 +57,7 @@ fn sequential_phase_history_matches_oracle() {
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
         compute_crlb: false,
         compute_closure_phase: false,
+        compute_average_coherence: false,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
@@ -114,12 +115,22 @@ fn stitching_and_quality_match_oracle_multiministack() {
         compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
         compute_crlb: true,
         compute_closure_phase: true,
+        compute_average_coherence: true,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
 
     // Two ministacks must have formed (else this isn't a stitching test).
     assert_eq!(out.compressed_slcs.len(), 2, "expected 2 ministacks");
+    let phase_coh = out
+        .phase_linking_coherence
+        .as_ref()
+        .expect("average coherence enabled");
+    assert!(phase_coh.iter().all(|v| (0.0..=1.0).contains(v)));
+    assert_ne!(
+        phase_coh, &out.temporal_coherence,
+        "phase-linking coherence must not alias temporal coherence"
+    );
 
     let tcoh_err = nan_aware_maxerr(out.temporal_coherence.view(), tcoh_o.view());
     assert!(

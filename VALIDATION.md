@@ -618,3 +618,58 @@ Initial result bars remain provisional: endpoint sign agreement, absolute endpoi
 ≤20 mm, TLS slope 0.85–1.15, and correlation ≥0.90. Atmospheric corrections are held identical
 between backends; if left off, the GNSS residual includes atmosphere and must not be attributed
 solely to unwrapping. One station pair is not sufficient evidence to change the default backend.
+
+## Distinct coherence and degenerate-input contracts (2026-07-21)
+
+The phase-linking output now separates two dimensionless `[0,1]` quantities:
+
+- `temporal_coherence.tif`: estimator-fit phase consistency (the existing compatible layer);
+- `phase_linking_coherence.tif`: optional real-date-weighted mean of
+  `average_coherence_per_date[i] = mean_j(abs(C[i,j]))`, including the diagonal to match
+  dolphin v0.35.0's internal calculation.
+
+Pinned-source inspection found that dolphin v0.35.0's public `avg_coh` is actually
+`argmax(abs(C).mean(axis=3), axis=2)`, a 2D reference-date index. dolphinRust preserves and
+names the bounded floating-point intermediate instead; it does not serve the integer argmax
+as coherence. `oracle/gen_quality.py` regenerates the optional local oracle fixture, and the
+analytic contract remains runnable without ignored oracle data.
+
+Pinned all-NaN oracle receipt:
+
+```text
+$ oracle/.venv/bin/python oracle/check_all_nan_v035.py
+{"dolphin_version":"0.35.0","exception":"PhaseLinkRuntimeError",
+ "message":"slc_stack[[2]] out of 4 are all NaNs.","status":"rejected"}
+```
+
+The Rust fused/engine entry points now reject the corresponding all-non-finite acquisition.
+This is parity, not a forward divergence. Partially valid windows retain the existing
+finite-or-zero covariance masking.
+
+### Optional-layer memory receipt
+
+Fresh-process `pl_bench` A/B on this 12-core host, 16 dates, a 512x512 tile, 11x11 window,
+EMI+CRLB, one fused iteration (`FUSED_ONLY=1`):
+
+| output strides | average coherence | wall | CPU | peak RSS |
+|---|---:|---:|---:|---:|
+| 3x6 | off | 0.105 s | 0.942 s | 98.2 MiB |
+| 3x6 | on | 0.112 s | 0.931 s | 99.4 MiB |
+| 1x1 | off | 1.338 s | 10.955 s | 387.2 MiB |
+| 1x1 | on | 1.380 s | 10.936 s | 454.6 MiB |
+
+At GroundPulse's current reduced posting the observed delta is **+1.2 MiB RSS / +0.007 s**.
+At stride 1 it is **+67.4 MiB / +0.042 s**. The theoretical per-date core array is
+`8 * n_dates * out_rows * out_cols` bytes (32 MiB at stride 1 for this case); observed RSS
+also includes per-pixel collection/packing overhead. The workflow immediately reduces each
+ministack to real-date sum/count arrays, so it does not retain the per-date cube across the
+whole burst. These are local synthetic resource measurements, not a 60 GiB production-AOI
+or terminal-artifact proof.
+
+Reproduce the four cases by varying `STRIDE_Y`, `STRIDE_X`, and `AVERAGE_COH` in:
+
+```sh
+ROWS=512 NSLC=16 ITERS=1 FUSED_ONLY=1 STRIDE_Y=3 STRIDE_X=6 AVERAGE_COH=1 \
+  cargo run --release --example pl_bench -p dolphin-phaselink \
+  --no-default-features --features no-gpu
+```

@@ -22,21 +22,20 @@ Entry format:
 
 ## DEFERRED
 
-### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0
-- **Source**: inbound (cross-repo signal, `../eo` `dolphin-safety-report.md` Finding #2)
-- **Issue**: #8  (enhancement-labeled, NOT yet backlog-ready)
-- **Re-entry gate**: run the pinned dolphin v0.35.0 oracle against an all-NaN synthetic SLC
-  stack and record its actual output. If Python dolphin also returns temp_coh=1.0/disp=0.0
-  on all-NaN input, this becomes a forward-divergence architecture decision (add an explicit
-  nodata guard) rather than a parity bug fix — elevate that call per PLAYBOOK's "elevate
-  genuine blockers" policy rather than deciding it in an unattended run. If dolphin fails
-  loudly/differently, this is a direct parity bug, fix to match the oracle.
-- **Design sketch**: `dolphin-phaselink/src/covariance.rs::finite_or_zero` +
-  `coherence_entry` (AMP_FLOOR underflow → 0+0j matrix) combined with
-  `quality.rs::temp_coh_single`/`pair_diff` (phase-only, `arg(0+0j)==0.0`) reproduces the
-  observed 1.0/0.0 exactly on a fully-degenerate window — traced, not yet fixed.
-- **Added**: 2026-07-20 by scheduled scout run
+_(none)_
 
 ## SHIPPED
 
-_(none yet)_
+### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0
+- **Source**: inbound (cross-repo signal, `../eo` `dolphin-safety-report.md` Finding #2)
+- **Issue**: #8
+- **Gate result**: pinned dolphin v0.35.0 raises `PhaseLinkRuntimeError` when any SLC date is
+  all NaN (`oracle/check_all_nan_v035.py`), so this is a direct parity fix rather than a
+  forward divergence.
+- **Design sketch**: `dolphin-phaselink/src/covariance.rs::finite_or_zero` +
+  `coherence_entry` (AMP_FLOOR underflow → 0+0j matrix) combined with
+  `quality.rs::temp_coh_single`/`pair_diff` (phase-only, `arg(0+0j)==0.0`) reproduces the
+  observed 1.0/0.0 exactly. The phase-link entry now rejects an all-non-finite acquisition
+  before covariance estimation while preserving partially valid masking.
+- **Added**: 2026-07-20 by scheduled scout run
+- **Shipped**: 2026-07-21 by manual contract-first implementation

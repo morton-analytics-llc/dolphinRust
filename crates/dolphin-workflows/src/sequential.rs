@@ -50,6 +50,9 @@ pub struct SequentialConfig {
     pub compute_crlb: bool,
     /// Produce the per-triplet closure-phase layer (dolphin `write_closure_phase`).
     pub compute_closure_phase: bool,
+    /// Produce the distinct phase-linking-coherence layer from dolphin's
+    /// per-date average coherence magnitudes.
+    pub compute_average_coherence: bool,
 }
 
 /// Output of a sequential run.
@@ -62,6 +65,9 @@ pub struct SequentialOutput {
     /// (dolphin's `temporal_coherence_average` = `numpy.nanmean`), `(out_rows,
     /// out_cols)`. 1.0 = perfect phase consistency.
     pub temporal_coherence: Array2<f64>,
+    /// Mean coherence-matrix magnitude across real acquisition dates,
+    /// `(out_rows, out_cols)`. `None` unless requested.
+    pub phase_linking_coherence: Option<Array2<f64>>,
     /// Per-date CRLB σ (radians), `(nslc, out_rows, out_cols)` — real dates only,
     /// concatenated across ministacks. `None` when `compute_crlb` is off.
     pub crlb_sigma: Option<Array3<f64>>,
@@ -89,6 +95,8 @@ pub struct SequentialState {
     /// Temporal coherence of each sealed ministack (kept per-ministack so the
     /// cross-ministack `nanmean` stitch stays exact under incremental updates).
     sealed_temp_coh: Vec<Array2<f64>>,
+    /// Finite sum/count aggregates for sealed ministacks' real-date coherence.
+    sealed_average_coherence: Vec<CoherenceAggregate>,
     /// Per-sealed-ministack CRLB σ layers (empty when CRLB is off).
     sealed_crlb: Vec<Array3<f64>>,
     /// Per-sealed-ministack closure-phase layers (empty when closure is off).
@@ -103,8 +111,17 @@ struct Drive {
     compressed: Vec<Array2<Cf64>>,
     phases: Vec<Array3<Cf64>>,
     temp_coh: Vec<Array2<f64>>,
+    average_coherence: Vec<CoherenceAggregate>,
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
+}
+
+/// Per-pixel finite sum/count for real-date average coherence. Keeping this
+/// aggregate instead of every date band bounds sequential/NRT memory.
+#[derive(Clone)]
+struct CoherenceAggregate {
+    sum: Array2<f64>,
+    count: Array2<u32>,
 }
 
 /// Phase-link + compress each planned ministack of `real_stack`, carrying the
@@ -122,6 +139,7 @@ fn drive(
         compressed: Vec::new(),
         phases: Vec::new(),
         temp_coh: Vec::new(),
+        average_coherence: Vec::new(),
         crlb: Vec::new(),
         closure: Vec::new(),
     };
@@ -133,6 +151,9 @@ fn drive(
         carry.push(r.compressed.clone());
         out.compressed.push(r.compressed);
         out.temp_coh.push(r.temp_coh);
+        if let Some(average) = r.average_coherence {
+            out.average_coherence.push(average);
+        }
         if let Some(s) = r.crlb_sigma {
             out.crlb.push(s);
         }
@@ -149,6 +170,7 @@ fn build_output(
     phases: &[Array3<Cf64>],
     compressed: Vec<Array2<Cf64>>,
     temp_coh: &[Array2<f64>],
+    average_coherence: &[CoherenceAggregate],
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
 ) -> Result<SequentialOutput, &'static str> {
@@ -158,6 +180,7 @@ fn build_output(
         cpx_phase,
         compressed_slcs: compressed,
         temporal_coherence: stitch_temp_coh(temp_coh),
+        phase_linking_coherence: finish_average_coherence(average_coherence),
         crlb_sigma: concat_bands(crlb)?,
         closure_phase: concat_bands(closure)?,
     })
@@ -193,6 +216,7 @@ pub fn run_sequential_resumable(
         &d.phases,
         d.compressed.clone(),
         &d.temp_coh,
+        &d.average_coherence,
         d.crlb.clone(),
         d.closure.clone(),
     )?;
@@ -242,10 +266,18 @@ pub fn update_sequential(
 
     let phases = chain(&state.sealed_phases, &d.phases);
     let temp_coh = chain(&state.sealed_temp_coh, &d.temp_coh);
+    let average_coherence = chain(&state.sealed_average_coherence, &d.average_coherence);
     let compressed = chain(&state.sealed_compressed, &d.compressed);
     let crlb = chain(&state.sealed_crlb, &d.crlb);
     let closure = chain(&state.sealed_closure, &d.closure);
-    let output = build_output(&phases, compressed, &temp_coh, crlb, closure)?;
+    let output = build_output(
+        &phases,
+        compressed,
+        &temp_coh,
+        &average_coherence,
+        crlb,
+        closure,
+    )?;
     let next =
         seal_state(&tail_plans, tail.view(), cfg.ministack_size, d).with_sealed_prefix(state);
     Ok((output, next))
@@ -285,6 +317,7 @@ fn seal_state(
         sealed_compressed: d.compressed[..sealed].to_vec(),
         sealed_phases: d.phases[..sealed].to_vec(),
         sealed_temp_coh: d.temp_coh[..sealed].to_vec(),
+        sealed_average_coherence: take_prefix(&d.average_coherence, sealed),
         sealed_crlb: take_prefix(&d.crlb, sealed),
         sealed_closure: take_prefix(&d.closure, sealed),
         open_real_slcs,
@@ -298,6 +331,10 @@ impl SequentialState {
         self.sealed_compressed = chain(&prev.sealed_compressed, &self.sealed_compressed);
         self.sealed_phases = chain(&prev.sealed_phases, &self.sealed_phases);
         self.sealed_temp_coh = chain(&prev.sealed_temp_coh, &self.sealed_temp_coh);
+        self.sealed_average_coherence = chain(
+            &prev.sealed_average_coherence,
+            &self.sealed_average_coherence,
+        );
         self.sealed_crlb = chain(&prev.sealed_crlb, &self.sealed_crlb);
         self.sealed_closure = chain(&prev.sealed_closure, &self.sealed_closure);
         self
@@ -306,11 +343,47 @@ impl SequentialState {
 
 /// Quality layers are empty when the layer is disabled; otherwise take the first
 /// `n` (the sealed ministacks).
-fn take_prefix(v: &[Array3<f64>], n: usize) -> Vec<Array3<f64>> {
+fn take_prefix<T: Clone>(v: &[T], n: usize) -> Vec<T> {
     match v.is_empty() {
         true => Vec::new(),
         false => v[..n].to_vec(),
     }
+}
+
+/// Collapse all real-date coherence aggregates to one 2D mean. `None` means the
+/// optional metric was disabled, not a fabricated zero-valued layer.
+fn finish_average_coherence(layers: &[CoherenceAggregate]) -> Option<Array2<f64>> {
+    let first = layers.first()?;
+    Some(Array2::from_shape_fn(first.sum.dim(), |(r, c)| {
+        let (sum, count) = layers.iter().fold((0.0, 0_u32), |(sum, count), layer| {
+            (sum + layer.sum[(r, c)], count + layer.count[(r, c)])
+        });
+        match count {
+            0 => f64::NAN,
+            _ => sum / f64::from(count),
+        }
+    }))
+}
+
+/// Reduce the per-date core result to a real-acquisition-only sum/count. Carried
+/// compressed SLC bands precede `num_compressed` and are intentionally excluded.
+fn aggregate_real_average(layer: Array3<f64>, num_compressed: usize) -> CoherenceAggregate {
+    let real = layer.slice(s![num_compressed.., .., ..]);
+    let (_, rows, cols) = real.dim();
+    let sum = Array2::from_shape_fn((rows, cols), |(r, c)| {
+        real.slice(s![.., r, c])
+            .iter()
+            .filter(|v| v.is_finite())
+            .copied()
+            .sum()
+    });
+    let count = Array2::from_shape_fn((rows, cols), |(r, c)| {
+        real.slice(s![.., r, c])
+            .iter()
+            .filter(|v| v.is_finite())
+            .count() as u32
+    });
+    CoherenceAggregate { sum, count }
 }
 
 /// Concatenate two per-ministack product lists (sealed prefix ++ tail).
@@ -381,6 +454,8 @@ struct MinistackResult {
     compressed: Array2<Cf64>,
     /// Temporal coherence, `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
+    /// Real-date-only finite sum/count of average coherence.
+    average_coherence: Option<CoherenceAggregate>,
     /// CRLB σ for this ministack's real dates, `(num_real, out_rows, out_cols)`.
     crlb_sigma: Option<Array3<f64>>,
     /// Closure phase for this ministack, `(num_combined-2, out_rows, out_cols)`.
@@ -414,10 +489,14 @@ fn link_and_compress(
     let crlb_sigma = fused
         .crlb_sigma
         .map(|s| s.slice(s![ms.num_compressed.., .., ..]).to_owned());
+    let average_coherence = fused
+        .average_coherence_per_date
+        .map(|layer| aggregate_real_average(layer, ms.num_compressed));
     Ok(MinistackResult {
         cpx,
         compressed,
         temp_coh: fused.temporal_coherence,
+        average_coherence,
         crlb_sigma,
         closure_phase: fused.closure_phase,
     })
@@ -437,6 +516,7 @@ fn fused_params(ms: MiniStack, cfg: &SequentialConfig) -> FusedParams {
         crlb_reference_idx: ms.num_compressed.saturating_sub(1),
         num_looks: (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt(),
         compute_closure: cfg.compute_closure_phase,
+        compute_average_coherence: cfg.compute_average_coherence,
     }
 }
 
