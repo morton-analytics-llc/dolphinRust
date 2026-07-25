@@ -15,7 +15,9 @@ use dolphin_io::{
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
     read_nisar_geotransform, read_nisar_window, write_raster, write_raster_with_metadata, GeoInfo,
 };
-use dolphin_phaselink::{correct_phase_bias, estimate_bias_velocity, ComputeEngine};
+use dolphin_phaselink::{
+    all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
+};
 use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_precisions,
     estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
@@ -26,11 +28,14 @@ use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
-use crate::burst::{burst_offset, frame_grid, group_by_burst, paste2, paste3, BurstGeo, FrameGrid};
+use crate::burst::{burst_offset, frame_grid, group_by_burst, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
 use crate::dates::decimal_days;
-use crate::provenance::GeometryProvenance;
+use crate::provenance::{
+    BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
+    INPUT_COVERAGE_POLICY_VERSION,
+};
 use crate::sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
     SequentialOutput, SequentialState,
@@ -95,6 +100,8 @@ pub struct DisplacementOutput {
     /// Mean coherence-matrix magnitude across real acquisitions, distinct from
     /// estimator-fit temporal coherence. `None` unless `calc_average_coh` is on.
     pub phase_linking_coherence: Option<Array2<f64>>,
+    /// Pixels with complete temporal input support after burst mosaicking and trim.
+    pub validity_mask: Array2<bool>,
     /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
     /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
     /// feeds GroundPulse's `confidence_score`. `None` when `phase_linking.write_crlb`
@@ -194,7 +201,7 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
                 let window = crop
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(link_one_burst(cfg, idxs, &engine, window))
+                Some(link_one_burst(cfg, idxs, index, &engine, window))
             })
             .collect::<Result<Vec<_>>>()
     })?;
@@ -216,6 +223,8 @@ fn finish_displacement(
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
     let stitched = timed("stitch", || stitch_bursts(bursts))?;
+    let validity_mask = stitched.validity_mask;
+    let burst_coverage = stitched.coverage;
     let mut pl = stitched.pl;
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
@@ -295,6 +304,8 @@ fn finish_displacement(
         disp_rad: inversion.displacement,
         vel_rad,
         temporal_coherence,
+        validity_mask,
+        burst_coverage,
         phase_linking_coherence: stitched.phase_linking_coherence,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
@@ -406,6 +417,8 @@ struct SpatialProducts {
     disp_rad: Array3<f64>,
     vel_rad: Array2<f64>,
     temporal_coherence: Array2<f64>,
+    validity_mask: Array2<bool>,
+    burst_coverage: Vec<BurstCoverageProvenance>,
     phase_linking_coherence: Option<Array2<f64>>,
     crlb_sigma: Option<Array3<f64>>,
     closure_phase: Option<Array3<f64>>,
@@ -435,6 +448,7 @@ fn emit_displacement(
             cfg.timeseries_options.write_velocity_uncertainty,
         )?;
     }
+    spatial.apply_validity_mask();
     if let (Some(variance), Some(point)) = (
         spatial.posterior_variance_rad.as_mut(),
         spatial.reference_point,
@@ -476,10 +490,12 @@ fn emit_displacement(
         velocity_sigma: velocity_sigma.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
     };
-    let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_bounds(
+    let input_coverage = summarize_input_coverage(&spatial);
+    let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
         crop.map(|plan| plan.provenance.clone()),
+        Some(input_coverage),
     );
     timed("write", || -> Result<()> {
         write_outputs(
@@ -505,6 +521,7 @@ fn emit_displacement(
         unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
+        validity_mask: spatial.validity_mask,
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -522,7 +539,93 @@ fn emit_displacement(
     })
 }
 
+fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenance {
+    let output_pixels = spatial.validity_mask.len();
+    let valid_pixels = spatial.validity_mask.iter().filter(|&&valid| valid).count();
+    let sum =
+        |pick: fn(&BurstCoverageProvenance) -> usize| spatial.burst_coverage.iter().map(pick).sum();
+    let total_tiles = sum(|burst| burst.total_tiles);
+    let linked_tiles = sum(|burst| burst.linked_tiles);
+    let nodata_tiles = sum(|burst| burst.nodata_tiles);
+    let valid_fraction = if output_pixels == 0 {
+        0.0
+    } else {
+        valid_pixels as f64 / output_pixels as f64
+    };
+    tracing::info!(
+        stage = "input_coverage",
+        total_tiles,
+        linked_tiles,
+        nodata_tiles,
+        output_pixels,
+        valid_pixels,
+        valid_fraction,
+        coverage_policy = INPUT_COVERAGE_POLICY_VERSION,
+        "input coverage complete"
+    );
+    InputCoverageProvenance {
+        policy_version: INPUT_COVERAGE_POLICY_VERSION.into(),
+        total_tiles,
+        linked_tiles,
+        nodata_tiles,
+        bursts: spatial.burst_coverage.clone(),
+        output_pixels,
+        valid_pixels,
+        valid_fraction,
+    }
+}
+
 impl SpatialProducts {
+    fn apply_validity_mask(&mut self) {
+        ndarray::Zip::from(&mut self.validity_mask)
+            .and(&self.vel_rad)
+            .for_each(|valid, &velocity| *valid &= velocity.is_finite());
+        let mask = &self.validity_mask;
+        mask3_f64(&mut self.disp_rad, mask);
+        mask2_f64(&mut self.vel_rad, mask);
+        mask2_f64(&mut self.temporal_coherence, mask);
+        if let Some(layer) = self.phase_linking_coherence.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.crlb_sigma.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(layer) = self.closure_phase.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(layer) = self.posterior_variance_rad.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(layer) = self.timeseries_residual_rad.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.velocity_sigma_rad.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.corrections.ionosphere.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(layer) = self.corrections.troposphere.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(geometry) = self.corrections.los_geometry.as_mut() {
+            mask2_f64(&mut geometry.east, mask);
+            mask2_f64(&mut geometry.north, mask);
+            mask2_f64(&mut geometry.up, mask);
+        }
+        ndarray::Zip::from(self.unwrap_connected_components.axis_iter_mut(Axis(0))).for_each(
+            |mut band| {
+                ndarray::Zip::from(&mut band)
+                    .and(mask)
+                    .for_each(|value, &valid| {
+                        if !valid {
+                            *value = 0;
+                        }
+                    });
+            },
+        );
+    }
+
     fn trim(
         &mut self,
         target: BlockIndices,
@@ -573,6 +676,7 @@ impl SpatialProducts {
         self.disp_rad = trim3(&self.disp_rad, target);
         self.vel_rad = trim2(&self.vel_rad, target);
         self.temporal_coherence = trim2(&self.temporal_coherence, target);
+        self.validity_mask = trim2(&self.validity_mask, target);
         self.phase_linking_coherence = self
             .phase_linking_coherence
             .take()
@@ -612,6 +716,8 @@ struct BurstLink {
     crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet closure phase (band-major), if enabled.
     closure_phase: Option<Array3<f64>>,
+    validity_mask: Array2<bool>,
+    coverage: BurstCoverageProvenance,
     /// Burst footprint on the output grid.
     geo: BurstGeo,
     /// Acquisition decimal-days for this burst's dates.
@@ -627,6 +733,7 @@ struct BurstLink {
 fn link_one_burst(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
+    burst_index: usize,
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
 ) -> Result<BurstLink> {
@@ -648,7 +755,7 @@ fn link_one_burst(
         },
         |window| window.source,
     );
-    let out = phase_link_tiled(
+    let tiled = phase_link_tiled(
         cfg,
         (source.height(), source.width()),
         files.len(),
@@ -661,14 +768,78 @@ fn link_one_burst(
                 offset_block(block, source.row_start, source.col_start),
             )
         },
-    )?;
-    burst_link(
+    )
+    .with_context(|| format!("burst ordinal {burst_index} phase linking failed"))?;
+    let mut link = burst_link(
         cfg,
-        out,
+        tiled.output,
         days,
         &files[0],
         (source.row_start, source.col_start),
-    )
+    )?;
+    link.validity_mask = tiled.validity_mask;
+    link.coverage = BurstCoverageProvenance {
+        burst_index,
+        acquisition_count: files.len(),
+        total_tiles: tiled.total_tiles,
+        linked_tiles: tiled.linked_tiles,
+        nodata_tiles: tiled.nodata_tiles,
+    };
+    Ok(link)
+}
+
+struct TiledPhaseLinkOutput {
+    output: SequentialOutput,
+    validity_mask: Array2<bool>,
+    total_tiles: usize,
+    linked_tiles: usize,
+    nodata_tiles: usize,
+}
+
+struct TiledPhaseLinkStats {
+    acquisition_has_finite: Vec<bool>,
+    total_tiles: usize,
+    linked_tiles: usize,
+    nodata_tiles: usize,
+    read_s: f64,
+    compute_s: f64,
+}
+
+impl TiledPhaseLinkStats {
+    fn finish(self, acc: TiledOutput) -> Result<TiledPhaseLinkOutput> {
+        let globally_empty: Vec<usize> = self
+            .acquisition_has_finite
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, &seen)| (!seen).then_some(ordinal))
+            .collect();
+        anyhow::ensure!(
+            globally_empty.is_empty(),
+            "burst has globally all-nonfinite acquisition ordinals {globally_empty:?}"
+        );
+        anyhow::ensure!(
+            self.linked_tiles > 0,
+            "burst has no tile with complete temporal support"
+        );
+        tracing::info!(
+            stage = "pl_breakdown",
+            read_s = self.read_s,
+            compute_s = self.compute_s,
+            total_tiles = self.total_tiles,
+            linked_tiles = self.linked_tiles,
+            nodata_tiles = self.nodata_tiles,
+            coverage_policy = INPUT_COVERAGE_POLICY_VERSION,
+            "stage complete"
+        );
+        let validity_mask = acc.validity_mask.clone();
+        Ok(TiledPhaseLinkOutput {
+            output: acc.into_output(),
+            validity_mask,
+            total_tiles: self.total_tiles,
+            linked_tiles: self.linked_tiles,
+            nodata_tiles: self.nodata_tiles,
+        })
+    }
 }
 
 /// Phase-link a burst tile-by-tile, assembling the per-tile sequential outputs
@@ -682,7 +853,7 @@ fn phase_link_tiled(
     nslc: usize,
     engine: &ComputeEngine,
     read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
-) -> Result<SequentialOutput> {
+) -> Result<TiledPhaseLinkOutput> {
     let strides = cfg.output_options.strides;
     let half = cfg.phase_linking.half_window;
     let out_shape = strides.out_shape(full_shape);
@@ -699,9 +870,16 @@ fn phase_link_tiled(
         cfg.phase_linking.write_crlb,
         cfg.phase_linking.calc_average_coh,
     );
-    let (mut read_s, mut compute_s) = (0.0_f64, 0.0_f64);
     let plans = plan_tiles(full_shape, strides, half, depth, out_block);
     let tile_count = plans.len();
+    let mut stats = TiledPhaseLinkStats {
+        acquisition_has_finite: vec![false; nslc],
+        total_tiles: tile_count,
+        linked_tiles: 0,
+        nodata_tiles: 0,
+        read_s: 0.0,
+        compute_s: 0.0,
+    };
     for (tile_offset, plan) in plans.into_iter().enumerate() {
         let tile_index = tile_offset + 1;
         let (rss_kib, peak_rss_kib) = memory_kib();
@@ -724,7 +902,15 @@ fn phase_link_tiled(
         );
         let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
-        read_s += t_read.elapsed().as_secs_f64();
+        stats.read_s += t_read.elapsed().as_secs_f64();
+        let missing = all_non_finite_acquisition_indices(stack.view());
+        let mut locally_finite = vec![true; nslc];
+        for &ordinal in &missing {
+            locally_finite[ordinal] = false;
+        }
+        for (seen, finite) in stats.acquisition_has_finite.iter_mut().zip(locally_finite) {
+            *seen |= finite;
+        }
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
             stage = "phase_linking_tile",
@@ -735,9 +921,14 @@ fn phase_link_tiled(
             peak_rss_kib,
             "phase-linking tile read complete"
         );
+        if !missing.is_empty() {
+            stats.nodata_tiles += 1;
+            acc.place_nodata(&plan);
+            continue;
+        }
         let t_pl = Instant::now();
         let out = phase_link(cfg, stack.view(), engine)?;
-        compute_s += t_pl.elapsed().as_secs_f64();
+        stats.compute_s += t_pl.elapsed().as_secs_f64();
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
             stage = "phase_linking_tile",
@@ -749,6 +940,7 @@ fn phase_link_tiled(
             "phase-linking tile compute complete"
         );
         acc.place(&plan, &out)?;
+        stats.linked_tiles += 1;
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
             stage = "phase_linking_tile",
@@ -762,8 +954,7 @@ fn phase_link_tiled(
     }
     // Sub-breakdown of the `phase_linking` stage: windowed CSLC read vs the
     // covariance+estimator compute, summed across tiles (wall, not exclusive CPU).
-    tracing::info!(stage = "pl_breakdown", read_s, compute_s, "stage complete");
-    Ok(acc.into_output())
+    stats.finish(acc)
 }
 
 /// Read one tile's input (`block`, including halo) across all `files` epochs as a
@@ -883,6 +1074,7 @@ struct TiledOutput {
     phase_linking_coherence: Option<Array2<f64>>,
     crlb: Option<Array3<f64>>,
     closure: Option<Array3<f64>>,
+    validity_mask: Array2<bool>,
     out_shape: (usize, usize),
 }
 
@@ -895,11 +1087,13 @@ impl TiledOutput {
     ) -> Self {
         let (or, oc) = out_shape;
         Self {
-            cpx: Array3::zeros((nslc, or, oc)),
-            temp_coh: Array2::zeros((or, oc)),
-            phase_linking_coherence: want_average_coherence.then(|| Array2::zeros((or, oc))),
-            crlb: want_crlb.then(|| Array3::zeros((nslc, or, oc))),
+            cpx: Array3::from_elem((nslc, or, oc), Cf64::new(f64::NAN, f64::NAN)),
+            temp_coh: Array2::from_elem((or, oc), f64::NAN),
+            phase_linking_coherence: want_average_coherence
+                .then(|| Array2::from_elem((or, oc), f64::NAN)),
+            crlb: want_crlb.then(|| Array3::from_elem((nslc, or, oc), f64::NAN)),
             closure: None,
+            validity_mask: Array2::from_elem((or, oc), false),
             out_shape,
         }
     }
@@ -932,10 +1126,21 @@ impl TiledOutput {
             let (or, oc) = self.out_shape;
             let dst = self
                 .closure
-                .get_or_insert_with(|| Array3::zeros((src.dim().0, or, oc)));
+                .get_or_insert_with(|| Array3::from_elem((src.dim().0, or, oc), f64::NAN));
             assign_block3(dst, src, g, l, (h, w));
         }
+        self.validity_mask
+            .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
+            .fill(true);
         Ok(())
+    }
+
+    fn place_nodata(&mut self, plan: &TilePlan) {
+        let g = (plan.out.row_start, plan.out.col_start);
+        let (h, w) = (plan.out.height(), plan.out.width());
+        self.validity_mask
+            .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
+            .fill(false);
     }
 
     fn into_output(self) -> SequentialOutput {
@@ -986,9 +1191,39 @@ fn burst_link(
         phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
+        validity_mask: Array2::from_elem((rows, cols), true),
+        coverage: BurstCoverageProvenance {
+            burst_index: 0,
+            acquisition_count: days.len(),
+            total_tiles: 1,
+            linked_tiles: 1,
+            nodata_tiles: 0,
+        },
         geo: resolve_burst_geo(cfg, first_file, rows, cols, source_offset)?,
         days,
     })
+}
+
+fn mask2_f64(values: &mut Array2<f64>, mask: &Array2<bool>) {
+    ndarray::Zip::from(values)
+        .and(mask)
+        .for_each(|value, &valid| {
+            if !valid {
+                *value = f64::NAN;
+            }
+        });
+}
+
+fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
+    for mut band in values.axis_iter_mut(Axis(0)) {
+        ndarray::Zip::from(&mut band)
+            .and(mask)
+            .for_each(|value, &valid| {
+                if !valid {
+                    *value = f64::NAN;
+                }
+            });
+    }
 }
 
 /// Persisted state for an NRT incremental displacement update: per-burst
@@ -1021,6 +1256,7 @@ fn link_one_burst_resumable(
     idxs: &[usize],
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
+    burst_index: usize,
 ) -> Result<(BurstLink, SequentialState, BlockIndices)> {
     let files = burst_files(cfg, idxs);
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
@@ -1043,13 +1279,15 @@ fn link_one_burst_resumable(
     let stack = read_burst_tile(cfg.input_options.input_type, &files, subdataset, source)?;
     let (out, state) = run_sequential_resumable(stack.view(), &sequential_config(cfg), engine)
         .map_err(anyhow::Error::msg)?;
-    let link = burst_link(
+    let mut link = burst_link(
         cfg,
         out,
         days,
         &files[0],
         (source.row_start, source.col_start),
     )?;
+    link.coverage.burst_index = burst_index;
+    link.coverage.acquisition_count = files.len();
     Ok((link, state, source))
 }
 
@@ -1108,7 +1346,8 @@ pub fn run_displacement_resumable(
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
                 Some((|| {
-                    let (link, seq, source) = link_one_burst_resumable(cfg, idxs, &engine, window)?;
+                    let (link, seq, source) =
+                        link_one_burst_resumable(cfg, idxs, &engine, window, index)?;
                     Ok((id.clone(), burst_files(cfg, idxs), link, seq, source))
                 })())
             })
@@ -1158,7 +1397,6 @@ pub fn update_displacement(
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
-    let scfg = sequential_config(cfg);
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let updated = timed("phase_linking", || -> Result<Vec<_>> {
@@ -1170,7 +1408,7 @@ pub fn update_displacement(
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
                 Some(update_one_burst(
-                    state, cfg, &scfg, id, idxs, &engine, window,
+                    state, cfg, id, idxs, &engine, window, index,
                 ))
             })
             .collect()
@@ -1187,11 +1425,11 @@ pub fn update_displacement(
 fn update_one_burst(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
-    scfg: &SequentialConfig,
     id: &str,
     idxs: &[usize],
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
+    burst_index: usize,
 ) -> Result<(BurstLink, BurstState)> {
     let files = burst_files(cfg, idxs);
     let prev = state
@@ -1225,16 +1463,19 @@ fn update_one_burst(
         prev.source_window,
     )?;
     let (out, seq) =
-        update_sequential(&prev.seq, new_stack.view(), scfg, engine).map_err(anyhow::Error::msg)?;
+        update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine)
+            .map_err(anyhow::Error::msg)?;
     let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
         .context("parsing acquisition dates from CSLC filenames")?;
-    let link = burst_link(
+    let mut link = burst_link(
         cfg,
         out,
         days,
         &files[0],
         (prev.source_window.row_start, prev.source_window.col_start),
     )?;
+    link.coverage.burst_index = burst_index;
+    link.coverage.acquisition_count = files.len();
     let next = BurstState {
         id: id.to_string(),
         files,
@@ -1257,6 +1498,8 @@ struct Stitched {
     crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet closure phase (band-major), if enabled.
     closure_phase: Option<Array3<f64>>,
+    validity_mask: Array2<bool>,
+    coverage: Vec<BurstCoverageProvenance>,
     /// Frame grid georeferencing.
     geo: GeoInfo,
 }
@@ -1273,14 +1516,19 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
             phase_linking_coherence: b.phase_linking_coherence,
             crlb_sigma: b.crlb_sigma,
             closure_phase: b.closure_phase,
+            validity_mask: b.validity_mask,
+            coverage: vec![b.coverage],
             geo: b.geo.geo,
         });
     }
     let geos: Vec<BurstGeo> = bursts.iter().map(|b| b.geo).collect();
     let frame = frame_grid(&geos)?;
     let nslc = bursts[0].pl.dim().0;
-    let mut pl = Array3::<Cf64>::zeros((nslc, frame.rows, frame.cols));
-    let mut temp_coh = Array2::<f64>::zeros((frame.rows, frame.cols));
+    let mut pl = Array3::<Cf64>::from_elem(
+        (nslc, frame.rows, frame.cols),
+        Cf64::new(f64::NAN, f64::NAN),
+    );
+    let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
     for (burst_index, b) in bursts.iter_mut().enumerate() {
         anyhow::ensure!(b.pl.dim().0 == nslc, "bursts have differing date counts");
@@ -1288,12 +1536,13 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         if burst_index > 0 {
             level_burst_offsets(&pl, &temp_coh, &covered, b, off, burst_index)?;
         }
-        paste3(&mut pl, &b.pl, off);
-        paste2(&mut temp_coh, &b.temp_coh, off);
+        paste3_finite_complex(&mut pl, &b.pl, off);
+        paste2_finite(&mut temp_coh, &b.temp_coh, off);
         let (rows, cols) = b.temp_coh.dim();
-        covered
-            .slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols])
-            .fill(true);
+        let mut target = covered.slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols]);
+        ndarray::Zip::from(&mut target)
+            .and(&b.validity_mask)
+            .for_each(|dst, &src| *dst |= src);
     }
     let crlb_sigma = stitch_layer(&bursts, &frame, |b| b.crlb_sigma.as_ref());
     let closure_phase = stitch_layer(&bursts, &frame, |b| b.closure_phase.as_ref());
@@ -1305,8 +1554,36 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         phase_linking_coherence,
         crlb_sigma,
         closure_phase,
+        validity_mask: covered,
+        coverage: bursts.iter().map(|burst| burst.coverage.clone()).collect(),
         geo: frame.geo,
     })
+}
+
+fn paste2_finite(frame: &mut Array2<f64>, burst: &Array2<f64>, offset: (usize, usize)) {
+    let (row, col) = offset;
+    let (rows, cols) = burst.dim();
+    let mut target = frame.slice_mut(s![row..row + rows, col..col + cols]);
+    ndarray::Zip::from(&mut target)
+        .and(burst)
+        .for_each(|dst, &src| {
+            if src.is_finite() {
+                *dst = src;
+            }
+        });
+}
+
+fn paste3_finite_complex(frame: &mut Array3<Cf64>, burst: &Array3<Cf64>, offset: (usize, usize)) {
+    let (row, col) = offset;
+    let (_, rows, cols) = burst.dim();
+    let mut target = frame.slice_mut(s![.., row..row + rows, col..col + cols]);
+    ndarray::Zip::from(&mut target)
+        .and(burst)
+        .for_each(|dst, &src| {
+            if src.re.is_finite() && src.im.is_finite() {
+                *dst = src;
+            }
+        });
 }
 
 /// Rotate every acquisition of `burst` onto the phase datum already established
@@ -1371,9 +1648,9 @@ fn stitch_optional_2d(
     pick: impl Fn(&BurstLink) -> Option<&Array2<f64>>,
 ) -> Option<Array2<f64>> {
     pick(bursts.first()?)?;
-    let mut out = Array2::<f64>::zeros((frame.rows, frame.cols));
+    let mut out = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     for burst in bursts {
-        paste2(&mut out, pick(burst)?, burst_offset(frame, &burst.geo));
+        paste2_finite(&mut out, pick(burst)?, burst_offset(frame, &burst.geo));
     }
     Some(out)
 }
@@ -1386,10 +1663,19 @@ fn stitch_layer(
     pick: impl Fn(&BurstLink) -> Option<&Array3<f64>>,
 ) -> Option<Array3<f64>> {
     let bands = pick(bursts.first()?)?.dim().0;
-    let mut out = Array3::<f64>::zeros((bands, frame.rows, frame.cols));
+    let mut out = Array3::<f64>::from_elem((bands, frame.rows, frame.cols), f64::NAN);
     for b in bursts {
         let layer = pick(b)?;
-        paste3(&mut out, layer, burst_offset(frame, &b.geo));
+        let off = burst_offset(frame, &b.geo);
+        let (_, rows, cols) = layer.dim();
+        let mut target = out.slice_mut(s![.., off.0..off.0 + rows, off.1..off.1 + cols]);
+        ndarray::Zip::from(&mut target)
+            .and(layer)
+            .for_each(|dst, &src| {
+                if src.is_finite() {
+                    *dst = src;
+                }
+            });
     }
     Some(out)
 }
@@ -1879,6 +2165,14 @@ mod tests {
             phase_linking_coherence: None,
             crlb_sigma: None,
             closure_phase: None,
+            validity_mask: Array2::from_elem((3, 3), true),
+            coverage: BurstCoverageProvenance {
+                burst_index: 0,
+                acquisition_count: 2,
+                total_tiles: 1,
+                linked_tiles: 1,
+                nodata_tiles: 0,
+            },
             geo: BurstGeo {
                 geo: GeoInfo {
                     epsg: 32611,
@@ -1933,6 +2227,21 @@ mod tests {
         assert!((burst.pl[(0, 1, 1)] - frame[(0, 1, 1)]).norm() < 1e-12);
         assert!((burst.pl[(1, 1, 1)] - frame[(1, 1, 1)]).norm() < 1e-12);
     }
+
+    #[test]
+    fn multiburst_stitch_does_not_overwrite_finite_overlap_with_nodata() {
+        let first = seam_burst(0.0, 0.9);
+        let expected = first.pl[(0, 0, 0)];
+        let mut second = seam_burst(0.4, 0.9);
+        second.pl[(0, 0, 0)] = Cf64::new(f64::NAN, f64::NAN);
+        second.temp_coh[(0, 0)] = f64::NAN;
+        second.validity_mask[(0, 0)] = false;
+        second.coverage.burst_index = 1;
+        let stitched = stitch_bursts(vec![first, second]).unwrap();
+        assert_eq!(stitched.pl[(0, 0, 0)], expected);
+        assert!(stitched.temp_coh[(0, 0)].is_finite());
+        assert!(stitched.validity_mask[(0, 0)]);
+    }
     #[test]
     fn proc_status_memory_parser_is_bounded_and_path_free() {
         let status = "Name:\tdolphin\nVmHWM:\t  65432 kB\nVmRSS:\t  54321 kB\n";
@@ -1970,6 +2279,72 @@ mod tests {
     }
 
     #[test]
+    fn validity_mask_propagates_nodata_through_every_output_layer() {
+        let mut validity_mask = Array2::from_elem((2, 2), true);
+        validity_mask[(0, 0)] = false;
+        let mut velocity = Array2::from_elem((2, 2), 1.0);
+        velocity[(1, 1)] = f64::NAN;
+        let mut products = SpatialProducts {
+            disp_rad: Array3::from_elem((2, 2, 2), 1.0),
+            vel_rad: velocity,
+            temporal_coherence: Array2::from_elem((2, 2), 1.0),
+            validity_mask,
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
+            crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
+            closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
+            corrections: CorrectionLayers {
+                ionosphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
+                troposphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
+                los_geometry: Some(LosGeometry {
+                    east: Array2::from_elem((2, 2), 1.0),
+                    north: Array2::from_elem((2, 2), 1.0),
+                    up: Array2::from_elem((2, 2), 1.0),
+                }),
+            },
+            geotransform: [0.0; 6],
+            reference_point: None,
+            posterior_variance_rad: Some(Array3::from_elem((2, 2, 2), 1.0)),
+            timeseries_residual_rad: Some(Array2::from_elem((2, 2), 1.0)),
+            velocity_sigma_rad: Some(Array2::from_elem((2, 2), 1.0)),
+            interferogram_pairs: Vec::new(),
+            unwrap_connected_components: Array3::from_elem((2, 2, 2), 1),
+        };
+
+        products.apply_validity_mask();
+
+        for (row, col) in [(0, 0), (1, 1)] {
+            assert!(!products.validity_mask[(row, col)]);
+            assert!(products.vel_rad[(row, col)].is_nan());
+            assert!(products.temporal_coherence[(row, col)].is_nan());
+            assert!(products.phase_linking_coherence.as_ref().unwrap()[(row, col)].is_nan());
+            assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
+            assert!(products.velocity_sigma_rad.as_ref().unwrap()[(row, col)].is_nan());
+            for band in 0..2 {
+                assert!(products.disp_rad[(band, row, col)].is_nan());
+                assert!(products.crlb_sigma.as_ref().unwrap()[(band, row, col)].is_nan());
+                assert!(
+                    products.posterior_variance_rad.as_ref().unwrap()[(band, row, col)].is_nan()
+                );
+                assert!(
+                    products.corrections.ionosphere.as_ref().unwrap()[(band, row, col)].is_nan()
+                );
+                assert!(
+                    products.corrections.troposphere.as_ref().unwrap()[(band, row, col)].is_nan()
+                );
+                assert_eq!(products.unwrap_connected_components[(band, row, col)], 0);
+            }
+            assert!(products.closure_phase.as_ref().unwrap()[(0, row, col)].is_nan());
+            let geometry = products.corrections.los_geometry.as_ref().unwrap();
+            assert!(geometry.east[(row, col)].is_nan());
+            assert!(geometry.north[(row, col)].is_nan());
+            assert!(geometry.up[(row, col)].is_nan());
+        }
+        assert!(products.validity_mask[(0, 1)]);
+        assert_eq!(products.vel_rad[(0, 1)], 1.0);
+    }
+
+    #[test]
     fn bounded_trim_reselects_a_target_valid_reference_when_original_is_in_halo() {
         let mut products = SpatialProducts {
             disp_rad: Array3::from_shape_fn((2, 6, 8), |(date, row, col)| {
@@ -1977,6 +2352,8 @@ mod tests {
             }),
             vel_rad: Array2::zeros((6, 8)),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
+            validity_mask: Array2::from_elem((6, 8), true),
+            burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             crlb_sigma: None,
             closure_phase: None,
@@ -2017,6 +2394,8 @@ mod tests {
             disp_rad: Array3::zeros((2, 4, 4)),
             vel_rad: Array2::zeros((4, 4)),
             temporal_coherence: Array2::from_elem((4, 4), 0.1),
+            validity_mask: Array2::from_elem((4, 4), true),
+            burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             crlb_sigma: None,
             closure_phase: None,
@@ -2263,6 +2642,10 @@ mod tests {
             Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned())
         })
         .unwrap();
+        assert_eq!(tiled.nodata_tiles, 0);
+        assert_eq!(tiled.linked_tiles, tiled.total_tiles);
+        assert!(tiled.validity_mask.iter().all(|valid| *valid));
+        let tiled = tiled.output;
         assert_c64_eq(tiled.cpx_phase.view(), whole.cpx_phase.view(), "cpx_phase");
         assert_f64_eq(
             tiled.temporal_coherence.view().insert_axis(Axis(0)),
@@ -2294,6 +2677,78 @@ mod tests {
             whole.closure_phase.as_ref().unwrap().view(),
             "closure_phase",
         );
+    }
+
+    #[test]
+    fn locally_empty_edge_tile_becomes_nodata_without_aborting_burst() {
+        use std::cell::Cell;
+
+        let dims = (17, 19);
+        let nslc = 5;
+        let cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let calls = Cell::new(0_usize);
+        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
+            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+            if calls.replace(calls.get() + 1) == 0 {
+                tile.index_axis_mut(Axis(0), 2)
+                    .fill(Cf64::new(f64::NAN, f64::NAN));
+            }
+            Ok(tile)
+        })
+        .unwrap();
+        assert_eq!(tiled.nodata_tiles, 1);
+        assert!(tiled.linked_tiles > 0);
+        assert!(tiled.validity_mask.iter().any(|valid| *valid));
+        assert!(tiled.validity_mask.iter().any(|valid| !*valid));
+        for ((_, row, col), value) in tiled.output.cpx_phase.indexed_iter() {
+            if !tiled.validity_mask[(row, col)] {
+                assert!(value.re.is_nan() && value.im.is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn globally_empty_acquisition_reports_safe_ordinal() {
+        let dims = (17, 19);
+        let nslc = 5;
+        let cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
+            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+            tile.index_axis_mut(Axis(0), 3)
+                .fill(Cf64::new(f64::NAN, f64::NAN));
+            Ok(tile)
+        })
+        .err()
+        .expect("globally empty acquisition must fail");
+        assert!(error.to_string().contains("ordinals [3]"));
+    }
+
+    #[test]
+    fn no_tile_with_complete_temporal_support_fails_explicitly() {
+        use std::cell::Cell;
+
+        let dims = (17, 19);
+        let nslc = 5;
+        let cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let calls = Cell::new(0_usize);
+        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
+            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+            let ordinal = calls.replace(calls.get() + 1) % 2;
+            tile.index_axis_mut(Axis(0), ordinal)
+                .fill(Cf64::new(f64::NAN, f64::NAN));
+            Ok(tile)
+        })
+        .err()
+        .expect("no complete tile must fail");
+        assert!(error
+            .to_string()
+            .contains("no tile with complete temporal support"));
     }
 
     /// Contract (the load-bearing one): block-tiled phase linking is BIT-IDENTICAL

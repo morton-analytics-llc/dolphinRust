@@ -177,7 +177,7 @@ impl ComputeEngine {
             let (nslc, rows, cols) = stack.dim();
             let (out_rows, out_cols) = strides.out_shape((rows, cols));
             if self.gpu_ready(out_rows * out_cols, nslc) {
-                if crate::fused::has_all_non_finite_acquisition(stack) {
+                if !crate::fused::all_non_finite_acquisition_indices(stack).is_empty() {
                     return Err("slc stack contains an all non-finite acquisition");
                 }
                 return self.link_staged(stack, half, strides, neighbors, params);

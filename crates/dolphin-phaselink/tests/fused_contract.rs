@@ -6,8 +6,9 @@
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{
-    estimate_average_coherence, estimate_closure_phases, estimate_crlb, estimate_stack_covariance,
-    estimate_temp_coh, link_fused, process_coherence_matrices, FusedParams,
+    all_non_finite_acquisition_indices, estimate_average_coherence, estimate_closure_phases,
+    estimate_crlb, estimate_stack_covariance, estimate_temp_coh, link_fused,
+    process_coherence_matrices, FusedParams,
 };
 use ndarray::{s, Array3, Array4};
 
@@ -159,6 +160,45 @@ fn all_non_finite_slc_is_rejected_like_dolphin_v035() {
         Err(err) => err,
     };
     assert!(err.contains("all non-finite"), "unexpected error: {err}");
+}
+
+#[test]
+fn all_non_finite_diagnostic_returns_only_safe_ordinals() {
+    let mut stack = synth_stack(5, 4, 4);
+    for ordinal in [1, 4] {
+        stack
+            .index_axis_mut(ndarray::Axis(0), ordinal)
+            .fill(Cf64::new(f64::NAN, f64::NAN));
+    }
+
+    assert_eq!(all_non_finite_acquisition_indices(stack.view()), vec![1, 4]);
+}
+
+#[test]
+fn partially_nonfinite_acquisition_remains_processable() {
+    let mut stack = synth_stack(4, 5, 5);
+    stack[(2, 0, 0)] = Cf64::new(f64::NAN, f64::NAN);
+    let p = FusedParams {
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        reference_idx: 0,
+        compute_crlb: false,
+        crlb_reference_idx: 0,
+        num_looks: 1.0,
+        compute_closure: false,
+        compute_average_coherence: false,
+        average_coherence_start_idx: 0,
+    };
+
+    assert!(link_fused(
+        stack.view(),
+        HalfWindow { y: 1, x: 1 },
+        Strides { y: 1, x: 1 },
+        None,
+        p,
+    )
+    .is_ok());
 }
 
 #[test]

@@ -25,8 +25,10 @@ use crate::crop::ProcessingBoundsProvenance;
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/2";
-const METHOD_VERSION: &str = "2.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/3";
+const METHOD_VERSION: &str = "3.0.0";
+/// Versioned rule used to turn locally incomplete temporal tiles into nodata.
+pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
 /// `temporal_coherence.tif`; relative to `work_directory`.
 const PHASE_LINKING_COHERENCE_KEY: &str = "phase_linking_coherence.tif";
@@ -47,7 +49,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/2`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/3`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -79,8 +81,47 @@ pub struct GeometryProvenance {
     /// AOI target/analysis/read-window contract; absent for full-frame runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing_bounds: Option<ProcessingBoundsProvenance>,
+    /// Aggregate, identifier-free receipt for temporal input coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_coverage: Option<InputCoverageProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
+}
+
+/// Identifier-free coverage receipt for one displacement output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputCoverageProvenance {
+    /// Versioned tile-validity policy.
+    pub policy_version: String,
+    /// Total number of planned phase-linking tiles across included bursts.
+    pub total_tiles: usize,
+    /// Tiles with complete temporal support that were phase-linked.
+    pub linked_tiles: usize,
+    /// Tiles emitted as nodata because at least one acquisition was locally empty.
+    pub nodata_tiles: usize,
+    /// Per-burst aggregate counts, using stable planner ordinals only.
+    pub bursts: Vec<BurstCoverageProvenance>,
+    /// Number of pixels in the final target grid.
+    pub output_pixels: usize,
+    /// Final target pixels with complete temporal support.
+    pub valid_pixels: usize,
+    /// `valid_pixels / output_pixels`, or zero for an empty grid.
+    pub valid_fraction: f64,
+}
+
+/// Aggregate temporal-coverage counts for one planned burst.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurstCoverageProvenance {
+    /// Stable zero-based burst position in the planner input.
+    pub burst_index: usize,
+    /// Number of selected acquisitions in the burst.
+    pub acquisition_count: usize,
+    /// Total planned tiles for the burst.
+    pub total_tiles: usize,
+    /// Tiles with complete temporal support.
+    pub linked_tiles: usize,
+    /// Tiles emitted as nodata for incomplete temporal support.
+    pub nodata_tiles: usize,
 }
 
 /// The nested provenance block naming source metadata keys + method version.
@@ -151,6 +192,17 @@ pub fn assemble_geometry_provenance_with_bounds(
     los: Option<&LosGeometry>,
     processing_bounds: Option<ProcessingBoundsProvenance>,
 ) -> GeometryProvenance {
+    assemble_geometry_provenance_with_coverage(cfg, los, processing_bounds, None)
+}
+
+/// Assemble geometry plus identifier-free input-coverage provenance.
+#[must_use]
+pub fn assemble_geometry_provenance_with_coverage(
+    cfg: &DisplacementWorkflow,
+    los: Option<&LosGeometry>,
+    processing_bounds: Option<ProcessingBoundsProvenance>,
+    input_coverage: Option<InputCoverageProvenance>,
+) -> GeometryProvenance {
     let mut fields = BTreeMap::new();
     let cslc = read_granules(cfg, &mut fields);
     let orbit_direction = orbit_direction(&cslc, &mut fields);
@@ -190,6 +242,7 @@ pub fn assemble_geometry_provenance_with_bounds(
             && acquisition_time_of_day_utc_s.is_some()
             && incidence_ok,
         processing_bounds,
+        input_coverage,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,

@@ -19,8 +19,8 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/2",
-  "method_version": "2.0.0",
+  "schema": "dolphinrust-geometry-provenance/3",
+  "method_version": "3.0.0",
   "orbit_direction": "descending",
   "incidence_angle_deg": 39.27,
   "incidence_angle_spread_deg": 1.57,
@@ -32,6 +32,22 @@ Two surfaces, one type:
   "acquisition_time_of_day_utc_s": 50428.5,
   "phase_linking_coherence": "phase_linking_coherence.tif",
   "decomposition_geometry_complete": true,
+  "input_coverage": {
+    "policy_version": "complete-temporal-tile/1",
+    "total_tiles": 12,
+    "linked_tiles": 10,
+    "nodata_tiles": 2,
+    "bursts": [{
+      "burst_index": 0,
+      "acquisition_count": 90,
+      "total_tiles": 12,
+      "linked_tiles": 10,
+      "nodata_tiles": 2
+    }],
+    "output_pixels": 65536,
+    "valid_pixels": 53248,
+    "valid_fraction": 0.8125
+  },
   "geometry_provenance": {
     "fields": {
       "orbit_direction": {
@@ -49,6 +65,21 @@ Two surfaces, one type:
   }
 }
 ```
+
+Version 3 adds `input_coverage`; version 2 records remain valid and deserialize with
+`input_coverage = null`. Coverage contains only aggregate counts and stable zero-based burst
+ordinals. It must never contain source paths, object keys, AOI geometry, or acquisition
+identifiers.
+
+A tiled burst is processed only where every selected acquisition has finite complex support
+somewhere in that tile's dependency window. A locally incomplete tile is emitted as nodata in
+every layer and is counted, but acquisitions are never dropped or filled with numeric zero. An
+acquisition that is nonfinite across every tile remains a hard failure, as does a burst with no
+tile having complete temporal support. The direct phase-linking API retains its pinned v0.35
+whole-stack rejection. The final validity mask is also intersected with finite velocity and is
+applied to displacement, velocity, both coherence layers, CRLB, closure, uncertainty,
+corrections, LOS geometry, and connected components. During multi-burst stitching finite
+overlap may replace nodata; later nodata never replaces an earlier finite value.
 
 - Scalar fields are `null` when not sourced; the matching `fields` entry is then
   `{"status": "absent", "reason": "<why>"}`. A `null` scalar with a `sourced` entry

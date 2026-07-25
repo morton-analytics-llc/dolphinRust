@@ -24,7 +24,9 @@ pub use displacement::{
 };
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
-    write_geometry_provenance, FieldProvenance, GeometryProvenance, GEOMETRY_PROVENANCE_FILENAME,
+    assemble_geometry_provenance_with_coverage, write_geometry_provenance, BurstCoverageProvenance,
+    FieldProvenance, GeometryProvenance, InputCoverageProvenance, GEOMETRY_PROVENANCE_FILENAME,
+    INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
     run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
