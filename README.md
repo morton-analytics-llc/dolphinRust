@@ -97,8 +97,9 @@ cargo build --release
 # accepts a genuine dolphin `DisplacementWorkflow` YAML unchanged
 ./target/release/dolphin run --config workflow.yaml
 # writes velocity.tif, temporal_coherence.tif, displacement_NN.tif (COGs) to work_directory
-# plus crlb_sigma_NN.tif (CRLB σ uncertainty, on by default) and — when enabled —
-# closure_phase_NN.tif
+# plus conncomp_NN.tif and crlb_sigma_NN.tif (CRLB σ, UNITTYPE=rad); optional
+# L2 products include displacement_variance_NN.tif, timeseries_residual_rms.tif,
+# and velocity_sigma.tif
 ```
 
 The **CRLB σ** layer (`crlb_sigma`) is the per-pixel, per-date physical uncertainty (radians)
@@ -107,6 +108,10 @@ GroundPulse's `confidence_score` needs to weight a velocity by how well-determin
 **closure-phase** layer (`closure_phase`, off by default) is the nearest-neighbour triplet
 non-closure diagnostic. Both are validated against a forward dolphin v0.42.0 oracle; see
 [docs/usage.md](docs/usage.md) §5 and [VALIDATION.md](VALIDATION.md).
+
+L2 inversion uses CRLB-derived observation precision by default. Set
+`timeseries_options.use_coherence_weights: false` for legacy unweighted parity. Posterior
+and velocity uncertainty rasters are opt-in; posterior uncertainty is rejected for L1.
 
 ## Quickstart — library
 

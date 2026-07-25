@@ -95,11 +95,15 @@ fn parallel_network_is_bit_identical_to_serial_golden() {
         .unwrap_network(pl.view(), &pairs, corr.view(), &scratch)
         .unwrap();
 
-    assert_eq!(out.dim(), (pairs.len(), rows, cols), "stacked shape");
+    assert_eq!(
+        out.unwrapped.dim(),
+        (pairs.len(), rows, cols),
+        "stacked shape"
+    );
 
     // Bit-identical, layer by layer, in pairs order. Bitwise — not approximate.
     for (idx, g) in golden.iter().enumerate() {
-        let layer = out.index_axis(ndarray::Axis(0), idx);
+        let layer = out.unwrapped.index_axis(ndarray::Axis(0), idx);
         let mismatches = layer
             .iter()
             .zip(g.iter())

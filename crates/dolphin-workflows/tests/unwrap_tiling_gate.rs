@@ -140,8 +140,9 @@ fn report_single_vs_tiled_deviation() {
     let single = run(&base, "single");
     let multi = run(&tiled, "tiled");
     let dev = single
+        .unwrapped
         .iter()
-        .zip(multi.iter())
+        .zip(multi.unwrapped.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
     println!(

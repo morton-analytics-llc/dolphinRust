@@ -29,7 +29,7 @@ pub use geo::{read_geotransform, transform_bounds, GeoInfo};
 pub use geometry::{read_los_layers, LosLayers};
 pub use geotiff::{
     grid_centroid_lonlat, read_aligned_raster_window, read_raster, read_raster_window,
-    write_raster, RasterData,
+    write_raster, write_raster_with_metadata, RasterData,
 };
 pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack, read_nisar_window};
 

@@ -13,12 +13,14 @@ use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, Un
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
-    read_nisar_geotransform, read_nisar_window, write_raster, GeoInfo,
+    read_nisar_geotransform, read_nisar_window, write_raster, write_raster_with_metadata, GeoInfo,
 };
 use dolphin_phaselink::{correct_phase_bias, estimate_bias_velocity, ComputeEngine};
 use dolphin_timeseries::{
-    build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
-    reference_to_point, select_reference_point, L1Config, NetworkConfig,
+    build_network, estimate_velocity, estimate_velocity_with_precisions,
+    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
+    invert_stack_with_uncertainty, reference_to_point, select_reference_point, L1Config,
+    NetworkConfig,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -34,7 +36,9 @@ use crate::sequential::{
     SequentialOutput, SequentialState,
 };
 use crate::tiling::{plan_tiles, TilePlan};
-use crate::unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
+use crate::unwrap_backend::{
+    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend, UnwrapNetworkOutput,
+};
 use dolphin_corrections::LosGeometry;
 
 /// Sentinel-1 C-band radar wavelength (m); used to express velocity in mm/yr
@@ -74,6 +78,16 @@ pub struct DisplacementOutput {
     /// scoring). Derived from the LOS phase rate via `-λ/4π`, using the config
     /// wavelength or the Sentinel-1 default, `(rows, cols)`.
     pub velocity_mm_yr: Array2<f64>,
+    /// One-sigma linear-rate uncertainty in the same units/year as `velocity`.
+    pub velocity_sigma: Option<Array2<f64>>,
+    /// L2 posterior displacement variance in the same units squared as `displacement`.
+    pub displacement_variance: Option<Array3<f64>>,
+    /// Weighted time-series residual RMS in the same units as `displacement`.
+    pub timeseries_residual_rms: Option<Array2<f64>>,
+    /// Interferogram date-index pairs corresponding to unwrap output bands.
+    pub interferogram_pairs: Vec<(usize, usize)>,
+    /// Per-interferogram connected-component labels.
+    pub unwrap_connected_components: Array3<u32>,
     /// Temporal coherence per pixel in `[0, 1]`, stitched across ministacks by
     /// NaN-aware mean (dolphin's `temporal_coherence_average` = `numpy.nanmean`);
     /// a phase-quality mask, `(rows, cols)`.
@@ -219,16 +233,27 @@ fn finish_displacement(
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
-    let dphi_rad = timed("unwrap", || {
-        unwrap_network(cfg, pl.view(), &pairs, geotransform, epsg)
+    let unwrap = timed("unwrap", || {
+        unwrap_network(
+            cfg,
+            pl.view(),
+            &pairs,
+            temporal_coherence.view(),
+            geotransform,
+            epsg,
+        )
     })?;
+    let dphi_rad = unwrap.unwrapped;
     let incidence = get_incidence_matrix(&pairs);
-    let mut disp_rad = timed("timeseries", || match cfg.timeseries_options.method {
-        TimeseriesMethod::L1 => {
-            invert_stack_l1(incidence.view(), dphi_rad.view(), L1Config::default())
-        }
-        TimeseriesMethod::L2 => invert_stack(incidence.view(), dphi_rad.view(), None),
-    });
+    let mut inversion = timed("timeseries", || {
+        invert_time_series(
+            cfg,
+            incidence.view(),
+            dphi_rad.view(),
+            stitched.crlb_sigma.as_ref(),
+            &pairs,
+        )
+    })?;
     // Spatially reference the series to a stable pixel (dolphin parity): the
     // configured point, else the center-of-mass of the high-coherence region.
     let configured_reference = configured_analysis_reference(
@@ -243,7 +268,7 @@ fn finish_displacement(
         )
     });
     if let Some(point) = analysis_reference_point {
-        reference_to_point(&mut disp_rad, point);
+        reference_to_point(&mut inversion.displacement, point);
     }
     // Atmospheric corrections subtract per-date delay from the inverted series,
     // before velocity (opt-in; no-op when no correction files are configured).
@@ -252,25 +277,129 @@ fn finish_displacement(
         apply_corrections(
             &cfg.correction_options,
             cfg.input_options.wavelength,
-            &mut disp_rad,
+            &mut inversion.displacement,
             &date_files,
             epsg.unwrap_or(0),
             geotransform,
         )
     })?;
-    let vel_rad = timed("velocity", || velocity_of(disp_rad.view(), &days));
+    let (vel_rad, velocity_sigma_rad) = timed("velocity", || {
+        fit_velocity(
+            cfg,
+            inversion.displacement.view(),
+            &days,
+            stitched.crlb_sigma.as_ref(),
+        )
+    })?;
     let spatial = SpatialProducts {
-        disp_rad,
+        disp_rad: inversion.displacement,
         vel_rad,
         temporal_coherence,
         phase_linking_coherence: stitched.phase_linking_coherence,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
         corrections,
+        posterior_variance_rad: inversion.posterior_variance,
+        timeseries_residual_rad: inversion.residual_rms,
+        velocity_sigma_rad,
+        interferogram_pairs: pairs,
+        unwrap_connected_components: unwrap.connected_components,
         geotransform,
         reference_point: analysis_reference_point,
     };
     emit_displacement(cfg, days, epsg, crop, spatial)
+}
+
+struct InversionProducts {
+    displacement: Array3<f64>,
+    posterior_variance: Option<Array3<f64>>,
+    residual_rms: Option<Array2<f64>>,
+}
+
+fn invert_time_series(
+    cfg: &DisplacementWorkflow,
+    incidence: ArrayView2<f64>,
+    dphi: ArrayView3<f64>,
+    crlb_sigma: Option<&Array3<f64>>,
+    pairs: &[(usize, usize)],
+) -> Result<InversionProducts> {
+    anyhow::ensure!(
+        !(cfg.timeseries_options.write_posterior_uncertainty
+            && cfg.timeseries_options.method == TimeseriesMethod::L1),
+        "posterior uncertainty is available only for L2 timeseries inversion"
+    );
+    let precision = if cfg.timeseries_options.method == TimeseriesMethod::L2
+        && (cfg.timeseries_options.use_coherence_weights
+            || cfg.timeseries_options.write_posterior_uncertainty)
+    {
+        Some(if cfg.timeseries_options.use_coherence_weights {
+            interferogram_precisions(
+                crlb_sigma
+                    .context("coherence weighting requires internally computed CRLB")?
+                    .view(),
+                pairs,
+            )
+        } else {
+            Array3::ones(dphi.dim())
+        })
+    } else {
+        None
+    };
+    match cfg.timeseries_options.method {
+        TimeseriesMethod::L1 => Ok(InversionProducts {
+            displacement: invert_stack_l1(incidence, dphi, L1Config::default()),
+            posterior_variance: None,
+            residual_rms: None,
+        }),
+        TimeseriesMethod::L2 if cfg.timeseries_options.write_posterior_uncertainty => {
+            let output = invert_stack_with_uncertainty(
+                incidence,
+                dphi,
+                precision
+                    .as_ref()
+                    .context("posterior uncertainty requires L2 observation precision")?
+                    .view(),
+            );
+            Ok(InversionProducts {
+                displacement: output.phase,
+                posterior_variance: Some(output.posterior_variance),
+                residual_rms: Some(output.residual_rms),
+            })
+        }
+        TimeseriesMethod::L2 => Ok(InversionProducts {
+            displacement: invert_stack(incidence, dphi, precision.as_ref().map(Array3::view)),
+            posterior_variance: None,
+            residual_rms: None,
+        }),
+    }
+}
+
+fn fit_velocity(
+    cfg: &DisplacementWorkflow,
+    displacement: ArrayView3<f64>,
+    days: &[f64],
+    crlb_sigma: Option<&Array3<f64>>,
+) -> Result<(Array2<f64>, Option<Array2<f64>>)> {
+    if !(cfg.timeseries_options.use_coherence_weights
+        || cfg.timeseries_options.write_velocity_uncertainty)
+    {
+        return Ok((velocity_of(displacement, days), None));
+    }
+    let precision = date_precisions(
+        crlb_sigma
+            .context("velocity weighting requires internally computed CRLB")?
+            .view(),
+    );
+    let series = series_with_reference(displacement);
+    if cfg.timeseries_options.write_velocity_uncertainty {
+        let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
+        Ok((output.velocity, Some(output.sigma)))
+    } else {
+        Ok((
+            estimate_velocity_with_precisions(days, series.view(), precision.view()),
+            None,
+        ))
+    }
 }
 
 struct SpatialProducts {
@@ -283,6 +412,11 @@ struct SpatialProducts {
     corrections: CorrectionLayers,
     geotransform: [f64; 6],
     reference_point: Option<(usize, usize)>,
+    posterior_variance_rad: Option<Array3<f64>>,
+    timeseries_residual_rad: Option<Array2<f64>>,
+    velocity_sigma_rad: Option<Array2<f64>>,
+    interferogram_pairs: Vec<(usize, usize)>,
+    unwrap_connected_components: Array3<u32>,
 }
 
 fn emit_displacement(
@@ -297,7 +431,15 @@ fn emit_displacement(
             plan.target_in_analysis,
             &days,
             cfg.timeseries_options.correlation_threshold,
+            cfg.timeseries_options.use_coherence_weights,
+            cfg.timeseries_options.write_velocity_uncertainty,
         )?;
+    }
+    if let (Some(variance), Some(point)) = (
+        spatial.posterior_variance_rad.as_mut(),
+        spatial.reference_point,
+    ) {
+        reference_variance_to_point(variance, point);
     }
     let phase_to_disp = cfg
         .input_options
@@ -308,10 +450,31 @@ fn emit_displacement(
     let velocity_mm_yr = spatial
         .vel_rad
         .mapv(|rate| rate * mm_per_rad(cfg.input_options.wavelength));
+    let displacement_variance = spatial
+        .posterior_variance_rad
+        .as_ref()
+        .map(|values| values.mapv(|value| value * phase_to_disp * phase_to_disp));
+    let timeseries_residual_rms = spatial
+        .timeseries_residual_rad
+        .as_ref()
+        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
+    let velocity_sigma = spatial
+        .velocity_sigma_rad
+        .as_ref()
+        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
+    let emitted_crlb = cfg
+        .phase_linking
+        .write_crlb
+        .then_some(spatial.crlb_sigma.as_ref())
+        .flatten();
     let quality = QualityLayers {
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
-        crlb_sigma: spatial.crlb_sigma.as_ref(),
+        crlb_sigma: emitted_crlb,
         closure_phase: spatial.closure_phase.as_ref(),
+        displacement_variance: displacement_variance.as_ref(),
+        timeseries_residual_rms: timeseries_residual_rms.as_ref(),
+        velocity_sigma: velocity_sigma.as_ref(),
+        connected_components: &spatial.unwrap_connected_components,
     };
     let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_bounds(
         cfg,
@@ -335,9 +498,18 @@ fn emit_displacement(
         displacement,
         velocity,
         velocity_mm_yr,
+        velocity_sigma,
+        displacement_variance,
+        timeseries_residual_rms,
+        interferogram_pairs: spatial.interferogram_pairs,
+        unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
-        crlb_sigma: spatial.crlb_sigma,
+        crlb_sigma: cfg
+            .phase_linking
+            .write_crlb
+            .then_some(spatial.crlb_sigma)
+            .flatten(),
         closure_phase: spatial.closure_phase,
         acquisition_days: days,
         epsg,
@@ -356,6 +528,8 @@ impl SpatialProducts {
         target: BlockIndices,
         days: &[f64],
         correlation_threshold: f64,
+        use_coherence_weights: bool,
+        write_velocity_uncertainty: bool,
     ) -> Result<()> {
         // A halo reference is scientifically valid for analysis but cannot be
         // represented by a target-local coordinate. Re-reference to a coherent
@@ -375,7 +549,25 @@ impl SpatialProducts {
             )?;
             let global = (target.row_start + local.0, target.col_start + local.1);
             reference_to_point(&mut self.disp_rad, global);
-            self.vel_rad = velocity_of(self.disp_rad.view(), days);
+            if use_coherence_weights || write_velocity_uncertainty {
+                let precision = self
+                    .crlb_sigma
+                    .as_ref()
+                    .map(|sigma| date_precisions(sigma.view()))
+                    .context("bounded velocity weighting requires internally computed CRLB")?;
+                let series = series_with_reference(self.disp_rad.view());
+                if write_velocity_uncertainty {
+                    let result =
+                        estimate_velocity_with_uncertainty(days, series.view(), precision.view());
+                    self.vel_rad = result.velocity;
+                    self.velocity_sigma_rad = Some(result.sigma);
+                } else {
+                    self.vel_rad =
+                        estimate_velocity_with_precisions(days, series.view(), precision.view());
+                }
+            } else {
+                self.vel_rad = velocity_of(self.disp_rad.view(), days);
+            }
             self.reference_point = Some(global);
         }
         self.disp_rad = trim3(&self.disp_rad, target);
@@ -387,6 +579,19 @@ impl SpatialProducts {
             .map(|layer| trim2(&layer, target));
         self.crlb_sigma = self.crlb_sigma.take().map(|layer| trim3(&layer, target));
         self.closure_phase = self.closure_phase.take().map(|layer| trim3(&layer, target));
+        self.posterior_variance_rad = self
+            .posterior_variance_rad
+            .take()
+            .map(|layer| trim3(&layer, target));
+        self.timeseries_residual_rad = self
+            .timeseries_residual_rad
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.velocity_sigma_rad = self
+            .velocity_sigma_rad
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
         trim_corrections(&mut self.corrections, target);
         self.reference_point = trim_reference(self.reference_point, target);
         self.geotransform =
@@ -1258,7 +1463,9 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         zero_correlation_threshold: cfg.phase_linking.zero_correlation_threshold,
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
-        compute_crlb: cfg.phase_linking.write_crlb,
+        compute_crlb: cfg.phase_linking.write_crlb
+            || cfg.timeseries_options.use_coherence_weights
+            || cfg.timeseries_options.write_velocity_uncertainty,
         // The phase-bias correction consumes the closure layer, so force it on
         // when the correction is enabled even if the raster isn't written.
         compute_closure_phase: cfg.phase_linking.write_closure_phase
@@ -1285,13 +1492,15 @@ fn unwrap_network(
     cfg: &DisplacementWorkflow,
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
+    temporal_coherence: ArrayView2<f64>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
-) -> Result<Array3<f64>> {
+) -> Result<UnwrapNetworkOutput> {
     let (_, rows, cols) = pl.dim();
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let correlation = analysis_correlation(cfg, geotransform, epsg, (rows, cols))?;
+    let correlation =
+        analysis_correlation(cfg, temporal_coherence, geotransform, epsg, (rows, cols))?;
     let masked_phase = (cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some())
         .then(|| apply_phase_mask(pl, correlation.view()));
     let backend = unwrap_backend(cfg, (rows, cols));
@@ -1317,20 +1526,37 @@ fn apply_phase_mask(pl: ArrayView3<Cf64>, mask: ArrayView2<f32>) -> Array3<Cf64>
 
 fn analysis_correlation(
     cfg: &DisplacementWorkflow,
+    temporal_coherence: ArrayView2<f64>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
     shape: (usize, usize),
 ) -> Result<Array2<f32>> {
+    anyhow::ensure!(
+        temporal_coherence.dim() == shape,
+        "temporal coherence shape differs from unwrap grid"
+    );
+    let mut correlation = temporal_coherence.mapv(|value| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    });
     if !cfg.unwrap_options.zero_where_masked {
-        return Ok(Array2::from_elem(shape, 1.0));
+        return Ok(correlation);
     }
     let Some(path) = cfg.mask_file.as_ref() else {
-        return Ok(Array2::from_elem(shape, 1.0));
+        return Ok(correlation);
     };
     let epsg = epsg.context("mask_file requires a sourced output EPSG")?;
     let mask = read_aligned_raster_window::<u8>(path, geotransform, epsg, shape)
         .context("reading configured aligned mask")?;
-    Ok(mask.mapv(|value| if value == 0 { 0.0 } else { 1.0 }))
+    for ((row, col), value) in mask.indexed_iter() {
+        if *value == 0 {
+            correlation[(row, col)] = 0.0;
+        }
+    }
+    Ok(correlation)
 }
 
 /// Rayon pool sizing the ifg-network unwrap fan-out. `n_parallel_jobs` is
@@ -1464,12 +1690,57 @@ fn mm_per_rad(wavelength: Option<f64>) -> f64 {
 /// Linear velocity (rad/yr) from the phase displacement series, fitting against
 /// the real acquisition `days` (date 0 = 0 reference).
 fn velocity_of(displacement: ArrayView3<f64>, days: &[f64]) -> Array2<f64> {
+    let series = series_with_reference(displacement);
+    estimate_velocity(days, series.view(), None)
+}
+
+fn series_with_reference(displacement: ArrayView3<f64>) -> Array3<f64> {
     let (nd, rows, cols) = displacement.dim();
-    let series = Array3::from_shape_fn((nd + 1, rows, cols), |(t, r, c)| match t {
+    Array3::from_shape_fn((nd + 1, rows, cols), |(t, r, c)| match t {
         0 => 0.0,
         _ => displacement[(t - 1, r, c)],
-    });
-    estimate_velocity(days, series.view(), None)
+    })
+}
+
+/// Propagate an independent-pixel approximation through spatial referencing.
+/// The selected reference is identically zero; every other pixel receives the
+/// reference pixel's temporal variance in quadrature.
+fn reference_variance_to_point(variance: &mut Array3<f64>, point: (usize, usize)) {
+    let reference: Vec<_> = variance
+        .axis_iter(Axis(0))
+        .map(|band| band[point])
+        .collect();
+    for ((date, row, col), value) in variance.indexed_iter_mut() {
+        if (row, col) == point {
+            *value = 0.0;
+        } else {
+            *value += reference[date];
+        }
+    }
+}
+
+fn interferogram_precisions(sigma: ArrayView3<f64>, pairs: &[(usize, usize)]) -> Array3<f64> {
+    let (_, rows, cols) = sigma.dim();
+    Array3::from_shape_fn((pairs.len(), rows, cols), |(k, r, c)| {
+        let (i, j) = pairs[k];
+        let variance = sigma[(i, r, c)].powi(2) + sigma[(j, r, c)].powi(2);
+        if variance.is_finite() {
+            1.0 / variance.max(1e-12)
+        } else {
+            0.0
+        }
+    })
+}
+
+fn date_precisions(sigma: ArrayView3<f64>) -> Array3<f64> {
+    sigma.mapv(|value| {
+        let variance = value * value;
+        if variance.is_finite() {
+            1.0 / variance.max(1e-12)
+        } else {
+            0.0
+        }
+    })
 }
 
 /// Write the velocity, temporal-coherence, per-date displacement, and (when
@@ -1490,16 +1761,43 @@ fn write_outputs(
         write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
     };
     write_f32("velocity.tif", velocity)?;
+    if let Some(sigma) = quality.velocity_sigma {
+        write_f32("velocity_sigma.tif", sigma.view())?;
+    }
+    if let Some(residual) = quality.timeseries_residual_rms {
+        write_f32("timeseries_residual_rms.tif", residual.view())?;
+    }
     write_f32("temporal_coherence.tif", temporal_coherence)?;
     if let Some(coherence) = quality.phase_linking_coherence {
         write_f32("phase_linking_coherence.tif", coherence.view())?;
     }
     write_bands(&write_f32, displacement, "displacement")?;
     if let Some(crlb) = quality.crlb_sigma {
-        write_bands(&write_f32, crlb.view(), "crlb_sigma")?;
+        for band in 0..crlb.dim().0 {
+            write_raster_with_metadata(
+                &dir.join(format!("crlb_sigma_{band:02}.tif")),
+                crlb.index_axis(Axis(0), band).mapv(|v| v as f32).view(),
+                gt,
+                epsg,
+                None,
+                &[("UNITTYPE", "rad")],
+            )?;
+        }
     }
     if let Some(closure) = quality.closure_phase {
         write_bands(&write_f32, closure.view(), "closure_phase")?;
+    }
+    if let Some(variance) = quality.displacement_variance {
+        write_bands(&write_f32, variance.view(), "displacement_variance")?;
+    }
+    for band in 0..quality.connected_components.dim().0 {
+        write_raster(
+            &dir.join(format!("conncomp_{band:02}.tif")),
+            quality.connected_components.index_axis(Axis(0), band),
+            gt,
+            epsg,
+            Some(0.0),
+        )?;
     }
     Ok(())
 }
@@ -1547,6 +1845,10 @@ struct QualityLayers<'a> {
     phase_linking_coherence: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
+    displacement_variance: Option<&'a Array3<f64>>,
+    timeseries_residual_rms: Option<&'a Array2<f64>>,
+    velocity_sigma: Option<&'a Array2<f64>>,
+    connected_components: &'a Array3<u32>,
 }
 
 /// Write each band of a `(bands, rows, cols)` layer as `{prefix}_NN.tif`.
@@ -1685,6 +1987,11 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
+            posterior_variance_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: None,
+            interferogram_pairs: Vec::new(),
+            unwrap_connected_components: Array3::zeros((0, 6, 8)),
         };
         let target = BlockIndices {
             row_start: 2,
@@ -1692,7 +1999,9 @@ mod tests {
             col_start: 3,
             col_stop: 7,
         };
-        products.trim(target, &[0.0, 12.0, 24.0], 0.5).unwrap();
+        products
+            .trim(target, &[0.0, 12.0, 24.0], 0.5, false, false)
+            .unwrap();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
         assert!(products
@@ -1718,6 +2027,11 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
+            posterior_variance_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: None,
+            interferogram_pairs: Vec::new(),
+            unwrap_connected_components: Array3::zeros((0, 4, 4)),
         };
         let error = products
             .trim(
@@ -1729,6 +2043,8 @@ mod tests {
                 },
                 &[0.0, 12.0, 24.0],
                 0.5,
+                false,
+                false,
             )
             .unwrap_err();
         assert!(error.to_string().contains("reference coherence threshold"));
@@ -1786,6 +2102,7 @@ mod tests {
         cfg.unwrap_options.zero_where_masked = true;
         let error = analysis_correlation(
             &cfg,
+            Array2::ones((8, 8)).view(),
             [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
             Some(32611),
             (8, 8),
@@ -1802,12 +2119,56 @@ mod tests {
         };
         let correlation = analysis_correlation(
             &cfg,
+            Array2::ones((8, 8)).view(),
             [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
             Some(32611),
             (8, 8),
         )
         .unwrap();
         assert!(correlation.iter().all(|&value| value == 1.0));
+    }
+
+    #[test]
+    fn unwrap_correlation_preserves_real_temporal_quality() {
+        let cfg = DisplacementWorkflow::default();
+        let temporal = ndarray::array![[0.1, 0.8], [f64::NAN, 1.2]];
+        let correlation = analysis_correlation(
+            &cfg,
+            temporal.view(),
+            [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+            Some(32611),
+            (2, 2),
+        )
+        .unwrap();
+        assert_eq!(correlation, ndarray::array![[0.1_f32, 0.8], [0.0, 1.0]]);
+    }
+
+    #[test]
+    fn posterior_uncertainty_supports_unweighted_l2_and_rejects_l1() {
+        let incidence = ndarray::array![[1.0], [1.0]];
+        let dphi = Array3::from_shape_vec((2, 1, 1), vec![1.0, 2.0]).unwrap();
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.write_posterior_uncertainty = true;
+        let output = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
+            .expect("unweighted posterior");
+        assert!(output.posterior_variance.is_some());
+        cfg.timeseries_options.method = TimeseriesMethod::L1;
+        let error = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
+            .err()
+            .expect("L1 must reject posterior output");
+        assert!(error.to_string().contains("only for L2"));
+    }
+
+    #[test]
+    fn spatial_reference_variance_includes_reference_pixel() {
+        let mut variance = Array3::from_shape_vec((1, 1, 3), vec![1.0, 4.0, 9.0]).unwrap();
+        reference_variance_to_point(&mut variance, (0, 1));
+        assert_eq!(
+            variance,
+            Array3::from_shape_vec((1, 1, 3), vec![5.0, 0.0, 13.0]).unwrap()
+        );
     }
 
     #[test]

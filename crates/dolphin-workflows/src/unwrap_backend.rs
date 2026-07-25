@@ -37,7 +37,15 @@ pub trait UnwrapBackend: Send + Sync {
         pairs: &[(usize, usize)],
         correlation: ArrayView2<f32>,
         scratch: &Path,
-    ) -> Result<Array3<f64>>;
+    ) -> Result<UnwrapNetworkOutput>;
+}
+
+/// Network-aligned unwrap products. Both cubes follow `pairs` order.
+pub struct UnwrapNetworkOutput {
+    /// Unwrapped phase, one band per interferogram.
+    pub unwrapped: Array3<f64>,
+    /// Connected-component labels in the same band order.
+    pub connected_components: Array3<u32>,
 }
 
 /// Single-pass SNAPHU (the default backend).
@@ -58,7 +66,7 @@ impl UnwrapBackend for SnaphuBackend {
         pairs: &[(usize, usize)],
         correlation: ArrayView2<f32>,
         scratch: &Path,
-    ) -> Result<Array3<f64>> {
+    ) -> Result<UnwrapNetworkOutput> {
         // #3: the correlation is identical across every pair — serialize it once
         // into the shared scratch and reuse the file for all ifgs instead of
         // re-writing corr.f4 per pair.
@@ -69,9 +77,8 @@ impl UnwrapBackend for SnaphuBackend {
             correlation,
             scratch,
             |ifg, _corr, pair_scratch| {
-                Ok(unwrap_with_corr(ifg, &corr_path, &self.0, pair_scratch)?
-                    .unwrapped
-                    .mapv(f64::from))
+                let out = unwrap_with_corr(ifg, &corr_path, &self.0, pair_scratch)?;
+                Ok((out.unwrapped.mapv(f64::from), out.conncomp))
             },
         )
     }
@@ -84,16 +91,15 @@ impl UnwrapBackend for TophuBackend {
         pairs: &[(usize, usize)],
         correlation: ArrayView2<f32>,
         scratch: &Path,
-    ) -> Result<Array3<f64>> {
+    ) -> Result<UnwrapNetworkOutput> {
         unwrap_each_ifg(
             pl,
             pairs,
             correlation,
             scratch,
             |ifg, corr, pair_scratch| {
-                Ok(unwrap_multiscale(ifg, corr, &self.0, pair_scratch)?
-                    .unwrapped
-                    .mapv(f64::from))
+                let out = unwrap_multiscale(ifg, corr, &self.0, pair_scratch)?;
+                Ok((out.unwrapped.mapv(f64::from), out.conncomp))
             },
         )
     }
@@ -106,15 +112,14 @@ impl UnwrapBackend for NativeUnwrapBackend {
         pairs: &[(usize, usize)],
         correlation: ArrayView2<f32>,
         _scratch: &Path,
-    ) -> Result<Array3<f64>> {
+    ) -> Result<UnwrapNetworkOutput> {
         // In-process: form each ifg and unwrap from memory — no scratch dirs,
         // no subprocess. `par_iter().collect()` keeps the stack in `pairs` order.
         let layers = pairs
             .par_iter()
             .map(|&pair| solve_native(pl, pair, correlation, &self.0))
             .collect::<Result<Vec<_>>>()?;
-        let views: Vec<_> = layers.iter().map(Array2::view).collect();
-        ndarray::stack(Axis(0), &views).context("stacking unwrapped ifgs")
+        stack_layers(layers)
     }
 }
 
@@ -124,10 +129,10 @@ fn solve_native(
     pair: (usize, usize),
     correlation: ArrayView2<f32>,
     cfg: &NativeConfig,
-) -> Result<Array2<f64>> {
+) -> Result<(Array2<f64>, Array2<u32>)> {
     let ifg = form_ifg(pl, pair);
     let out = unwrap_native(ifg.view(), correlation, cfg).context("native unwrap")?;
-    Ok(out.unwrapped.mapv(f64::from))
+    Ok((out.unwrapped.mapv(f64::from), out.conncomp))
 }
 
 /// Form each ifg from the linked phase and unwrap it with a 2D solver, stacking
@@ -137,8 +142,9 @@ fn unwrap_each_ifg(
     pairs: &[(usize, usize)],
     correlation: ArrayView2<f32>,
     scratch: &Path,
-    solve: impl Fn(ArrayView2<Cf32>, ArrayView2<f32>, &Path) -> Result<Array2<f64>> + Sync,
-) -> Result<Array3<f64>> {
+    solve: impl Fn(ArrayView2<Cf32>, ArrayView2<f32>, &Path) -> Result<(Array2<f64>, Array2<u32>)>
+        + Sync,
+) -> Result<UnwrapNetworkOutput> {
     // Solve pairs concurrently; `par_iter().collect()` is order-stable, so the
     // stack matches `pairs` order regardless of completion order. Each pair gets
     // its own scratch subdir so the fixed-name SNAPHU files never collide.
@@ -147,8 +153,17 @@ fn unwrap_each_ifg(
         .enumerate()
         .map(|(idx, &pair)| unwrap_one_pair(pl, pair, correlation, scratch, idx, &solve))
         .collect::<Result<Vec<_>>>()?;
-    let views: Vec<_> = layers.iter().map(Array2::view).collect();
-    ndarray::stack(Axis(0), &views).context("stacking unwrapped ifgs")
+    stack_layers(layers)
+}
+
+fn stack_layers(layers: Vec<(Array2<f64>, Array2<u32>)>) -> Result<UnwrapNetworkOutput> {
+    let phase_views: Vec<_> = layers.iter().map(|layer| layer.0.view()).collect();
+    let component_views: Vec<_> = layers.iter().map(|layer| layer.1.view()).collect();
+    Ok(UnwrapNetworkOutput {
+        unwrapped: ndarray::stack(Axis(0), &phase_views).context("stacking unwrapped ifgs")?,
+        connected_components: ndarray::stack(Axis(0), &component_views)
+            .context("stacking connected components")?,
+    })
 }
 
 /// Unwrap a single pair into its own scratch subdir `pair_NNNN`, isolating the
@@ -159,8 +174,9 @@ fn unwrap_one_pair(
     correlation: ArrayView2<f32>,
     scratch: &Path,
     idx: usize,
-    solve: &(impl Fn(ArrayView2<Cf32>, ArrayView2<f32>, &Path) -> Result<Array2<f64>> + Sync),
-) -> Result<Array2<f64>> {
+    solve: &(impl Fn(ArrayView2<Cf32>, ArrayView2<f32>, &Path) -> Result<(Array2<f64>, Array2<u32>)>
+          + Sync),
+) -> Result<(Array2<f64>, Array2<u32>)> {
     let pair_scratch = scratch.join(format!("pair_{idx:04}"));
     std::fs::create_dir_all(&pair_scratch)?;
     solve(form_ifg(pl, pair).view(), correlation, &pair_scratch)

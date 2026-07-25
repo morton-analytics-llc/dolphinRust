@@ -53,9 +53,13 @@ fn both_backends_unwrap_through_the_trait() {
         let out = backend
             .unwrap_network(pl.view(), &pairs, corr.view(), &scratch)
             .unwrap();
-        assert_eq!(out.dim(), (1, rows, cols), "one unwrapped ifg of the grid");
+        assert_eq!(
+            out.unwrapped.dim(),
+            (1, rows, cols),
+            "one unwrapped ifg of the grid"
+        );
         assert!(
-            out.iter().all(|v: &f64| v.is_finite()),
+            out.unwrapped.iter().all(|v: &f64| v.is_finite()),
             "finite unwrapped phase"
         );
     }
@@ -77,8 +81,8 @@ fn native_backend_matches_snaphu_network() {
     let native = NativeUnwrapBackend(NativeConfig::default())
         .unwrap_network(pl.view(), &pairs, corr.view(), &scratch)
         .unwrap();
-    assert_eq!(native.dim(), (1, rows, cols));
-    assert!(native.iter().all(|v: &f64| v.is_finite()));
+    assert_eq!(native.unwrapped.dim(), (1, rows, cols));
+    assert!(native.unwrapped.iter().all(|v: &f64| v.is_finite()));
 
     if !snaphu_available() {
         return;
@@ -88,8 +92,9 @@ fn native_backend_matches_snaphu_network() {
         .unwrap();
     let tau = std::f64::consts::TAU;
     let cycles: Vec<i64> = native
+        .unwrapped
         .iter()
-        .zip(snaphu.iter())
+        .zip(snaphu.unwrapped.iter())
         .map(|(n, s)| ((n - s) / tau).round() as i64)
         .collect();
     let mode = cycles[0];
@@ -98,4 +103,31 @@ fn native_backend_matches_snaphu_network() {
         disagree, 0,
         "native network must match SNAPHU up to a constant"
     );
+}
+
+#[test]
+fn native_backend_uses_nonuniform_coherence_for_segmentation() {
+    let (rows, cols) = (24, 24);
+    let pl = ramp_pl(rows, cols);
+    let pairs = [(0_usize, 1_usize)];
+    let uniform = Array2::<f32>::from_elem((rows, cols), 1.0);
+    let mut split = uniform.clone();
+    split.slice_mut(ndarray::s![.., 11..13]).fill(0.0);
+    let backend = NativeUnwrapBackend(NativeConfig::default());
+    let scratch = std::env::temp_dir().join("dolphinrust_unwrap_coherence");
+    let connected = backend
+        .unwrap_network(pl.view(), &pairs, uniform.view(), &scratch)
+        .unwrap();
+    let segmented = backend
+        .unwrap_network(pl.view(), &pairs, split.view(), &scratch)
+        .unwrap();
+    assert_ne!(
+        connected.connected_components, segmented.connected_components,
+        "a zero-coherence moat must alter component segmentation"
+    );
+    assert!(segmented
+        .connected_components
+        .slice(ndarray::s![0, .., 11..13])
+        .iter()
+        .all(|label| *label == 0));
 }

@@ -98,6 +98,9 @@ interferogram_network:
   reference_idx: 0             # single-reference network; or set max_bandwidth / max_temporal_baseline
 timeseries_options:
   method: L1                   # L1 (dolphin default, ADMM/LAD) or L2 (weighted least squares)
+  use_coherence_weights: true  # L2 IFG precision from per-date CRLBs; L1 remains unweighted
+  write_posterior_uncertainty: false # L2 only: variance + residual RMS rasters
+  write_velocity_uncertainty: false  # date-CRLB-weighted slope sigma raster
 unwrap_options:
   unwrap_method: snaphu        # default; or `tophu` for multi-scale (see below)
   snaphu_options: { cost: smooth, init_method: mcf, ntiles: [1, 1] }
@@ -232,6 +235,11 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 | `displacement` | `Array3<f64>` `(n_dates-1, rows, cols)` | meters (if `wavelength`) else radians | cumulative LOS vs acquisition 0 |
 | `velocity` | `Array2<f64>` `(rows, cols)` | m/yr (if `wavelength`) else rad/yr | raster-unit linear rate |
 | `velocity_mm_yr` | `Array2<f64>` `(rows, cols)` | **mm/yr** | LOS rate via `−λ/4π`; config λ or Sentinel-1 default |
+| `velocity_sigma` | `Option<Array2<f64>>` | displacement units/yr | CRLB-weighted slope σ; opt-in |
+| `displacement_variance` | `Option<Array3<f64>>` | displacement units² | L2 posterior diagonal; opt-in |
+| `timeseries_residual_rms` | `Option<Array2<f64>>` | displacement units | L2 residual RMS; opt-in |
+| `interferogram_pairs` | `Vec<(usize, usize)>` | date indexes | ordering for unwrap bands and component labels |
+| `unwrap_connected_components` | `Array3<u32>` | labels | actual native/SNAPHU labels, one band per pair |
 | `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | per-ministack-stitched phase quality (dolphin's NaN-aware mean across ministacks; unmasked) |
 | `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-date Cramér–Rao σ lower bound; band 0 = reference (σ=0), singular-Γ pixels `NaN`. `Some` by default (`write_crlb`) |
 | `closure_phase` | `Option<Array3<f64>>` `(n_dates-2, rows, cols)` | radians | per-triplet nearest-neighbour non-closure; `Some` only when `write_closure_phase` |
@@ -249,9 +257,13 @@ DEFLATE-compressed, overviews) sharing `epsg` + `geotransform`:
 | File | Band | Units |
 |---|---|---|
 | `velocity.tif` | linear velocity | raster units/yr (m/yr or rad/yr) |
+| `velocity_sigma.tif` | one-sigma linear-rate uncertainty (opt-in) | raster units/yr |
+| `timeseries_residual_rms.tif` | L2 residual RMS (with posterior output) | meters or radians |
 | `temporal_coherence.tif` | temporal coherence | `[0, 1]` |
 | `displacement_NN.tif` | cumulative displacement at date `NN+1` | meters or radians |
-| `crlb_sigma_NN.tif` | CRLB σ at date `NN` (band 0 = reference) | radians |
+| `displacement_variance_NN.tif` | L2 posterior displacement variance (opt-in) | meters² or radians² |
+| `crlb_sigma_NN.tif` | CRLB σ at date `NN` (band 0 = reference; `UNITTYPE=rad`) | radians |
+| `conncomp_NN.tif` | unwrap connected-component labels for interferogram `NN` | integer labels |
 | `closure_phase_NN.tif` | nearest-neighbour closure of triplet `NN` (only if `write_closure_phase`) | radians |
 | `ionosphere_NN.tif` | ionospheric range delay at date `NN` (only if `ionosphere_files`) | meters |
 | `troposphere_NN.tif` | tropospheric range delay at date `NN` (only if `troposphere_files`) | meters |

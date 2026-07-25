@@ -158,7 +158,7 @@ fn main() -> Result<()> {
     let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
     let _ = std::fs::remove_dir_all(&scratch);
 
-    let checksum = out.iter().copied().fold(0.0_f64, |a, b| a + b);
+    let checksum = out.unwrapped.iter().copied().fold(0.0_f64, |a, b| a + b);
     println!(
         "backend={name} dense={} tile={tile} epochs={epochs} ifgs={} grid={rows}x{cols} threads={threads} wall_ms={wall_ms:.1} checksum={checksum:.3}",
         dense as u8,

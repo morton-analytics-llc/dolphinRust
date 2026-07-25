@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_timeseries::{
-    build_network, estimate_velocity, get_incidence_matrix, invert_stack, invert_stack_l1,
-    L1Config, NetworkConfig,
+    build_network, estimate_velocity, estimate_velocity_with_precisions,
+    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
+    invert_stack_with_uncertainty, solve_pixel_with_covariance, L1Config, NetworkConfig,
 };
 use ndarray::{Array2, Array3};
 
@@ -72,6 +73,71 @@ fn velocity_is_slope_per_year() {
         "got {}",
         vel[(0, 0)]
     );
+}
+
+#[test]
+fn weighted_l2_returns_bounded_posterior_variance() {
+    let a = ndarray::array![[1.0], [1.0], [1.0]];
+    let dphi = Array3::from_shape_vec((3, 1, 1), vec![1.0, 2.0, 9.0]).unwrap();
+    let precision = Array3::from_shape_vec((3, 1, 1), vec![4.0, 4.0, 0.01]).unwrap();
+    let weighted = invert_stack_with_uncertainty(a.view(), dphi.view(), precision.view());
+    let unweighted = invert_stack(a.view(), dphi.view(), None);
+    assert!((weighted.phase[(0, 0, 0)] - 12.09 / 8.01).abs() < 1e-12);
+    assert!(weighted.phase[(0, 0, 0)] < unweighted[(0, 0, 0)]);
+    assert!(weighted.posterior_variance[(0, 0, 0)].is_finite());
+    assert!(weighted.residual_rms[(0, 0)].is_finite());
+}
+
+#[test]
+fn pixel_covariance_matches_diagonal_normal_equation() {
+    let a = ndarray::array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+    let dphi = Array3::from_shape_vec((3, 1, 1), vec![1.0, 2.0, 3.0]).unwrap();
+    let precision = Array3::from_elem((3, 1, 1), 1.0);
+    let out = solve_pixel_with_covariance(a.view(), dphi.view(), Some(precision.view()), (0, 0), 3)
+        .unwrap();
+    assert!((out.parameters[0] - 1.0).abs() < 1e-12);
+    assert!((out.parameters[1] - 2.0).abs() < 1e-12);
+    assert!((out.covariance[(0, 0)] - 2.0 / 3.0).abs() < 1e-12);
+    assert!((out.covariance[(0, 1)] + 1.0 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn rank_deficient_weighted_pixel_returns_none() {
+    let a = ndarray::array![[1.0, 0.0], [1.0, 0.0]];
+    let dphi = Array3::zeros((2, 1, 1));
+    assert!(solve_pixel_with_covariance(a.view(), dphi.view(), None, (0, 0), 2).is_none());
+}
+
+#[test]
+fn zero_precision_excludes_nonfinite_observation() {
+    let a = ndarray::array![[1.0], [1.0]];
+    let dphi = Array3::from_shape_vec((2, 1, 1), vec![2.0, f64::NAN]).unwrap();
+    let precision = Array3::from_shape_vec((2, 1, 1), vec![1.0, 0.0]).unwrap();
+    let out = solve_pixel_with_covariance(a.view(), dphi.view(), Some(precision.view()), (0, 0), 2)
+        .expect("one valid observation determines one parameter");
+    assert_eq!(out.parameters, vec![2.0]);
+    assert_eq!(out.residual_rms, 0.0);
+}
+
+#[test]
+fn velocity_uncertainty_matches_closed_form_line() {
+    let x = [0.0, 1.0, 2.0, 3.0];
+    let series = Array3::from_shape_vec((4, 1, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+    let precision = Array3::from_elem((4, 1, 1), 1.0);
+    let out = estimate_velocity_with_uncertainty(&x, series.view(), precision.view());
+    assert!((out.velocity[(0, 0)] - 365.25).abs() < 1e-9);
+    assert!(out.sigma[(0, 0)].is_finite() && out.sigma[(0, 0)] > 0.0);
+    assert!(out.residual_rms[(0, 0)] < 1e-12);
+}
+
+#[test]
+fn date_precision_changes_velocity_fit() {
+    let x = [0.0, 1.0, 2.0];
+    let series = Array3::from_shape_vec((3, 1, 1), vec![0.0, 1.0, 20.0]).unwrap();
+    let precision = Array3::from_shape_vec((3, 1, 1), vec![1.0, 1.0, 1e-6]).unwrap();
+    let weighted = estimate_velocity_with_precisions(&x, series.view(), precision.view());
+    let unweighted = estimate_velocity(&x, series.view(), None);
+    assert!(weighted[(0, 0)] < unweighted[(0, 0)] / 2.0);
 }
 
 // ------------------------------- oracle (secondary) ---------------------------

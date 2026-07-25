@@ -11,7 +11,7 @@ use std::path::Path;
 use dolphin_core::BlockIndices;
 use gdal::raster::{Buffer, GdalType, RasterCreationOptions};
 use gdal::spatial_ref::{CoordTransform, SpatialRef};
-use gdal::{Dataset, DriverManager};
+use gdal::{Dataset, DriverManager, Metadata};
 use ndarray::{Array2, ArrayView2};
 
 use crate::error::{IoError, Result};
@@ -62,12 +62,30 @@ pub fn write_raster<T: GdalType + Copy>(
     epsg: Option<u32>,
     nodata: Option<f64>,
 ) -> Result<()> {
+    write_raster_with_metadata(path, data, geotransform, epsg, nodata, &[])
+}
+
+/// Write a single-band Cloud-Optimized GeoTIFF and attach root-domain metadata.
+///
+/// Metadata is set on the in-memory source before the COG copy so callers can
+/// record physical units without reopening the completed file in update mode.
+pub fn write_raster_with_metadata<T: GdalType + Copy>(
+    path: &Path,
+    data: ArrayView2<T>,
+    geotransform: [f64; 6],
+    epsg: Option<u32>,
+    nodata: Option<f64>,
+    metadata: &[(&str, &str)],
+) -> Result<()> {
     let (rows, cols) = data.dim();
     let mem = DriverManager::get_driver_by_name("MEM")?;
     let mut src = mem.create_with_band_type::<T, _>("", cols, rows, 1)?;
     src.set_geo_transform(&geotransform)?;
     if let Some(code) = epsg {
         src.set_spatial_ref(&SpatialRef::from_epsg(code)?)?;
+    }
+    for (key, value) in metadata {
+        src.set_metadata_item(key, value, "")?;
     }
     {
         let mut band = src.rasterband(1)?;

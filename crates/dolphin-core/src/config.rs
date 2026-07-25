@@ -198,6 +198,12 @@ pub struct TimeseriesOptions {
     pub block_shape: (usize, usize),
     /// Number of parallel blocks to process at once.
     pub num_parallel_blocks: usize,
+    /// Use CRLB-derived observation precision for L2 SBAS and velocity fits.
+    pub use_coherence_weights: bool,
+    /// Emit L2 posterior displacement variance and residual RMS products.
+    pub write_posterior_uncertainty: bool,
+    /// Emit velocity one-sigma uncertainty.
+    pub write_velocity_uncertainty: bool,
 }
 
 impl Default for TimeseriesOptions {
@@ -211,6 +217,9 @@ impl Default for TimeseriesOptions {
             correlation_threshold: 0.2,
             block_shape: (256, 256),
             num_parallel_blocks: 4,
+            use_coherence_weights: true,
+            write_posterior_uncertainty: false,
+            write_velocity_uncertainty: false,
         }
     }
 }
