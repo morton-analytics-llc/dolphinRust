@@ -317,8 +317,8 @@ fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), l
 
 #[test]
 fn bounded_target_trims_after_analysis_at_both_required_strides() {
-    if !snaphu_available() {
-        eprintln!("skipping bounded displacement contract: snaphu not on PATH");
+    if !fixtures().join("disp/config.yaml").exists() || !snaphu_available() {
+        eprintln!("skipping bounded displacement contract: no fixtures / snaphu");
         return;
     }
     assert_bounded_case(Strides { y: 1, x: 2 }, (8, 30, 6, 24), "1x2");
