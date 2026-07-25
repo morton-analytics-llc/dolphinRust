@@ -12,7 +12,6 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
-      HDF5_DIR: /usr
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
