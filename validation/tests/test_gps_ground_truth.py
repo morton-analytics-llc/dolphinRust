@@ -82,6 +82,21 @@ class GroundTruthContract(unittest.TestCase):
         inferred = gps.infer_reference_pixel(cube, Path("/nonexistent/coherence.tif"))
         self.assertEqual(inferred["pixel"], [2, 1])
 
+    def test_uncertainty_coverage_keeps_models_separate(self) -> None:
+        residual = np.array([0.0, 1.5, 3.0])
+        gnss = np.array([0.0, 0.5, 0.5])
+        crlb = np.array([0.0, 1.0, 1.0])
+        posterior = np.array([0.0, 2.0, 2.0])
+        result = gps.uncertainty_reliability(residual, gnss, crlb, posterior)
+        self.assertEqual(
+            set(result), {"crlb_only", "posterior_only", "combined_quadrature"}
+        )
+        self.assertEqual(result["crlb_only"]["intervals"]["68"]["evaluated"], 2)
+        self.assertGreaterEqual(
+            result["combined_quadrature"]["intervals"]["90"]["coverage"],
+            result["crlb_only"]["intervals"]["90"]["coverage"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

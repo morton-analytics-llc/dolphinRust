@@ -126,6 +126,14 @@ fn incremental_displacement_matches_full_run() {
     eprintln!("incremental vs full displacement: ddisp={dd:.2e} dvel={dv:.2e} dtcoh={dt:.2e} dcrlb={dc:.2e}");
     assert_eq!(inc.acquisition_days, full.acquisition_days, "dates match");
     assert_eq!(
+        inc.interferogram_pairs, full.interferogram_pairs,
+        "pair order"
+    );
+    assert_eq!(
+        inc.unwrap_connected_components, full.unwrap_connected_components,
+        "unwrap component labels"
+    );
+    assert_eq!(
         inc.reference_point, full.reference_point,
         "ref point matches"
     );

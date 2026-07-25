@@ -28,6 +28,9 @@ fn defaults_match_dolphin() {
     assert_eq!(c.timeseries_options.method, TimeseriesMethod::L1);
     assert_eq!(c.timeseries_options.correlation_threshold, 0.2);
     assert_eq!(c.timeseries_options.block_shape, (256, 256));
+    assert!(c.timeseries_options.use_coherence_weights);
+    assert!(!c.timeseries_options.write_posterior_uncertainty);
+    assert!(!c.timeseries_options.write_velocity_uncertainty);
     assert_eq!(c.output_options.strides.y, 1);
     assert_eq!(c.output_options.strides.x, 1);
     assert_eq!(c.output_options.overview_levels, vec![4, 8, 16, 32, 64]);

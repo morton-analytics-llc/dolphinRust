@@ -545,9 +545,12 @@ Implemented surfaces:
   paired CSLC/STATIC bounds on their own grids, preserved identification/metadata, fixture hashes.
 - `gps_ground_truth.py`: documented 23-column tenv3 parser, bounded/labeled date interpolation,
   exact ENU dot LOS projection, fixed window sensitivity, reference cancellation, OLS/TLS and
-  residual metrics, versioned JSON/CSV/SVG artifacts.
+  residual metrics, and versioned JSON/CSV/SVG artifacts. It also samples both stations' CRLB,
+  posterior, and velocity uncertainty from the same output grid and reports 68%, 90%, and 95%
+  CRLB-only, posterior-only, and combined-quadrature coverage separately.
 - `run_gps_ground_truth.py`: native/SNAPHU configs derived from one base and asserted identical
-  except backend/work directory, sourced-geometry checks, run receipts, common-frame scoring.
+  except backend/work directory, plus unweighted A/B variants, sourced-geometry checks, run
+  receipts, common-frame scoring, and `uncertainty_reliability.{json,csv,svg}` generation.
 - `validation/tests/test_gps_*.py`: 22 synthetic contracts covering acquisition, crops, GNSS,
   projection/sign, reference cancellation, metrics, artifacts, and config identity.
 
@@ -618,6 +621,26 @@ Initial result bars remain provisional: endpoint sign agreement, absolute endpoi
 ≤20 mm, TLS slope 0.85–1.15, and correlation ≥0.90. Atmospheric corrections are held identical
 between backends; if left off, the GNSS residual includes atmosphere and must not be attributed
 solely to unwrapping. One station pair is not sufficient evidence to change the default backend.
+The uncertainty reliability sample has the same limitations: one station pair, 13 temporally
+correlated epochs, and uncorrected atmosphere. CRLB-only, posterior-only, and quadrature coverage
+must remain separate because the posterior already derives from CRLB precision and combining them
+may double-count information.
+
+### Reliability/uncertainty implementation validation (2026-07-24)
+
+The updated common-frame runner completed all four 352×2217, 13-epoch runs (native/SNAPHU ×
+CRLB-weighted/unweighted). Both weighted engines produced the same finite footprint (98.8613%),
+while both unweighted engines remained fully finite. The weighted MMX1 station sample is finite,
+but ICMX falls in a singular-CRLB region: its 1×1 and 3×3 samples contain no finite weighted
+solution and its primary 5×5 window has only 5/25 finite pixels, below the recipe's 50% contract.
+The scorer therefore reports `not_evaluable` instead of weakening the station-window threshold or
+silently falling back to unweighted inversion. This is a real-data calibration limitation, not an
+operational crash; the unweighted A/B outputs remain available for diagnosis.
+
+The production-shaped native weighted run completed in 61.41 s on the local machine. macOS
+`/usr/bin/time -l` reported 1,304,494,080 bytes maximum RSS (973,063,704-byte peak footprint).
+This includes the 13-date common frame, posterior diagonal, residual RMS, connected-component,
+and velocity-sigma products; no full covariance cube is retained.
 
 ## Distinct coherence and degenerate-input contracts (2026-07-21)
 

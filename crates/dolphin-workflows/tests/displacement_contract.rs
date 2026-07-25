@@ -10,6 +10,7 @@ use dolphin_core::config::DisplacementWorkflow;
 use dolphin_core::Strides;
 use dolphin_io::write_raster;
 use dolphin_workflows::run_displacement;
+use gdal::{Dataset, Metadata};
 use ndarray::{Array2, Array3};
 
 fn fixtures() -> PathBuf {
@@ -83,7 +84,8 @@ fn end_to_end_displacement_matches_oracle() {
         return;
     }
 
-    let cfg = georeferenced_config("oracle");
+    let mut cfg = georeferenced_config("oracle");
+    cfg.timeseries_options.use_coherence_weights = false;
     let out = run_displacement(&cfg).unwrap();
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();
@@ -136,6 +138,7 @@ fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
         return;
     }
     let mut cfg = georeferenced_config("average_coherence");
+    cfg.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
     cfg.phase_linking.calc_average_coh = true;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_average_coherence_e2e");
     let out = run_displacement(&cfg).unwrap();
@@ -149,10 +152,42 @@ fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
         .join("phase_linking_coherence.tif")
         .exists());
     assert!(cfg.work_directory.join("temporal_coherence.tif").exists());
+    assert!(cfg.work_directory.join("conncomp_00.tif").exists());
     assert_ne!(
         coherence, out.temporal_coherence,
         "metrics must be distinct"
     );
+}
+
+#[test]
+fn l2_uncertainty_products_are_opt_in_and_unit_aligned() {
+    let dir = fixtures();
+    if !dir.join("disp_displacement.npy").exists() || !snaphu_available() {
+        eprintln!("skipping uncertainty end-to-end: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg = georeferenced_config("uncertainty");
+    cfg.timeseries_options.method = dolphin_core::config::TimeseriesMethod::L2;
+    cfg.timeseries_options.write_posterior_uncertainty = true;
+    cfg.timeseries_options.write_velocity_uncertainty = true;
+    let out = run_displacement(&cfg).unwrap();
+    let variance = out.displacement_variance.expect("posterior variance");
+    let sigma = out.velocity_sigma.expect("velocity sigma");
+    assert_eq!(variance.dim(), out.displacement.dim());
+    assert_eq!(sigma.dim(), out.velocity.dim());
+    assert!(variance.iter().any(|value| value.is_finite()));
+    assert!(cfg
+        .work_directory
+        .join("displacement_variance_00.tif")
+        .exists());
+    assert!(cfg
+        .work_directory
+        .join("timeseries_residual_rms.tif")
+        .exists());
+    assert!(cfg.work_directory.join("velocity_sigma.tif").exists());
+    assert!(cfg.work_directory.join("conncomp_00.tif").exists());
+    let crlb = Dataset::open(cfg.work_directory.join("crlb_sigma_00.tif")).unwrap();
+    assert_eq!(crlb.metadata_item("UNITTYPE", "").as_deref(), Some("rad"));
 }
 
 /// Enabling the phase-bias correction (Michaelides 2022) runs end-to-end through
@@ -282,8 +317,8 @@ fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), l
 
 #[test]
 fn bounded_target_trims_after_analysis_at_both_required_strides() {
-    if !snaphu_available() {
-        eprintln!("skipping bounded displacement contract: snaphu not on PATH");
+    if !fixtures().join("disp/config.yaml").exists() || !snaphu_available() {
+        eprintln!("skipping bounded displacement contract: no fixtures / snaphu");
         return;
     }
     assert_bounded_case(Strides { y: 1, x: 2 }, (8, 30, 6, 24), "1x2");

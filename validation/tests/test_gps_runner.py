@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import run_gps_ground_truth as runner
@@ -117,6 +119,35 @@ class RunnerContract(unittest.TestCase):
             svg = (root / "result.svg").read_text()
             self.assertIn("<svg", svg)
             self.assertIn("native", svg)
+
+    def test_uncertainty_reliability_artifacts_are_regenerable(self) -> None:
+        import gps_ground_truth as gps
+
+        reliability = gps.uncertainty_reliability(
+            np.array([0.0, 1.0, 2.0]),
+            np.array([0.0, 0.5, 0.5]),
+            np.array([0.0, 1.0, 1.0]),
+            np.array([0.0, 2.0, 2.0]),
+        )
+        payload = {
+            "comparison": "MMX1_minus_ICMX_common_frame",
+            "dates": ["2023-01-04", "2023-01-28", "2023-02-09"],
+            "gnss_date_quality": {"MMX1": ["exact"] * 3, "ICMX": ["exact"] * 3},
+            "limitations": ["synthetic contract"],
+            "engines": {
+                "native": {
+                    "gnss_projected_sigma_mm": [0.0, 0.5, 0.5],
+                    "velocity_comparison": {"insar_velocity_mm_yr": 1.0},
+                    "uncertainty_reliability": reliability,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gps.write_reliability_artifacts(root, payload)
+            self.assertTrue((root / "uncertainty_reliability.json").exists())
+            self.assertIn("combined_quadrature", (root / "uncertainty_reliability.csv").read_text())
+            self.assertIn("<svg", (root / "uncertainty_reliability.svg").read_text())
 
 
 if __name__ == "__main__":

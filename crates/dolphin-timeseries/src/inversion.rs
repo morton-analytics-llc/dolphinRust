@@ -16,6 +16,44 @@ use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use rayon::prelude::*;
 
+/// Full weighted-L2 solution for one pixel. The covariance is kept on demand
+/// rather than materialized as an `n_dates^2 * area` workflow cube.
+#[derive(Debug, Clone)]
+pub struct PixelL2Solution {
+    /// Fitted phase parameters.
+    pub parameters: Vec<f64>,
+    /// Full posterior parameter covariance.
+    pub covariance: Array2<f64>,
+    /// Residual root-mean-square in observation units.
+    pub residual_rms: f64,
+}
+
+/// Bounded stack-level uncertainty products.
+pub struct L2InversionOutput {
+    /// Fitted phase stack.
+    pub phase: Array3<f64>,
+    /// Diagonal posterior parameter variance.
+    pub posterior_variance: Array3<f64>,
+    /// Residual root-mean-square in observation units.
+    pub residual_rms: Array2<f64>,
+}
+
+/// Linear-rate estimate and its one-sigma standard error, both per year.
+pub struct VelocityOutput {
+    /// Linear velocity per year.
+    pub velocity: Array2<f64>,
+    /// One-sigma slope uncertainty per year.
+    pub sigma: Array2<f64>,
+    /// Regression residual root-mean-square in series units.
+    pub residual_rms: Array2<f64>,
+}
+
+struct PixelUncertaintySummary {
+    parameters: Vec<f64>,
+    variance: Vec<f64>,
+    residual_rms: f64,
+}
+
 /// Build the incidence matrix from interferogram index pairs (port of
 /// `get_incidence_matrix`, dropping the first date's column).
 #[must_use]
@@ -62,6 +100,53 @@ pub fn invert_stack(
         .collect();
 
     Array3::from_shape_fn((n_dates, rows, cols), |(d, r, c)| columns[r * cols + c][d])
+}
+
+/// Solve weighted L2 while retaining only covariance diagonals at stack scale.
+#[must_use]
+pub fn invert_stack_with_uncertainty(
+    a: ArrayView2<f64>,
+    dphi: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+) -> L2InversionOutput {
+    let (n_ifgs, rows, cols) = dphi.dim();
+    let n_dates = a.ncols();
+    let columns: Vec<Option<PixelUncertaintySummary>> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| {
+            solve_pixel_with_covariance(a, dphi, Some(precisions), (idx / cols, idx % cols), n_ifgs)
+                .map(|solution| {
+                    let diagonal = (0..n_dates)
+                        .map(|date| solution.covariance[(date, date)])
+                        .collect();
+                    PixelUncertaintySummary {
+                        parameters: solution.parameters,
+                        variance: diagonal,
+                        residual_rms: solution.residual_rms,
+                    }
+                })
+        })
+        .collect();
+    let phase = Array3::from_shape_fn((n_dates, rows, cols), |(d, r, c)| {
+        columns[r * cols + c]
+            .as_ref()
+            .map_or(f64::NAN, |value| value.parameters[d])
+    });
+    let posterior_variance = Array3::from_shape_fn((n_dates, rows, cols), |(d, r, c)| {
+        columns[r * cols + c]
+            .as_ref()
+            .map_or(f64::NAN, |value| value.variance[d])
+    });
+    let residual_rms = Array2::from_shape_fn((rows, cols), |(r, c)| {
+        columns[r * cols + c]
+            .as_ref()
+            .map_or(f64::NAN, |value| value.residual_rms)
+    });
+    L2InversionOutput {
+        phase,
+        posterior_variance,
+        residual_rms,
+    }
 }
 
 /// ADMM parameters for L1 (least-absolute-deviations) inversion. Defaults match
@@ -160,23 +245,76 @@ fn solve_pixel(
     pixel: (usize, usize),
     n_ifgs: usize,
 ) -> Vec<f64> {
+    solve_pixel_with_covariance(a, dphi, weights, pixel, n_ifgs)
+        .map_or_else(|| vec![f64::NAN; a.ncols()], |value| value.parameters)
+}
+
+/// Solve one L2 pixel and return its full covariance on demand.
+#[must_use]
+pub fn solve_pixel_with_covariance(
+    a: ArrayView2<f64>,
+    dphi: ArrayView3<f64>,
+    weights: Option<ArrayView3<f64>>,
+    pixel: (usize, usize),
+    n_ifgs: usize,
+) -> Option<PixelL2Solution> {
     let n = a.ncols();
-    let w = |k: usize| weights.map_or(1.0, |ws| ws[(k, pixel.0, pixel.1)]);
+    let precision = |k: usize| {
+        let value = weights.map_or(1.0, |ws| ws[(k, pixel.0, pixel.1)]);
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        }
+    };
+    let valid: Vec<_> = (0..n_ifgs)
+        .filter(|&k| precision(k) > 0.0 && dphi[(k, pixel.0, pixel.1)].is_finite())
+        .collect();
+    if valid.len() < n {
+        return None;
+    }
     let ata = Mat::from_fn(n, n, |i, j| {
-        (0..n_ifgs)
-            .map(|k| a[(k, i)] * w(k) * a[(k, j)])
+        valid
+            .iter()
+            .map(|&k| a[(k, i)] * precision(k) * a[(k, j)])
             .sum::<f64>()
     });
     let atb = Mat::from_fn(n, 1, |i, _| {
-        (0..n_ifgs)
-            .map(|k| a[(k, i)] * w(k) * dphi[(k, pixel.0, pixel.1)])
+        valid
+            .iter()
+            .map(|&k| a[(k, i)] * precision(k) * dphi[(k, pixel.0, pixel.1)])
             .sum::<f64>()
     });
-    let x = ata
-        .cholesky(Side::Lower)
-        .expect("AtWA not SPD (rank-deficient network)")
-        .solve(atb);
-    (0..n).map(|i| x[(i, 0)]).collect()
+    let llt = ata.cholesky(Side::Lower).ok()?;
+    let x = llt.solve(atb);
+    let identity = Mat::from_fn(n, n, |i, j| f64::from(i == j));
+    let inverse = llt.solve(identity);
+    let residuals: Vec<_> = valid
+        .iter()
+        .map(|&k| {
+            let predicted = (0..n).map(|i| a[(k, i)] * x[(i, 0)]).sum::<f64>();
+            (k, dphi[(k, pixel.0, pixel.1)] - predicted)
+        })
+        .collect();
+    let weighted_sse = residuals
+        .iter()
+        .map(|(k, residual)| precision(*k) * residual * residual)
+        .sum::<f64>();
+    let residual_sse = residuals
+        .iter()
+        .map(|(_, residual)| residual * residual)
+        .sum::<f64>();
+    let dof = valid.len().saturating_sub(n);
+    let inflation = if dof == 0 {
+        1.0
+    } else {
+        (weighted_sse / dof as f64).max(1.0)
+    };
+    Some(PixelL2Solution {
+        parameters: (0..n).map(|i| x[(i, 0)]).collect(),
+        covariance: Array2::from_shape_fn((n, n), |(i, j)| inverse[(i, j)] * inflation),
+        residual_rms: (residual_sse / valid.len() as f64).sqrt(),
+    })
 }
 
 /// Per-pixel linear velocity (slope × 365.25) of a displacement series.
@@ -193,6 +331,104 @@ pub fn estimate_velocity(
         .map(|idx| velocity_pixel(x, series, weights, (idx / cols, idx % cols)))
         .collect();
     Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
+}
+
+/// Weighted linear velocity with residual and one-sigma slope uncertainty.
+#[must_use]
+pub fn estimate_velocity_with_uncertainty(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+) -> VelocityOutput {
+    let (_, rows, cols) = series.dim();
+    let values: Vec<(f64, f64, f64)> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| velocity_pixel_with_uncertainty(x, series, precisions, (idx / cols, idx % cols)))
+        .collect();
+    let layer = |index: usize| {
+        Array2::from_shape_fn((rows, cols), |(r, c)| {
+            let value = values[r * cols + c];
+            [value.0, value.1, value.2][index]
+        })
+    };
+    VelocityOutput {
+        velocity: layer(0),
+        sigma: layer(1),
+        residual_rms: layer(2),
+    }
+}
+
+/// Linear velocity using direct observation precisions without uncertainty outputs.
+#[must_use]
+pub fn estimate_velocity_with_precisions(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+) -> Array2<f64> {
+    let (_, rows, cols) = series.dim();
+    let values: Vec<f64> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| {
+            velocity_pixel_with_uncertainty(x, series, precisions, (idx / cols, idx % cols)).0
+        })
+        .collect();
+    Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
+}
+
+fn velocity_pixel_with_uncertainty(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+    pixel: (usize, usize),
+) -> (f64, f64, f64) {
+    let valid = |t: usize| {
+        let p = precisions[(t, pixel.0, pixel.1)];
+        let y = series[(t, pixel.0, pixel.1)];
+        p.is_finite() && p > 0.0 && y.is_finite()
+    };
+    let (mut sw, mut swx, mut swxx, mut swy, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (t, &xt) in x.iter().enumerate().filter(|(t, _)| valid(*t)) {
+        let p = precisions[(t, pixel.0, pixel.1)];
+        let y = series[(t, pixel.0, pixel.1)];
+        sw += p;
+        swx += p * xt;
+        swxx += p * xt * xt;
+        swy += p * y;
+        swxy += p * xt * y;
+    }
+    let det = sw * swxx - swx * swx;
+    if !det.is_finite() || det <= 0.0 {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let slope = (sw * swxy - swx * swy) / det;
+    let intercept = (swy - slope * swx) / sw;
+    let indices: Vec<_> = (0..x.len()).filter(|&t| valid(t)).collect();
+    let residuals: Vec<_> = indices
+        .iter()
+        .map(|&t| {
+            let residual = series[(t, pixel.0, pixel.1)] - (intercept + slope * x[t]);
+            (t, residual)
+        })
+        .collect();
+    let weighted_sse = residuals
+        .iter()
+        .map(|(t, residual)| precisions[(*t, pixel.0, pixel.1)] * residual * residual)
+        .sum::<f64>();
+    let residual_sse = residuals
+        .iter()
+        .map(|(_, residual)| residual * residual)
+        .sum::<f64>();
+    let dof = indices.len().saturating_sub(2);
+    let inflation = if dof == 0 {
+        1.0
+    } else {
+        (weighted_sse / dof as f64).max(1.0)
+    };
+    (
+        slope * 365.25,
+        (inflation * sw / det).sqrt() * 365.25,
+        (residual_sse / indices.len() as f64).sqrt(),
+    )
 }
 
 /// Slope of a weighted degree-1 fit (numpy `polyfit` weighting), scaled to /year.

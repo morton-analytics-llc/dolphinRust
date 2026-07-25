@@ -7,6 +7,13 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Reliability and uncertainty outputs** (issues #12–#16). Unwrapping now retains actual
+  per-interferogram connected-component labels and writes `conncomp_NN.tif`; L2 SBAS uses
+  per-observation CRLB precision by default and exposes an opt-in posterior covariance API,
+  displacement variance, residual RMS, and velocity sigma without allocating a covariance
+  cube. CRLB rasters retain radians and now declare `UNITTYPE=rad`. The MMX1/ICMX harness runs
+  weighted/unweighted A/B configurations and regenerates JSON/CSV/SVG 68/90/95% reliability
+  artifacts with GNSS, CRLB-only, posterior-only, and combined uncertainty kept separate.
 - **Distinct phase-linking coherence output** (issues #7 and #9). Optional
   `phase_linking.calc_average_coh` computes dolphin v0.35.0's bounded internal per-date
   `mean_j |C_ij|` values inside the fused per-pixel pass, excludes carried compressed-SLC
