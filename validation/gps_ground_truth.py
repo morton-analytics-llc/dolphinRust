@@ -360,6 +360,34 @@ def load_displacement_cube(work_directory: Path, expected_epochs: int) -> tuple[
     return prepend_reference_epoch(bands), metadata or {}
 
 
+def unwrap_component_counts(work_directory: Path) -> list[int]:
+    """Count positive connected-component labels in each interferogram raster."""
+    counts = []
+    for path in sorted(work_directory.glob("conncomp_[0-9][0-9].tif")):
+        with rasterio.open(path) as dataset:
+            labels = np.unique(dataset.read(1))
+        counts.append(int(np.sum(labels > 0)))
+    return counts
+
+
+def raster_delta_summary(first: Path, second: Path) -> dict[str, float]:
+    """Summarize finite first-minus-second raster differences."""
+    with rasterio.open(first) as left, rasterio.open(second) as right:
+        if (left.shape, left.crs, left.transform) != (right.shape, right.crs, right.transform):
+            raise NotEvaluable("weighted/unweighted velocity grids differ")
+        delta = left.read(1).astype(float) - right.read(1).astype(float)
+    finite = delta[np.isfinite(delta)]
+    if finite.size == 0:
+        raise NotEvaluable("weighted/unweighted velocity delta has no finite pixels")
+    return {
+        "mean": float(np.mean(finite)),
+        "median": float(np.median(finite)),
+        "p05": float(np.percentile(finite, 5)),
+        "p95": float(np.percentile(finite, 95)),
+        "max_abs": float(np.max(np.abs(finite))),
+    }
+
+
 def infer_reference_pixel(cube: np.ndarray, coherence_path: Path) -> dict[str, Any]:
     finite = np.all(np.isfinite(cube), axis=0)
     zero = np.all(np.abs(cube) <= 1e-12, axis=0)
@@ -390,6 +418,23 @@ def gnss_los_series(aligned: Sequence[AlignedRecord], los: np.ndarray) -> np.nda
     return np.array([project_enu(vector, los) for vector in delta]) * 1000.0
 
 
+def gnss_los_sigma_series(aligned: Sequence[AlignedRecord], los: np.ndarray) -> np.ndarray:
+    """Project independent ENU one-sigma errors into referenced LOS millimeters."""
+    component_sigma = np.array(
+        [
+            math.sqrt(
+                (item.record.sigma_e_m * los[0]) ** 2
+                + (item.record.sigma_n_m * los[1]) ** 2
+                + (item.record.sigma_u_m * los[2]) ** 2
+            )
+            for item in aligned
+        ]
+    )
+    relative = np.sqrt(component_sigma**2 + component_sigma[0] ** 2) * 1000.0
+    relative[0] = 0.0
+    return relative
+
+
 def sample_cube(
     cube_m: np.ndarray,
     row: int,
@@ -407,6 +452,152 @@ def sample_cube(
             "total_count": stats[0].total_count,
         }
     return output
+
+
+def sample_uncertainty_layers(
+    work_directory: Path,
+    row: int,
+    col: int,
+    window: int,
+    minimum_finite_fraction: float,
+    expected_epochs: int,
+    wavelength_m: float,
+) -> dict[str, Any]:
+    """Sample CRLB, posterior, and velocity uncertainty from one station pixel."""
+    mm_per_rad = abs(wavelength_m / (4.0 * math.pi)) * 1000.0
+
+    def sample_files(files: Sequence[Path], transform) -> list[float]:
+        values = []
+        for path in files:
+            with rasterio.open(path) as dataset:
+                stats = window_stats(
+                    transform(dataset.read(1).astype(float)),
+                    row,
+                    col,
+                    window,
+                    minimum_finite_fraction,
+                )
+            values.append(stats.mean)
+        return values
+
+    crlb_files = sorted(work_directory.glob("crlb_sigma_[0-9][0-9].tif"))
+    posterior_files = sorted(
+        work_directory.glob("displacement_variance_[0-9][0-9].tif")
+    )
+    if len(crlb_files) != expected_epochs:
+        raise NotEvaluable(
+            f"expected {expected_epochs} CRLB rasters in {work_directory}; found {len(crlb_files)}"
+        )
+    if len(posterior_files) != expected_epochs - 1:
+        raise NotEvaluable(
+            f"expected {expected_epochs - 1} posterior rasters in {work_directory}; found {len(posterior_files)}"
+        )
+    crlb = sample_files(crlb_files, lambda data: np.abs(data) * mm_per_rad)
+    posterior = [0.0, *sample_files(posterior_files, lambda data: np.sqrt(np.maximum(data, 0.0)) * 1000.0)]
+    velocity_path = work_directory / "velocity_sigma.tif"
+    if not velocity_path.exists():
+        raise NotEvaluable(f"missing velocity uncertainty: {velocity_path}")
+    velocity_sigma = sample_files([velocity_path], lambda data: np.abs(data) * 1000.0)[0]
+    return {
+        "crlb_sigma_mm": crlb,
+        "posterior_sigma_mm": posterior,
+        "velocity_sigma_mm_yr": velocity_sigma,
+    }
+
+
+def uncertainty_reliability(
+    residual_mm: np.ndarray,
+    gnss_sigma_mm: np.ndarray,
+    crlb_sigma_mm: np.ndarray,
+    posterior_sigma_mm: np.ndarray,
+) -> dict[str, Any]:
+    """Coverage for CRLB-only, posterior-only, and their quadrature combination."""
+    residual = np.asarray(residual_mm, dtype=float)
+    gnss = np.asarray(gnss_sigma_mm, dtype=float)
+    crlb = np.asarray(crlb_sigma_mm, dtype=float)
+    posterior = np.asarray(posterior_sigma_mm, dtype=float)
+    if not (residual.shape == gnss.shape == crlb.shape == posterior.shape):
+        raise ValueError("uncertainty and residual series must share a shape")
+    methods = {
+        "crlb_only": np.sqrt(gnss**2 + crlb**2),
+        "posterior_only": np.sqrt(gnss**2 + posterior**2),
+        "combined_quadrature": np.sqrt(gnss**2 + crlb**2 + posterior**2),
+    }
+    levels = {"68": (0.68, 1.0), "90": (0.90, 1.6448536269514722), "95": (0.95, 1.959963984540054)}
+    output: dict[str, Any] = {}
+    for name, sigma in methods.items():
+        finite = np.isfinite(residual) & np.isfinite(sigma) & (sigma > 0)
+        output[name] = {
+            "sigma_mm": sigma.tolist(),
+            "intervals": {
+                label: {
+                    "nominal": nominal,
+                    "covered": int(np.sum(np.abs(residual[finite]) <= z * sigma[finite])),
+                    "evaluated": int(np.sum(finite)),
+                    "coverage": float(np.mean(np.abs(residual[finite]) <= z * sigma[finite]))
+                    if np.any(finite)
+                    else None,
+                }
+                for label, (nominal, z) in levels.items()
+            },
+        }
+    return output
+
+
+def write_reliability_artifacts(path: Path, payload: dict[str, Any]) -> None:
+    """Write flat CSV and dependency-free SVG coverage artifacts."""
+    engines = payload["engines"]
+    reliability = {
+        "schema": "dolphinrust-uncertainty-reliability/1",
+        "comparison": payload["comparison"],
+        "dates": payload["dates"],
+        "gnss_date_quality": payload["gnss_date_quality"],
+        "limitations": payload["limitations"],
+        "engines": {
+            name: {
+                "gnss_projected_sigma_mm": data["gnss_projected_sigma_mm"],
+                "velocity_comparison": data["velocity_comparison"],
+                "uncertainty_reliability": data["uncertainty_reliability"],
+            }
+            for name, data in engines.items()
+        },
+    }
+    (path / "uncertainty_reliability.json").write_text(
+        json.dumps(reliability, indent=2) + "\n"
+    )
+    with (path / "uncertainty_reliability.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["engine", "method", "interval_percent", "nominal", "covered", "evaluated", "coverage"])
+        for engine, data in engines.items():
+            for method, result in data["uncertainty_reliability"].items():
+                for level, interval in result["intervals"].items():
+                    writer.writerow([engine, method, level, interval["nominal"], interval["covered"], interval["evaluated"], interval["coverage"]])
+    width, height, margin = 980, 540, 70
+    entries = [
+        (engine, method, level, result["coverage"])
+        for engine, data in engines.items()
+        for method, method_data in data["uncertainty_reliability"].items()
+        for level, result in method_data["intervals"].items()
+    ]
+    bar_width = (width - 2 * margin) / max(1, len(entries))
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<text x="70" y="28" font-family="sans-serif" font-size="18">MMX1/ICMX uncertainty interval coverage</text>',
+    ]
+    colors = {"crlb_only": "#2563eb", "posterior_only": "#dc2626", "combined_quadrature": "#059669"}
+    for index, (engine, method, level, coverage) in enumerate(entries):
+        value = 0.0 if coverage is None else coverage
+        x = margin + index * bar_width
+        y = height - margin - value * (height - 2 * margin)
+        lines.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{max(1.0, bar_width - 1):.1f}" height="{value * (height - 2 * margin):.1f}" fill="{colors[method]}"/>')
+        lines.append(f'<text transform="translate({x + bar_width / 2:.1f},{height-margin+8}) rotate(65)" font-family="sans-serif" font-size="8">{engine}:{method}:{level}</text>')
+    lines.extend([
+        f'<line x1="{margin}" y1="{height-margin}" x2="{width-margin}" y2="{height-margin}" stroke="#6b7280"/>',
+        f'<line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height-margin}" stroke="#6b7280"/>',
+        '</svg>',
+    ])
+    (path / "uncertainty_reliability.svg").write_text("\n".join(lines) + "\n")
 
 
 def write_csv(path: Path, dates: Sequence[str], gnss: np.ndarray, engines: dict[str, dict[str, Any]]) -> None:
@@ -460,6 +651,7 @@ def score_common_frame(
     static_path: Path,
     cache_directory: Path,
     output_directory: Path,
+    wavelength_m: float,
 ) -> dict[str, Any]:
     if fixture_manifest.get("fixture") != "mmx1_icmx_common":
         raise NotEvaluable("magnitude scoring requires the shared MMX1/ICMX frame")
@@ -490,6 +682,7 @@ def score_common_frame(
         with rasterio.open(first_raster) as dataset:
             station_data: dict[str, Any] = {}
             gnss_station: dict[str, np.ndarray] = {}
+            gnss_station_sigma: dict[str, np.ndarray] = {}
             for station_id in ["MMX1", "ICMX"]:
                 station = recipe["stations"][station_id]
                 row, col = station_pixel(dataset, station["longitude"], station["latitude"])
@@ -513,8 +706,20 @@ def score_common_frame(
                     "los_east_north_up": los.tolist(),
                     "temporal_coherence": coherence,
                     "samples": {str(size): data for size, data in samples.items()},
+                    "uncertainty": sample_uncertainty_layers(
+                        work_directory,
+                        row,
+                        col,
+                        recipe["primary_window"],
+                        recipe["minimum_finite_fraction"],
+                        len(dates),
+                        wavelength_m,
+                    ),
                 }
                 gnss_station[station_id] = gnss_los_series(aligned_by_station[station_id], los)
+                gnss_station_sigma[station_id] = gnss_los_sigma_series(
+                    aligned_by_station[station_id], los
+                )
             current_gnss_diff = spatial_difference(gnss_station["MMX1"], gnss_station["ICMX"])
             if gnss_diff is None:
                 gnss_diff = current_gnss_diff
@@ -526,6 +731,24 @@ def score_common_frame(
                 np.asarray(station_data["MMX1"]["samples"][primary]["series_mm"]),
                 np.asarray(station_data["ICMX"]["samples"][primary]["series_mm"]),
             )
+            gnss_diff_sigma = np.sqrt(
+                gnss_station_sigma["MMX1"] ** 2 + gnss_station_sigma["ICMX"] ** 2
+            )
+            crlb_diff_sigma = np.sqrt(
+                np.asarray(station_data["MMX1"]["uncertainty"]["crlb_sigma_mm"]) ** 2
+                + np.asarray(station_data["ICMX"]["uncertainty"]["crlb_sigma_mm"]) ** 2
+            )
+            posterior_diff_sigma = np.sqrt(
+                np.asarray(station_data["MMX1"]["uncertainty"]["posterior_sigma_mm"]) ** 2
+                + np.asarray(station_data["ICMX"]["uncertainty"]["posterior_sigma_mm"]) ** 2
+            )
+            days = np.array([(date - dates[0]).days for date in dates], dtype=float)
+            insar_velocity = float(np.polyfit(days, insar_diff, 1)[0] * 365.25)
+            gnss_velocity = float(np.polyfit(days, current_gnss_diff, 1)[0] * 365.25)
+            velocity_sigma = math.sqrt(
+                station_data["MMX1"]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
+                + station_data["ICMX"]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
+            )
             engines[engine] = {
                 "work_directory": str(work_directory),
                 "grid": grid,
@@ -535,6 +758,20 @@ def score_common_frame(
                 "stations": station_data,
                 "insar_diff_mm": insar_diff.tolist(),
                 "metrics": compute_metrics(gnss_diff, insar_diff, recipe["thresholds"]),
+                "unwrap_component_counts": unwrap_component_counts(work_directory),
+                "gnss_projected_sigma_mm": gnss_diff_sigma.tolist(),
+                "uncertainty_reliability": uncertainty_reliability(
+                    insar_diff - current_gnss_diff,
+                    gnss_diff_sigma,
+                    crlb_diff_sigma,
+                    posterior_diff_sigma,
+                ),
+                "velocity_comparison": {
+                    "insar_velocity_mm_yr": insar_velocity,
+                    "insar_sigma_mm_yr": velocity_sigma,
+                    "gnss_velocity_mm_yr": gnss_velocity,
+                    "difference_mm_yr": insar_velocity - gnss_velocity,
+                },
             }
     if gnss_diff is None:
         raise NotEvaluable("no backend outputs supplied for scoring")
@@ -551,6 +788,22 @@ def score_common_frame(
             "mae_mm": float(np.mean(np.abs(difference))),
             "rmse_mm": float(np.sqrt(np.mean(difference**2))),
         }
+    weighting_ab: dict[str, Any] = {}
+    for backend in ["native", "snaphu"]:
+        unweighted = f"{backend}_unweighted"
+        if backend in engines and unweighted in engines:
+            weighting_ab[backend] = {
+                "velocity_delta": raster_delta_summary(
+                    Path(engines[backend]["work_directory"]) / "velocity.tif",
+                    Path(engines[unweighted]["work_directory"]) / "velocity.tif",
+                ),
+                "component_counts_weighted": engines[backend]["unwrap_component_counts"],
+                "component_counts_unweighted": engines[unweighted]["unwrap_component_counts"],
+                "gnss_metrics_weighted": engines[backend]["metrics"],
+                "gnss_metrics_unweighted": engines[unweighted]["metrics"],
+                "reference_weighted": engines[backend]["spatial_reference"],
+                "reference_unweighted": engines[unweighted]["spatial_reference"],
+            }
     payload = {
         "schema": "dolphinrust-gps-ground-truth/1",
         "status": overall,
@@ -568,9 +821,17 @@ def score_common_frame(
         "station_geometry": station_geometry,
         "engines": engines,
         "native_minus_snaphu": backend_difference,
+        "weighted_unweighted_ab": weighting_ab,
+        "limitations": [
+            "one Sentinel-1 burst pair of stations",
+            "13 acquisition epochs",
+            "atmospheric corrections are disabled",
+            "coverage samples are temporally correlated and are not an independent population",
+        ],
     }
     output_directory.mkdir(parents=True, exist_ok=True)
     (output_directory / "gps_ground_truth.json").write_text(json.dumps(payload, indent=2) + "\n")
     write_csv(output_directory / "gps_ground_truth.csv", recipe["expected_dates"], gnss_diff, engines)
     write_svg(output_directory / "gps_ground_truth.svg", recipe["expected_dates"], gnss_diff, engines)
+    write_reliability_artifacts(output_directory, payload)
     return payload

@@ -40,6 +40,12 @@ def build_backend_configs(
         config["work_directory"] = str(run_root / f"work_{backend}")
         config.setdefault("unwrap_options", {})["unwrap_method"] = backend
         config.setdefault("correction_options", {})["geometry_files"] = [str(static_path)]
+        config.setdefault("input_options", {}).setdefault("wavelength", 0.05546576)
+        timeseries = config.setdefault("timeseries_options", {})
+        timeseries["method"] = "L2"
+        timeseries["use_coherence_weights"] = True
+        timeseries["write_posterior_uncertainty"] = True
+        timeseries["write_velocity_uncertainty"] = True
         configs.append(config)
     return configs[0], configs[1]
 
@@ -134,7 +140,7 @@ def ensure_rust_binary(build: bool) -> None:
 
 
 def run_backend(backend: str, config_path: Path, log_path: Path) -> dict[str, Any]:
-    if backend == "snaphu" and shutil.which("snaphu") is None:
+    if backend.startswith("snaphu") and shutil.which("snaphu") is None:
         raise gps.NotEvaluable("SNAPHU executable is unavailable on PATH")
     started = datetime.now(UTC)
     with log_path.open("w") as log:
@@ -263,6 +269,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     native, snaphu = build_backend_configs(base, static_files[0].resolve(), run_root)
     assert_backend_config_identity(native, snaphu)
     configs = {"native": native, "snaphu": snaphu}
+    for backend, weighted in list(configs.items()):
+        unweighted = copy.deepcopy(weighted)
+        unweighted["work_directory"] = str(run_root / f"work_{backend}_unweighted")
+        unweighted["timeseries_options"]["use_coherence_weights"] = False
+        configs[f"{backend}_unweighted"] = unweighted
     config_paths: dict[str, Path] = {}
     for backend, config in configs.items():
         path = run_root / f"config_{backend}.yaml"
@@ -279,7 +290,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "fixture_manifest_sha256": sha256_file(manifest_path),
         "static": str(static_files[0]),
     }
-    for backend in ["native", "snaphu"]:
+    for backend in configs:
         work_directory = Path(configs[backend]["work_directory"])
         receipt: dict[str, Any] = {
             "config": str(config_paths[backend]),
@@ -331,6 +342,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             static_files[0],
             ROOT / "validation" / "real_data" / "gps_mmx1" / "gnss",
             run_root,
+            float(native["input_options"]["wavelength"]),
         )
         payload["context"] = context
         payload["run_receipts"] = engine_receipts
@@ -364,6 +376,11 @@ def main() -> None:
             str(error),
             {"fixture": args.fixture, "recipe": str(args.recipe)},
             {},
+        )
+        run_root = args.run_root or ROOT / "validation" / "runs" / "gps_mmx1" / args.fixture
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "run_receipt.json").write_text(
+            json.dumps(payload, indent=2) + "\n"
         )
         print(json.dumps(payload, indent=2))
         raise SystemExit(exit_code_for_status(status)) from error
