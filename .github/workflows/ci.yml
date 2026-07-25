@@ -17,7 +17,14 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes gdal-bin libgdal-dev libhdf5-dev pkg-config snaphu
+          sudo apt-get install --yes \
+            gdal-bin \
+            libgdal-dev \
+            libhdf5-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            pkg-config \
+            snaphu
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
