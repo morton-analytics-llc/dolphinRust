@@ -16,7 +16,9 @@ use dolphin_core::config::DisplacementWorkflow;
 use dolphin_corrections::geometry::resolve_los_geometry;
 use dolphin_corrections::LosGeometry;
 use dolphin_workflows::provenance::{
-    assemble_geometry_provenance, FieldProvenance, GeometryProvenance, GEOMETRY_PROVENANCE_FILENAME,
+    assemble_geometry_provenance, assemble_geometry_provenance_with_coverage,
+    BurstCoverageProvenance, FieldProvenance, GeometryProvenance, InputCoverageProvenance,
+    GEOMETRY_PROVENANCE_FILENAME, INPUT_COVERAGE_POLICY_VERSION,
 };
 use ndarray::Array2;
 
@@ -125,6 +127,65 @@ fn phase_linking_coherence_provenance_is_optional_and_never_aliases_temporal() {
         present.phase_linking_coherence.as_deref(),
         Some("temporal_coherence.tif")
     );
+}
+
+#[test]
+fn coverage_v3_round_trips_without_identifiers() {
+    let coverage = InputCoverageProvenance {
+        policy_version: INPUT_COVERAGE_POLICY_VERSION.into(),
+        total_tiles: 3,
+        linked_tiles: 2,
+        nodata_tiles: 1,
+        bursts: vec![BurstCoverageProvenance {
+            burst_index: 0,
+            acquisition_count: 4,
+            total_tiles: 3,
+            linked_tiles: 2,
+            nodata_tiles: 1,
+        }],
+        output_pixels: 48,
+        valid_pixels: 32,
+        valid_fraction: 2.0 / 3.0,
+    };
+    let provenance = assemble_geometry_provenance_with_coverage(
+        &DisplacementWorkflow::default(),
+        None,
+        None,
+        Some(coverage.clone()),
+    );
+    let json = serde_json::to_string(&provenance).unwrap();
+    let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/3");
+    assert_eq!(decoded.input_coverage, Some(coverage));
+    for forbidden in [
+        "source_path",
+        "object_key",
+        "aoi_geometry",
+        "acquisition_id",
+    ] {
+        assert!(!json.contains(forbidden), "coverage leaked {forbidden}");
+    }
+}
+
+#[test]
+fn provenance_v2_without_coverage_still_deserializes() {
+    let current = assemble_geometry_provenance(&DisplacementWorkflow::default(), None);
+    let mut value = serde_json::to_value(current).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert(
+        "schema".into(),
+        serde_json::Value::String("dolphinrust-geometry-provenance/2".into()),
+    );
+    object.insert(
+        "method_version".into(),
+        serde_json::Value::String("2.0.0".into()),
+    );
+    object.remove("input_coverage");
+
+    let decoded: GeometryProvenance = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/2");
+    assert_eq!(decoded.input_coverage, None);
 }
 
 /// Contract 2a: a /data-only granule (cropped, no metadata groups) yields explicit

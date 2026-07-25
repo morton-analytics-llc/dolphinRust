@@ -669,6 +669,13 @@ The Rust fused/engine entry points now reject the corresponding all-non-finite a
 This is parity, not a forward divergence. Partially valid windows retain the existing
 finite-or-zero covariance masking.
 
+Tiled workflow processing separately treats an acquisition that is empty only within one
+tile's dependency window as local nodata. It skips phase linking for that tile, propagates an
+explicit validity mask through every emitted layer, and continues when another tile has complete
+temporal support. It still rejects an acquisition that is empty across the entire burst and a
+burst with no complete tile. Geometry provenance v3 records aggregate tile and output-pixel
+coverage without paths or acquisition identifiers; v2 artifacts remain deserializable.
+
 ### Optional-layer memory receipt
 
 Fresh-process `pl_bench` A/B on this 12-core host, 16 dates, a 512x512 tile, 11x11 window,

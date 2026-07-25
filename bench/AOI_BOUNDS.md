@@ -35,3 +35,18 @@ MINISTACK=4 STRIDE_Y=1 STRIDE_X=2 BOUNDED=1 cargo run --release \
   --example profile_e2e -p dolphin-workflows \
   --no-default-features --features no-gpu
 ```
+
+## Tiled nonfinite-coverage regression receipt
+
+Measured 2026-07-25 after adding explicit validity-mask and coverage-provenance outputs. A
+fresh-process 2048×2048, 12-epoch, stride-1 run with average coherence enabled completed in
+26.79 s. macOS `/usr/bin/time -l` reported 4,426,809,344 bytes maximum RSS (4.12 GiB) and a
+4,912,500,840-byte peak footprint (4.57 GiB), below the 5.5 GiB acceptance ceiling. This is a
+production-shaped synthetic resource gate; GroundPulse production remains the authoritative
+current-image acceptance receipt.
+
+```sh
+ROWS=2048 COLS=2048 EPOCHS=12 BURSTS=1 MINISTACK=12 \
+STRIDE_Y=1 STRIDE_X=1 BOUNDED=0 RUST_LOG=info /usr/bin/time -l \
+  target/release/examples/profile_e2e
+```

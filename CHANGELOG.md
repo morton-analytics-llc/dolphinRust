@@ -7,6 +7,11 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Identifier-free temporal input-coverage provenance.** Geometry provenance advances to
+  `dolphinrust-geometry-provenance/3` and records the versioned tile policy, aggregate and
+  per-burst tile counts using stable ordinals, and final valid-pixel fraction. The workflow
+  also exposes an explicit output validity mask and emits aggregate INFO coverage telemetry;
+  source paths, acquisition identifiers, object keys, and AOI geometry are excluded.
 - **Reliability and uncertainty outputs** (issues #12–#16). Unwrapping now retains actual
   per-interferogram connected-component labels and writes `conncomp_NN.tif`; L2 SBAS uses
   per-observation CRLB precision by default and exposes an opt-in posterior covariance API,
@@ -61,6 +66,12 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **Locally empty phase-linking tiles now remain nodata instead of aborting a usable AOI.**
+  Tiled processing skips a tile when any acquisition has no finite complex support in its
+  dependency window, initializes every output layer as nodata, and links the remaining tiles.
+  It still fails when an acquisition is empty across the whole burst or when no tile has
+  complete temporal support. Multi-burst mosaics now allow finite overlap to replace nodata
+  without letting a later burst's nodata erase earlier valid pixels.
 - **All-non-finite phase-linking input now fails loudly** (issue #8). A stack containing an
   acquisition with no finite complex samples returns an error before covariance/estimation,
   matching pinned dolphin v0.35.0's `PhaseLinkRuntimeError` instead of allowing a zero

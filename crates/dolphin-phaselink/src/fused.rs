@@ -105,7 +105,7 @@ pub fn link_fused(
     params: FusedParams,
 ) -> Result<FusedEstimate, &'static str> {
     let (nslc, rows, cols) = stack.dim();
-    if has_all_non_finite_acquisition(stack) {
+    if !all_non_finite_acquisition_indices(stack).is_empty() {
         return Err("slc stack contains an all non-finite acquisition");
     }
     if params.compute_average_coherence && params.average_coherence_start_idx > nslc {
@@ -130,15 +130,22 @@ pub fn link_fused(
     Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
 }
 
-/// Whether any acquisition contains no finite complex sample. Pinned dolphin
-/// v0.35.0 rejects the same degenerate stack before covariance estimation.
-pub(crate) fn has_all_non_finite_acquisition(stack: ArrayView3<Cf64>) -> bool {
-    (0..stack.dim().0).any(|date| {
-        stack
-            .index_axis(ndarray::Axis(0), date)
-            .iter()
-            .all(|z| !z.re.is_finite() || !z.im.is_finite())
-    })
+/// Return the zero-based ordinals of acquisitions containing no finite complex sample.
+///
+/// Direct phase-linking entry points reject any non-empty result to preserve the
+/// pinned dolphin v0.35.0 contract. Tiled workflow callers may use the ordinals
+/// to mark one locally incomplete tile as nodata while separately proving that
+/// every acquisition is finite somewhere across the complete logical burst.
+#[must_use]
+pub fn all_non_finite_acquisition_indices(stack: ArrayView3<Cf64>) -> Vec<usize> {
+    (0..stack.dim().0)
+        .filter(|&date| {
+            stack
+                .index_axis(ndarray::Axis(0), date)
+                .iter()
+                .all(|z| !z.re.is_finite() || !z.im.is_finite())
+        })
+        .collect()
 }
 
 /// SHP-masked path: flat per-output-pixel, each pixel builds its own coherence
