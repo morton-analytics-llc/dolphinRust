@@ -22,7 +22,30 @@ Entry format:
 
 ## DEFERRED
 
-_(none)_
+### D2 — External-TEC-free (split-spectrum) ionospheric correction
+- **Source**: competitive + ecosystem (MintPy split-spectrum; Earth Planets and Space 2025 practical-recipe paper)
+- **Issue**: #23 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: a real scene is found where IONEX/GNSS TEC coverage is missing or
+  demonstrably insufficient, OR the real multi-date NISAR validation work (ROADMAP.md's
+  "NISAR calibrated-data timing" external gate) surfaces an ionospheric residual large
+  enough to justify a second correction path.
+- **Design sketch**: analytic fixture with injected sub-band ionospheric phase ramp;
+  recover known TEC/delay via split-spectrum estimator; additive fallback/cross-check to
+  the existing IONEX path in `dolphin-corrections::ionosphere`, off by default.
+- **Added**: 2026-08-01 by scheduled scout run
+
+### D3 — Automated loop-closure QC gate for unwrap-network errors
+- **Source**: competitive (LiCSBAS)
+- **Issue**: #24 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: a design review confirms this targets unwrap-network errors distinct
+  from what the existing closure-phase/phase-bias quality layer already catches, and
+  clarifies whether the existing per-ifg `conncomp_NN.tif` labels already provide enough
+  signal to build this cheaply.
+- **Design sketch**: network-level phase-closure-loop pass over the interferogram set,
+  flagging/masking pixels with inconsistent loop sums before the SBAS solve — distinct
+  from the per-pixel decorrelation-driven non-closure bias `dolphin-phaselink` already
+  measures.
+- **Added**: 2026-08-01 by scheduled scout run
 
 ## SHIPPED
 
