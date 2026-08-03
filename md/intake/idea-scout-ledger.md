@@ -47,6 +47,19 @@ Entry format:
   measures.
 - **Added**: 2026-08-01 by scheduled scout run
 
+### D4 — Possible output-grid geometry ambiguity under asymmetric strides
+- **Source**: inbound (cross-repo signal, `../eo`#277 — P1 production incident, unconfirmed hypothesis)
+- **Issue**: #26 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: `../eo`#277's own reproduction step (default `{y:3, x:6}` strides vs.
+  the `{x:2, y:1}` override on the Montana harness AOI) runs and points at dolphinRust's
+  own output-grid/analysis-domain geometry math — rather than `../eo`'s water-mask/
+  geotransform derivation — as the actual locus of the bug.
+- **Design sketch**: if gated in, a property/contract test asserting the reported
+  output-grid geotransform/dimensions and "bounded analysis domain" coverage check agree
+  pixel-for-pixel with the actual strided output raster for asymmetric strides (`y≠x`),
+  extending the existing Phase 0 block-manager property tests.
+- **Added**: 2026-08-03 by scheduled scout run
+
 ## SHIPPED
 
 ### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0

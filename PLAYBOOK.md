@@ -808,6 +808,21 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
    covariance perf work stop at the current box-sum (measured ~2.0–2.7× over direct,
    PLAYBOOK §Optimization log)? See `md/intake/idea-scout-ledger.md` / issue #5 for the
    full analysis.
+3. **Re-pin decision: pinned dolphin oracle (`v0.35.0`) vs. current (`v0.42.7`) (surfaced
+   by issue #25, 2026-08-03).** The pinned reference is ~20 releases behind current. Several
+   intervening changes are already independently handled (auto center-of-mass reference
+   point v1.1.0; CRLB and per-ministack temp-coh/similarity stitching already validated
+   against forward v0.42.0 oracles, per the Phase 4 pin note). Two items are untested: (a)
+   v0.40.0's combined sliding-window + similarity masking, not confirmed present in
+   dolphinRust; (b) whether v0.42.0's larger default half-window / nearest-3 network
+   defaults differ from what dolphinRust ships today. Re-pinning is a real cost (every
+   `.npy` oracle fixture regenerated, every kernel's tolerance re-validated); the project
+   has an established cheaper middle path — targeted forward oracles for specific new
+   capabilities, done twice already (CRLB, closure/stitching) — rather than a full re-pin.
+   Smallest next step if pursued: diff v0.35.0's and v0.42.0's default `DisplacementWorkflow`
+   YAML directly (no oracle generation needed) to check whether the default-value changes
+   are real before spending oracle-generation effort. Is a full re-pin warranted, or should
+   this stay on the targeted-forward-oracle path? See issue #25 for the full analysis.
 
 ## Open questions (technical, resolve before Phase 1)
 
