@@ -18,3 +18,5 @@ Cargo.lock.bak
 *.nc
 *.vrt
 __pycache__/
+# Local Claude Code git-worktree tooling state (not project content)
+/.claude/worktrees/
