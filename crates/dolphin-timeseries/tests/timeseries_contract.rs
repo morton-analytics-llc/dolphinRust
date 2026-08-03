@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_precisions,
-    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
-    invert_stack_with_uncertainty, solve_pixel_with_covariance, L1Config, NetworkConfig,
+    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
+    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
+    solve_pixel_with_covariance, L1Config, NetworkConfig,
 };
 use ndarray::{Array2, Array3};
 
@@ -138,6 +139,91 @@ fn date_precision_changes_velocity_fit() {
     let weighted = estimate_velocity_with_precisions(&x, series.view(), precision.view());
     let unweighted = estimate_velocity(&x, series.view(), None);
     assert!(weighted[(0, 0)] < unweighted[(0, 0)] / 2.0);
+}
+
+// ------------------- temporal-correlation (N_eff) uncertainty correction -------
+
+/// Deterministic xorshift64 sequence mapped to ~unit variance — reproducible,
+/// no RNG dependency. Not a statistical-quality PRNG; good enough to build an
+/// AR(1) fixture with a known target correlation.
+fn deterministic_white_noise(n: usize, seed: u64) -> Vec<f64> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = (state >> 11) as f64 / (1u64 << 53) as f64; // uniform [0, 1)
+            (u - 0.5) * 2.0 * 3.0_f64.sqrt() // uniform(-1,1) scaled to unit variance
+        })
+        .collect()
+}
+
+/// AR(1) sequence `e[t] = rho*e[t-1] + sqrt(1-rho^2)*w[t]` from unit-variance white
+/// noise `w`; theoretical lag-1 autocorrelation of `e` is `rho`.
+fn ar1_series(n: usize, rho: f64, seed: u64) -> Vec<f64> {
+    let w = deterministic_white_noise(n, seed);
+    let scale = (1.0 - rho * rho).sqrt();
+    let mut e = vec![0.0; n];
+    e[0] = w[0];
+    for t in 1..n {
+        e[t] = rho * e[t - 1] + scale * w[t];
+    }
+    e
+}
+
+#[test]
+fn temporal_correlation_inflation_matches_known_ar1_factor() {
+    const N: usize = 400;
+    let x: Vec<f64> = (0..N).map(|t| t as f64 * 6.0).collect();
+    let rho_true = 0.6;
+    let noise = ar1_series(N, rho_true, 0xC0FFEE);
+    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 3.0 + 0.01 * x[t] + noise[t]);
+    let precision = Array3::from_elem((N, 1, 1), 1.0);
+
+    let out = estimate_velocity_with_uncertainty_neff(&x, series.view(), precision.view());
+    let baseline = estimate_velocity_with_uncertainty(&x, series.view(), precision.view());
+
+    // Existing fields are untouched (regression-safety): the opt-in path never
+    // silently changes today's velocity/sigma.
+    assert!((out.velocity[(0, 0)] - baseline.velocity[(0, 0)]).abs() < 1e-9);
+    assert!((out.sigma[(0, 0)] - baseline.sigma[(0, 0)]).abs() < 1e-9);
+
+    let closed_form_factor = ((1.0 + rho_true) / (1.0 - rho_true)).sqrt(); // 2.0 at rho=0.6
+    let factor = out.inflation_factor[(0, 0)];
+    assert!(
+        (factor - closed_form_factor).abs() < 0.3,
+        "inflation factor {factor} far from closed-form {closed_form_factor} (rho={rho_true})"
+    );
+    assert!(
+        factor > 1.2,
+        "expected clear inflation for strong AR(1) correlation, got {factor}"
+    );
+
+    // sigma_temporal_corrected is definitionally sigma * inflation_factor.
+    let expected = out.sigma[(0, 0)] * factor;
+    assert!((out.sigma_temporal_corrected[(0, 0)] - expected).abs() < 1e-9);
+    assert!(out.sigma_temporal_corrected[(0, 0)] > out.sigma[(0, 0)]);
+}
+
+#[test]
+fn temporal_correlation_correction_is_noop_at_zero_correlation() {
+    const N: usize = 400;
+    let x: Vec<f64> = (0..N).map(|t| t as f64 * 6.0).collect();
+    let noise = deterministic_white_noise(N, 0xC0FFEE); // rho == 0 by construction
+    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 3.0 + 0.01 * x[t] + noise[t]);
+    let precision = Array3::from_elem((N, 1, 1), 1.0);
+
+    let out = estimate_velocity_with_uncertainty_neff(&x, series.view(), precision.view());
+    let factor = out.inflation_factor[(0, 0)];
+    assert!(
+        (factor - 1.0).abs() < 0.15,
+        "expected ~no inflation for uncorrelated residuals, got {factor}"
+    );
+    assert!(
+        (out.sigma_temporal_corrected[(0, 0)] - out.sigma[(0, 0)]).abs() < 0.15 * out.sigma[(0, 0)],
+        "corrected sigma should stay close to uncorrected sigma at rho~0"
+    );
 }
 
 // ------------------------------- oracle (secondary) ---------------------------

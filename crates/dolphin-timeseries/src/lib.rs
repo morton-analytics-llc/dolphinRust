@@ -12,8 +12,9 @@ pub mod reference;
 
 pub use inversion::{
     estimate_velocity, estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
-    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
-    solve_pixel_with_covariance, L1Config, L2InversionOutput, PixelL2Solution, VelocityOutput,
+    estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
+    invert_stack_with_uncertainty, solve_pixel_with_covariance, L1Config, L2InversionOutput,
+    PixelL2Solution, VelocityOutput, VelocityOutputNeff,
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};

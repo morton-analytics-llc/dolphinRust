@@ -48,6 +48,33 @@ pub struct VelocityOutput {
     pub residual_rms: Array2<f64>,
 }
 
+/// [`VelocityOutput`] plus an opt-in temporal-correlation (N_eff) correction.
+///
+/// InSAR displacement series carry temporally correlated (e.g. atmospheric) noise,
+/// so `dof = n_valid_dates - 2` overstates the number of independent observations
+/// and `sigma` alone understates the true slope uncertainty (Agram & Zebker 2015).
+/// `sigma` is untouched here (regression-safe with [`estimate_velocity_with_uncertainty`]);
+/// `sigma_temporal_corrected` and `inflation_factor` are reported alongside it rather
+/// than silently replacing it, since a larger `sigma` can flip a downstream risk-tier
+/// threshold and that change needs its own reviewed rollout.
+pub struct VelocityOutputNeff {
+    /// Linear velocity per year (identical to [`VelocityOutput::velocity`]).
+    pub velocity: Array2<f64>,
+    /// One-sigma slope uncertainty per year, uncorrected (identical to
+    /// [`VelocityOutput::sigma`]).
+    pub sigma: Array2<f64>,
+    /// `sigma * inflation_factor` — the temporal-correlation-corrected one-sigma
+    /// slope uncertainty per year.
+    pub sigma_temporal_corrected: Array2<f64>,
+    /// `sqrt(n_valid / n_eff) = sqrt((1 + rho) / (1 - rho))`, `rho` the estimated
+    /// lag-1 residual autocorrelation clamped to `[0, 1)`. `1.0` where residuals are
+    /// uncorrelated or too few to estimate `rho`.
+    pub inflation_factor: Array2<f64>,
+    /// Regression residual root-mean-square in series units (identical to
+    /// [`VelocityOutput::residual_rms`]).
+    pub residual_rms: Array2<f64>,
+}
+
 struct PixelUncertaintySummary {
     parameters: Vec<f64>,
     variance: Vec<f64>,
@@ -358,6 +385,48 @@ pub fn estimate_velocity_with_uncertainty(
     }
 }
 
+/// Weighted linear velocity with uncertainty, plus an opt-in AR(1) temporal-
+/// correlation (N_eff) correction reported alongside the uncorrected `sigma`
+/// (see [`VelocityOutputNeff`]). `velocity`, `sigma`, and `residual_rms` are
+/// identical to [`estimate_velocity_with_uncertainty`]'s output.
+#[must_use]
+pub fn estimate_velocity_with_uncertainty_neff(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+) -> VelocityOutputNeff {
+    let (_, rows, cols) = series.dim();
+    let values: Vec<(f64, f64, f64, f64)> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| {
+            velocity_pixel_with_temporal_correlation(
+                x,
+                series,
+                precisions,
+                (idx / cols, idx % cols),
+            )
+        })
+        .collect();
+    let layer = |index: usize| {
+        Array2::from_shape_fn((rows, cols), |(r, c)| {
+            let value = values[r * cols + c];
+            [value.0, value.1, value.2, value.3][index]
+        })
+    };
+    let sigma = layer(1);
+    let inflation_factor = layer(2);
+    let sigma_temporal_corrected = Array2::from_shape_fn((rows, cols), |(r, c)| {
+        sigma[(r, c)] * inflation_factor[(r, c)]
+    });
+    VelocityOutputNeff {
+        velocity: layer(0),
+        sigma,
+        sigma_temporal_corrected,
+        inflation_factor,
+        residual_rms: layer(3),
+    }
+}
+
 /// Linear velocity using direct observation precisions without uncertainty outputs.
 #[must_use]
 pub fn estimate_velocity_with_precisions(
@@ -375,12 +444,22 @@ pub fn estimate_velocity_with_precisions(
     Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
 }
 
-fn velocity_pixel_with_uncertainty(
+/// Shared weighted-linear fit for one pixel: velocity, uncorrected sigma,
+/// residual RMS, and the in-time-order residuals (feeding the opt-in temporal-
+/// correlation correction). All non-finite when the normal equations are singular.
+struct PixelUncertaintyFit {
+    velocity_per_year: f64,
+    sigma_per_year: f64,
+    residual_rms: f64,
+    residuals: Vec<f64>,
+}
+
+fn velocity_pixel_uncertainty_fit(
     x: &[f64],
     series: ArrayView3<f64>,
     precisions: ArrayView3<f64>,
     pixel: (usize, usize),
-) -> (f64, f64, f64) {
+) -> PixelUncertaintyFit {
     let valid = |t: usize| {
         let p = precisions[(t, pixel.0, pixel.1)];
         let y = series[(t, pixel.0, pixel.1)];
@@ -398,37 +477,93 @@ fn velocity_pixel_with_uncertainty(
     }
     let det = sw * swxx - swx * swx;
     if !det.is_finite() || det <= 0.0 {
-        return (f64::NAN, f64::NAN, f64::NAN);
+        return PixelUncertaintyFit {
+            velocity_per_year: f64::NAN,
+            sigma_per_year: f64::NAN,
+            residual_rms: f64::NAN,
+            residuals: Vec::new(),
+        };
     }
     let slope = (sw * swxy - swx * swy) / det;
     let intercept = (swy - slope * swx) / sw;
     let indices: Vec<_> = (0..x.len()).filter(|&t| valid(t)).collect();
-    let residuals: Vec<_> = indices
+    let residuals: Vec<f64> = indices
         .iter()
-        .map(|&t| {
-            let residual = series[(t, pixel.0, pixel.1)] - (intercept + slope * x[t]);
-            (t, residual)
-        })
+        .map(|&t| series[(t, pixel.0, pixel.1)] - (intercept + slope * x[t]))
         .collect();
-    let weighted_sse = residuals
+    let weighted_sse: f64 = indices
         .iter()
-        .map(|(t, residual)| precisions[(*t, pixel.0, pixel.1)] * residual * residual)
-        .sum::<f64>();
-    let residual_sse = residuals
-        .iter()
-        .map(|(_, residual)| residual * residual)
-        .sum::<f64>();
+        .zip(&residuals)
+        .map(|(&t, residual)| precisions[(t, pixel.0, pixel.1)] * residual * residual)
+        .sum();
+    let residual_sse: f64 = residuals.iter().map(|residual| residual * residual).sum();
     let dof = indices.len().saturating_sub(2);
-    let inflation = if dof == 0 {
+    let variance_inflation = if dof == 0 {
         1.0
     } else {
         (weighted_sse / dof as f64).max(1.0)
     };
+    PixelUncertaintyFit {
+        velocity_per_year: slope * 365.25,
+        sigma_per_year: (variance_inflation * sw / det).sqrt() * 365.25,
+        residual_rms: (residual_sse / indices.len() as f64).sqrt(),
+        residuals,
+    }
+}
+
+fn velocity_pixel_with_uncertainty(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+    pixel: (usize, usize),
+) -> (f64, f64, f64) {
+    let fit = velocity_pixel_uncertainty_fit(x, series, precisions, pixel);
+    (fit.velocity_per_year, fit.sigma_per_year, fit.residual_rms)
+}
+
+fn velocity_pixel_with_temporal_correlation(
+    x: &[f64],
+    series: ArrayView3<f64>,
+    precisions: ArrayView3<f64>,
+    pixel: (usize, usize),
+) -> (f64, f64, f64, f64) {
+    let fit = velocity_pixel_uncertainty_fit(x, series, precisions, pixel);
+    let inflation_factor = if fit.sigma_per_year.is_finite() {
+        temporal_correlation_inflation(&fit.residuals)
+    } else {
+        f64::NAN
+    };
     (
-        slope * 365.25,
-        (inflation * sw / det).sqrt() * 365.25,
-        (residual_sse / indices.len() as f64).sqrt(),
+        fit.velocity_per_year,
+        fit.sigma_per_year,
+        inflation_factor,
+        fit.residual_rms,
     )
+}
+
+/// Lag-1 sample autocorrelation of `residuals`, clamped to `[0, 0.98]`. Negative
+/// or undersampled estimates do not warrant inflating sigma below the uncorrected
+/// value, and a clamp short of 1.0 keeps the inflation factor finite.
+fn lag1_autocorrelation(residuals: &[f64]) -> f64 {
+    if residuals.len() < 3 {
+        return 0.0;
+    }
+    let mean = residuals.iter().sum::<f64>() / residuals.len() as f64;
+    let centered: Vec<f64> = residuals.iter().map(|r| r - mean).collect();
+    let denom: f64 = centered.iter().map(|c| c * c).sum();
+    if denom <= 0.0 {
+        return 0.0;
+    }
+    let numer: f64 = centered.windows(2).map(|w| w[0] * w[1]).sum();
+    (numer / denom).clamp(0.0, 0.98)
+}
+
+/// `sqrt((1 + rho) / (1 - rho))` — the AR(1) effective-sample-size inflation
+/// factor for the slope standard error (Zhang et al. 1997; Agram & Zebker 2015),
+/// `rho` the lag-1 residual autocorrelation. `1.0` at `rho == 0`.
+fn temporal_correlation_inflation(residuals: &[f64]) -> f64 {
+    let rho = lag1_autocorrelation(residuals);
+    ((1.0 + rho) / (1.0 - rho)).sqrt()
 }
 
 /// Slope of a weighted degree-1 fit (numpy `polyfit` weighting), scaled to /year.
