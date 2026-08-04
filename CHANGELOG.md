@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Opt-in AR(1) temporal-correlation (N_eff) velocity-uncertainty correction**
+  (issue #20). `dolphin-timeseries::estimate_velocity_with_uncertainty_neff` estimates
+  the lag-1 autocorrelation of the WLS velocity-fit residuals and reports
+  `sigma_temporal_corrected = sigma * sqrt((1+rho)/(1-rho))` (Zhang et al. 1997 / Agram
+  & Zebker 2015) alongside the existing uncorrected `sigma`, without changing it —
+  matching `../eo`#206's own fix for the identical understated-uncertainty bug.
+  `estimate_velocity_with_uncertainty`/`VelocityOutput` are untouched (bit-identical);
+  the new `VelocityOutputNeff` is a separate opt-in output so a downstream risk-tier
+  threshold never moves without a reviewed follow-up. Analytic AR(1) contract fixture
+  validates the inflation factor against the closed-form value and confirms it
+  converges to a no-op at zero correlation.
 - **Identifier-free temporal input-coverage provenance.** Geometry provenance advances to
   `dolphinrust-geometry-provenance/3` and records the versioned tile policy, aggregate and
   per-burst tile counts using stable ordinals, and final valid-pixel fraction. The workflow
