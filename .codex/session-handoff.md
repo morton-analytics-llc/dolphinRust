@@ -1,100 +1,102 @@
-# Session handoff — 2026-07-14
+# Session handoff — 2026-07-25
 
 ## Summary
 
-Merged the scheduled covariance follow-up PR, executed the first full MMX1/ICMX independent
-GNSS gate, fixed the native MCF final-epoch cycle slip that gate exposed, and landed a reviewed
-follow-up. The corrected native and SNAPHU runs both pass the provisional GNSS bars. The
-implementation head is synchronized with `origin/main` at `9fec550`; the local branch adds only
-this EOD handoff commit. There are no open PRs or issues.
+dolphinRust ends the session synchronized with `origin/main` at `bb79b4e`, with no open issues or
+pull requests. The combined reliability and uncertainty work, CI repair, and tiled non-finite
+coverage fix all merged through PRs #17–#19. GroundPulse then completed the fresh bounded
+production acceptance gate and closed dolphinRust #10/#11 with correlated terminal-artifact
+receipts. No code work remains in progress; only local handoff files are uncommitted.
 
 ## Completed
 
-- Reviewed and merged PR #6 as `3ba489e`; the measured box-sum win is documented and further
-  cross-row accumulation remains deferred because it conflicts with tiled/whole bit identity.
-- Downloaded and validated all 13 declared T005 CSLCs plus the matching STATIC product, then
-  built the 384x384 MMX1 core and 352x2217 MMX1/ICMX common-frame fixtures.
-- Ran native and SNAPHU on both fixtures and produced JSON/CSV/SVG ground-truth artifacts.
-- Captured the initial common-frame result honestly: SNAPHU passed; native missed the TLS ceiling
-  after a localized final-epoch 27.733 mm cycle slip.
-- Added a red live parity contract and isolated two independent defects at the old 7x46 grid:
-  randomized equal-weight seam ordering and an overly fine 48-pixel tile floor.
-- Committed `18a1652 fix(unwrap): stabilize native seam reconciliation`:
-  - deterministic seam vote and spanning-forest ordering;
-  - 64-pixel production tile floor (5x34 on the common frame);
-  - live MMX1 parity and permanent analytic/tile-floor contracts;
-  - corrected validation and performance documentation.
-- Landed review follow-up `9fec550`, which made the live test's dominant-offset vote
-  deterministic, pinned the equal-weight vote tie-break analytically, removed unreachable sort
-  clauses, and documented the isolated A/B attribution precisely.
-- Closed issues #4 and #5. No GroundPulse submodule bump, release, publication, or deployment was
-  performed.
+- Merged PR #17 (`6fb8014`, `feat: add reliability and uncertainty outputs`):
+  - real temporal coherence and masks now feed every unwrap backend;
+  - native/SNAPHU connected-component labels are retained and written pair-aligned;
+  - CRLB-derived L2 SBAS and velocity weighting is enabled by default with a legacy opt-out;
+  - bounded posterior variance, residual RMS, on-demand covariance, and velocity sigma outputs
+    were added without retaining a full covariance cube;
+  - the MMX1/ICMX harness now produces weighted/unweighted reliability JSON, CSV, and SVG.
+- Merged PR #18 (`d0b71f9`, `ci: let pkg-config discover HDF5`): Ubuntu CI now uses distro HDF5
+  discovery and a Mesa software Vulkan adapter. The 384-date hardware stress contract remains
+  excluded only on that 128 MiB software-adapter binding limit; all other GPU contracts run.
+- Merged PR #19 (`bb79b4e`, `fix: preserve nodata in tiled phase linking`): tiled phase linking
+  preserves nodata instead of turning incomplete temporal tiles into an all-non-finite acquisition
+  failure.
+- GroundPulse production acceptance completed against the current dolphinRust fix and consumer
+  corrections through GroundPulse `1f97f4c8`:
+  - bounded T137 processing completed phase linking, nodata-aware two-burst stitching, unwrap,
+    inversion, corrections, velocity, write, distinct phase-linking-coherence COG, COG, and
+    PMTiles generation;
+  - peak RSS was 2,483,532 KiB (about 2.37 GiB), below the 5.5 GiB acceptance ceiling;
+  - provenance `/3` recorded 48 total tiles, 32 linked, 16 nodata, and 235,400 valid of 235,404
+    output pixels;
+  - no exit 139, SIGSEGV, OOM, lease loss, or abnormal container exit occurred;
+  - the canonical correlated terminal-artifact verifier passed, and a repeat audited dispatch
+    returned `enqueued: false` without duplicate computation.
+- Closed dolphinRust issues #10–#16. GitHub currently reports zero open issues and zero open PRs.
 
 ## In progress
 
-- No code is in progress and the working tree is clean.
-- The 64-pixel floor's broad 1024x1024 throughput/concurrency benchmark has not been rerun. The
-  older 48-pixel 10x-throughput claim is retained only as historical evidence and must not be
-  reused as current.
-- Atmospheric corrections remain off for the MMX1/ICMX comparison. Residuals include atmosphere
-  and cannot be attributed solely to either unwrapper.
-- The live CSLC, STATIC, GNSS, raster, and scoring artifacts are local and gitignored. The live
-  Rust contract skips on fresh checkouts without that external fixture; permanent analytic tests
-  still exercise determinism and the production tile floor.
+- No dolphinRust implementation is in progress.
+- A later GroundPulse worker was still running after the accepted receipt was established. It is
+  outside this repository/session and does not reopen or weaken the completed #10/#11 receipt.
+- GroundPulse public map publication remains intentionally suppressed where the required water
+  mask is absent. Acceptance did not bypass that serving policy.
+- The real weighted MMX1/ICMX uncertainty coverage result remains honestly `not_evaluable`:
+  ICMX lies in a singular-CRLB region with only 5/25 finite pixels in its primary 5x5 window.
+  This is a real-data/scientific-evidence limitation, not a known implementation defect.
 
 ## Verification
 
-Corrected full live score (run after `18a1652` implementation, before review-only `9fec550`):
+Passing evidence:
 
-- Overall status: PASS; both native and SNAPHU pass provisional-1 bars.
-- GNSS endpoint truth: -104.262 mm.
-- Native estimate: -94.305 mm; residual +9.958 mm; correlation 0.9375; TLS 1.0357.
-- SNAPHU has the same rounded metrics; native-minus-SNAPHU endpoint is 0.000033 mm.
-- Final-epoch native/SNAPHU per-component disagreement: 0.1918% (gate <=0.5%).
-- Runtime on the shared frame: native 61.3 s; SNAPHU 100.7 s.
+- PR #17 local gates: `cargo fmt --all -- --check`, `cargo check --workspace`, strict workspace
+  Clippy, `cargo test --workspace`, Python compile/unit tests, oracle/AOI/NRT/native/SNAPHU/GPU/
+  multiburst contracts, four real MMX1/ICMX A/B runs, and a production-shaped RSS benchmark.
+- PR #18 GitHub Actions run `30138907433`: formatting, workspace check, strict Clippy, Rust tests,
+  and Python validation tests passed on Ubuntu/Rust 1.94.
+- PR #19 GitHub Actions run `30166301446` passed.
+- GroundPulse production receipt: exact run-linked summary, COG, phase-linking-coherence COG,
+  PMTiles, provenance, bounded RSS, normal exit, and canonical verifier success.
+- Post-session reconciliation: `main...origin/main = 0 0` at `bb79b4e`; no open issues/PRs.
 
-Current `9fec550` HEAD verification completed and passing:
+Not established:
 
-- `cargo check --workspace`.
-- `cargo clippy --all-targets --workspace -- -D warnings`.
-- `cargo test --workspace`, including GPU contracts, the live MMX1 contract, native tiling,
-  oracle parity, end-to-end displacement, NRT, sign, geometry, and doc tests.
-- `git diff --check` before the implementation commit.
-
-Not run:
-
-- Full GNSS acquisition/crop/score again after `9fec550`; that follow-up changed tests,
-  deterministic test voting, documentation, and unreachable sort tie-breaks, not the selected
-  5x34 production result. Its live contract and full workspace suite pass at current HEAD.
-- Atmospheric-corrected MMX1/ICMX comparison.
-- GroundPulse integration/submodule bump or live deployment.
+- Nominal uncertainty interval coverage against a valid weighted ICMX station sample remains
+  `not_evaluable`; do not convert the current receipt into an empirical calibration claim.
+- Public overlay availability is not proven for artifacts suppressed by the missing-water-mask
+  policy.
 
 ## Open questions
 
-1. Should the provisional GNSS thresholds become hard release gates, or remain report-only until
-   more station pairs and atmospheric corrections are included?
-2. Should the 64-pixel native floor be rebenchmarked now on the 1024x1024 concurrency harness, or
-   only when a performance decision depends on updated numbers?
-3. When should GroundPulse consume `9fec550` through its human-gated dolphinRust submodule bump?
+1. Should the `not_evaluable` ICMX coverage boundary become a new research/data issue, or remain
+   documented until a suitable station window or additional real stack is available?
+2. Should the three completed feature/fix worktrees and their merged branches be removed in a
+   later cleanup pass?
+3. Should the local `.codex` handoff chain be committed so fresh clones can consume it, or remain
+   local as before?
 
 ## Next actions
 
-1. If current performance claims matter, rerun the residue-dense 1024x1024 latency/concurrency
-   benchmark at the 64-pixel floor and update PLAYBOOK/config commentary from measured evidence.
-2. Decide whether to harden the GNSS bars and whether to acquire/apply 13-date atmospheric inputs
-   before making unwrapper-specific residual claims.
-3. If GroundPulse should consume the fix, bump its dolphinRust submodule in `../eo`, run the GP
-   worker contracts, and keep deployment/release separately human-gated.
-4. Run `$briefing` next session; the repo itself has no open PR or issue queue at this handoff.
+1. Start the next dolphinRust session with `$briefing`; there is currently no implementation
+   backlog to select.
+2. If empirical uncertainty calibration is prioritized, acquire or select a weighted-finite
+   ICMX comparison window and regenerate the 68%, 90%, and 95% reliability artifacts without
+   weakening the fixed 50% finite-pixel threshold.
+3. Optionally remove the merged `dolphinRust-quality`, `dolphinRust-ci-hdf5`, and temporary
+   nodata-fix worktrees after confirming no local-only artifacts are needed.
+4. Keep GroundPulse water-mask/public-serving work and any later worker monitoring in the
+   GroundPulse session rather than reopening completed dolphinRust acceptance.
 
 ## References
 
-- Branch/upstream: implementation synchronized at `9fec550`; local `main` adds the EOD handoff
-  commit and is one commit ahead of `origin/main`.
-- Commits: `3ba489e` (merge PR #6), `18a1652` (native stabilization), `9fec550` (review follow-up).
-- Issues: #4 and #5 closed; no open PRs.
-- Validation narrative: `VALIDATION.md` MMX1/ICMX section.
-- Solver changes: `crates/dolphin-unwrap/src/native/tile.rs`.
-- Live contract: `crates/dolphin-unwrap/tests/native_mmx1_live_contract.rs`.
-- Tile policy: `crates/dolphin-workflows/src/displacement.rs::native_tiling`.
-- Local result: `validation/runs/gps_mmx1/mmx1_icmx_common/gps_ground_truth.json`.
+- Branch/upstream: `main` synchronized with `origin/main` at
+  `bb79b4ee60ef6c33fe09bacc076cbdc8a164b62d`.
+- PR #17: `6fb8014` — reliability and uncertainty outputs.
+- PR #18: `d0b71f9` — HDF5/Vulkan CI configuration.
+- PR #19: `bb79b4e` — tiled nodata/non-finite coverage fix.
+- GroundPulse consumer acceptance head: `1f97f4c8`.
+- CI runs: `30138907433` and `30166301446`.
+- Production acceptance receipts: dolphinRust issues #10 and #11 final comments.
+- Previous handoff: `.codex/handoffs/2026-07-21.md`.
