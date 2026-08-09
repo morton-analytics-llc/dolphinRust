@@ -2003,11 +2003,26 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
 
 /// Build the interferogram index pairs from the config and real baselines.
 fn network(cfg: &DisplacementWorkflow, days: &[f64]) -> Vec<(usize, usize)> {
+    let configured = &cfg.interferogram_network;
+    // An entirely unconfigured network means single-reference on date 0, not "no
+    // interferograms" — parity with pinned dolphin v0.35.0's
+    // `InterferogramNetwork._check_zero_parameters`. Without the fallback a bare
+    // config produces zero pairs and the run fails where dolphin's would succeed.
+    // v0.42.0 moved this fallback to nearest-3 (`max_bandwidth = 3`), an
+    // output-changing default change tracked as issue #25 / PLAYBOOK §Elevated
+    // questions; dolphinRust holds the pinned behavior until that is decided.
+    let unconfigured = configured.reference_idx.is_none()
+        && configured.max_bandwidth.is_none()
+        && configured.max_temporal_baseline.is_none()
+        && configured.indexes.is_none();
     let net = NetworkConfig {
-        reference_idx: cfg.interferogram_network.reference_idx,
-        max_bandwidth: cfg.interferogram_network.max_bandwidth,
-        max_temporal_baseline: cfg.interferogram_network.max_temporal_baseline,
-        indexes: cfg.interferogram_network.indexes.clone(),
+        reference_idx: match unconfigured {
+            true => Some(0),
+            false => configured.reference_idx,
+        },
+        max_bandwidth: configured.max_bandwidth,
+        max_temporal_baseline: configured.max_temporal_baseline,
+        indexes: configured.indexes.clone(),
     };
     build_network(days.len(), days, &net)
 }
@@ -3469,6 +3484,28 @@ mod tests {
             "the CRLB is a bound regardless of the network"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #25, found by diffing dolphin v0.35.0's and v0.42.0's config
+    /// defaults: an unconfigured `interferogram_network` produced **zero pairs**
+    /// and failed the run, where dolphin falls back to a network. dolphinRust
+    /// holds the pinned v0.35.0 behavior — single-reference on date 0.
+    #[test]
+    fn unconfigured_network_falls_back_to_single_reference() {
+        let cfg = DisplacementWorkflow::default();
+        assert_eq!(cfg.interferogram_network, Default::default());
+        let pairs = network(&cfg, &[0.0, 12.0, 24.0, 36.0]);
+        assert_eq!(pairs, vec![(0, 1), (0, 2), (0, 3)]);
+    }
+
+    /// The fallback must not fire when any option is set — a config asking for
+    /// nearest-2 must not silently also get the single-reference pairs.
+    #[test]
+    fn configured_network_does_not_get_the_fallback() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.interferogram_network.max_bandwidth = Some(2);
+        let pairs = network(&cfg, &[0.0, 12.0, 24.0, 36.0]);
+        assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]);
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {

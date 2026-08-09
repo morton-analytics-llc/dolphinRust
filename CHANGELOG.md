@@ -164,6 +164,15 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **An unconfigured `interferogram_network` no longer fails the run** (found while working
+  issue #25). `build_network` on an all-`None` network returned zero pairs and
+  `finish_displacement` aborted with "interferogram_network produced no pairs" — a bare
+  config could not run at all, where both dolphin versions fall back to a network. The
+  fallback is the pinned dolphin v0.35.0 one (`InterferogramNetwork._check_zero_parameters`):
+  single-reference on date 0, which is also what every oracle fixture config already states,
+  so no contract changes. dolphin v0.42.0 moved its fallback to nearest-3
+  (`max_bandwidth = 3`) — an output-changing default that stays out pending the re-pin
+  decision; see PLAYBOOK §Elevated questions for the full v0.35-vs-v0.42 default diff.
 - **The STATIC identity check no longer rejects the along-track neighbour the LOS mosaic
   needs** (issue #39). `verify_static_consistency` required every
   `correction_options.geometry_files` granule's `burst_id` to be in the CSLC stack's burst

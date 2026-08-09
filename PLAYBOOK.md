@@ -827,6 +827,45 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
    are real before spending oracle-generation effort. Is a full re-pin warranted, or should
    this stay on the targeted-forward-oracle path? See issue #25 for the full analysis.
 
+   **That diff was run (2026-08-09, both venvs local, no network).** Results, so the
+   decision is made on data:
+
+   | default | dolphin v0.35.0 | dolphin v0.42.0 | dolphinRust ships |
+   |---|---|---|---|
+   | `half_window` | y=5, x=11 | y=7, x=14 | **y=7, x=14** (v0.42's) |
+   | `phase_linking.max_num_compressed` | 100 | 10 | **10** (v0.42's) |
+   | `phase_linking.output_reference_idx` | 0 | null | **None** (v0.42's) |
+   | `interferogram_network.reference_idx` | 0 | null | **None** (v0.42's) |
+   | unconfigured-network fallback | single-reference `reference_idx=0` | **nearest-3** `max_bandwidth=3` | was **none at all** — fixed, see below |
+   | `write_crlb` / `write_closure_phase` | absent | true / false | **true / false** (v0.42's) |
+   | `timeseries.apply_mask_to_timeseries` | absent | true | **true** (v0.42's) |
+   | `preprocess.interpolation_cor_threshold` | 0.3 | 0.25 | not modelled |
+
+   Three things follow. **First, dolphinRust already ships the v0.42 values**, not the
+   pinned v0.35 ones — so "silent drift toward the old pin" is not the risk; if anything
+   the config surface leads the pin. Every oracle fixture config sets `half_window` and
+   `reference_idx` explicitly (`oracle/fixtures/disp/config.yaml`: `half_window {y:1, x:1}`,
+   `reference_idx: 0`), so no parity contract depends on a default and none of this
+   invalidates an existing gate.
+
+   **Second, the unconfigured-network fallback was a real defect, now fixed.** v0.35 sets
+   `reference_idx = 0` in `InterferogramNetwork._check_zero_parameters`; v0.42.0 removed
+   that validator and replaced it with `DisplacementWorkflow._check_zero_interferogram_network`,
+   which sets `max_bandwidth = 3`. dolphinRust had **neither**: `build_network` on an
+   all-`None` config returned zero pairs and `finish_displacement` failed the run with
+   "interferogram_network produced no pairs" — where both dolphin versions run. `network()`
+   now applies the **pinned v0.35 fallback** (single-reference, date 0), which is also what
+   every fixture config already states.
+
+   **Third, the nearest-3 default is the live question, and it now has a second reason to
+   move.** Adopting v0.42's `max_bandwidth = 3` would change output, so it stays out until
+   this question is decided — but issue #36 independently concluded that a calibrated
+   uncertainty product requires an **over-determined** network, which is exactly what
+   nearest-3 gives. So "adopt v0.42's network default" and "ship a posterior that carries
+   empirical scale" are the same decision, not two.
+
+   Still untested: v0.40.0's combined sliding-window + similarity masking.
+
 ## Open questions (technical, resolve before Phase 1)
 
 1. ~~Pin the exact dolphin reference version/commit for oracle generation.~~ **Resolved:
