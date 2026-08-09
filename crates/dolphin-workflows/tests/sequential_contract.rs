@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dolphin_core::config::{CompressedSlcPlan, ComputeBackend};
+use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf32, Cf64, HalfWindow, Strides};
 use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{run_sequential, SequentialConfig};
@@ -58,6 +58,11 @@ fn sequential_phase_history_matches_oracle() {
         compute_crlb: false,
         compute_closure_phase: false,
         compute_average_coherence: false,
+        // These fixtures come from dolphin's `run_phase_linking` with no
+        // `neighbor_arrays`, i.e. the rectangular window, so pin the method
+        // rather than inheriting dolphin's GLRT config default.
+        shp_method: ShpMethod::Rect,
+        shp_alpha: 0.001,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
@@ -116,6 +121,8 @@ fn stitching_and_quality_match_oracle_multiministack() {
         compute_crlb: true,
         compute_closure_phase: true,
         compute_average_coherence: true,
+        shp_method: ShpMethod::Rect,
+        shp_alpha: 0.001,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();

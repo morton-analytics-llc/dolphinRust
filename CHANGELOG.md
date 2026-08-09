@@ -7,6 +7,20 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **SHP neighbor selection is now applied during phase linking** (issue #29).
+  `phase_linking.shp_method` / `shp_alpha` were accepted in config but never reached the
+  covariance kernel — `sequential.rs` passed `neighbors: None` unconditionally, so
+  `dolphin-shp` had no caller and covariance always used the full rectangular window. Each
+  ministack now derives the GLRT or KS mask from its **real** acquisitions (carried
+  compressed SLCs are projections, not observations) and passes it through. `shp_method:
+  rect` keeps the unmasked kernel and is bit-identical to the previous output; the
+  dolphin-oracle fixtures were generated without `neighbor_arrays`, so their configs now
+  declare `rect` explicitly rather than inheriting dolphin's GLRT default, and every oracle
+  contract is unchanged. This also fixes a correctness gap: with `beta: 0.0` the estimator's
+  `Γ = |C|` need not be PSD, and an indefinite `Γ` yields a NaN CRLB that
+  `apply_validity_mask` propagates to every emitted layer. On the MMX1/ICMX frame the finite
+  footprint goes 98.8613% → 99.3062% and the GNSS uncertainty-reliability scorer completes
+  for the first time, emitting `uncertainty_reliability.{json,csv,svg}`. See VALIDATION.md.
 - **Opt-in AR(1) temporal-correlation (N_eff) velocity-uncertainty correction**
   (issue #20). `dolphin-timeseries::estimate_velocity_with_uncertainty_neff` estimates
   the lag-1 autocorrelation of the WLS velocity-fit residuals and reports
@@ -108,15 +122,12 @@ All notable changes to dolphinRust are documented here. The format follows
   (single-burst consumer unaffected). See the design doc's Deferred section.
 
 ### Known limitations
-- **The MMX1/ICMX harness does not currently produce reliability artifacts** on real data,
-  qualifying the "regenerates JSON/CSV/SVG 68/90/95% reliability artifacts" claim above.
-  The GLRT SHP mask the config specifies is never wired into `sequential.rs`, so covariance
-  uses the full rectangular window; with `beta: 0.0` the estimator's `Γ = |C|` is indefinite
-  at ~1.1% of pixels, `crlb.rs` has no EVD fallback, and `apply_validity_mask` gates every
-  emitted layer on `velocity.is_finite()`. ICMX lands in such a region, so the scorer
-  correctly reports `not_evaluable` rather than weakening its 50% station-window contract.
-  The weighted/unweighted A/B is **not** an independent diagnostic for this — the two are
-  bit-identical here. Tracked as issue #29; see VALIDATION.md for the evidence.
+- **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
+  temporally correlated epochs quantize every 68/90/95 bin at 8.3%, from one station pair on
+  one burst. Read directionally, the CRLB-only budget under-covers at 68% and 90% —
+  consistent with issue #20, whose AR(1) N_eff inflation is implemented but not yet wired
+  into the workflow. A defensible calibration needs more stations in this burst or more
+  frames.
 
 ## [v1.4.0] — 2026-06-18
 

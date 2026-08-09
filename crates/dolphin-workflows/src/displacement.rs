@@ -1757,6 +1757,8 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         compute_closure_phase: cfg.phase_linking.write_closure_phase
             || cfg.phase_linking.correct_phase_bias,
         compute_average_coherence: cfg.phase_linking.calc_average_coh,
+        shp_method: cfg.phase_linking.shp_method,
+        shp_alpha: cfg.phase_linking.shp_alpha,
     }
 }
 

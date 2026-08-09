@@ -19,11 +19,12 @@
 //! phase-linking-stage half of NRT; the non-causal downstream (ifg network →
 //! unwrap → timeseries → velocity) recomputes from the updated phase history.
 
-use dolphin_core::config::CompressedSlcPlan;
+use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{compress, AverageCoherenceAggregate, ComputeEngine, FusedParams};
+use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
-use ndarray::{concatenate, s, Array2, Array3, ArrayView3, Axis};
+use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView3, Axis};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +54,11 @@ pub struct SequentialConfig {
     /// Produce the distinct phase-linking-coherence layer from dolphin's
     /// per-date average coherence magnitudes.
     pub compute_average_coherence: bool,
+    /// Statistical test selecting the SHP neighbors covariance averages over.
+    /// [`ShpMethod::Rect`] uses the full rectangular window.
+    pub shp_method: ShpMethod,
+    /// Significance level (false-alarm probability) for the SHP test.
+    pub shp_alpha: f64,
 }
 
 /// Output of a sequential run.
@@ -441,11 +447,15 @@ fn link_and_compress(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<MinistackResult, &'static str> {
+    // SHP neighbors are selected from the real acquisitions only; the carried
+    // compressed SLCs are projections, not observations, so their amplitude
+    // statistics would not describe the scatterer.
+    let neighbors = shp_neighbors(combined.slice(s![ms.num_compressed.., .., ..]), cfg);
     let fused = engine.link(
         combined,
         cfg.half_window,
         cfg.strides,
-        None,
+        neighbors.as_ref().map(Array4::view),
         fused_params(ms, cfg),
     )?;
     let cpx = fused.cpx_phase;
@@ -469,6 +479,36 @@ fn link_and_compress(
         crlb_sigma,
         closure_phase: fused.closure_phase,
     })
+}
+
+/// SHP neighbor mask for one ministack's real acquisitions, or `None` for the
+/// full rectangular window ([`ShpMethod::Rect`], which keeps the unmasked
+/// covariance kernel and so stays bit-identical to the pre-SHP output).
+fn shp_neighbors(real: ArrayView3<Cf64>, cfg: &SequentialConfig) -> Option<Array4<bool>> {
+    let nslc = real.dim().0;
+    let amplitude = real.mapv(|z| z.norm());
+    match cfg.shp_method {
+        ShpMethod::Rect => None,
+        ShpMethod::Glrt => {
+            let mean = amplitude.mean_axis(Axis(0))?;
+            let var = amplitude.var_axis(Axis(0), 0.0);
+            Some(estimate_neighbors_glrt(
+                mean.view(),
+                var.view(),
+                cfg.half_window,
+                nslc,
+                cfg.strides,
+                cfg.shp_alpha,
+            ))
+        }
+        ShpMethod::Ks => Some(estimate_neighbors_ks(
+            amplitude.view(),
+            cfg.half_window,
+            cfg.strides,
+            cfg.shp_alpha,
+            false,
+        )),
+    }
 }
 
 /// Build the fused-pass parameters. `num_looks` is dolphin's conservative

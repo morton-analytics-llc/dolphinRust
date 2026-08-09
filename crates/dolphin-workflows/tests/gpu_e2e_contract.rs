@@ -11,7 +11,7 @@
 //! Runs only in the default (gpu) build and only when a GPU adapter is present.
 #![cfg(feature = "gpu")]
 
-use dolphin_core::config::{CompressedSlcPlan, ComputeBackend};
+use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{ComputeEngine, ResolvedBackend};
 use dolphin_workflows::{run_sequential, SequentialConfig};
@@ -53,6 +53,11 @@ fn config() -> SequentialConfig {
         compute_crlb: false,
         compute_closure_phase: false,
         compute_average_coherence: true,
+        // These fixtures come from dolphin's `run_phase_linking` with no
+        // `neighbor_arrays`, i.e. the rectangular window, so pin the method
+        // rather than inheriting dolphin's GLRT config default.
+        shp_method: ShpMethod::Rect,
+        shp_alpha: 0.001,
     }
 }
 
