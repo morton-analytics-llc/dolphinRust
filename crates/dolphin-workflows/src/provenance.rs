@@ -593,9 +593,16 @@ fn incidence(
     Some(stats)
 }
 
-/// Verify each CSLC-S1-STATIC granule belongs to the same pass and burst set as
+/// Verify each CSLC-S1-STATIC granule belongs to the same pass and **track** as
 /// the CSLC stack (STATIC products carry the same `/identification` group). A
 /// mismatched STATIC would otherwise source plausible-but-wrong incidence.
+///
+/// Burst identity is deliberately *not* required: a frame can extend past the
+/// valid LOS of the bursts whose CSLCs are being processed, and covering it needs
+/// the along-track neighbour STATIC — whose burst is by definition not in the
+/// stack (#39). Track identity is the physical requirement; a same-track
+/// neighbour's LOS is checked against the mosaic in the overlap by
+/// [`dolphin_corrections::geometry::resolve_los_geometry`].
 fn verify_static_consistency(
     geometry_files: &[PathBuf],
     granules: &[GranuleMeta],
@@ -604,14 +611,14 @@ fn verify_static_consistency(
         .iter()
         .map(|g| g.ident.orbit_pass_direction.to_ascii_lowercase())
         .collect();
-    let stack_bursts: Vec<String> = granules
+    let stack_tracks: Vec<String> = granules
         .iter()
-        .map(|g| normalize_burst_id(&g.ident.burst_id))
+        .map(|g| burst_track(&g.ident.burst_id))
         .collect();
     for path in geometry_files {
         let name = granule_name(path);
         let ident = read_cslc_identification(path)
-            .map_err(|e| format!("STATIC granule {name}: identification unreadable ({e}) — cannot verify pass/burst consistency"))?;
+            .map_err(|e| format!("STATIC granule {name}: identification unreadable ({e}) — cannot verify pass/track consistency"))?;
         let pass = ident.orbit_pass_direction.to_ascii_lowercase();
         if !stack_passes.contains(&pass) {
             return Err(format!(
@@ -619,10 +626,12 @@ fn verify_static_consistency(
                 ident.orbit_pass_direction
             ));
         }
-        let burst = normalize_burst_id(&ident.burst_id);
-        if !stack_bursts.contains(&burst) {
+        let track = burst_track(&ident.burst_id);
+        if !stack_tracks.contains(&track) {
             return Err(format!(
-                "STATIC granule {name} burst_id {burst:?} not in the CSLC stack's burst set"
+                "STATIC granule {name} track {track:?} (burst_id {:?}) is not on the CSLC stack's \
+                 track set {stack_tracks:?}",
+                normalize_burst_id(&ident.burst_id)
             ));
         }
     }
@@ -632,6 +641,16 @@ fn verify_static_consistency(
 /// Normalize a burst id for comparison (`T144-308011-IW2` ≡ `t144_308011_iw2`).
 fn normalize_burst_id(raw: &str) -> String {
     raw.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+/// Track prefix of a burst id (`T144-308011-IW2` → `t144`). Falls back to the
+/// whole normalized id when the id carries no separator, so an unparseable id
+/// stays strict rather than matching everything.
+fn burst_track(raw: &str) -> String {
+    let normalized = normalize_burst_id(raw);
+    normalized
+        .split_once('_')
+        .map_or(normalized.clone(), |(track, _)| track.to_string())
 }
 
 /// Heading, azimuth spacing, and time-of-day for one granule.

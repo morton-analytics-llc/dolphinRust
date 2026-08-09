@@ -101,6 +101,20 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **The STATIC identity check no longer rejects the along-track neighbour the LOS mosaic
+  needs** (issue #39). `verify_static_consistency` required every
+  `correction_options.geometry_files` granule's `burst_id` to be in the CSLC stack's burst
+  set — incompatible with the multi-burst LOS mosaic the same code advertises, because a
+  frame legitimately extends past the valid LOS of the bursts being processed. On the
+  three-station GNSS fixture that clips burst `008704`'s north-west corner by 309,940 pixels
+  (3.21%) and needs `008705`, which is by definition not in the stack. The failure was silent:
+  LOS marked absent, the scalar `incidence_angle_deg` (37°) substituted, and with troposphere
+  enabled the zenith→slant projection used `1/cos 37° = 1.252` instead of the true per-pixel
+  `1/up ≈ 1.18` — a ~6% error in the applied correction. The rule is now same **track** and
+  pass; a different track is still rejected (the same frame intersects T041, T078 and T143).
+  Because a neighbour's LOS is now mosaicked in, `resolve_los_geometry` checks rather than
+  trusts first-covered-burst-wins: overlapping granules must agree to a median 1° over their
+  shared pixels, else the new `CorrectionError::GeometryOverlapMismatch`.
 - **A pixel with no usable CRLB no longer loses its displacement** (issue #34). The NaN bound
   on a singular `Γ` is correct and matches dolphin v0.42, but it reached the observation
   precisions as a **zero weight**, making the normal equations singular and destroying the

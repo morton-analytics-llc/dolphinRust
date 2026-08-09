@@ -433,15 +433,11 @@ fn wrong_pass_static_is_absent_not_sourced() {
     let _hdf5 = hdf5_guard();
     let path = std::env::temp_dir().join("geomprov_wrong_pass_static.h5");
     let _ = std::fs::remove_file(&path);
-    write_static_identification(&path, "Ascending"); // the CSLC stack is Descending
+    // The CSLC stack is Descending.
+    write_static_identification(&path, "Ascending", "t144_308011_iw2");
 
-    let los = LosGeometry {
-        east: Array2::from_elem((8, 8), 0.62),
-        north: Array2::from_elem((8, 8), -0.11),
-        up: Array2::from_elem((8, 8), (1.0_f64 - 0.62 * 0.62 - 0.11 * 0.11).sqrt()),
-    };
     let cfg = cfg_with_static(&path);
-    let prov = assemble_geometry_provenance(&cfg, Some(&los));
+    let prov = assemble_geometry_provenance(&cfg, Some(&plausible_los()));
 
     assert_eq!(prov.incidence_angle_deg, None, "wrong-pass STATIC sourced");
     assert!(
@@ -452,15 +448,71 @@ fn wrong_pass_static_is_absent_not_sourced() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// #39: the along-track neighbour STATIC is the granule the LOS mosaic needs when
+/// the frame extends past the processed burst's valid LOS. Its burst is by
+/// definition not in the CSLC stack, so requiring burst identity silently dropped
+/// LOS to the scalar-incidence fallback. Same track + pass must be accepted.
+#[test]
+fn same_track_neighbour_burst_static_is_sourced() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join("geomprov_neighbour_burst_static.h5");
+    let _ = std::fs::remove_file(&path);
+    // Stack burst is t144_308011_iw2; this is the along-track neighbour.
+    write_static_identification(&path, "Descending", "t144_308012_iw2");
+
+    let cfg = cfg_with_static(&path);
+    let prov = assemble_geometry_provenance(&cfg, Some(&plausible_los()));
+
+    assert!(
+        prov.incidence_angle_deg.is_some(),
+        "same-track neighbour STATIC not sourced: {}",
+        absent_reason(&prov, "incidence_angle_deg")
+    );
+    assert!(sourced(&prov, "incidence_angle_deg"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The relaxation is track-scoped, not a removal: a STATIC from a different track
+/// that happens to share the pass direction is still rejected. The GNSS-fixture
+/// frame intersects T041/T078/T143, whose LOS would be wrong to mosaic.
+#[test]
+fn wrong_track_static_is_absent_not_sourced() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join("geomprov_wrong_track_static.h5");
+    let _ = std::fs::remove_file(&path);
+    write_static_identification(&path, "Descending", "t041_308011_iw2");
+
+    let cfg = cfg_with_static(&path);
+    let prov = assemble_geometry_provenance(&cfg, Some(&plausible_los()));
+
+    assert_eq!(prov.incidence_angle_deg, None, "wrong-track STATIC sourced");
+    assert!(
+        absent_reason(&prov, "incidence_angle_deg").contains("t041"),
+        "reason names the offending track"
+    );
+    assert!(!prov.decomposition_geometry_complete);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A uniform LOS with plausible S1 incidence — the identity cross-check, not the
+/// LOS values, is what these tests exercise.
+fn plausible_los() -> LosGeometry {
+    LosGeometry {
+        east: Array2::from_elem((8, 8), 0.62),
+        north: Array2::from_elem((8, 8), -0.11),
+        up: Array2::from_elem((8, 8), (1.0_f64 - 0.62 * 0.62 - 0.11 * 0.11).sqrt()),
+    }
+}
+
 /// Minimal STATIC-shaped file carrying only `/identification` (the group the
 /// consistency check reads).
-fn write_static_identification(path: &Path, orbit_pass: &str) {
+fn write_static_identification(path: &Path, orbit_pass: &str, burst_id: &str) {
     let f = hdf5::File::create(path).unwrap();
     let g = f.create_group("identification").unwrap();
     for (key, value) in [
         ("orbit_pass_direction", orbit_pass),
         ("look_direction", "Right"),
-        ("burst_id", "t144_308011_iw2"),
+        ("burst_id", burst_id),
         ("zero_doppler_start_time", "2014-04-03 00:00:00.000000"),
         ("zero_doppler_end_time", "2014-04-03 00:00:03.000000"),
     ] {

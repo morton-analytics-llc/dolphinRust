@@ -45,7 +45,11 @@ modelling + raster subtraction, no solver.
   is the ellipsoid-normal angle the zenith→slant `1/cos` mapping needs — **not**
   `local_incidence_angle`, which is terrain-relative). Atmospheric slant is then per-pixel
   `1/up`. **CSLC-S1-STATIC is per-burst**, so a multi-burst frame needs the per-burst granule
-  list, mosaicked (first-covered-burst wins). **Nodata rule matches dolphin (`nodata=0`):** every
+  list, mosaicked (first-covered-burst wins). Granules that overlap must **agree** there —
+  median LOS angle difference ≤ 1° over the shared pixels, else `GeometryOverlapMismatch`; the
+  provenance identity check is track-scoped, not burst-scoped, so the along-track neighbour
+  STATIC a frame needs is accepted and this is what keeps it honest (#39).
+  **Nodata rule matches dolphin (`nodata=0`):** every
   component is reprojected via `warp_to_frame` (GDAL fills off-coverage with exactly 0), so a
   frame pixel is valid iff `east≠0 || north≠0` and finite; for S1 (incidence 30–46°) a valid
   pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Partial coverage is a

@@ -903,7 +903,35 @@ passing comparison into a failing one.
 
 The long-baseline case cannot be demonstrated end-to-end yet: the three-station frame needs
 the along-track neighbour's STATIC for LOS coverage, and `verify_static_consistency` rejects
-it (issue #39), which silently drops the run to scalar incidence.
+it (issue #39), which silently drops the run to scalar incidence. **Resolved 2026-08-09 —
+see below.**
+
+### The along-track neighbour STATIC, on the real granules (2026-08-09, #39)
+
+`verify_static_consistency` demanded that every `geometry_files` granule's `burst_id` be in
+the CSLC stack's burst set. Measured on the three-station frame
+(`mmx1_icmx_mxtx_common`, EPSG:32614, 1547 × 6248), that rule is unsatisfiable:
+
+| | result |
+|---|---|
+| 008704 alone (the processed burst) | **309,940 frame pixels (3.2%) uncovered** |
+| 008704 + 008705 (along-track neighbour) | full coverage; incidence mean **32.4772°**, std 0.6116°, range 31.3121–33.6254° |
+| overlap between the two | **694,037 px**, LOS difference median / p99 / max all **< 5e-5°** |
+
+The neighbour's burst is by definition not in the CSLC stack, so the run did not fail — it
+marked LOS absent and fell back to the scalar `incidence_angle_deg` (37°). With troposphere
+enabled that projects zenith→slant with `1/cos 37° = 1.2521` instead of the resolved
+`1/cos 32.4772° = 1.1854` — the correction applied **5.6% too large**, every pixel, silently.
+
+The rule is now same **track** and pass. Track identity is the physical requirement; the
+pass check still blocks the genuinely wrong case (this frame also intersects T041, T078,
+T143). Because a neighbour's LOS is now mosaicked in, `resolve_los_geometry` no longer
+trusts first-covered-burst-wins blindly: overlapping granules must agree to a median 1°
+across their shared pixels. On the real pair they agree to **better than 5e-5°** — the two
+STATIC products are derived on a common geocoded grid, so the shared region is identical,
+not merely close. Gate: `crates/dolphin-corrections/tests/los_neighbour_burst_real.rs`
+(skips when the fixtures are absent; the overlap statistic there is computed independently
+of the one inside `resolve_los_geometry`, so it is a cross-check rather than a restatement).
 
 ### What truth set this burst can support (surveyed 2026-08-08)
 

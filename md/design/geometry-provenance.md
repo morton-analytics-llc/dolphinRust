@@ -143,9 +143,9 @@ sign-insensitive, so a STATIC granule from the wrong pass — or an adjacent tra
 an overlap zone — yields perfectly plausible sourced incidence. Before sourcing
 incidence, each `geometry_files` granule's `/identification` (STATIC products carry
 the same group) is cross-checked against the CSLC stack: `orbit_pass_direction`
-must match and its normalized `burst_id` must be in the stack's burst set; any
-mismatch or unreadable STATIC identification → incidence absent with the mismatch
-as reason (fail-safe). When the CSLC identifications themselves are unreadable the
+must match and its `burst_id`'s **track** prefix must be in the stack's track set;
+any mismatch or unreadable STATIC identification → incidence absent with the
+mismatch as reason (fail-safe). When the CSLC identifications themselves are unreadable the
 check cannot run — incidence stays sourced with an "unverified" note, and the
 decomposition gate is already closed via the absent CSLC-derived fields.
 
@@ -153,6 +153,27 @@ decomposition gate is already closed via the absent CSLC-derived fields.
 `acquisition_time_of_day_utc_s` sourced: with readable granules it can only be
 absent through its 60 s consistency gate, which signals a mixed stack (e.g. an
 adjacent relative orbit whose heading/spacing still pass their gates).
+
+**Why track, not burst (#39).** Burst identity was the original rule and it is too
+strict: a frame legitimately extends past the valid LOS of the bursts whose CSLCs are
+being processed, and covering the remainder needs the **along-track neighbour**
+STATIC — whose burst is by definition not in the stack. On the three-station GNSS
+fixture that clipped burst `008704`'s north-west corner by 309,940 pixels (3.21%), and
+because the failure is fail-safe rather than fatal it degraded silently: LOS marked
+absent, the scalar `incidence_angle_deg` (37°) used instead, and with troposphere
+enabled the zenith→slant projection off by ~6% (`1/cos 37° = 1.252` vs a true
+`1/up ≈ 1.18`). Track identity is the physical requirement, and the pass-direction
+check still blocks the genuinely wrong case — the same frame intersects T041, T078 and
+T143, whose LOS would be wrong to mosaic.
+
+Accepting a neighbour's LOS assumes the two bursts' geometry agrees where they
+overlap (694,037 pixels on this frame), so `resolve_los_geometry` now **checks** that
+instead of trusting first-covered-burst-wins: the median angle between the mosaicked
+LOS and each incoming granule's LOS over their shared pixels must be ≤ 1°, else
+`GeometryOverlapMismatch`. The median, not the max — both footprints' bilinear edge
+rings (GDAL blends against nodata `0`) fall inside the overlap and would dominate a
+max, whereas a granule that does not belong to the frame disagrees throughout.
+Overlaps under 32 pixels are not gated; a sliver is all edge ring.
 
 Notes:
 

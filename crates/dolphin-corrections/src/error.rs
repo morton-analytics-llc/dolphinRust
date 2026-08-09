@@ -58,6 +58,11 @@ pub enum CorrectionError {
     /// pixels, so it is a hard error instead.
     #[error("los geometry coverage: {0}")]
     GeometryCoverage(String),
+    /// Two supplied CSLC-S1-STATIC granules carry materially different LOS where
+    /// their footprints overlap. Mosaicking them first-covered-burst-wins would
+    /// pick one arbitrarily, so the disagreement is a hard error (#39).
+    #[error("los geometry overlap: {0}")]
+    GeometryOverlapMismatch(String),
     /// RAiDER was requested but is not installed (no `python -c 'import RAiDER'`
     /// and no `raider.py` on PATH). Gated like SNAPHU — never stubbed.
     #[error("RAiDER is not installed; install it or supply troposphere_files (OPERA L4)")]

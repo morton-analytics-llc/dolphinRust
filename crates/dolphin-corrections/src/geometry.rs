@@ -3,7 +3,9 @@
 //! Ingests the OPERA CSLC-S1-STATIC `los_east`/`los_north` unit-vector components
 //! ([`dolphin_io::read_los_layers`]), reprojects each per-burst granule onto the
 //! displacement frame grid, mosaics them (first covered burst wins), and derives
-//! the up component. The result drives the atmospheric zenith→slant projection
+//! the up component. Where two granules' footprints overlap, first-covered-wins is
+//! only defensible if they agree there, so the overlap is checked rather than
+//! trusted (#39). The result drives the atmospheric zenith→slant projection
 //! (`slant = 1/up = 1/cos(incidence)`) and the GPS-harness ENU→LOS projection
 //! (`d_los = d_e·east + d_n·north + d_u·up`; ground→sensor, positive = toward sat).
 //!
@@ -77,14 +79,27 @@ pub struct IncidenceStats {
     pub max_deg: f64,
 }
 
+/// Maximum tolerated median LOS disagreement, in degrees, between granules where
+/// their footprints overlap. Bursts on the same track image a shared ground point
+/// at very nearly the same look geometry, so real agreement is far tighter; the
+/// gate is loose enough to absorb warp resampling and tight enough to catch a
+/// granule whose geometry does not belong to this frame.
+const OVERLAP_AGREEMENT_GATE_DEG: f64 = 1.0;
+
+/// Overlaps smaller than this are not gated — a sliver is dominated by the
+/// bilinear seam ring and carries no usable statistic.
+const MIN_OVERLAP_PIXELS: usize = 32;
+
 /// Resolve per-pixel LOS geometry onto the frame grid from one-or-more per-burst
 /// CSLC-S1-STATIC granules. Each granule is reprojected onto `(dst_gt, dst_epsg,
 /// shape)` and mosaicked (first covered burst wins); coverage over the whole frame
-/// is required.
+/// is required, and granules that overlap must agree there.
 ///
 /// # Errors
 /// [`CorrectionError::GeometryCoverage`] if `layers` is empty or any frame pixel is
-/// left uncovered; [`CorrectionError::Gdal`]/[`CorrectionError::Shape`] on warp failure.
+/// left uncovered; [`CorrectionError::GeometryOverlapMismatch`] if overlapping
+/// granules carry materially different LOS;
+/// [`CorrectionError::Gdal`]/[`CorrectionError::Shape`] on warp failure.
 pub fn resolve_los_geometry(
     layers: &[LosLayers],
     dst_gt: [f64; 6],
@@ -99,12 +114,15 @@ pub fn resolve_los_geometry(
     let mut east = Array2::<f64>::zeros(shape);
     let mut north = Array2::<f64>::zeros(shape);
     let mut covered = Array2::from_elem(shape, false);
+    let mut disagreement_deg = Vec::new();
     for layer in layers {
         let e = warp_component(&layer.east, layer.geo, dst_gt, dst_epsg, shape)?;
         let n = warp_component(&layer.north, layer.geo, dst_gt, dst_epsg, shape)?;
+        disagreement_deg.extend(overlap_disagreement_deg(&east, &north, &covered, &e, &n));
         fill_uncovered(&mut east, &mut north, &mut covered, &e, &n);
     }
     ensure_full_coverage(&covered)?;
+    ensure_overlap_agreement(&mut disagreement_deg)?;
     let up = derive_up(&east, &north);
     Ok(LosGeometry { east, north, up })
 }
@@ -150,6 +168,60 @@ fn fill_uncovered(
                 *cov = true;
             }
         });
+}
+
+/// Angle between the already-mosaicked LOS and this granule's LOS, in degrees, at
+/// every pixel where both are valid. Empty when the footprints do not overlap.
+fn overlap_disagreement_deg(
+    east: &Array2<f64>,
+    north: &Array2<f64>,
+    covered: &Array2<bool>,
+    e: &Array2<f64>,
+    n: &Array2<f64>,
+) -> Vec<f64> {
+    let mut diffs = Vec::new();
+    Zip::from(east)
+        .and(north)
+        .and(covered)
+        .and(e)
+        .and(n)
+        .for_each(|&eo, &no, &cov, &ev, &nv| {
+            let valid = cov && ev.is_finite() && nv.is_finite() && (ev != 0.0 || nv != 0.0);
+            if valid {
+                diffs.push(los_angle_between_deg([eo, no], [ev, nv]));
+            }
+        });
+    diffs
+}
+
+/// Angle in degrees between two ground→sensor LOS unit vectors given their
+/// horizontal components (`up` is derived, so the pair is fully determined).
+fn los_angle_between_deg(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let up = |[e, n]: [f64; 2]| (1.0 - e * e - n * n).max(0.0).sqrt();
+    let dot = a[0] * b[0] + a[1] * b[1] + up(a) * up(b);
+    dot.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// Error if overlapping granules disagree. Gates on the **median** rather than the
+/// max: both footprints' bilinear edge rings (GDAL blends against nodata `0`) fall
+/// inside the overlap and would dominate a max, whereas a granule that does not
+/// belong to this frame disagrees across the whole overlap.
+fn ensure_overlap_agreement(diffs: &mut [f64]) -> Result<()> {
+    if diffs.len() < MIN_OVERLAP_PIXELS {
+        return Ok(());
+    }
+    diffs.sort_by(f64::total_cmp);
+    let median = diffs[diffs.len() / 2];
+    if median <= OVERLAP_AGREEMENT_GATE_DEG {
+        return Ok(());
+    }
+    Err(CorrectionError::GeometryOverlapMismatch(format!(
+        "supplied CSLC-S1-STATIC granules disagree where they overlap: median LOS difference \
+         {median:.3}° over {} overlap pixels exceeds the {OVERLAP_AGREEMENT_GATE_DEG}° gate \
+         (max {:.3}°) — the granules are not same-track neighbours of this frame",
+        diffs.len(),
+        diffs[diffs.len() - 1]
+    )))
 }
 
 /// Error if any frame pixel is uncovered by every supplied granule.
@@ -279,21 +351,49 @@ mod tests {
     }
 
     /// Bar #6: two granules mosaic first-valid-wins — burst A's nodata hole is filled
-    /// from burst B, and A's valid region is kept over B.
+    /// from burst B, and A's valid region is kept over B. B is the along-track
+    /// neighbour, so its geometry agrees with A's in the overlap (0.3° apart).
     #[test]
     fn mosaics_first_valid_wins() {
         let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
         // Burst A: valid everywhere except a nodata (0,0) hole in the last two cols.
-        let mut a = constant_layer((6, 6), -0.30, -0.45, gt, 32614);
-        a.east.slice_mut(ndarray::s![.., 4..]).fill(0.0);
-        a.north.slice_mut(ndarray::s![.., 4..]).fill(0.0);
-        // Burst B: valid everywhere, a different geometry.
-        let b = constant_layer((6, 6), -0.20, -0.50, gt, 32614);
+        let mut a = constant_layer((8, 8), -0.30, -0.45, gt, 32614);
+        a.east.slice_mut(ndarray::s![.., 6..]).fill(0.0);
+        a.north.slice_mut(ndarray::s![.., 6..]).fill(0.0);
+        // Burst B: the along-track neighbour — valid everywhere, near-identical LOS.
+        let b = constant_layer((8, 8), -0.305, -0.452, gt, 32614);
 
-        let los = resolve_los_geometry(&[a, b], gt, 32614, (6, 6)).unwrap();
+        let los = resolve_los_geometry(&[a, b], gt, 32614, (8, 8)).unwrap();
         // Interior of A's valid region keeps A.
         assert!((los.east[(2, 1)] - (-0.30)).abs() < 1e-6, "A region");
-        // The hole (col 5) is filled from B.
-        assert!((los.east[(2, 5)] - (-0.20)).abs() < 1e-6, "B fills hole");
+        // The hole (col 7) is filled from B.
+        assert!((los.east[(2, 7)] - (-0.305)).abs() < 1e-6, "B fills hole");
+    }
+
+    /// #39: relaxing the provenance rule to same-track means a neighbour burst's
+    /// LOS is mosaicked in, so first-covered-wins must be *checked* in the overlap.
+    /// Two granules whose look geometry differs by ~6° are rejected, not silently
+    /// resolved to whichever one happened to be listed first.
+    #[test]
+    fn disagreeing_overlap_is_error() {
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        let a = constant_layer((8, 8), -0.30, -0.45, gt, 32614);
+        let b = constant_layer((8, 8), -0.20, -0.50, gt, 32614);
+        let err = resolve_los_geometry(&[a, b], gt, 32614, (8, 8)).unwrap_err();
+        assert!(
+            matches!(err, CorrectionError::GeometryOverlapMismatch(_)),
+            "{err}"
+        );
+    }
+
+    /// The overlap gate must not fire on granules that agree: a full-frame overlap
+    /// of two near-identical neighbours resolves normally.
+    #[test]
+    fn agreeing_overlap_resolves() {
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        let a = constant_layer((8, 8), -0.30, -0.45, gt, 32614);
+        let b = constant_layer((8, 8), -0.302, -0.451, gt, 32614);
+        let los = resolve_los_geometry(&[a, b], gt, 32614, (8, 8)).unwrap();
+        assert!((los.east[(4, 4)] - (-0.30)).abs() < 1e-6);
     }
 }
