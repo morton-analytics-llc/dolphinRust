@@ -871,6 +871,40 @@ because at 23–34 km the unmodelled delay exceeds the near-null differential si
 original 11 km MMX1−ICMX pair was well chosen. Long-baseline pairs need
 `correction_options` troposphere enabled before their coverage means anything.
 
+### Tropospheric correction: correct, and it makes the 11 km pair worse (2026-08-09, #38)
+
+With the DEM height interpolation in place, the MMX1/ICMX frame was run with
+`troposphere_files` (13 OPERA L4 TROPO-ZENITH granules) and `dem_file` (Copernicus DEM 30 m,
+the family OPERA itself used), against the same GNSS truth:
+
+| | RMSE | corr | TLS | endpoint residual | velocity Δ | coverage (CRLB) |
+|---|---:|---:|---:|---:|---:|---|
+| uncorrected | 10.20 | 0.954 | 1.062 | +11.88 mm | −3.32 mm/yr | 0.500 / 0.583 / 0.833 |
+| **corrected** | **13.78** | 0.936 | 1.204 | **−3.36 mm** | **−30.14 mm/yr** | 0.250 / 0.583 / 0.583 |
+
+The endpoint residual improves markedly (11.88 → −3.36 mm) but the correction injects a
+**+12 mm trend** across the 13 epochs, which dominates the velocity comparison.
+
+**The implementation is not at fault.** The applied delay was checked against an independent
+Python computation from the same granules: Rust gives 10.21 mm at epoch 6 with a 12.0 mm
+trend, bilinear Python gives 10.82 mm and 12.12 mm. Absolute delays agree too (MMX1 epoch 0:
+2.1695 m Rust vs 2.170 m Python).
+
+**The product does not resolve an 11 km differential.** Sampling the same field
+nearest-neighbour instead of bilinear changes the epoch-6 differential from 10.82 mm to
+2.08 mm — a 5× swing from an interpolation choice alone. When the answer depends that
+strongly on how the grid is sampled, the ~7.4 km field is not carrying real structure at that
+separation, and applying it adds model noise on top of a real differential of order 2 mm.
+
+This is consistent with the earlier baseline analysis: HRES explained **107%** of the 23 km
+residual and **68%** of the 34 km one, but **~0%** at 11 km. Tropospheric correction is a
+long-baseline instrument. **Do not enable it unconditionally** — on this pair it turns a
+passing comparison into a failing one.
+
+The long-baseline case cannot be demonstrated end-to-end yet: the three-station frame needs
+the along-track neighbour's STATIC for LOS coverage, and `verify_static_consistency` rejects
+it (issue #39), which silently drops the run to scalar incidence.
+
 ### What truth set this burst can support (surveyed 2026-08-08)
 
 19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the

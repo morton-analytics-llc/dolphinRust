@@ -32,7 +32,11 @@ SAFE_YAML = RuamelYAML(typ="safe")
 
 
 def build_backend_configs(
-    base: dict[str, Any], static_paths: list[Path], run_root: Path
+    base: dict[str, Any],
+    static_paths: list[Path],
+    run_root: Path,
+    troposphere: list[Path] | None = None,
+    dem: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     configs = []
     for backend in ["native", "snaphu"]:
@@ -42,6 +46,13 @@ def build_backend_configs(
         config.setdefault("correction_options", {})["geometry_files"] = [
             str(path) for path in static_paths
         ]
+        # The L4 product is height-resolved, so the DEM is required alongside it;
+        # without one the workflow rejects the granule rather than reading the
+        # -500 m level (issue #38).
+        corrections = config.setdefault("correction_options", {})
+        if troposphere:
+            corrections["troposphere_files"] = [str(path) for path in troposphere]
+            corrections["dem_file"] = str(dem)
         config.setdefault("input_options", {}).setdefault("wavelength", 0.05546576)
         timeseries = config.setdefault("timeseries_options", {})
         timeseries["method"] = "L2"
@@ -289,7 +300,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     base_path = run_root / "config_base.yaml"
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
     native, snaphu = build_backend_configs(
-        base, [path.resolve() for path in static_files], run_root
+        base,
+        [path.resolve() for path in static_files],
+        run_root,
+        sorted(args.troposphere_dir.glob("*.nc")) if args.troposphere_dir else None,
+        args.dem.resolve() if args.dem else None,
     )
     assert_backend_config_identity(native, snaphu)
     if args.native_only:
@@ -398,6 +413,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--no-run", action="store_true", help="reuse existing backend outputs")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument(
+        "--troposphere-dir",
+        type=Path,
+        help="directory of OPERA L4 TROPO-ZENITH granules, one per declared date",
+    )
+    parser.add_argument("--dem", type=Path, help="DEM for L4 height interpolation (issue #38)")
     parser.add_argument(
         "--native-only",
         action="store_true",
