@@ -150,8 +150,12 @@ All notable changes to dolphinRust are documented here. The format follows
   alternative: on an exactly-determined single-reference network it collapses to a spatially
   constant `(AᵀA)⁻¹` geometry factor with no physical scale. On that network the residual-based
   inflation is inert (`dof = 0`, residual RMS ~3e-18), so **no layer carries empirical
-  scale** — an over-determined network (`max_bandwidth >= 2`) is what restores it. Issues #36
-  (which layer is the product) and #35 (truth set).
+  scale** — the posterior column is bit-for-bit the CRLB column there. An over-determined
+  network restores it: scored A/B on the same GNSS truth, `max_bandwidth: 3` moves
+  posterior-only coverage from 0.500/0.583/0.833 to **0.583/0.833/1.000** and velocity
+  agreement from −3.319 to −2.243 mm/yr. Recommendation: carry the over-determined posterior
+  as the uncertainty product; the library default stays `null` to match dolphin, so this is a
+  deployment choice (issue #36). Truth-set limits in issue #35.
 
 ## [v1.4.0] — 2026-06-18
 

@@ -754,8 +754,34 @@ Its near-nominal coverage is a coincidence of magnitude, not calibration.
 all** — every layer traces back to the CRLB lower bound, the residual-based inflation is inert
 at dof = 0, and `timeseries_residual_rms.tif` is a no-op product. An over-determined network
 restores it: at `max_bandwidth: 3` the posterior at MMX1 rises 2.5055 → **5.5041 mm** (2.2×)
-from the data rather than from CRLB. Tracked as issue #36; this is a network-geometry
-decision, not a weighting-flag one.
+from the data rather than from CRLB.
+
+#### Scored A/B: over-determined network vs single-reference (issue #36)
+
+Both configurations scored against the same GNSS truth, same fixture, 12 evaluated epochs:
+
+| configuration | CRLB-only | posterior-only | velocity Δ vs GNSS | endpoint RMSE |
+|---|---|---|---:|---:|
+| single-reference (`max_bandwidth: null`) | 0.500 / 0.583 / 0.833 | **0.500 / 0.583 / 0.833** | −3.319 mm/yr | 10.201 mm |
+| `max_bandwidth: 3` | 0.500 / 0.583 / 0.833 | **0.583 / 0.833 / 1.000** | **−2.243 mm/yr** | 10.186 mm |
+| nominal | 0.68 / 0.90 / 0.95 | 0.68 / 0.90 / 0.95 | — | — |
+
+Two things to read here. First, on the single-reference network the posterior column is
+**identical** to the CRLB column — direct confirmation that the posterior adds no information
+there, exactly as `dof = 0` predicts. Second, the over-determined network separates them and
+moves the posterior toward nominal, and independently improves velocity agreement with GNSS
+from −3.319 to −2.243 mm/yr. CRLB-only is unchanged, as expected: it comes from phase linking
+and does not depend on the interferogram network.
+
+**Recommendation:** carry the posterior from an over-determined network as the uncertainty
+product; do not publish CRLB or the unweighted posterior as one. The library default for
+`max_bandwidth` stays `null` to match dolphin's, so this is a deployment configuration choice,
+tracked in issue #36.
+
+**Still not a calibration claim.** 0.583 / 0.833 / 1.000 against 0.68 / 0.90 / 0.95 is closer
+but still under at 68% and 90%, and every bin quantizes at 8.3% on 12 correlated samples. The
+`dof = 0` mechanism is structural and certain; "the over-determined posterior is calibrated"
+is not established and needs issue #35.
 
 It is now wired behind `timeseries_options.correct_velocity_temporal_correlation` (forward
 divergence from dolphin, **off by default**, following the `correct_phase_bias` precedent).
@@ -858,9 +884,25 @@ oracle/.venv/bin/python validation/run_gps_ground_truth.py \
     --recipe <recipe> --fixture shared --native-only --score
 ```
 
-**Scientific status: NOT EVALUABLE.** Both the stored Earthdata bearer token and the standard
-`.netrc` credentials failed authentication before the first download. The frozen metadata cohort
-is feasibility evidence only; no multi-burst displacement or calibration claim exists.
+**Scientific status: FAIL / NOT EVALUABLE (executed 2026-08-08).** The stored bearer token was
+stale, but the current EDL account token was fetched at runtime. All 152 CSLC epochs and five
+STATIC products downloaded and passed HDF5 validation. Four bursts produced evaluable native
+receipts and failed their point-estimate thresholds; nominal 90% coverage was 0.107–0.300 for
+CRLB and 0.143–0.367 for posterior. `T137_292316_IW3` abstained because JPLM had 0/25 finite
+CRLB, posterior, and velocity-sigma pixels in the preregistered 5×5 window while displacement
+and coherence remained 25/25 finite. With only four evaluable bursts, `score_gnss_cohort.py`
+returned `not_evaluable` and did not fit a scale.
+
+`T150_320250_IW3` required one outcome-blind fixture amendment: the full STATIC product has a
+triangular NaN corner that left 4,098 pixels of the original 32-pixel-margin frame unsupported.
+Reducing the margin to three pixels retained both stations and every declared sampling window;
+the exact GDAL preflight then reported 0/6,578,052 uncovered geometry pixels. No station,
+acquisition, or sampling-window selection changed.
+
+This pilot does not support a calibration claim. The single-reference network is exactly
+determined, the required iid baseline was not produced, and every receipt does not embed the
+processing-binary hash. Re-entry requires an over-determined network, a new outcome-blind cohort,
+and five evaluable held-out bursts.
 
 ## Distinct coherence and degenerate-input contracts (2026-07-21)
 
