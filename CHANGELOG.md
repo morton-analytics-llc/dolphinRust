@@ -146,9 +146,12 @@ All notable changes to dolphinRust are documented here. The format follows
 - **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
   temporally correlated epochs quantize every 68/90/95 bin at 8.3%, from one station pair on
   one burst. The CRLB columns under-cover **by construction** — a Cramér–Rao *lower* bound
-  used as a predicted σ must under-predict the spread — so the layer to carry as
-  "uncertainty" is the unweighted posterior, the only column near nominal. A defensible
-  calibration needs more stations in this burst or more frames (issue #35).
+  used as a predicted σ must under-predict the spread. The unweighted posterior is **not** an
+  alternative: on an exactly-determined single-reference network it collapses to a spatially
+  constant `(AᵀA)⁻¹` geometry factor with no physical scale. On that network the residual-based
+  inflation is inert (`dof = 0`, residual RMS ~3e-18), so **no layer carries empirical
+  scale** — an over-determined network (`max_bandwidth >= 2`) is what restores it. Issues #36
+  (which layer is the product) and #35 (truth set).
 
 ## [v1.4.0] — 2026-06-18
 

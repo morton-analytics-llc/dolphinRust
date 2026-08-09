@@ -729,6 +729,34 @@ comparison; the 68/90/95 table is built from per-epoch `crlb_sigma_NN.tif` and
 `displacement_variance_NN.tif`. AR(1) inflation corrects the **velocity slope** σ, a different
 quantity.
 
+#### Correction (same day): the unweighted posterior is not calibrated either
+
+The paragraph above recommended the unweighted posterior. That was wrong, and the reason
+matters more than the recommendation.
+
+`solve_pixel_with_covariance` returns `(AᵀWA)⁻¹ · max(weighted_sse/dof, 1)` with
+`dof = n_valid_ifgs − n_unknowns`. This frame is **exactly determined** — 13 dates,
+`max_bandwidth: null` → 12 interferograms for 12 unknowns → **dof = 0**, so the inflation is
+pinned to 1.0 and the fit is exact. `timeseries_residual_rms.tif` confirms it: median
+**3.4e-18**.
+
+| configuration | residual RMS | posterior σ at MMX1 | frame median | spatial std |
+|---|---:|---:|---:|---:|
+| single-ref, weighted | 3.4e-18 | 2.5055 mm | 2.1475 mm | 0.4598 |
+| single-ref, **unweighted** | 0.0 | 6.2421 mm | **6.2421 mm** | — |
+| `max_bandwidth: 3`, weighted | 6.4e-03 | **5.5041 mm** | 5.0248 mm | 0.2287 |
+
+The unweighted posterior's frame median *equals* its station value: with `W = I` it collapses
+to `(AᵀA)⁻¹`, a spatially constant, dimensionless geometry factor carrying no physical scale.
+Its near-nominal coverage is a coincidence of magnitude, not calibration.
+
+**On a single-reference network there is therefore no empirical uncertainty in the pipeline at
+all** — every layer traces back to the CRLB lower bound, the residual-based inflation is inert
+at dof = 0, and `timeseries_residual_rms.tif` is a no-op product. An over-determined network
+restores it: at `max_bandwidth: 3` the posterior at MMX1 rises 2.5055 → **5.5041 mm** (2.2×)
+from the data rather than from CRLB. Tracked as issue #36; this is a network-geometry
+decision, not a weighting-flag one.
+
 It is now wired behind `timeseries_options.correct_velocity_temporal_correlation` (forward
 divergence from dolphin, **off by default**, following the `correct_phase_bias` precedent).
 Measured on the MMX1/ICMX frame with the flag on: velocity is bit-identical (max|Δ| = 0, the
