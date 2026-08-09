@@ -10,7 +10,7 @@ optimize. All math in `Cf64`.
   array. The #1 hot path. Two kernels: the **direct** per-pixel path (`_direct`,
   parallel over output pixels — the SHP-masked implementation and the tolerance oracle)
   and the **row-separable box-sum** (default for the unmasked rectangular window,
-  `neighbors: None` = the production path): parallel over output *rows*, reusing each
+  `neighbors: None`, i.e. `shp_method: rect`): parallel over output *rows*, reusing each
   row's per-column vertical sums across its output columns and summing each window in
   fixed left-to-right order. The sliding kernel matches direct to coherence ~1e-4 (order
   differs), **not** bit-exactly; but `fused==staged` and `tiled==whole` stay bit-identical

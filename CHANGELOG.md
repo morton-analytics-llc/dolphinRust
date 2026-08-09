@@ -87,7 +87,8 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ### Changed
 - **Phase-linking covariance — row-separable box-sum** (`dolphin-phaselink::covariance`).
-  The unmasked rectangular-window path (the entire production path — `neighbors: None`)
+  The unmasked rectangular-window path (`neighbors: None`, which was the entire
+  production path until SHP selection was wired in — see issue #29)
   now reuses per-output-row vertical sums across the row's output columns and sums each
   window directly in fixed left-to-right order, instead of re-reading the full
   `win_h×win_w` window per pixel. Targets the overlapping-window redundancy
