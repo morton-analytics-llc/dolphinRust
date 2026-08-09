@@ -711,6 +711,39 @@ temporal-correlation argument behind issue #20, whose AR(1) N_eff inflation
 (`estimate_velocity_with_uncertainty_neff`) is implemented but not yet wired into the
 workflow (issue #33).
 
+### Reading the coverage table correctly, and the N_eff correction (2026-08-08, issue #33)
+
+Two corrections to how the coverage numbers above were first described.
+
+**CRLB under-covering is not a defect.** The Cramér–Rao bound is a *lower* bound on achievable
+variance, so using it as the predicted σ must under-predict the real spread. The weighted
+posterior inherits the same optimism because its scale comes from CRLB precisions. The
+**unweighted** posterior takes its scale from the residuals themselves (the
+`(weighted_sse / dof).max(1.0)` inflation in `velocity_pixel_uncertainty_fit`) and is the only
+column close to nominal — 0.583 / 0.917 / 1.000 against 0.68 / 0.90 / 0.95, where the 68% gap
+is about one sample at 12 epochs. **The layer a consumer should carry as "uncertainty" is the
+unweighted posterior, not CRLB.**
+
+**The N_eff correction cannot move that table.** `velocity_sigma.tif` feeds only the velocity
+comparison; the 68/90/95 table is built from per-epoch `crlb_sigma_NN.tif` and
+`displacement_variance_NN.tif`. AR(1) inflation corrects the **velocity slope** σ, a different
+quantity.
+
+It is now wired behind `timeseries_options.correct_velocity_temporal_correlation` (forward
+divergence from dolphin, **off by default**, following the `correct_phase_bias` precedent).
+Measured on the MMX1/ICMX frame with the flag on: velocity is bit-identical (max|Δ| = 0, the
+correction touches only σ), and the inflation factor is median **1.0623**, mean 1.1096,
+p90 1.3007, p99 1.5488, max 2.8814. 59.9% of pixels inflate by more than 1%; 38.3% are exactly
+1.0 because their lag-1 residual autocorrelation is non-positive.
+
+**Caveat that limits what this proves.** At both GNSS stations the factor is exactly 1.000 —
+their residual lag-1 autocorrelation is *negative* (MMX1 −0.146, ICMX −0.132), which the
+estimator clamps to zero. So the correction is a no-op precisely where ground truth exists,
+and this dataset **cannot validate it against GNSS**. Frame-wide the median lag-1
+autocorrelation is only +0.028 with 55% of pixels positive, consistent with atmospheric noise
+decorrelating well inside the 12-day sampling. More stations (issue #35) would be needed to
+land a truth pixel where the correction actually bites.
+
 ### A missing bound no longer destroys the data (2026-08-08, issue #34)
 
 The NaN CRLB on a singular `Γ` is **correct** — dolphin v0.42 NaNs such blocks deliberately
@@ -788,6 +821,14 @@ CSLC transfer is 38.77 GB; exact recipe searches including STATIC products total
 bursts, improvement in mean 90% interval score, reduced 90% coverage error on at least four
 held-out bursts, and abstention for every nonfinite or nonpositive uncertainty value. Epochs and
 pixels never cross folds.
+
+Run each frozen cohort with the native weighted backend used by that gate:
+
+```sh
+oracle/.venv/bin/python validation/crop_real.py --recipe <recipe> --fixture shared
+oracle/.venv/bin/python validation/run_gps_ground_truth.py \
+    --recipe <recipe> --fixture shared --native-only --score
+```
 
 **Scientific status: NOT EVALUABLE.** Both the stored Earthdata bearer token and the standard
 `.netrc` credentials failed authentication before the first download. The frozen metadata cohort

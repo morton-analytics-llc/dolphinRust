@@ -21,6 +21,15 @@ All notable changes to dolphinRust are documented here. The format follows
   `apply_validity_mask` propagates to every emitted layer. On the MMX1/ICMX frame the finite
   footprint goes 98.8613% → 99.3062% and the GNSS uncertainty-reliability scorer completes
   for the first time, emitting `uncertainty_reliability.{json,csv,svg}`. See VALIDATION.md.
+- **The AR(1) N_eff velocity-uncertainty correction is now reachable from config** (issue
+  #33). `timeseries_options.correct_velocity_temporal_correlation` (forward divergence from
+  dolphin, **off by default**, following the `correct_phase_bias` precedent) routes
+  `fit_velocity` through `estimate_velocity_with_uncertainty_neff`, on both the whole-frame
+  and bounded/tiled paths. Velocity is bit-identical with the flag on — only σ changes. On the
+  MMX1/ICMX frame the inflation factor is median 1.0623, p90 1.3007, max 2.8814, with 59.9% of
+  pixels inflated and 38.3% left at 1.0 (non-positive lag-1 autocorrelation). Note it is a
+  no-op at both GNSS stations, whose residual autocorrelation is negative, so this dataset
+  cannot validate the correction against ground truth — see VALIDATION.md.
 - **Opt-in AR(1) temporal-correlation (N_eff) velocity-uncertainty correction**
   (issue #20). `dolphin-timeseries::estimate_velocity_with_uncertainty_neff` estimates
   the lag-1 autocorrelation of the WLS velocity-fit residuals and reports
@@ -135,10 +144,10 @@ All notable changes to dolphinRust are documented here. The format follows
 ### Known limitations
 - **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
   temporally correlated epochs quantize every 68/90/95 bin at 8.3%, from one station pair on
-  one burst. Read directionally, the CRLB-only budget under-covers at 68% and 90% —
-  consistent with issue #20, whose AR(1) N_eff inflation is implemented but not yet wired
-  into the workflow. A defensible calibration needs more stations in this burst or more
-  frames.
+  one burst. The CRLB columns under-cover **by construction** — a Cramér–Rao *lower* bound
+  used as a predicted σ must under-predict the spread — so the layer to carry as
+  "uncertainty" is the unweighted posterior, the only column near nominal. A defensible
+  calibration needs more stations in this burst or more frames (issue #35).
 
 ## [v1.4.0] — 2026-06-18
 

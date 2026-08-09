@@ -20,9 +20,9 @@ use dolphin_phaselink::{
 };
 use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_precisions,
-    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
-    invert_stack_with_uncertainty, reference_to_point, select_reference_point, L1Config,
-    NetworkConfig,
+    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
+    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
+    reference_to_point, select_reference_point, L1Config, NetworkConfig,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -392,6 +392,22 @@ fn invert_time_series(
     }
 }
 
+/// Weighted velocity and its one-sigma, applying the opt-in AR(1)
+/// temporal-correlation inflation when configured.
+fn velocity_and_sigma(
+    correct_temporal_correlation: bool,
+    days: &[f64],
+    series: ArrayView3<f64>,
+    precision: ArrayView3<f64>,
+) -> (Array2<f64>, Array2<f64>) {
+    if !correct_temporal_correlation {
+        let output = estimate_velocity_with_uncertainty(days, series, precision);
+        return (output.velocity, output.sigma);
+    }
+    let output = estimate_velocity_with_uncertainty_neff(days, series, precision);
+    (output.velocity, output.sigma_temporal_corrected)
+}
+
 fn fit_velocity(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
@@ -410,10 +426,14 @@ fn fit_velocity(
     let precision = date_precisions(sigma, valid.view());
     let series = series_with_reference(displacement);
     if cfg.timeseries_options.write_velocity_uncertainty {
-        let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
-        let mut velocity_sigma = output.sigma;
-        clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
-        Ok((output.velocity, Some(velocity_sigma)))
+        let (velocity, mut sigma) = velocity_and_sigma(
+            cfg.timeseries_options.correct_velocity_temporal_correlation,
+            days,
+            series.view(),
+            precision.view(),
+        );
+        clear_unbounded_uncertainty(&mut sigma, valid.view());
+        Ok((velocity, Some(sigma)))
     } else {
         Ok((
             estimate_velocity_with_precisions(days, series.view(), precision.view()),
@@ -455,6 +475,7 @@ fn emit_displacement(
             cfg.timeseries_options.correlation_threshold,
             cfg.timeseries_options.use_coherence_weights,
             cfg.timeseries_options.write_velocity_uncertainty,
+            cfg.timeseries_options.correct_velocity_temporal_correlation,
         )?;
     }
     spatial.apply_validity_mask();
@@ -642,6 +663,7 @@ impl SpatialProducts {
         correlation_threshold: f64,
         use_coherence_weights: bool,
         write_velocity_uncertainty: bool,
+        correct_temporal_correlation: bool,
     ) -> Result<()> {
         // A halo reference is scientifically valid for analysis but cannot be
         // represented by a target-local coordinate. Re-reference to a coherent
@@ -671,10 +693,13 @@ impl SpatialProducts {
                 let precision = date_precisions(sigma, valid.view());
                 let series = series_with_reference(self.disp_rad.view());
                 if write_velocity_uncertainty {
-                    let result =
-                        estimate_velocity_with_uncertainty(days, series.view(), precision.view());
-                    self.vel_rad = result.velocity;
-                    let mut velocity_sigma = result.sigma;
+                    let (velocity, mut velocity_sigma) = velocity_and_sigma(
+                        correct_temporal_correlation,
+                        days,
+                        series.view(),
+                        precision.view(),
+                    );
+                    self.vel_rad = velocity;
                     clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
                     self.velocity_sigma_rad = Some(velocity_sigma);
                 } else {
@@ -2435,7 +2460,7 @@ mod tests {
             col_stop: 7,
         };
         products
-            .trim(target, &[0.0, 12.0, 24.0], 0.5, false, false)
+            .trim(target, &[0.0, 12.0, 24.0], 0.5, false, false, false)
             .unwrap();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
@@ -2480,6 +2505,7 @@ mod tests {
                 },
                 &[0.0, 12.0, 24.0],
                 0.5,
+                false,
                 false,
                 false,
             )
@@ -2596,6 +2622,56 @@ mod tests {
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
+    }
+
+    /// Issue #33: velocity sigma understates the slope uncertainty because the
+    /// residuals are temporally correlated. Opt-in AR(1) inflation, off by
+    /// default so no downstream threshold moves unreviewed.
+    #[test]
+    fn temporal_correlation_inflates_velocity_sigma_only_when_enabled() {
+        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
+        // A drifting (positively autocorrelated) departure from the trend.
+        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| {
+            let time = days[t + 1];
+            0.01 * time + 4.0 * (f64::from(t as i32) * 0.45).sin()
+        });
+        let crlb = Array3::from_elem((12, 1, 1), 0.5);
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+
+        let (_, plain) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
+        let (_, corrected) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+
+        let plain = plain.expect("velocity sigma")[(0, 0)];
+        let corrected = corrected.expect("velocity sigma")[(0, 0)];
+        assert!(plain.is_finite() && corrected.is_finite());
+        assert!(
+            corrected > plain,
+            "correlated residuals must inflate sigma: {corrected} !> {plain}"
+        );
+    }
+
+    /// The correction is a no-op on uncorrelated residuals — it must not inflate
+    /// sigma just because it is switched on.
+    #[test]
+    fn temporal_correlation_correction_is_a_no_op_without_correlation() {
+        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
+        // Exactly linear: zero residual, so no autocorrelation to find.
+        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| 0.01 * days[t + 1]);
+        let crlb = Array3::from_elem((12, 1, 1), 0.5);
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+
+        let (_, plain) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
+        let (_, corrected) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        let plain = plain.expect("velocity sigma")[(0, 0)];
+        let corrected = corrected.expect("velocity sigma")[(0, 0)];
+        assert!(
+            (corrected - plain).abs() < 1e-12,
+            "uncorrelated residuals must not inflate sigma: {corrected} vs {plain}"
+        );
     }
 
     /// Issue #34: a NaN CRLB is a missing *bound*, not evidence the data is bad.

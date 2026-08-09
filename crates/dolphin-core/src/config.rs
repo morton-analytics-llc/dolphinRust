@@ -204,6 +204,15 @@ pub struct TimeseriesOptions {
     pub write_posterior_uncertainty: bool,
     /// Emit velocity one-sigma uncertainty.
     pub write_velocity_uncertainty: bool,
+    /// Inflate the velocity one-sigma by the AR(1) effective-sample-size factor
+    /// `sqrt((1+rho)/(1-rho))` (Zhang et al. 1997 / Agram & Zebker 2015), `rho`
+    /// the lag-1 autocorrelation of the velocity-fit residuals. InSAR series
+    /// carry temporally correlated noise, so the uncorrected sigma understates
+    /// the slope uncertainty. **Forward divergence from dolphin, opt-in and off
+    /// by default** — a larger sigma can flip a downstream risk-tier threshold,
+    /// so enabling it is the reviewed rollout. Requires
+    /// `write_velocity_uncertainty`.
+    pub correct_velocity_temporal_correlation: bool,
 }
 
 impl Default for TimeseriesOptions {
@@ -220,6 +229,7 @@ impl Default for TimeseriesOptions {
             use_coherence_weights: true,
             write_posterior_uncertainty: false,
             write_velocity_uncertainty: false,
+            correct_velocity_temporal_correlation: false,
         }
     }
 }

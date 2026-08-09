@@ -278,12 +278,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
     native, snaphu = build_backend_configs(base, static_files[0].resolve(), run_root)
     assert_backend_config_identity(native, snaphu)
-    configs = {"native": native, "snaphu": snaphu}
-    for backend, weighted in list(configs.items()):
-        unweighted = copy.deepcopy(weighted)
-        unweighted["work_directory"] = str(run_root / f"work_{backend}_unweighted")
-        unweighted["timeseries_options"]["use_coherence_weights"] = False
-        configs[f"{backend}_unweighted"] = unweighted
+    if args.native_only:
+        configs = {"native": native}
+    else:
+        configs = {"native": native, "snaphu": snaphu}
+        for backend, weighted in list(configs.items()):
+            unweighted = copy.deepcopy(weighted)
+            unweighted["work_directory"] = str(run_root / f"work_{backend}_unweighted")
+            unweighted["timeseries_options"]["use_coherence_weights"] = False
+            configs[f"{backend}_unweighted"] = unweighted
     config_paths: dict[str, Path] = {}
     for backend, config in configs.items():
         path = run_root / f"config_{backend}.yaml"
@@ -381,6 +384,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--no-run", action="store_true", help="reuse existing backend outputs")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument(
+        "--native-only",
+        action="store_true",
+        help="run only the native weighted backend used by the cohort direction gate",
+    )
     return parser.parse_args()
 
 
