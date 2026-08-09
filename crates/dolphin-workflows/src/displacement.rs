@@ -469,6 +469,50 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
     Ok(VelocityModel { step_days, ..model })
 }
 
+/// Every emitted layer scaled from LOS phase (rad) to displacement units, kept
+/// together so `emit_displacement` reads as a sequence of steps.
+struct ScaledOutputs {
+    displacement: Array3<f64>,
+    velocity: Array2<f64>,
+    velocity_mm_yr: Array2<f64>,
+    displacement_variance: Option<Array3<f64>>,
+    timeseries_residual_rms: Option<Array2<f64>>,
+    velocity_sigma: Option<Array2<f64>>,
+    seasonal_amplitude: Option<Array2<f64>>,
+    step_magnitude: Vec<Array2<f64>>,
+}
+
+fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> ScaledOutputs {
+    let phase_to_disp = cfg
+        .input_options
+        .wavelength
+        .map_or(1.0, |w| -w / (4.0 * std::f64::consts::PI));
+    let (seasonal_amplitude, step_magnitude) =
+        scale_velocity_terms(&spatial.velocity_terms, phase_to_disp);
+    ScaledOutputs {
+        displacement: spatial.disp_rad.mapv(|phase| phase * phase_to_disp),
+        velocity: spatial.vel_rad.mapv(|rate| rate * phase_to_disp),
+        velocity_mm_yr: spatial
+            .vel_rad
+            .mapv(|rate| rate * mm_per_rad(cfg.input_options.wavelength)),
+        // Variance is squared displacement; a sigma and an RMS are magnitudes.
+        displacement_variance: spatial
+            .posterior_variance_rad
+            .as_ref()
+            .map(|v| v.mapv(|value| value * phase_to_disp * phase_to_disp)),
+        timeseries_residual_rms: spatial
+            .timeseries_residual_rad
+            .as_ref()
+            .map(|v| v.mapv(|value| value * phase_to_disp.abs())),
+        velocity_sigma: spatial
+            .velocity_sigma_rad
+            .as_ref()
+            .map(|v| v.mapv(|value| value * phase_to_disp.abs())),
+        seasonal_amplitude,
+        step_magnitude,
+    }
+}
+
 /// Seasonal amplitude and step magnitudes from phase (rad) to displacement units.
 /// Both are series quantities, so they take the same factor as displacement
 /// itself; amplitude is an unsigned magnitude, a step is signed. The seasonal peak
@@ -630,46 +674,27 @@ fn emit_displacement(
     ) {
         reference_variance_to_point(variance, point);
     }
-    let phase_to_disp = cfg
-        .input_options
-        .wavelength
-        .map_or(1.0, |w| -w / (4.0 * std::f64::consts::PI));
-    let displacement = spatial.disp_rad.mapv(|phase| phase * phase_to_disp);
-    let velocity = spatial.vel_rad.mapv(|rate| rate * phase_to_disp);
-    let velocity_mm_yr = spatial
-        .vel_rad
-        .mapv(|rate| rate * mm_per_rad(cfg.input_options.wavelength));
-    let displacement_variance = spatial
-        .posterior_variance_rad
-        .as_ref()
-        .map(|values| values.mapv(|value| value * phase_to_disp * phase_to_disp));
-    let timeseries_residual_rms = spatial
-        .timeseries_residual_rad
-        .as_ref()
-        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
-    let velocity_sigma = spatial
-        .velocity_sigma_rad
-        .as_ref()
-        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
-    let emitted_crlb = cfg
-        .phase_linking
-        .write_crlb
-        .then_some(spatial.crlb_sigma.as_ref())
-        .flatten();
-    let (seasonal_amplitude, step_magnitude) =
-        scale_velocity_terms(&spatial.velocity_terms, phase_to_disp);
+    let scaled = scale_outputs(cfg, &spatial);
     let quality = QualityLayers {
+        posterior_dof: spatial
+            .interferogram_pairs
+            .len()
+            .saturating_sub(spatial.disp_rad.dim().0),
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
-        crlb_sigma: emitted_crlb,
+        crlb_sigma: cfg
+            .phase_linking
+            .write_crlb
+            .then_some(spatial.crlb_sigma.as_ref())
+            .flatten(),
         closure_phase: spatial.closure_phase.as_ref(),
-        displacement_variance: displacement_variance.as_ref(),
-        timeseries_residual_rms: timeseries_residual_rms.as_ref(),
-        velocity_sigma: velocity_sigma.as_ref(),
+        displacement_variance: scaled.displacement_variance.as_ref(),
+        timeseries_residual_rms: scaled.timeseries_residual_rms.as_ref(),
+        velocity_sigma: scaled.velocity_sigma.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
         velocity_terms: VelocityTermLayers {
-            seasonal_amplitude: seasonal_amplitude.as_ref(),
+            seasonal_amplitude: scaled.seasonal_amplitude.as_ref(),
             seasonal_phase_days: spatial.velocity_terms.seasonal_phase_days.as_ref(),
-            step_magnitude: &step_magnitude,
+            step_magnitude: &scaled.step_magnitude,
         },
     };
     let input_coverage = summarize_input_coverage(&spatial);
@@ -682,8 +707,8 @@ fn emit_displacement(
     timed("write", || -> Result<()> {
         write_outputs(
             cfg,
-            displacement.view(),
-            velocity.view(),
+            scaled.displacement.view(),
+            scaled.velocity.view(),
             spatial.temporal_coherence.view(),
             quality,
             epsg,
@@ -693,12 +718,12 @@ fn emit_displacement(
         crate::provenance::write_geometry_provenance(&cfg.work_directory, &geometry_provenance)
     })?;
     Ok(DisplacementOutput {
-        displacement,
-        velocity,
-        velocity_mm_yr,
-        velocity_sigma,
-        displacement_variance,
-        timeseries_residual_rms,
+        displacement: scaled.displacement,
+        velocity: scaled.velocity,
+        velocity_mm_yr: scaled.velocity_mm_yr,
+        velocity_sigma: scaled.velocity_sigma,
+        displacement_variance: scaled.displacement_variance,
+        timeseries_residual_rms: scaled.timeseries_residual_rms,
         interferogram_pairs: spatial.interferogram_pairs,
         unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
@@ -2305,9 +2330,26 @@ fn write_outputs(
     let write_f32 = |name: &str, a: ArrayView2<f64>| {
         write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
     };
+    // Issue #36: which layer is *the* uncertainty is not a matter of taste, it
+    // depends on whether the interferogram system has residual degrees of freedom.
+    // Say so in the raster rather than leaving it to the reader.
+    let (scale, scale_note) = uncertainty_scale(quality.posterior_dof);
+    let dof_text = quality.posterior_dof.to_string();
+    let posterior_tags = [
+        ("UNCERTAINTY_SCALE", scale),
+        ("POSTERIOR_DOF", dof_text.as_str()),
+        ("DESCRIPTION", scale_note),
+    ];
     write_f32("velocity.tif", velocity)?;
     if let Some(sigma) = quality.velocity_sigma {
-        write_f32("velocity_sigma.tif", sigma.view())?;
+        write_raster_with_metadata(
+            &dir.join("velocity_sigma.tif"),
+            sigma.mapv(|v| v as f32).view(),
+            gt,
+            epsg,
+            None,
+            &posterior_tags,
+        )?;
     }
     if let Some(residual) = quality.timeseries_residual_rms {
         write_f32("timeseries_residual_rms.tif", residual.view())?;
@@ -2325,7 +2367,11 @@ fn write_outputs(
                 gt,
                 epsg,
                 None,
-                &[("UNITTYPE", "rad")],
+                &[
+                    ("UNITTYPE", "rad"),
+                    ("UNCERTAINTY_SCALE", "crlb_bound"),
+                    ("DESCRIPTION", CRLB_BOUND_NOTE),
+                ],
             )?;
         }
     }
@@ -2349,7 +2395,16 @@ fn write_outputs(
         write_f32(&format!("velocity_step_{k:02}.tif"), step.view())?;
     }
     if let Some(variance) = quality.displacement_variance {
-        write_bands(&write_f32, variance.view(), "displacement_variance")?;
+        for band in 0..variance.dim().0 {
+            write_raster_with_metadata(
+                &dir.join(format!("displacement_variance_{band:02}.tif")),
+                variance.index_axis(Axis(0), band).mapv(|v| v as f32).view(),
+                gt,
+                epsg,
+                None,
+                &posterior_tags,
+            )?;
+        }
     }
     for band in 0..quality.connected_components.dim().0 {
         write_raster(
@@ -2404,8 +2459,42 @@ fn write_correction_outputs(
     Ok(())
 }
 
+/// In-band note on `crlb_sigma_NN.tif`. The bound is correct and matches dolphin;
+/// what it is not is a predictive sigma, and a consumer reading the band without
+/// this would have no way to know (#36).
+const CRLB_BOUND_NOTE: &str =
+    "Cramer-Rao LOWER BOUND on the phase-linking sigma, not a predictive uncertainty. \
+     It under-covers the true spread by construction. Do not publish it as the \
+     uncertainty layer.";
+
+/// In-band note on the posterior layers when the interferogram system is exactly
+/// determined, so their scale is not empirical.
+const POSTERIOR_BOUND_NOTE: &str =
+    "dof=0: the interferogram system is exactly determined (single-reference network), so \
+     the residual-based inflation is pinned to 1 and this sigma traces entirely to the \
+     CRLB lower bound. It is NOT an empirically scaled uncertainty. Set \
+     interferogram_network.max_bandwidth for a posterior scaled by the data.";
+
+/// In-band note on the posterior layers when they do carry empirical scale.
+const POSTERIOR_EMPIRICAL_NOTE: &str =
+    "Posterior sigma scaled by the fit residuals (dof>0). This is the layer to carry as \
+     the uncertainty product.";
+
+/// Where an uncertainty layer's scale comes from, given the posterior degrees of
+/// freedom `n_interferograms - n_unknowns`.
+fn uncertainty_scale(posterior_dof: usize) -> (&'static str, &'static str) {
+    match posterior_dof {
+        0 => ("crlb_bound", POSTERIOR_BOUND_NOTE),
+        _ => ("empirical", POSTERIOR_EMPIRICAL_NOTE),
+    }
+}
+
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
+    /// Residual degrees of freedom of the SBAS solve,
+    /// `n_interferograms - (n_dates - 1)`. Zero on a single-reference network,
+    /// which is what decides whether the posterior layers carry empirical scale.
+    posterior_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
@@ -3302,6 +3391,84 @@ mod tests {
         let v6 = mk(&[0.0, 6.0, 12.0, 18.0]);
         assert!((v12 - phase_per_yr).abs() < 1e-9);
         assert!((v6 - phase_per_yr).abs() < 1e-9);
+    }
+
+    /// Issue #36: the emitted rasters must say where their scale comes from. On a
+    /// single-reference network `dof = 0`, the residual inflation is inert, and
+    /// every uncertainty layer traces to the CRLB bound — so the bands are tagged
+    /// `crlb_bound`, not left for a consumer to misread as a predictive sigma.
+    #[test]
+    fn uncertainty_layers_declare_their_scale_in_band() {
+        let dir = std::env::temp_dir().join("dolphin_uncertainty_scale_tags");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = DisplacementWorkflow {
+            work_directory: dir.clone(),
+            ..Default::default()
+        };
+        let gt = [0.0, 30.0, 0.0, 120.0, 0.0, -30.0];
+        let displacement = Array3::<f64>::zeros((2, 2, 2));
+        let variance = Array3::from_elem((2, 2, 2), 4.0);
+        let sigma = Array2::from_elem((2, 2), 2.0);
+        let crlb = Array3::from_elem((2, 2, 2), 1.0);
+        let conncomp = Array3::<u32>::zeros((0, 2, 2));
+
+        let write = |dof: usize| {
+            write_outputs(
+                &cfg,
+                displacement.view(),
+                Array2::zeros((2, 2)).view(),
+                Array2::from_elem((2, 2), 0.9).view(),
+                QualityLayers {
+                    posterior_dof: dof,
+                    phase_linking_coherence: None,
+                    crlb_sigma: Some(&crlb),
+                    closure_phase: None,
+                    displacement_variance: Some(&variance),
+                    timeseries_residual_rms: None,
+                    velocity_sigma: Some(&sigma),
+                    connected_components: &conncomp,
+                    velocity_terms: VelocityTermLayers::default(),
+                },
+                Some(32614),
+                gt,
+            )
+            .unwrap();
+        };
+        let tag = |name: &str, key: &str| {
+            use gdal::Metadata;
+            gdal::Dataset::open(dir.join(name))
+                .unwrap()
+                .metadata_item(key, "")
+                .unwrap_or_default()
+        };
+
+        write(0);
+        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
+        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "0");
+        assert_eq!(
+            tag("displacement_variance_00.tif", "UNCERTAINTY_SCALE"),
+            "crlb_bound"
+        );
+        assert!(tag("velocity_sigma.tif", "DESCRIPTION").contains("NOT an empirically scaled"));
+        // The bound is always a bound, whatever the network.
+        assert_eq!(tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
+        assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("LOWER BOUND"));
+        assert_eq!(tag("crlb_sigma_00.tif", "UNITTYPE"), "rad");
+
+        // An over-determined network is the case where the posterior earns the name.
+        write(3);
+        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "empirical");
+        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "3");
+        assert_eq!(
+            tag("displacement_variance_01.tif", "UNCERTAINTY_SCALE"),
+            "empirical"
+        );
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"),
+            "crlb_bound",
+            "the CRLB is a bound regardless of the network"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {

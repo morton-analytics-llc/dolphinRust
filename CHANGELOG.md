@@ -7,6 +7,28 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The uncertainty layers now declare their own scale, and the product is decided** (issue
+  #36). `crlb_sigma_NN.tif`, `displacement_variance_NN.tif`, and `velocity_sigma.tif` were
+  emitted with nothing to distinguish a Cramér–Rao *lower bound* from a predictive sigma; a
+  consumer picking the wrong one understates risk by roughly 2× at the 90% level.
+  - **The documented uncertainty product is the posterior from an over-determined network**
+    (`interferogram_network.max_bandwidth` set): `displacement_variance_NN.tif` per epoch,
+    `velocity_sigma.tif` for the rate. CRLB is a lower bound and under-covers by
+    construction. On a **single-reference** network `dof = 0`, the residual inflation is
+    pinned to 1, and the posterior reduces to the CRLB bound through a geometry factor — the
+    measured coverage columns are identical there (0.500 / 0.583 / 0.833), and separate only
+    at `max_bandwidth: 3` (0.583 / 0.833 / 1.000). The `max_bandwidth` default stays `null`
+    to match dolphin, so this is a deployment choice, not a library default.
+  - **Rasters now say which case they are in.** `crlb_sigma_NN.tif` carries
+    `UNCERTAINTY_SCALE=crlb_bound` plus a `DESCRIPTION` naming it a bound; the posterior
+    layers carry `UNCERTAINTY_SCALE` (`empirical` / `crlb_bound`), `POSTERIOR_DOF`, and a
+    matching `DESCRIPTION`. The tag is computed from the actual network
+    (`n_interferograms − (n_dates − 1)`), so a single-reference run self-identifies as
+    carrying no empirical scale.
+  - **`use_coherence_weights` stays `true`.** The unweighted posterior's better coverage is
+    an artifact, not a result: on a single-reference network weighted and unweighted
+    displacement are bit-identical and the unweighted posterior collapses to a spatially
+    constant, dimensionless `(AᵀA)⁻¹`. See VALIDATION.md.
 - **Solid-earth-tide correction** (issue #21). `dolphin-corrections::solid_earth_tide`
   models the lunisolar solid earth tide (IERS 2010 §7.1.1 step-1 degree-2 in-phase, nominal
   `h₂ = 0.6078`, `l₂ = 0.0847`, low-precision analytic Sun/Moon ephemerides) and expresses

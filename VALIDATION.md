@@ -798,6 +798,50 @@ autocorrelation is only +0.028 with 55% of pixels positive, consistent with atmo
 decorrelating well inside the 12-day sampling. More stations (issue #35) would be needed to
 land a truth pixel where the correction actually bites.
 
+### Decided: which layer is the uncertainty product (2026-08-09, issue #36)
+
+The analysis above left three questions open. Answering them, and putting the answers where
+a consumer will actually see them.
+
+**1. The documented uncertainty product is the posterior from an over-determined network** —
+`displacement_variance_NN.tif` per epoch, `velocity_sigma.tif` for the rate, with
+`interferogram_network.max_bandwidth` set. Not CRLB: it is a *lower bound*, so as a predicted
+σ it must under-cover, and that is a property of the quantity rather than a defect to tune
+out. Not the posterior from a single-reference network either: there `dof = 0`, the
+`(weighted_sse/dof).max(1.0)` inflation is pinned to 1, and the posterior reduces to the CRLB
+bound pushed through a geometry factor. The measured A/B is direct confirmation — on the
+single-reference network the posterior column is *identical* to the CRLB column
+(0.500 / 0.583 / 0.833), and at `max_bandwidth: 3` it separates and moves toward nominal
+(0.583 / 0.833 / 1.000) while velocity agreement independently improves from −3.319 to
+−2.243 mm/yr.
+
+The library default for `max_bandwidth` stays `null`, matching dolphin. So this is a
+**deployment configuration choice, not a library default** — a consumer that wants a
+calibrated uncertainty has to ask for the network that produces one.
+
+**2. `use_coherence_weights` stays `true`.** The open question was whether to flip it, since
+the unweighted posterior was the only column near nominal. It should not be flipped, and the
+reason is that the evidence for flipping is an artifact. On a single-reference network
+weighted and unweighted displacement are bit-identical (the system is exactly determined, so
+the weights cancel), and the unweighted posterior collapses to `(AᵀA)⁻¹` — spatially constant,
+dimensionless, carrying no physical scale. Its frame median *equals* its station value
+(6.2421 mm both). Near-nominal coverage from a constant is a coincidence of magnitude, not
+calibration, and changing a default on that basis would be reading an artifact as a result.
+
+**3. CRLB is now labelled in band.** `crlb_sigma_NN.tif` carries
+`UNCERTAINTY_SCALE=crlb_bound` and a `DESCRIPTION` naming it a lower bound, alongside the
+existing `UNITTYPE=rad`. The posterior layers carry `UNCERTAINTY_SCALE` (`empirical` or
+`crlb_bound`), `POSTERIOR_DOF`, and a `DESCRIPTION` that says which case they are in — the
+tag is **computed from the actual network** (`n_interferograms − (n_dates − 1)`), so a
+single-reference run self-identifies as unscaled without anyone having to remember. This is
+the part that closes the issue's real complaint: the three layers were emitted with no
+guidance on which was which.
+
+**What this does not settle.** Whether the over-determined posterior is *calibrated* is not
+established — 0.583 / 0.833 / 1.000 is still under at 68% and 90%, and 12 temporally
+correlated samples from one station pair quantize every bin at 8.3%. Issue #35 governs how
+much better that can get. The `dof = 0` mechanism, by contrast, is structural and certain.
+
 ### A missing bound no longer destroys the data (2026-08-08, issue #34)
 
 The NaN CRLB on a singular `Γ` is **correct** — dolphin v0.42 NaNs such blocks deliberately
