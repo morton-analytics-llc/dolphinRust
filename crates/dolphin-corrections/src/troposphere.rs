@@ -12,7 +12,7 @@ use std::path::Path;
 
 use gdal::raster::Buffer;
 use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
-use gdal::Dataset;
+use gdal::{Dataset, Metadata};
 use ndarray::{Array2, ArrayView2};
 
 use crate::error::{CorrectionError, Result};
@@ -84,16 +84,79 @@ pub fn read_l4_netcdf_for_grid(
 ) -> Result<DelayGrid> {
     let conn = format!("NETCDF:\"{}\":{var}", path.display());
     let ds = Dataset::open(Path::new(&conn))?;
-    read_dataset_for_grid(&ds, dst_gt, dst_epsg, dst_shape)
+    ensure_single_level(&ds)?;
+    read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
 }
 
-fn read_dataset_for_grid(
-    ds: &Dataset,
+/// Height levels (metres) of a height-resolved L4 variable, in band order.
+///
+/// GDAL maps each level of the product's `height` dimension to its own band and
+/// records the coordinate in `NETCDF_DIM_height` band metadata.
+///
+/// # Errors
+/// [`CorrectionError::Gdal`] if the variable cannot be opened, or
+/// [`CorrectionError::Shape`] if a band carries no height coordinate.
+pub fn height_levels(path: &Path, var: &str) -> Result<Vec<f64>> {
+    let conn = format!("NETCDF:\"{}\":{var}", path.display());
+    let ds = Dataset::open(Path::new(&conn))?;
+    (1..=ds.raster_count())
+        .map(|index| {
+            ds.rasterband(index)?
+                .metadata_item("NETCDF_DIM_height", "")
+                .and_then(|value: String| value.parse::<f64>().ok())
+                .ok_or_else(|| {
+                    CorrectionError::Shape(format!("band {index} has no NETCDF_DIM_height"))
+                })
+        })
+        .collect()
+}
+
+/// Read one height level of an L4 variable onto the destination grid window.
+///
+/// # Errors
+/// As [`read_l4_netcdf_for_grid`], plus [`CorrectionError::Shape`] if `level` is
+/// out of range.
+pub fn read_l4_level_for_grid(
+    path: &Path,
+    var: &str,
+    level: usize,
     dst_gt: [f64; 6],
     dst_epsg: u32,
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
-    ensure_single_level(ds)?;
+    let conn = format!("NETCDF:\"{}\":{var}", path.display());
+    let ds = Dataset::open(Path::new(&conn))?;
+    if level >= ds.raster_count() {
+        return Err(CorrectionError::Shape(format!(
+            "height level {level} out of range ({} levels)",
+            ds.raster_count()
+        )));
+    }
+    read_dataset_for_grid(&ds, level + 1, dst_gt, dst_epsg, dst_shape)
+}
+
+/// Read a plain georeferenced raster (e.g. a DEM) onto the destination grid
+/// window, reusing the tropospheric bounded-read path.
+///
+/// # Errors
+/// As [`read_l4_netcdf_for_grid`].
+pub fn read_raster_for_grid(
+    path: &Path,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<DelayGrid> {
+    let ds = Dataset::open(path)?;
+    read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
+}
+
+fn read_dataset_for_grid(
+    ds: &Dataset,
+    band_index: usize,
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    dst_shape: (usize, usize),
+) -> Result<DelayGrid> {
     let src_gt = ds.geo_transform()?;
     if src_gt[1] <= 0.0
         || src_gt[5] >= 0.0
@@ -153,7 +216,7 @@ fn read_dataset_for_grid(
     if row_start >= row_stop || col_start >= col_stop {
         return Err(CorrectionError::TroposphereCoverage);
     }
-    let band = ds.rasterband(1)?;
+    let band = ds.rasterband(band_index)?;
     let buffer = band.read_as::<f64>(
         (col_start as isize, row_start as isize),
         (col_stop - col_start, row_stop - row_start),

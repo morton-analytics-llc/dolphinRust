@@ -150,8 +150,15 @@ All notable changes to dolphinRust are documented here. The format follows
   three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
   the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
 
-- **A height-resolved L4 troposphere granule is now rejected instead of silently
-  mis-corrected** (issue #38). GDAL exposes each of the real product's 145 height levels as a
+- **Tropospheric delay is now taken at each pixel's terrain elevation** (issue #38). The real
+  OPERA L4 product resolves delay over 145 height levels and GDAL maps each to a band, so the
+  reader's `rasterband(1)` used the −500 m level rather than the terrain — over-stating the
+  epoch-relative differential delay by 1.9–7.5× at ~2250 m. `correction_options.dem_file` now
+  drives per-pixel linear interpolation between the two bracketing levels, and a
+  height-resolved granule supplied *without* a DEM is rejected rather than silently
+  mis-corrected. On the MMX1/ICMX/MXTX frame the MMX1−MXTX relative differential delay comes
+  out at 31.4 mm against 30.4 mm computed independently in Python, versus 68.1 mm from the old
+  band-1 path. Superseded detail of the original guard (issue #38). GDAL exposes each of the real product's 145 height levels as a
   band, so reading `rasterband(1)` used the −500 m level rather than the terrain. Measured at
   the MMX1/ICMX/MXTX stations (~2250 m), that over-states the epoch-relative differential
   delay by 1.9–7.5× — enabling `troposphere_files` today would have applied a correction about
@@ -446,8 +453,15 @@ physically-meaningful tolerances.
   three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
   the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
 
-- **A height-resolved L4 troposphere granule is now rejected instead of silently
-  mis-corrected** (issue #38). GDAL exposes each of the real product's 145 height levels as a
+- **Tropospheric delay is now taken at each pixel's terrain elevation** (issue #38). The real
+  OPERA L4 product resolves delay over 145 height levels and GDAL maps each to a band, so the
+  reader's `rasterband(1)` used the −500 m level rather than the terrain — over-stating the
+  epoch-relative differential delay by 1.9–7.5× at ~2250 m. `correction_options.dem_file` now
+  drives per-pixel linear interpolation between the two bracketing levels, and a
+  height-resolved granule supplied *without* a DEM is rejected rather than silently
+  mis-corrected. On the MMX1/ICMX/MXTX frame the MMX1−MXTX relative differential delay comes
+  out at 31.4 mm against 30.4 mm computed independently in Python, versus 68.1 mm from the old
+  band-1 path. Superseded detail of the original guard (issue #38). GDAL exposes each of the real product's 145 height levels as a
   band, so reading `rasterband(1)` used the −500 m level rather than the terrain. Measured at
   the MMX1/ICMX/MXTX stations (~2250 m), that over-states the epoch-relative differential
   delay by 1.9–7.5× — enabling `troposphere_files` today would have applied a correction about

@@ -15,8 +15,8 @@ use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
-    ensure_finite_coverage, read_l4_netcdf_for_grid, read_l4_total_for_grid, resample_bilinear,
-    warp_to_frame, DelayGrid,
+    ensure_finite_coverage, height_levels, read_l4_level_for_grid, read_l4_netcdf_for_grid,
+    read_l4_total_for_grid, read_raster_for_grid, resample_bilinear, warp_to_frame, DelayGrid,
 };
 use dolphin_io::{grid_centroid_lonlat, GeoInfo};
 use ndarray::{Array2, Array3, Axis};
@@ -218,13 +218,111 @@ fn build_troposphere(
     // ZTD is a zenith delay; project to line-of-sight by 1/cos(incidence) — per pixel
     // (1/up) from geometry when supplied, else the scalar knob (bit-identical fill).
     let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
+    // The real L4 product resolves delay over 145 height levels, so a pixel's
+    // delay must be taken at its terrain elevation; reading level 0 (-500 m)
+    // over-corrects by ~2x at 2 km (issue #38). A DEM is therefore required
+    // whenever the granule is height-resolved.
+    let terrain = load_terrain(opts, gt, epsg, (rows, cols))?;
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
-        let grid = read_tropo_for_grid(nc, &opts.troposphere_variable, gt, epsg, (rows, cols))?;
-        let band = resample_to_frame(&grid, gt, epsg, (rows, cols))?;
+        let band = match terrain.as_ref() {
+            Some(dem) => {
+                tropo_at_terrain(nc, &opts.troposphere_variable, gt, epsg, (rows, cols), dem)?
+            }
+            None => {
+                let grid =
+                    read_tropo_for_grid(nc, &opts.troposphere_variable, gt, epsg, (rows, cols))?;
+                resample_to_frame(&grid, gt, epsg, (rows, cols))?
+            }
+        };
         out.index_axis_mut(Axis(0), t).assign(&(&band * &slant));
     }
     Ok(Some(out))
+}
+
+/// Terrain elevation on the frame grid, or `None` when no DEM is configured.
+fn load_terrain(
+    opts: &CorrectionOptions,
+    gt: [f64; 6],
+    epsg: u32,
+    shape: (usize, usize),
+) -> Result<Option<Array2<f64>>> {
+    let Some(dem) = opts.dem_file.as_ref() else {
+        return Ok(None);
+    };
+    let grid = read_raster_for_grid(dem, gt, epsg, shape).map_err(anyhow::Error::msg)?;
+    let frame = resample_to_frame(&grid, gt, epsg, shape)?;
+    ensure_finite_coverage(&frame).map_err(anyhow::Error::msg)?;
+    Ok(Some(frame))
+}
+
+/// Delay at each pixel's terrain elevation, linearly interpolated between the
+/// two bracketing height levels of the L4 granule.
+fn tropo_at_terrain(
+    nc: &Path,
+    var: &str,
+    gt: [f64; 6],
+    epsg: u32,
+    shape: (usize, usize),
+    terrain: &Array2<f64>,
+) -> Result<Array2<f64>> {
+    let vars: Vec<&str> = match var {
+        "total" => vec!["hydrostatic_delay", "wet_delay"],
+        other => vec![other],
+    };
+    let levels = height_levels(nc, vars[0]).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(!levels.is_empty(), "L4 granule reports no height levels");
+    let (lo, hi) = bracketing_levels(&levels, terrain);
+    let mut total = Array2::<f64>::zeros(shape);
+    for name in vars {
+        let mut planes = Vec::with_capacity(hi - lo + 1);
+        for level in lo..=hi {
+            let grid = read_l4_level_for_grid(nc, name, level, gt, epsg, shape)
+                .map_err(anyhow::Error::msg)?;
+            planes.push(resample_to_frame(&grid, gt, epsg, shape)?);
+        }
+        total += &interpolate_to_terrain(&levels[lo..=hi], &planes, terrain);
+    }
+    Ok(total)
+}
+
+/// Inclusive band range covering the frame's terrain range, clamped to the
+/// granule's own levels.
+fn bracketing_levels(levels: &[f64], terrain: &Array2<f64>) -> (usize, usize) {
+    let finite: Vec<f64> = terrain.iter().copied().filter(|v| v.is_finite()).collect();
+    let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let last = levels.len() - 1;
+    let lo = levels.iter().rposition(|&h| h <= min).unwrap_or(0);
+    let hi = levels.iter().position(|&h| h >= max).unwrap_or(last);
+    (lo.min(hi), hi.max(lo))
+}
+
+/// Per-pixel linear interpolation of the level planes onto terrain elevation.
+fn interpolate_to_terrain(
+    levels: &[f64],
+    planes: &[Array2<f64>],
+    terrain: &Array2<f64>,
+) -> Array2<f64> {
+    Array2::from_shape_fn(terrain.dim(), |ix| {
+        let h = terrain[ix];
+        if levels.len() == 1 || !h.is_finite() {
+            return planes[0][ix];
+        }
+        let upper = levels
+            .iter()
+            .position(|&level| level >= h)
+            .unwrap_or(levels.len() - 1);
+        let upper = upper.max(1);
+        let lower = upper - 1;
+        let span = levels[upper] - levels[lower];
+        let weight = if span > 0.0 {
+            (h - levels[lower]) / span
+        } else {
+            0.0
+        };
+        planes[lower][ix] * (1.0 - weight) + planes[upper][ix] * weight
+    })
 }
 
 /// Per-pixel zenith→slant factor `1/cos(incidence)`: `1/up` from geometry when
@@ -313,6 +411,35 @@ fn parse_time_token(w: &[char]) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #38: a pixel's delay must come from its terrain elevation, not the
+    /// granule's lowest level. Linear between bracketing levels, exact at a knot.
+    #[test]
+    fn delay_interpolates_to_terrain_elevation() {
+        let levels = [0.0_f64, 1000.0, 2000.0, 3000.0];
+        // Each plane is constant so the expected value is analytic.
+        let planes: Vec<Array2<f64>> = [2.6_f64, 2.2, 1.8, 1.4]
+            .iter()
+            .map(|&v| Array2::from_elem((1, 4), v))
+            .collect();
+        let terrain = ndarray::array![[0.0_f64, 2000.0, 2500.0, 3000.0]];
+        let out = interpolate_to_terrain(&levels, &planes, &terrain);
+        // knots exact
+        assert!((out[(0, 0)] - 2.6).abs() < 1e-12);
+        assert!((out[(0, 1)] - 1.8).abs() < 1e-12);
+        assert!((out[(0, 3)] - 1.4).abs() < 1e-12);
+        // midway between 2000 m and 3000 m
+        assert!((out[(0, 2)] - 1.6).abs() < 1e-12);
+    }
+
+    /// The level window must cover the frame's terrain range, so a 2.2-2.7 km
+    /// frame reads the 2000 m and 3000 m levels and not the -500 m one.
+    #[test]
+    fn bracketing_levels_cover_the_terrain_range() {
+        let levels = [-500.0_f64, 0.0, 1000.0, 2000.0, 3000.0, 4000.0];
+        let terrain = ndarray::array![[2200.0_f64, 2700.0]];
+        assert_eq!(bracketing_levels(&levels, &terrain), (3, 4));
+    }
+
     use super::*;
     use dolphin_io::read_los_layers;
     use ndarray::Array3;
