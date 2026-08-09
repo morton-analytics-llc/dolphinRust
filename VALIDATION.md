@@ -551,12 +551,20 @@ Implemented surfaces:
 - `run_gps_ground_truth.py`: native/SNAPHU configs derived from one base and asserted identical
   except backend/work directory, plus unweighted A/B variants, sourced-geometry checks, run
   receipts, common-frame scoring, and `uncertainty_reliability.{json,csv,svg}` generation.
-- `validation/tests/test_gps_*.py`: 22 synthetic contracts covering acquisition, crops, GNSS,
+- `validation/tests/test_gps_*.py`: 24 synthetic contracts covering acquisition, crops, GNSS,
   projection/sign, reference cancellation, metrics, artifacts, and config identity.
+
+Note on where these run: `oracle/fixtures/*` is gitignored apart from 11 force-tracked CI
+fixtures, so the oracle-parity gates that need `disp_displacement.npy` / `disp_velocity.npy`
+(and a SNAPHU binary) **skip** in CI and are verified locally only. A skipped test reports the
+same green as a passing one, which is how `auto_tile_opt_in_holds_oracle_parity` drifted
+unnoticed until 2026-08-08 — it compared a CRLB-weighted velocity against the unweighted
+dolphin oracle once `use_coherence_weights` became default-true. Run the workspace suite
+locally against the fixtures before trusting a parity claim.
 
 Current verification is deliberately split:
 
-- **Local/synthetic — PASS:** 22 GNSS harness contracts; Python compile; config generation and
+- **Local/synthetic — PASS:** 24 GNSS harness contracts; Python compile; config generation and
   ruamel YAML round-trip against the existing 13-file T005 crop.
 - **Live acquisition preflight — PASS:** ASF resolves exactly the declared 13 CSLC v1.1 epochs
   plus one T005 CSLC-S1-STATIC v1.0 product. `GP_EARTHDATA_TOKEN` authenticated a real 161.6 MB

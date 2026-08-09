@@ -38,6 +38,14 @@ fn auto_tile_opt_in_holds_oracle_parity() {
     let mut cfg =
         DisplacementWorkflow::from_yaml(&std::fs::read_to_string(&config).unwrap()).unwrap();
     cfg.unwrap_options.snaphu_options.auto_tile = true;
+    // Hold the estimator fixed so the only variable is auto-tiling. The oracle
+    // fixture is dolphin-generated and therefore unweighted, while
+    // `use_coherence_weights` now defaults to true — matching
+    // `displacement_contract.rs`. Displacement is weight-invariant here (the
+    // single-reference SBAS system is exactly determined), but the over-determined
+    // velocity fit is not, so leaving this on compares a CRLB-weighted velocity
+    // against an unweighted oracle.
+    cfg.timeseries_options.use_coherence_weights = false;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_autotile_gate");
     std::fs::create_dir_all(&cfg.work_directory).unwrap();
     cfg.cslc_file_list = cfg

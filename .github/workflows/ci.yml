@@ -2,6 +2,10 @@ name: CI
 
 on:
   pull_request:
+  # Work lands on main directly as well as through PRs, so verify pushes to main
+  # too — otherwise a direct commit is never checked by anything.
+  push:
+    branches: [main]
 
 permissions:
   contents: read

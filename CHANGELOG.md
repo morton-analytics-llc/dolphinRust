@@ -88,6 +88,14 @@ All notable changes to dolphinRust are documented here. The format follows
   matching pinned dolphin v0.35.0's `PhaseLinkRuntimeError` instead of allowing a zero
   coherence matrix to masquerade as `temporal_coherence=1.0` / zero displacement. Partially
   valid inputs retain the existing dolphin-compatible masking behavior.
+- **`auto_tile_opt_in_holds_oracle_parity` compared against the wrong estimator.** The gate
+  loaded the fixture config without pinning `use_coherence_weights`, which became default-true
+  in the reliability wave, so it fitted a CRLB-weighted velocity and compared it to the
+  unweighted dolphin oracle (velocity error 0.446 against a 1e-2 bar). Displacement still
+  matched because the single-reference SBAS system is exactly determined and therefore
+  weight-invariant. The gate now pins the estimator like `displacement_contract.rs`, so
+  auto-tiling is the only variable. This never reached CI: `oracle/fixtures/*` is gitignored,
+  so the oracle-parity gates skip there and had been green-by-skip.
 - **Flaky HDF5 unit tests in `dolphin-io`.** `hdf5-metno` links a non-thread-safe HDF5, so
   parallel test threads creating/opening HDF5 fixtures raced and corrupted global library
   state (intermittent `geo`/`nisar`/geometry failures). HDF5-touching unit tests now serialize
@@ -98,6 +106,17 @@ All notable changes to dolphinRust are documented here. The format follows
   dolphin, not introduced here; the per-pixel path reproduces today's *ground*-incidence
   behavior); `local_incidence_angle` ingest; nearest-vs-bilinear resample at burst seams
   (single-burst consumer unaffected). See the design doc's Deferred section.
+
+### Known limitations
+- **The MMX1/ICMX harness does not currently produce reliability artifacts** on real data,
+  qualifying the "regenerates JSON/CSV/SVG 68/90/95% reliability artifacts" claim above.
+  The GLRT SHP mask the config specifies is never wired into `sequential.rs`, so covariance
+  uses the full rectangular window; with `beta: 0.0` the estimator's `Γ = |C|` is indefinite
+  at ~1.1% of pixels, `crlb.rs` has no EVD fallback, and `apply_validity_mask` gates every
+  emitted layer on `velocity.is_finite()`. ICMX lands in such a region, so the scorer
+  correctly reports `not_evaluable` rather than weakening its 50% station-window contract.
+  The weighted/unweighted A/B is **not** an independent diagnostic for this — the two are
+  bit-identical here. Tracked as issue #29; see VALIDATION.md for the evidence.
 
 ## [v1.4.0] — 2026-06-18
 
