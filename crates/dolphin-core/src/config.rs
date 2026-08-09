@@ -228,6 +228,15 @@ pub struct TimeseriesOptions {
     /// detected from the data: a step whose timing is fitted is a different
     /// (nonlinear) estimator with its own failure modes. Empty by default.
     pub velocity_step_dates: Vec<String>,
+    /// Close every triangle in the **unwrapped** interferogram network before the
+    /// SBAS solve and blank pixels whose loops miss closure by more than half a
+    /// cycle — a 2π unwrap error, which the wrapped closure-phase layer cannot
+    /// see (`.arg()` maps a whole cycle to zero). Forward divergence from
+    /// dolphin, **off by default**. A no-op on a single-reference network, which
+    /// has no loops; needs `interferogram_network.max_bandwidth` or
+    /// `max_temporal_baseline`. Emits `loop_closure_bad_count.tif` and
+    /// `loop_closure_worst_cycles.tif`. See issue #24.
+    pub mask_unwrap_loop_errors: bool,
 }
 
 impl Default for TimeseriesOptions {
@@ -247,6 +256,7 @@ impl Default for TimeseriesOptions {
             correct_velocity_temporal_correlation: false,
             velocity_seasonal: false,
             velocity_step_dates: Vec::new(),
+            mask_unwrap_loop_errors: false,
         }
     }
 }

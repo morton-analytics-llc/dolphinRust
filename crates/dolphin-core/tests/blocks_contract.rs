@@ -47,6 +47,24 @@ fn cases() -> Vec<Case> {
             Strides { y: 2, x: 2 },
             HalfWindow { y: 5, x: 11 },
         ),
+        // The `GP_DOLPHIN_OUTPUT_STRIDE_X=2 / _Y=1` override from `../eo`#277.
+        // That bug turned out to be on the eo side (the AOI water mask was
+        // derived from a stale grid, not from dolphinRust's output), but the
+        // override strides themselves were never covered here — see #26.
+        (
+            (120, 240),
+            (32, 64),
+            Strides { y: 1, x: 2 },
+            HalfWindow { y: 7, x: 14 },
+        ),
+        // The transposed asymmetry: every asymmetric case above has x > y, so a
+        // row/column swap in the striding math would go unnoticed.
+        (
+            (240, 120),
+            (64, 32),
+            Strides { y: 6, x: 3 },
+            HalfWindow { y: 14, x: 7 },
+        ),
     ]
 }
 

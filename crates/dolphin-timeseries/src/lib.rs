@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod inversion;
+pub mod loop_closure;
 pub mod network;
 pub mod reference;
 pub mod velocity_model;
@@ -16,6 +17,10 @@ pub use inversion::{
     estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
     invert_stack_with_uncertainty, solve_pixel_with_covariance, L1Config, L2InversionOutput,
     PixelL2Solution, VelocityOutput, VelocityOutputNeff,
+};
+pub use loop_closure::{
+    loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, Triplet,
+    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};

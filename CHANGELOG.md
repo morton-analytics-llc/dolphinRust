@@ -7,6 +7,22 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Post-unwrap loop-closure QC gate** (issue #24, whose re-entry gate was a design review;
+  the review is in the issue and the module docs). `dolphin-timeseries::loop_closure` closes
+  every triangle in the **unwrapped** interferogram network and blanks pixels whose loops
+  miss closure by more than half a cycle, before the SBAS solve.
+  **It is not a duplicate of the existing closure-phase layer.** That one computes
+  `∠(C[k,k+1]·C[k+1,k+2]·conj(C[k,k+2]))` on the coherence matrix — wrapped phase, bounded
+  to `(−π, π]` by the `.arg()` — and targets decorrelation-driven bias. An unwrapping error
+  is an integer multiple of `2π`, which is exactly what that `.arg()` discards: a clean 2π
+  error wraps to zero and is invisible to it. There is a test asserting precisely that.
+  Connected-component labels turned out to supply the correction *granularity* and a free
+  prefilter, but no cross-interferogram information, so they cannot supply the detection.
+  Gated by `timeseries_options.mask_unwrap_loop_errors` (default `false`); forward
+  divergence from dolphin. **A no-op on a single-reference network**, which has no loops —
+  it warns rather than erroring, since that is a configuration mismatch, not bad data. Emits
+  `loop_closure_bad_count.tif` and `loop_closure_worst_cycles.tif`. A pixel with no
+  evaluable loop is never masked: the gate acts only on positive evidence.
 - **The uncertainty layers now declare their own scale, and the product is decided** (issue
   #36). `crlb_sigma_NN.tif`, `displacement_variance_NN.tif`, and `velocity_sigma.tif` were
   emitted with nothing to distinguish a Cramér–Rao *lower bound* from a predictive sigma; a

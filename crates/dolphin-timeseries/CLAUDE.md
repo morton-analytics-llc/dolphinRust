@@ -5,6 +5,15 @@
 - **L2 weighted least squares first** (faer), block-parallel; optional coherence weighting
   and `correlation_threshold` censoring. Linear velocity = trend of the series.
 - L1/ADMM deferred until L2 is validated.
+- **Post-unwrap loop-closure QC (`loop_closure.rs`, issue #24)** — closes every triangle in
+  the *unwrapped* network and masks pixels whose loops miss closure by >½ cycle, before the
+  solve. Distinct from `dolphin-phaselink`'s closure phase, which is computed on the
+  coherence matrix and bounded by `.arg()` to `(−π, π]`: a 2π unwrap error wraps to zero
+  there and cannot be seen. **No-op on a single-reference network** (no loops), so it needs
+  `max_bandwidth`/`max_temporal_baseline` — the same over-determined network #36 needs for
+  an empirically scaled posterior. Off by default. Never masks a pixel with no evaluable
+  loop: positive evidence only.
+
 - **Velocity time-function terms (`velocity_model.rs`, issue #22)** — an annual sinusoid
   and/or configured Heaviside steps fitted *jointly* with the rate, so the reported rate is
   the rate rather than the rate plus whatever the seasonal cycle and step contributed over

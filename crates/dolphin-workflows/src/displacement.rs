@@ -22,8 +22,9 @@ use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_model,
     estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
     estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
-    invert_stack_with_uncertainty, reference_to_point, select_reference_point, L1Config,
-    NetworkConfig, VelocityModel,
+    invert_stack_with_uncertainty, loop_closure_qc, mask_failed_loops, network_triplets,
+    reference_to_point, select_reference_point, L1Config, LoopClosureQc, NetworkConfig,
+    VelocityModel, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -259,17 +260,8 @@ fn finish_displacement(
             epsg,
         )
     })?;
-    let dphi_rad = unwrap.unwrapped;
-    let incidence = get_incidence_matrix(&pairs);
-    let mut inversion = timed("timeseries", || {
-        invert_time_series(
-            cfg,
-            incidence.view(),
-            dphi_rad.view(),
-            stitched.crlb_sigma.as_ref(),
-            &pairs,
-        )
-    })?;
+    let (mut inversion, loop_closure) =
+        solve_time_series(cfg, unwrap.unwrapped, &pairs, stitched.crlb_sigma.as_ref())?;
     // Spatially reference the series to a stable pixel (dolphin parity): the
     // configured point, else the center-of-mass of the high-coherence region.
     let configured_reference = configured_analysis_reference(
@@ -311,6 +303,7 @@ fn finish_displacement(
         vel_rad: fit.velocity,
         velocity_model,
         velocity_terms: fit.terms,
+        loop_closure,
         temporal_coherence,
         validity_mask,
         burst_coverage,
@@ -533,6 +526,57 @@ fn scale_velocity_terms(
     (amplitude, steps)
 }
 
+/// Loop-closure QC on the unwrapped network, then the SBAS solve. The QC runs
+/// first because a 2π unwrap error is a confident wrong number in the solve, and
+/// it is invisible to the wrapped closure-phase layer (#24).
+fn solve_time_series(
+    cfg: &DisplacementWorkflow,
+    mut dphi_rad: Array3<f64>,
+    pairs: &[(usize, usize)],
+    crlb_sigma: Option<&Array3<f64>>,
+) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
+    let loop_closure = timed("loop_closure", || {
+        apply_loop_closure_qc(cfg, &mut dphi_rad, pairs)
+    });
+    let incidence = get_incidence_matrix(pairs);
+    let inversion = timed("timeseries", || {
+        invert_time_series(cfg, incidence.view(), dphi_rad.view(), crlb_sigma, pairs)
+    })?;
+    Ok((inversion, loop_closure))
+}
+
+/// Run the opt-in post-unwrap loop-closure QC and blank the failing pixels.
+/// Returns the QC layers for output, or `None` when the gate is off or the
+/// network has no loops to close.
+fn apply_loop_closure_qc(
+    cfg: &DisplacementWorkflow,
+    dphi_rad: &mut Array3<f64>,
+    pairs: &[(usize, usize)],
+) -> Option<LoopClosureQc> {
+    if !cfg.timeseries_options.mask_unwrap_loop_errors {
+        return None;
+    }
+    if network_triplets(pairs).is_empty() {
+        tracing::warn!(
+            stage = "loop_closure",
+            "mask_unwrap_loop_errors is set but the interferogram network has no closed \
+             triangles (single-reference?) — nothing to check; set \
+             interferogram_network.max_bandwidth or max_temporal_baseline"
+        );
+        return None;
+    }
+    let qc = loop_closure_qc(dphi_rad.view(), pairs, DEFAULT_CLOSURE_TOLERANCE_CYCLES);
+    let masked = qc.bad_loop_count.iter().filter(|&&n| n > 0.0).count();
+    tracing::info!(
+        stage = "loop_closure",
+        masked_pixels = masked,
+        pixels = qc.bad_loop_count.len(),
+        "masked pixels whose unwrapped loops did not close"
+    );
+    mask_failed_loops(dphi_rad, &qc);
+    Some(qc)
+}
+
 /// Resolve the configured time-function model and fit the whole-frame velocity.
 fn frame_velocity(
     cfg: &DisplacementWorkflow,
@@ -641,6 +685,7 @@ struct SpatialProducts {
     vel_rad: Array2<f64>,
     velocity_model: VelocityModel,
     velocity_terms: VelocityTerms,
+    loop_closure: Option<LoopClosureQc>,
     temporal_coherence: Array2<f64>,
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
@@ -696,6 +741,7 @@ fn emit_displacement(
             seasonal_phase_days: spatial.velocity_terms.seasonal_phase_days.as_ref(),
             step_magnitude: &scaled.step_magnitude,
         },
+        loop_closure: spatial.loop_closure.as_ref(),
     };
     let input_coverage = summarize_input_coverage(&spatial);
     let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
@@ -2409,6 +2455,13 @@ fn write_outputs(
     for (k, step) in quality.velocity_terms.step_magnitude.iter().enumerate() {
         write_f32(&format!("velocity_step_{k:02}.tif"), step.view())?;
     }
+    if let Some(qc) = quality.loop_closure {
+        write_f32("loop_closure_bad_count.tif", qc.bad_loop_count.view())?;
+        write_f32(
+            "loop_closure_worst_cycles.tif",
+            qc.worst_residual_cycles.view(),
+        )?;
+    }
     if let Some(variance) = quality.displacement_variance {
         for band in 0..variance.dim().0 {
             write_raster_with_metadata(
@@ -2520,6 +2573,8 @@ struct QualityLayers<'a> {
     /// Seasonal amplitude in displacement units, peak day, and per-step
     /// magnitudes — present only when the time-function model is configured.
     velocity_terms: VelocityTermLayers<'a>,
+    /// Post-unwrap loop-closure QC, present only when the gate ran.
+    loop_closure: Option<&'a LoopClosureQc>,
 }
 
 /// Emitted form of [`VelocityTerms`], already scaled to displacement units.
@@ -2694,6 +2749,7 @@ mod tests {
             vel_rad: velocity,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
@@ -2761,6 +2817,7 @@ mod tests {
             vel_rad: Array2::zeros((6, 8)),
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
@@ -2806,6 +2863,7 @@ mod tests {
             vel_rad: Array2::zeros((4, 4)),
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
             temporal_coherence: Array2::from_elem((4, 4), 0.1),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
@@ -3443,6 +3501,7 @@ mod tests {
                     velocity_sigma: Some(&sigma),
                     connected_components: &conncomp,
                     velocity_terms: VelocityTermLayers::default(),
+                    loop_closure: None,
                 },
                 Some(32614),
                 gt,
@@ -3506,6 +3565,52 @@ mod tests {
         cfg.interferogram_network.max_bandwidth = Some(2);
         let pairs = network(&cfg, &[0.0, 12.0, 24.0, 36.0]);
         assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]);
+    }
+
+    /// Issue #24: the gate is off by default, so the unwrapped stack reaches the
+    /// solve untouched.
+    #[test]
+    fn loop_closure_gate_is_off_by_default() {
+        let cfg = DisplacementWorkflow::default();
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
+        let original = dphi.clone();
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        assert_eq!(dphi, original);
+    }
+
+    /// Enabled on a single-reference network it is a no-op with a warning, not an
+    /// error: there are no loops to close, and that is a configuration mismatch
+    /// rather than bad data.
+    #[test]
+    fn loop_closure_gate_is_a_no_op_without_loops() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (0, 3)];
+        let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
+        let original = dphi.clone();
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        assert_eq!(dphi, original);
+    }
+
+    /// Enabled on a network with loops, a 2π error is masked out of every
+    /// interferogram at that pixel before the solve sees it.
+    #[test]
+    fn loop_closure_gate_masks_a_cycle_error() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let phase = [0.0, 1.3, 2.9];
+        let mut dphi = Array3::from_shape_fn((pairs.len(), 2, 2), |(k, _, _)| {
+            let (i, j) = pairs[k];
+            phase[j] - phase[i]
+        });
+        dphi[(2, 1, 1)] += std::f64::consts::TAU;
+
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, &pairs).expect("qc ran");
+        assert!(qc.bad_loop_count[(1, 1)] > 0.0);
+        assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
+        assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
@@ -3626,6 +3731,7 @@ mod tests {
                 seasonal: false,
                 step_days: vec![step_day],
             },
+            loop_closure: None,
             velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
