@@ -186,6 +186,7 @@ fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
 /// # Errors
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
+    validate_uncertainty_options(cfg)?;
     let groups = group_by_burst(&cfg.cslc_file_list);
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
@@ -1368,6 +1369,7 @@ fn source_layouts(
 pub fn run_displacement_resumable(
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
+    validate_uncertainty_options(cfg)?;
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
     let groups = group_by_burst(&cfg.cslc_file_list);
     let layouts = source_layouts(cfg, &groups)?;
@@ -1423,6 +1425,7 @@ pub fn update_displacement(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
+    validate_uncertainty_options(cfg)?;
     // The finite dependency cone grows when an update adds ministacks. Reusing a
     // prior bounded state could therefore omit newly-required halo pixels. A
     // bounded update deliberately recomputes the bounded analysis domain; it is
@@ -1522,6 +1525,17 @@ fn update_one_burst(
         seq,
     };
     Ok((link, next))
+}
+
+fn validate_uncertainty_options(cfg: &DisplacementWorkflow) -> Result<()> {
+    anyhow::ensure!(
+        !cfg
+            .timeseries_options
+            .correct_velocity_temporal_correlation
+            || cfg.timeseries_options.write_velocity_uncertainty,
+        "timeseries_options.correct_velocity_temporal_correlation requires write_velocity_uncertainty"
+    );
+    Ok(())
 }
 
 /// The frame-grid mosaic of the per-burst phase-linking products.
@@ -2622,6 +2636,22 @@ mod tests {
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
+    }
+
+    /// The correction changes only the emitted uncertainty product, so enabling
+    /// it without that product must fail rather than silently doing nothing.
+    #[test]
+    fn temporal_correlation_requires_velocity_uncertainty_output() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
+
+        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires write_velocity_uncertainty"));
+
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        validate_uncertainty_options(&cfg).expect("valid uncertainty options");
     }
 
     /// Issue #33: velocity sigma understates the slope uncertainty because the
