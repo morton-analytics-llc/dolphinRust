@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use dolphin_core::config::CorrectionOptions;
 use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
+use dolphin_corrections::solid_earth_tide::{tide_range_delay_grid, LonLatGrid};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
     ensure_finite_coverage, height_levels, read_l4_level_for_grid, read_l4_netcdf_for_grid,
@@ -34,6 +35,9 @@ pub struct CorrectionLayers {
     /// ground-truth harness's ENU→LOS projection. When present it also drives the
     /// per-pixel zenith→slant incidence for the iono/tropo delays.
     pub los_geometry: Option<LosGeometry>,
+    /// Solid-earth-tide equivalent range delay, present when
+    /// `correction_options.solid_earth_tide` is set.
+    pub solid_earth_tide: Option<Array3<f64>>,
 }
 
 /// Build and subtract the configured corrections from `disp_rad` in place.
@@ -61,6 +65,7 @@ pub fn apply_corrections(
         return Ok(CorrectionLayers {
             ionosphere: None,
             troposphere: None,
+            solid_earth_tide: None,
             los_geometry,
         });
     }
@@ -76,10 +81,14 @@ pub fn apply_corrections(
     };
     let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), geo, freq, los)?;
     let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los)?;
+    let solid_earth_tide = build_solid_earth_tide(opts, date_files, (rows, cols), geo, los)?;
 
     let total = sum_layers(
-        ionosphere.as_ref(),
-        troposphere.as_ref(),
+        [
+            ionosphere.as_ref(),
+            troposphere.as_ref(),
+            solid_earth_tide.as_ref(),
+        ],
         n_dates,
         (rows, cols),
     );
@@ -87,6 +96,7 @@ pub fn apply_corrections(
     Ok(CorrectionLayers {
         ionosphere,
         troposphere,
+        solid_earth_tide,
         los_geometry,
     })
 }
@@ -120,22 +130,70 @@ fn resolve_geometry(
     Ok(Some(resolve_los_geometry(&layers, gt, epsg, shape)?))
 }
 
-/// Sum the present delay layers (either may be absent) into one `(n_dates, rows,
+/// Sum the present delay layers (any may be absent) into one `(n_dates, rows,
 /// cols)` total.
-fn sum_layers(
-    iono: Option<&Array3<f64>>,
-    tropo: Option<&Array3<f64>>,
+fn sum_layers<const N: usize>(
+    layers: [Option<&Array3<f64>>; N],
     n_dates: usize,
     (rows, cols): (usize, usize),
 ) -> Array3<f64> {
-    let mut total = Array3::<f64>::zeros((n_dates, rows, cols));
-    if let Some(a) = iono {
-        total += a;
+    layers.iter().flatten().fold(
+        Array3::<f64>::zeros((n_dates, rows, cols)),
+        |mut total, layer| {
+            total += *layer;
+            total
+        },
+    )
+}
+
+/// Per-date solid-earth-tide equivalent range delay (meters) on the frame grid.
+///
+/// Needs no external data file — only the acquisition UTC from each granule name
+/// and the per-pixel LOS geometry. Both are hard requirements rather than
+/// fallbacks: the tide is semidiurnal, so a defaulted acquisition time would be
+/// wrong by up to half a cycle, and the tide is a 3-D vector whose LOS projection
+/// needs the full unit vector, which the scalar `incidence_angle_deg` cannot give.
+fn build_solid_earth_tide(
+    opts: &CorrectionOptions,
+    date_files: &[PathBuf],
+    (rows, cols): (usize, usize),
+    geo: GeoInfo,
+    los: Option<&LosGeometry>,
+) -> Result<Option<Array3<f64>>> {
+    if !opts.solid_earth_tide {
+        return Ok(None);
     }
-    if let Some(a) = tropo {
-        total += a;
+    let los = los.context(
+        "correction_options.solid_earth_tide requires geometry_files: projecting a 3-D \
+         tidal displacement into line of sight needs the full LOS unit vector, which the \
+         scalar incidence_angle_deg cannot supply",
+    )?;
+    let corners = dolphin_io::grid_corner_lonlat(geo.geotransform, rows, cols, geo.epsg)?;
+    let lonlat = LonLatGrid::from_corners(corners, rows, cols);
+    let mut out = Array3::<f64>::zeros((date_files.len(), rows, cols));
+    for (t, path) in date_files.iter().enumerate() {
+        let utc = acq_utc_datetime(path).with_context(|| {
+            format!(
+                "correction_options.solid_earth_tide needs each granule's acquisition time; \
+                 {} carries no YYYYMMDDThhmmss token. The tide is semidiurnal, so defaulting \
+                 the time would be wrong by up to half a cycle",
+                path.display()
+            )
+        })?;
+        out.index_axis_mut(Axis(0), t)
+            .assign(&tide_range_delay_grid(utc, &lonlat, los));
     }
-    total
+    Ok(Some(out))
+}
+
+/// Full acquisition UTC from a granule name's `YYYYMMDDThhmmss` token.
+fn acq_utc_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+    let name = path.file_name().and_then(|s| s.to_str())?;
+    let chars: Vec<char> = name.chars().collect();
+    chars.windows(15).find_map(|w| {
+        let token: String = w.iter().collect();
+        chrono::NaiveDateTime::parse_from_str(&token, "%Y%m%dT%H%M%S").ok()
+    })
 }
 
 /// Build the per-date ionospheric delay grid from IONEX TEC maps. IONEX is coarse
@@ -692,5 +750,105 @@ mod tests {
         let want = 13.0 * 3600.0 + 24.0 * 60.0 + 17.0;
         assert!((acq_utc_sec(opera) - want).abs() < 1e-9);
         assert!((acq_utc_sec(Path::new("cslc_20221119.h5")) - 43200.0).abs() < 1e-9);
+    }
+
+    /// The tide needs the whole timestamp, not just the seconds of day, and a
+    /// date-only name has none to give.
+    #[test]
+    fn parses_full_acquisition_datetime() {
+        let opera = Path::new("OPERA_L2_CSLC-S1_T027_20230914T132417Z_x.h5");
+        let parsed = acq_utc_datetime(opera).expect("OPERA stamp");
+        assert_eq!(parsed.to_string(), "2023-09-14 13:24:17");
+        assert!(acq_utc_datetime(Path::new("cslc_20221119.h5")).is_none());
+    }
+
+    /// Issue #21, the default: the tide flag is off, so `apply_corrections` is a
+    /// no-op on displacement and emits no tide layer.
+    #[test]
+    fn solid_earth_tide_is_off_by_default() {
+        let opts = CorrectionOptions::default();
+        assert!(!opts.is_enabled());
+        let mut disp = Array3::from_shape_fn((2, 2, 2), |(t, r, c)| (t + r + c) as f64);
+        let original = disp.clone();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6]).unwrap();
+        assert!(layers.solid_earth_tide.is_none());
+        assert_eq!(disp, original);
+    }
+
+    /// Enabling the tide without geometry fails closed and says why: a 3-D
+    /// displacement cannot be projected into line of sight from a scalar incidence.
+    #[test]
+    fn solid_earth_tide_without_geometry_fails_closed() {
+        let opts = CorrectionOptions {
+            solid_earth_tide: true,
+            ..Default::default()
+        };
+        let mut disp = Array3::<f64>::zeros((1, 2, 2));
+        let gt = [500_000.0, 60.0, 0.0, 2_150_000.0, 0.0, -60.0];
+        let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
+        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("geometry_files"),
+            "expected the geometry requirement, got: {err:#}"
+        );
+    }
+
+    /// A granule with no time stamp fails closed rather than defaulting to noon:
+    /// the tide is semidiurnal, so a defaulted time can be wrong by half a cycle.
+    #[test]
+    fn solid_earth_tide_without_a_timestamp_fails_closed() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_set_no_time.h5");
+        write_uniform_static(&path, 34.0, gt, (3, 3));
+        let opts = CorrectionOptions {
+            solid_earth_tide: true,
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let mut disp = Array3::<f64>::zeros((1, 3, 3));
+        let files = vec![PathBuf::from("cslc_20230104.h5")];
+        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("semidiurnal"),
+            "expected the timestamp requirement, got: {err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// End to end: with geometry and timestamps the tide layer is built, has the
+    /// physically expected magnitude, and is actually subtracted from the series.
+    #[test]
+    fn solid_earth_tide_is_built_and_subtracted() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_set_applied.h5");
+        write_uniform_static(&path, 34.0, gt, (3, 3));
+        let opts = CorrectionOptions {
+            solid_earth_tide: true,
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        // Two acquisitions 12 days and ~12 h of tidal phase apart, so the
+        // differential does not cancel.
+        let files = vec![
+            PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5"),
+            PathBuf::from("OPERA_L2_CSLC-S1_T005_20230116T124053Z_x.h5"),
+        ];
+        let mut disp = Array3::<f64>::zeros((1, 3, 3));
+        let layers = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap();
+
+        let tide = layers.solid_earth_tide.expect("tide layer");
+        assert_eq!(tide.dim(), (2, 3, 3));
+        let peak = tide.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            (0.005..0.40).contains(&peak),
+            "tide LOS delay {peak} m is outside the physical envelope"
+        );
+        assert!(
+            disp.iter().any(|v| v.abs() > 1e-9),
+            "the tide was built but never subtracted"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

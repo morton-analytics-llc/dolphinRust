@@ -512,10 +512,12 @@ dependencies = [
 name = "dolphin-corrections"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "dolphin-core",
  "dolphin-io",
  "gdal",
  "ndarray",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

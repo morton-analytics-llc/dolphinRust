@@ -42,6 +42,49 @@ pub fn grid_centroid_lonlat(
     Ok((x[0], y[0]))
 }
 
+/// Geographic (lon, lat) in degrees at the four corner **pixel centres** of a
+/// grid, row-major: top-left, top-right, bottom-left, bottom-right.
+///
+/// Where [`grid_centroid_lonlat`] serves products coarse enough that one sample
+/// describes the whole frame (IONEX), this serves fields with a real gradient
+/// across it — the solid earth tide varies by millimetres over 100 km, so its
+/// per-pixel position matters, and four corners plus bilinear interpolation is
+/// enough because within one projected zone the lon/lat ↔ x/y map departs from
+/// bilinear by only tens of meters over that distance.
+///
+/// # Errors
+/// Returns `Err` if the CRS or the coordinate transform cannot be built.
+pub fn grid_corner_lonlat(
+    gt: [f64; 6],
+    rows: usize,
+    cols: usize,
+    epsg: u32,
+) -> Result<[[f64; 2]; 4]> {
+    let last = |extent: usize| (extent.max(1) - 1) as f64;
+    let pixels = [
+        (0.5, 0.5),
+        (last(cols) + 0.5, 0.5),
+        (0.5, last(rows) + 0.5),
+        (last(cols) + 0.5, last(rows) + 0.5),
+    ];
+    let mut x: Vec<f64> = pixels
+        .iter()
+        .map(|&(col, row)| gt[0] + col * gt[1] + row * gt[2])
+        .collect();
+    let mut y: Vec<f64> = pixels
+        .iter()
+        .map(|&(col, row)| gt[3] + col * gt[4] + row * gt[5])
+        .collect();
+    let mut src = SpatialRef::from_epsg(epsg)?;
+    let mut dst = SpatialRef::from_epsg(4326)?;
+    src.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    dst.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    let ct = CoordTransform::new(&src, &dst)?;
+    let mut z = [0.0; 4];
+    ct.transform_coords(&mut x, &mut y, &mut z)?;
+    Ok(std::array::from_fn(|i| [x[i], y[i]]))
+}
+
 /// A raster with its georeferencing.
 pub struct RasterData<T> {
     /// Pixel values, `(rows, cols)`.

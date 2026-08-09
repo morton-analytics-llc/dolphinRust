@@ -460,6 +460,14 @@ pub struct CorrectionOptions {
     /// `"total"` (the default) sums the real product's `hydrostatic_delay` +
     /// `wet_delay` zenith fields; any other value reads that single variable.
     pub troposphere_variable: String,
+    /// Subtract the lunisolar solid-earth tide (issue #21). Unlike the other
+    /// corrections this needs **no external data file** — only the acquisition
+    /// time from the granule name and per-pixel LOS geometry — so it is gated by
+    /// a flag rather than by a file list. dolphinRust-only forward divergence,
+    /// **off by default**. Requires `geometry_files`: the tide is a 3-D
+    /// displacement vector and projecting it into line of sight needs the full
+    /// LOS unit vector, which the scalar `incidence_angle_deg` cannot supply.
+    pub solid_earth_tide: bool,
 }
 
 impl Default for CorrectionOptions {
@@ -471,15 +479,19 @@ impl Default for CorrectionOptions {
             dem_file: None,
             incidence_angle_deg: 37.0,
             troposphere_variable: "total".into(),
+            solid_earth_tide: false,
         }
     }
 }
 
 impl CorrectionOptions {
-    /// Whether any correction is enabled (any correction file supplied).
+    /// Whether any correction is enabled (any correction file supplied, or the
+    /// file-free solid-earth-tide flag set).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.ionosphere_files.is_empty() || !self.troposphere_files.is_empty()
+        !self.ionosphere_files.is_empty()
+            || !self.troposphere_files.is_empty()
+            || self.solid_earth_tide
     }
 }
 

@@ -7,6 +7,24 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Solid-earth-tide correction** (issue #21). `dolphin-corrections::solid_earth_tide`
+  models the lunisolar solid earth tide (IERS 2010 §7.1.1 step-1 degree-2 in-phase, nominal
+  `h₂ = 0.6078`, `l₂ = 0.0847`, low-precision analytic Sun/Moon ephemerides) and expresses
+  it as an equivalent per-date range delay, so it sums with the ionospheric and tropospheric
+  layers and goes through the same `subtract_delay` stage. Unlike those it needs **no
+  external data file** — only the acquisition time from the granule name and per-pixel LOS
+  geometry — so it is gated by `correction_options.solid_earth_tide` (default `false`)
+  rather than a file list. Both inputs are **required, not defaulted**: the tide is
+  semidiurnal, so a defaulted acquisition time could be wrong by half a cycle, and a 3-D
+  displacement vector cannot be projected into line of sight from the scalar
+  `incidence_angle_deg`. Emits `solid_earth_tide_NN.tif`. On the three-station GNSS frame
+  the LOS tide runs −157 to +138 mm per date with a 206 mm peak differential and up to
+  3.35 mm of spatial spread across the frame — the spread is why it is evaluated per pixel
+  rather than sampled once at the centre like IONEX. Omitted: degree-3, out-of-phase, and
+  latitude-dependent Love-number terms (each ≲ 2 mm), IERS step-2 frequency dependence, and
+  **ocean tidal loading**, which is the larger remaining gap and needs an external
+  loading-coefficient grid. See VALIDATION.md, including why the −195 mm/yr velocity leak
+  measured on that 13-epoch window is not a general figure.
 - **Opt-in seasonal and step terms in the velocity fit** (issue #22).
   `dolphin-timeseries::estimate_velocity_with_model` fits an annual sinusoid and/or
   configured Heaviside steps **jointly** with the linear rate in one weighted least-squares

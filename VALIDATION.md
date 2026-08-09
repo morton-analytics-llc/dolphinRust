@@ -933,6 +933,51 @@ not merely close. Gate: `crates/dolphin-corrections/tests/los_neighbour_burst_re
 (skips when the fixtures are absent; the overlap statistic there is computed independently
 of the one inside `resolve_los_geometry`, so it is a cross-check rather than a restatement).
 
+### Solid earth tide, on the real GNSS frame (2026-08-09, #21)
+
+The lunisolar solid earth tide was not modelled at all. Run over the three-station frame's
+13 real acquisition times and real per-pixel LOS geometry
+(`crates/dolphin-corrections/tests/solid_earth_tide_real.rs`):
+
+| | value |
+|---|---:|
+| LOS tide per date, frame mean | **−157 to +138 mm** |
+| peak differential vs acquisition 0 (what is actually applied) | **206 mm** |
+| largest across-frame spatial spread on any date | **3.35 mm** |
+| rate the uncorrected differential contributes to a linear velocity fit | **−195 mm/yr** |
+
+For scale, the deformation signal this frame is used to measure is a few mm/yr.
+
+**Read the −195 mm/yr carefully.** It is the leak *for this particular 13-epoch, 5-month
+window*, not a general figure. Every acquisition is at ~00:40:5x UTC, so the solar tide is
+sampled at nearly the same phase each time and largely cancels in the differential; the
+±150 mm swing is lunar, and the ~27.5-day lunar cycle aliased against the 12-day cadence
+over 5 months happens to look like a trend. A multi-year stack averages that down — but
+**not to zero**, which is the reason the term belongs in the pipeline rather than in the
+noise budget.
+
+The across-frame spread (up to 3.35 mm) is why the tide is computed **per pixel** rather
+than sampled once at the frame centre the way the coarse IONEX path is: 3 mm of spatial
+ramp is InSAR signal, not rounding.
+
+Model: IERS 2010 §7.1.1 step-1 degree-2 in-phase, nominal `h₂ = 0.6078`, `l₂ = 0.0847`,
+with low-precision analytic Sun and Moon ephemerides. Omitted terms (degree-3, out-of-phase,
+latitude-dependent Love numbers, step-2 frequency dependence) are each ≲ 2 mm; ocean tidal
+loading is **not modelled at all** and is the larger remaining gap (cm-level near coasts,
+needs an external loading grid). So this is a first-order correction, not a reference IERS
+implementation. Off by default; requires `geometry_files` and a timestamped granule name,
+both enforced rather than defaulted — the tide is semidiurnal, so a defaulted acquisition
+time could be wrong by half a cycle, and a 3-D displacement cannot be projected into LOS
+from a scalar incidence.
+
+**Not yet validated against GNSS.** The NGL `.tenv3` series are themselves tide-corrected,
+so the harness cannot confirm this correction improves agreement; that needs either
+tide-uncorrected GNSS or an independent implementation to difference against. The evidence
+here is that the model reproduces the closed-form and structural properties of the tide
+(0.218 m lunar / 0.100 m solar zenith amplitude, `P₂` sign change at 54.7356°, semidiurnal
+period, ephemeris envelopes) and that its magnitude on real data is far above the error
+budget.
+
 ### What truth set this burst can support (surveyed 2026-08-08)
 
 19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the

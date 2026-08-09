@@ -37,6 +37,23 @@ modelling + raster subtraction, no solver.
   (`raider.py` subprocess) — **gated behind an availability check like SNAPHU, never
   stubbed**; absent ⇒ `RaiderUnavailable` and the path is skipped (deferred), not faked.
 
+- **Solid earth tide (`solid_earth_tide.rs`, issue #21).** Not a propagation delay — real
+  lunisolar ground motion — but it enters a repeat-pass measurement the same way, so it is
+  expressed as an **equivalent range delay** (`−(Δr · l̂)`, `l̂` ground→sensor) and summed with
+  iono/tropo before `subtract_delay`. IERS 2010 §7.1.1 step-1 degree-2 in-phase,
+  `h₂ = 0.6078`, `l₂ = 0.0847`, with Astronomical-Almanac low-precision Sun/Moon ephemerides
+  (mean equinox of date, so precession cancels against GMST rather than accumulating).
+  **Needs no external file** — only the granule's `YYYYMMDDThhmmss` and per-pixel LOS — so
+  it is flag-gated (`correction_options.solid_earth_tide`, off by default) rather than
+  file-gated, and `is_enabled()` accounts for it. Both inputs are hard requirements: the
+  tide is semidiurnal (a defaulted time can be half a cycle wrong) and a 3-D vector cannot
+  be projected into LOS from a scalar incidence. Evaluated **per pixel** — it varies ~3 mm
+  across a 100 km frame, so the IONEX-style single centre sample would discard real signal;
+  lon/lat comes from bilinear interpolation of the four frame corners, whose error is tens
+  of meters and therefore ~0.003 mm of tide. The ephemeris is hoisted out of the pixel loop
+  (it dominates otherwise: 153 s → 13 s on a 9.7 Mpx × 13-date frame). Ocean tidal loading
+  is **not** modelled.
+
 - **Per-pixel LOS geometry (`geometry.rs`).** Ingests the OPERA **CSLC-S1-STATIC** companion
   product's ground→sensor LOS unit-vector components (`/data/los_east`, `/data/los_north`, f32,
   read by `dolphin-io::read_los_layers`) and resolves them onto the frame grid, replacing the

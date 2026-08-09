@@ -132,6 +132,11 @@ pub struct DisplacementOutput {
     /// subtracted from the series. `None` unless `correction_options.troposphere_files`
     /// were supplied.
     pub troposphere_delay: Option<Array3<f64>>,
+    /// Per-date solid-earth-tide equivalent range delay (meters), `(n_dates, rows,
+    /// cols)`, that was subtracted from the series. `None` unless
+    /// `correction_options.solid_earth_tide` was set. Not a propagation delay —
+    /// real lunisolar ground motion, expressed as the range change it causes.
+    pub solid_earth_tide_delay: Option<Array3<f64>>,
     /// Per-pixel LOS unit-vector geometry (east/north/up) on the output grid. `None`
     /// unless `correction_options.geometry_files` (CSLC-S1-STATIC) were supplied. The
     /// front door for the GPS ground-truth harness's ENU→LOS projection.
@@ -711,6 +716,7 @@ fn emit_displacement(
         reference_point: spatial.reference_point,
         ionosphere_delay: spatial.corrections.ionosphere,
         troposphere_delay: spatial.corrections.troposphere,
+        solid_earth_tide_delay: spatial.corrections.solid_earth_tide,
         los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
@@ -783,6 +789,9 @@ impl SpatialProducts {
             mask3_f64(layer, mask);
         }
         if let Some(layer) = self.corrections.troposphere.as_mut() {
+            mask3_f64(layer, mask);
+        }
+        if let Some(layer) = self.corrections.solid_earth_tide.as_mut() {
             mask3_f64(layer, mask);
         }
         if let Some(geometry) = self.corrections.los_geometry.as_mut() {
@@ -1199,6 +1208,10 @@ fn trim_corrections(corrections: &mut CorrectionLayers, block: BlockIndices) {
         .map(|layer| trim3(&layer, block));
     corrections.troposphere = corrections
         .troposphere
+        .take()
+        .map(|layer| trim3(&layer, block));
+    corrections.solid_earth_tide = corrections
+        .solid_earth_tide
         .take()
         .map(|layer| trim3(&layer, block));
     corrections.los_geometry = corrections.los_geometry.take().map(|geometry| LosGeometry {
@@ -2385,6 +2398,9 @@ fn write_correction_outputs(
     if let Some(tropo) = &corrections.troposphere {
         write_bands(&write_f32, tropo.view(), "troposphere")?;
     }
+    if let Some(tide) = &corrections.solid_earth_tide {
+        write_bands(&write_f32, tide.view(), "solid_earth_tide")?;
+    }
     Ok(())
 }
 
@@ -2544,6 +2560,7 @@ mod tests {
         let mut corrections = CorrectionLayers {
             ionosphere: Some(values.clone()),
             troposphere: Some(values),
+            solid_earth_tide: None,
             los_geometry: Some(geometry),
         };
         let target = BlockIndices {
@@ -2582,6 +2599,7 @@ mod tests {
             corrections: CorrectionLayers {
                 ionosphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
                 troposphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
+                solid_earth_tide: None,
                 los_geometry: Some(LosGeometry {
                     east: Array2::from_elem((2, 2), 1.0),
                     north: Array2::from_elem((2, 2), 1.0),
@@ -2648,6 +2666,7 @@ mod tests {
             corrections: CorrectionLayers {
                 ionosphere: None,
                 troposphere: None,
+                solid_earth_tide: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
@@ -2692,6 +2711,7 @@ mod tests {
             corrections: CorrectionLayers {
                 ionosphere: None,
                 troposphere: None,
+                solid_earth_tide: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
@@ -3412,6 +3432,7 @@ mod tests {
             corrections: CorrectionLayers {
                 ionosphere: None,
                 troposphere: None,
+                solid_earth_tide: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
