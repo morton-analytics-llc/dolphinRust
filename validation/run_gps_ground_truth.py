@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Run and score the MMX1/ICMX GNSS validation matrix.
+"""Run and score a public GNSS station-pair validation matrix.
 
 This runner creates native and SNAPHU Rust configs from one dolphin-generated
 base, asserts that their scientific settings are identical, runs each backend,
-and optionally scores the shared MMX1/ICMX frame against NGL GNSS.
+and optionally scores the declared shared station frame against NGL GNSS.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from ruamel.yaml import YAML as RuamelYAML
 
 import gps_ground_truth as gps
 from crop_real import validate_cslc_files
-from fetch_real import load_recipe, sha256_file
+from fetch_real import cohort_id, load_recipe, sha256_file
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV = ROOT / "oracle" / ".venv" / "bin"
@@ -193,10 +193,14 @@ def verify_output(work_directory: Path, expected_epochs: int) -> dict[str, Any]:
 
 
 def verify_core_station(
-    work_directory: Path, recipe: dict[str, Any]
+    work_directory: Path, recipe: dict[str, Any], fixture: str
 ) -> dict[str, Any]:
     final_path = sorted(work_directory.glob("displacement_[0-9][0-9].tif"))[-1]
-    station = recipe["stations"]["MMX1"]
+    fixture_contract = recipe["fixtures"][fixture]
+    station_id = fixture_contract.get("center_station")
+    if fixture_contract.get("mode") != "center" or station_id not in recipe["stations"]:
+        raise gps.NotEvaluable("core-station verification requires a center fixture")
+    station = recipe["stations"][station_id]
     with rasterio.open(final_path) as dataset:
         row, col = gps.station_pixel(dataset, station["longitude"], station["latitude"])
         stats = gps.window_stats(
@@ -206,7 +210,7 @@ def verify_core_station(
             recipe["primary_window"],
             recipe["minimum_finite_fraction"],
         )
-    return {"pixel": [row, col], "final_window": as_json(stats)}
+    return {"station": station_id, "pixel": [row, col], "final_window": as_json(stats)}
 
 
 def as_json(value: Any) -> Any:
@@ -248,7 +252,13 @@ def validate_fixture_contract(
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     recipe = load_recipe(args.recipe)
-    fixture_root = args.fixture_root or ROOT / "validation" / "real_data" / "gps_mmx1" / "cropped" / args.fixture
+    cohort = cohort_id(recipe)
+    if args.fixture not in recipe["fixtures"]:
+        raise gps.NotEvaluable(f"fixture is not declared by recipe: {args.fixture}")
+    fixture_root = (
+        args.fixture_root
+        or ROOT / "validation" / "real_data" / cohort / "cropped" / args.fixture
+    )
     manifest_path = fixture_root / "fixture_manifest.json"
     if not manifest_path.exists():
         raise gps.NotEvaluable(f"fixture manifest is missing: {manifest_path}")
@@ -262,7 +272,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     validate_fixture_contract(
         fixture_manifest, recipe, args.fixture, cslcs, static_files[0]
     )
-    run_root = args.run_root or ROOT / "validation" / "runs" / "gps_mmx1" / args.fixture
+    run_root = args.run_root or ROOT / "validation" / "runs" / cohort / args.fixture
     run_root.mkdir(parents=True, exist_ok=True)
     base_path = run_root / "config_base.yaml"
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
@@ -283,6 +293,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     engine_receipts: dict[str, Any] = {}
     context = {
         "commit": git_commit(),
+        "cohort_id": cohort,
+        "burst_id": recipe["burst_id"],
         "recipe": str(args.recipe.resolve()),
         "recipe_sha256": sha256_file(args.recipe),
         "fixture": args.fixture,
@@ -311,8 +323,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             receipt["output"] = verify_output(
                 work_directory, len(recipe["expected_dates"])
             )
-            if args.fixture == "mmx1_core":
-                receipt["core_station"] = verify_core_station(work_directory, recipe)
+            if recipe["fixtures"][args.fixture].get("mode") == "center":
+                receipt["core_station"] = verify_core_station(
+                    work_directory, recipe, args.fixture
+                )
         except gps.NotEvaluable as error:
             receipt.update({"status": "not_evaluable", "reason": str(error)})
         except RuntimeError as error:
@@ -333,20 +347,25 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         )
         return payload
     if args.score:
-        if args.fixture != "mmx1_icmx_common":
-            raise gps.NotEvaluable("--score requires --fixture mmx1_icmx_common")
+        comparison = gps.comparison_contract(recipe)
+        if args.fixture != comparison["fixture"]:
+            raise gps.NotEvaluable(
+                f"--score requires --fixture {comparison['fixture']}"
+            )
         payload = gps.score_common_frame(
             recipe,
             fixture_manifest,
             {backend: Path(configs[backend]["work_directory"]) for backend in configs},
             static_files[0],
-            ROOT / "validation" / "real_data" / "gps_mmx1" / "gnss",
+            ROOT / "validation" / "real_data" / cohort / "gnss",
             run_root,
             float(native["input_options"]["wavelength"]),
         )
         payload["context"] = context
         payload["run_receipts"] = engine_receipts
-        (run_root / "gps_ground_truth.json").write_text(json.dumps(payload, indent=2) + "\n")
+        (run_root / "gps_ground_truth.json").write_text(
+            json.dumps(payload, indent=2, allow_nan=False) + "\n"
+        )
         return payload
     payload = result_payload("complete", None, context, engine_receipts)
     (run_root / "run_receipt.json").write_text(json.dumps(payload, indent=2) + "\n")
@@ -356,7 +375,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--recipe", type=Path, default=ROOT / "validation" / "gps_mmx1.json")
-    parser.add_argument("--fixture", choices=["mmx1_core", "mmx1_icmx_common"], required=True)
+    parser.add_argument("--fixture", required=True)
     parser.add_argument("--fixture-root", type=Path)
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--score", action="store_true")
@@ -377,7 +396,11 @@ def main() -> None:
             {"fixture": args.fixture, "recipe": str(args.recipe)},
             {},
         )
-        run_root = args.run_root or ROOT / "validation" / "runs" / "gps_mmx1" / args.fixture
+        try:
+            cohort = cohort_id(load_recipe(args.recipe))
+        except (OSError, ValueError, KeyError):
+            cohort = "unknown_cohort"
+        run_root = args.run_root or ROOT / "validation" / "runs" / cohort / args.fixture
         run_root.mkdir(parents=True, exist_ok=True)
         (run_root / "run_receipt.json").write_text(
             json.dumps(payload, indent=2) + "\n"

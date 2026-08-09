@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Independent GNSS-to-InSAR comparison primitives for the MMX1 harness."""
+"""Independent GNSS-to-InSAR comparison primitives for public station pairs."""
 
 from __future__ import annotations
 
@@ -52,6 +52,19 @@ class WindowStats:
     std: float
     valid_count: int
     total_count: int
+
+
+def json_safe(value: Any) -> Any:
+    """Convert numpy values and nonfinite abstentions to strict JSON values."""
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def parse_tenv3(text: str) -> list[Tenv3Record]:
@@ -147,6 +160,19 @@ def align_records(
             )
         aligned.append(AlignedRecord(interpolate_record(before, after, date), "interpolated"))
     return aligned
+
+
+def align_records_available(
+    records: Sequence[Tenv3Record], dates: Sequence[dt.date], max_gap_days: int
+) -> list[AlignedRecord | None]:
+    """Align dates independently so unavailable truth remains an abstention."""
+    output: list[AlignedRecord | None] = []
+    for date in dates:
+        try:
+            output.append(align_records(records, [date], max_gap_days)[0])
+        except NotEvaluable:
+            output.append(None)
+    return output
 
 
 def project_enu(enu_m: np.ndarray, los: np.ndarray) -> float:
@@ -511,7 +537,7 @@ def uncertainty_reliability(
     crlb_sigma_mm: np.ndarray,
     posterior_sigma_mm: np.ndarray,
 ) -> dict[str, Any]:
-    """Coverage for CRLB-only, posterior-only, and their quadrature combination."""
+    """Coverage and interval score for independent uncertainty alternatives."""
     residual = np.asarray(residual_mm, dtype=float)
     gnss = np.asarray(gnss_sigma_mm, dtype=float)
     crlb = np.asarray(crlb_sigma_mm, dtype=float)
@@ -521,27 +547,64 @@ def uncertainty_reliability(
     methods = {
         "crlb_only": np.sqrt(gnss**2 + crlb**2),
         "posterior_only": np.sqrt(gnss**2 + posterior**2),
-        "combined_quadrature": np.sqrt(gnss**2 + crlb**2 + posterior**2),
     }
     levels = {"68": (0.68, 1.0), "90": (0.90, 1.6448536269514722), "95": (0.95, 1.959963984540054)}
     output: dict[str, Any] = {}
     for name, sigma in methods.items():
         finite = np.isfinite(residual) & np.isfinite(sigma) & (sigma > 0)
+        intervals: dict[str, Any] = {}
+        for label, (nominal, z) in levels.items():
+            evaluated = int(np.sum(finite))
+            lower = -z * sigma[finite]
+            upper = z * sigma[finite]
+            observed = residual[finite]
+            alpha = 1.0 - nominal
+            score = (
+                upper
+                - lower
+                + (2.0 / alpha) * (lower - observed) * (observed < lower)
+                + (2.0 / alpha) * (observed - upper) * (observed > upper)
+            )
+            intervals[label] = {
+                    "nominal": nominal,
+                    "covered": int(np.sum(np.abs(observed) <= z * sigma[finite])),
+                    "evaluated": evaluated,
+                    "abstained": int(residual.size - evaluated),
+                    "coverage": float(np.mean(np.abs(observed) <= z * sigma[finite]))
+                    if evaluated
+                    else None,
+                    "coverage_error": float(
+                        abs(np.mean(np.abs(observed) <= z * sigma[finite]) - nominal)
+                    )
+                    if evaluated
+                    else None,
+                    "mean_width_mm": float(np.mean(upper - lower)) if evaluated else None,
+                    "mean_interval_score": float(np.mean(score)) if evaluated else None,
+                }
         output[name] = {
             "sigma_mm": sigma.tolist(),
-            "intervals": {
-                label: {
-                    "nominal": nominal,
-                    "covered": int(np.sum(np.abs(residual[finite]) <= z * sigma[finite])),
-                    "evaluated": int(np.sum(finite)),
-                    "coverage": float(np.mean(np.abs(residual[finite]) <= z * sigma[finite]))
-                    if np.any(finite)
-                    else None,
-                }
-                for label, (nominal, z) in levels.items()
-            },
+            "intervals": intervals,
         }
     return output
+
+
+def comparison_contract(recipe: dict[str, Any]) -> dict[str, str]:
+    comparison = recipe.get("comparison")
+    if comparison is None:
+        comparison = {
+            "id": "MMX1_minus_ICMX_common_frame",
+            "fixture": "mmx1_icmx_common",
+            "primary_station": "MMX1",
+            "control_station": "ICMX",
+        }
+    required = {"id", "fixture", "primary_station", "control_station"}
+    missing = required - set(comparison)
+    if missing:
+        raise NotEvaluable(f"comparison contract is missing: {sorted(missing)}")
+    station_ids = {comparison["primary_station"], comparison["control_station"]}
+    if len(station_ids) != 2 or not station_ids.issubset(recipe["stations"]):
+        raise NotEvaluable("comparison stations must be distinct recipe stations")
+    return {key: str(comparison[key]) for key in required}
 
 
 def write_reliability_artifacts(path: Path, payload: dict[str, Any]) -> None:
@@ -563,7 +626,7 @@ def write_reliability_artifacts(path: Path, payload: dict[str, Any]) -> None:
         },
     }
     (path / "uncertainty_reliability.json").write_text(
-        json.dumps(reliability, indent=2) + "\n"
+        json.dumps(reliability, indent=2, allow_nan=False) + "\n"
     )
     with (path / "uncertainty_reliability.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
@@ -583,9 +646,9 @@ def write_reliability_artifacts(path: Path, payload: dict[str, Any]) -> None:
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
-        '<text x="70" y="28" font-family="sans-serif" font-size="18">MMX1/ICMX uncertainty interval coverage</text>',
+        f'<text x="70" y="28" font-family="sans-serif" font-size="18">{payload["comparison"]} uncertainty interval coverage</text>',
     ]
-    colors = {"crlb_only": "#2563eb", "posterior_only": "#dc2626", "combined_quadrature": "#059669"}
+    colors = {"crlb_only": "#2563eb", "posterior_only": "#dc2626"}
     for index, (engine, method, level, coverage) in enumerate(entries):
         value = 0.0 if coverage is None else coverage
         x = margin + index * bar_width
@@ -608,12 +671,21 @@ def write_csv(path: Path, dates: Sequence[str], gnss: np.ndarray, engines: dict[
             writer.writerow([date, float(gnss[index]), *[engine["insar_diff_mm"][index] for engine in engines.values()]])
 
 
-def write_svg(path: Path, dates: Sequence[str], gnss: np.ndarray, engines: dict[str, dict[str, Any]]) -> None:
+def write_svg(
+    path: Path,
+    dates: Sequence[str],
+    gnss: np.ndarray,
+    engines: dict[str, dict[str, Any]],
+    comparison: str = "station-pair",
+) -> None:
     series = [("GNSS", np.asarray(gnss), "#111827")]
     colors = ["#2563eb", "#dc2626"]
     series.extend((name, np.asarray(data["insar_diff_mm"]), colors[index % len(colors)]) for index, (name, data) in enumerate(engines.items()))
     all_values = np.concatenate([values for _, values, _ in series])
-    low, high = float(all_values.min()), float(all_values.max())
+    finite_values = all_values[np.isfinite(all_values)]
+    if finite_values.size == 0:
+        raise NotEvaluable("plot has no finite station-pair values")
+    low, high = float(finite_values.min()), float(finite_values.max())
     if high == low:
         high += 1.0
     width, height, margin = 900, 520, 60
@@ -622,6 +694,8 @@ def write_svg(path: Path, dates: Sequence[str], gnss: np.ndarray, engines: dict[
     def points(values: np.ndarray) -> str:
         coords = []
         for index, value in enumerate(values):
+            if not math.isfinite(float(value)):
+                continue
             x_value = margin + plot_width * index / max(1, len(values) - 1)
             y_value = margin + plot_height * (high - float(value)) / (high - low)
             coords.append(f"{x_value:.1f},{y_value:.1f}")
@@ -632,7 +706,7 @@ def write_svg(path: Path, dates: Sequence[str], gnss: np.ndarray, engines: dict[
         '<rect width="100%" height="100%" fill="white"/>',
         f'<line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height-margin}" stroke="#6b7280"/>',
         f'<line x1="{margin}" y1="{height-margin}" x2="{width-margin}" y2="{height-margin}" stroke="#6b7280"/>',
-        f'<text x="{margin}" y="28" font-family="sans-serif" font-size="18">MMX1 - ICMX LOS displacement (mm)</text>',
+        f'<text x="{margin}" y="28" font-family="sans-serif" font-size="18">{comparison} LOS displacement (mm)</text>',
         f'<text x="8" y="{margin}" font-family="sans-serif" font-size="12">{high:.1f}</text>',
         f'<text x="8" y="{height-margin}" font-family="sans-serif" font-size="12">{low:.1f}</text>',
     ]
@@ -653,12 +727,16 @@ def score_common_frame(
     output_directory: Path,
     wavelength_m: float,
 ) -> dict[str, Any]:
-    if fixture_manifest.get("fixture") != "mmx1_icmx_common":
-        raise NotEvaluable("magnitude scoring requires the shared MMX1/ICMX frame")
+    comparison = comparison_contract(recipe)
+    if fixture_manifest.get("fixture") != comparison["fixture"]:
+        raise NotEvaluable("magnitude scoring requires the declared shared station frame")
+    primary_station = comparison["primary_station"]
+    control_station = comparison["control_station"]
+    station_ids = [primary_station, control_station]
     dates = [dt.date.fromisoformat(value) for value in recipe["expected_dates"]]
-    aligned_by_station: dict[str, list[AlignedRecord]] = {}
+    aligned_by_station: dict[str, list[AlignedRecord | None]] = {}
     source_provenance: dict[str, Any] = {}
-    for station_id in ["MMX1", "ICMX"]:
+    for station_id in station_ids:
         station = recipe["stations"][station_id]
         text, source = fetch_text(station["tenv3_url"], cache_directory / f"{station_id}.tenv3")
         metadata_text, metadata_source = fetch_text(station["metadata_url"], cache_directory / f"{station_id}.sta.html")
@@ -670,8 +748,25 @@ def score_common_frame(
         reference = min(records, key=lambda record: abs((record.date - dates[0]).days))
         if abs(reference.latitude - station["latitude"]) > 0.002 or abs(reference.longitude - station["longitude"]) > 0.002:
             raise NotEvaluable(f"{station_id} authoritative coordinates conflict with recipe")
-        aligned_by_station[station_id] = align_records(records, dates, recipe["max_interpolation_gap_days"])
+        aligned_by_station[station_id] = align_records_available(
+            records, dates, recipe["max_interpolation_gap_days"]
+        )
         source_provenance[station_id] = {"tenv3": source, "metadata": metadata_source, "metadata_bytes": len(metadata_text.encode())}
+
+    common_gnss = np.array(
+        [
+            all(aligned_by_station[station_id][index] is not None for station_id in station_ids)
+            for index in range(len(dates))
+        ],
+        dtype=bool,
+    )
+    required_fraction = float(recipe.get("minimum_gnss_fraction", 1.0))
+    if float(np.mean(common_gnss)) < required_fraction:
+        raise NotEvaluable(
+            f"common GNSS availability {float(np.mean(common_gnss)):.3f} is below {required_fraction:.3f}"
+        )
+    if not common_gnss[0]:
+        raise NotEvaluable("the reference acquisition lacks common GNSS truth")
 
     engines: dict[str, dict[str, Any]] = {}
     station_geometry: dict[str, Any] | None = None
@@ -683,7 +778,7 @@ def score_common_frame(
             station_data: dict[str, Any] = {}
             gnss_station: dict[str, np.ndarray] = {}
             gnss_station_sigma: dict[str, np.ndarray] = {}
-            for station_id in ["MMX1", "ICMX"]:
+            for station_id in station_ids:
                 station = recipe["stations"][station_id]
                 row, col = station_pixel(dataset, station["longitude"], station["latitude"])
                 los = los_at_output_pixel(static_path, dataset, row, col)
@@ -716,38 +811,53 @@ def score_common_frame(
                         wavelength_m,
                     ),
                 }
-                gnss_station[station_id] = gnss_los_series(aligned_by_station[station_id], los)
-                gnss_station_sigma[station_id] = gnss_los_sigma_series(
-                    aligned_by_station[station_id], los
-                )
-            current_gnss_diff = spatial_difference(gnss_station["MMX1"], gnss_station["ICMX"])
+                available = [
+                    item
+                    for index, item in enumerate(aligned_by_station[station_id])
+                    if common_gnss[index] and item is not None
+                ]
+                station_series = np.full(len(dates), np.nan)
+                station_sigma = np.full(len(dates), np.nan)
+                station_series[common_gnss] = gnss_los_series(available, los)
+                station_sigma[common_gnss] = gnss_los_sigma_series(available, los)
+                gnss_station[station_id] = station_series
+                gnss_station_sigma[station_id] = station_sigma
+            current_gnss_diff = spatial_difference(
+                gnss_station[primary_station], gnss_station[control_station]
+            )
             if gnss_diff is None:
                 gnss_diff = current_gnss_diff
                 station_geometry = station_data
-            elif not np.allclose(current_gnss_diff, gnss_diff, atol=1e-6):
+            elif not np.allclose(current_gnss_diff, gnss_diff, atol=1e-6, equal_nan=True):
                 raise NotEvaluable("backend output grids produce different station LOS geometry")
             primary = str(recipe["primary_window"])
             insar_diff = spatial_difference(
-                np.asarray(station_data["MMX1"]["samples"][primary]["series_mm"]),
-                np.asarray(station_data["ICMX"]["samples"][primary]["series_mm"]),
+                np.asarray(station_data[primary_station]["samples"][primary]["series_mm"]),
+                np.asarray(station_data[control_station]["samples"][primary]["series_mm"]),
             )
             gnss_diff_sigma = np.sqrt(
-                gnss_station_sigma["MMX1"] ** 2 + gnss_station_sigma["ICMX"] ** 2
+                gnss_station_sigma[primary_station] ** 2
+                + gnss_station_sigma[control_station] ** 2
             )
             crlb_diff_sigma = np.sqrt(
-                np.asarray(station_data["MMX1"]["uncertainty"]["crlb_sigma_mm"]) ** 2
-                + np.asarray(station_data["ICMX"]["uncertainty"]["crlb_sigma_mm"]) ** 2
+                np.asarray(station_data[primary_station]["uncertainty"]["crlb_sigma_mm"]) ** 2
+                + np.asarray(station_data[control_station]["uncertainty"]["crlb_sigma_mm"]) ** 2
             )
             posterior_diff_sigma = np.sqrt(
-                np.asarray(station_data["MMX1"]["uncertainty"]["posterior_sigma_mm"]) ** 2
-                + np.asarray(station_data["ICMX"]["uncertainty"]["posterior_sigma_mm"]) ** 2
+                np.asarray(station_data[primary_station]["uncertainty"]["posterior_sigma_mm"]) ** 2
+                + np.asarray(station_data[control_station]["uncertainty"]["posterior_sigma_mm"]) ** 2
             )
             days = np.array([(date - dates[0]).days for date in dates], dtype=float)
-            insar_velocity = float(np.polyfit(days, insar_diff, 1)[0] * 365.25)
-            gnss_velocity = float(np.polyfit(days, current_gnss_diff, 1)[0] * 365.25)
+            insar_velocity = float(
+                np.polyfit(days[common_gnss], insar_diff[common_gnss], 1)[0] * 365.25
+            )
+            gnss_velocity = float(
+                np.polyfit(days[common_gnss], current_gnss_diff[common_gnss], 1)[0]
+                * 365.25
+            )
             velocity_sigma = math.sqrt(
-                station_data["MMX1"]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
-                + station_data["ICMX"]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
+                station_data[primary_station]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
+                + station_data[control_station]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
             )
             engines[engine] = {
                 "work_directory": str(work_directory),
@@ -757,7 +867,9 @@ def score_common_frame(
                 ),
                 "stations": station_data,
                 "insar_diff_mm": insar_diff.tolist(),
-                "metrics": compute_metrics(gnss_diff, insar_diff, recipe["thresholds"]),
+                "metrics": compute_metrics(
+                    gnss_diff[common_gnss], insar_diff[common_gnss], recipe["thresholds"]
+                ),
                 "unwrap_component_counts": unwrap_component_counts(work_directory),
                 "gnss_projected_sigma_mm": gnss_diff_sigma.tolist(),
                 "uncertainty_reliability": uncertainty_reliability(
@@ -782,11 +894,14 @@ def score_common_frame(
         difference = np.asarray(engines["native"]["insar_diff_mm"]) - np.asarray(
             engines["snaphu"]["insar_diff_mm"]
         )
+        finite_difference = difference[np.isfinite(difference)]
+        if finite_difference.size == 0:
+            raise NotEvaluable("native/SNAPHU station-pair difference is not finite")
         backend_difference = {
             "series_mm": difference.tolist(),
-            "endpoint_mm": float(difference[-1]),
-            "mae_mm": float(np.mean(np.abs(difference))),
-            "rmse_mm": float(np.sqrt(np.mean(difference**2))),
+            "endpoint_mm": float(finite_difference[-1]),
+            "mae_mm": float(np.mean(np.abs(finite_difference))),
+            "rmse_mm": float(np.sqrt(np.mean(finite_difference**2))),
         }
     weighting_ab: dict[str, Any] = {}
     for backend in ["native", "snaphu"]:
@@ -807,16 +922,19 @@ def score_common_frame(
     payload = {
         "schema": "dolphinrust-gps-ground-truth/1",
         "status": overall,
-        "comparison": "MMX1_minus_ICMX_common_frame",
+        "comparison": comparison["id"],
         "units": "millimeters_ground_to_sensor_los",
         "sign_convention": "negative_is_motion_away_from_sensor",
         "dates": recipe["expected_dates"],
         "thresholds": recipe["thresholds"],
         "gnss_diff_mm": gnss_diff.tolist(),
         "gnss_date_quality": {
-            station_id: [item.quality for item in aligned]
+            station_id: [
+                item.quality if item is not None else "unavailable" for item in aligned
+            ]
             for station_id, aligned in aligned_by_station.items()
         },
+        "common_gnss_fraction": float(np.mean(common_gnss)),
         "gnss_sources": source_provenance,
         "station_geometry": station_geometry,
         "engines": engines,
@@ -824,14 +942,23 @@ def score_common_frame(
         "weighted_unweighted_ab": weighting_ab,
         "limitations": [
             "one Sentinel-1 burst pair of stations",
-            "13 acquisition epochs",
+            f"{len(dates)} acquisition epochs",
             "atmospheric corrections are disabled",
             "coverage samples are temporally correlated and are not an independent population",
         ],
     }
     output_directory.mkdir(parents=True, exist_ok=True)
-    (output_directory / "gps_ground_truth.json").write_text(json.dumps(payload, indent=2) + "\n")
     write_csv(output_directory / "gps_ground_truth.csv", recipe["expected_dates"], gnss_diff, engines)
-    write_svg(output_directory / "gps_ground_truth.svg", recipe["expected_dates"], gnss_diff, engines)
-    write_reliability_artifacts(output_directory, payload)
-    return payload
+    write_svg(
+        output_directory / "gps_ground_truth.svg",
+        recipe["expected_dates"],
+        gnss_diff,
+        engines,
+        comparison["id"],
+    )
+    safe_payload = json_safe(payload)
+    (output_directory / "gps_ground_truth.json").write_text(
+        json.dumps(safe_payload, indent=2, allow_nan=False) + "\n"
+    )
+    write_reliability_artifacts(output_directory, safe_payload)
+    return safe_payload

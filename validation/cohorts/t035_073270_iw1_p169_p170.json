@@ -1,0 +1,90 @@
+{
+  "schema": "dolphinrust-gps-ground-truth-recipe/2",
+  "cohort_id": "t035_073270_iw1_p169_p170",
+  "burst_id": "T035_073270_IW1",
+  "burst_filename_id": "T035-073270-IW1",
+  "start": "2023-01-06",
+  "end": "2023-12-21",
+  "expected_dates": [
+    "2023-01-06",
+    "2023-01-18",
+    "2023-01-30",
+    "2023-02-11",
+    "2023-02-23",
+    "2023-03-07",
+    "2023-03-19",
+    "2023-03-31",
+    "2023-04-12",
+    "2023-04-24",
+    "2023-05-06",
+    "2023-05-18",
+    "2023-05-30",
+    "2023-06-11",
+    "2023-06-23",
+    "2023-07-05",
+    "2023-07-17",
+    "2023-07-29",
+    "2023-08-10",
+    "2023-08-22",
+    "2023-09-03",
+    "2023-09-15",
+    "2023-09-27",
+    "2023-10-09",
+    "2023-10-21",
+    "2023-11-02",
+    "2023-11-14",
+    "2023-11-26",
+    "2023-12-08",
+    "2023-12-20"
+  ],
+  "stations": {
+    "P169": {
+      "role": "primary",
+      "latitude": 40.7911,
+      "longitude": -123.96770000000001,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/P169.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/P169.sta"
+    },
+    "P170": {
+      "role": "control",
+      "latitude": 40.8802,
+      "longitude": -123.86330000000001,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/P170.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/P170.sta"
+    }
+  },
+  "fixtures": {
+    "shared": {
+      "mode": "stations",
+      "station_ids": [
+        "P169",
+        "P170"
+      ],
+      "margin_pixels": 32
+    }
+  },
+  "comparison": {
+    "id": "P169_minus_P170",
+    "fixture": "shared",
+    "primary_station": "P169",
+    "control_station": "P170"
+  },
+  "sample_windows": [
+    1,
+    3,
+    5,
+    7
+  ],
+  "primary_window": 5,
+  "minimum_finite_fraction": 0.5,
+  "minimum_gnss_fraction": 0.9,
+  "max_interpolation_gap_days": 4,
+  "interpolation_policy": "linear only between bracketing NGL IGS20 daily final solutions; unavailable dates abstain and common availability must remain at least 90 percent",
+  "thresholds": {
+    "version": "provisional-point-estimate-1",
+    "endpoint_error_mm": 20,
+    "tls_slope_min": 0.85,
+    "tls_slope_max": 1.15,
+    "correlation_min": 0.9
+  }
+}

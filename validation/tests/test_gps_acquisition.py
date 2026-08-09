@@ -32,6 +32,16 @@ def result(level: str, date: str, name: str | None = None) -> FakeResult:
 
 
 class AcquisitionContract(unittest.TestCase):
+    def test_v2_recipe_and_cohort_id_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "recipe.json"
+            path.write_text(
+                '{"schema":"dolphinrust-gps-ground-truth-recipe/2",'
+                '"cohort_id":"public_pair","burst_id":"T001_000001_IW1"}'
+            )
+            recipe = fetch_real.load_recipe(path)
+            self.assertEqual(fetch_real.cohort_id(recipe), "public_pair")
+
     def test_selects_exact_declared_dates_in_order(self) -> None:
         expected = ["2023-01-04", "2023-01-28", "2023-02-09"]
         results = [

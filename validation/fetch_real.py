@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import netrc
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -27,6 +28,7 @@ from typing import Any
 
 import asf_search as asf
 import h5py
+from asf_search.exceptions import ASFAuthenticationError
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "real_data"
@@ -43,11 +45,45 @@ def require_token(environment: Mapping[str, str] = os.environ) -> str:
     return token
 
 
+def authenticated_session(
+    environment: Mapping[str, str] = os.environ,
+) -> asf.ASFSession:
+    """Authenticate by bearer token, then the standard Earthdata netrc entry."""
+    token = environment.get("GP_EARTHDATA_TOKEN", "").strip()
+    if token:
+        try:
+            return asf.ASFSession().auth_with_token(token)
+        except ASFAuthenticationError:
+            pass
+    try:
+        credentials = netrc.netrc().authenticators("urs.earthdata.nasa.gov")
+    except (FileNotFoundError, netrc.NetrcParseError, OSError):
+        credentials = None
+    if credentials is None:
+        raise RuntimeError(
+            "Earthdata authentication failed: bearer token is missing/expired and no usable urs.earthdata.nasa.gov netrc entry exists"
+        )
+    username, _, password = credentials
+    try:
+        return asf.ASFSession().auth_with_creds(username, password)
+    except ASFAuthenticationError as error:
+        raise RuntimeError(
+            "Earthdata authentication failed for both bearer token and netrc credentials"
+        ) from error
+
+
 def load_recipe(path: Path) -> dict[str, Any]:
     recipe = json.loads(path.read_text())
-    if recipe.get("schema") != "dolphinrust-gps-ground-truth-recipe/1":
+    if recipe.get("schema") not in {
+        "dolphinrust-gps-ground-truth-recipe/1",
+        "dolphinrust-gps-ground-truth-recipe/2",
+    }:
         raise ValueError(f"unsupported GPS recipe schema in {path}")
     return recipe
+
+
+def cohort_id(recipe: Mapping[str, Any]) -> str:
+    return str(recipe.get("cohort_id") or recipe["burst_id"].lower())
 
 
 def result_date(result: Any) -> str:
@@ -288,9 +324,8 @@ def run_recipe(args: argparse.Namespace) -> None:
     if args.dry_run:
         return
 
-    token = require_token()
-    session = asf.ASFSession().auth_with_token(token)
-    out = args.out.resolve() if args.out else OUT / "gps_mmx1" / "source"
+    session = authenticated_session()
+    out = args.out.resolve() if args.out else OUT / cohort_id(recipe) / "source"
     manifest_path = out / "acquisition_manifest.json"
     known_hashes = prior_hashes(manifest_path)
     cslc_paths = [] if args.static_only else [
@@ -341,8 +376,7 @@ def run_recipe(args: argparse.Namespace) -> None:
 def run_legacy(args: argparse.Namespace) -> None:
     out = args.out.resolve() if args.out else OUT
     out.mkdir(parents=True, exist_ok=True)
-    token = require_token()
-    session = asf.ASFSession().auth_with_token(token)
+    session = authenticated_session()
     results = asf.search(
         dataset="OPERA-S1",
         processingLevel="CSLC",

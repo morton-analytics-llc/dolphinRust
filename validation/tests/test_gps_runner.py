@@ -146,7 +146,9 @@ class RunnerContract(unittest.TestCase):
             root = Path(tmp)
             gps.write_reliability_artifacts(root, payload)
             self.assertTrue((root / "uncertainty_reliability.json").exists())
-            self.assertIn("combined_quadrature", (root / "uncertainty_reliability.csv").read_text())
+            csv_text = (root / "uncertainty_reliability.csv").read_text()
+            self.assertIn("crlb_only", csv_text)
+            self.assertNotIn("combined_quadrature", csv_text)
             self.assertIn("<svg", (root / "uncertainty_reliability.svg").read_text())
 
 

@@ -551,7 +551,7 @@ Implemented surfaces:
 - `run_gps_ground_truth.py`: native/SNAPHU configs derived from one base and asserted identical
   except backend/work directory, plus unweighted A/B variants, sourced-geometry checks, run
   receipts, common-frame scoring, and `uncertainty_reliability.{json,csv,svg}` generation.
-- `validation/tests/test_gps_*.py`: 24 synthetic contracts covering acquisition, crops, GNSS,
+- `validation/tests/test_gps_*.py` plus `test_gnss_cohort.py`: 30 synthetic contracts covering acquisition, crops, GNSS,
   projection/sign, reference cancellation, metrics, artifacts, and config identity.
 
 Note on where these run: `oracle/fixtures/*` is gitignored apart from 11 force-tracked CI
@@ -564,7 +564,7 @@ locally against the fixtures before trusting a parity claim.
 
 Current verification is deliberately split:
 
-- **Local/synthetic — PASS:** 24 GNSS harness contracts; Python compile; config generation and
+- **Local/synthetic — PASS:** 30 GNSS harness contracts; Python compile; config generation and
   ruamel YAML round-trip against the existing 13-file T005 crop.
 - **Live acquisition preflight — PASS:** ASF resolves exactly the declared 13 CSLC v1.1 epochs
   plus one T005 CSLC-S1-STATIC v1.0 product. `GP_EARTHDATA_TOKEN` authenticated a real 161.6 MB
@@ -709,8 +709,24 @@ residual is one station pair on one burst. Read as a direction rather than a num
 CRLB-only budget **under-covers** at 68% and 90% on every engine — consistent with the
 temporal-correlation argument behind issue #20, whose AR(1) N_eff inflation
 (`estimate_velocity_with_uncertainty_neff`) is implemented but not yet wired into the
-workflow. A defensible calibration still needs more stations in this burst (the Mexico City
-NGL cluster) or more frames; that remains open and is not answered by this fix.
+workflow (issue #33).
+
+### What truth set this burst can support (surveyed 2026-08-08)
+
+19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the
+declared 2023 window: ICMX (157 daily solutions), MXTX (157), MMX1 (153). The rest are dead
+by 2023, and the count declines monotonically — 2018: 8, 2019: 6, 2020: 6, 2021: 5, 2022: 4,
+2023: 3, 2024: 2, 2025: 1. **MXTX is usable today and is not currently scored.**
+
+A 2018 window would carry 8 stations and **52** OPERA CSLC granules on this burst (versus 14
+in 2023), giving 28 pairs and ~1,057 residual samples under per-pair scoring.
+
+The ceiling is lower than those counts suggest: N stations give only **N−1 independent**
+differential series, so 8 stations buy 7, not 28, and epochs within a series are temporally
+correlated. That is enough to separate "the CRLB budget under-covers badly" from "roughly
+calibrated" — the go/no-go the uncertainty model needs — but **not** enough to certify a
+calibration to a few percent, and no configuration of this burst will be. Tracked as issue
+#35; until at least MXTX is added, the numbers above should not be quoted outside the repo.
 
 MMX1 alone does not substitute. The comparison is differential by construction because InSAR is
 referenced to an arbitrary coherent pixel — here (176, 1108), which carries no GNSS. The
@@ -722,6 +738,31 @@ The production-shaped native weighted run completed in 61.41 s on the local mach
 `/usr/bin/time -l` reported 1,304,494,080 bytes maximum RSS (973,063,704-byte peak footprint).
 This includes the 13-date common frame, posterior diagonal, residual RMS, connected-component,
 and velocity-sigma products; no full covariance cube is retained.
+
+### Five-burst public cohort protocol (2026-08-08)
+
+The MMX1-specific harness is generalized under recipe schema
+`dolphinrust-gps-ground-truth-recipe/2`: arbitrary station IDs, shared fixtures, burst IDs,
+acquisition windows, sample windows, output roots, and comparison direction are declared in
+the recipe. The v1 recipe remains readable. `gps_ground_truth.py` no longer reports the
+CRLB+posterior quadrature diagnostic because those terms are dependent until proven otherwise;
+each alternative now reports coverage, absolute coverage error, interval width, proper interval
+score, and abstention.
+
+`discover_gnss_cohort.py` froze five outcome-blind NGL/OPERA station-pair sites in
+`validation/gnss_cohort_2023.json`, with executable recipes under `validation/cohorts/`:
+30–31 acquisitions per burst, 348–360-day spans, 2.28–29.59 km station separation, and
+0.90–1.00 acquisition-date GNSS availability under the four-day interpolation limit. Estimated
+CSLC transfer is 38.77 GB; exact recipe searches including STATIC products total about 39.62 GB.
+
+`score_gnss_cohort.py` performs leave-one-burst-out scale calibration. It requires five distinct
+bursts, improvement in mean 90% interval score, reduced 90% coverage error on at least four
+held-out bursts, and abstention for every nonfinite or nonpositive uncertainty value. Epochs and
+pixels never cross folds.
+
+**Scientific status: NOT EVALUABLE.** Both the stored Earthdata bearer token and the standard
+`.netrc` credentials failed authentication before the first download. The frozen metadata cohort
+is feasibility evidence only; no multi-burst displacement or calibration claim exists.
 
 ## Distinct coherence and degenerate-input contracts (2026-07-21)
 

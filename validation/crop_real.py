@@ -19,7 +19,7 @@ import h5py
 import numpy as np
 from pyproj import Transformer
 
-from fetch_real import load_recipe, sha256_file
+from fetch_real import cohort_id, load_recipe, sha256_file
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "real_data"
@@ -271,7 +271,7 @@ def validate_cslc_files(files: list[Path], recipe: dict[str, Any]) -> None:
 
 def run_recipe(recipe_path: Path, fixture_name: str, source_root: Path | None, out: Path | None) -> None:
     recipe = load_recipe(recipe_path)
-    source = source_root or SRC / "gps_mmx1" / "source"
+    source = source_root or SRC / cohort_id(recipe) / "source"
     cslcs = sorted((source / "cslc").glob(f"OPERA_L2_CSLC-S1_{recipe['burst_filename_id']}_*.h5"))
     static_files = sorted((source / "static").glob(f"OPERA_L2_CSLC-S1-STATIC_{recipe['burst_filename_id']}_*.h5"))
     if len(static_files) != 1:
@@ -282,7 +282,7 @@ def run_recipe(recipe_path: Path, fixture_name: str, source_root: Path | None, o
     x, y, epsg = assert_cslc_grids(cslcs)
     window, stations = fixture_window(recipe, fixture_name, x, y, epsg)
     bounds = window_projected_bounds(window, x, y)
-    destination = out or SRC / "gps_mmx1" / "cropped" / fixture_name
+    destination = out or SRC / cohort_id(recipe) / "cropped" / fixture_name
     cslc_out = destination / "cslc"
     static_out = destination / "static"
     entries = [
@@ -337,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--recipe", type=Path)
-    parser.add_argument("--fixture", choices=["mmx1_core", "mmx1_icmx_common"])
+    parser.add_argument("--fixture")
     return parser.parse_args()
 
 

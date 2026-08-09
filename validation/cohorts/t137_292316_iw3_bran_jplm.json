@@ -1,0 +1,91 @@
+{
+  "schema": "dolphinrust-gps-ground-truth-recipe/2",
+  "cohort_id": "t137_292316_iw3_bran_jplm",
+  "burst_id": "T137_292316_IW3",
+  "burst_filename_id": "T137-292316-IW3",
+  "start": "2023-01-01",
+  "end": "2023-12-28",
+  "expected_dates": [
+    "2023-01-01",
+    "2023-01-13",
+    "2023-01-25",
+    "2023-02-06",
+    "2023-02-18",
+    "2023-03-02",
+    "2023-03-14",
+    "2023-03-26",
+    "2023-04-07",
+    "2023-04-19",
+    "2023-05-01",
+    "2023-05-13",
+    "2023-05-25",
+    "2023-06-06",
+    "2023-06-18",
+    "2023-06-30",
+    "2023-07-12",
+    "2023-07-24",
+    "2023-08-05",
+    "2023-08-17",
+    "2023-08-29",
+    "2023-09-10",
+    "2023-09-22",
+    "2023-10-04",
+    "2023-10-16",
+    "2023-10-28",
+    "2023-11-09",
+    "2023-11-21",
+    "2023-12-03",
+    "2023-12-15",
+    "2023-12-27"
+  ],
+  "stations": {
+    "BRAN": {
+      "role": "primary",
+      "latitude": 34.1849,
+      "longitude": -118.27699999999999,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/BRAN.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/BRAN.sta"
+    },
+    "JPLM": {
+      "role": "control",
+      "latitude": 34.2048,
+      "longitude": -118.17320000000001,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/JPLM.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/JPLM.sta"
+    }
+  },
+  "fixtures": {
+    "shared": {
+      "mode": "stations",
+      "station_ids": [
+        "BRAN",
+        "JPLM"
+      ],
+      "margin_pixels": 32
+    }
+  },
+  "comparison": {
+    "id": "BRAN_minus_JPLM",
+    "fixture": "shared",
+    "primary_station": "BRAN",
+    "control_station": "JPLM"
+  },
+  "sample_windows": [
+    1,
+    3,
+    5,
+    7
+  ],
+  "primary_window": 5,
+  "minimum_finite_fraction": 0.5,
+  "minimum_gnss_fraction": 0.9,
+  "max_interpolation_gap_days": 4,
+  "interpolation_policy": "linear only between bracketing NGL IGS20 daily final solutions; unavailable dates abstain and common availability must remain at least 90 percent",
+  "thresholds": {
+    "version": "provisional-point-estimate-1",
+    "endpoint_error_mm": 20,
+    "tls_slope_min": 0.85,
+    "tls_slope_max": 1.15,
+    "correlation_min": 0.9
+  }
+}

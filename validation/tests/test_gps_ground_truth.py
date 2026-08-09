@@ -41,6 +41,11 @@ class GroundTruthContract(unittest.TestCase):
         self.assertAlmostEqual(aligned[1].record.up_m, 2235.89)
         with self.assertRaisesRegex(gps.NotEvaluable, "extrapolate"):
             gps.align_records(records, [dt.date(2023, 1, 3)], 2)
+        optional = gps.align_records_available(
+            records, [dt.date(2023, 1, 3), dt.date(2023, 1, 4)], 2
+        )
+        self.assertIsNone(optional[0])
+        self.assertEqual(optional[1].quality, "exact")
 
     def test_enu_projection_sign_and_reference_cancellation(self) -> None:
         los = np.array([-0.4, 0.1, np.sqrt(0.83)])
@@ -88,14 +93,27 @@ class GroundTruthContract(unittest.TestCase):
         crlb = np.array([0.0, 1.0, 1.0])
         posterior = np.array([0.0, 2.0, 2.0])
         result = gps.uncertainty_reliability(residual, gnss, crlb, posterior)
-        self.assertEqual(
-            set(result), {"crlb_only", "posterior_only", "combined_quadrature"}
-        )
+        self.assertEqual(set(result), {"crlb_only", "posterior_only"})
         self.assertEqual(result["crlb_only"]["intervals"]["68"]["evaluated"], 2)
-        self.assertGreaterEqual(
-            result["combined_quadrature"]["intervals"]["90"]["coverage"],
-            result["crlb_only"]["intervals"]["90"]["coverage"],
-        )
+        self.assertEqual(result["crlb_only"]["intervals"]["90"]["abstained"], 1)
+        self.assertGreater(result["crlb_only"]["intervals"]["90"]["mean_width_mm"], 0)
+        self.assertGreaterEqual(result["crlb_only"]["intervals"]["90"]["mean_interval_score"], 0)
+        self.assertEqual(gps.json_safe([np.nan, np.float64(1.0)]), [None, 1.0])
+
+    def test_comparison_contract_is_generic_and_validated(self) -> None:
+        recipe = {
+            "stations": {"AAAA": {}, "BBBB": {}},
+            "comparison": {
+                "id": "AAAA_minus_BBBB",
+                "fixture": "shared",
+                "primary_station": "AAAA",
+                "control_station": "BBBB",
+            },
+        }
+        self.assertEqual(gps.comparison_contract(recipe)["fixture"], "shared")
+        recipe["comparison"]["control_station"] = "AAAA"
+        with self.assertRaisesRegex(gps.NotEvaluable, "distinct"):
+            gps.comparison_contract(recipe)
 
 
 if __name__ == "__main__":

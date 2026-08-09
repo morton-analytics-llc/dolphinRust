@@ -1,0 +1,90 @@
+{
+  "schema": "dolphinrust-gps-ground-truth-recipe/2",
+  "cohort_id": "t100_213486_iw2_p105_smel",
+  "burst_id": "T100_213486_IW2",
+  "burst_filename_id": "T100-213486-IW2",
+  "start": "2023-01-10",
+  "end": "2023-12-25",
+  "expected_dates": [
+    "2023-01-10",
+    "2023-01-22",
+    "2023-02-03",
+    "2023-02-15",
+    "2023-02-27",
+    "2023-03-11",
+    "2023-03-23",
+    "2023-04-04",
+    "2023-04-16",
+    "2023-04-28",
+    "2023-05-10",
+    "2023-05-22",
+    "2023-06-03",
+    "2023-06-15",
+    "2023-06-27",
+    "2023-07-09",
+    "2023-07-21",
+    "2023-08-02",
+    "2023-08-14",
+    "2023-08-26",
+    "2023-09-07",
+    "2023-09-19",
+    "2023-10-01",
+    "2023-10-13",
+    "2023-10-25",
+    "2023-11-06",
+    "2023-11-18",
+    "2023-11-30",
+    "2023-12-12",
+    "2023-12-24"
+  ],
+  "stations": {
+    "P105": {
+      "role": "primary",
+      "latitude": 39.3875,
+      "longitude": -112.5041,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/P105.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/P105.sta"
+    },
+    "SMEL": {
+      "role": "control",
+      "latitude": 39.4256,
+      "longitude": -112.8449,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/SMEL.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/SMEL.sta"
+    }
+  },
+  "fixtures": {
+    "shared": {
+      "mode": "stations",
+      "station_ids": [
+        "P105",
+        "SMEL"
+      ],
+      "margin_pixels": 32
+    }
+  },
+  "comparison": {
+    "id": "P105_minus_SMEL",
+    "fixture": "shared",
+    "primary_station": "P105",
+    "control_station": "SMEL"
+  },
+  "sample_windows": [
+    1,
+    3,
+    5,
+    7
+  ],
+  "primary_window": 5,
+  "minimum_finite_fraction": 0.5,
+  "minimum_gnss_fraction": 0.9,
+  "max_interpolation_gap_days": 4,
+  "interpolation_policy": "linear only between bracketing NGL IGS20 daily final solutions; unavailable dates abstain and common availability must remain at least 90 percent",
+  "thresholds": {
+    "version": "provisional-point-estimate-1",
+    "endpoint_error_mm": 20,
+    "tls_slope_min": 0.85,
+    "tls_slope_max": 1.15,
+    "correlation_min": 0.9
+  }
+}
