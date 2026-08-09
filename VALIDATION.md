@@ -629,13 +629,45 @@ may double-count information.
 ### Reliability/uncertainty implementation validation (2026-07-24)
 
 The updated common-frame runner completed all four 352×2217, 13-epoch runs (native/SNAPHU ×
-CRLB-weighted/unweighted). Both weighted engines produced the same finite footprint (98.8613%),
-while both unweighted engines remained fully finite. The weighted MMX1 station sample is finite,
-but ICMX falls in a singular-CRLB region: its 1×1 and 3×3 samples contain no finite weighted
-solution and its primary 5×5 window has only 5/25 finite pixels, below the recipe's 50% contract.
-The scorer therefore reports `not_evaluable` instead of weakening the station-window threshold or
-silently falling back to unweighted inversion. This is a real-data calibration limitation, not an
-operational crash; the unweighted A/B outputs remain available for diagnosis.
+CRLB-weighted/unweighted). MMX1 samples are finite, but ICMX falls in a singular-CRLB region: its
+1×1 and 3×3 samples contain no finite solution and its primary 5×5 window has only 5/25 finite
+pixels, below the recipe's 50% contract. The scorer therefore reports `not_evaluable` instead of
+weakening the station-window threshold or silently falling back to unweighted inversion.
+
+**Corrected 2026-08-08** (re-run at `157a64c`; the two claims below replace this entry's original
+"both unweighted engines remained fully finite" and its reading of ICMX as a weighted-path or
+coherence limitation):
+
+- **All four engines share the identical 98.8613% footprint**, not just the weighted pair.
+  `write_velocity_uncertainty: true` routes CRLB into the unweighted configs through
+  `fit_velocity`, so clearing `use_coherence_weights` does not escape it. Weighted and unweighted
+  displacement are in fact bit-identical (max|diff| = 0): the single-reference interferogram
+  network is exactly determined (12 ifgs / 12 unknowns), so the weights cancel in the L2 solve.
+  The unweighted A/B is therefore not an independent diagnostic for this failure.
+- **The cause is unregularized `Γ`, not low coherence at ICMX.** With `beta: 0.0`, `Γ = |C|`, and
+  the entrywise modulus of a PSD matrix need not be PSD — at 1.1387% of pixels `Γ` carries one
+  small negative eigenvalue (ICMX: −0.0812 against a max of 7.51). `crlb.rs::invert_pd` fails and,
+  unlike `estimator.rs`, the CRLB path has no EVD fallback. `date_precisions` maps the NaN σ to
+  weight 0, the velocity fit loses all weight, and `displacement.rs::apply_validity_mask` gates
+  `validity_mask` on `velocity.is_finite()` — NaN-ing displacement, velocity, temporal coherence,
+  CRLB, posterior variance, and residual together. Evidence: the four NaN masks match at
+  1.000000; 80 sampled singular pixels are 100% indefinite against 0% of 80 finite controls;
+  singular pixels' median mean-|γ| is 0.479 versus 0.536 for finite controls, against a 0.063
+  noise floor, and ICMX's raw window has no nodata and temporal coherence of 0.94 one row below.
+
+This is a numerical-conditioning limitation, not a real-data calibration limitation and not an
+operational crash. The gate is window geometry: `sequential.rs` passes `neighbors: None`
+hardcoded, so the config's `shp_method: glrt` / `shp_alpha: 0.001` are inert (dolphin v0.35.0
+applies the GLRT mask on this path — `workflows/single.py` calls `shp.estimate_neighbors`
+unconditionally). Applying that mask restores a finite CRLB at 82.5% of sampled singular pixels
+and takes ICMX from 0/1, 0/9, 5/25 to 1/1, 9/9, 24/25 — every window clears the contract. Tracked
+as issue #29; until it lands, this site has no defensible coverage number.
+
+MMX1 alone does not substitute. The comparison is differential by construction because InSAR is
+referenced to an arbitrary coherent pixel — here (176, 1108), which carries no GNSS. The
+single-station residual drifts monotonically to +49.0 mm against a ~4.7 mm σ budget, and coverage
+collapses to 0% / 8.3% / 16.7% at 68/90/95 across all three methods; that measures the reference
+pixel's own subsidence, not uncertainty calibration.
 
 The production-shaped native weighted run completed in 61.41 s on the local machine. macOS
 `/usr/bin/time -l` reported 1,304,494,080 bytes maximum RSS (973,063,704-byte peak footprint).

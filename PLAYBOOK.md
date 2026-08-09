@@ -774,7 +774,10 @@ lever is **blocked on an architecture decision**, not implemented.
   contract system-wide (larger reads, a new global constant) and is exactly the
   kind of decision this project's workflow reserves for a human call, not an
   unattended one. **Elevated to PLAYBOOK §Elevated questions.** Not implemented in
-  this run; issue #5 stays open on this item only.
+  this run. Issue #5 has since been closed; the incremental-accumulation question
+  lives on in §Elevated questions, and the SHP-masked-path item it also covered is
+  now tracked as issue #29 (the mask is still never wired into `sequential.rs`,
+  which blocks the GNSS uncertainty-reliability scorer — see VALIDATION.md).
 
 ---
 
