@@ -31,16 +31,28 @@ pub struct DelayGrid {
     pub srs_wkt: Option<String>,
 }
 
+/// Reject a height-resolved variable: GDAL maps each level to a band, so band 1
+/// is the lowest level (-500 m in the OPERA L4 product), not the terrain.
+fn ensure_single_level(ds: &Dataset) -> Result<()> {
+    let bands = ds.raster_count();
+    match bands {
+        1 => Ok(()),
+        n => Err(CorrectionError::TroposphereHeightLevels(n)),
+    }
+}
+
 /// Read a tropospheric range-delay band (meters) from an OPERA L4 netCDF variable.
 ///
 /// `var` is the netCDF variable name (e.g. `troposphere`); GDAL is opened on the
 /// `NETCDF:"path":var` connection string.
 ///
 /// # Errors
-/// Returns [`CorrectionError::Gdal`] if the variable or grid cannot be read.
+/// Returns [`CorrectionError::Gdal`] if the variable or grid cannot be read, or
+/// [`CorrectionError::TroposphereHeightLevels`] for a height-resolved variable.
 pub fn read_l4_netcdf(path: &Path, var: &str) -> Result<DelayGrid> {
     let conn = format!("NETCDF:\"{}\":{var}", path.display());
     let ds = Dataset::open(Path::new(&conn))?;
+    ensure_single_level(&ds)?;
     let (cols, rows) = ds.raster_size();
     let band = ds.rasterband(1)?;
     let buf: Buffer<f64> = band.read_as((0, 0), (cols, rows), (cols, rows), None)?;
@@ -81,6 +93,7 @@ fn read_dataset_for_grid(
     dst_epsg: u32,
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
+    ensure_single_level(ds)?;
     let src_gt = ds.geo_transform()?;
     if src_gt[1] <= 0.0
         || src_gt[5] >= 0.0

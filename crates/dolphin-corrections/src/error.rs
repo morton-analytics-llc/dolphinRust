@@ -20,6 +20,16 @@ pub enum CorrectionError {
     /// Array-shape mismatch between a correction layer and the frame grid.
     #[error("shape: {0}")]
     Shape(String),
+    /// A height-resolved L4 troposphere variable was supplied. GDAL exposes each
+    /// height level as a band, so reading band 1 would silently use the lowest
+    /// level (-500 m) instead of the terrain, over-correcting by ~2x at 2 km
+    /// elevation. Selecting the level needs a DEM; see issue #38.
+    #[error(
+        "L4 troposphere variable has {0} height levels; selecting one needs terrain \
+         elevation (correction_options.dem_file), and reading level 0 would apply a \
+         wrong correction - see issue #38"
+    )]
+    TroposphereHeightLevels(usize),
     /// Corrections were requested but `input_options.wavelength` is unset, so a
     /// range delay in meters cannot be converted to LOS phase.
     #[error("atmospheric corrections require input_options.wavelength to be set")]

@@ -150,6 +150,14 @@ All notable changes to dolphinRust are documented here. The format follows
   three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
   the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
 
+- **A height-resolved L4 troposphere granule is now rejected instead of silently
+  mis-corrected** (issue #38). GDAL exposes each of the real product's 145 height levels as a
+  band, so reading `rasterband(1)` used the −500 m level rather than the terrain. Measured at
+  the MMX1/ICMX/MXTX stations (~2250 m), that over-states the epoch-relative differential
+  delay by 1.9–7.5× — enabling `troposphere_files` today would have applied a correction about
+  twice too large and read as "correction doesn't help". Selecting the level needs a DEM;
+  until then the reader fails loudly, as the LOS-coverage gate already does.
+
 ### Known limitations
 - **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
   temporally correlated epochs quantize every 68/90/95 bin at 8.3%, from one station pair on
@@ -437,6 +445,14 @@ physically-meaningful tolerances.
   `correction_options.geometry_files` for `dolphin-corrections` to mosaic. Needed because a
   three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
   the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
+
+- **A height-resolved L4 troposphere granule is now rejected instead of silently
+  mis-corrected** (issue #38). GDAL exposes each of the real product's 145 height levels as a
+  band, so reading `rasterband(1)` used the −500 m level rather than the terrain. Measured at
+  the MMX1/ICMX/MXTX stations (~2250 m), that over-states the epoch-relative differential
+  delay by 1.9–7.5× — enabling `troposphere_files` today would have applied a correction about
+  twice too large and read as "correction doesn't help". Selecting the level needs a DEM;
+  until then the reader fails loudly, as the LOS-coverage gate already does.
 
 ### Known limitations / deferred
 - **Real-data velocity absolute scale under strong signal** not independently pinned (sampled
