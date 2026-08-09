@@ -711,6 +711,35 @@ temporal-correlation argument behind issue #20, whose AR(1) N_eff inflation
 (`estimate_velocity_with_uncertainty_neff`) is implemented but not yet wired into the
 workflow (issue #33).
 
+### A missing bound no longer destroys the data (2026-08-08, issue #34)
+
+The NaN CRLB on a singular `Γ` is **correct** — dolphin v0.42 NaNs such blocks deliberately
+(`phase_link/crlb.py`: "overwrite sigma on zero blocks to NaN"), and
+`quality_v042_contract` already pins that parity against
+`oracle/fixtures/crlb_singular_sigma_v042.npy`. What was wrong was the blast radius: the NaN
+reached `interferogram_precisions` / `date_precisions` as a **zero weight**, which made the
+normal equations singular and destroyed the displacement, then `apply_validity_mask` blanked
+every remaining layer.
+
+A missing weight is missing information, not evidence the data is bad. A pixel with no usable
+bound now weights **uniformly** and keeps its displacement; its uncertainty layers still read
+as absent. For a single-reference network the SBAS system is exactly determined, so weights
+cancel and this is *identical* to the weighted solution — it is only a real estimator change
+for an over-determined network (`max_bandwidth` set).
+
+Measured on the MMX1/ICMX frame:
+
+| layer | before | after |
+|---|---:|---:|
+| displacement / velocity / temporal coherence | 0.993062 | **1.000000** |
+| crlb_sigma / velocity_sigma / displacement_variance | 0.993062 | 0.993062 |
+
+At the 0.6938% of pixels with no bound, displacement and temporal coherence are finite in
+100% of cases and `velocity_sigma` is NaN in 100% of cases — data preserved, bound reported
+absent. Coverage is unchanged (both stations were already bounded); velocity moves from
+−251.143 to −251.130 mm/yr against GNSS −247.811. Combined with #29 the frame goes from
+98.8613% → 99.3062% → **100%** displacement coverage.
+
 ### What truth set this burst can support (surveyed 2026-08-08)
 
 19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the

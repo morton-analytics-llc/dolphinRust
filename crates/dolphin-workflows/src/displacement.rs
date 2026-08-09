@@ -344,12 +344,10 @@ fn invert_time_series(
             || cfg.timeseries_options.write_posterior_uncertainty)
     {
         Some(if cfg.timeseries_options.use_coherence_weights {
-            interferogram_precisions(
-                crlb_sigma
-                    .context("coherence weighting requires internally computed CRLB")?
-                    .view(),
-                pairs,
-            )
+            let sigma = crlb_sigma
+                .context("coherence weighting requires internally computed CRLB")?
+                .view();
+            interferogram_precisions(sigma, pairs, uncertainty_valid(sigma).view())
         } else {
             Array3::ones(dphi.dim())
         })
@@ -371,9 +369,18 @@ fn invert_time_series(
                     .context("posterior uncertainty requires L2 observation precision")?
                     .view(),
             );
+            // Uniform weights recover the displacement at an unbounded pixel but
+            // do not yield a posterior it can stand behind, so blank it there.
+            let mut posterior_variance = output.posterior_variance;
+            if let Some(sigma) = crlb_sigma {
+                let valid = uncertainty_valid(sigma.view());
+                for mut band in posterior_variance.outer_iter_mut() {
+                    clear_unbounded_uncertainty_2d(&mut band, valid.view());
+                }
+            }
             Ok(InversionProducts {
                 displacement: output.phase,
-                posterior_variance: Some(output.posterior_variance),
+                posterior_variance: Some(posterior_variance),
                 residual_rms: Some(output.residual_rms),
             })
         }
@@ -396,15 +403,17 @@ fn fit_velocity(
     {
         return Ok((velocity_of(displacement, days), None));
     }
-    let precision = date_precisions(
-        crlb_sigma
-            .context("velocity weighting requires internally computed CRLB")?
-            .view(),
-    );
+    let sigma = crlb_sigma
+        .context("velocity weighting requires internally computed CRLB")?
+        .view();
+    let valid = uncertainty_valid(sigma);
+    let precision = date_precisions(sigma, valid.view());
     let series = series_with_reference(displacement);
     if cfg.timeseries_options.write_velocity_uncertainty {
         let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
-        Ok((output.velocity, Some(output.sigma)))
+        let mut velocity_sigma = output.sigma;
+        clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
+        Ok((output.velocity, Some(velocity_sigma)))
     } else {
         Ok((
             estimate_velocity_with_precisions(days, series.view(), precision.view()),
@@ -653,17 +662,21 @@ impl SpatialProducts {
             let global = (target.row_start + local.0, target.col_start + local.1);
             reference_to_point(&mut self.disp_rad, global);
             if use_coherence_weights || write_velocity_uncertainty {
-                let precision = self
+                let sigma = self
                     .crlb_sigma
                     .as_ref()
-                    .map(|sigma| date_precisions(sigma.view()))
-                    .context("bounded velocity weighting requires internally computed CRLB")?;
+                    .context("bounded velocity weighting requires internally computed CRLB")?
+                    .view();
+                let valid = uncertainty_valid(sigma);
+                let precision = date_precisions(sigma, valid.view());
                 let series = series_with_reference(self.disp_rad.view());
                 if write_velocity_uncertainty {
                     let result =
                         estimate_velocity_with_uncertainty(days, series.view(), precision.view());
                     self.vel_rad = result.velocity;
-                    self.velocity_sigma_rad = Some(result.sigma);
+                    let mut velocity_sigma = result.sigma;
+                    clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
+                    self.velocity_sigma_rad = Some(velocity_sigma);
                 } else {
                     self.vel_rad =
                         estimate_velocity_with_precisions(days, series.view(), precision.view());
@@ -2007,28 +2020,71 @@ fn reference_variance_to_point(variance: &mut Array3<f64>, point: (usize, usize)
     }
 }
 
-fn interferogram_precisions(sigma: ArrayView3<f64>, pairs: &[(usize, usize)]) -> Array3<f64> {
+/// Pixels whose CRLB is usable on every date, i.e. that have a bound at all.
+///
+/// A singular `Γ` yields a NaN bound — correct, and matched to dolphin v0.42 by
+/// `quality_v042_contract`. But a missing bound is missing *information*, not
+/// evidence the data is bad, so such a pixel weights uniformly rather than
+/// collapsing to zero weight (issue #34).
+fn uncertainty_valid(sigma: ArrayView3<f64>) -> Array2<bool> {
+    let (dates, rows, cols) = sigma.dim();
+    Array2::from_shape_fn((rows, cols), |(r, c)| {
+        (0..dates).all(|date| sigma[(date, r, c)].is_finite())
+    })
+}
+
+/// Uniform weight for a pixel with no usable bound. For a single-reference
+/// network the SBAS system is exactly determined, so weights cancel and this is
+/// *identical* to the weighted solution; it is only a real estimator change for
+/// an over-determined network (`max_bandwidth` set).
+const UNIFORM_PRECISION: f64 = 1.0;
+
+fn interferogram_precisions(
+    sigma: ArrayView3<f64>,
+    pairs: &[(usize, usize)],
+    valid: ArrayView2<bool>,
+) -> Array3<f64> {
     let (_, rows, cols) = sigma.dim();
     Array3::from_shape_fn((pairs.len(), rows, cols), |(k, r, c)| {
         let (i, j) = pairs[k];
         let variance = sigma[(i, r, c)].powi(2) + sigma[(j, r, c)].powi(2);
-        if variance.is_finite() {
-            1.0 / variance.max(1e-12)
-        } else {
-            0.0
+        match valid[(r, c)] && variance.is_finite() {
+            true => 1.0 / variance.max(1e-12),
+            false => UNIFORM_PRECISION,
         }
     })
 }
 
-fn date_precisions(sigma: ArrayView3<f64>) -> Array3<f64> {
-    sigma.mapv(|value| {
-        let variance = value * value;
-        if variance.is_finite() {
-            1.0 / variance.max(1e-12)
-        } else {
-            0.0
+fn date_precisions(sigma: ArrayView3<f64>, valid: ArrayView2<bool>) -> Array3<f64> {
+    let (dates, rows, cols) = sigma.dim();
+    Array3::from_shape_fn((dates, rows, cols), |(date, r, c)| {
+        let variance = sigma[(date, r, c)] * sigma[(date, r, c)];
+        match valid[(r, c)] && variance.is_finite() {
+            true => 1.0 / variance.max(1e-12),
+            false => UNIFORM_PRECISION,
         }
     })
+}
+
+/// Blank an uncertainty layer wherever the pixel has no usable bound. Uniform
+/// weights recover the displacement; they do not manufacture an uncertainty, so
+/// the derived σ must still read as absent.
+fn clear_unbounded_uncertainty(layer: &mut Array2<f64>, valid: ArrayView2<bool>) {
+    clear_unbounded_uncertainty_2d(&mut layer.view_mut(), valid);
+}
+
+/// [`clear_unbounded_uncertainty`] over a borrowed 2-D view (one band of a cube).
+fn clear_unbounded_uncertainty_2d(
+    layer: &mut ndarray::ArrayViewMut2<f64>,
+    valid: ArrayView2<bool>,
+) {
+    ndarray::Zip::from(layer)
+        .and(valid)
+        .for_each(|value, &usable| {
+            if !usable {
+                *value = f64::NAN;
+            }
+        });
 }
 
 /// Write the velocity, temporal-coherence, per-date displacement, and (when
@@ -2540,6 +2596,56 @@ mod tests {
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
+    }
+
+    /// Issue #34: a NaN CRLB is a missing *bound*, not evidence the data is bad.
+    /// dolphin v0.42 NaNs a singular block deliberately (matched by
+    /// `quality_v042_contract`), so the bound is right — but mapping it to a zero
+    /// weight makes the normal equations singular and destroys the displacement
+    /// too. Such a pixel falls back to uniform weights instead.
+    #[test]
+    fn a_pixel_with_no_usable_bound_falls_back_to_uniform_weights() {
+        // Two pixels, two dates; the second pixel's bound is missing on one date.
+        let mut sigma = Array3::from_elem((2, 1, 2), 2.0);
+        sigma[(1, 0, 1)] = f64::NAN;
+        let valid = uncertainty_valid(sigma.view());
+        assert_eq!(valid, ndarray::array![[true, false]]);
+
+        let precision = date_precisions(sigma.view(), valid.view());
+        assert!(
+            precision
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0),
+            "no weight may be zero or non-finite: {precision:?}"
+        );
+        // The bounded pixel keeps 1/sigma^2; the unbounded one goes uniform.
+        assert!((precision[(0, 0, 0)] - 0.25).abs() < 1e-12);
+        assert!((precision[(0, 0, 1)] - 1.0).abs() < 1e-12);
+        assert!((precision[(1, 0, 1)] - 1.0).abs() < 1e-12);
+
+        let pairs = [(0, 1)];
+        let ifg = interferogram_precisions(sigma.view(), &pairs, valid.view());
+        assert!(
+            ifg.iter().all(|value| value.is_finite() && *value > 0.0),
+            "no interferogram weight may be zero or non-finite: {ifg:?}"
+        );
+        assert!((ifg[(0, 0, 1)] - 1.0).abs() < 1e-12);
+    }
+
+    /// The bound must still be reported as absent — falling back to uniform
+    /// weights recovers the displacement, it does not manufacture an uncertainty.
+    #[test]
+    fn an_unbounded_pixel_reports_no_uncertainty() {
+        let mut sigma = Array3::from_elem((2, 1, 2), 2.0);
+        sigma[(1, 0, 1)] = f64::NAN;
+        let valid = uncertainty_valid(sigma.view());
+        let mut velocity_sigma = ndarray::array![[0.5_f64, 0.5]];
+        clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
+        assert!(velocity_sigma[(0, 0)].is_finite());
+        assert!(
+            velocity_sigma[(0, 1)].is_nan(),
+            "a pixel without a usable CRLB must not report a velocity sigma"
+        );
     }
 
     #[test]

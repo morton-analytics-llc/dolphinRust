@@ -91,6 +91,17 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **A pixel with no usable CRLB no longer loses its displacement** (issue #34). The NaN bound
+  on a singular `Γ` is correct and matches dolphin v0.42, but it reached the observation
+  precisions as a **zero weight**, making the normal equations singular and destroying the
+  displacement, after which `apply_validity_mask` blanked every other layer. A missing weight
+  is missing information, not evidence the data is bad: such a pixel now weights uniformly
+  and keeps displacement, velocity, and temporal coherence, while `crlb_sigma`,
+  `velocity_sigma`, and `displacement_variance` still read as absent there. For a
+  single-reference network the SBAS system is exactly determined, so weights cancel and the
+  fallback is identical to the weighted solution; it is only an estimator change for an
+  over-determined network (`max_bandwidth` set). On the MMX1/ICMX frame displacement coverage
+  goes 99.3062% → **100%**, with uncertainty layers NaN at exactly the 0.69% unbounded pixels.
 - **Locally empty phase-linking tiles now remain nodata instead of aborting a usable AOI.**
   Tiled processing skips a tile when any acquisition has no finite complex support in its
   dependency window, initializes every output layer as nodata, and links the remaining tiles.
