@@ -561,7 +561,7 @@ fn lag1_autocorrelation(residuals: &[f64]) -> f64 {
 /// `sqrt((1 + rho) / (1 - rho))` — the AR(1) effective-sample-size inflation
 /// factor for the slope standard error (Zhang et al. 1997; Agram & Zebker 2015),
 /// `rho` the lag-1 residual autocorrelation. `1.0` at `rho == 0`.
-fn temporal_correlation_inflation(residuals: &[f64]) -> f64 {
+pub(crate) fn temporal_correlation_inflation(residuals: &[f64]) -> f64 {
     let rho = lag1_autocorrelation(residuals);
     ((1.0 + rho) / (1.0 - rho)).sqrt()
 }

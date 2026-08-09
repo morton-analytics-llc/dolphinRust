@@ -213,6 +213,21 @@ pub struct TimeseriesOptions {
     /// so enabling it is the reviewed rollout. Requires
     /// `write_velocity_uncertainty`.
     pub correct_velocity_temporal_correlation: bool,
+    /// Fit an annual sinusoid (period 365.25 d) jointly with the linear rate, so
+    /// a real seasonal cycle (groundwater, thermal) is reported as an amplitude
+    /// and phase instead of leaking into the rate. **Forward divergence from
+    /// dolphin, opt-in and off by default** — dolphin's `velocity.py` is
+    /// linear-only, and with this false the velocity fit is the untouched
+    /// degree-1 one. Emits `velocity_seasonal_amplitude.tif` and
+    /// `velocity_seasonal_phase_days.tif`.
+    pub velocity_seasonal: bool,
+    /// Acquisition dates (`YYYY-MM-DD`) at which to fit a Heaviside step jointly
+    /// with the linear rate — a co-seismic offset, an instrument change, a known
+    /// anthropogenic event. Each date adds one basis column and emits
+    /// `velocity_step_NN.tif` in list order. The epoch is an **input**, never
+    /// detected from the data: a step whose timing is fitted is a different
+    /// (nonlinear) estimator with its own failure modes. Empty by default.
+    pub velocity_step_dates: Vec<String>,
 }
 
 impl Default for TimeseriesOptions {
@@ -230,6 +245,8 @@ impl Default for TimeseriesOptions {
             write_posterior_uncertainty: false,
             write_velocity_uncertainty: false,
             correct_velocity_temporal_correlation: false,
+            velocity_seasonal: false,
+            velocity_step_dates: Vec::new(),
         }
     }
 }

@@ -19,10 +19,11 @@ use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
 use dolphin_timeseries::{
-    build_network, estimate_velocity, estimate_velocity_with_precisions,
-    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
-    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
-    reference_to_point, select_reference_point, L1Config, NetworkConfig,
+    build_network, estimate_velocity, estimate_velocity_with_model,
+    estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
+    estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
+    invert_stack_with_uncertainty, reference_to_point, select_reference_point, L1Config,
+    NetworkConfig, VelocityModel,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -31,7 +32,7 @@ use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 use crate::burst::{burst_offset, frame_grid, group_by_burst, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
-use crate::dates::decimal_days;
+use crate::dates::{decimal_days, parse_date};
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
@@ -293,17 +294,18 @@ fn finish_displacement(
             geotransform,
         )
     })?;
-    let (vel_rad, velocity_sigma_rad) = timed("velocity", || {
-        fit_velocity(
-            cfg,
-            inversion.displacement.view(),
-            &days,
-            stitched.crlb_sigma.as_ref(),
-        )
-    })?;
+    let (velocity_model, fit) = frame_velocity(
+        cfg,
+        inversion.displacement.view(),
+        &days,
+        stitched.crlb_sigma.as_ref(),
+        &date_files,
+    )?;
     let spatial = SpatialProducts {
         disp_rad: inversion.displacement,
-        vel_rad,
+        vel_rad: fit.velocity,
+        velocity_model,
+        velocity_terms: fit.terms,
         temporal_coherence,
         validity_mask,
         burst_coverage,
@@ -313,7 +315,7 @@ fn finish_displacement(
         corrections,
         posterior_variance_rad: inversion.posterior_variance,
         timeseries_residual_rad: inversion.residual_rms,
-        velocity_sigma_rad,
+        velocity_sigma_rad: fit.sigma,
         interferogram_pairs: pairs,
         unwrap_connected_components: unwrap.connected_components,
         geotransform,
@@ -409,43 +411,187 @@ fn velocity_and_sigma(
     (output.velocity, output.sigma_temporal_corrected)
 }
 
+/// Optional velocity time-function terms, in the same phase units (rad) as the
+/// velocity fit — except `seasonal_phase_days`, which is days. Empty unless
+/// `timeseries_options.velocity_seasonal` / `velocity_step_dates` are configured.
+#[derive(Debug, Clone, Default)]
+struct VelocityTerms {
+    seasonal_amplitude_rad: Option<Array2<f64>>,
+    seasonal_phase_days: Option<Array2<f64>>,
+    step_magnitude_rad: Vec<Array2<f64>>,
+}
+
+/// Rate, one-sigma, and optional time-function terms in one place, so the
+/// whole-frame and bounded/tiled paths cannot drift apart.
+struct VelocityFit {
+    velocity: Array2<f64>,
+    sigma: Option<Array2<f64>>,
+    terms: VelocityTerms,
+}
+
+/// The configured time-function model, with step dates resolved to decimal days
+/// from acquisition 0 — the same origin [`decimal_days`] gives the `days` the fit
+/// runs against. `date_files` is the first burst's files in date order.
+///
+/// # Errors
+/// Returns `Err` if a step date is not `YYYY-MM-DD` or the acquisition-0 date is
+/// unparseable. A step the user asked for and did not get is a wrong answer, not
+/// a degraded one, so this fails the run rather than dropping the term.
+fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<VelocityModel> {
+    let options = &cfg.timeseries_options;
+    let model = VelocityModel {
+        seasonal: options.velocity_seasonal,
+        step_days: Vec::new(),
+    };
+    if model.is_linear() && options.velocity_step_dates.is_empty() {
+        return Ok(model);
+    }
+    let first = date_files
+        .first()
+        .context("velocity time-function model requires at least one acquisition")?;
+    let anchor = parse_date(first, &cfg.input_options.cslc_date_fmt)?;
+    let step_days = options
+        .velocity_step_dates
+        .iter()
+        .map(|raw| {
+            let date =
+                chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").with_context(|| {
+                    format!("timeseries_options.velocity_step_dates: {raw:?} is not YYYY-MM-DD")
+                })?;
+            Ok((date - anchor).num_days() as f64)
+        })
+        .collect::<Result<Vec<f64>>>()?;
+    Ok(VelocityModel { step_days, ..model })
+}
+
+/// Seasonal amplitude and step magnitudes from phase (rad) to displacement units.
+/// Both are series quantities, so they take the same factor as displacement
+/// itself; amplitude is an unsigned magnitude, a step is signed. The seasonal peak
+/// day needs no scaling — it is already days.
+fn scale_velocity_terms(
+    terms: &VelocityTerms,
+    phase_to_disp: f64,
+) -> (Option<Array2<f64>>, Vec<Array2<f64>>) {
+    let amplitude = terms
+        .seasonal_amplitude_rad
+        .as_ref()
+        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
+    let steps = terms
+        .step_magnitude_rad
+        .iter()
+        .map(|values| values.mapv(|value| value * phase_to_disp))
+        .collect();
+    (amplitude, steps)
+}
+
+/// Resolve the configured time-function model and fit the whole-frame velocity.
+fn frame_velocity(
+    cfg: &DisplacementWorkflow,
+    displacement: ArrayView3<f64>,
+    days: &[f64],
+    crlb_sigma: Option<&Array3<f64>>,
+    date_files: &[PathBuf],
+) -> Result<(VelocityModel, VelocityFit)> {
+    let model = velocity_model(cfg, date_files)?;
+    let fit = timed("velocity", || {
+        fit_velocity(cfg, displacement, days, crlb_sigma, &model)
+    })?;
+    Ok((model, fit))
+}
+
 fn fit_velocity(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     days: &[f64],
     crlb_sigma: Option<&Array3<f64>>,
-) -> Result<(Array2<f64>, Option<Array2<f64>>)> {
-    if !(cfg.timeseries_options.use_coherence_weights
-        || cfg.timeseries_options.write_velocity_uncertainty)
-    {
-        return Ok((velocity_of(displacement, days), None));
+    model: &VelocityModel,
+) -> Result<VelocityFit> {
+    let weighted = cfg.timeseries_options.use_coherence_weights
+        || cfg.timeseries_options.write_velocity_uncertainty;
+    if !weighted && model.is_linear() {
+        return Ok(VelocityFit {
+            velocity: velocity_of(displacement, days),
+            sigma: None,
+            terms: VelocityTerms::default(),
+        });
+    }
+    let series = series_with_reference(displacement);
+    if !weighted {
+        return Ok(fit_velocity_with_model(
+            cfg,
+            days,
+            series.view(),
+            None,
+            model,
+        ));
     }
     let sigma = crlb_sigma
         .context("velocity weighting requires internally computed CRLB")?
         .view();
     let valid = uncertainty_valid(sigma);
     let precision = date_precisions(sigma, valid.view());
-    let series = series_with_reference(displacement);
-    if cfg.timeseries_options.write_velocity_uncertainty {
-        let (velocity, mut sigma) = velocity_and_sigma(
-            cfg.timeseries_options.correct_velocity_temporal_correlation,
-            days,
-            series.view(),
-            precision.view(),
-        );
-        clear_unbounded_uncertainty(&mut sigma, valid.view());
-        Ok((velocity, Some(sigma)))
-    } else {
-        Ok((
-            estimate_velocity_with_precisions(days, series.view(), precision.view()),
-            None,
-        ))
+    if !model.is_linear() {
+        let mut fit =
+            fit_velocity_with_model(cfg, days, series.view(), Some(precision.view()), model);
+        if let Some(sigma) = fit.sigma.as_mut() {
+            clear_unbounded_uncertainty(sigma, valid.view());
+        }
+        return Ok(fit);
+    }
+    if !cfg.timeseries_options.write_velocity_uncertainty {
+        return Ok(VelocityFit {
+            velocity: estimate_velocity_with_precisions(days, series.view(), precision.view()),
+            sigma: None,
+            terms: VelocityTerms::default(),
+        });
+    }
+    let (velocity, mut sigma) = velocity_and_sigma(
+        cfg.timeseries_options.correct_velocity_temporal_correlation,
+        days,
+        series.view(),
+        precision.view(),
+    );
+    clear_unbounded_uncertainty(&mut sigma, valid.view());
+    Ok(VelocityFit {
+        velocity,
+        sigma: Some(sigma),
+        terms: VelocityTerms::default(),
+    })
+}
+
+/// The joint seasonal/step fit, sharing the linear path's uncertainty switches:
+/// sigma is emitted only when `write_velocity_uncertainty`, and the AR(1)
+/// inflation applies to this model's own residuals when configured.
+fn fit_velocity_with_model(
+    cfg: &DisplacementWorkflow,
+    days: &[f64],
+    series: ArrayView3<f64>,
+    precision: Option<ArrayView3<f64>>,
+    model: &VelocityModel,
+) -> VelocityFit {
+    let output = estimate_velocity_with_model(days, series, precision, model);
+    let sigma = cfg.timeseries_options.write_velocity_uncertainty.then(|| {
+        match cfg.timeseries_options.correct_velocity_temporal_correlation {
+            true => &output.sigma * &output.inflation_factor,
+            false => output.sigma.clone(),
+        }
+    });
+    VelocityFit {
+        velocity: output.velocity,
+        sigma,
+        terms: VelocityTerms {
+            seasonal_amplitude_rad: output.seasonal_amplitude,
+            seasonal_phase_days: output.seasonal_phase_days,
+            step_magnitude_rad: output.step_magnitude,
+        },
     }
 }
 
 struct SpatialProducts {
     disp_rad: Array3<f64>,
     vel_rad: Array2<f64>,
+    velocity_model: VelocityModel,
+    velocity_terms: VelocityTerms,
     temporal_coherence: Array2<f64>,
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
@@ -470,14 +616,7 @@ fn emit_displacement(
     mut spatial: SpatialProducts,
 ) -> Result<DisplacementOutput> {
     if let Some(plan) = crop {
-        spatial.trim(
-            plan.target_in_analysis,
-            &days,
-            cfg.timeseries_options.correlation_threshold,
-            cfg.timeseries_options.use_coherence_weights,
-            cfg.timeseries_options.write_velocity_uncertainty,
-            cfg.timeseries_options.correct_velocity_temporal_correlation,
-        )?;
+        spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
     spatial.apply_validity_mask();
     if let (Some(variance), Some(point)) = (
@@ -512,6 +651,8 @@ fn emit_displacement(
         .write_crlb
         .then_some(spatial.crlb_sigma.as_ref())
         .flatten();
+    let (seasonal_amplitude, step_magnitude) =
+        scale_velocity_terms(&spatial.velocity_terms, phase_to_disp);
     let quality = QualityLayers {
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
         crlb_sigma: emitted_crlb,
@@ -520,6 +661,11 @@ fn emit_displacement(
         timeseries_residual_rms: timeseries_residual_rms.as_ref(),
         velocity_sigma: velocity_sigma.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
+        velocity_terms: VelocityTermLayers {
+            seasonal_amplitude: seasonal_amplitude.as_ref(),
+            seasonal_phase_days: spatial.velocity_terms.seasonal_phase_days.as_ref(),
+            step_magnitude: &step_magnitude,
+        },
     };
     let input_coverage = summarize_input_coverage(&spatial);
     let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
@@ -661,10 +807,7 @@ impl SpatialProducts {
         &mut self,
         target: BlockIndices,
         days: &[f64],
-        correlation_threshold: f64,
-        use_coherence_weights: bool,
-        write_velocity_uncertainty: bool,
-        correct_temporal_correlation: bool,
+        cfg: &DisplacementWorkflow,
     ) -> Result<()> {
         // A halo reference is scientifically valid for analysis but cannot be
         // represented by a target-local coordinate. Re-reference to a coherent
@@ -679,41 +822,47 @@ impl SpatialProducts {
                 target.row_start..target.row_stop,
                 target.col_start..target.col_stop
             ]);
-            let local = select_reference_point(target_coherence, correlation_threshold).context(
+            let local = select_reference_point(
+                target_coherence,
+                cfg.timeseries_options.correlation_threshold,
+            )
+            .context(
                 "bounded target has no pixel meeting the configured reference coherence threshold",
             )?;
             let global = (target.row_start + local.0, target.col_start + local.1);
             reference_to_point(&mut self.disp_rad, global);
-            if use_coherence_weights || write_velocity_uncertainty {
-                let sigma = self
-                    .crlb_sigma
-                    .as_ref()
-                    .context("bounded velocity weighting requires internally computed CRLB")?
-                    .view();
-                let valid = uncertainty_valid(sigma);
-                let precision = date_precisions(sigma, valid.view());
-                let series = series_with_reference(self.disp_rad.view());
-                if write_velocity_uncertainty {
-                    let (velocity, mut velocity_sigma) = velocity_and_sigma(
-                        correct_temporal_correlation,
-                        days,
-                        series.view(),
-                        precision.view(),
-                    );
-                    self.vel_rad = velocity;
-                    clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
-                    self.velocity_sigma_rad = Some(velocity_sigma);
-                } else {
-                    self.vel_rad =
-                        estimate_velocity_with_precisions(days, series.view(), precision.view());
-                }
-            } else {
-                self.vel_rad = velocity_of(self.disp_rad.view(), days);
-            }
+            // Re-fit through the same front door as the whole-frame path, so the
+            // configured time-function model cannot reach one and not the other.
+            let fit = fit_velocity(
+                cfg,
+                self.disp_rad.view(),
+                days,
+                self.crlb_sigma.as_ref(),
+                &self.velocity_model,
+            )
+            .context("bounded velocity re-fit after re-referencing")?;
+            self.vel_rad = fit.velocity;
+            self.velocity_sigma_rad = fit.sigma;
+            self.velocity_terms = fit.terms;
             self.reference_point = Some(global);
         }
         self.disp_rad = trim3(&self.disp_rad, target);
         self.vel_rad = trim2(&self.vel_rad, target);
+        self.velocity_terms.seasonal_amplitude_rad = self
+            .velocity_terms
+            .seasonal_amplitude_rad
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.velocity_terms.seasonal_phase_days = self
+            .velocity_terms
+            .seasonal_phase_days
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.velocity_terms.step_magnitude_rad =
+            std::mem::take(&mut self.velocity_terms.step_magnitude_rad)
+                .iter()
+                .map(|layer| trim2(layer, target))
+                .collect();
         self.temporal_coherence = trim2(&self.temporal_coherence, target);
         self.validity_mask = trim2(&self.validity_mask, target);
         self.phase_linking_coherence = self
@@ -2170,6 +2319,22 @@ fn write_outputs(
     if let Some(closure) = quality.closure_phase {
         write_bands(&write_f32, closure.view(), "closure_phase")?;
     }
+    if let Some(amplitude) = quality.velocity_terms.seasonal_amplitude {
+        write_f32("velocity_seasonal_amplitude.tif", amplitude.view())?;
+    }
+    if let Some(phase) = quality.velocity_terms.seasonal_phase_days {
+        write_raster_with_metadata(
+            &dir.join("velocity_seasonal_phase_days.tif"),
+            phase.mapv(|v| v as f32).view(),
+            gt,
+            epsg,
+            None,
+            &[("UNITTYPE", "days")],
+        )?;
+    }
+    for (k, step) in quality.velocity_terms.step_magnitude.iter().enumerate() {
+        write_f32(&format!("velocity_step_{k:02}.tif"), step.view())?;
+    }
     if let Some(variance) = quality.displacement_variance {
         write_bands(&write_f32, variance.view(), "displacement_variance")?;
     }
@@ -2232,6 +2397,17 @@ struct QualityLayers<'a> {
     timeseries_residual_rms: Option<&'a Array2<f64>>,
     velocity_sigma: Option<&'a Array2<f64>>,
     connected_components: &'a Array3<u32>,
+    /// Seasonal amplitude in displacement units, peak day, and per-step
+    /// magnitudes — present only when the time-function model is configured.
+    velocity_terms: VelocityTermLayers<'a>,
+}
+
+/// Emitted form of [`VelocityTerms`], already scaled to displacement units.
+#[derive(Default)]
+struct VelocityTermLayers<'a> {
+    seasonal_amplitude: Option<&'a Array2<f64>>,
+    seasonal_phase_days: Option<&'a Array2<f64>>,
+    step_magnitude: &'a [Array2<f64>],
 }
 
 /// Write each band of a `(bands, rows, cols)` layer as `{prefix}_NN.tif`.
@@ -2252,6 +2428,17 @@ mod tests {
     use super::*;
     use dolphin_core::config::ComputeBackend;
     use dolphin_core::{HalfWindow, Strides};
+
+    /// A config whose velocity path is the unweighted degree-1 fit — the branch
+    /// the bounded-trim reference-reselection tests exercise.
+    fn unweighted_cfg(correlation_threshold: f64) -> DisplacementWorkflow {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.correlation_threshold = correlation_threshold;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.write_velocity_uncertainty = false;
+        cfg.timeseries_options.correct_velocity_temporal_correlation = false;
+        cfg
+    }
 
     fn seam_burst(phase_offset: f64, coherence: f64) -> BurstLink {
         BurstLink {
@@ -2384,6 +2571,8 @@ mod tests {
         let mut products = SpatialProducts {
             disp_rad: Array3::from_elem((2, 2, 2), 1.0),
             vel_rad: velocity,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
@@ -2448,6 +2637,8 @@ mod tests {
                 date as f64 + row as f64 * 0.1 + col as f64 * 0.01
             }),
             vel_rad: Array2::zeros((6, 8)),
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
@@ -2474,7 +2665,7 @@ mod tests {
             col_stop: 7,
         };
         products
-            .trim(target, &[0.0, 12.0, 24.0], 0.5, false, false, false)
+            .trim(target, &[0.0, 12.0, 24.0], &unweighted_cfg(0.5))
             .unwrap();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
@@ -2490,6 +2681,8 @@ mod tests {
         let mut products = SpatialProducts {
             disp_rad: Array3::zeros((2, 4, 4)),
             vel_rad: Array2::zeros((4, 4)),
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((4, 4), 0.1),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
@@ -2518,10 +2711,7 @@ mod tests {
                     col_stop: 4,
                 },
                 &[0.0, 12.0, 24.0],
-                0.5,
-                false,
-                false,
-                false,
+                &unweighted_cfg(0.5),
             )
             .unwrap_err();
         assert!(error.to_string().contains("reference coherence threshold"));
@@ -2668,10 +2858,15 @@ mod tests {
         let crlb = Array3::from_elem((12, 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
+        let linear = VelocityModel::default();
 
-        let (_, plain) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
+            .unwrap()
+            .sigma;
         cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let (_, corrected) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
+            .unwrap()
+            .sigma;
 
         let plain = plain.expect("velocity sigma")[(0, 0)];
         let corrected = corrected.expect("velocity sigma")[(0, 0)];
@@ -2692,10 +2887,15 @@ mod tests {
         let crlb = Array3::from_elem((12, 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
+        let linear = VelocityModel::default();
 
-        let (_, plain) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
+            .unwrap()
+            .sigma;
         cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let (_, corrected) = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb)).unwrap();
+        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
+            .unwrap()
+            .sigma;
         let plain = plain.expect("velocity sigma")[(0, 0)];
         let corrected = corrected.expect("velocity sigma")[(0, 0)];
         assert!(
@@ -3082,5 +3282,173 @@ mod tests {
         let v6 = mk(&[0.0, 6.0, 12.0, 18.0]);
         assert!((v12 - phase_per_yr).abs() < 1e-9);
         assert!((v6 - phase_per_yr).abs() < 1e-9);
+    }
+
+    fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
+        dates
+            .iter()
+            .map(|d| PathBuf::from(format!("/x/cslc_{d}.h5")))
+            .collect()
+    }
+
+    /// Issue #22, default path: with neither knob set the model is linear, so the
+    /// velocity fit stays on the parity-critical degree-1 estimator and no
+    /// time-function layer is produced.
+    #[test]
+    fn default_config_leaves_the_velocity_model_linear() {
+        let cfg = DisplacementWorkflow::default();
+        let files = dated_files(&["20230104", "20230116"]);
+        let model = velocity_model(&cfg, &files).unwrap();
+        assert!(model.is_linear());
+
+        let days = vec![0.0, 12.0];
+        let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
+        let crlb = Array3::from_elem((2, 1, 1), 0.5);
+        let fit = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        assert!(fit.terms.seasonal_amplitude_rad.is_none());
+        assert!(fit.terms.step_magnitude_rad.is_empty());
+    }
+
+    /// Step dates are resolved against acquisition 0, the same origin `days` uses.
+    #[test]
+    fn step_dates_resolve_to_days_from_acquisition_zero() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.velocity_step_dates = vec!["2023-01-04".into(), "2023-03-05".into()];
+        let files = dated_files(&["20230104", "20230609"]);
+        let model = velocity_model(&cfg, &files).unwrap();
+        assert!(!model.is_linear());
+        assert_eq!(model.step_days, vec![0.0, 60.0]);
+    }
+
+    /// A step the user asked for and did not get is a wrong answer, not a degraded
+    /// one — a malformed date fails the run instead of dropping the term.
+    #[test]
+    fn malformed_step_date_fails_the_run() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.velocity_step_dates = vec!["04/01/2023".into()];
+        let error = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap_err();
+        assert!(error.to_string().contains("velocity_step_dates"), "{error}");
+    }
+
+    /// The configured model reaches `fit_velocity`, separates the seasonal cycle
+    /// from the rate, and emits its terms — where the linear fit on the same series
+    /// reports a rate biased by the cycle.
+    #[test]
+    fn seasonal_model_separates_the_cycle_from_the_rate() {
+        let days: Vec<f64> = (0..16).map(|t| f64::from(t) * 12.0).collect();
+        let (rate_per_year, amplitude) = (5.0, 2.0);
+        let omega = std::f64::consts::TAU / 365.25;
+        // `fit_velocity` prepends the zero reference epoch, so the stack carries
+        // dates 1..n and must evaluate to zero at day 0 — which this series does.
+        let displacement = Array3::from_shape_fn((days.len() - 1, 1, 1), |(t, _, _)| {
+            let time = days[t + 1];
+            rate_per_year * time / 365.25 + amplitude * ((omega * time).cos() - 1.0)
+        });
+        let crlb = Array3::from_elem((days.len(), 1, 1), 0.5);
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.velocity_seasonal = true;
+        let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
+
+        let seasonal = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        assert!(
+            (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
+            "rate {} != {rate_per_year}",
+            seasonal.velocity[(0, 0)]
+        );
+        let recovered = seasonal.terms.seasonal_amplitude_rad.expect("amplitude")[(0, 0)];
+        assert!(
+            (recovered - amplitude).abs() < 1e-6,
+            "amplitude {recovered}"
+        );
+        assert!(
+            seasonal.sigma.is_some(),
+            "sigma follows write_velocity_uncertainty"
+        );
+
+        cfg.timeseries_options.velocity_seasonal = false;
+        let linear = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            &VelocityModel::default(),
+        )
+        .unwrap();
+        assert!(
+            (linear.velocity[(0, 0)] - rate_per_year).abs() > 1.0,
+            "fixture must show the linear fit absorbing the cycle, got {}",
+            linear.velocity[(0, 0)]
+        );
+    }
+
+    /// The bounded/tiled path re-fits through the same front door, so a configured
+    /// model reaches it too — a step is recovered after re-referencing, not lost.
+    #[test]
+    fn bounded_trim_refits_with_the_configured_model() {
+        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
+        let step_day = 60.0;
+        let mut products = SpatialProducts {
+            // Signal scales with row so re-referencing (which subtracts the
+            // reference pixel's whole series) leaves a recoverable row-to-row
+            // difference rather than a flat zero.
+            disp_rad: Array3::from_shape_fn((days.len() - 1, 4, 4), |(t, row, _)| {
+                let time = days[t + 1];
+                let scale = row as f64 + 1.0;
+                (0.01 * time + f64::from(time >= step_day) * 3.0) * scale
+            }),
+            vel_rad: Array2::zeros((4, 4)),
+            velocity_model: VelocityModel {
+                seasonal: false,
+                step_days: vec![step_day],
+            },
+            velocity_terms: VelocityTerms::default(),
+            temporal_coherence: Array2::from_elem((4, 4), 0.9),
+            validity_mask: Array2::from_elem((4, 4), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            // In the halo, so trim re-selects a reference and re-fits.
+            reference_point: Some((0, 0)),
+            posterior_variance_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: None,
+            interferogram_pairs: Vec::new(),
+            unwrap_connected_components: Array3::zeros((0, 4, 4)),
+        };
+        let target = BlockIndices {
+            row_start: 1,
+            row_stop: 4,
+            col_start: 1,
+            col_stop: 4,
+        };
+        products.trim(target, &days, &unweighted_cfg(0.5)).unwrap();
+
+        let step = products
+            .velocity_terms
+            .step_magnitude_rad
+            .first()
+            .expect("step layer");
+        assert_eq!(step.dim(), (3, 3), "terms are trimmed with the rest");
+        // Re-referencing removes a common offset, so the recoverable quantity is
+        // the row-to-row difference: one row of scale is exactly one step of 3.0.
+        assert!(
+            (step[(1, 0)] - step[(0, 0)] - 3.0).abs() < 1e-9,
+            "step magnitude gradient {} -> {}",
+            step[(0, 0)],
+            step[(1, 0)]
+        );
+        let rate_gradient = products.vel_rad[(1, 0)] - products.vel_rad[(0, 0)];
+        assert!(
+            (rate_gradient - 0.01 * 365.25).abs() < 1e-9,
+            "rate gradient {rate_gradient} — the step must not leak into it"
+        );
     }
 }

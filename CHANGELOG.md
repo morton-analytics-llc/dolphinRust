@@ -7,6 +7,29 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Opt-in seasonal and step terms in the velocity fit** (issue #22).
+  `dolphin-timeseries::estimate_velocity_with_model` fits an annual sinusoid and/or
+  configured Heaviside steps **jointly** with the linear rate in one weighted least-squares
+  solve, so a real seasonal cycle (groundwater, thermal) or a known step (co-seismic,
+  instrument change) is reported separately instead of leaking into the reported rate.
+  Config-gated by `timeseries_options.velocity_seasonal` (default `false`) and
+  `timeseries_options.velocity_step_dates` (default empty, `YYYY-MM-DD`, resolved against
+  acquisition 0). **Forward divergence from dolphin** — dolphin's `velocity.py` is
+  linear-only — following the `correct_phase_bias` / `correct_velocity_temporal_correlation`
+  precedent. With both unset the model is linear and the fit stays on the untouched degree-1
+  estimators; `estimate_velocity_with_model` asserts against a linear model rather than
+  reimplementing the parity-critical path. Step epochs are an **input, never detected**: a
+  fitted step time is a different, nonlinear estimator. New layers when enabled:
+  `velocity_seasonal_amplitude.tif`, `velocity_seasonal_phase_days.tif` (`UNITTYPE=days`),
+  and `velocity_step_NN.tif` in `velocity_step_dates` order. Measured on a noiseless
+  −25 mm/yr series with an 8 mm annual cycle, the linear-only fit reports a rate wrong by
+  2.4 mm/yr over a 360-day window and by ~34 mm/yr over a 180-day one — the error is a
+  function of which part of the cycle the acquisitions sampled, not of the ground. The
+  bounded/tiled path re-fits through the same front door, so the model cannot reach the
+  whole-frame path and miss the tiled one. Post-seismic (exponential/logarithmic) relaxation
+  is deliberately not included: it needs a relaxation time constant, which is another
+  nonlinear parameter or another knob, and neither is justified before these terms have
+  been used on real data.
 - **SHP neighbor selection is now applied during phase linking** (issue #29).
   `phase_linking.shp_method` / `shp_alpha` were accepted in config but never reached the
   covariance kernel — `sequential.rs` passed `neighbors: None` unconditionally, so

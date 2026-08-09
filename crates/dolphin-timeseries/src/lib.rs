@@ -9,6 +9,7 @@
 pub mod inversion;
 pub mod network;
 pub mod reference;
+pub mod velocity_model;
 
 pub use inversion::{
     estimate_velocity, estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
@@ -18,3 +19,4 @@ pub use inversion::{
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};
+pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};
