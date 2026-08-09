@@ -21,11 +21,17 @@ class RunnerContract(unittest.TestCase):
             "correction_options": {"geometry_files": []},
             "timeseries_options": {"reference_point": [2, 3]},
         }
-        native, snaphu = runner.build_backend_configs(base, Path("static.h5"), Path("/tmp/run"))
+        native, snaphu = runner.build_backend_configs(
+            base, [Path("static.h5"), Path("neighbour.h5")], Path("/tmp/run")
+        )
         runner.assert_backend_config_identity(native, snaphu)
         self.assertEqual(native["unwrap_options"]["unwrap_method"], "native")
         self.assertEqual(snaphu["unwrap_options"]["unwrap_method"], "snaphu")
-        self.assertEqual(native["correction_options"]["geometry_files"], ["static.h5"])
+        # A frame wider than one burst carries every covering STATIC, in order.
+        self.assertEqual(
+            native["correction_options"]["geometry_files"],
+            ["static.h5", "neighbour.h5"],
+        )
         native["timeseries_options"]["reference_point"] = [9, 9]
         with self.assertRaisesRegex(ValueError, "scientific settings"):
             runner.assert_backend_config_identity(native, snaphu)

@@ -142,6 +142,14 @@ All notable changes to dolphinRust are documented here. The format follows
   behavior); `local_incidence_angle` ingest; nearest-vs-bilinear resample at burst seams
   (single-burst consumer unaffected). See the design doc's Deferred section.
 
+### Changed
+- **The GNSS harness supports frames wider than one burst.** `crop_real.py` crops every
+  covering CSLC-S1-STATIC granule instead of exactly one, clamping a partially-overlapping
+  neighbour to its intersection, and the runner passes them all as
+  `correction_options.geometry_files` for `dolphin-corrections` to mosaic. Needed because a
+  three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
+  the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
+
 ### Known limitations
 - **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
   temporally correlated epochs quantize every 68/90/95 bin at 8.3%, from one station pair on
@@ -421,6 +429,14 @@ physically-meaningful tolerances.
   agreement PASS (displacement RMS residual ≤ 0.008 rad, matching velocity magnitude +
   temporal coherence). Reproducer: `validation/{fetch_real,crop_real,scan_coherence}.py`,
   `run_real.sh`.
+
+### Changed
+- **The GNSS harness supports frames wider than one burst.** `crop_real.py` crops every
+  covering CSLC-S1-STATIC granule instead of exactly one, clamping a partially-overlapping
+  neighbour to its intersection, and the runner passes them all as
+  `correction_options.geometry_files` for `dolphin-corrections` to mosaic. Needed because a
+  three-station frame clips the primary burst's valid LOS at a corner (3.21% of pixels), which
+  the fail-loud coverage gate correctly rejects. Only same-track neighbours are admissible.
 
 ### Known limitations / deferred
 - **Real-data velocity absolute scale under strong signal** not independently pinned (sampled

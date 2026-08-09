@@ -180,6 +180,23 @@ def crop_product(
     }
 
 
+def clamp_window(window: Window, shape: tuple[int, int]) -> Window:
+    """Intersect a window with the source grid.
+
+    A frame can be wider than any one burst, so an along-track neighbour covers
+    only part of it. Clipping to the overlap is correct there — unlike the CSLC
+    path, where an out-of-range window is a genuine error.
+    """
+    rows, cols = shape
+    row0 = min(max(window.row0, 0), rows)
+    col0 = min(max(window.col0, 0), cols)
+    height = min(window.row1, rows) - row0
+    width = min(window.col1, cols) - col0
+    if height <= 0 or width <= 0:
+        raise ValueError(f"crop window {window} does not overlap source shape {shape}")
+    return Window(row0, col0, height, width)
+
+
 def crop_product_to_bounds(
     source_path: Path,
     destination_path: Path,
@@ -188,7 +205,22 @@ def crop_product_to_bounds(
     margin_pixels: int = 0,
 ) -> dict[str, Any]:
     x, y, _ = read_grid(source_path)
-    window = window_for_projected_bounds(bounds, x, y, margin_pixels)
+    left, bottom, right, top = bounds
+    corners = [
+        projected_to_pixel(left, bottom, x, y),
+        projected_to_pixel(left, top, x, y),
+        projected_to_pixel(right, bottom, x, y),
+        projected_to_pixel(right, top, x, y),
+    ]
+    rows = [row for row, _ in corners]
+    cols = [col for _, col in corners]
+    requested = Window(
+        min(rows) - margin_pixels,
+        min(cols) - margin_pixels,
+        max(rows) - min(rows) + 1 + 2 * margin_pixels,
+        max(cols) - min(cols) + 1 + 2 * margin_pixels,
+    )
+    window = clamp_window(requested, (len(y), len(x)))
     return crop_product(source_path, destination_path, product_type, window)
 
 
@@ -273,12 +305,15 @@ def run_recipe(recipe_path: Path, fixture_name: str, source_root: Path | None, o
     recipe = load_recipe(recipe_path)
     source = source_root or SRC / cohort_id(recipe) / "source"
     cslcs = sorted((source / "cslc").glob(f"OPERA_L2_CSLC-S1_{recipe['burst_filename_id']}_*.h5"))
-    static_files = sorted((source / "static").glob(f"OPERA_L2_CSLC-S1-STATIC_{recipe['burst_filename_id']}_*.h5"))
-    if len(static_files) != 1:
-        raise ValueError(f"expected exactly one source STATIC; found {len(static_files)}")
+    # The frame may extend past one burst's LOS coverage, so accept the
+    # along-track neighbours too; dolphin-corrections mosaics them onto the frame
+    # grid. The recipe's own burst must be among them.
+    static_files = sorted((source / "static").glob("OPERA_L2_CSLC-S1-STATIC_*.h5"))
+    if not static_files:
+        raise ValueError("no source STATIC granules found")
+    if not any(recipe["burst_filename_id"] in path.name for path in static_files):
+        raise ValueError(f"no source STATIC matches recipe burst {recipe['burst_filename_id']}")
     validate_cslc_files(cslcs, recipe)
-    if recipe["burst_filename_id"] not in static_files[0].name:
-        raise ValueError("source STATIC burst does not match recipe")
     x, y, epsg = assert_cslc_grids(cslcs)
     window, stations = fixture_window(recipe, fixture_name, x, y, epsg)
     bounds = window_projected_bounds(window, x, y)
@@ -289,9 +324,12 @@ def run_recipe(recipe_path: Path, fixture_name: str, source_root: Path | None, o
         crop_product(path, cslc_out / path.name, "cslc", window)
         for path in cslcs
     ]
-    static_entry = crop_product_to_bounds(
-        static_files[0], static_out / static_files[0].name, "static", bounds, margin_pixels=1
-    )
+    static_entries = [
+        crop_product_to_bounds(
+            path, static_out / path.name, "static", bounds, margin_pixels=1
+        )
+        for path in static_files
+    ]
     manifest = {
         "schema": "dolphinrust-gps-fixture/1",
         "recipe": str(recipe_path.resolve()),
@@ -305,7 +343,7 @@ def run_recipe(recipe_path: Path, fixture_name: str, source_root: Path | None, o
         "estimated_complex_pixels": window.height * window.width * len(cslcs),
         "stations": stations,
         "cslc": entries,
-        "static": [static_entry],
+        "static": static_entries,
     }
     destination.mkdir(parents=True, exist_ok=True)
     manifest_path = destination / "fixture_manifest.json"

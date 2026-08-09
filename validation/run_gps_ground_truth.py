@@ -32,14 +32,16 @@ SAFE_YAML = RuamelYAML(typ="safe")
 
 
 def build_backend_configs(
-    base: dict[str, Any], static_path: Path, run_root: Path
+    base: dict[str, Any], static_paths: list[Path], run_root: Path
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     configs = []
     for backend in ["native", "snaphu"]:
         config = copy.deepcopy(base)
         config["work_directory"] = str(run_root / f"work_{backend}")
         config.setdefault("unwrap_options", {})["unwrap_method"] = backend
-        config.setdefault("correction_options", {})["geometry_files"] = [str(static_path)]
+        config.setdefault("correction_options", {})["geometry_files"] = [
+            str(path) for path in static_paths
+        ]
         config.setdefault("input_options", {}).setdefault("wavelength", 0.05546576)
         timeseries = config.setdefault("timeseries_options", {})
         timeseries["method"] = "L2"
@@ -267,16 +269,28 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     static_files = sorted((fixture_root / "static").glob("OPERA_L2_CSLC-S1-STATIC_*.h5"))
     if len(cslcs) != len(recipe["expected_dates"]):
         raise gps.NotEvaluable(f"expected {len(recipe['expected_dates'])} cropped CSLCs; found {len(cslcs)}")
-    if len(static_files) != 1:
-        raise gps.NotEvaluable(f"expected one cropped STATIC; found {len(static_files)}")
+    if not static_files:
+        raise gps.NotEvaluable("expected at least one cropped STATIC; found none")
+    # A frame wider than one burst needs the along-track neighbours' LOS too;
+    # dolphin-corrections mosaics them. Station sampling still uses the recipe's
+    # own burst, which is the one that must be present.
+    primary_static = next(
+        (path for path in static_files if recipe["burst_filename_id"] in path.name), None
+    )
+    if primary_static is None:
+        raise gps.NotEvaluable(
+            f"no cropped STATIC matches recipe burst {recipe['burst_filename_id']}"
+        )
     validate_fixture_contract(
-        fixture_manifest, recipe, args.fixture, cslcs, static_files[0]
+        fixture_manifest, recipe, args.fixture, cslcs, primary_static
     )
     run_root = args.run_root or ROOT / "validation" / "runs" / cohort / args.fixture
     run_root.mkdir(parents=True, exist_ok=True)
     base_path = run_root / "config_base.yaml"
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
-    native, snaphu = build_backend_configs(base, static_files[0].resolve(), run_root)
+    native, snaphu = build_backend_configs(
+        base, [path.resolve() for path in static_files], run_root
+    )
     assert_backend_config_identity(native, snaphu)
     if args.native_only:
         configs = {"native": native}
@@ -303,7 +317,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "fixture": args.fixture,
         "fixture_manifest": str(manifest_path),
         "fixture_manifest_sha256": sha256_file(manifest_path),
-        "static": str(static_files[0]),
+        "static": [str(path) for path in static_files],
     }
     for backend in configs:
         work_directory = Path(configs[backend]["work_directory"])
@@ -359,7 +373,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             recipe,
             fixture_manifest,
             {backend: Path(configs[backend]["work_directory"]) for backend in configs},
-            static_files[0],
+            primary_static,
             ROOT / "validation" / "real_data" / cohort / "gnss",
             run_root,
             float(native["input_options"]["wavelength"]),

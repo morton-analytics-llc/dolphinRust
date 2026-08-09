@@ -827,6 +827,50 @@ absent. Coverage is unchanged (both stations were already bounded); velocity mov
 −251.143 to −251.130 mm/yr against GNSS −247.811. Combined with #29 the frame goes from
 98.8613% → 99.3062% → **100%** displacement coverage.
 
+### Three-station run: the coverage shortfall is uncorrected troposphere (2026-08-09, #35)
+
+MXTX was added and the three-station fixture (`mmx1_icmx_mxtx_common`, 1547×6248, 12× the
+two-station frame) was built and run. Two prerequisites surfaced on the way:
+
+- the wider frame clips burst `T005_008704_IW1`'s valid LOS at its north-west corner
+  (309,940 pixels, 3.21%; the two-station frame had zero), so the fail-loud coverage gate
+  rejected all four engines. The along-track neighbour `T005_008705_IW1` covers **exactly**
+  those pixels — together 0 uncovered. `crop_real.py` now crops every covering STATIC and
+  clamps a partially-overlapping granule to its intersection; the runner passes them all as
+  `geometry_files`. Only same-track neighbours are admissible: the other six bursts
+  intersecting this frame are different relative orbits, whose LOS would be wrong to mosaic.
+- station surveys must filter on **valid-data** footprint, not the nominal grid extent.
+
+Scored per pair on the native engine, 12 epochs:
+
+| pair | baseline | status | RMSE | corr | TLS | InSAR | GNSS | Δ mm/yr |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| MMX1−ICMX | 11.1 km | pass | 10.20 | 0.954 | 1.062 | −251.13 | −247.81 | −3.32 |
+| MMX1−MXTX | 23.4 km | fail | 18.68 | 0.910 | 1.276 | −274.40 | −238.76 | −35.64 |
+| ICMX−MXTX | 34.3 km | fail | 19.77 | −0.052 | −77.16 | −23.27 | +9.05 | −32.32 |
+
+MMX1−ICMX reproduces the two-station frame to the millimetre (−3.319 both runs), so the 12×
+frame is sound. The MXTX failures are **not** a bad station and not unwrapping: all three
+share connected component 1 in all 12 interferograms, and the residual series oscillates in
+sign (monotone fraction 0.50–0.67) rather than ramping.
+
+**It is turbulent troposphere, and it scales.** RMSE/√baseline is near-constant at
+**3.06 / 3.86 / 3.38 mm·km^−0.5** across the three pairs — the turbulent structure-function
+signature. Station heights span only 36 m (2231–2267 m), so this is not stratified delay.
+The harness runs with atmospheric corrections disabled, as its own limitations note says.
+
+**This explains the coverage shortfall quantitatively.** For MMX1−ICMX the modelled budget is
+√(4.25² + 1.41² + 2.51²) = **5.13 mm**, against an observed residual RMS of **10.20 mm** —
+a factor of 1.99. The implied missing term is **8.81 mm**, and the turbulence model predicts
+3.4·√11.14 = **11.35 mm** at that baseline. So the dominant error in this comparison is
+atmospheric and is **entirely absent from the uncertainty budget** — a larger effect than the
+temporal-correlation term of issue #33 and the reason CRLB-only sits near 0.500 at 68%.
+
+Consequences: MXTX does not enlarge the usable truth set without tropospheric correction,
+because at 23–34 km the unmodelled delay exceeds the near-null differential signal. The
+original 11 km MMX1−ICMX pair was well chosen. Long-baseline pairs need
+`correction_options` troposphere enabled before their coverage means anything.
+
 ### What truth set this burst can support (surveyed 2026-08-08)
 
 19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the
