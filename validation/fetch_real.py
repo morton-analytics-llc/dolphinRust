@@ -35,12 +35,39 @@ OUT = ROOT / "real_data"
 DATE_RE = re.compile(r"_(20\d{6})T")
 
 
+TOKEN_KEYS = ("GP_EARTHDATA_TOKEN", "EARTHDATA_TOKEN")
+
+
+def resolve_token(environment: Mapping[str, str] = os.environ) -> str:
+    """Return the Earthdata bearer token, without ever logging its value.
+
+    Reads the process environment first, then the repo `.env` — the same file the
+    module docstring already points at, and no more privileged than the
+    `~/.netrc` this module already reads. Sourcing a shell helper first therefore
+    remains supported but is no longer required.
+    """
+    for key in TOKEN_KEYS:
+        token = environment.get(key, "").strip()
+        if token:
+            return token
+    env_file = ROOT.parent / ".env"
+    if not env_file.is_file():
+        return ""
+    for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in TOKEN_KEYS:
+            token = value.strip().strip("'\"")
+            if token:
+                return token
+    return ""
+
+
 def require_token(environment: Mapping[str, str] = os.environ) -> str:
     """Return the Earthdata bearer token or fail without exposing its value."""
-    token = environment.get("GP_EARTHDATA_TOKEN", "").strip()
+    token = resolve_token(environment)
     if not token:
         raise RuntimeError(
-            "GP_EARTHDATA_TOKEN is missing; source validation/creds.sh and check .env"
+            "No Earthdata bearer token: set GP_EARTHDATA_TOKEN or put it in .env"
         )
     return token
 
@@ -48,27 +75,40 @@ def require_token(environment: Mapping[str, str] = os.environ) -> str:
 def authenticated_session(
     environment: Mapping[str, str] = os.environ,
 ) -> asf.ASFSession:
-    """Authenticate by bearer token, then the standard Earthdata netrc entry."""
-    token = environment.get("GP_EARTHDATA_TOKEN", "").strip()
+    """Authenticate by bearer token, falling back to the Earthdata netrc entry.
+
+    The token is the supported path. netrc is only a fallback, and its failure is
+    reported separately from the token's so an expired token cannot hide behind a
+    stale netrc entry (or the reverse).
+    """
+    token = resolve_token(environment)
+    token_error: Exception | None = None
     if token:
         try:
             return asf.ASFSession().auth_with_token(token)
-        except ASFAuthenticationError:
-            pass
+        except ASFAuthenticationError as error:
+            token_error = error
+    token_state = (
+        f"bearer token was rejected ({token_error})"
+        if token_error
+        else "no bearer token found in the environment or .env"
+    )
     try:
         credentials = netrc.netrc().authenticators("urs.earthdata.nasa.gov")
     except (FileNotFoundError, netrc.NetrcParseError, OSError):
         credentials = None
     if credentials is None:
         raise RuntimeError(
-            "Earthdata authentication failed: bearer token is missing/expired and no usable urs.earthdata.nasa.gov netrc entry exists"
+            f"Earthdata authentication failed: {token_state}, and no usable"
+            " urs.earthdata.nasa.gov netrc entry exists"
         )
     username, _, password = credentials
     try:
         return asf.ASFSession().auth_with_creds(username, password)
     except ASFAuthenticationError as error:
         raise RuntimeError(
-            "Earthdata authentication failed for both bearer token and netrc credentials"
+            f"Earthdata authentication failed: {token_state}; the netrc fallback was"
+            " also rejected"
         ) from error
 
 

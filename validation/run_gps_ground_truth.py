@@ -143,6 +143,27 @@ def generate_base_config(cslcs: list[Path], path: Path, work_directory: Path) ->
     return load_yaml(path)
 
 
+def apply_network_override(base: dict[str, Any], max_bandwidth: int | None) -> None:
+    """Switch the run from single-reference to a nearest-N interferogram network.
+
+    `dolphin config` emits the pinned v0.35 default, `reference_idx: 0`, which
+    makes the SBAS system exactly determined: `dof = 0`, the residual-based
+    inflation is pinned to 1, and every uncertainty layer traces back to the CRLB
+    lower bound (issue #36). A calibration run on that network cannot measure what
+    it exists to measure, so the network is an explicit choice here. `reference_idx`
+    is cleared rather than left alongside `max_bandwidth`, since dolphinRust unions
+    the configured modes and the union is neither network.
+    """
+    if max_bandwidth is None:
+        return
+    base["interferogram_network"] = {
+        "reference_idx": None,
+        "max_bandwidth": max_bandwidth,
+        "max_temporal_baseline": None,
+        "indexes": None,
+    }
+
+
 def ensure_rust_binary(build: bool) -> None:
     if build or not RUST_BIN.exists():
         subprocess.run(
@@ -299,6 +320,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     run_root.mkdir(parents=True, exist_ok=True)
     base_path = run_root / "config_base.yaml"
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
+    apply_network_override(base, args.max_bandwidth)
     native, snaphu = build_backend_configs(
         base,
         [path.resolve() for path in static_files],
@@ -419,6 +441,15 @@ def parse_args() -> argparse.Namespace:
         help="directory of OPERA L4 TROPO-ZENITH granules, one per declared date",
     )
     parser.add_argument("--dem", type=Path, help="DEM for L4 height interpolation (issue #38)")
+    parser.add_argument(
+        "--max-bandwidth",
+        type=int,
+        help=(
+            "form a nearest-N interferogram network instead of the single-reference "
+            "default. Required for the posterior uncertainty to carry empirical scale: "
+            "single-reference leaves dof=0 (issue #36)"
+        ),
+    )
     parser.add_argument(
         "--native-only",
         action="store_true",
