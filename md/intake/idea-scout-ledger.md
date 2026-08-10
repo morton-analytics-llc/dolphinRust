@@ -60,6 +60,20 @@ Entry format:
   extending the existing Phase 0 block-manager property tests.
 - **Added**: 2026-08-03 by scheduled scout run
 
+### D5 — ERA5-based tropospheric delay as a dolphinRust correction source
+- **Source**: inbound (cross-repo signal, `../eo`#238, itself sourced from an ecosystem scan)
+- **Issue**: #41 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: (1) both source papers (PMC11819746 and the paywalled ScienceDirect
+  S0273117726001419) are read in full to confirm the power-law+ERA5 delay estimate is
+  reproducible from ERA5 alone, without the proprietary Beijing GNSS-ZTD-gradient enhancement;
+  (2) `../eo`#238's own open architecture question is resolved — whether the correction must
+  stay a per-pair scalar in eo's pipeline (out of scope here) or can be a per-pixel raster layer
+  like the existing iono/tropo/solid-earth-tide corrections (in scope here).
+- **Design sketch**: if gated in, a new opt-in `dolphin-corrections` module (Saastamoinen zenith
+  delay, LOS-mapped via the existing shared `resolve_los_geometry`/`1/up` path), analogous to
+  the existing troposphere/ionosphere layers; closed-form analytic fixture for the contract.
+- **Added**: 2026-08-10 by scheduled scout run
+
 ## SHIPPED
 
 ### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0
