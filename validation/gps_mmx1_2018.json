@@ -1,0 +1,161 @@
+{
+  "schema": "dolphinrust-gps-ground-truth-recipe/2",
+  "cohort_id": "gps_mmx1_2018",
+  "burst_id": "T005_008704_IW1",
+  "burst_filename_id": "T005-008704-IW1",
+  "start": "2018-01-06",
+  "end": "2018-12-27",
+  "expected_dates": [
+    "2018-01-06",
+    "2018-01-12",
+    "2018-01-30",
+    "2018-02-05",
+    "2018-02-17",
+    "2018-03-01",
+    "2018-03-07",
+    "2018-03-19",
+    "2018-03-25",
+    "2018-03-31",
+    "2018-04-06",
+    "2018-04-12",
+    "2018-04-18",
+    "2018-04-30",
+    "2018-05-06",
+    "2018-05-12",
+    "2018-05-18",
+    "2018-05-24",
+    "2018-05-30",
+    "2018-06-05",
+    "2018-06-11",
+    "2018-06-17",
+    "2018-06-23",
+    "2018-06-29",
+    "2018-07-05",
+    "2018-07-11",
+    "2018-07-17",
+    "2018-07-23",
+    "2018-07-29",
+    "2018-08-04",
+    "2018-08-10",
+    "2018-08-16",
+    "2018-08-22",
+    "2018-08-28",
+    "2018-09-03",
+    "2018-09-09",
+    "2018-09-15",
+    "2018-09-21",
+    "2018-09-27",
+    "2018-10-03",
+    "2018-10-15",
+    "2018-10-21",
+    "2018-10-27",
+    "2018-11-02",
+    "2018-11-08",
+    "2018-11-14",
+    "2018-11-20",
+    "2018-11-26",
+    "2018-12-02",
+    "2018-12-14",
+    "2018-12-20",
+    "2018-12-26"
+  ],
+  "stations": {
+    "MMX1": {
+      "role": "high_snr_primary",
+      "latitude": 19.4317,
+      "longitude": -99.0684,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/MMX1.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/MMX1.sta"
+    },
+    "ICMX": {
+      "role": "near_null_control",
+      "latitude": 19.4056,
+      "longitude": -99.1709,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/ICMX.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/ICMX.sta"
+    },
+    "MXMX": {
+      "role": "cohort",
+      "latitude": 19.4315,
+      "longitude": -99.1753,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/MXMX.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/MXMX.sta"
+    },
+    "MXTM": {
+      "role": "cohort",
+      "latitude": 19.4844,
+      "longitude": -98.9785,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/MXTM.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/MXTM.sta"
+    },
+    "SSNX": {
+      "role": "cohort",
+      "latitude": 19.3272,
+      "longitude": -99.1768,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/SSNX.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/SSNX.sta"
+    },
+    "TNGF": {
+      "role": "cohort",
+      "latitude": 19.3269,
+      "longitude": -99.1761,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/TNGF.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/TNGF.sta"
+    },
+    "UJAL": {
+      "role": "cohort",
+      "latitude": 19.3131,
+      "longitude": -99.2262,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/UJAL.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/UJAL.sta"
+    },
+    "UNVA": {
+      "role": "cohort",
+      "latitude": 19.4836,
+      "longitude": -99.1472,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/UNVA.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/UNVA.sta"
+    },
+    "UTAC": {
+      "role": "cohort",
+      "latitude": 19.4045,
+      "longitude": -99.1952,
+      "tenv3_url": "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/UTAC.tenv3",
+      "metadata_url": "https://geodesy.unr.edu/NGLStationPages/stations/UTAC.sta"
+    }
+  },
+  "fixtures": {
+    "mmx1_2018_common": {
+      "mode": "stations",
+      "station_ids": [
+        "MMX1",
+        "ICMX",
+        "MXMX",
+        "MXTM",
+        "SSNX",
+        "TNGF",
+        "UJAL",
+        "UNVA",
+        "UTAC"
+      ],
+      "margin_pixels": 32
+    }
+  },
+  "comparison": {
+    "id": "MMX1_minus_ICMX_2018_common_frame",
+    "fixture": "mmx1_2018_common",
+    "primary_station": "MMX1",
+    "control_station": "ICMX"
+  },
+  "sample_windows": [
+    1,
+    3,
+    5,
+    7
+  ],
+  "primary_window": 5,
+  "minimum_finite_fraction": 0.5,
+  "max_interpolation_gap_days": 4,
+  "interpolation_policy": "linear only between bracketing daily final solutions",
+  "notes": "Issue #35 option B: the 2018 window, where this burst carries its most GNSS stations. The survey in #35 listed 8; UTAC also spans all of 2018 (2013-06-27 to 2019-11-26, 969 daily solutions) and was missed, so this cohort is 9 stations and 8 independent differential series, not 7. 52 OPERA CSLC granules (S1A+S1B era) against 14 in 2023."
+}
