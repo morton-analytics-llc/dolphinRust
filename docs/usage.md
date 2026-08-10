@@ -237,7 +237,8 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 | `velocity_mm_yr` | `Array2<f64>` `(rows, cols)` | **mm/yr** | LOS rate via `−λ/4π`; config λ or Sentinel-1 default |
 | `velocity_sigma` | `Option<Array2<f64>>` | displacement units/yr | CRLB-weighted slope σ; opt-in |
 | `displacement_variance` | `Option<Array3<f64>>` | displacement units² | L2 posterior diagonal; opt-in |
-| `timeseries_residual_rms` | `Option<Array2<f64>>` | displacement units | L2 residual RMS; opt-in |
+| `network_misclosure_rms` | `Option<Array2<f64>>` | displacement units | SBAS network-inversion misclosure RMS (`A·φ=Δφ`); `Some` only for `write_posterior_uncertainty` L2 runs |
+| `timeseries_residual_rms` | `Option<Array2<f64>>` | displacement units | temporal motion-model fit residual RMS (rate ± seasonal/step); `None` only on the unweighted-linear fast path |
 | `interferogram_pairs` | `Vec<(usize, usize)>` | date indexes | ordering for unwrap bands and component labels |
 | `unwrap_connected_components` | `Array3<u32>` | labels | actual native/SNAPHU labels, one band per pair |
 | `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | per-ministack-stitched phase quality (dolphin's NaN-aware mean across ministacks; unmasked) |
@@ -258,7 +259,8 @@ DEFLATE-compressed, overviews) sharing `epsg` + `geotransform`:
 |---|---|---|
 | `velocity.tif` | linear velocity | raster units/yr (m/yr or rad/yr) |
 | `velocity_sigma.tif` | one-sigma linear-rate uncertainty (opt-in) | raster units/yr |
-| `timeseries_residual_rms.tif` | L2 residual RMS (with posterior output) | meters or radians |
+| `timeseries_residual_rms.tif` | temporal motion-model fit residual RMS | meters or radians |
+| `network_misclosure_rms.tif` | SBAS network-inversion misclosure RMS (with posterior output) | meters or radians |
 | `temporal_coherence.tif` | temporal coherence | `[0, 1]` |
 | `displacement_NN.tif` | cumulative displacement at date `NN+1` | meters or radians |
 | `displacement_variance_NN.tif` | L2 posterior displacement variance (opt-in) | meters² or radians² |

@@ -180,6 +180,30 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **`timeseries_residual_rms.tif` now carries the temporal motion-model fit residual it was
+  always named for, and the SBAS network-inversion misclosure it actually served has its own
+  raster** (issue #40, cross-repo signal from `../eo`#316). `SpatialProducts::timeseries_residual_rad`
+  was populated from `InversionProducts::residual_rms` — the L2 network-inversion misclosure
+  RMS (`A·φ = Δφ`) — not from the per-pixel scatter of displacement around the fitted velocity
+  model that `dolphin-timeseries::velocity_model` / `estimate_velocity_with_uncertainty` already
+  computed and `fit_velocity` discarded. Two consequences on `main`: the raster was **absent
+  entirely** on the default `TimeseriesMethod::L1` path and on plain L2 without
+  `write_posterior_uncertainty` (the misclosure quantity is `None` there), and where present it
+  answered "did the interferogram network close," not "does displacement fit the model" — the
+  two can and do diverge (a redundant, perfectly-closing network can still phase-link a
+  temporally inconsistent epoch). `timeseries_residual_rms.tif` / `DisplacementOutput::
+  timeseries_residual_rms` now carries the temporal-fit residual on every velocity path that
+  computes a model fit (weighted linear, seasonal, step); it stays absent only on the
+  unweighted-linear fast path, which computes no fit statistics at all (matching `velocity_sigma`'s
+  existing rule there). The network misclosure is unchanged in value and semantics but renamed
+  to `network_misclosure_rms.tif` / `DisplacementOutput::network_misclosure_rms`, still `Some`
+  only for `write_posterior_uncertainty` L2 runs. **Breaking output-schema change**: a consumer
+  reading `timeseries_residual_rms.tif` for the old (network-misclosure) meaning must switch to
+  `network_misclosure_rms.tif` — flagged for `../eo`'s `gp-dolphin::sample_output`, the direct
+  consumer named in `../eo`#316. Analytic contract
+  (`network_misclosure_and_temporal_fit_residual_are_decoupled`): an over-determined network with
+  zero misclosure but a motion-model-inconsistent epoch shows the two residuals moving
+  independently, proving they were never the same quantity.
 - **`unwrap_options.run_interpolation` is now rejected instead of silently ignored** (issue
   #25). `PreprocessOptions` round-trips a dolphin YAML and `crop.rs` already reserves
   `max_radius` of AOI halo for the stage, but no pre-unwrap interpolation exists — so

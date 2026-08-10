@@ -734,11 +734,17 @@ quantity.
 The paragraph above recommended the unweighted posterior. That was wrong, and the reason
 matters more than the recommendation.
 
+> **Naming note (issue #40, added later):** at the time this section was measured, the
+> network-inversion misclosure below was the raster named `timeseries_residual_rms.tif`. That
+> field now carries the (distinct) temporal motion-model fit residual; the misclosure quantity
+> discussed in this section is `network_misclosure_rms.tif` going forward. The numbers and
+> analysis are unchanged — only the current raster name differs from what is written below.
+
 `solve_pixel_with_covariance` returns `(AᵀWA)⁻¹ · max(weighted_sse/dof, 1)` with
 `dof = n_valid_ifgs − n_unknowns`. This frame is **exactly determined** — 13 dates,
 `max_bandwidth: null` → 12 interferograms for 12 unknowns → **dof = 0**, so the inflation is
-pinned to 1.0 and the fit is exact. `timeseries_residual_rms.tif` confirms it: median
-**3.4e-18**.
+pinned to 1.0 and the fit is exact. `timeseries_residual_rms.tif` (now `network_misclosure_rms.tif`)
+confirms it: median **3.4e-18**.
 
 | configuration | residual RMS | posterior σ at MMX1 | frame median | spatial std |
 |---|---:|---:|---:|---:|
@@ -752,7 +758,7 @@ Its near-nominal coverage is a coincidence of magnitude, not calibration.
 
 **On a single-reference network there is therefore no empirical uncertainty in the pipeline at
 all** — every layer traces back to the CRLB lower bound, the residual-based inflation is inert
-at dof = 0, and `timeseries_residual_rms.tif` is a no-op product. An over-determined network
+at dof = 0, and `network_misclosure_rms.tif` is a no-op product. An over-determined network
 restores it: at `max_bandwidth: 3` the posterior at MMX1 rises 2.5055 → **5.5041 mm** (2.2×)
 from the data rather than from CRLB.
 

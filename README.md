@@ -97,9 +97,10 @@ cargo build --release
 # accepts a genuine dolphin `DisplacementWorkflow` YAML unchanged
 ./target/release/dolphin run --config workflow.yaml
 # writes velocity.tif, temporal_coherence.tif, displacement_NN.tif (COGs) to work_directory
-# plus conncomp_NN.tif and crlb_sigma_NN.tif (CRLB σ, UNITTYPE=rad); optional
-# L2 products include displacement_variance_NN.tif, timeseries_residual_rms.tif,
-# and velocity_sigma.tif
+# plus conncomp_NN.tif and crlb_sigma_NN.tif (CRLB σ, UNITTYPE=rad); optional products
+# include timeseries_residual_rms.tif (temporal fit residual) and velocity_sigma.tif;
+# L2 posterior output additionally writes displacement_variance_NN.tif and
+# network_misclosure_rms.tif (SBAS network-inversion misclosure)
 ```
 
 The **CRLB σ** layer (`crlb_sigma`) is the per-pixel, per-date physical uncertainty (radians)
