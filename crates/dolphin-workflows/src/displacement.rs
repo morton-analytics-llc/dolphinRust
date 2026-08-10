@@ -1768,6 +1768,16 @@ fn validate_uncertainty_options(cfg: &DisplacementWorkflow) -> Result<()> {
             || cfg.timeseries_options.write_velocity_uncertainty,
         "timeseries_options.correct_velocity_temporal_correlation requires write_velocity_uncertainty"
     );
+    // `preprocess_options` round-trips a dolphin YAML and `crop.rs` already
+    // reserves `max_radius` of halo for it, but no interpolation stage exists —
+    // so accepting the flag would widen every AOI read and change nothing. Reject
+    // it rather than silently ignore it (same rule as the check above, #25).
+    anyhow::ensure!(
+        !cfg.unwrap_options.run_interpolation,
+        "unwrap_options.run_interpolation is accepted for dolphin YAML round-trip but the \
+         pre-unwrap interpolation stage is not implemented; leave it false (dolphin's own \
+         default) rather than running with it silently ignored"
+    );
     Ok(())
 }
 
@@ -3565,6 +3575,21 @@ mod tests {
         cfg.interferogram_network.max_bandwidth = Some(2);
         let pairs = network(&cfg, &[0.0, 12.0, 24.0, 36.0]);
         assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]);
+    }
+
+    /// Issue #25: `run_interpolation` round-trips from a dolphin YAML and already
+    /// widens the AOI halo, but no interpolation stage exists — so it must be
+    /// rejected, not silently ignored.
+    #[test]
+    fn run_interpolation_is_rejected_as_unimplemented() {
+        let mut cfg = DisplacementWorkflow::default();
+        assert!(
+            validate_uncertainty_options(&cfg).is_ok(),
+            "dolphin's own default (false) must pass"
+        );
+        cfg.unwrap_options.run_interpolation = true;
+        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        assert!(error.to_string().contains("run_interpolation"), "{error}");
     }
 
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the

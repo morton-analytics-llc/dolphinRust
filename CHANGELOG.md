@@ -180,6 +180,13 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **`unwrap_options.run_interpolation` is now rejected instead of silently ignored** (issue
+  #25). `PreprocessOptions` round-trips a dolphin YAML and `crop.rs` already reserves
+  `max_radius` of AOI halo for the stage, but no pre-unwrap interpolation exists — so
+  setting the flag widened every bounded read and changed nothing. It now fails config
+  validation, following the `correct_velocity_temporal_correlation` precedent (#37).
+  dolphin's own default is `false`, so nothing that round-trips a real dolphin config is
+  affected.
 - **An unconfigured `interferogram_network` no longer fails the run** (found while working
   issue #25). `build_network` on an all-`None` network returned zero pairs and
   `finish_displacement` aborted with "interferogram_network produced no pairs" — a bare

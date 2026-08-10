@@ -864,7 +864,31 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
    nearest-3 gives. So "adopt v0.42's network default" and "ship a posterior that carries
    empirical scale" are the same decision, not two.
 
-   Still untested: v0.40.0's combined sliding-window + similarity masking.
+   **v0.40.0's masking change was audited too (2026-08-09), and it is real.** In v0.35
+   `unwrap/_unwrap.py` masks on similarity **or** correlation — similarity *replaces*
+   correlation. In v0.42 it masks on **both** (`coherent_pixel_mask &= sim >= sim_cutoff`),
+   writes a `.masked.cor.tif` so SNAPHU skips the masked pixels, and adds
+   `zero_correlation_where_interpolating`. `similarity.py` itself is byte-identical between
+   the two versions bar a logger name, so the change is entirely in how the masks combine.
+
+   It **cannot cause silent parity drift**, because it lives inside the pre-unwrap
+   interpolation stage and `unwrap_options.run_interpolation` defaults to **false in both
+   versions**. dolphinRust models `PreprocessOptions` for YAML round-trip (already carrying
+   the v0.42 values: `interpolation_cor_threshold: 0.25`, plus the v0.42-only
+   `zero_correlation_where_interpolating`) and `crop.rs` reserves `max_radius` of AOI halo
+   for it — but **no interpolation stage exists**, so setting the flag widened every bounded
+   read and changed nothing. That is now rejected at config validation rather than silently
+   ignored, following the #37 precedent.
+
+   **Decision (2026-08-09): stay on the pinned `v0.35.0` with targeted forward oracles. No
+   full re-pin.** Both untested items are closed and neither is material: the default-value
+   changes are already what dolphinRust ships, and the masking change sits behind an
+   off-by-default stage dolphinRust does not implement. A full re-pin would regenerate every
+   `.npy` fixture and re-validate every tolerance to buy nothing this audit could find. The
+   nearest-3 network default stays out of the library defaults for the same reason — it
+   changes output for every bare config — and remains the deployment choice documented under
+   issue #36. Re-open only if a *new* upstream release changes a kernel dolphinRust
+   reproduces, not on release-count drift alone.
 
 ## Open questions (technical, resolve before Phase 1)
 
