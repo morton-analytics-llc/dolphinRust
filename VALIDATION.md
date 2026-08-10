@@ -1022,6 +1022,91 @@ here is that the model reproduces the closed-form and structural properties of t
 period, ephemeris envelopes) and that its magnitude on real data is far above the error
 budget.
 
+### The 2018 calibration run, and what option B actually buys (2026-08-09, #35)
+
+Issue #35's option B was run: the 2018 window on burst `T005_008704_IW1`, 52 OPERA CSLC
+granules (13.70 GB fetched), against a **nearest-3** interferogram network — the
+over-determined network #36 concluded is required for an empirically scaled posterior.
+
+**Three corrections to the premise, all measured rather than assumed.**
+
+| | #35 said | measured |
+|---|---|---|
+| stations in the burst footprint | 19 | 19 ✓ |
+| spanning all of 2018 | 8 | **9** — UTAC (2013-06-27→2019-11-26, 969 solutions) was missed |
+| usable on a processable frame | 8 | **5** — see below |
+| well sampled within 2018 | — | **3** (MMX1, ICMX, MXMX ≥ 47/52 epochs) |
+| independent differential series | 7 | **~2** |
+
+The binding constraint is geometry, not data availability. The 9-station bounding box is
+**not processable**: its western third falls outside burst `T005_008704_IW1`'s valid LOS
+(15.6% of the frame uncovered even with both along-track neighbours), and no other T005
+burst covers that ground — only IW1 exists on this track here. **SSNX, TNGF, UJAL and UTAC
+cannot be carried on any frame built from this stack.** The five inside the swath give a
+936 × 4197 window that is 100% LOS-covered by `008703` + `008704`.
+
+Of those five, GNSS sampling then thins the set further: UNVA has **23/52** epochs and MXTM
+44/52, so the usable pairs are MMX1−ICMX (48/52), ICMX−MXMX (48/52), MMX1−MXMX (47/52).
+
+**So option B does not buy 7 independent series — it buys about 2, the same as option A.
+What it buys is 4× the epochs per series: 48 against 12.** That is a real gain and it is
+precisely the one #35 needed — a coverage bin quantizes at **2.1%** instead of 8.3% — but it
+is not the gain the issue advertised, and the difference matters for deciding whether to
+repeat this at other sites.
+
+**Scored result** (native engine, nearest-3, MMX1−ICMX, 48 common epochs):
+
+| | 2023 window (13 epochs, single-reference) | **2018 window (52 epochs, nearest-3)** |
+|---|---:|---:|
+| RMSE | 10.20 mm | **10.83 mm** |
+| correlation | 0.954 | **0.991** |
+| TLS slope | 1.062 | 1.094 |
+| endpoint residual | +11.88 mm | −13.09 mm |
+| InSAR velocity | −251.13 mm/yr | **−262.01 ± 9.10 mm/yr** |
+| GNSS velocity | −247.81 mm/yr | −240.83 mm/yr |
+| velocity Δ | **−3.32 mm/yr** | **−21.17 mm/yr** |
+| status | pass | **pass** |
+
+Correlation improves markedly (0.954 → 0.991) on 4× the epochs, and RMSE is unchanged. The
+velocity difference is **worse** — −21.17 mm/yr against a −241 mm/yr signal (8.8%) versus
+1.3% in 2023. Three things changed at once (window, network, epoch count), so this run does
+not attribute that; it is a result to explain, not a regression to accept.
+
+**#36's uncertainty contract, confirmed on real data.** This is the first dolphinRust run to
+emit a posterior that carries empirical scale, and the rasters say so themselves:
+
+```
+velocity_sigma.tif          UNCERTAINTY_SCALE=empirical    POSTERIOR_DOF=99
+displacement_variance_NN    UNCERTAINTY_SCALE=empirical    POSTERIOR_DOF=99
+crlb_sigma_NN.tif           UNCERTAINTY_SCALE=crlb_bound
+```
+
+`dof = 150 interferograms − 51 unknowns = 99`, against `dof = 0` on every single-reference
+run to date. Station `velocity_sigma` is **6.44 mm/yr**, scaled by the fit residuals rather
+than traced back to the CRLB bound.
+
+**Cost, measured.** 52 dates × 3.9 Mpx with 150 interferograms: **~53 min**, peak footprint
+**~18 GB**. The 9-station attempt at 10.3 Mpx reached a **~46 GB footprint** on a 32 GB
+machine before failing — memory scales with `n_ifgs`, and nearest-3 triples it against
+single-reference (150 vs 51). The over-determined network #36 wants is therefore not free:
+at production frame sizes it needs a much larger machine or the bounded/tiled path.
+
+**Two process findings.**
+
+- LOS geometry was resolved in the corrections stage, *after* unwrapping and inversion, so an
+  uncovered frame failed **~90 minutes in** having already paid for every expensive stage.
+  There is now a `geometry_precheck` before the network is built; the same fault now surfaces
+  in about two minutes.
+- Roughly 82 GB was reclaimed off this machine mid-session and `validation/real_data/*/source/`
+  was emptied — including the 13.70 GB just fetched. Not the tooling. Treat source granules
+  here as **cache**: the cropped fixtures are what runs consume and they survived.
+
+**Caveats.** `minimum_gnss_fraction` is set to 0.9 for this cohort (the scorer defaults to
+1.0, set for the 13-date window where every epoch had GNSS); the justification is epoch
+count — 0.9 of 52 is ≥47 common epochs — and the recipe records which pairs that admits and
+excludes. Atmospheric corrections are disabled. The epochs remain temporally correlated, so
+48 samples are not 48 independent ones.
+
 ### What truth set this burst can support (surveyed 2026-08-08)
 
 19 NGL stations lie inside burst `T005_008704_IW1`, but only **3** have GNSS data in the

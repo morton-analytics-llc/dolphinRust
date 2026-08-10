@@ -139,11 +139,22 @@
         "UTAC"
       ],
       "margin_pixels": 32
+    },
+    "mmx1_2018_los_common": {
+      "mode": "stations",
+      "station_ids": [
+        "MMX1",
+        "ICMX",
+        "MXMX",
+        "MXTM",
+        "UNVA"
+      ],
+      "margin_pixels": 32
     }
   },
   "comparison": {
     "id": "MMX1_minus_ICMX_2018_common_frame",
-    "fixture": "mmx1_2018_common",
+    "fixture": "mmx1_2018_los_common",
     "primary_station": "MMX1",
     "control_station": "ICMX"
   },
@@ -157,5 +168,13 @@
   "minimum_finite_fraction": 0.5,
   "max_interpolation_gap_days": 4,
   "interpolation_policy": "linear only between bracketing daily final solutions",
-  "notes": "Issue #35 option B: the 2018 window, where this burst carries its most GNSS stations. The survey in #35 listed 8; UTAC also spans all of 2018 (2013-06-27 to 2019-11-26, 969 daily solutions) and was missed, so this cohort is 9 stations and 8 independent differential series, not 7. 52 OPERA CSLC granules (S1A+S1B era) against 14 in 2023."
+  "notes": "Issue #35 option B: the 2018 window, where this burst carries its most GNSS stations. The survey in #35 listed 8; UTAC also spans all of 2018 (2013-06-27 to 2019-11-26, 969 daily solutions) and was missed, so this cohort is 9 stations and 8 independent differential series, not 7. 52 OPERA CSLC granules (S1A+S1B era) against 14 in 2023. Measured: the 9-station bounding box is NOT processable. Its western third falls outside burst T005_008704_IW1's valid LOS, and no other T005 burst covers it (only IW1 exists on this track here), so SSNX, TNGF, UJAL and UTAC cannot be carried on any frame built from this stack. The 5 stations inside the swath (MMX1, ICMX, MXMX, MXTM, UNVA) give a 936x4197 window that is 100% LOS-covered by 008703+008704 -- 4 independent differential series. minimum_gnss_fraction is set to 0.9 for this cohort (the scorer defaults to 1.0, which was set for the 13-date 2023 window where every declared epoch had GNSS). The justification is epoch count, not what passes: 0.9 of 52 is >=47 common epochs, about 4x the 2023 cohort's 12, so a coverage bin quantizes at 2.1% instead of 8.3%. It admits MMX1-ICMX (48/52), ICMX-MXMX (48/52) and MMX1-MXMX (47/52), and excludes every MXTM pair (<=44) and every UNVA pair (23) -- UNVA spans 2018 but is sparse in it.",
+  "minimum_gnss_fraction": 0.9,
+  "thresholds": {
+    "version": "provisional-1",
+    "endpoint_error_mm": 20.0,
+    "tls_slope_min": 0.85,
+    "tls_slope_max": 1.15,
+    "correlation_min": 0.9
+  }
 }

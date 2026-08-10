@@ -101,6 +101,27 @@ pub fn apply_corrections(
     })
 }
 
+/// Resolve the configured LOS geometry and discard it, purely to fail early.
+///
+/// Geometry is otherwise resolved in the corrections stage, which runs *after*
+/// unwrapping and inversion. A frame the supplied CSLC-S1-STATIC granules do not
+/// cover therefore surfaced ~90 minutes into a real 52-date run, having already
+/// paid for every expensive stage. The check costs a couple of warps.
+///
+/// # Errors
+/// Returns the same [`CorrectionError::GeometryCoverage`] /
+/// [`CorrectionError::GeometryOverlapMismatch`] the corrections stage would.
+pub fn verify_geometry_coverage(
+    opts: &CorrectionOptions,
+    epsg: u32,
+    gt: [f64; 6],
+    shape: (usize, usize),
+) -> Result<()> {
+    resolve_geometry(opts, epsg, gt, shape)
+        .context("line-of-sight geometry precheck (before unwrapping)")?;
+    Ok(())
+}
+
 /// Load + resolve per-pixel LOS geometry from the configured CSLC-S1-STATIC
 /// granules (one per burst), or `None` when none are configured.
 fn resolve_geometry(

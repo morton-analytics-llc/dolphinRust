@@ -247,6 +247,18 @@ fn finish_displacement(
         days.len(),
         pl.dim().0
     );
+    // Cheap precondition, checked before the expensive stages: LOS geometry is
+    // otherwise resolved during corrections, which runs after unwrapping and
+    // inversion, so an uncovered frame surfaced ~90 minutes into a real 52-date
+    // run having already paid for all of it.
+    timed("geometry_precheck", || {
+        crate::corrections::verify_geometry_coverage(
+            &cfg.correction_options,
+            epsg.unwrap_or(0),
+            geotransform,
+            temporal_coherence.dim(),
+        )
+    })?;
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
 
