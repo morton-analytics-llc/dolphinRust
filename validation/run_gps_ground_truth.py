@@ -164,6 +164,20 @@ def apply_network_override(base: dict[str, Any], max_bandwidth: int | None) -> N
     }
 
 
+def apply_seasonal_override(base: dict[str, Any], velocity_seasonal: bool) -> None:
+    """Add an annual sine/cosine pair to the velocity fit (issue #22).
+
+    `dolphin config` emits the pinned v0.35 schema, which has no such field, so it
+    is added here rather than toggled. A single linear rate is misspecified over a
+    window spanning a full seasonal cycle: on the 2018 Mexico City cohort the GNSS
+    rate itself changes 32 mm/yr between halves of the year, and fitting one slope
+    across that leaves a residual the network cannot explain.
+    """
+    if not velocity_seasonal:
+        return
+    base["timeseries_options"]["velocity_seasonal"] = True
+
+
 def ensure_rust_binary(build: bool) -> None:
     if build or not RUST_BIN.exists():
         subprocess.run(
@@ -321,6 +335,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     base_path = run_root / "config_base.yaml"
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
     apply_network_override(base, args.max_bandwidth)
+    apply_seasonal_override(base, args.velocity_seasonal)
     native, snaphu = build_backend_configs(
         base,
         [path.resolve() for path in static_files],
@@ -448,6 +463,15 @@ def parse_args() -> argparse.Namespace:
             "form a nearest-N interferogram network instead of the single-reference "
             "default. Required for the posterior uncertainty to carry empirical scale: "
             "single-reference leaves dof=0 (issue #36)"
+        ),
+    )
+    parser.add_argument(
+        "--velocity-seasonal",
+        action="store_true",
+        help=(
+            "fit an annual seasonal term alongside the linear rate (issue #22). "
+            "A single slope is misspecified over a window spanning a full seasonal "
+            "cycle, which is where this cohort's InSAR-GNSS velocity gap lives"
         ),
     )
     parser.add_argument(
