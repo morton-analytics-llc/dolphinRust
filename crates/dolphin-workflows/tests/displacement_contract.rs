@@ -180,10 +180,19 @@ fn l2_uncertainty_products_are_opt_in_and_unit_aligned() {
         .work_directory
         .join("displacement_variance_00.tif")
         .exists());
+    // Issue #40: the temporal motion-model fit residual and the SBAS
+    // network-inversion misclosure are distinct rasters now, not one field
+    // wearing two meanings.
     assert!(cfg
         .work_directory
         .join("timeseries_residual_rms.tif")
         .exists());
+    assert!(cfg
+        .work_directory
+        .join("network_misclosure_rms.tif")
+        .exists());
+    assert!(out.timeseries_residual_rms.is_some());
+    assert!(out.network_misclosure_rms.is_some());
     assert!(cfg.work_directory.join("velocity_sigma.tif").exists());
     assert!(cfg.work_directory.join("conncomp_00.tif").exists());
     let crlb = Dataset::open(cfg.work_directory.join("crlb_sigma_00.tif")).unwrap();

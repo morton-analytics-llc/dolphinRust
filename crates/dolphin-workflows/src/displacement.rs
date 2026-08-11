@@ -20,11 +20,11 @@ use dolphin_phaselink::{
 };
 use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_model,
-    estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
-    estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
-    invert_stack_with_uncertainty, loop_closure_qc, mask_failed_loops, network_triplets,
-    reference_to_point, select_reference_point, L1Config, LoopClosureQc, NetworkConfig,
-    VelocityModel, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
+    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
+    loop_closure_qc, mask_failed_loops, network_triplets, reference_to_point,
+    select_reference_point, L1Config, LoopClosureQc, NetworkConfig, VelocityModel,
+    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -89,7 +89,17 @@ pub struct DisplacementOutput {
     pub velocity_sigma: Option<Array2<f64>>,
     /// L2 posterior displacement variance in the same units squared as `displacement`.
     pub displacement_variance: Option<Array3<f64>>,
-    /// Weighted time-series residual RMS in the same units as `displacement`.
+    /// SBAS network-inversion misclosure RMS (residual of `A*phi = dphi` in the
+    /// same units as `displacement`) — how well the interferogram network
+    /// closed. `Some` only for `write_posterior_uncertainty` L2 runs. Distinct
+    /// from `timeseries_residual_rms` (issue #40): a network can close perfectly
+    /// while displacement still fits the temporal model badly, and vice versa.
+    pub network_misclosure_rms: Option<Array2<f64>>,
+    /// Temporal motion-model fit residual RMS in the same units as
+    /// `displacement`: the per-pixel scatter of displacement around the fitted
+    /// rate (+ seasonal/step terms, when configured). `None` only on the
+    /// unweighted-linear fast path (no `use_coherence_weights` /
+    /// `write_velocity_uncertainty` / time-function model configured).
     pub timeseries_residual_rms: Option<Array2<f64>>,
     /// Interferogram date-index pairs corresponding to unwrap output bands.
     pub interferogram_pairs: Vec<(usize, usize)>,
@@ -324,7 +334,8 @@ fn finish_displacement(
         closure_phase: stitched.closure_phase,
         corrections,
         posterior_variance_rad: inversion.posterior_variance,
-        timeseries_residual_rad: inversion.residual_rms,
+        network_misclosure_rad: inversion.network_misclosure_rms,
+        timeseries_residual_rad: fit.residual_rms,
         velocity_sigma_rad: fit.sigma,
         interferogram_pairs: pairs,
         unwrap_connected_components: unwrap.connected_components,
@@ -337,7 +348,12 @@ fn finish_displacement(
 struct InversionProducts {
     displacement: Array3<f64>,
     posterior_variance: Option<Array3<f64>>,
-    residual_rms: Option<Array2<f64>>,
+    /// L2 SBAS network-inversion misclosure RMS (residual of `A*phi = dphi`) —
+    /// how well the interferogram network closed, not how well displacement
+    /// fits a temporal motion model (issue #40; that quantity is
+    /// [`VelocityFit::residual_rms`]). `Some` only for
+    /// `write_posterior_uncertainty` L2 runs.
+    network_misclosure_rms: Option<Array2<f64>>,
 }
 
 fn invert_time_series(
@@ -371,7 +387,7 @@ fn invert_time_series(
         TimeseriesMethod::L1 => Ok(InversionProducts {
             displacement: invert_stack_l1(incidence, dphi, L1Config::default()),
             posterior_variance: None,
-            residual_rms: None,
+            network_misclosure_rms: None,
         }),
         TimeseriesMethod::L2 if cfg.timeseries_options.write_posterior_uncertainty => {
             let output = invert_stack_with_uncertainty(
@@ -394,31 +410,37 @@ fn invert_time_series(
             Ok(InversionProducts {
                 displacement: output.phase,
                 posterior_variance: Some(posterior_variance),
-                residual_rms: Some(output.residual_rms),
+                network_misclosure_rms: Some(output.residual_rms),
             })
         }
         TimeseriesMethod::L2 => Ok(InversionProducts {
             displacement: invert_stack(incidence, dphi, precision.as_ref().map(Array3::view)),
             posterior_variance: None,
-            residual_rms: None,
+            network_misclosure_rms: None,
         }),
     }
 }
 
 /// Weighted velocity and its one-sigma, applying the opt-in AR(1)
-/// temporal-correlation inflation when configured.
+/// temporal-correlation inflation when configured. The residual RMS is
+/// identical between the two branches (the correction rescales sigma, not the
+/// fit), so it is returned once alongside whichever sigma was requested.
 fn velocity_and_sigma(
     correct_temporal_correlation: bool,
     days: &[f64],
     series: ArrayView3<f64>,
     precision: ArrayView3<f64>,
-) -> (Array2<f64>, Array2<f64>) {
+) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
     if !correct_temporal_correlation {
         let output = estimate_velocity_with_uncertainty(days, series, precision);
-        return (output.velocity, output.sigma);
+        return (output.velocity, output.sigma, output.residual_rms);
     }
     let output = estimate_velocity_with_uncertainty_neff(days, series, precision);
-    (output.velocity, output.sigma_temporal_corrected)
+    (
+        output.velocity,
+        output.sigma_temporal_corrected,
+        output.residual_rms,
+    )
 }
 
 /// Optional velocity time-function terms, in the same phase units (rad) as the
@@ -436,6 +458,15 @@ struct VelocityTerms {
 struct VelocityFit {
     velocity: Array2<f64>,
     sigma: Option<Array2<f64>>,
+    /// Temporal motion-model fit residual RMS: the per-pixel scatter of
+    /// displacement around the fitted rate (+ seasonal/step terms), in the same
+    /// units as `displacement` (issue #40). Distinct from the SBAS
+    /// network-inversion misclosure (`InversionProducts::network_misclosure_rms`)
+    /// — a network can close perfectly while still carrying a phase history the
+    /// model fits badly, and vice versa. `None` on the unweighted-linear fast
+    /// path, which computes no fit statistics at all (matching `sigma`'s rule
+    /// there).
+    residual_rms: Option<Array2<f64>>,
     terms: VelocityTerms,
 }
 
@@ -481,6 +512,7 @@ struct ScaledOutputs {
     velocity: Array2<f64>,
     velocity_mm_yr: Array2<f64>,
     displacement_variance: Option<Array3<f64>>,
+    network_misclosure_rms: Option<Array2<f64>>,
     timeseries_residual_rms: Option<Array2<f64>>,
     velocity_sigma: Option<Array2<f64>>,
     seasonal_amplitude: Option<Array2<f64>>,
@@ -505,6 +537,10 @@ fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> Scale
             .posterior_variance_rad
             .as_ref()
             .map(|v| v.mapv(|value| value * phase_to_disp * phase_to_disp)),
+        network_misclosure_rms: spatial
+            .network_misclosure_rad
+            .as_ref()
+            .map(|v| v.mapv(|value| value * phase_to_disp.abs())),
         timeseries_residual_rms: spatial
             .timeseries_residual_rad
             .as_ref()
@@ -614,9 +650,14 @@ fn fit_velocity(
     let weighted = cfg.timeseries_options.use_coherence_weights
         || cfg.timeseries_options.write_velocity_uncertainty;
     if !weighted && model.is_linear() {
+        // The cheapest path: no precision, no fit statistics at all. Computing a
+        // residual here would mean fitting a second, otherwise-unneeded model per
+        // pixel just to report it, so this path stays a rate-only estimate,
+        // matching `sigma`'s existing `None` rule.
         return Ok(VelocityFit {
             velocity: velocity_of(displacement, days),
             sigma: None,
+            residual_rms: None,
             terms: VelocityTerms::default(),
         });
     }
@@ -644,13 +685,18 @@ fn fit_velocity(
         return Ok(fit);
     }
     if !cfg.timeseries_options.write_velocity_uncertainty {
+        // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
+        // (velocity is bit-identical); the uncertainty variant is used instead so
+        // the residual it already computes is not thrown away.
+        let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
         return Ok(VelocityFit {
-            velocity: estimate_velocity_with_precisions(days, series.view(), precision.view()),
+            velocity: output.velocity,
             sigma: None,
+            residual_rms: Some(output.residual_rms),
             terms: VelocityTerms::default(),
         });
     }
-    let (velocity, mut sigma) = velocity_and_sigma(
+    let (velocity, mut sigma, residual_rms) = velocity_and_sigma(
         cfg.timeseries_options.correct_velocity_temporal_correlation,
         days,
         series.view(),
@@ -660,6 +706,7 @@ fn fit_velocity(
     Ok(VelocityFit {
         velocity,
         sigma: Some(sigma),
+        residual_rms: Some(residual_rms),
         terms: VelocityTerms::default(),
     })
 }
@@ -684,6 +731,10 @@ fn fit_velocity_with_model(
     VelocityFit {
         velocity: output.velocity,
         sigma,
+        // Unlike sigma, the residual is not gated by write_velocity_uncertainty:
+        // estimate_velocity_with_model always computes it as part of the fit, so
+        // reporting it here costs nothing extra.
+        residual_rms: Some(output.residual_rms),
         terms: VelocityTerms {
             seasonal_amplitude_rad: output.seasonal_amplitude,
             seasonal_phase_days: output.seasonal_phase_days,
@@ -708,6 +759,13 @@ struct SpatialProducts {
     geotransform: [f64; 6],
     reference_point: Option<(usize, usize)>,
     posterior_variance_rad: Option<Array3<f64>>,
+    /// SBAS network-inversion misclosure RMS (see
+    /// `InversionProducts::network_misclosure_rms`) — how well the
+    /// interferogram network closed.
+    network_misclosure_rad: Option<Array2<f64>>,
+    /// Temporal motion-model fit residual RMS (see `VelocityFit::residual_rms`)
+    /// — how well displacement fits the configured velocity model. Distinct from
+    /// `network_misclosure_rad` (issue #40).
     timeseries_residual_rad: Option<Array2<f64>>,
     velocity_sigma_rad: Option<Array2<f64>>,
     interferogram_pairs: Vec<(usize, usize)>,
@@ -745,6 +803,7 @@ fn emit_displacement(
             .flatten(),
         closure_phase: spatial.closure_phase.as_ref(),
         displacement_variance: scaled.displacement_variance.as_ref(),
+        network_misclosure_rms: scaled.network_misclosure_rms.as_ref(),
         timeseries_residual_rms: scaled.timeseries_residual_rms.as_ref(),
         velocity_sigma: scaled.velocity_sigma.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
@@ -781,6 +840,7 @@ fn emit_displacement(
         velocity_mm_yr: scaled.velocity_mm_yr,
         velocity_sigma: scaled.velocity_sigma,
         displacement_variance: scaled.displacement_variance,
+        network_misclosure_rms: scaled.network_misclosure_rms,
         timeseries_residual_rms: scaled.timeseries_residual_rms,
         interferogram_pairs: spatial.interferogram_pairs,
         unwrap_connected_components: spatial.unwrap_connected_components,
@@ -862,6 +922,9 @@ impl SpatialProducts {
         if let Some(layer) = self.posterior_variance_rad.as_mut() {
             mask3_f64(layer, mask);
         }
+        if let Some(layer) = self.network_misclosure_rad.as_mut() {
+            mask2_f64(layer, mask);
+        }
         if let Some(layer) = self.timeseries_residual_rad.as_mut() {
             mask2_f64(layer, mask);
         }
@@ -935,6 +998,10 @@ impl SpatialProducts {
             .context("bounded velocity re-fit after re-referencing")?;
             self.vel_rad = fit.velocity;
             self.velocity_sigma_rad = fit.sigma;
+            // Re-referencing shifts every date's displacement, which shifts the
+            // temporal-fit residual too; the network misclosure is unaffected (it
+            // is computed upstream, from the inversion, before re-referencing).
+            self.timeseries_residual_rad = fit.residual_rms;
             self.velocity_terms = fit.terms;
             self.reference_point = Some(global);
         }
@@ -967,6 +1034,10 @@ impl SpatialProducts {
             .posterior_variance_rad
             .take()
             .map(|layer| trim3(&layer, target));
+        self.network_misclosure_rad = self
+            .network_misclosure_rad
+            .take()
+            .map(|layer| trim2(&layer, target));
         self.timeseries_residual_rad = self
             .timeseries_residual_rad
             .take()
@@ -2437,6 +2508,9 @@ fn write_outputs(
     if let Some(residual) = quality.timeseries_residual_rms {
         write_f32("timeseries_residual_rms.tif", residual.view())?;
     }
+    if let Some(misclosure) = quality.network_misclosure_rms {
+        write_f32("network_misclosure_rms.tif", misclosure.view())?;
+    }
     write_f32("temporal_coherence.tif", temporal_coherence)?;
     if let Some(coherence) = quality.phase_linking_coherence {
         write_f32("phase_linking_coherence.tif", coherence.view())?;
@@ -2589,6 +2663,7 @@ struct QualityLayers<'a> {
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
     displacement_variance: Option<&'a Array3<f64>>,
+    network_misclosure_rms: Option<&'a Array2<f64>>,
     timeseries_residual_rms: Option<&'a Array2<f64>>,
     velocity_sigma: Option<&'a Array2<f64>>,
     connected_components: &'a Array3<u32>,
@@ -2791,6 +2866,7 @@ mod tests {
             geotransform: [0.0; 6],
             reference_point: None,
             posterior_variance_rad: Some(Array3::from_elem((2, 2, 2), 1.0)),
+            network_misclosure_rad: Some(Array2::from_elem((2, 2), 1.0)),
             timeseries_residual_rad: Some(Array2::from_elem((2, 2), 1.0)),
             velocity_sigma_rad: Some(Array2::from_elem((2, 2), 1.0)),
             interferogram_pairs: Vec::new(),
@@ -2804,6 +2880,7 @@ mod tests {
             assert!(products.vel_rad[(row, col)].is_nan());
             assert!(products.temporal_coherence[(row, col)].is_nan());
             assert!(products.phase_linking_coherence.as_ref().unwrap()[(row, col)].is_nan());
+            assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.velocity_sigma_rad.as_ref().unwrap()[(row, col)].is_nan());
             for band in 0..2 {
@@ -2855,6 +2932,7 @@ mod tests {
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
             posterior_variance_rad: None,
+            network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
             interferogram_pairs: Vec::new(),
@@ -2901,6 +2979,7 @@ mod tests {
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
             posterior_variance_rad: None,
+            network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
             interferogram_pairs: Vec::new(),
@@ -3030,6 +3109,60 @@ mod tests {
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
+    }
+
+    /// Issue #40: the SBAS network-inversion misclosure and the temporal
+    /// motion-model fit residual are different physical quantities and must not
+    /// share one field. A redundant network whose interferograms are perfectly
+    /// consistent (zero misclosure) can still carry a phase history a linear
+    /// velocity model fits badly — proving the two residuals move independently.
+    #[test]
+    fn network_misclosure_and_temporal_fit_residual_are_decoupled() {
+        // True per-date phase, referenced to date 0: a sharp late jump breaks the
+        // linear velocity model even though every interferogram in this
+        // over-determined network is exactly consistent with it.
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let true_phi = [0.0_f64, 1.0, 1.2, 5.0];
+        let pairs = [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (0, 3)];
+        let incidence = get_incidence_matrix(&pairs);
+        let dphi = Array3::from_shape_fn((pairs.len(), 1, 1), |(k, _, _)| {
+            let (a, b) = pairs[k];
+            true_phi[b] - true_phi[a]
+        });
+
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.write_posterior_uncertainty = true;
+        let inversion = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &pairs)
+            .expect("redundant, well-conditioned network");
+        let misclosure = inversion
+            .network_misclosure_rms
+            .as_ref()
+            .expect("posterior uncertainty computes the network misclosure")[(0, 0)];
+        assert!(
+            misclosure < 1e-9,
+            "a perfectly consistent network must show ~0 misclosure, got {misclosure}"
+        );
+
+        // The same true phase history as a velocity-fit input: date 0 is the
+        // dropped reference (implicit zero), dates 1..3 are the fitted bands.
+        let series = Array3::from_shape_fn((3, 1, 1), |(d, _, _)| true_phi[d + 1]);
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let crlb = Array3::from_elem((4, 1, 1), 1.0);
+        let fit = fit_velocity(
+            &cfg,
+            series.view(),
+            &days,
+            Some(&crlb),
+            &VelocityModel::default(),
+        )
+        .unwrap();
+        let temporal_residual = fit.residual_rms.expect("weighted fit reports a residual")[(0, 0)];
+        assert!(
+            temporal_residual > 0.5,
+            "a late jump must leave the linear model a large residual, got {temporal_residual}"
+        );
     }
 
     /// The correction changes only the emitted uncertainty product, so enabling
@@ -3519,6 +3652,7 @@ mod tests {
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
                     displacement_variance: Some(&variance),
+                    network_misclosure_rms: None,
                     timeseries_residual_rms: None,
                     velocity_sigma: Some(&sigma),
                     connected_components: &conncomp,
@@ -3786,6 +3920,7 @@ mod tests {
             // In the halo, so trim re-selects a reference and re-fits.
             reference_point: Some((0, 0)),
             posterior_variance_rad: None,
+            network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
             interferogram_pairs: Vec::new(),
