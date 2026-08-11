@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import gps_ground_truth as gps  # noqa: E402
+import run_gps_ground_truth as runner  # noqa: E402
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -50,21 +51,25 @@ def pair_recipe(recipe: dict[str, Any], primary: str, control: str) -> dict[str,
     return variant
 
 
-def summarize(entry: dict[str, Any]) -> dict[str, Any]:
-    """Pull the comparable numbers out of one pair's payload, tolerating shape drift."""
-    metrics = entry.get("metrics", entry)
-    picked = {}
-    for key in (
-        "rmse_mm",
-        "correlation",
-        "tls_slope",
-        "insar_velocity_mm_yr",
-        "gnss_velocity_mm_yr",
-        "velocity_difference_mm_yr",
-        "evaluated_epochs",
-    ):
-        if isinstance(metrics, dict) and key in metrics:
-            picked[key] = metrics[key]
+def summarize(payload: dict[str, Any], engine: str) -> dict[str, Any]:
+    """Pull the comparable numbers out of one pair's payload.
+
+    `score_common_frame` nests its scores under `engines[engine]`, splitting the
+    time-series fit (`metrics`) from the rate comparison (`velocity_comparison`);
+    coverage is the one number that stays at the top level.
+    """
+    scores = payload.get("engines", {}).get(engine, {})
+    metrics = scores.get("metrics", {})
+    velocity = scores.get("velocity_comparison", {})
+    picked = {key: metrics[key] for key in ("rmse_mm", "correlation", "tls_slope") if key in metrics}
+    picked.update(
+        {
+            key: velocity[key]
+            for key in ("insar_velocity_mm_yr", "gnss_velocity_mm_yr", "difference_mm_yr")
+            if key in velocity
+        }
+    )
+    picked["common_gnss_fraction"] = payload.get("common_gnss_fraction")
     return picked
 
 
@@ -82,11 +87,7 @@ def main() -> None:
     run_root = args.run_root or ROOT / "runs" / cohort / args.fixture
     fixture_root = ROOT / "real_data" / cohort / "cropped" / args.fixture
     fixture_manifest = load_json(fixture_root / "fixture_manifest.json")
-    config = gps.load_yaml(run_root / f"config_{args.engine}.yaml") if hasattr(gps, "load_yaml") else None
-    if config is None:
-        import yaml
-
-        config = yaml.safe_load((run_root / f"config_{args.engine}.yaml").read_text())
+    config = runner.load_yaml(run_root / f"config_{args.engine}.yaml")
     work = {args.engine: Path(config["work_directory"])}
     static_files = sorted((fixture_root / "static").glob("OPERA_L2_CSLC-S1-STATIC_*.h5"))
     primary_static = next(
@@ -96,7 +97,11 @@ def main() -> None:
     cache = ROOT / "real_data" / cohort / "gnss"
     cache.mkdir(parents=True, exist_ok=True)
 
-    stations = sorted(recipe["stations"])
+    # Only the stations this fixture was cropped around have pipeline output; the
+    # rest of the recipe's cohort falls outside the burst's valid LOS, so counting
+    # them would inflate `independent_differential_series` — the one number this
+    # survey exists to state honestly.
+    stations = sorted(recipe["fixtures"][args.fixture]["station_ids"])
     results: dict[str, Any] = {}
     for primary, control in itertools.combinations(stations, 2):
         label = f"{primary}-{control}"
@@ -112,7 +117,7 @@ def main() -> None:
                 out,
                 wavelength,
             )
-            results[label] = {"status": "scored", **summarize(payload)}
+            results[label] = {"status": "scored", **summarize(payload, args.engine)}
         except gps.NotEvaluable as error:
             results[label] = {"status": "not_evaluable", "reason": str(error)}
         except Exception as error:  # noqa: BLE001 - one bad pair must not sink the survey
