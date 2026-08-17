@@ -203,6 +203,29 @@ fn timed<T>(stage: &str, f: impl FnOnce() -> T) -> T {
 /// # Errors
 /// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
 pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput> {
+    run_displacement_with_output_policy(cfg, DisplacementOutputPolicy::Full)
+}
+
+/// Runtime-only serialization policy for a displacement run.
+///
+/// This is deliberately separate from scientific configuration: it changes only
+/// which already-computed arrays are serialized into the work directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplacementOutputPolicy {
+    /// Emit every compatibility, diagnostic, correction, and provenance file.
+    Full,
+    /// Emit only the phase-linking-coherence raster consumed by GroundPulse.
+    GroundPulse,
+}
+
+/// Run the displacement workflow with an explicit runtime-only serialization policy.
+///
+/// # Errors
+/// Returns `Err` on I/O, phase-linking, unwrapping, date-parsing, or config problems.
+pub fn run_displacement_with_output_policy(
+    cfg: &DisplacementWorkflow,
+    output_policy: DisplacementOutputPolicy,
+) -> Result<DisplacementOutput> {
     validate_uncertainty_options(cfg)?;
     let groups = group_by_burst(&cfg.cslc_file_list);
     let layouts = source_layouts(cfg, &groups)?;
@@ -223,7 +246,7 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    finish_displacement(cfg, bursts, crop.as_ref())
+    finish_displacement(cfg, bursts, crop.as_ref(), output_policy)
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
@@ -234,6 +257,7 @@ fn finish_displacement(
     cfg: &DisplacementWorkflow,
     bursts: Vec<BurstLink>,
     crop: Option<&BoundedPlan>,
+    output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
     let days = bursts
@@ -342,7 +366,7 @@ fn finish_displacement(
         geotransform,
         reference_point: analysis_reference_point,
     };
-    emit_displacement(cfg, days, epsg, crop, spatial)
+    emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
 }
 
 struct InversionProducts {
@@ -772,12 +796,14 @@ struct SpatialProducts {
     unwrap_connected_components: Array3<u32>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_displacement(
     cfg: &DisplacementWorkflow,
     days: Vec<f64>,
     epsg: Option<u32>,
     crop: Option<&BoundedPlan>,
     mut spatial: SpatialProducts,
+    output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
@@ -822,17 +848,37 @@ fn emit_displacement(
         Some(input_coverage),
     );
     timed("write", || -> Result<()> {
-        write_outputs(
-            cfg,
-            scaled.displacement.view(),
-            scaled.velocity.view(),
-            spatial.temporal_coherence.view(),
-            quality,
-            epsg,
-            spatial.geotransform,
-        )?;
-        write_correction_outputs(cfg, &spatial.corrections, epsg, spatial.geotransform)?;
-        crate::provenance::write_geometry_provenance(&cfg.work_directory, &geometry_provenance)
+        match output_policy {
+            DisplacementOutputPolicy::Full => {
+                write_outputs(
+                    cfg,
+                    scaled.displacement.view(),
+                    scaled.velocity.view(),
+                    spatial.temporal_coherence.view(),
+                    quality,
+                    epsg,
+                    spatial.geotransform,
+                )?;
+                write_correction_outputs(cfg, &spatial.corrections, epsg, spatial.geotransform)?;
+                crate::provenance::write_geometry_provenance(
+                    &cfg.work_directory,
+                    &geometry_provenance,
+                )
+            }
+            DisplacementOutputPolicy::GroundPulse => {
+                std::fs::create_dir_all(&cfg.work_directory)?;
+                if let Some(coherence) = quality.phase_linking_coherence {
+                    write_raster(
+                        &cfg.work_directory.join("phase_linking_coherence.tif"),
+                        coherence.mapv(|value| value as f32).view(),
+                        spatial.geotransform,
+                        epsg,
+                        None,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     })?;
     Ok(DisplacementOutput {
         displacement: scaled.displacement,
@@ -1719,7 +1765,7 @@ pub fn run_displacement_resumable(
         });
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref())?;
+    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
     Ok((output, DisplacementState { bursts: states }))
 }
 
@@ -1774,7 +1820,7 @@ pub fn update_displacement(
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref())?;
+    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
     Ok((output, DisplacementState { bursts: states }))
 }
 
