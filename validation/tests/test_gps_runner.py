@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,49 @@ class RunnerContract(unittest.TestCase):
             ),
             "error",
         )
+
+    def test_scored_pass_overwrites_stale_failure_receipt(self) -> None:
+        # issue #43: a scored run that passes must leave a receipt describing
+        # that pass, not a failure receipt an earlier attempt left behind.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            runner.write_run_receipt(
+                run_root,
+                "not_evaluable",
+                "common GNSS availability 0.923 is below 1.000",
+                {"commit": "aaaaaaa"},
+                {"native": {"status": "not_evaluable"}},
+            )
+            score_payload = {
+                "status": "pass",
+                "comparison": "MMX1_minus_ICMX_common_frame",
+            }
+            result = runner.finalize_score_run(
+                run_root,
+                {"commit": "bbbbbbb"},
+                {"native": {"status": "complete"}},
+                score_payload,
+            )
+            receipt = json.loads((run_root / "run_receipt.json").read_text())
+            scores = json.loads((run_root / "gps_ground_truth.json").read_text())
+            self.assertEqual(receipt["status"], "pass")
+            self.assertEqual(receipt["context"]["commit"], "bbbbbbb")
+            self.assertEqual(scores["context"]["commit"], "bbbbbbb")
+            self.assertEqual(receipt["status"], scores["status"])
+            self.assertEqual(result, scores)
+
+    def test_score_run_without_prior_receipt_still_writes_one(self) -> None:
+        # issue #43: a fresh run root with no prior failure must still gain a
+        # receipt on a scored pass, not be left with none at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            self.assertFalse((run_root / "run_receipt.json").exists())
+            runner.finalize_score_run(
+                run_root, {"commit": "ccccccc"}, {}, {"status": "pass"}
+            )
+            self.assertTrue((run_root / "run_receipt.json").exists())
+            receipt = json.loads((run_root / "run_receipt.json").read_text())
+            self.assertEqual(receipt["status"], "pass")
 
     def test_scientific_failure_has_nonzero_exit(self) -> None:
         self.assertEqual(runner.exit_code_for_status("pass"), 0)

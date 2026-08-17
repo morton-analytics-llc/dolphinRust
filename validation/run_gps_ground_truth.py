@@ -92,6 +92,44 @@ def result_payload(
     return payload
 
 
+def write_run_receipt(
+    run_root: Path,
+    status: str,
+    reason: str | None,
+    context: dict[str, Any],
+    engine_receipts: dict[str, Any],
+) -> dict[str, Any]:
+    """Write `run_receipt.json` describing the run that just happened.
+
+    Every terminal path in `execute()` calls this, so a run root never keeps a
+    receipt from an earlier, different attempt (issue #43).
+    """
+    payload = result_payload(status, reason, context, engine_receipts)
+    (run_root / "run_receipt.json").write_text(json.dumps(payload, indent=2) + "\n")
+    return payload
+
+
+def finalize_score_run(
+    run_root: Path,
+    context: dict[str, Any],
+    engine_receipts: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist a scored run's result and receipt so both describe the same run.
+
+    `payload["status"]` (`"pass"` / `"fail"` from `gps.score_common_frame`) becomes
+    the receipt's status, replacing whatever an earlier attempt in this run root
+    left behind (issue #43).
+    """
+    payload["context"] = context
+    payload["run_receipts"] = engine_receipts
+    (run_root / "gps_ground_truth.json").write_text(
+        json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    )
+    write_run_receipt(run_root, payload["status"], None, context, engine_receipts)
+    return payload
+
+
 def matrix_status(engine_receipts: dict[str, dict[str, Any]]) -> str:
     statuses = {receipt.get("status") for receipt in engine_receipts.values()}
     if "error" in statuses:
@@ -408,11 +446,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             for backend, receipt in engine_receipts.items()
             if receipt["status"] in {"not_evaluable", "error"}
         ]
-        payload = result_payload(
-            status, "; ".join(reasons), context, engine_receipts
-        )
-        (run_root / "run_receipt.json").write_text(
-            json.dumps(payload, indent=2) + "\n"
+        payload = write_run_receipt(
+            run_root, status, "; ".join(reasons), context, engine_receipts
         )
         return payload
     if args.score:
@@ -430,15 +465,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             run_root,
             float(native["input_options"]["wavelength"]),
         )
-        payload["context"] = context
-        payload["run_receipts"] = engine_receipts
-        (run_root / "gps_ground_truth.json").write_text(
-            json.dumps(payload, indent=2, allow_nan=False) + "\n"
-        )
-        return payload
-    payload = result_payload("complete", None, context, engine_receipts)
-    (run_root / "run_receipt.json").write_text(json.dumps(payload, indent=2) + "\n")
-    return payload
+        return finalize_score_run(run_root, context, engine_receipts, payload)
+    return write_run_receipt(run_root, "complete", None, context, engine_receipts)
 
 
 def parse_args() -> argparse.Namespace:
