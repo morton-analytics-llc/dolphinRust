@@ -19,8 +19,8 @@ pub mod unwrap_backend;
 
 pub use crop::{BoundsError, ProcessingBoundsProvenance};
 pub use displacement::{
-    run_displacement, run_displacement_resumable, update_displacement, DisplacementOutput,
-    DisplacementState,
+    run_displacement, run_displacement_resumable, run_displacement_with_output_policy,
+    update_displacement, DisplacementOutput, DisplacementOutputPolicy, DisplacementState,
 };
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,

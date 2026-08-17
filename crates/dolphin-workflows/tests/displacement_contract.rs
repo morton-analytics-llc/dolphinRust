@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use dolphin_core::config::DisplacementWorkflow;
 use dolphin_core::Strides;
 use dolphin_io::write_raster;
-use dolphin_workflows::run_displacement;
+use dolphin_workflows::{
+    run_displacement, run_displacement_with_output_policy, DisplacementOutputPolicy,
+};
 use gdal::{Dataset, Metadata};
 use ndarray::{Array2, Array3};
 
@@ -157,6 +159,141 @@ fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
         coherence, out.temporal_coherence,
         "metrics must be distinct"
     );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+fn groundpulse_output_policy_preserves_arrays_and_emits_only_coherence() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping GroundPulse output-policy contract: no fixtures / snaphu");
+        return;
+    }
+
+    let output_root = std::env::temp_dir().join(format!(
+        "dolphinrust_output_policy_contract_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&output_root).unwrap();
+    let mut full = georeferenced_config("output_policy");
+    full.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
+    full.phase_linking.calc_average_coh = true;
+    full.work_directory = output_root.join("full");
+    let mut groundpulse = full.clone();
+    groundpulse.work_directory = output_root.join("groundpulse");
+
+    let full_output = run_displacement(&full).unwrap();
+    let groundpulse_output =
+        run_displacement_with_output_policy(&groundpulse, DisplacementOutputPolicy::GroundPulse)
+            .unwrap();
+
+    assert_eq!(full_output.displacement, groundpulse_output.displacement);
+    assert_eq!(full_output.velocity, groundpulse_output.velocity);
+    assert_eq!(
+        full_output.velocity_mm_yr,
+        groundpulse_output.velocity_mm_yr
+    );
+    assert_eq!(
+        full_output.velocity_sigma,
+        groundpulse_output.velocity_sigma
+    );
+    assert_eq!(
+        full_output.displacement_variance,
+        groundpulse_output.displacement_variance
+    );
+    assert_eq!(
+        full_output.network_misclosure_rms,
+        groundpulse_output.network_misclosure_rms
+    );
+    assert_eq!(
+        full_output.timeseries_residual_rms,
+        groundpulse_output.timeseries_residual_rms
+    );
+    assert_eq!(
+        full_output.interferogram_pairs,
+        groundpulse_output.interferogram_pairs
+    );
+    assert_eq!(
+        full_output.unwrap_connected_components,
+        groundpulse_output.unwrap_connected_components
+    );
+    assert_eq!(
+        full_output.temporal_coherence,
+        groundpulse_output.temporal_coherence
+    );
+    assert_eq!(
+        full_output.phase_linking_coherence,
+        groundpulse_output.phase_linking_coherence
+    );
+    assert_eq!(full_output.validity_mask, groundpulse_output.validity_mask);
+    assert_eq!(full_output.crlb_sigma, groundpulse_output.crlb_sigma);
+    assert_eq!(full_output.closure_phase, groundpulse_output.closure_phase);
+    assert_eq!(
+        full_output.acquisition_days,
+        groundpulse_output.acquisition_days
+    );
+    assert_eq!(full_output.epsg, groundpulse_output.epsg);
+    assert_eq!(full_output.geotransform, groundpulse_output.geotransform);
+    assert_eq!(
+        full_output.reference_point,
+        groundpulse_output.reference_point
+    );
+    assert_eq!(
+        full_output.ionosphere_delay,
+        groundpulse_output.ionosphere_delay
+    );
+    assert_eq!(
+        full_output.troposphere_delay,
+        groundpulse_output.troposphere_delay
+    );
+    assert_eq!(
+        full_output.solid_earth_tide_delay,
+        groundpulse_output.solid_earth_tide_delay
+    );
+    match (&full_output.los_geometry, &groundpulse_output.los_geometry) {
+        (None, None) => {}
+        (Some(full), Some(groundpulse)) => {
+            assert_eq!(full.east, groundpulse.east);
+            assert_eq!(full.north, groundpulse.north);
+            assert_eq!(full.up, groundpulse.up);
+        }
+        _ => panic!("LOS geometry presence changed with output policy"),
+    }
+    assert_eq!(
+        serde_json::to_value(&full_output.geometry_provenance).unwrap(),
+        serde_json::to_value(&groundpulse_output.geometry_provenance).unwrap()
+    );
+
+    let full_coherence = full.work_directory.join("phase_linking_coherence.tif");
+    let groundpulse_coherence = groundpulse
+        .work_directory
+        .join("phase_linking_coherence.tif");
+    assert_eq!(
+        std::fs::read(full_coherence).unwrap(),
+        std::fs::read(groundpulse_coherence).unwrap()
+    );
+    assert!(full.work_directory.join("velocity.tif").exists());
+    assert!(!groundpulse.work_directory.join("velocity.tif").exists());
+    assert!(full
+        .work_directory
+        .join("geometry_provenance.json")
+        .exists());
+    assert!(!groundpulse
+        .work_directory
+        .join("geometry_provenance.json")
+        .exists());
+    let groundpulse_artifacts = std::fs::read_dir(&groundpulse.work_directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            matches!(
+                entry.path().extension().and_then(|value| value.to_str()),
+                Some("tif" | "json")
+            )
+        })
+        .count();
+    assert_eq!(groundpulse_artifacts, 1);
 }
 
 #[test]
