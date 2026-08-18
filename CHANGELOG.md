@@ -180,6 +180,21 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **A scored GNSS validation run now always leaves a receipt describing itself** (issue #43).
+  `validation/run_gps_ground_truth.py`'s `--score` branch wrote `gps_ground_truth.json` and
+  returned without ever writing `run_receipt.json` — the only path in `execute()` that skipped
+  it. A run root that previously failed (e.g. on a coverage gate) and was then re-scored to a
+  pass kept the earlier failure's receipt (`status: "not_evaluable"`) sitting next to a passing
+  `gps_ground_truth.json`; a fresh run root that passed on the first try got no receipt at all.
+  The receipt is the only artifact carrying `commit`/`recipe_sha256`/`fixture_manifest_sha256`
+  provenance, so either way a reader of `run_receipt.json` saw the wrong run or none. The three
+  terminal paths in `execute()` now share `write_run_receipt`/`finalize_score_run`, so every
+  path writes exactly one receipt matching the outcome that just happened; the scored path's
+  receipt status is `gps.score_common_frame`'s own `"pass"`/`"fail"`, not the unrelated
+  `"complete"`/`"not_evaluable"`/`"error"` vocabulary of the non-scored paths. Contract:
+  `test_scored_pass_overwrites_stale_failure_receipt` (a stale failure receipt is replaced by a
+  pass) and `test_score_run_without_prior_receipt_still_writes_one` (a fresh run root gains a
+  receipt) in `validation/tests/test_gps_runner.py`.
 - **`timeseries_residual_rms.tif` now carries the temporal motion-model fit residual it was
   always named for, and the SBAS network-inversion misclosure it actually served has its own
   raster** (issue #40, cross-repo signal from `../eo`#316). `SpatialProducts::timeseries_residual_rad`
