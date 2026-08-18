@@ -76,10 +76,19 @@ class AcquisitionContract(unittest.TestCase):
 
     def test_token_required_without_leaking_value(self) -> None:
         secret = "do-not-print-me"
-        self.assertEqual(fetch_real.require_token({"GP_EARTHDATA_TOKEN": secret}), secret)
-        with self.assertRaisesRegex(RuntimeError, "GP_EARTHDATA_TOKEN") as ctx:
-            fetch_real.require_token({})
-        self.assertNotIn(secret, str(ctx.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("GP_EARTHDATA_TOKEN=file-token\n")
+            self.assertEqual(
+                fetch_real.require_token(
+                    {"GP_EARTHDATA_TOKEN": secret}, env_file=env_file
+                ),
+                secret,
+            )
+            self.assertEqual(fetch_real.require_token({}, env_file=env_file), "file-token")
+            with self.assertRaisesRegex(RuntimeError, "GP_EARTHDATA_TOKEN") as ctx:
+                fetch_real.require_token({}, env_file=Path(tmp) / "missing")
+            self.assertNotIn(secret, str(ctx.exception))
 
     def test_downloaded_hdf_identities_must_match_burst_and_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -38,7 +38,11 @@ DATE_RE = re.compile(r"_(20\d{6})T")
 TOKEN_KEYS = ("GP_EARTHDATA_TOKEN", "EARTHDATA_TOKEN")
 
 
-def resolve_token(environment: Mapping[str, str] = os.environ) -> str:
+def resolve_token(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    env_file: Path = ROOT.parent / ".env",
+) -> str:
     """Return the Earthdata bearer token, without ever logging its value.
 
     Reads the process environment first, then the repo `.env` — the same file the
@@ -50,7 +54,6 @@ def resolve_token(environment: Mapping[str, str] = os.environ) -> str:
         token = environment.get(key, "").strip()
         if token:
             return token
-    env_file = ROOT.parent / ".env"
     if not env_file.is_file():
         return ""
     for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -62,9 +65,13 @@ def resolve_token(environment: Mapping[str, str] = os.environ) -> str:
     return ""
 
 
-def require_token(environment: Mapping[str, str] = os.environ) -> str:
+def require_token(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    env_file: Path = ROOT.parent / ".env",
+) -> str:
     """Return the Earthdata bearer token or fail without exposing its value."""
-    token = resolve_token(environment)
+    token = resolve_token(environment, env_file=env_file)
     if not token:
         raise RuntimeError(
             "No Earthdata bearer token: set GP_EARTHDATA_TOKEN or put it in .env"
@@ -74,6 +81,8 @@ def require_token(environment: Mapping[str, str] = os.environ) -> str:
 
 def authenticated_session(
     environment: Mapping[str, str] = os.environ,
+    *,
+    env_file: Path = ROOT.parent / ".env",
 ) -> asf.ASFSession:
     """Authenticate by bearer token, falling back to the Earthdata netrc entry.
 
@@ -81,7 +90,7 @@ def authenticated_session(
     reported separately from the token's so an expired token cannot hide behind a
     stale netrc entry (or the reverse).
     """
-    token = resolve_token(environment)
+    token = resolve_token(environment, env_file=env_file)
     token_error: Exception | None = None
     if token:
         try:
