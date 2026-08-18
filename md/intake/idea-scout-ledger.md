@@ -60,20 +60,6 @@ Entry format:
   extending the existing Phase 0 block-manager property tests.
 - **Added**: 2026-08-03 by scheduled scout run
 
-### D5 — ERA5-based tropospheric delay as a dolphinRust correction source
-- **Source**: inbound (cross-repo signal, `../eo`#238, itself sourced from an ecosystem scan)
-- **Issue**: #41 (enhancement-labeled, NOT yet backlog-ready)
-- **Re-entry gate**: (1) both source papers (PMC11819746 and the paywalled ScienceDirect
-  S0273117726001419) are read in full to confirm the power-law+ERA5 delay estimate is
-  reproducible from ERA5 alone, without the proprietary Beijing GNSS-ZTD-gradient enhancement;
-  (2) `../eo`#238's own open architecture question is resolved — whether the correction must
-  stay a per-pair scalar in eo's pipeline (out of scope here) or can be a per-pixel raster layer
-  like the existing iono/tropo/solid-earth-tide corrections (in scope here).
-- **Design sketch**: if gated in, a new opt-in `dolphin-corrections` module (Saastamoinen zenith
-  delay, LOS-mapped via the existing shared `resolve_los_geometry`/`1/up` path), analogous to
-  the existing troposphere/ionosphere layers; closed-form analytic fixture for the contract.
-- **Added**: 2026-08-10 by scheduled scout run
-
 ## SHIPPED
 
 ### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0
@@ -89,3 +75,20 @@ Entry format:
   before covariance estimation while preserving partially valid masking.
 - **Added**: 2026-07-20 by scheduled scout run
 - **Shipped**: 2026-07-21 by manual contract-first implementation
+
+## OUT OF SCOPE
+
+### D5 — ERA5-based tropospheric delay as a dolphinRust correction source
+- **Source**: inbound (cross-repo signal, `../eo`#238, itself sourced from an ecosystem scan)
+- **Issue**: #41 (close as out of scope in this repository)
+- **Intake IDs**: EO-238-ARCH, DR-041
+- **Disposition**: `../eo`#238 was closed by `../eo`#379 as superseded by open
+  `../eo`#188. The successor constrains any future correction to eo's wrapper chain or an
+  upstream pointer bump, never a local dolphinRust implementation. Do not scope an
+  `era5_troposphere` module here.
+- **Re-entry gate**: eo explicitly reverses that boundary and selects a per-pixel dolphinRust
+  layer, and both source papers (PMC11819746 and ScienceDirect S0273117726001419) are read in
+  full and show that the power-law+ERA5 estimate is reproducible from ERA5 alone without the
+  proprietary Beijing GNSS-ZTD-gradient enhancement.
+- **Added**: 2026-08-10 by scheduled scout run
+- **Closed locally**: 2026-08-17 after eo ownership resolution
