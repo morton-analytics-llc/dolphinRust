@@ -25,14 +25,18 @@ yet. The fix is to publish in dependency order; each crate becomes available for
 
 ## How eo consumes dolphinRust
 
-GroundPulse (`../eo`) depends on dolphinRust as a **git (or path) workspace dependency**, not
-from crates.io, e.g.:
+GroundPulse (`../eo`) vendors dolphinRust as the `vendor/dolphinRust` git submodule. The
+superproject records the release tag's target commit as a gitlink; git does not store the tag
+name itself. Verify the pin resolves to the intended tag before committing it:
 
-```toml
-dolphin-workflows = { git = "https://github.com/morton-analytics-llc/dolphinRust", tag = "v1.0.0" }
+```sh
+git -C ../eo/vendor/dolphinRust fetch --tags origin
+git -C ../eo/vendor/dolphinRust checkout v1.5.0
+git -C ../eo/vendor/dolphinRust describe --exact-match --tags HEAD
+git -C ../eo add vendor/dolphinRust
 ```
 
-So crates.io publication is **optional** for the eo integration. If/when publishing to
+Crates.io publication is therefore **optional** for the eo integration. If/when publishing to
 crates.io is desired, publish in this topological order (each waits for the previous to
 appear on the index):
 
@@ -45,10 +49,35 @@ appear on the index):
 
 ## Cutting a release
 
+1. Move the accumulated changelog entries from Unreleased to the version/date and open a new
+   empty Unreleased section.
+2. Set `[workspace.package].version` and every internal workspace dependency requirement to
+   the release version, then regenerate `Cargo.lock`.
+3. Run the complete local release checks:
+
 ```sh
 cargo fmt --all -- --check
+cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo doc --no-deps --workspace
-git tag v1.0.0 && git push origin v1.0.0   # only after sign-off
+oracle/.venv/bin/python -m compileall -q validation
+oracle/.venv/bin/python -m unittest discover -s validation/tests
+git diff --check
 ```
+
+4. Merge through a green PR, then require green `main` CI on the exact release commit.
+5. Create and push an annotated tag from that commit, create the GitHub Release, and verify the
+   remote peeled tag target:
+
+```sh
+git switch main
+git pull --ff-only origin main
+git tag -a v1.5.0 -m "Release v1.5.0"
+git push origin v1.5.0
+gh release create v1.5.0 --title v1.5.0 --notes-file /path/to/release-notes.md
+git describe --exact-match --tags HEAD
+git ls-remote --tags origin refs/tags/v1.5.0 'refs/tags/v1.5.0^{}'
+```
+
+Crates.io publication is a separate operation; a GitHub release does not authorize it.
