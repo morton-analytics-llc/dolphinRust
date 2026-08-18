@@ -531,6 +531,73 @@ def sample_uncertainty_layers(
     }
 
 
+def sample_velocity_layers(
+    work_directory: Path,
+    station_pixels: dict[str, tuple[int, int]],
+    displacement_dataset: rasterio.DatasetReader,
+) -> dict[str, dict[str, float]]:
+    """Sample velocity-model rasters at the exact station pixels."""
+    velocity_path = work_directory / "velocity.tif"
+    if not velocity_path.exists():
+        raise NotEvaluable(f"missing velocity raster: {velocity_path}")
+    amplitude_path = work_directory / "velocity_seasonal_amplitude.tif"
+    phase_path = work_directory / "velocity_seasonal_phase_days.tif"
+    if amplitude_path.exists() != phase_path.exists():
+        raise NotEvaluable("seasonal velocity rasters must be paired")
+
+    with rasterio.open(velocity_path) as velocity_dataset:
+        if (
+            velocity_dataset.shape,
+            velocity_dataset.crs,
+            velocity_dataset.transform,
+        ) != (
+            displacement_dataset.shape,
+            displacement_dataset.crs,
+            displacement_dataset.transform,
+        ):
+            raise NotEvaluable("velocity raster grid differs from displacement raster")
+        output: dict[str, dict[str, float]] = {}
+        for station_id, (row, col) in station_pixels.items():
+            value = float(
+                velocity_dataset.read(1, window=((row, row + 1), (col, col + 1)))[0, 0]
+            )
+            if not math.isfinite(value):
+                raise NotEvaluable(
+                    f"velocity raster is non-finite at {station_id} station pixel"
+                )
+            output[station_id] = {"velocity_raster_mm_yr": value * 1000.0}
+
+        for path, key, scale in [
+            (amplitude_path, "velocity_seasonal_amplitude_mm", 1000.0),
+            (phase_path, "velocity_seasonal_phase_days", 1.0),
+        ]:
+            if not path.exists():
+                continue
+            with rasterio.open(path) as seasonal_dataset:
+                if (
+                    seasonal_dataset.shape,
+                    seasonal_dataset.crs,
+                    seasonal_dataset.transform,
+                ) != (
+                    velocity_dataset.shape,
+                    velocity_dataset.crs,
+                    velocity_dataset.transform,
+                ):
+                    raise NotEvaluable(f"seasonal velocity raster grid differs: {path}")
+                for station_id, (row, col) in station_pixels.items():
+                    value = float(
+                        seasonal_dataset.read(
+                            1, window=((row, row + 1), (col, col + 1))
+                        )[0, 0]
+                    )
+                    if not math.isfinite(value):
+                        raise NotEvaluable(
+                            f"{path.name} is non-finite at {station_id} station pixel"
+                        )
+                    output[station_id][key] = value * scale
+    return output
+
+
 def uncertainty_reliability(
     residual_mm: np.ndarray,
     gnss_sigma_mm: np.ndarray,
@@ -822,6 +889,14 @@ def score_common_frame(
                 station_sigma[common_gnss] = gnss_los_sigma_series(available, los)
                 gnss_station[station_id] = station_series
                 gnss_station_sigma[station_id] = station_sigma
+            station_raster_samples = sample_velocity_layers(
+                work_directory,
+                {
+                    station_id: tuple(station_data[station_id]["pixel"])
+                    for station_id in station_ids
+                },
+                dataset,
+            )
             current_gnss_diff = spatial_difference(
                 gnss_station[primary_station], gnss_station[control_station]
             )
@@ -855,10 +930,30 @@ def score_common_frame(
                 np.polyfit(days[common_gnss], current_gnss_diff[common_gnss], 1)[0]
                 * 365.25
             )
+            insar_velocity_raster = (
+                station_raster_samples[primary_station]["velocity_raster_mm_yr"]
+                - station_raster_samples[control_station]["velocity_raster_mm_yr"]
+            )
             velocity_sigma = math.sqrt(
                 station_data[primary_station]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
                 + station_data[control_station]["uncertainty"]["velocity_sigma_mm_yr"] ** 2
             )
+            velocity_estimators = {
+                "insar_velocity_mm_yr": "unweighted_ols_displacement_common_gnss_epochs",
+                "insar_sigma_mm_yr": "rss_station_velocity_sigma_tif_primary_window",
+                "gnss_velocity_mm_yr": "unweighted_ols_projected_gnss_common_epochs",
+                "difference_mm_yr": "insar_velocity_mm_yr_minus_gnss_velocity_mm_yr",
+                "insar_velocity_raster_mm_yr": "primary_minus_control_velocity_tif_station_pixels",
+                "difference_raster_mm_yr": "insar_velocity_raster_mm_yr_minus_gnss_velocity_mm_yr",
+                "station_raster_samples.velocity_raster_mm_yr": "velocity_tif_station_pixel",
+            }
+            if "velocity_seasonal_amplitude_mm" in station_raster_samples[primary_station]:
+                velocity_estimators.update(
+                    {
+                        "station_raster_samples.velocity_seasonal_amplitude_mm": "velocity_seasonal_amplitude_tif_station_pixel",
+                        "station_raster_samples.velocity_seasonal_phase_days": "velocity_seasonal_phase_days_tif_station_pixel",
+                    }
+                )
             engines[engine] = {
                 "work_directory": str(work_directory),
                 "grid": grid,
@@ -883,6 +978,10 @@ def score_common_frame(
                     "insar_sigma_mm_yr": velocity_sigma,
                     "gnss_velocity_mm_yr": gnss_velocity,
                     "difference_mm_yr": insar_velocity - gnss_velocity,
+                    "insar_velocity_raster_mm_yr": insar_velocity_raster,
+                    "difference_raster_mm_yr": insar_velocity_raster - gnss_velocity,
+                    "station_raster_samples": station_raster_samples,
+                    "estimators": velocity_estimators,
                 },
             }
     if gnss_diff is None:

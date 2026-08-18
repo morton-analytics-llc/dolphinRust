@@ -6,6 +6,16 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+## [v1.5.0] — 2026-08-17
+
+### Breaking changes
+- **Residual output semantics changed** (issue #40 / PR #42).
+  `timeseries_residual_rms.tif` now contains temporal motion-model fit residuals. Consumers
+  needing the former SBAS network misclosure must read `network_misclosure_rms.tif`.
+- **Unimplemented interpolation is rejected** (issue #25).
+  `unwrap_options.run_interpolation: true` now fails config validation instead of silently
+  widening the bounded read and doing no interpolation.
+
 ### Added
 - **Post-unwrap loop-closure QC gate** (issue #24, whose re-entry gate was a design review;
   the review is in the issue and the module docs). `dolphin-timeseries::loop_closure` closes
@@ -165,6 +175,12 @@ All notable changes to dolphinRust are documented here. The format follows
   contract test. Design: `md/design/geometry-provenance.md`.
 
 ### Changed
+- **GroundPulse can select a reduced serialization policy without changing the scientific
+  run** (PR #46). `DisplacementOutputPolicy::GroundPulse` preserves the same computed arrays
+  and provenance in memory while writing only the phase-linking-coherence raster consumed by
+  GroundPulse; the existing CLI and NISAR paths retain full output by default. The controlled
+  GroundPulse Docker comparison measured high-water memory down 5.46% and S3 requests down
+  from 38 to 32.
 - **Phase-linking covariance — row-separable box-sum** (`dolphin-phaselink::covariance`).
   The unmasked rectangular-window path (`neighbors: None`, which was the entire
   production path until SHP selection was wired in — see issue #29)
@@ -180,6 +196,18 @@ All notable changes to dolphinRust are documented here. The format follows
   by design, not yet benched. Vertical cross-row incremental (~3.7× more) is a follow-up.
 
 ### Fixed
+- **The GNSS scorer now reports the pipeline's velocity model instead of being blind to it**
+  (issue #44). The existing common-GNSS-epoch displacement polyfit remains as an independent
+  estimator, while `insar_velocity_raster_mm_yr` and `difference_raster_mm_yr` sample
+  `velocity.tif` at the declared station pixels. Optional seasonal amplitude/phase rasters are
+  reported per station and every velocity scalar names its estimator. On the saved 2018
+  MMX1-ICMX A/B, the unchanged polyfit is -262.0050 mm/yr in both runs; the raster-derived
+  residual moves from -11.5075 to -5.7378 mm/yr with the seasonal model, whose station
+  amplitudes are 24.9781 and 25.6244 mm.
+- **Validation token tests no longer read the developer's real `.env`** (issue #47).
+  Earthdata token resolution accepts an explicit env-file path while retaining process-token
+  first, env-file second, and netrc fallback last. The exact local suite passes 32 tests with
+  a real repository `.env` present before #44 adds its 33rd contract.
 - **A scored GNSS validation run now always leaves a receipt describing itself** (issue #43).
   `validation/run_gps_ground_truth.py`'s `--score` branch wrote `gps_ground_truth.json` and
   returned without ever writing `run_receipt.json` — the only path in `execute()` that skipped
@@ -306,12 +334,7 @@ All notable changes to dolphinRust are documented here. The format follows
   height-resolved granule supplied *without* a DEM is rejected rather than silently
   mis-corrected. On the MMX1/ICMX/MXTX frame the MMX1−MXTX relative differential delay comes
   out at 31.4 mm against 30.4 mm computed independently in Python, versus 68.1 mm from the old
-  band-1 path. Superseded detail of the original guard (issue #38). GDAL exposes each of the real product's 145 height levels as a
-  band, so reading `rasterband(1)` used the −500 m level rather than the terrain. Measured at
-  the MMX1/ICMX/MXTX stations (~2250 m), that over-states the epoch-relative differential
-  delay by 1.9–7.5× — enabling `troposphere_files` today would have applied a correction about
-  twice too large and read as "correction doesn't help". Selecting the level needs a DEM;
-  until then the reader fails loudly, as the LOS-coverage gate already does.
+  band-1 path.
 
 ### Known limitations
 - **The MMX1/ICMX coverage numbers are indicative, not a calibration claim.** Twelve
@@ -623,4 +646,6 @@ physically-meaningful tolerances.
 - CRLB / closure-phase rasters, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform,
   `EagerLoader` prefetch, and tophu/spurt/whirlwind unwrappers are deferred (see STATUS.md).
 
+[Unreleased]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.5.0...HEAD
+[v1.5.0]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.4.0...v1.5.0
 [1.0.0]: https://github.com/morton-analytics-llc/dolphinRust/releases/tag/v1.0.0

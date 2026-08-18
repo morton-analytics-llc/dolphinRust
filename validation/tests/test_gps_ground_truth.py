@@ -2,17 +2,77 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
+import rasterio
+from rasterio.transform import from_origin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import gps_ground_truth as gps
+import score_pairs
 
 
 LINE = "MMX1 23JAN04 2023.0082 59948 2243 3 -99.1 3319 0.500000 2149449 0.250000 2236 -0.100000 0.0000 0.001 0.001 0.004 0 0 0 19.4316533 -99.0683894 2235.9"
+GRID_TRANSFORM = from_origin(-1.0, 2.0, 1.0, 1.0)
+
+
+def write_raster(
+    path: Path,
+    data: np.ndarray,
+    transform=GRID_TRANSFORM,
+) -> None:
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=data.shape[0],
+        width=data.shape[1],
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=transform,
+    ) as dataset:
+        dataset.write(data.astype(np.float32), 1)
+
+
+def tenv3_series(
+    station: str,
+    longitude: float,
+    latitude: float,
+    up_m: list[float],
+) -> str:
+    lines = []
+    for date, up in zip(["23JAN04", "23JAN05", "23JAN06"], up_m, strict=True):
+        columns = LINE.split()
+        columns[0] = station
+        columns[1] = date
+        columns[11] = "0"
+        columns[12] = str(up)
+        columns[20] = str(latitude)
+        columns[21] = str(longitude)
+        lines.append(" ".join(columns))
+    return "\n".join(lines)
+
+
+def write_synthetic_work_directory(path: Path, velocity_m_yr: tuple[float, float]) -> None:
+    primary = (1, 0)
+    control = (1, 2)
+    for index, displacement_m in enumerate([-0.001, -0.002]):
+        displacement = np.zeros((3, 3))
+        displacement[primary] = displacement_m
+        write_raster(path / f"displacement_{index:02}.tif", displacement)
+        write_raster(path / f"displacement_variance_{index:02}.tif", np.zeros((3, 3)))
+    for index in range(3):
+        write_raster(path / f"crlb_sigma_{index:02}.tif", np.ones((3, 3)) * 0.001)
+    write_raster(path / "velocity_sigma.tif", np.ones((3, 3)) * 0.001)
+    velocity = np.zeros((3, 3))
+    velocity[primary], velocity[control] = velocity_m_yr
+    write_raster(path / "velocity.tif", velocity)
 
 
 class GroundTruthContract(unittest.TestCase):
@@ -99,6 +159,147 @@ class GroundTruthContract(unittest.TestCase):
         self.assertGreater(result["crlb_only"]["intervals"]["90"]["mean_width_mm"], 0)
         self.assertGreaterEqual(result["crlb_only"]["intervals"]["90"]["mean_interval_score"], 0)
         self.assertEqual(gps.json_safe([np.nan, np.float64(1.0)]), [None, 1.0])
+
+    def test_scorer_samples_velocity_and_optional_seasonal_rasters_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            linear = root / "linear"
+            seasonal = root / "seasonal"
+            cache = root / "cache"
+            linear.mkdir()
+            seasonal.mkdir()
+            cache.mkdir()
+            write_synthetic_work_directory(linear, (-0.300, -0.050))
+            write_synthetic_work_directory(seasonal, (-0.290, -0.050))
+
+            amplitude = np.zeros((3, 3))
+            amplitude[1, 0], amplitude[1, 2] = 0.025, 0.024
+            phase = np.zeros((3, 3))
+            phase[1, 0], phase[1, 2] = 120.0, 140.0
+            write_raster(seasonal / "velocity_seasonal_amplitude.tif", amplitude)
+            write_raster(seasonal / "velocity_seasonal_phase_days.tif", phase)
+
+            stations = {
+                "AAAA": {"longitude": -0.5, "latitude": 0.5},
+                "BBBB": {"longitude": 1.5, "latitude": 0.5},
+            }
+            for station, values in stations.items():
+                values["tenv3_url"] = f"https://example.test/{station}.tenv3"
+                values["metadata_url"] = f"https://example.test/{station}.sta.html"
+                up = [0.0, -0.001, -0.002] if station == "AAAA" else [0.0, 0.0, 0.0]
+                (cache / f"{station}.tenv3").write_text(
+                    tenv3_series(station, values["longitude"], values["latitude"], up)
+                )
+                (cache / f"{station}.sta.html").write_text("synthetic station metadata")
+            recipe = {
+                "stations": stations,
+                "comparison": {
+                    "id": "AAAA_minus_BBBB",
+                    "fixture": "shared",
+                    "primary_station": "AAAA",
+                    "control_station": "BBBB",
+                },
+                "expected_dates": ["2023-01-04", "2023-01-05", "2023-01-06"],
+                "minimum_gnss_fraction": 1.0,
+                "max_interpolation_gap_days": 2,
+                "sample_windows": [1],
+                "primary_window": 1,
+                "minimum_finite_fraction": 1.0,
+                "thresholds": {
+                    "endpoint_error_mm": 1.0,
+                    "tls_slope_min": 0.99,
+                    "tls_slope_max": 1.01,
+                    "correlation_min": 0.99,
+                },
+            }
+            with mock.patch.object(
+                gps, "los_at_output_pixel", return_value=np.array([0.0, 0.0, 1.0])
+            ):
+                payload = gps.score_common_frame(
+                    recipe,
+                    {"fixture": "shared"},
+                    {"linear": linear, "seasonal": seasonal},
+                    root / "unused-static.h5",
+                    cache,
+                    root / "output",
+                    0.055,
+                )
+
+            linear_velocity = payload["engines"]["linear"]["velocity_comparison"]
+            seasonal_velocity = payload["engines"]["seasonal"]["velocity_comparison"]
+            self.assertAlmostEqual(
+                linear_velocity["insar_velocity_mm_yr"],
+                seasonal_velocity["insar_velocity_mm_yr"],
+            )
+            self.assertAlmostEqual(
+                linear_velocity["insar_velocity_raster_mm_yr"], -250.0, places=3
+            )
+            self.assertAlmostEqual(
+                seasonal_velocity["insar_velocity_raster_mm_yr"], -240.0, places=3
+            )
+            self.assertAlmostEqual(
+                seasonal_velocity["difference_raster_mm_yr"],
+                seasonal_velocity["insar_velocity_raster_mm_yr"]
+                - seasonal_velocity["gnss_velocity_mm_yr"],
+            )
+            seasonal_primary = seasonal_velocity["station_raster_samples"]["AAAA"]
+            self.assertAlmostEqual(
+                seasonal_primary["velocity_raster_mm_yr"], -290.0, places=3
+            )
+            self.assertAlmostEqual(
+                seasonal_primary["velocity_seasonal_amplitude_mm"], 25.0, places=3
+            )
+            self.assertAlmostEqual(
+                seasonal_primary["velocity_seasonal_phase_days"], 120.0
+            )
+            self.assertEqual(
+                set(linear_velocity["station_raster_samples"]["AAAA"]),
+                {"velocity_raster_mm_yr"},
+            )
+            self.assertEqual(
+                seasonal_velocity["estimators"]["insar_velocity_raster_mm_yr"],
+                "primary_minus_control_velocity_tif_station_pixels",
+            )
+            pair_summary = score_pairs.summarize(payload, "seasonal")
+            self.assertAlmostEqual(
+                pair_summary["insar_velocity_raster_mm_yr"], -240.0, places=3
+            )
+            self.assertAlmostEqual(
+                pair_summary["difference_raster_mm_yr"],
+                seasonal_velocity["difference_raster_mm_yr"],
+            )
+
+            write_raster(
+                seasonal / "velocity_seasonal_phase_days.tif",
+                phase,
+                from_origin(-2.0, 2.0, 1.0, 1.0),
+            )
+            with mock.patch.object(
+                gps, "los_at_output_pixel", return_value=np.array([0.0, 0.0, 1.0])
+            ), self.assertRaisesRegex(gps.NotEvaluable, "seasonal velocity raster grid differs"):
+                gps.score_common_frame(
+                    recipe,
+                    {"fixture": "shared"},
+                    {"seasonal": seasonal},
+                    root / "unused-static.h5",
+                    cache,
+                    root / "mismatched-output",
+                    0.055,
+                )
+
+            (seasonal / "velocity_seasonal_phase_days.tif").unlink()
+            with mock.patch.object(
+                gps, "los_at_output_pixel", return_value=np.array([0.0, 0.0, 1.0])
+            ), self.assertRaisesRegex(gps.NotEvaluable, "seasonal velocity rasters must be paired"):
+                gps.score_common_frame(
+                    recipe,
+                    {"fixture": "shared"},
+                    {"seasonal": seasonal},
+                    root / "unused-static.h5",
+                    cache,
+                    root / "unpaired-output",
+                    0.055,
+                )
 
     def test_comparison_contract_is_generic_and_validated(self) -> None:
         recipe = {

@@ -65,7 +65,13 @@ def summarize(payload: dict[str, Any], engine: str) -> dict[str, Any]:
     picked.update(
         {
             key: velocity[key]
-            for key in ("insar_velocity_mm_yr", "gnss_velocity_mm_yr", "difference_mm_yr")
+            for key in (
+                "insar_velocity_mm_yr",
+                "gnss_velocity_mm_yr",
+                "difference_mm_yr",
+                "insar_velocity_raster_mm_yr",
+                "difference_raster_mm_yr",
+            )
             if key in velocity
         }
     )
