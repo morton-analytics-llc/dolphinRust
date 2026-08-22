@@ -395,7 +395,6 @@ fn closure_layer_produced_when_enabled() {
 fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), label: &str) {
     let mut full = georeferenced_config(&format!("bounded_{label}"));
     full.output_options.strides = strides;
-    full.output_options.epsg = Some(32611);
     full.phase_linking.calc_average_coh = true;
     full.timeseries_options.reference_point =
         Some(((target.0 + target.1) / 2, (target.2 + target.3) / 2));
@@ -404,6 +403,7 @@ fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), l
     let gt = full_output.geotransform;
     let (row_start, row_stop, col_start, col_stop) = target;
     let mut bounded = full.clone();
+    bounded.output_options.epsg = Some(32611);
     bounded.output_options.bounds_epsg = Some(32611);
     bounded.output_options.bounds = Some((
         gt[0] + col_start as f64 * gt[1],

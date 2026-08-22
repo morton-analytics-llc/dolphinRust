@@ -31,6 +31,9 @@ tracing.workspace = true
 rayon.workspace = true
 ndarray.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+gdal = "0.19"
+gdal-sys = "0.12"
 # Optional heap profiler (enabled only via the `dhat-heap` feature for profiling).
 dhat = { version = "0.3", optional = true }
 
@@ -44,8 +47,6 @@ dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 num-complex.workspace = true
-# Writes synthesized 4326 OPERA-L4 netCDF fixtures for the tropo 4326→UTM warp test.
-gdal = "0.19"
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.

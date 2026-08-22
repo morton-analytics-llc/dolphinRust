@@ -12,7 +12,8 @@ use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{
-    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    run_sequential, run_sequential_masked, run_sequential_resumable,
+    run_sequential_resumable_masked, update_sequential, update_sequential_masked, SequentialConfig,
 };
 use ndarray::{s, Array2, Array3, ArrayView3};
 
@@ -120,6 +121,7 @@ fn assert_outputs_match(
     );
     assert!(dcrlb < tol, "crlb max|Δ| {dcrlb}");
     assert!(dclos < tol, "closure max|Δ| {dclos}");
+    assert_eq!(inc.validity_mask, full.validity_mask, "validity mask");
 }
 
 const TOL: f64 = 1e-9;
@@ -132,6 +134,91 @@ fn resumable_matches_plain_run() {
     let plain = run_sequential(stack.view(), &cfg(), &engine).unwrap();
     let (resumable, _state) = run_sequential_resumable(stack.view(), &cfg(), &engine).unwrap();
     assert_outputs_match(&resumable, &plain, TOL);
+}
+
+#[test]
+fn masked_incremental_update_matches_fresh_full_run() {
+    let full_stack = synth_stack(13, 8, 8);
+    let mut valid = Array2::from_elem((8, 8), true);
+    valid.slice_mut(s![2..5, 3..7]).fill(false);
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let full = run_sequential_masked(full_stack.view(), valid.view(), &cfg(), &engine).unwrap();
+    let (_initial, state) = run_sequential_resumable_masked(
+        full_stack.slice(s![..9, .., ..]),
+        valid.view(),
+        &cfg(),
+        &engine,
+    )
+    .unwrap();
+    let (incremental, _) = update_sequential_masked(
+        &state,
+        full_stack.slice(s![9.., .., ..]),
+        valid.view(),
+        &cfg(),
+        &engine,
+    )
+    .unwrap();
+
+    assert_outputs_match(&incremental, &full, TOL);
+    assert!(incremental.validity_mask.iter().any(|valid| !*valid));
+}
+
+#[test]
+fn sequential_state_rejects_changed_or_mixed_mask_contracts() {
+    let stack = synth_stack(10, 8, 8);
+    let mut valid = Array2::from_elem((8, 8), true);
+    valid[(2, 3)] = false;
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let (_, masked_state) = run_sequential_resumable_masked(
+        stack.slice(s![..9, .., ..]),
+        valid.view(),
+        &cfg(),
+        &engine,
+    )
+    .unwrap();
+    let mut changed = valid.clone();
+    changed[(2, 4)] = false;
+    let error = match update_sequential_masked(
+        &masked_state,
+        stack.slice(s![9.., .., ..]),
+        changed.view(),
+        &cfg(),
+        &engine,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("changed native validity must fail"),
+    };
+    assert!(
+        error.contains("validity differs from the series"),
+        "{error}"
+    );
+
+    let error =
+        match update_sequential(&masked_state, stack.slice(s![9.., .., ..]), &cfg(), &engine) {
+            Err(error) => error,
+            Ok(_) => panic!("masked state cannot use the unmasked update API"),
+        };
+    assert!(
+        error.contains("mask mode differs from the series"),
+        "{error}"
+    );
+
+    let (_, unmasked_state) =
+        run_sequential_resumable(stack.slice(s![..9, .., ..]), &cfg(), &engine).unwrap();
+    let error = match update_sequential_masked(
+        &unmasked_state,
+        stack.slice(s![9.., .., ..]),
+        valid.view(),
+        &cfg(),
+        &engine,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("unmasked state cannot use the masked update API"),
+    };
+    assert!(
+        error.contains("mask mode differs from the series"),
+        "{error}"
+    );
 }
 
 /// Add 4 acquisitions at once to an existing 9-SLC series; the open trailing
