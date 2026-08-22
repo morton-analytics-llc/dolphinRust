@@ -3,15 +3,17 @@
 //! An OPERA frame is tiled by several bursts (e.g. `T064-135518-IW1/2/3`). Each
 //! burst is phase-linked independently, then the per-date linked phase and
 //! quality layers are mosaicked onto one frame grid before unwrapping (so phase
-//! is continuous across burst seams). dolphin does this with `gdal_merge`
-//! (last-on-top in overlaps); because a frame's bursts share pixel posting and
-//! CRS, an integer-offset paste onto the union grid is exact — no resampling.
-//! Bursts with differing posting/CRS are rejected (reprojection is deferred).
+//! is continuous across burst seams). A later finite burst value replaces an
+//! earlier one in overlaps, while later nodata does not erase existing finite
+//! support. Because a frame's bursts share pixel posting and CRS, an
+//! integer-offset paste onto the union grid is exact — no resampling. Bursts
+//! with differing posting/CRS are rejected (reprojection is deferred).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Result};
+use dolphin_core::config::InputType;
 use dolphin_io::GeoInfo;
 use ndarray::{Array2, Array3};
 
@@ -34,12 +36,109 @@ pub fn group_by_burst(files: &[PathBuf]) -> BTreeMap<String, Vec<usize>> {
     groups
 }
 
+/// Resolve configured layover/shadow masks onto the active burst groups.
+///
+/// An empty mask list is the identity path. OPERA inputs require one mask with
+/// an unambiguous burst id for every active burst. Inputs without burst ids and
+/// non-OPERA inputs support exactly one mask for their single group.
+pub(crate) fn resolve_layover_shadow_masks(
+    input_type: InputType,
+    groups: &BTreeMap<String, Vec<usize>>,
+    mask_files: &[PathBuf],
+) -> Result<BTreeMap<String, Option<PathBuf>>> {
+    if mask_files.is_empty() {
+        return Ok(groups.keys().cloned().map(|id| (id, None)).collect());
+    }
+
+    let is_single_group = groups.len() == 1 && groups.contains_key("single");
+    if input_type != InputType::OperaCslc || is_single_group {
+        ensure!(
+            groups.len() == 1,
+            "layover/shadow masks for non-OPERA inputs require exactly one active group; found {}",
+            groups.len()
+        );
+        ensure!(
+            mask_files.len() == 1,
+            "layover_shadow_mask_files must contain exactly one file for a single/non-OPERA group; found {}",
+            mask_files.len()
+        );
+        let group = groups
+            .keys()
+            .next()
+            .expect("group count was checked above")
+            .clone();
+        return Ok(BTreeMap::from([(group, Some(mask_files[0].clone()))]));
+    }
+
+    ensure!(
+        !groups.is_empty() && !groups.contains_key("single"),
+        "OPERA CSLC filenames must contain burst ids when layover_shadow_mask_files is configured"
+    );
+
+    let mut resolved = BTreeMap::new();
+    for mask in mask_files {
+        let ids = opera_burst_ids(mask);
+        ensure!(
+            ids.len() == 1,
+            "layover/shadow mask '{}' must contain exactly one OPERA burst id; found {}",
+            mask.display(),
+            ids.len()
+        );
+        let id = &ids[0];
+        ensure!(
+            groups.contains_key(id),
+            "layover/shadow mask '{}' names burst '{}' which is not active",
+            mask.display(),
+            id
+        );
+        ensure!(
+            resolved.insert(id.clone(), Some(mask.clone())).is_none(),
+            "multiple layover/shadow masks were provided for active burst '{id}'"
+        );
+    }
+
+    for id in groups.keys() {
+        ensure!(
+            resolved.contains_key(id),
+            "no layover/shadow mask was provided for active burst '{id}'"
+        );
+    }
+    Ok(resolved)
+}
+
 /// Extract the `T###-######-IW#` burst id from a filename, if present.
 fn burst_id(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     name.split('_')
         .find(|t| t.starts_with('T') && t.contains("-IW"))
         .map(str::to_string)
+}
+
+fn opera_burst_ids(path: &Path) -> Vec<String> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let bytes = name.as_bytes();
+    const BURST_ID_LEN: usize = 15;
+    let mut ids = Vec::new();
+    for start in 0..bytes.len().saturating_sub(BURST_ID_LEN - 1) {
+        let end = start + BURST_ID_LEN;
+        if bytes[start] != b'T'
+            || !bytes[start + 1..start + 4].iter().all(u8::is_ascii_digit)
+            || bytes[start + 4] != b'-'
+            || !bytes[start + 5..start + 11].iter().all(u8::is_ascii_digit)
+            || &bytes[start + 11..start + 14] != b"-IW"
+            || !bytes[start + 14].is_ascii_digit()
+        {
+            continue;
+        }
+        let starts_at_boundary = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let ends_at_boundary = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if starts_at_boundary && ends_at_boundary {
+            ids.push(name[start..end].to_string());
+        }
+    }
+    ids
 }
 
 /// One burst's grid footprint on the output CRS.
@@ -144,6 +243,13 @@ fn reduce(bursts: &[BurstGeo], op: fn(f64, f64) -> f64, key: impl Fn(&BurstGeo) 
 mod tests {
     use super::*;
 
+    fn opera_groups() -> BTreeMap<String, Vec<usize>> {
+        BTreeMap::from([
+            ("T064-135518-IW1".to_string(), vec![0, 2]),
+            ("T064-135518-IW2".to_string(), vec![1, 3]),
+        ])
+    }
+
     fn geo(ox: f64, oy: f64, rows: usize, cols: usize) -> BurstGeo {
         BurstGeo {
             geo: GeoInfo {
@@ -177,6 +283,181 @@ mod tests {
         let g = group_by_burst(&files);
         assert_eq!(g.len(), 1);
         assert_eq!(g["single"], vec![0, 1]);
+    }
+
+    #[test]
+    fn empty_mask_list_is_identity_for_every_active_group() {
+        let resolved =
+            resolve_layover_shadow_masks(InputType::OperaCslc, &opera_groups(), &[]).unwrap();
+        assert_eq!(
+            resolved,
+            BTreeMap::from([
+                ("T064-135518-IW1".to_string(), None),
+                ("T064-135518-IW2".to_string(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn opera_mask_mapping_is_independent_of_list_order() {
+        let groups = opera_groups();
+        let first = vec![
+            PathBuf::from("masks/T064-135518-IW2_mask.tif"),
+            PathBuf::from("masks/T064-135518-IW1_mask.tif"),
+        ];
+        let second = vec![first[1].clone(), first[0].clone()];
+        let first_resolved =
+            resolve_layover_shadow_masks(InputType::OperaCslc, &groups, &first).unwrap();
+        let second_resolved =
+            resolve_layover_shadow_masks(InputType::OperaCslc, &groups, &second).unwrap();
+        assert_eq!(first_resolved, second_resolved);
+        assert_eq!(
+            first_resolved["T064-135518-IW1"],
+            Some(PathBuf::from("masks/T064-135518-IW1_mask.tif"))
+        );
+        assert_eq!(
+            first_resolved["T064-135518-IW2"],
+            Some(PathBuf::from("masks/T064-135518-IW2_mask.tif"))
+        );
+    }
+
+    #[test]
+    fn single_group_accepts_one_mask_without_a_burst_id() {
+        let groups = BTreeMap::from([("single".to_string(), vec![0, 1])]);
+        let mask = PathBuf::from("layover-shadow.tif");
+        let resolved = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &groups,
+            std::slice::from_ref(&mask),
+        )
+        .unwrap();
+        assert_eq!(resolved["single"], Some(mask));
+    }
+
+    #[test]
+    fn non_opera_group_accepts_one_mask_without_a_burst_id() {
+        let groups = BTreeMap::from([("nisar".to_string(), vec![0, 1])]);
+        let mask = PathBuf::from("layover-shadow.tif");
+        let resolved = resolve_layover_shadow_masks(
+            InputType::NisarGslc,
+            &groups,
+            std::slice::from_ref(&mask),
+        )
+        .unwrap();
+        assert_eq!(resolved["nisar"], Some(mask));
+    }
+
+    #[test]
+    fn rejects_missing_opera_mask() {
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &opera_groups(),
+            &[PathBuf::from("T064-135518-IW1_mask.tif")],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no layover/shadow mask was provided for active burst 'T064-135518-IW2'"));
+    }
+
+    #[test]
+    fn rejects_duplicate_opera_mask() {
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &opera_groups(),
+            &[
+                PathBuf::from("a_T064-135518-IW1_mask.tif"),
+                PathBuf::from("b_T064-135518-IW1_mask.tif"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("multiple layover/shadow masks were provided for active burst"));
+    }
+
+    #[test]
+    fn rejects_extra_opera_mask() {
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &opera_groups(),
+            &[
+                PathBuf::from("T064-135518-IW1_mask.tif"),
+                PathBuf::from("T064-135518-IW2_mask.tif"),
+                PathBuf::from("T064-135518-IW3_mask.tif"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("which is not active"));
+    }
+
+    #[test]
+    fn rejects_unparseable_opera_mask() {
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &opera_groups(),
+            &[PathBuf::from("mask_without_burst_id.tif")],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must contain exactly one OPERA burst id; found 0"));
+    }
+
+    #[test]
+    fn rejects_mask_with_multiple_opera_burst_ids() {
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &opera_groups(),
+            &[PathBuf::from("T064-135518-IW1_T064-135518-IW2_mask.tif")],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must contain exactly one OPERA burst id; found 2"));
+    }
+
+    #[test]
+    fn rejects_mixed_parseable_and_unparseable_opera_groups() {
+        let groups = BTreeMap::from([
+            ("T064-135518-IW1".to_string(), vec![0]),
+            ("single".to_string(), vec![1]),
+        ]);
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &groups,
+            &[PathBuf::from("T064-135518-IW1_mask.tif")],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("OPERA CSLC filenames must contain burst ids"));
+    }
+
+    #[test]
+    fn rejects_multiple_masks_for_single_group() {
+        let groups = BTreeMap::from([("single".to_string(), vec![0, 1])]);
+        let error = resolve_layover_shadow_masks(
+            InputType::OperaCslc,
+            &groups,
+            &[PathBuf::from("a.tif"), PathBuf::from("b.tif")],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly one file"));
+    }
+
+    #[test]
+    fn rejects_multiple_active_non_opera_groups() {
+        let groups = BTreeMap::from([("a".to_string(), vec![0]), ("b".to_string(), vec![1])]);
+        let error = resolve_layover_shadow_masks(
+            InputType::NisarGslc,
+            &groups,
+            &[PathBuf::from("mask.tif")],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("require exactly one active group"));
     }
 
     #[test]

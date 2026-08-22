@@ -5,11 +5,16 @@
 //! velocity → write COGs. Single-burst stacks take the stitch identity path.
 //! Synchronous; the host app bridges to its runtime.
 
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
+use dolphin_core::config::{
+    ComputeBackend, DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod,
+};
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
@@ -29,8 +34,11 @@ use dolphin_timeseries::{
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
+use sha2::{Digest, Sha256};
 
-use crate::burst::{burst_offset, frame_grid, group_by_burst, BurstGeo, FrameGrid};
+use crate::burst::{
+    burst_offset, frame_grid, group_by_burst, resolve_layover_shadow_masks, BurstGeo, FrameGrid,
+};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
 use crate::dates::{decimal_days, parse_date};
@@ -39,7 +47,8 @@ use crate::provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
-    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    run_sequential, run_sequential_masked, run_sequential_resumable,
+    run_sequential_resumable_masked, update_sequential, update_sequential_masked, SequentialConfig,
     SequentialOutput, SequentialState,
 };
 use crate::tiling::{plan_tiles, TilePlan};
@@ -53,6 +62,7 @@ use dolphin_corrections::LosGeometry;
 const SENTINEL1_WAVELENGTH_M: f64 = 0.055_465_76;
 const MIN_SEAM_SUPPORT: usize = 4;
 const MIN_SEAM_COHERENCE: f64 = 0.5;
+const MASK_PREFLIGHT_STRIPE_ROWS: usize = 1_024;
 
 /// Typed failure from multi-burst phase-offset reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -226,23 +236,36 @@ pub fn run_displacement_with_output_policy(
     cfg: &DisplacementWorkflow,
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
-    validate_uncertainty_options(cfg)?;
+    validate_config(cfg)?;
     let groups = group_by_burst(&cfg.cslc_file_list);
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
     // One compute engine for the whole run: it acquires a single GPU context (if
     // selected and available) and is reused across every burst + ministack.
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let bursts = timed("phase_linking", || {
         groups
-            .values()
+            .iter()
             .enumerate()
-            .filter_map(|(index, idxs)| {
+            .filter_map(|(index, (id, idxs))| {
                 let window = crop
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(link_one_burst(cfg, idxs, index, &engine, window))
+                Some(link_one_burst(
+                    cfg,
+                    idxs,
+                    index,
+                    &engine,
+                    window,
+                    prepared_masks[id].as_ref(),
+                ))
             })
             .collect::<Result<Vec<_>>>()
     })?;
@@ -272,9 +295,8 @@ fn finish_displacement(
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
     let temporal_coherence = stitched.temp_coh;
-    let geo = stitched.geo;
-    let epsg = (geo.epsg != 0).then_some(geo.epsg);
-    let geotransform = geo.geotransform;
+    let epsg = (stitched.geo.epsg != 0).then_some(stitched.geo.epsg);
+    let geotransform = stitched.geo.geotransform;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -295,6 +317,12 @@ fn finish_displacement(
     })?;
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
+    let configured_reference = checked_configured_analysis_reference(
+        cfg.timeseries_options.reference_point,
+        crop,
+        temporal_coherence.view(),
+        validity_mask.view(),
+    )?;
 
     let unwrap = timed("unwrap", || {
         unwrap_network(
@@ -302,6 +330,7 @@ fn finish_displacement(
             pl.view(),
             &pairs,
             temporal_coherence.view(),
+            validity_mask.view(),
             geotransform,
             epsg,
         )
@@ -310,11 +339,6 @@ fn finish_displacement(
         solve_time_series(cfg, unwrap.unwrapped, &pairs, stitched.crlb_sigma.as_ref())?;
     // Spatially reference the series to a stable pixel (dolphin parity): the
     // configured point, else the center-of-mass of the high-coherence region.
-    let configured_reference = configured_analysis_reference(
-        cfg.timeseries_options.reference_point,
-        crop,
-        temporal_coherence.dim(),
-    )?;
     let analysis_reference_point = configured_reference.or_else(|| {
         select_reference_point(
             temporal_coherence.view(),
@@ -977,6 +1001,20 @@ impl SpatialProducts {
         if let Some(layer) = self.velocity_sigma_rad.as_mut() {
             mask2_f64(layer, mask);
         }
+        if let Some(layer) = self.velocity_terms.seasonal_amplitude_rad.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.velocity_terms.seasonal_phase_days.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        for layer in &mut self.velocity_terms.step_magnitude_rad {
+            mask2_f64(layer, mask);
+        }
+        if let Some(qc) = self.loop_closure.as_mut() {
+            mask2_f64(&mut qc.bad_loop_count, mask);
+            mask2_f64(&mut qc.evaluable_loop_count, mask);
+            mask2_f64(&mut qc.worst_residual_cycles, mask);
+        }
         if let Some(layer) = self.corrections.ionosphere.as_mut() {
             mask3_f64(layer, mask);
         }
@@ -1092,6 +1130,11 @@ impl SpatialProducts {
             .velocity_sigma_rad
             .take()
             .map(|layer| trim2(&layer, target));
+        if let Some(qc) = self.loop_closure.as_mut() {
+            qc.bad_loop_count = trim2(&qc.bad_loop_count, target);
+            qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
+            qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
+        }
         self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
         trim_corrections(&mut self.corrections, target);
         self.reference_point = trim_reference(self.reference_point, target);
@@ -1133,25 +1176,16 @@ fn link_one_burst(
     burst_index: usize,
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
+    mask: Option<&PreparedBurstMask>,
 ) -> Result<BurstLink> {
     let files = burst_files(cfg, idxs);
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let days = acquisition_days(cfg, &files)?;
     let subdataset = cfg
         .input_options
         .subdataset
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let full_shape = read_cslc_shape(&files[0], &subdataset)?;
-    let source = bounded.map_or(
-        BlockIndices {
-            row_start: 0,
-            row_stop: full_shape.0,
-            col_start: 0,
-            col_stop: full_shape.1,
-        },
-        |window| window.source,
-    );
+    let source = burst_source_window(&files[0], &subdataset, bounded)?;
     let tiled = phase_link_tiled(
         cfg,
         (source.height(), source.width()),
@@ -1164,6 +1198,10 @@ fn link_one_burst(
                 &subdataset,
                 offset_block(block, source.row_start, source.col_start),
             )
+        },
+        |block| {
+            mask.as_ref()
+                .map_or(Ok(None), |mask| mask.reader.read(block).map(Some))
         },
     )
     .with_context(|| format!("burst ordinal {burst_index} phase linking failed"))?;
@@ -1250,6 +1288,7 @@ fn phase_link_tiled(
     nslc: usize,
     engine: &ComputeEngine,
     read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
+    read_mask: impl Fn(BlockIndices) -> Result<Option<Array2<bool>>>,
 ) -> Result<TiledPhaseLinkOutput> {
     let strides = cfg.output_options.strides;
     let half = cfg.phase_linking.half_window;
@@ -1299,15 +1338,9 @@ fn phase_link_tiled(
         );
         let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
+        let tile_mask = read_mask(plan.read)?;
         stats.read_s += t_read.elapsed().as_secs_f64();
-        let missing = all_non_finite_acquisition_indices(stack.view());
-        let mut locally_finite = vec![true; nslc];
-        for &ordinal in &missing {
-            locally_finite[ordinal] = false;
-        }
-        for (seen, finite) in stats.acquisition_has_finite.iter_mut().zip(locally_finite) {
-            *seen |= finite;
-        }
+        let missing = record_finite_acquisitions(stack.view(), &mut stats.acquisition_has_finite);
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
             stage = "phase_linking_tile",
@@ -1323,8 +1356,17 @@ fn phase_link_tiled(
             acc.place_nodata(&plan);
             continue;
         }
+        let all_masked = tile_mask
+            .as_ref()
+            .is_some_and(|mask| !mask.iter().any(|valid| *valid));
+        if all_masked {
+            stats.nodata_tiles += 1;
+            acc.place_nodata(&plan);
+            continue;
+        }
         let t_pl = Instant::now();
-        let out = phase_link(cfg, stack.view(), engine)?;
+        let valid_mask = tile_mask.as_ref().map(Array2::view);
+        let out = phase_link(cfg, stack.view(), engine, valid_mask)?;
         stats.compute_s += t_pl.elapsed().as_secs_f64();
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
@@ -1354,6 +1396,18 @@ fn phase_link_tiled(
     stats.finish(acc)
 }
 
+fn record_finite_acquisitions(stack: ArrayView3<Cf64>, seen: &mut [bool]) -> Vec<usize> {
+    let missing = all_non_finite_acquisition_indices(stack);
+    let mut locally_finite = vec![true; seen.len()];
+    for &ordinal in &missing {
+        locally_finite[ordinal] = false;
+    }
+    for (global, local) in seen.iter_mut().zip(locally_finite) {
+        *global |= local;
+    }
+    missing
+}
+
 /// Read one tile's input (`block`, including halo) across all `files` epochs as a
 /// `(nslc, h, w)` `Cf64` stack. Each epoch is read as a `Cf32` window and upcast
 /// in place — the global `Cf32→Cf64` doubling of the whole-burst load is gone;
@@ -1374,6 +1428,368 @@ fn read_burst_tile(
         upcast_into(tile.index_axis_mut(Axis(0), k), window.view());
     }
     Ok(tile)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BurstMaskState {
+    path: PathBuf,
+    semantic_fingerprint: [u8; 32],
+    file_fingerprint: [u8; 32],
+    effective_dataset_fingerprint: [u8; 32],
+}
+
+struct PreparedBurstMask {
+    path: PathBuf,
+    semantic_fingerprint: [u8; 32],
+    reader: BurstMaskReader,
+}
+
+struct PreparedUpdateMask {
+    prepared: Option<PreparedBurstMask>,
+    state: Option<BurstMaskState>,
+}
+
+impl PreparedBurstMask {
+    fn resumable_state(&self) -> Result<BurstMaskState> {
+        let file = capture_mask_file(&self.path)?;
+        Ok(BurstMaskState {
+            path: file.path,
+            semantic_fingerprint: self.semantic_fingerprint,
+            file_fingerprint: file.fingerprint,
+            effective_dataset_fingerprint: file.effective_dataset_fingerprint,
+        })
+    }
+}
+
+struct BurstMaskReader {
+    path: PathBuf,
+    geotransform: [f64; 6],
+    epsg: u32,
+    shape: (usize, usize),
+}
+
+impl BurstMaskReader {
+    fn read(&self, block: BlockIndices) -> Result<Array2<bool>> {
+        anyhow::ensure!(
+            block.row_start <= block.row_stop
+                && block.col_start <= block.col_stop
+                && block.row_stop <= self.shape.0
+                && block.col_stop <= self.shape.1,
+            "layover/shadow mask '{}' read window exceeds the processed burst grid",
+            self.path.display()
+        );
+        let target_geotransform =
+            offset_geotransform(self.geotransform, block.row_start, block.col_start);
+        let values = read_aligned_raster_window::<f64>(
+            &self.path,
+            target_geotransform,
+            self.epsg,
+            (block.height(), block.width()),
+        )
+        .with_context(|| format!("reading layover/shadow mask '{}'", self.path.display()))?;
+        Ok(values.mapv(|value| value.is_finite() && value != 0.0))
+    }
+
+    fn full_block(&self) -> BlockIndices {
+        BlockIndices {
+            row_start: 0,
+            row_stop: self.shape.0,
+            col_start: 0,
+            col_stop: self.shape.1,
+        }
+    }
+}
+
+fn preflight_burst_mask(
+    cfg: &DisplacementWorkflow,
+    first_cslc: &Path,
+    mask_path: Option<&Path>,
+    source: BlockIndices,
+) -> Result<Option<PreparedBurstMask>> {
+    let Some(path) = mask_path else {
+        return Ok(None);
+    };
+    ensure_gtiff_mask(path)?;
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to align a layover/shadow mask")?;
+    let source_geo = match cfg.input_options.input_type {
+        InputType::OperaCslc => read_geotransform(first_cslc, subdataset),
+        InputType::NisarGslc => read_nisar_geotransform(first_cslc, subdataset),
+    }
+    .context("reading source georeference for layover/shadow mask alignment")?;
+    anyhow::ensure!(
+        source_geo.epsg != 0,
+        "layover/shadow mask '{}' requires a sourced CSLC EPSG",
+        path.display()
+    );
+    let reader = BurstMaskReader {
+        path: path.to_path_buf(),
+        geotransform: offset_geotransform(
+            source_geo.geotransform,
+            source.row_start,
+            source.col_start,
+        ),
+        epsg: source_geo.epsg,
+        shape: (source.height(), source.width()),
+    };
+    let strides = cfg.output_options.strides;
+    anyhow::ensure!(
+        strides.y > 0 && strides.x > 0,
+        "output_options.strides must be positive"
+    );
+    let looked_extent = (
+        reader.shape.0 / strides.y * strides.y,
+        reader.shape.1 / strides.x * strides.x,
+    );
+    let semantic_fingerprint = preflight_mask_semantics(&reader, looked_extent)?;
+    Ok(Some(PreparedBurstMask {
+        path: path.to_path_buf(),
+        semantic_fingerprint,
+        reader,
+    }))
+}
+
+fn preflight_mask_semantics(
+    reader: &BurstMaskReader,
+    looked_extent: (usize, usize),
+) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        looked_extent.0 <= reader.shape.0 && looked_extent.1 <= reader.shape.1,
+        "layover/shadow mask '{}' effective grid exceeds the processed burst grid",
+        reader.path.display()
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"dolphinRust:layover-shadow-validity:v2\0");
+    hasher.update(reader.epsg.to_le_bytes());
+    for value in reader.geotransform {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher.update((reader.shape.0 as u64).to_le_bytes());
+    hasher.update((reader.shape.1 as u64).to_le_bytes());
+    hasher.update((looked_extent.0 as u64).to_le_bytes());
+    hasher.update((looked_extent.1 as u64).to_le_bytes());
+    let mut any_valid = false;
+    let mut row_bytes = Vec::with_capacity(reader.shape.1);
+    for row_start in (0..reader.shape.0).step_by(MASK_PREFLIGHT_STRIPE_ROWS) {
+        let stripe = reader.read(BlockIndices {
+            row_start,
+            row_stop: (row_start + MASK_PREFLIGHT_STRIPE_ROWS).min(reader.shape.0),
+            col_start: 0,
+            col_stop: reader.shape.1,
+        })?;
+        for (local_row, row) in stripe.rows().into_iter().enumerate() {
+            row_bytes.clear();
+            row_bytes.extend(row.iter().map(|&valid| u8::from(valid)));
+            if row_start + local_row < looked_extent.0 {
+                any_valid |= row_bytes[..looked_extent.1].iter().any(|&valid| valid != 0);
+            }
+            hasher.update(&row_bytes);
+        }
+    }
+    anyhow::ensure!(
+        any_valid,
+        "layover/shadow mask '{}' has no valid pixel in the processed burst window",
+        reader.path.display()
+    );
+    Ok(hasher.finalize().into())
+}
+
+fn preflight_included_burst_masks(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+    crop: Option<&BoundedPlan>,
+) -> Result<BTreeMap<String, Option<PreparedBurstMask>>> {
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to align a layover/shadow mask")?;
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (id, idxs))| {
+            let bounded = crop
+                .as_ref()
+                .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
+            Some((|| {
+                let prepared = match masks[id].as_deref() {
+                    Some(mask_path) => {
+                        let first = &cfg.cslc_file_list[idxs[0]];
+                        let source = burst_source_window(first, subdataset, bounded)?;
+                        preflight_burst_mask(cfg, first, Some(mask_path), source)?
+                    }
+                    None => None,
+                };
+                Ok((id.clone(), prepared))
+            })())
+        })
+        .collect()
+}
+
+fn burst_source_window(
+    first_file: &Path,
+    subdataset: &str,
+    bounded: Option<BurstWindow>,
+) -> Result<BlockIndices> {
+    let full_shape = read_cslc_shape(first_file, subdataset)?;
+    Ok(bounded.map_or(
+        BlockIndices {
+            row_start: 0,
+            row_stop: full_shape.0,
+            col_start: 0,
+            col_stop: full_shape.1,
+        },
+        |window| window.source,
+    ))
+}
+
+fn fingerprint_mask_file(path: &Path) -> Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "layover/shadow mask '{}' must be std::fs-readable to bind resumable state",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let count = file.read(&mut buffer).with_context(|| {
+            format!(
+                "reading layover/shadow mask '{}' for resumable identity",
+                path.display()
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn ensure_gtiff_mask(path: &Path) -> Result<gdal::Dataset> {
+    let dataset = gdal::Dataset::open(path)
+        .with_context(|| format!("opening layover/shadow mask '{}'", path.display()))?;
+    let driver = dataset.driver().short_name();
+    anyhow::ensure!(
+        driver == "GTiff",
+        "layover/shadow mask '{}' must use the GDAL GTiff driver for stable file identity; found {driver}",
+        path.display()
+    );
+    anyhow::ensure!(
+        dataset.raster_count() == 1,
+        "layover/shadow mask '{}' must have exactly one raster band; found {}",
+        path.display(),
+        dataset.raster_count()
+    );
+    Ok(dataset)
+}
+
+fn capture_mask_file(path: &Path) -> Result<MaskFileState> {
+    let dataset = ensure_gtiff_mask(path)?;
+    Ok(MaskFileState {
+        path: path.to_path_buf(),
+        fingerprint: fingerprint_mask_file(path)?,
+        effective_dataset_fingerprint: fingerprint_mask_effective_dataset(&dataset)?,
+    })
+}
+
+fn fingerprint_mask_effective_dataset(dataset: &gdal::Dataset) -> Result<[u8; 32]> {
+    let band = dataset
+        .rasterband(1)
+        .context("opening the layover/shadow mask band for resumable identity")?;
+    let geotransform = dataset
+        .geo_transform()
+        .context("reading the layover/shadow mask geotransform for resumable identity")?;
+    let spatial_ref = dataset
+        .spatial_ref()
+        .context("reading the layover/shadow mask CRS for resumable identity")?;
+    let epsg = spatial_ref
+        .auth_code()
+        .context("reading the layover/shadow mask EPSG for resumable identity")?;
+    let spatial_wkt = spatial_ref
+        .to_wkt()
+        .context("serializing the layover/shadow mask CRS for resumable identity")?;
+    let nodata = band.no_data_value();
+    let mask_flags = band
+        .mask_flags()
+        .context("reading the layover/shadow validity contract for resumable identity")?;
+    let _mask_band = band
+        .open_mask_band()
+        .context("opening the layover/shadow validity band for resumable identity")?;
+
+    // SAFETY: GDAL owns the null-terminated string list. Every entry is copied
+    // before the matching CSLDestroy call, and the dataset remains open.
+    let raw_files = unsafe { gdal_sys::GDALGetFileList(dataset.c_dataset()) };
+    anyhow::ensure!(
+        !raw_files.is_null(),
+        "GDAL did not report the files backing the layover/shadow mask"
+    );
+    let files = (|| -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let mut index = 0;
+        loop {
+            // SAFETY: GDALGetFileList returns a null-terminated CSL string list.
+            let raw_path = unsafe { *raw_files.add(index) };
+            if raw_path.is_null() {
+                break;
+            }
+            // SAFETY: each non-null CSL entry is a valid null-terminated string.
+            let path = unsafe { CStr::from_ptr(raw_path) }
+                .to_str()
+                .context("GDAL reported a non-UTF8 layover/shadow mask file")?;
+            paths.push(PathBuf::from(path));
+            index += 1;
+        }
+        Ok(paths)
+    })();
+    // SAFETY: raw_files came from GDALGetFileList and has not been freed.
+    unsafe { gdal_sys::CSLDestroy(raw_files) };
+
+    let mut files = files?;
+    files.sort_unstable();
+    files.dedup();
+    anyhow::ensure!(
+        !files.is_empty(),
+        "GDAL reported no files backing the layover/shadow mask"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"dolphinRust:gtiff-mask-effective-dataset:v1\0");
+    let (cols, rows) = dataset.raster_size();
+    hasher.update((rows as u64).to_le_bytes());
+    hasher.update((cols as u64).to_le_bytes());
+    hasher.update((band.band_type() as u32).to_le_bytes());
+    hasher.update(band.color_interpretation().c_int().to_le_bytes());
+    for coefficient in geotransform {
+        hasher.update(coefficient.to_bits().to_le_bytes());
+    }
+    hasher.update(epsg.to_le_bytes());
+    hasher.update((spatial_wkt.len() as u64).to_le_bytes());
+    hasher.update(spatial_wkt.as_bytes());
+    match nodata {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([
+        u8::from(mask_flags.is_all_valid()),
+        u8::from(mask_flags.is_per_dataset()),
+        u8::from(mask_flags.is_alpha()),
+        u8::from(mask_flags.is_nodata()),
+    ]);
+    for file in files {
+        let encoded = file.as_os_str().as_encoded_bytes();
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(encoded);
+        hasher.update(fingerprint_mask_file(&file)?);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Upcast a `Cf32` window into a `Cf64` destination view (the only place the
@@ -1455,6 +1871,22 @@ fn configured_analysis_reference(
     Ok(Some(local))
 }
 
+fn checked_configured_analysis_reference(
+    point: Option<(usize, usize)>,
+    crop: Option<&BoundedPlan>,
+    temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+) -> Result<Option<(usize, usize)>> {
+    let reference = configured_analysis_reference(point, crop, temporal_coherence.dim())?;
+    if let Some((row, col)) = reference {
+        anyhow::ensure!(
+            validity_mask[(row, col)] && temporal_coherence[(row, col)].is_finite(),
+            "timeseries_options.reference_point resolves to a layover/shadow-invalid pixel"
+        );
+    }
+    Ok(reference)
+}
+
 fn offset_geotransform(gt: [f64; 6], row: usize, col: usize) -> [f64; 6] {
     [
         gt[0] + col as f64 * gt[1] + row as f64 * gt[2],
@@ -1532,7 +1964,7 @@ impl TiledOutput {
         }
         self.validity_mask
             .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
-            .fill(true);
+            .assign(&out.validity_mask.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
         Ok(())
     }
 
@@ -1552,6 +1984,7 @@ impl TiledOutput {
             phase_linking_coherence: self.phase_linking_coherence,
             crlb_sigma: self.crlb,
             closure_phase: self.closure,
+            validity_mask: self.validity_mask,
         }
     }
 }
@@ -1592,7 +2025,7 @@ fn burst_link(
         phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
-        validity_mask: Array2::from_elem((rows, cols), true),
+        validity_mask: out.validity_mask,
         coverage: BurstCoverageProvenance {
             burst_index: 0,
             acquisition_count: days.len(),
@@ -1632,9 +2065,25 @@ fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
 /// [`run_displacement_resumable`] and thread it through [`update_displacement`].
 ///
 /// Opaque; the same config (phase-linking parameters, strides, input type) must
-/// be used across the resumed series.
+/// be used across the resumed series. Configured layover/shadow masks must use
+/// the GDAL `GTiff` driver; resumable identity binds every effective backing
+/// file reported by GDAL.
 pub struct DisplacementState {
+    input_groups: BTreeMap<String, InputGroupState>,
     bursts: Vec<BurstState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputGroupState {
+    files: Vec<PathBuf>,
+    mask: Option<MaskFileState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaskFileState {
+    path: PathBuf,
+    fingerprint: [u8; 32],
+    effective_dataset_fingerprint: [u8; 32],
 }
 
 /// One burst's resumable state.
@@ -1645,8 +2094,10 @@ struct BurstState {
     files: Vec<PathBuf>,
     /// Footprint on the output grid (stable across updates).
     geo: BurstGeo,
-    /// Full-resolution source read window (stable across updates).
+    /// Full-resolution source read window used by the latest completed run.
     source_window: BlockIndices,
+    /// Resolved native terrain-validity contract used by the initial run.
+    mask: Option<BurstMaskState>,
     /// Sequential phase-linking carry (sealed ministacks + open trailing SLCs).
     seq: SequentialState,
 }
@@ -1658,28 +2109,37 @@ fn link_one_burst_resumable(
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
     burst_index: usize,
-) -> Result<(BurstLink, SequentialState, BlockIndices)> {
+    mask: Option<&PreparedBurstMask>,
+) -> Result<(
+    BurstLink,
+    SequentialState,
+    BlockIndices,
+    Option<BurstMaskState>,
+)> {
     let files = burst_files(cfg, idxs);
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let days = acquisition_days(cfg, &files)?;
     let subdataset = cfg
         .input_options
         .subdataset
         .as_deref()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let full_shape = read_cslc_shape(&files[0], subdataset)?;
-    let source = bounded.map_or(
-        BlockIndices {
-            row_start: 0,
-            row_stop: full_shape.0,
-            col_start: 0,
-            col_stop: full_shape.1,
-        },
-        |window| window.source,
-    );
+    let source = burst_source_window(&files[0], subdataset, bounded)?;
+    let mask_state = mask.map(PreparedBurstMask::resumable_state).transpose()?;
     let stack = read_burst_tile(cfg.input_options.input_type, &files, subdataset, source)?;
-    let (out, state) = run_sequential_resumable(stack.view(), &sequential_config(cfg), engine)
-        .map_err(anyhow::Error::msg)?;
+    let native_validity = mask
+        .as_ref()
+        .map(|mask| mask.reader.read(mask.reader.full_block()))
+        .transpose()?;
+    let (out, state) = match native_validity.as_ref() {
+        Some(valid) => run_sequential_resumable_masked(
+            stack.view(),
+            valid.view(),
+            &sequential_config(cfg),
+            engine,
+        ),
+        None => run_sequential_resumable(stack.view(), &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)?;
     let mut link = burst_link(
         cfg,
         out,
@@ -1689,13 +2149,117 @@ fn link_one_burst_resumable(
     )?;
     link.coverage.burst_index = burst_index;
     link.coverage.acquisition_count = files.len();
-    Ok((link, state, source))
+    Ok((link, state, source, mask_state))
 }
 
 /// The CSLC files for a burst's indices into `cfg.cslc_file_list`.
 fn burst_files(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Vec<PathBuf> {
     idxs.iter()
         .map(|&i| cfg.cslc_file_list[i].clone())
+        .collect()
+}
+
+fn acquisition_days(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Vec<f64>> {
+    decimal_days(files, &cfg.input_options.cslc_date_fmt)
+        .context("parsing acquisition dates from CSLC filenames")
+}
+
+fn capture_input_groups(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, InputGroupState>> {
+    groups
+        .iter()
+        .map(|(id, idxs)| {
+            let mask = masks[id].as_deref().map(capture_mask_file).transpose()?;
+            Ok((
+                id.clone(),
+                InputGroupState {
+                    files: burst_files(cfg, idxs),
+                    mask,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn validate_updated_input_groups(
+    previous: &BTreeMap<String, InputGroupState>,
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, InputGroupState>> {
+    anyhow::ensure!(
+        previous.keys().eq(groups.keys()),
+        "incremental update must preserve the active burst-group set"
+    );
+    for (id, idxs) in groups {
+        let files = burst_files(cfg, idxs);
+        let prior = &previous[id];
+        anyhow::ensure!(
+            files.starts_with(&prior.files),
+            "burst {id}: prior files must be a date-ordered prefix of the updated list"
+        );
+        anyhow::ensure!(
+            files.len() > prior.files.len(),
+            "burst {id}: no new acquisitions; an update must extend every burst"
+        );
+        match (&prior.mask, &masks[id]) {
+            (None, None) => {}
+            (Some(old), Some(path)) if old.path == *path => {}
+            _ => anyhow::bail!(
+                "burst {id}: layover/shadow mask path or mapping changed during an incremental update"
+            ),
+        }
+    }
+    let current = capture_input_groups(cfg, groups, masks)?;
+    for (id, prior) in previous {
+        if prior.mask != current[id].mask {
+            anyhow::bail!(
+                "burst {id}: layover/shadow mask file or valid-pixel content changed during an incremental update"
+            );
+        }
+    }
+    Ok(current)
+}
+
+fn preflight_update_masks(
+    state: &DisplacementState,
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, PreparedUpdateMask>> {
+    groups
+        .iter()
+        .map(|(id, idxs)| {
+            let previous = state
+                .bursts
+                .iter()
+                .find(|burst| burst.id == *id)
+                .with_context(|| format!("burst {id} is new; updates must not introduce bursts"))?;
+            let first = &cfg.cslc_file_list[idxs[0]];
+            let prepared =
+                preflight_burst_mask(cfg, first, masks[id].as_deref(), previous.source_window)?;
+            let current = prepared
+                .as_ref()
+                .map(PreparedBurstMask::resumable_state)
+                .transpose()?;
+            match (&previous.mask, &current) {
+                (None, None) => {}
+                (Some(old), Some(new)) if old == new => {}
+                _ => anyhow::bail!(
+                    "burst {id}: layover/shadow mask path, mapping, grid, or valid-pixel content changed during an incremental update"
+                ),
+            }
+            Ok((
+                id.clone(),
+                PreparedUpdateMask {
+                    prepared,
+                    state: current,
+                },
+            ))
+        })
         .collect()
 }
 
@@ -1731,12 +2295,19 @@ fn source_layouts(
 pub fn run_displacement_resumable(
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
-    validate_uncertainty_options(cfg)?;
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    validate_config(cfg)?;
     let groups = group_by_burst(&cfg.cslc_file_list);
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
+    let input_groups = capture_input_groups(cfg, &groups, &masks)?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let linked = timed("phase_linking", || -> Result<Vec<_>> {
@@ -1748,25 +2319,38 @@ pub fn run_displacement_resumable(
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
                 Some((|| {
-                    let (link, seq, source) =
-                        link_one_burst_resumable(cfg, idxs, &engine, window, index)?;
-                    Ok((id.clone(), burst_files(cfg, idxs), link, seq, source))
+                    let (link, seq, source, mask) = link_one_burst_resumable(
+                        cfg,
+                        idxs,
+                        &engine,
+                        window,
+                        index,
+                        prepared_masks[id].as_ref(),
+                    )?;
+                    Ok((id.clone(), burst_files(cfg, idxs), link, seq, source, mask))
                 })())
             })
             .collect()
     })?;
-    for (id, files, link, seq, source_window) in linked {
+    for (id, files, link, seq, source_window, mask) in linked {
         states.push(BurstState {
             id,
             files,
             geo: link.geo,
             source_window,
+            mask,
             seq,
         });
         bursts.push(link);
     }
     let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
-    Ok((output, DisplacementState { bursts: states }))
+    Ok((
+        output,
+        DisplacementState {
+            input_groups,
+            bursts: states,
+        },
+    ))
 }
 
 /// Fold newly-arrived acquisitions into an existing displacement series. `cfg`
@@ -1787,32 +2371,27 @@ pub fn update_displacement(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
-    validate_uncertainty_options(cfg)?;
-    // The finite dependency cone grows when an update adds ministacks. Reusing a
-    // prior bounded state could therefore omit newly-required halo pixels. A
-    // bounded update deliberately recomputes the bounded analysis domain; it is
-    // still memory-bounded and scientifically equivalent to a fresh AOI-local run.
+    validate_config(cfg)?;
+    let groups = group_by_burst(&cfg.cslc_file_list);
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
+    let input_groups = validate_updated_input_groups(&state.input_groups, cfg, &groups, &masks)?;
     if cfg.output_options.bounds.is_some() {
         return run_displacement_resumable(cfg);
     }
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
-    let groups = group_by_burst(&cfg.cslc_file_list);
-    let layouts = source_layouts(cfg, &groups)?;
-    let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
-    let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_update_masks(state, cfg, &groups, &masks)?;
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let updated = timed("phase_linking", || -> Result<Vec<_>> {
         groups
             .iter()
             .enumerate()
-            .filter_map(|(index, (id, idxs))| {
-                let window = crop
-                    .as_ref()
-                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(update_one_burst(
-                    state, cfg, id, idxs, &engine, window, index,
-                ))
+            .map(|(index, (id, idxs))| {
+                update_one_burst(state, cfg, id, idxs, &engine, index, &prepared_masks[id])
             })
             .collect()
     })?;
@@ -1820,19 +2399,24 @@ pub fn update_displacement(
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
-    Ok((output, DisplacementState { bursts: states }))
+    let output = finish_displacement(cfg, bursts, None, DisplacementOutputPolicy::Full)?;
+    Ok((
+        output,
+        DisplacementState {
+            input_groups,
+            bursts: states,
+        },
+    ))
 }
 
-/// Fold new acquisitions into one burst, returning its extended link + new state.
 fn update_one_burst(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
     id: &str,
     idxs: &[usize],
     engine: &ComputeEngine,
-    bounded: Option<BurstWindow>,
     burst_index: usize,
+    mask: &PreparedUpdateMask,
 ) -> Result<(BurstLink, BurstState)> {
     let files = burst_files(cfg, idxs);
     let prev = state
@@ -1849,11 +2433,6 @@ fn update_one_burst(
         !new_files.is_empty(),
         "burst {id}: no new acquisitions; an update must extend every burst"
     );
-    let planned_window = bounded.map_or(prev.source_window, |window| window.source);
-    anyhow::ensure!(
-        planned_window == prev.source_window,
-        "bounded source window changed during an incremental update"
-    );
     let subdataset = cfg
         .input_options
         .subdataset
@@ -1865,11 +2444,23 @@ fn update_one_burst(
         subdataset,
         prev.source_window,
     )?;
-    let (out, seq) =
-        update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine)
-            .map_err(anyhow::Error::msg)?;
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let native_validity = mask
+        .prepared
+        .as_ref()
+        .map(|mask| mask.reader.read(mask.reader.full_block()))
+        .transpose()?;
+    let (out, seq) = match native_validity.as_ref() {
+        Some(valid) => update_sequential_masked(
+            &prev.seq,
+            new_stack.view(),
+            valid.view(),
+            &sequential_config(cfg),
+            engine,
+        ),
+        None => update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)?;
+    let days = acquisition_days(cfg, &files)?;
     let mut link = burst_link(
         cfg,
         out,
@@ -1884,12 +2475,14 @@ fn update_one_burst(
         files,
         geo: prev.geo,
         source_window: prev.source_window,
+        mask: mask.state.clone(),
         seq,
     };
     Ok((link, next))
 }
 
-fn validate_uncertainty_options(cfg: &DisplacementWorkflow) -> Result<()> {
+fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
+    cfg.validate_supported_options()?;
     anyhow::ensure!(
         !cfg
             .timeseries_options
@@ -1897,17 +2490,11 @@ fn validate_uncertainty_options(cfg: &DisplacementWorkflow) -> Result<()> {
             || cfg.timeseries_options.write_velocity_uncertainty,
         "timeseries_options.correct_velocity_temporal_correlation requires write_velocity_uncertainty"
     );
-    // `preprocess_options` round-trips a dolphin YAML and `crop.rs` already
-    // reserves `max_radius` of halo for it, but no interpolation stage exists —
-    // so accepting the flag would widen every AOI read and change nothing. Reject
-    // it rather than silently ignore it (same rule as the check above, #25).
-    anyhow::ensure!(
-        !cfg.unwrap_options.run_interpolation,
-        "unwrap_options.run_interpolation is accepted for dolphin YAML round-trip but the \
-         pre-unwrap interpolation stage is not implemented; leave it false (dolphin's own \
-         default) rather than running with it silently ignored"
-    );
     Ok(())
+}
+
+fn configured_compute_backend(cfg: &DisplacementWorkflow) -> ComputeBackend {
+    cfg.worker_settings.compute_backend
 }
 
 /// The frame-grid mosaic of the per-burst phase-linking products.
@@ -2146,8 +2733,13 @@ fn phase_link(
     cfg: &DisplacementWorkflow,
     stack: ArrayView3<Cf64>,
     engine: &ComputeEngine,
+    valid_mask: Option<ArrayView2<bool>>,
 ) -> Result<SequentialOutput> {
-    run_sequential(stack, &sequential_config(cfg), engine).map_err(anyhow::Error::msg)
+    match valid_mask {
+        Some(mask) => run_sequential_masked(stack, mask, &sequential_config(cfg), engine),
+        None => run_sequential(stack, &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)
 }
 
 /// Subtract the phase-bias (non-closure) cumulative bias from the stitched linked
@@ -2220,16 +2812,35 @@ fn unwrap_network(
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
     temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
 ) -> Result<UnwrapNetworkOutput> {
     let (_, rows, cols) = pl.dim();
+    anyhow::ensure!(
+        validity_mask.dim() == (rows, cols),
+        "phase-link validity shape differs from unwrap grid"
+    );
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let correlation =
+    let mut correlation =
         analysis_correlation(cfg, temporal_coherence, geotransform, epsg, (rows, cols))?;
-    let masked_phase = (cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some())
-        .then(|| apply_phase_mask(pl, correlation.view()));
+    ndarray::Zip::from(&mut correlation)
+        .and(validity_mask)
+        .for_each(|correlation, &valid| {
+            if !valid {
+                *correlation = 0.0;
+            }
+        });
+    let apply_configured_mask = cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some();
+    let has_invalid_phase_link_pixel = validity_mask.iter().any(|valid| !*valid);
+    let masked_phase = (has_invalid_phase_link_pixel || apply_configured_mask).then(|| {
+        apply_phase_masks(
+            pl,
+            validity_mask,
+            apply_configured_mask.then_some(correlation.view()),
+        )
+    });
     let backend = unwrap_backend(cfg, (rows, cols));
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
@@ -2241,10 +2852,17 @@ fn unwrap_network(
     }
 }
 
-fn apply_phase_mask(pl: ArrayView3<Cf64>, mask: ArrayView2<f32>) -> Array3<Cf64> {
+fn apply_phase_masks(
+    pl: ArrayView3<Cf64>,
+    phase_link_validity: ArrayView2<bool>,
+    configured_mask: Option<ArrayView2<f32>>,
+) -> Array3<Cf64> {
     let mut values = pl.to_owned();
-    for ((row, col), &validity) in mask.indexed_iter() {
-        if validity == 0.0 {
+    for ((row, col), &valid) in phase_link_validity.indexed_iter() {
+        let configured_invalid = configured_mask
+            .as_ref()
+            .is_some_and(|mask| mask[(row, col)] == 0.0);
+        if !valid || configured_invalid {
             values.slice_mut(s![.., row, col]).fill(Cf64::new(0.0, 0.0));
         }
     }
@@ -2744,7 +3362,7 @@ fn write_bands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dolphin_core::config::ComputeBackend;
+    use dolphin_core::config::{CompressedSlcPlan, InterferogramNetwork, ShpMethod};
     use dolphin_core::{HalfWindow, Strides};
 
     /// A config whose velocity path is the unweighted degree-1 fit — the branch
@@ -2882,6 +3500,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn validity_mask_propagates_nodata_through_every_output_layer() {
         let mut validity_mask = Array2::from_elem((2, 2), true);
         validity_mask[(0, 0)] = false;
@@ -2891,8 +3510,19 @@ mod tests {
             disp_rad: Array3::from_elem((2, 2, 2), 1.0),
             vel_rad: velocity,
             velocity_model: VelocityModel::default(),
-            velocity_terms: VelocityTerms::default(),
-            loop_closure: None,
+            velocity_terms: VelocityTerms {
+                seasonal_amplitude_rad: Some(Array2::from_elem((2, 2), 1.0)),
+                seasonal_phase_days: Some(Array2::from_elem((2, 2), 2.0)),
+                step_magnitude_rad: vec![
+                    Array2::from_elem((2, 2), 3.0),
+                    Array2::from_elem((2, 2), 4.0),
+                ],
+            },
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_elem((2, 2), 1.0),
+                evaluable_loop_count: Array2::from_elem((2, 2), 2.0),
+                worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
+            }),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
@@ -2929,6 +3559,27 @@ mod tests {
             assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.velocity_sigma_rad.as_ref().unwrap()[(row, col)].is_nan());
+            assert!(products
+                .velocity_terms
+                .seasonal_amplitude_rad
+                .as_ref()
+                .unwrap()[(row, col)]
+                .is_nan());
+            assert!(products
+                .velocity_terms
+                .seasonal_phase_days
+                .as_ref()
+                .unwrap()[(row, col)]
+                .is_nan());
+            assert!(products
+                .velocity_terms
+                .step_magnitude_rad
+                .iter()
+                .all(|layer| layer[(row, col)].is_nan()));
+            let loop_closure = products.loop_closure.as_ref().unwrap();
+            assert!(loop_closure.bad_loop_count[(row, col)].is_nan());
+            assert!(loop_closure.evaluable_loop_count[(row, col)].is_nan());
+            assert!(loop_closure.worst_residual_cycles[(row, col)].is_nan());
             for band in 0..2 {
                 assert!(products.disp_rad[(band, row, col)].is_nan());
                 assert!(products.crlb_sigma.as_ref().unwrap()[(band, row, col)].is_nan());
@@ -2951,6 +3602,18 @@ mod tests {
         }
         assert!(products.validity_mask[(0, 1)]);
         assert_eq!(products.vel_rad[(0, 1)], 1.0);
+        assert_eq!(
+            products
+                .velocity_terms
+                .seasonal_amplitude_rad
+                .as_ref()
+                .unwrap()[(0, 1)],
+            1.0
+        );
+        assert_eq!(
+            products.loop_closure.as_ref().unwrap().bad_loop_count[(0, 1)],
+            1.0
+        );
     }
 
     #[test]
@@ -2962,7 +3625,11 @@ mod tests {
             vel_rad: Array2::zeros((6, 8)),
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
-            loop_closure: None,
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_shape_fn((6, 8), |(row, col)| (row * 10 + col) as f64),
+                evaluable_loop_count: Array2::from_elem((6, 8), 2.0),
+                worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
+            }),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
@@ -2993,6 +3660,7 @@ mod tests {
         products
             .trim(target, &[0.0, 12.0, 24.0], &unweighted_cfg(0.5))
             .unwrap();
+        products.apply_validity_mask();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
         assert!(products
@@ -3000,6 +3668,11 @@ mod tests {
             .slice(s![.., reference.0, reference.1])
             .iter()
             .all(|value| value.abs() < 1e-12));
+        let qc = products.loop_closure.as_ref().unwrap();
+        assert_eq!(qc.bad_loop_count.dim(), (3, 4));
+        assert_eq!(qc.evaluable_loop_count.dim(), (3, 4));
+        assert_eq!(qc.worst_residual_cycles.dim(), (3, 4));
+        assert_eq!(qc.bad_loop_count[(0, 0)], 23.0);
     }
 
     #[test]
@@ -3105,6 +3778,75 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("differs from target EPSG"));
+    }
+
+    #[test]
+    fn sole_valid_pixel_in_dropped_stride_remainder_fails_precompute() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_stride_remainder_mask_{}.tif",
+            std::process::id()
+        ));
+        let mut values = Array2::zeros((5, 5));
+        values[(4, 4)] = 1.0_f64;
+        let geotransform = [0.0, 30.0, 0.0, 150.0, 0.0, -30.0];
+        write_raster(&path, values.view(), geotransform, Some(32611), Some(0.0)).unwrap();
+        let reader = BurstMaskReader {
+            path: path.clone(),
+            geotransform,
+            epsg: 32611,
+            shape: (5, 5),
+        };
+        let error = preflight_mask_semantics(&reader, (4, 4)).unwrap_err();
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains("has no valid pixel in the processed burst window"),
+            "{error}"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn semantic_fingerprint_includes_trailing_stride_support() {
+        let base = std::env::temp_dir().join(format!(
+            "dolphin_stride_remainder_identity_{}",
+            std::process::id()
+        ));
+        let first_path = base.with_extension("first.tif");
+        let second_path = base.with_extension("second.tif");
+        let geotransform = [0.0, 30.0, 0.0, 150.0, 0.0, -30.0];
+        let mut first = Array2::zeros((5, 5));
+        first[(0, 0)] = 1.0_f64;
+        let mut second = first.clone();
+        second[(4, 4)] = 1.0;
+        write_raster(
+            &first_path,
+            first.view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        write_raster(
+            &second_path,
+            second.view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let reader = |path: &Path| BurstMaskReader {
+            path: path.to_path_buf(),
+            geotransform,
+            epsg: 32611,
+            shape: (5, 5),
+        };
+        let first_fingerprint = preflight_mask_semantics(&reader(&first_path), (4, 4)).unwrap();
+        let second_fingerprint = preflight_mask_semantics(&reader(&second_path), (4, 4)).unwrap();
+        assert_ne!(first_fingerprint, second_fingerprint);
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
     }
 
     #[test]
@@ -3218,13 +3960,13 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.correct_velocity_temporal_correlation = true;
 
-        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        let error = validate_config(&cfg).unwrap_err();
         assert!(error
             .to_string()
             .contains("requires write_velocity_uncertainty"));
 
         cfg.timeseries_options.write_velocity_uncertainty = true;
-        validate_uncertainty_options(&cfg).expect("valid uncertainty options");
+        validate_config(&cfg).expect("valid uncertainty options");
     }
 
     /// Issue #33: velocity sigma understates the slope uncertainty because the
@@ -3348,12 +4090,15 @@ mod tests {
     }
 
     #[test]
-    fn enabled_mask_zeros_linked_phase_before_wrapped_interferograms() {
+    fn terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms() {
         let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
+        let validity = ndarray::array![[true, true], [false, true]];
         let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
-        let masked = apply_phase_mask(phase.view(), mask.view());
+        let masked = apply_phase_masks(phase.view(), validity.view(), Some(mask.view()));
         assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 0, 1)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(0, 1, 0)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(1, 1, 0)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 1, 1)], Cf64::new(1.0, 1.0));
     }
 
@@ -3402,7 +4147,7 @@ mod tests {
         let (_, nr, nc) = a.dim();
         let mut diffs = 0;
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            if x == y {
+            if x == y || (x.re.is_nan() && x.im.is_nan() && y.re.is_nan() && y.im.is_nan()) {
                 continue;
             }
             let (band, r, c) = (i / (nr * nc), (i / nc) % nr, i % nc);
@@ -3434,10 +4179,15 @@ mod tests {
         let cfg = tiled_cfg(strides, half, block);
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
-        let whole = phase_link(&cfg, stack.view(), &engine).unwrap();
-        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |b| {
-            Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned())
-        })
+        let whole = phase_link(&cfg, stack.view(), &engine, None).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |b| Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned()),
+            |_| Ok(None),
+        )
         .unwrap();
         assert_eq!(tiled.nodata_tiles, 0);
         assert_eq!(tiled.linked_tiles, tiled.total_tiles);
@@ -3486,14 +4236,21 @@ mod tests {
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
         let calls = Cell::new(0_usize);
-        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            if calls.replace(calls.get() + 1) == 0 {
-                tile.index_axis_mut(Axis(0), 2)
-                    .fill(Cf64::new(f64::NAN, f64::NAN));
-            }
-            Ok(tile)
-        })
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                if calls.replace(calls.get() + 1) == 0 {
+                    tile.index_axis_mut(Axis(0), 2)
+                        .fill(Cf64::new(f64::NAN, f64::NAN));
+                }
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .unwrap();
         assert_eq!(tiled.nodata_tiles, 1);
         assert!(tiled.linked_tiles > 0);
@@ -3507,18 +4264,129 @@ mod tests {
     }
 
     #[test]
+    fn masked_tiled_phase_link_matches_whole_and_skips_invalid_tiles() {
+        let dims = (40, 50);
+        let nslc = 8;
+        let cfg = tiled_cfg(Strides { y: 2, x: 2 }, HalfWindow { y: 2, x: 3 }, (12, 12));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let mut valid = Array2::from_elem(dims, false);
+        valid.slice_mut(s![10..30, 12..38]).fill(true);
+
+        let whole = phase_link(&cfg, stack.view(), &engine, Some(valid.view())).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| Ok(Some(valid.slice(s![block.rows(), block.cols()]).to_owned())),
+        )
+        .unwrap();
+        assert!(tiled.nodata_tiles > 0, "fixture must skip invalid tiles");
+        assert!(tiled.linked_tiles > 0, "fixture must retain valid tiles");
+        assert_eq!(tiled.validity_mask, whole.validity_mask);
+        let tiled = tiled.output;
+        assert_c64_eq(
+            tiled.cpx_phase.view(),
+            whole.cpx_phase.view(),
+            "masked phase",
+        );
+        assert_f64_eq(
+            tiled.temporal_coherence.view().insert_axis(Axis(0)),
+            whole.temporal_coherence.view().insert_axis(Axis(0)),
+            "masked temporal coherence",
+        );
+        assert_f64_eq(
+            tiled
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            whole
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            "masked phase-linking coherence",
+        );
+        assert_f64_eq(
+            tiled.crlb_sigma.as_ref().unwrap().view(),
+            whole.crlb_sigma.as_ref().unwrap().view(),
+            "masked CRLB",
+        );
+        assert_f64_eq(
+            tiled.closure_phase.as_ref().unwrap().view(),
+            whole.closure_phase.as_ref().unwrap().view(),
+            "masked closure",
+        );
+    }
+
+    #[test]
+    fn masked_nondivisible_tiled_phase_link_matches_whole_burst() {
+        let dims = (5, 5);
+        let nslc = 6;
+        let cfg = tiled_cfg(Strides { y: 2, x: 2 }, HalfWindow { y: 1, x: 1 }, (2, 2));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let mut valid = Array2::from_elem(dims, true);
+        valid[(0, 0)] = false;
+        let whole = phase_link(&cfg, stack.view(), &engine, Some(valid.view())).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| Ok(Some(valid.slice(s![block.rows(), block.cols()]).to_owned())),
+        )
+        .unwrap();
+
+        assert_eq!(tiled.validity_mask, whole.validity_mask);
+        assert_c64_eq(
+            tiled.output.cpx_phase.view(),
+            whole.cpx_phase.view(),
+            "nondivisible masked phase",
+        );
+        assert_f64_eq(
+            tiled.output.temporal_coherence.view().insert_axis(Axis(0)),
+            whole.temporal_coherence.view().insert_axis(Axis(0)),
+            "nondivisible masked temporal coherence",
+        );
+        assert_f64_eq(
+            tiled.output.crlb_sigma.as_ref().unwrap().view(),
+            whole.crlb_sigma.as_ref().unwrap().view(),
+            "nondivisible masked CRLB",
+        );
+        assert_f64_eq(
+            tiled.output.closure_phase.as_ref().unwrap().view(),
+            whole.closure_phase.as_ref().unwrap().view(),
+            "nondivisible masked closure",
+        );
+    }
+
+    #[test]
     fn globally_empty_acquisition_reports_safe_ordinal() {
         let dims = (17, 19);
         let nslc = 5;
         let cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
-        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            tile.index_axis_mut(Axis(0), 3)
-                .fill(Cf64::new(f64::NAN, f64::NAN));
-            Ok(tile)
-        })
+        let error = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                tile.index_axis_mut(Axis(0), 3)
+                    .fill(Cf64::new(f64::NAN, f64::NAN));
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .err()
         .expect("globally empty acquisition must fail");
         assert!(error.to_string().contains("ordinals [3]"));
@@ -3534,13 +4402,20 @@ mod tests {
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
         let calls = Cell::new(0_usize);
-        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            let ordinal = calls.replace(calls.get() + 1) % 2;
-            tile.index_axis_mut(Axis(0), ordinal)
-                .fill(Cf64::new(f64::NAN, f64::NAN));
-            Ok(tile)
-        })
+        let error = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                let ordinal = calls.replace(calls.get() + 1) % 2;
+                tile.index_axis_mut(Axis(0), ordinal)
+                    .fill(Cf64::new(f64::NAN, f64::NAN));
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .err()
         .expect("no complete tile must fail");
         assert!(error
@@ -3769,6 +4644,59 @@ mod tests {
         assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]);
     }
 
+    #[test]
+    fn workflow_network_options_map_to_network_builder() {
+        let days = [0.0, 5.0, 20.0, 45.0];
+        let cases = [
+            (
+                InterferogramNetwork {
+                    reference_idx: Some(1),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2), (1, 3)],
+            ),
+            (
+                InterferogramNetwork {
+                    max_bandwidth: Some(1),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                InterferogramNetwork {
+                    max_temporal_baseline: Some(15.0),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2)],
+            ),
+            (
+                InterferogramNetwork {
+                    indexes: Some(vec![(0, 3), (1, 3)]),
+                    ..Default::default()
+                },
+                vec![(0, 3), (1, 3)],
+            ),
+        ];
+        for (configured, expected) in cases {
+            let cfg = DisplacementWorkflow {
+                interferogram_network: configured,
+                ..Default::default()
+            };
+            assert_eq!(network(&cfg, &days), expected);
+        }
+    }
+
+    #[test]
+    fn workflow_date_format_maps_to_acquisition_parser() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.input_options.cslc_date_fmt = "%Y-%m-%d".into();
+        let files = [
+            PathBuf::from("burst_2024-01-02.h5"),
+            PathBuf::from("burst_2024-01-17.h5"),
+        ];
+        assert_eq!(acquisition_days(&cfg, &files).unwrap(), vec![0.0, 15.0]);
+    }
+
     /// Issue #25: `run_interpolation` round-trips from a dolphin YAML and already
     /// widens the AOI halo, but no interpolation stage exists — so it must be
     /// rejected, not silently ignored.
@@ -3776,12 +4704,474 @@ mod tests {
     fn run_interpolation_is_rejected_as_unimplemented() {
         let mut cfg = DisplacementWorkflow::default();
         assert!(
-            validate_uncertainty_options(&cfg).is_ok(),
+            validate_config(&cfg).is_ok(),
             "dolphin's own default (false) must pass"
         );
         cfg.unwrap_options.run_interpolation = true;
-        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        let error = validate_config(&cfg).unwrap_err();
         assert!(error.to_string().contains("run_interpolation"), "{error}");
+    }
+
+    #[test]
+    fn workflow_phase_linking_options_map_to_sequential_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.ministack_size = 7;
+        cfg.phase_linking.max_num_compressed = 3;
+        cfg.phase_linking.output_reference_idx = Some(4);
+        cfg.phase_linking.half_window = HalfWindow { y: 5, x: 6 };
+        cfg.phase_linking.use_evd = true;
+        cfg.phase_linking.beta = 0.17;
+        cfg.phase_linking.zero_correlation_threshold = 0.23;
+        cfg.phase_linking.shp_method = ShpMethod::Ks;
+        cfg.phase_linking.shp_alpha = 0.007;
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::LastPerMinistack;
+        cfg.phase_linking.write_crlb = false;
+        cfg.phase_linking.write_closure_phase = false;
+        cfg.phase_linking.calc_average_coh = true;
+        cfg.phase_linking.correct_phase_bias = true;
+        cfg.output_options.strides = Strides { y: 2, x: 3 };
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.write_velocity_uncertainty = false;
+
+        let mapped = sequential_config(&cfg);
+        assert_eq!(mapped.ministack_size, 7);
+        assert_eq!(mapped.max_num_compressed, 3);
+        assert_eq!(mapped.output_reference_idx, 4);
+        assert_eq!(mapped.half_window, HalfWindow { y: 5, x: 6 });
+        assert_eq!(mapped.strides, Strides { y: 2, x: 3 });
+        assert!(mapped.use_evd);
+        assert_eq!(mapped.beta, 0.17);
+        assert_eq!(mapped.zero_correlation_threshold, 0.23);
+        assert_eq!(mapped.shp_method, ShpMethod::Ks);
+        assert_eq!(mapped.shp_alpha, 0.007);
+        assert_eq!(
+            mapped.compressed_slc_plan,
+            CompressedSlcPlan::LastPerMinistack
+        );
+        assert!(!mapped.compute_crlb);
+        assert!(mapped.compute_closure_phase, "phase-bias forces closure");
+        assert!(mapped.compute_average_coherence);
+
+        cfg.phase_linking.correct_phase_bias = false;
+        cfg.phase_linking.write_closure_phase = true;
+        cfg.timeseries_options.use_coherence_weights = true;
+        let forced = sequential_config(&cfg);
+        assert!(forced.compute_crlb, "coherence weighting forces CRLB");
+        assert!(forced.compute_closure_phase, "write flag maps to closure");
+    }
+
+    #[test]
+    fn workflow_compute_backend_maps_to_every_engine_entry() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.worker_settings.compute_backend = ComputeBackend::Gpu;
+        assert_eq!(configured_compute_backend(&cfg), ComputeBackend::Gpu);
+    }
+
+    #[test]
+    fn worker_block_shape_controls_phase_link_tile_count() {
+        let dims = (24, 24);
+        let nslc = 5;
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let small = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+        cfg.worker_settings.block_shape = (64, 64);
+        let large = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(small.total_tiles > large.total_tiles);
+    }
+
+    #[test]
+    fn native_unwrap_options_map_to_backend_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.unwrap_options.snaphu_options.ntiles = (3, 4);
+        cfg.unwrap_options.snaphu_options.cost = "defo".into();
+        let mapped = native_config(&cfg, (4_096, 4_096));
+        assert_eq!(mapped.tile, Some((3, 4)), "explicit tiles override auto");
+        assert!(matches!(mapped.cost, CostMode::Defo));
+    }
+
+    #[test]
+    fn snaphu_unwrap_options_map_to_backend_config_and_auto_tile() {
+        let mut cfg = DisplacementWorkflow::default();
+        let options = &mut cfg.unwrap_options.snaphu_options;
+        options.ntiles = (2, 3);
+        options.tile_overlap = (11, 13);
+        options.n_parallel_tiles = 5;
+        options.init_method = "mst".into();
+        options.cost = "defo".into();
+        let explicit = unwrap_config(&cfg, (2_048, 1_536));
+        assert_eq!(explicit.ntiles, (2, 3));
+        assert_eq!(explicit.tile_overlap, (11, 13));
+        assert_eq!(explicit.nproc, 5);
+        assert!(matches!(explicit.init, InitMethod::Mst));
+        assert!(matches!(explicit.cost, CostMode::Defo));
+
+        cfg.unwrap_options.snaphu_options.auto_tile = true;
+        let auto = unwrap_config(&cfg, (2_048, 1_536));
+        let (expected_tiles, expected_processes) = auto_tiling((2_048, 1_536));
+        assert_eq!(auto.ntiles, expected_tiles);
+        assert_eq!(auto.nproc, expected_processes);
+        assert_eq!(auto.tile_overlap, (11, 13));
+    }
+
+    #[test]
+    fn tophu_unwrap_options_map_to_backend_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        let options = &mut cfg.unwrap_options.tophu_options;
+        options.ntiles = (4, 5);
+        options.downsample_factor = (6, 7);
+        options.init_method = "mst".into();
+        options.cost = "defo".into();
+        let mapped = tophu_config(&cfg);
+        assert_eq!(mapped.ntiles, (4, 5));
+        assert_eq!(mapped.downsample_factor, (6, 7));
+        assert_eq!(mapped.tile_overlap, TophuConfig::default().tile_overlap);
+        assert!(matches!(mapped.init, InitMethod::Mst));
+        assert!(matches!(mapped.cost, CostMode::Defo));
+    }
+
+    #[test]
+    fn unsupported_worker_config_fails_before_io_at_every_entry_point() {
+        let missing = PathBuf::from("missing_worker_config_contract.h5");
+        let mut worker_cfg = DisplacementWorkflow {
+            cslc_file_list: vec![missing.clone()],
+            ..Default::default()
+        };
+        worker_cfg.worker_settings.threads_per_worker = 2;
+        let mut stride_cfg = worker_cfg.clone();
+        stride_cfg.worker_settings.threads_per_worker = 1;
+        stride_cfg.output_options.strides.y = 0;
+        let state = DisplacementState {
+            input_groups: BTreeMap::new(),
+            bursts: Vec::new(),
+        };
+        for (path, cfg) in [
+            ("worker_settings.threads_per_worker", worker_cfg),
+            ("output_options.strides.y", stride_cfg),
+        ] {
+            let errors = [
+                run_displacement(&cfg).err().expect("batch config guard"),
+                run_displacement_resumable(&cfg)
+                    .err()
+                    .expect("resumable config guard"),
+                update_displacement(&state, &cfg)
+                    .err()
+                    .expect("update config guard"),
+            ];
+            for error in errors {
+                assert!(error.to_string().contains(path), "{error}");
+            }
+        }
+        assert!(!missing.exists(), "fixture must remain nonexistent");
+    }
+
+    #[test]
+    fn incremental_update_rejects_removed_layover_shadow_mask_before_io() {
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let old = PathBuf::from("cslc_20230101.h5");
+        let new = PathBuf::from("cslc_20230113.h5");
+        cfg.cslc_file_list = vec![old.clone(), new];
+        let state = DisplacementState {
+            input_groups: BTreeMap::from([(
+                "single".into(),
+                InputGroupState {
+                    files: vec![old],
+                    mask: Some(MaskFileState {
+                        path: PathBuf::from("layover_shadow_mask.tif"),
+                        fingerprint: [0; 32],
+                        effective_dataset_fingerprint: [0; 32],
+                    }),
+                },
+            )]),
+            bursts: Vec::new(),
+        };
+
+        let error = match update_displacement(&state, &cfg) {
+            Err(error) => error,
+            Ok(_) => panic!("removing a configured mask must fail"),
+        };
+        assert!(error.to_string().contains("layover/shadow mask"), "{error}");
+        assert!(error.to_string().contains("changed"), "{error}");
+    }
+
+    #[test]
+    fn configured_mask_requires_gtiff_driver() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_driver_{}.vrt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"<VRTDataset rasterXSize="1" rasterYSize="1"><VRTRasterBand dataType="Byte" band="1"/></VRTDataset>"#,
+        )
+        .unwrap();
+        let error = ensure_gtiff_mask(&path).unwrap_err();
+        assert!(error.to_string().contains("GTiff"), "{error}");
+        assert!(error.to_string().contains("VRT"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn configured_mask_requires_exactly_one_raster_band() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_band_count_{}.tif",
+            std::process::id()
+        ));
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 2)
+            .unwrap();
+        drop(dataset);
+        let error = ensure_gtiff_mask(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("exactly one raster band"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("found 2"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mask_identity_tracks_gdal_reported_case_variant_world_file() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_effective_files_{}.BIN",
+            std::process::id()
+        ));
+        let world_path = path.with_extension("BNW");
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 1)
+            .unwrap();
+        dataset
+            .set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(32611).unwrap())
+            .unwrap();
+        drop(dataset);
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n15\n45\n").unwrap();
+        let baseline = capture_mask_file(&path).unwrap();
+        let dataset = ensure_gtiff_mask(&path).unwrap();
+        assert_eq!(
+            dataset.geo_transform().unwrap(),
+            [0.0, 30.0, 0.0, 60.0, 0.0, -30.0]
+        );
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n45\n45\n").unwrap();
+        let changed = capture_mask_file(&path).unwrap();
+        assert_ne!(
+            changed.effective_dataset_fingerprint,
+            baseline.effective_dataset_fingerprint
+        );
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n15\n45\n").unwrap();
+        assert_eq!(capture_mask_file(&path).unwrap(), baseline);
+        std::fs::remove_file(&world_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mask_identity_binds_effective_grid_when_gdal_precedence_changes() {
+        struct ConfigGuard(&'static str);
+
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                let _ = gdal::config::clear_thread_local_config_option(self.0);
+            }
+        }
+
+        const OPTION: &str = "GDAL_GEOREF_SOURCES";
+        let _guard = ConfigGuard(OPTION);
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_georef_precedence_{}.tif",
+            std::process::id()
+        ));
+        let mut aux_path = path.as_os_str().to_os_string();
+        aux_path.push(".aux.xml");
+        let aux_path = PathBuf::from(aux_path);
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 1)
+            .unwrap();
+        dataset
+            .set_geo_transform(&[0.0, 30.0, 0.0, 60.0, 0.0, -30.0])
+            .unwrap();
+        dataset
+            .set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(32611).unwrap())
+            .unwrap();
+        drop(dataset);
+        std::fs::write(
+            &aux_path,
+            br#"<PAMDataset>
+  <SRS dataAxisToSRSAxisMapping="1,2">EPSG:4326</SRS>
+  <GeoTransform>100, 2, 0, 200, 0, -2</GeoTransform>
+</PAMDataset>
+"#,
+        )
+        .unwrap();
+
+        gdal::config::set_thread_local_config_option(OPTION, "PAM,INTERNAL").unwrap();
+        let pam_first = capture_mask_file(&path).unwrap();
+        gdal::config::set_thread_local_config_option(OPTION, "INTERNAL,PAM").unwrap();
+        let internal_first = capture_mask_file(&path).unwrap();
+        assert_eq!(pam_first.fingerprint, internal_first.fingerprint);
+        assert_ne!(
+            pam_first.effective_dataset_fingerprint,
+            internal_first.effective_dataset_fingerprint
+        );
+
+        gdal::config::clear_thread_local_config_option(OPTION).unwrap();
+        std::fs::remove_file(aux_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn group_contracts_bind_masks_for_every_active_burst_before_cslc_io() {
+        let mask_path = std::env::temp_dir().join(format!(
+            "dolphinrust_group_mask_identity_{}.tif",
+            std::process::id()
+        ));
+        let geotransform = [0.0, 30.0, 0.0, 60.0, 0.0, -30.0];
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let a0 = PathBuf::from("missing_a_20230101.h5");
+        let b0 = PathBuf::from("missing_b_20230101.h5");
+        let a1 = PathBuf::from("missing_a_20230113.h5");
+        let b1 = PathBuf::from("missing_b_20230113.h5");
+        let mut cfg = DisplacementWorkflow {
+            cslc_file_list: vec![a0.clone(), b0.clone()],
+            ..Default::default()
+        };
+        let initial_groups =
+            BTreeMap::from([("a".into(), vec![0_usize]), ("b".into(), vec![1_usize])]);
+        let masks = BTreeMap::from([("a".into(), None), ("b".into(), Some(mask_path.clone()))]);
+        let previous = capture_input_groups(&cfg, &initial_groups, &masks).unwrap();
+        assert_eq!(previous.len(), 2, "crop-excluded groups must remain bound");
+
+        cfg.cslc_file_list = vec![a0, b0, a1, b1];
+        let updated_groups = BTreeMap::from([
+            ("a".into(), vec![0_usize, 2]),
+            ("b".into(), vec![1_usize, 3]),
+        ]);
+        validate_updated_input_groups(&previous, &cfg, &updated_groups, &masks).unwrap();
+        std::fs::remove_file(&mask_path).unwrap();
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 2_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let error =
+            validate_updated_input_groups(&previous, &cfg, &updated_groups, &masks).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("file or valid-pixel content changed"),
+            "{error}"
+        );
+        assert!(
+            cfg.cslc_file_list.iter().all(|path| !path.exists()),
+            "the contract must not need CSLC I/O"
+        );
+        std::fs::remove_file(mask_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_update_rejects_external_mask_sidecar_mutation_before_cslc_io() {
+        let mask_path = std::env::temp_dir().join(format!(
+            "dolphinrust_bounded_sidecar_identity_{}.tif",
+            std::process::id()
+        ));
+        let mut sidecar_path = mask_path.as_os_str().to_os_string();
+        sidecar_path.push(".msk");
+        let sidecar_path = PathBuf::from(sidecar_path);
+        let geotransform = [0.0, 30.0, 0.0, 60.0, 0.0, -30.0];
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        write_raster(
+            &sidecar_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let old_cslc = PathBuf::from("missing_cslc_20230101.h5");
+        let new_cslc = PathBuf::from("missing_cslc_20230113.h5");
+        let mut initial = DisplacementWorkflow {
+            cslc_file_list: vec![old_cslc.clone()],
+            layover_shadow_mask_files: vec![mask_path.clone()],
+            ..Default::default()
+        };
+        initial.output_options.bounds = Some((0.0, 0.0, 30.0, 30.0));
+        initial.output_options.bounds_epsg = Some(32611);
+        initial.output_options.epsg = Some(32611);
+        let initial_groups = group_by_burst(&initial.cslc_file_list);
+        let initial_masks = resolve_layover_shadow_masks(
+            initial.input_options.input_type,
+            &initial_groups,
+            &initial.layover_shadow_mask_files,
+        )
+        .unwrap();
+        let state = DisplacementState {
+            input_groups: capture_input_groups(&initial, &initial_groups, &initial_masks).unwrap(),
+            bursts: Vec::new(),
+        };
+        let main_fingerprint = fingerprint_mask_file(&mask_path).unwrap();
+
+        std::fs::remove_file(&sidecar_path).unwrap();
+        write_raster(
+            &sidecar_path,
+            Array2::from_elem((2, 2), 2_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let mut updated = initial;
+        updated.cslc_file_list.push(new_cslc.clone());
+        let error = match update_displacement(&state, &updated) {
+            Ok(_) => panic!("external mask sidecar mutation must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("file or valid-pixel content changed"),
+            "{error}"
+        );
+        assert_eq!(fingerprint_mask_file(&mask_path).unwrap(), main_fingerprint);
+        assert!(!new_cslc.exists(), "fixture must fail before new-CSLC I/O");
+        std::fs::remove_file(sidecar_path).unwrap();
+        std::fs::remove_file(mask_path).unwrap();
     }
 
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the

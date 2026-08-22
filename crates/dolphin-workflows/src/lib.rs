@@ -29,7 +29,8 @@ pub use provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
-    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    run_sequential, run_sequential_masked, run_sequential_resumable,
+    run_sequential_resumable_masked, update_sequential, update_sequential_masked, SequentialConfig,
     SequentialOutput, SequentialState,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};

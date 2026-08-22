@@ -1,6 +1,6 @@
 # Implementation plan: issue #50 layover/shadow masks and config accountability
 
-**Status:** planning complete 2026-08-22; implementation not started.
+**Status:** implementation and local verification complete 2026-08-22; unmerged PR pending.
 **Intake:** `md/intake/issue-50-layover-shadow-mask-2026-08-22.md`.
 **Live queue:** one open issue (#50), no open pull requests, `main` CI green at
 `9edd192949552aa4ee2f7b4f549cf387868b081d` (run 32103681198).
@@ -51,8 +51,8 @@ engine truthful but would leave the identified infrastructure-monitoring need un
   unparseable mappings before phase-linking I/O begins.
 - For the single/non-OPERA group, require exactly one mask when the list is nonempty.
 - Record resolved mask paths in the same deterministic burst order as `group_by_burst`.
-- Accept native-grid raster masks only. Direct OPERA STATIC HDF5 extraction belongs to the
-  GroundPulse follow-up, not this engine PR.
+- Accept single-band native-grid masks backed by the GDAL `GTiff` driver only. Direct OPERA
+  STATIC HDF5 extraction belongs to the GroundPulse follow-up, not this engine PR.
 
 ### R2 — raster and polarity contract (DR-050-MASK)
 
@@ -108,8 +108,10 @@ engine truthful but would leave the identified infrastructure-monitoring need un
   source compatibility and focused kernel tests.
 - Store the resolved burst mask identity and source-grid contract in `BurstState`.
 - `update_displacement` must require the same mask path/mapping, grid, polarity contract,
-  and content identity as the state-producing run. Reject removal, replacement, remapping,
-  or mutation before consuming new acquisitions.
+  and content identity as the state-producing run. Identity binds the primary raster and
+  every effective backing file reported by GDAL, including any active mask, PAM, world-file,
+  HFA auxiliary, or projection sidecar. Reject removal, replacement, remapping, or mutation
+  before consuming new acquisitions.
 - Carry the native/stride validity needed to mask sealed products and compressed SLCs so an
   incremental update remains bit-identical to a fresh full rerun.
 - Bounded updates may retain the current full bounded recompute, but must resolve and verify
@@ -269,6 +271,36 @@ git diff --check
 Completion also requires the PR receipt to record the red/green contract order, exact oracle
 identity, issue link, relevant commands, and the explicit statement that GroundPulse has not
 yet populated or production-verified the new field.
+
+## Execution receipt — 2026-08-22
+
+| Task | Result |
+|---|---|
+| T01 | Complete in red-contract commit `21b6a73`. `cargo test -p dolphin-workflows --test layover_shadow_mask_contract` failed because `run_sequential_masked` and `SequentialOutput.validity_mask` did not exist. The pinned generator records dolphin 0.35.0 at upstream `e567e554300f9bb2c6c4c49358d41876ce81e5a7`. |
+| T02-T04 | Complete. Per-burst resolution, exact single-band native-grid GTiff reads, pre-covariance masking, tiled/whole/bounded behavior, and final validity fanout are green. |
+| T05 | Complete. Batch/resumable/update paths bind mapping, primary bytes, GDAL's effective dataset descriptor and backing files, full valid-pixel semantics, and sequential validity state. |
+| T06 | Complete. The registry covers all 99 public config paths: 30 consumed, 42 conditional, and 27 compatibility-only. Non-default compatibility-only values and unsupported variants fail before workflow I/O. |
+| T07 | Documentation and local verification complete; the required unmerged `automation-pr` is pending. |
+
+Green evidence:
+
+- `oracle/gen_layover_shadow_mask.py` reproduced native and stride-2 validity from the pinned
+  Python oracle.
+- Focused mask, aligned-I/O, config, displacement, multi-burst, sequential, SHP, resumable,
+  and incremental contracts pass.
+- `cargo fmt --all -- --check`, `cargo check --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` pass;
+  the workflow library reports 109/109 unit tests.
+- `python -m unittest discover -s validation/tests` passes 33/33, validation bytecode
+  compilation passes, and `git diff --check` is clean.
+- Independent config and implementation reviews returned no findings after the GDAL
+  effective-dataset and single-band regressions were added.
+
+GroundPulse has not extracted, populated, or production-verified
+`layover_shadow_mask_files`. Its checked-in real-dolphin YAML also sets
+`worker_settings.threads_per_worker: 6`, which the new fail-before-I/O guard rejects until the
+caller is normalized. GP-050-TRUTH remains deferred behind engine merge, release, and pin
+selection; no `eo` files were changed.
 
 ## Resolved decisions
 

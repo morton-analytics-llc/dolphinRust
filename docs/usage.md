@@ -36,9 +36,9 @@ acquisition per HDF5 file), all on the same grid:
   used, so OPERA granule names (`..._20221119T232411Z_...`) and short names
   (`cslc_20221119.h5`) both work. **Real temporal baselines are derived from these dates** —
   they drive the velocity rate, so correct filenames matter.
-- **Georeferencing:** for projected output, the CSLC group should carry `x_coordinates`,
-  `y_coordinates`, and a `projection` (EPSG) dataset (OPERA layout). When absent, output
-  falls back to an identity geotransform and `output_options.epsg`.
+- **Georeferencing:** the CSLC group must carry `x_coordinates`, `y_coordinates`, and a
+  `projection` (EPSG) dataset (OPERA layout). Missing source georeferencing fails; output
+  reprojection and an identity-grid fallback are not implemented.
 - **Ordering:** list files in acquisition order in `cslc_file_list`.
 
 ### NISAR / L-band input (`input_type: nisar_gslc`)
@@ -75,13 +75,14 @@ Single-burst only in v1.0.0 — multi-burst frame mosaics are not yet stitched.
 ## 3. Configuration
 
 dolphinRust deserializes a genuine dolphin `DisplacementWorkflow` YAML unchanged (generate
-one with `dolphin config ...`); unknown solver blocks (tophu/spurt/whirlwind) are ignored.
-Key parameters (defaults match dolphin):
+one with `dolphin config ...`). Compatibility-only fields round-trip at their dolphin
+defaults and fail before input I/O when set to unsupported values. Key parameters:
 
 ```yaml
 cslc_file_list:
   - /data/cslc_20221119.h5
   - /data/cslc_20221201.h5     # 12-day cadence drives the mm/yr velocity
+layover_shadow_mask_files: []  # optional single-band native-grid GTiffs, one per active burst
 input_options:
   subdataset: /data/VV         # HDF5 path to the complex grid (required)
   cslc_date_fmt: "%Y%m%d"      # date parser for the filenames
@@ -107,7 +108,7 @@ unwrap_options:
   tophu_options: { ntiles: [4, 4], downsample_factor: [3, 3], init_method: mcf, cost: smooth }
 output_options:
   strides: { y: 1, x: 1 }      # output multilooking
-  epsg: 32611                  # fallback CRS when the CSLC carries none
+  # epsg: 32611                # bounded-run assertion only; must match the source CRS
 correction_options:           # atmospheric corrections — OFF by default (see §3a)
   ionosphere_files: []         # IONEX TEC maps, one per date → ionospheric delay
   troposphere_files: []        # OPERA L4 netCDF, one per date → tropospheric delay
@@ -118,6 +119,15 @@ work_directory: /out           # outputs are written here
 
 The complete config tree, with every field documented, is the rustdoc for
 `dolphin_core::config::DisplacementWorkflow` (`cargo doc --no-deps -p dolphin-core --open`).
+
+`layover_shadow_mask_files` is independent of the later unwrap `mask_file`. For OPERA,
+mask filenames are matched to active CSLC groups by burst ID; missing, duplicate, extra, or
+unparseable mappings fail. A single NISAR group accepts one mask. Masks must use the GDAL
+`GTiff` driver, contain exactly one raster band, and cover the native source grid without
+reprojection or resampling.
+Zero, non-finite, raster-nodata, and GDAL-invalid pixels are excluded before covariance;
+finite nonzero pixels are valid. Resumable updates bind the mask and every effective backing
+file reported by GDAL and reject any identity or validity change before new CSLC I/O.
 
 ### 3a. Atmospheric corrections (ionospheric + tropospheric)
 
