@@ -6,6 +6,29 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Breaking changes
+- **Modeled but unsupported dolphin config values now fail before input I/O** (issue #50).
+  The public config tree has an exhaustive `Consumed` / `Conditional` /
+  `CompatibilityOnly` registry. Compatibility-only fields still deserialize and round-trip,
+  but a non-default value returns a path-specific config error instead of being ignored.
+  Unsupported ICU/PHASS/SPURT/Whirlwind unwrap methods, invalid SNAPHU/Tophu option strings,
+  and unbounded `output_options.epsg` also fail instead of falling through or claiming an
+  unimplemented CRS fallback. GroundPulse's checked-in real-dolphin YAML currently sets
+  `worker_settings.threads_per_worker: 6` and must be normalized before this engine is pinned;
+  its programmatic configs retain supported defaults.
+
+### Added
+- **Per-burst layover/shadow masks now enter before covariance and phase linking** (issue
+  #50). `layover_shadow_mask_files` accepts one single-band native-grid GTiff per active burst, maps
+  OPERA masks by burst ID independent of list order, and rejects missing, duplicate, extra,
+  unparseable, misaligned, partially covered, or changed incremental inputs. Zero, raster
+  nodata, GDAL-invalid pixels, and non-finite values are invalid; every finite nonzero pixel
+  is valid. A stride cell is invalid only when all of its native pixels are invalid, and that
+  validity reaches every final output layer. Resumable identity binds every mask backing file
+  reported by GDAL. The later unwrap `mask_file` remains independent.
+  GroundPulse does not yet extract or populate these masks; caller wiring requires a separate
+  released-engine integration.
+
 ## [v1.5.0] — 2026-08-17
 
 ### Breaking changes

@@ -45,6 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
 # Internal crates (version pinned so the workspace is publishable)
 dolphin-core = { path = "crates/dolphin-core", version = "1.5.0" }
 dolphin-io = { path = "crates/dolphin-io", version = "1.5.0" }

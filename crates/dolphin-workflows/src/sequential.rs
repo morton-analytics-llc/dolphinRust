@@ -24,7 +24,7 @@ use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{compress, AverageCoherenceAggregate, ComputeEngine, FusedParams};
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
-use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView3, Axis};
+use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView2, ArrayView3, Axis};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +80,9 @@ pub struct SequentialOutput {
     /// Per-ministack nearest-neighbour closure phase (radians), band-major,
     /// concatenated across ministacks. `None` when `compute_closure_phase` is off.
     pub closure_phase: Option<Array3<f64>>,
+    /// Output-grid validity after reducing an optional native layover/shadow
+    /// mask. A stride cell is valid when any native pixel in it is valid.
+    pub validity_mask: Array2<bool>,
 }
 
 /// Persisted state for an NRT incremental update: the outputs of the **sealed**
@@ -94,6 +97,10 @@ pub struct SequentialOutput {
 /// across the resumed sequence.
 #[derive(Clone)]
 pub struct SequentialState {
+    /// Native semantic validity used by the state-producing run. `None` means
+    /// the unmasked API; `Some` retains even an all-valid configured mask so an
+    /// update cannot mix masked and unmasked state.
+    native_validity: Option<Array2<bool>>,
     /// Compressed SLC of each sealed ministack, in order (the carry-forward).
     sealed_compressed: Vec<Array2<Cf64>>,
     /// Per-real-date linked phase of each sealed ministack.
@@ -129,6 +136,7 @@ fn drive(
     plans: &[MiniStack],
     real_stack: ArrayView3<Cf64>,
     seed_compressed: &[Array2<Cf64>],
+    valid_mask: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<Drive, &'static str> {
@@ -143,7 +151,7 @@ fn drive(
     };
     for &ms in plans {
         let combined = assemble(&carry, real_stack, ms);
-        let r = link_and_compress(combined.view(), ms, cfg, engine)?;
+        let r = link_and_compress(combined.view(), ms, valid_mask, cfg, engine)?;
         out.phases
             .push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
         carry.push(r.compressed.clone());
@@ -171,6 +179,7 @@ fn build_output(
     average_coherence: &[AverageCoherenceAggregate],
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
+    validity_mask: Array2<bool>,
 ) -> Result<SequentialOutput, &'static str> {
     let views: Vec<ArrayView3<Cf64>> = phases.iter().map(Array3::view).collect();
     let cpx_phase = concatenate(Axis(0), &views).map_err(|_| "phase-history concat failed")?;
@@ -181,6 +190,7 @@ fn build_output(
         phase_linking_coherence: finish_average_coherence(average_coherence),
         crlb_sigma: concat_bands(crlb)?,
         closure_phase: concat_bands(closure)?,
+        validity_mask,
     })
 }
 
@@ -196,6 +206,22 @@ pub fn run_sequential(
     Ok(run_sequential_resumable(slc_stack, cfg, engine)?.0)
 }
 
+/// Run the sequential estimator with a native-grid layover/shadow validity
+/// mask (`true` = valid). Invalid samples are excluded before covariance; an
+/// output stride cell is invalid only when all native pixels in it are invalid.
+///
+/// # Errors
+/// Returns `Err` if the mask grid differs from `slc_stack`, planning fails, or
+/// a covariance window exceeds the stack.
+pub fn run_sequential_masked(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<SequentialOutput, &'static str> {
+    Ok(run_sequential_resumable_masked(slc_stack, valid_mask, cfg, engine)?.0)
+}
+
 /// Run the sequential estimator and also return the [`SequentialState`] needed to
 /// fold in later acquisitions incrementally via [`update_sequential`]. The
 /// [`SequentialOutput`] is identical to [`run_sequential`]'s.
@@ -207,9 +233,36 @@ pub fn run_sequential_resumable(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    run_sequential_resumable_impl(slc_stack, None, cfg, engine)
+}
+
+/// Run the masked sequential estimator and return resumable state.
+///
+/// # Errors
+/// Returns `Err` if the mask grid differs from `slc_stack`, planning fails, or
+/// a covariance window exceeds the stack.
+pub fn run_sequential_resumable_masked(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    run_sequential_resumable_impl(slc_stack, Some(valid_mask), cfg, engine)
+}
+
+fn run_sequential_resumable_impl(
+    slc_stack: ArrayView3<Cf64>,
+    native_validity: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    let valid_mask = match native_validity {
+        Some(mask) => nontrivial_mask(mask, (slc_stack.dim().1, slc_stack.dim().2))?,
+        None => None,
+    };
     let planner = planner_for(slc_stack.dim().0, cfg);
     let plans = planner.plan(cfg.ministack_size)?;
-    let d = drive(&plans, slc_stack, &[], cfg, engine)?;
+    let d = drive(&plans, slc_stack, &[], valid_mask, cfg, engine)?;
     let output = build_output(
         &d.phases,
         d.compressed.clone(),
@@ -217,8 +270,13 @@ pub fn run_sequential_resumable(
         &d.average_coherence,
         d.crlb.clone(),
         d.closure.clone(),
+        looked_validity(
+            valid_mask,
+            (slc_stack.dim().1, slc_stack.dim().2),
+            cfg.strides,
+        ),
     )?;
-    let state = seal_state(&plans, slc_stack, cfg.ministack_size, d);
+    let state = seal_state(&plans, slc_stack, cfg.ministack_size, native_validity, d);
     Ok((output, state))
 }
 
@@ -238,6 +296,32 @@ pub fn update_sequential(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    update_sequential_impl(state, new_slcs, None, cfg, engine)
+}
+
+/// Fold new acquisitions into masked resumable state using the same native
+/// layover/shadow validity grid as the state-producing run.
+///
+/// # Errors
+/// Returns `Err` if the mask or acquisition grid differs from the series,
+/// `new_slcs` is empty, or planning/phase linking fails.
+pub fn update_sequential_masked(
+    state: &SequentialState,
+    new_slcs: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    update_sequential_impl(state, new_slcs, Some(valid_mask), cfg, engine)
+}
+
+fn update_sequential_impl(
+    state: &SequentialState,
+    new_slcs: ArrayView3<Cf64>,
+    native_validity: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
     let (n_open, rows, cols) = state.open_real_slcs.dim();
     let (n_new, nrows, ncols) = new_slcs.dim();
     if n_new == 0 {
@@ -246,6 +330,19 @@ pub fn update_sequential(
     if (nrows, ncols) != (rows, cols) {
         return Err("update_sequential: new SLC grid differs from the series");
     }
+    let valid_mask = match (&state.native_validity, native_validity) {
+        (None, None) => None,
+        (Some(expected), Some(actual)) => {
+            if actual.dim() != (rows, cols) {
+                return Err("layover/shadow mask grid differs from the SLC stack");
+            }
+            if expected.view() != actual {
+                return Err("update_sequential: layover/shadow validity differs from the series");
+            }
+            nontrivial_mask(actual, (rows, cols))?
+        }
+        _ => return Err("update_sequential: layover/shadow mask mode differs from the series"),
+    };
     // Tail = open trailing real SLCs ++ the new acquisitions, owned.
     let tail = Array3::from_shape_fn((n_open + n_new, rows, cols), |(k, r, c)| match k < n_open {
         true => state.open_real_slcs[(k, r, c)],
@@ -258,6 +355,7 @@ pub fn update_sequential(
         &tail_plans,
         tail.view(),
         &state.sealed_compressed,
+        valid_mask,
         cfg,
         engine,
     )?;
@@ -275,10 +373,43 @@ pub fn update_sequential(
         &average_coherence,
         crlb,
         closure,
+        looked_validity(valid_mask, (rows, cols), cfg.strides),
     )?;
-    let next =
-        seal_state(&tail_plans, tail.view(), cfg.ministack_size, d).with_sealed_prefix(state);
+    let next = seal_state(
+        &tail_plans,
+        tail.view(),
+        cfg.ministack_size,
+        native_validity,
+        d,
+    )
+    .with_sealed_prefix(state);
     Ok((output, next))
+}
+
+fn nontrivial_mask<'a>(
+    valid_mask: ArrayView2<'a, bool>,
+    expected_shape: (usize, usize),
+) -> Result<Option<ArrayView2<'a, bool>>, &'static str> {
+    if valid_mask.dim() != expected_shape {
+        return Err("layover/shadow mask grid differs from the SLC stack");
+    }
+    Ok((!valid_mask.iter().all(|valid| *valid)).then_some(valid_mask))
+}
+
+fn looked_validity(
+    valid_mask: Option<ArrayView2<bool>>,
+    native_shape: (usize, usize),
+    strides: Strides,
+) -> Array2<bool> {
+    let output_shape = strides.out_shape(native_shape);
+    let Some(mask) = valid_mask else {
+        return Array2::from_elem(output_shape, true);
+    };
+    Array2::from_shape_fn(output_shape, |(row, col)| {
+        let rows = row * strides.y..(row + 1) * strides.y;
+        let cols = col * strides.x..(col + 1) * strides.x;
+        mask.slice(s![rows, cols]).iter().any(|valid| *valid)
+    })
 }
 
 /// The [`MiniStackPlanner`] for a stack of `num_slc` real SLCs under `cfg`.
@@ -299,6 +430,7 @@ fn seal_state(
     plans: &[MiniStack],
     real_stack: ArrayView3<Cf64>,
     ministack_size: usize,
+    native_validity: Option<ArrayView2<bool>>,
     d: Drive,
 ) -> SequentialState {
     let (_, rows, cols) = real_stack.dim();
@@ -312,6 +444,7 @@ fn seal_state(
         _ => Array3::zeros((0, rows, cols)),
     };
     SequentialState {
+        native_validity: native_validity.map(|mask| mask.to_owned()),
         sealed_compressed: d.compressed[..sealed].to_vec(),
         sealed_phases: d.phases[..sealed].to_vec(),
         sealed_temp_coh: d.temp_coh[..sealed].to_vec(),
@@ -444,6 +577,7 @@ struct MinistackResult {
 fn link_and_compress(
     combined: ArrayView3<Cf64>,
     ms: MiniStack,
+    valid_mask: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<MinistackResult, &'static str> {
@@ -451,34 +585,84 @@ fn link_and_compress(
     // compressed SLCs are projections, not observations, so their amplitude
     // statistics would not describe the scatterer.
     let neighbors = shp_neighbors(combined.slice(s![ms.num_compressed.., .., ..]), cfg);
-    let fused = engine.link(
-        combined,
-        cfg.half_window,
-        cfg.strides,
-        neighbors.as_ref().map(Array4::view),
-        fused_params(ms, cfg),
-    )?;
-    let cpx = fused.cpx_phase;
-    let compressed = compress(
-        combined,
-        cpx.view(),
-        ms.num_compressed,
-        Some(ms.compressed_reference_idx as usize),
-    );
-    // CRLB is produced for the full combined stack; keep only the real dates,
-    // matching the phase-history concatenation (drops carried compressed layers).
-    let crlb_sigma = fused
-        .crlb_sigma
-        .map(|s| s.slice(s![ms.num_compressed.., .., ..]).to_owned());
-    let average_coherence = fused.average_coherence;
-    Ok(MinistackResult {
-        cpx,
+    let compute = |input: ArrayView3<Cf64>| {
+        let fused = engine.link(
+            input,
+            cfg.half_window,
+            cfg.strides,
+            neighbors.as_ref().map(Array4::view),
+            fused_params(ms, cfg),
+        )?;
+        let compressed = compress(
+            input,
+            fused.cpx_phase.view(),
+            ms.num_compressed,
+            Some(ms.compressed_reference_idx as usize),
+        );
+        Ok::<_, &'static str>((fused, compressed))
+    };
+    let (fused, compressed) = match valid_mask {
+        Some(mask) => compute(mask_stack(combined, mask).view())?,
+        None => compute(combined)?,
+    };
+    let mut result = MinistackResult {
+        cpx: fused.cpx_phase,
         compressed,
         temp_coh: fused.temporal_coherence,
-        average_coherence,
-        crlb_sigma,
+        average_coherence: fused.average_coherence,
+        // CRLB is produced for the full combined stack; keep only the real
+        // dates, matching the phase-history concatenation.
+        crlb_sigma: fused
+            .crlb_sigma
+            .map(|sigma| sigma.slice(s![ms.num_compressed.., .., ..]).to_owned()),
         closure_phase: fused.closure_phase,
+    };
+    if let Some(mask) = valid_mask {
+        let validity = looked_validity(Some(mask), mask.dim(), cfg.strides);
+        apply_output_validity(&mut result, validity.view());
+        mask_native_complex(&mut result.compressed, mask);
+    }
+    Ok(result)
+}
+
+fn mask_stack(stack: ArrayView3<Cf64>, valid_mask: ArrayView2<bool>) -> Array3<Cf64> {
+    Array3::from_shape_fn(stack.dim(), |(date, row, col)| {
+        match valid_mask[(row, col)] {
+            true => stack[(date, row, col)],
+            false => Cf64::new(f64::NAN, f64::NAN),
+        }
     })
+}
+
+fn apply_output_validity(result: &mut MinistackResult, valid_mask: ArrayView2<bool>) {
+    let invalid_complex = Cf64::new(f64::NAN, f64::NAN);
+    for ((row, col), &valid) in valid_mask.indexed_iter() {
+        if valid {
+            continue;
+        }
+        result.cpx.slice_mut(s![.., row, col]).fill(invalid_complex);
+        result.temp_coh[(row, col)] = f64::NAN;
+        if let Some(average) = result.average_coherence.as_mut() {
+            average.sum[(row, col)] = 0.0;
+            average.count[(row, col)] = 0;
+        }
+        if let Some(sigma) = result.crlb_sigma.as_mut() {
+            sigma.slice_mut(s![.., row, col]).fill(f64::NAN);
+        }
+        if let Some(closure) = result.closure_phase.as_mut() {
+            closure.slice_mut(s![.., row, col]).fill(f64::NAN);
+        }
+    }
+}
+
+fn mask_native_complex(values: &mut Array2<Cf64>, valid_mask: ArrayView2<bool>) {
+    ndarray::Zip::from(values)
+        .and(valid_mask)
+        .for_each(|value, &valid| {
+            if !valid {
+                *value = Cf64::new(f64::NAN, f64::NAN);
+            }
+        });
 }
 
 /// SHP neighbor mask for one ministack's real acquisitions, or `None` for the

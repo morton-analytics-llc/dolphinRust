@@ -124,13 +124,28 @@ fn axis_window(
     let extra = depth.saturating_sub(1) * (h + s);
     let lo = origin(og0, s, h, dim).saturating_sub(extra);
     let hi = (origin(og1 - 1, s, h, dim) + win + extra).max(s * og1);
-    // Snap both ends to stride multiples so the tile's decimated grid aligns to
-    // the global one *and* its `out_shape` is an exact `1/s` of the read height —
-    // the compressed-SLC `upsample_nearest` infers its look factor as
-    // `read_len / out_len`, which only equals `s` (matching the whole-burst
-    // upsample phase) when the read length is a stride multiple.
-    let read_start = (lo / s) * s;
-    let read_stop = hi.div_ceil(s).saturating_mul(s).min((dim / s) * s);
+    // Snap the start to the global stride phase. Preserve a trailing partial
+    // stride cell when the dependency cone reaches the source edge: although it
+    // creates no output cell, it can contribute to the last retained covariance
+    // window and carried compressed SLC.
+    let mut read_start = (lo / s) * s;
+    let read_stop = hi.div_ceil(s).saturating_mul(s).min(dim);
+    // `compress::upsample_nearest` infers its repeat factor as
+    // `read_len / local_out_len`. At a non-divisible edge, include enough prior
+    // output cells that this equals the whole-burst inferred factor; otherwise
+    // the remainder starts repeating a different phase inside the tile.
+    if read_stop == dim {
+        let global_out = dim / s;
+        let global_looks = dim / global_out;
+        while read_start > 0 {
+            let read_len = read_stop - read_start;
+            let local_out = read_len / s;
+            if local_out > 0 && read_len / local_out == global_looks {
+                break;
+            }
+            read_start = read_start.saturating_sub(s);
+        }
+    }
     (read_start, read_stop, og0 - read_start / s)
 }
 
@@ -224,5 +239,27 @@ mod tests {
             4,
             (5, 5),
         );
+    }
+
+    #[test]
+    fn edge_reads_retain_trailing_stride_support_without_extra_output() {
+        let plans = plan_tiles(
+            (5, 5),
+            Strides { y: 2, x: 2 },
+            HalfWindow { y: 1, x: 1 },
+            1,
+            (1, 1),
+        );
+        let edge = plans.last().unwrap();
+        assert_eq!((edge.read.row_stop, edge.read.col_stop), (5, 5));
+        assert_eq!(
+            Strides { y: 2, x: 2 }.out_shape((edge.read.height(), edge.read.width())),
+            (
+                edge.local_row0 + edge.out.height(),
+                edge.local_col0 + edge.out.width()
+            )
+        );
+        assert_eq!(edge.read.height() / (edge.read.height() / 2), 5 / (5 / 2));
+        assert_eq!(edge.read.width() / (edge.read.width() / 2), 5 / (5 / 2));
     }
 }
