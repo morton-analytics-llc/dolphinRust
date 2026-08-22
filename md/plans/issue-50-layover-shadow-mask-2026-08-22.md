@@ -1,6 +1,7 @@
 # Implementation plan: issue #50 layover/shadow masks and config accountability
 
-**Status:** implementation and local verification complete 2026-08-22; unmerged PR pending.
+**Status:** implementation complete in unmerged PR #51; local and GitHub CI verification green
+2026-08-22.
 **Intake:** `md/intake/issue-50-layover-shadow-mask-2026-08-22.md`.
 **Live queue:** one open issue (#50), no open pull requests, `main` CI green at
 `9edd192949552aa4ee2f7b4f549cf387868b081d` (run 32103681198).
@@ -280,7 +281,7 @@ yet populated or production-verified the new field.
 | T02-T04 | Complete. Per-burst resolution, exact single-band native-grid GTiff reads, pre-covariance masking, tiled/whole/bounded behavior, and final validity fanout are green. |
 | T05 | Complete. Batch/resumable/update paths bind mapping, primary bytes, GDAL's effective dataset descriptor and backing files, full valid-pixel semantics, and sequential validity state. |
 | T06 | Complete. The registry covers all 99 public config paths: 30 consumed, 42 conditional, and 27 compatibility-only. Non-default compatibility-only values and unsupported variants fail before workflow I/O. |
-| T07 | Documentation and local verification complete; the required unmerged `automation-pr` is pending. |
+| T07 | Complete. PR #51 is open, labeled `automation-pr`, unmerged, and clean against `main`; CI run 32597447119 passed. |
 
 Green evidence:
 
@@ -295,6 +296,8 @@ Green evidence:
   compilation passes, and `git diff --check` is clean.
 - Independent config and implementation reviews returned no findings after the GDAL
   effective-dataset and single-band regressions were added.
+- GitHub CI run 32597447119 passed formatting, workspace check, clippy, Rust tests, and
+  Python validation on PR #51.
 
 GroundPulse has not extracted, populated, or production-verified
 `layover_shadow_mask_files`. Its checked-in real-dolphin YAML also sets
