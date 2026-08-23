@@ -30,11 +30,8 @@ fn matrix(rows: &[Vec<f64>]) -> Array2<f64> {
     let nrows = rows.len();
     let ncols = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == ncols));
-    Array2::from_shape_vec(
-        (nrows, ncols),
-        rows.iter().flatten().copied().collect(),
-    )
-    .expect("rectangular fixture matrix")
+    Array2::from_shape_vec((nrows, ncols), rows.iter().flatten().copied().collect())
+        .expect("rectangular fixture matrix")
 }
 
 fn assert_close(actual: &Array2<f64>, expected: &Array2<f64>) {
@@ -60,25 +57,16 @@ fn two_ministacks_reconstruct_global_covariance_with_exact_gauge() {
         .unwrap();
 
     let x1 = NodeId::new(10);
-    dag.add_node(
-        InfluenceNode::new(x1, 1)
-            .with_source(SourceEdge::new(eta1, array![[2.0]])),
-    )
-    .unwrap();
+    dag.add_node(InfluenceNode::new(x1, 1).with_source(SourceEdge::new(eta1, array![[2.0]])))
+        .unwrap();
     let compressed = NodeId::new(11);
-    dag.add_node(
-        InfluenceNode::new(compressed, 1)
-            .with_parent(ParentEdge::new(x1, array![[0.5]])),
-    )
-    .unwrap();
+    dag.add_node(InfluenceNode::new(compressed, 1).with_parent(ParentEdge::new(x1, array![[0.5]])))
+        .unwrap();
     let x23 = NodeId::new(20);
     dag.add_node(
         InfluenceNode::new(x23, 2)
             .with_parent(ParentEdge::new(compressed, array![[1.0], [1.0]]))
-            .with_source(SourceEdge::new(
-                eta2,
-                matrix(&f.second_block_cholesky),
-            )),
+            .with_source(SourceEdge::new(eta2, matrix(&f.second_block_cholesky))),
     )
     .unwrap();
 
@@ -114,8 +102,7 @@ fn strided_native_paths_contract_at_shared_source_roots() {
     ];
     for (node, source) in native_nodes {
         dag.add_node(
-            InfluenceNode::new(node, 1)
-                .with_source(SourceEdge::new(source, array![[1.0]])),
+            InfluenceNode::new(node, 1).with_source(SourceEdge::new(source, array![[1.0]])),
         )
         .unwrap();
     }
@@ -123,7 +110,10 @@ fn strided_native_paths_contract_at_shared_source_roots() {
     let downstream = NodeId::new(2000);
     dag.add_node(
         InfluenceNode::new(downstream, 2)
-            .with_parent(ParentEdge::new(NodeId::new(1000), array![[1.0 / 3.0], [0.0]]))
+            .with_parent(ParentEdge::new(
+                NodeId::new(1000),
+                array![[1.0 / 3.0], [0.0]],
+            ))
             .with_parent(ParentEdge::new(
                 NodeId::new(1001),
                 array![[1.0 / 3.0], [1.0 / 3.0]],
@@ -132,7 +122,10 @@ fn strided_native_paths_contract_at_shared_source_roots() {
                 NodeId::new(1002),
                 array![[1.0 / 3.0], [1.0 / 3.0]],
             ))
-            .with_parent(ParentEdge::new(NodeId::new(1003), array![[0.0], [1.0 / 3.0]])),
+            .with_parent(ParentEdge::new(
+                NodeId::new(1003),
+                array![[0.0], [1.0 / 3.0]],
+            )),
     )
     .unwrap();
 
@@ -142,10 +135,7 @@ fn strided_native_paths_contract_at_shared_source_roots() {
             TemporalCoordinate::node(downstream, 1),
         ])
         .unwrap();
-    assert_close(
-        &stride_covariance,
-        &matrix(&f.expected_stride_covariance),
-    );
+    assert_close(&stride_covariance, &matrix(&f.expected_stride_covariance));
 
     let history = dag
         .temporal_covariance(&[
