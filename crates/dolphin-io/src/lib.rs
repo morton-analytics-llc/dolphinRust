@@ -21,16 +21,19 @@ pub mod nisar;
 pub mod nisar_fixture;
 
 pub use covariance::{
-    read_covariance_operator, CovarianceEstimatorBranch, CovarianceOperatorArtifact,
+    read_covariance_operator, read_covariance_operator_block, read_covariance_operator_metadata,
+    read_covariance_operator_metadata_with_byte_cap, read_covariance_operator_with_byte_cap,
+    CovarianceCalibrationStatus, CovarianceEstimatorBranch, CovarianceOperatorArtifact,
     CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
     CovarianceOperatorStatus, CovarianceOperatorWriter, CovariancePhaseComponent,
-    CovariancePhaseComponentKind, CovarianceRegistryEntry, CovarianceReplayStatus,
-    DownstreamInferenceStatus, SourceReplayIdentity, StitchedCovarianceStatus,
+    CovariancePhaseComponentKind, CovarianceRectSupport, CovarianceRegistryEntry,
+    CovarianceReplayStatus, CovarianceSupportOrdering, DownstreamInferenceStatus,
+    SourceReplayIdentity, StitchedCovarianceStatus, COVARIANCE_CALIBRATION_STATUS_REGISTRY,
     COVARIANCE_ESTIMATOR_BRANCH_REGISTRY, COVARIANCE_METHOD_REGISTRY, COVARIANCE_OPERATOR_METHOD,
     COVARIANCE_OPERATOR_METHOD_VERSION, COVARIANCE_OPERATOR_SCHEMA_VERSION,
     COVARIANCE_OPERATOR_STATUS_REGISTRY, COVARIANCE_PHASE_COMPONENT_KIND_REGISTRY,
-    COVARIANCE_REPLAY_STATUS_REGISTRY, DOWNSTREAM_INFERENCE_STATUS_REGISTRY,
-    STITCHED_COVARIANCE_STATUS_REGISTRY,
+    COVARIANCE_REPLAY_STATUS_REGISTRY, COVARIANCE_SUPPORT_ORDERING_REGISTRY,
+    DOWNSTREAM_INFERENCE_STATUS_REGISTRY, STITCHED_COVARIANCE_STATUS_REGISTRY,
 };
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use cslc_metadata::{
