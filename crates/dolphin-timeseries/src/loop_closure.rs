@@ -21,9 +21,10 @@
 //! network has none — every pair shares date 0 — so this gate has nothing to
 //! close and reports no loops. It becomes meaningful only with
 //! `interferogram_network.max_bandwidth` / `max_temporal_baseline` set. That is
-//! the same condition under which the posterior uncertainty carries empirical
-//! scale (issue #36) and the same network dolphin v0.42 adopted as its default
-//! (issue #25) — one decision, three consequences.
+//! also the network shape used by the independent-IFG parameter-covariance
+//! approximation, but redundant interferograms share acquisition errors and do
+//! not provide independent empirical scale. dolphin v0.42 adopted this network
+//! shape as its default (issue #25).
 //!
 //! # What connected components contribute
 //!

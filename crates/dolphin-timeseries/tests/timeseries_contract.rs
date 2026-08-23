@@ -9,10 +9,10 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_timeseries::{
-    build_network, estimate_velocity, estimate_velocity_with_precisions,
-    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
-    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
-    solve_pixel_with_covariance, L1Config, NetworkConfig,
+    build_network, estimate_velocity, estimate_velocity_with_diagnostics,
+    estimate_velocity_with_precisions, estimate_velocity_with_uncertainty, get_incidence_matrix,
+    invert_stack, invert_stack_l1, invert_stack_with_uncertainty, solve_pixel_with_covariance,
+    L1Config, NetworkConfig, VelocityCadenceStatus, VelocityUncertaintyStatus,
 };
 use ndarray::{Array2, Array3};
 
@@ -77,7 +77,7 @@ fn velocity_is_slope_per_year() {
 }
 
 #[test]
-fn weighted_l2_returns_bounded_posterior_variance() {
+fn weighted_l2_returns_finite_independent_ifg_covariance_diagonal() {
     let a = ndarray::array![[1.0], [1.0], [1.0]];
     let dphi = Array3::from_shape_vec((3, 1, 1), vec![1.0, 2.0, 9.0]).unwrap();
     let precision = Array3::from_shape_vec((3, 1, 1), vec![4.0, 4.0, 0.01]).unwrap();
@@ -87,6 +87,34 @@ fn weighted_l2_returns_bounded_posterior_variance() {
     assert!(weighted.phase[(0, 0, 0)] < unweighted[(0, 0, 0)]);
     assert!(weighted.posterior_variance[(0, 0, 0)].is_finite());
     assert!(weighted.residual_rms[(0, 0)].is_finite());
+}
+
+#[test]
+fn primary_docs_reject_calibrated_posterior_and_global_crlb_claims() {
+    let primary_docs = [
+        ("README.md", include_str!("../../../README.md")),
+        ("inversion.rs", include_str!("../src/inversion.rs")),
+        ("loop_closure.rs", include_str!("../src/loop_closure.rs")),
+        (
+            "crates/dolphin-timeseries/CLAUDE.md",
+            include_str!("../CLAUDE.md"),
+        ),
+    ];
+    let rejected = [
+        "per-pixel, per-date physical uncertainty",
+        "Full posterior parameter covariance",
+        "Diagonal posterior parameter variance",
+        "posterior uncertainty carries empirical scale",
+        "empirically scaled posterior",
+    ];
+    for (name, contents) in primary_docs {
+        for claim in rejected {
+            assert!(
+                !contents.contains(claim),
+                "{name} reintroduced rejected uncertainty claim {claim:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -121,14 +149,68 @@ fn zero_precision_excludes_nonfinite_observation() {
 }
 
 #[test]
-fn velocity_uncertainty_matches_closed_form_line() {
+fn velocity_iid_conditional_se_matches_closed_form() {
     let x = [0.0, 1.0, 2.0, 3.0];
-    let series = Array3::from_shape_vec((4, 1, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+    let series = Array3::from_shape_vec((4, 1, 1), vec![0.0, 1.0, 2.0, 4.0]).unwrap();
     let precision = Array3::from_elem((4, 1, 1), 1.0);
     let out = estimate_velocity_with_uncertainty(&x, series.view(), precision.view());
-    assert!((out.velocity[(0, 0)] - 365.25).abs() < 1e-9);
-    assert!(out.sigma[(0, 0)].is_finite() && out.sigma[(0, 0)] > 0.0);
-    assert!(out.residual_rms[(0, 0)] < 1e-12);
+    let expected_sigma = (0.3_f64 / 2.0 / 5.0).sqrt() * 365.25;
+    assert!((out.velocity[(0, 0)] - 1.3 * 365.25).abs() < 1e-9);
+    assert!((out.sigma[(0, 0)] - expected_sigma).abs() < 1e-9);
+    assert!((out.residual_rms[(0, 0)] - (0.3_f64 / 4.0).sqrt()).abs() < 1e-12);
+    assert_eq!(out.valid_date_count[(0, 0)], 4);
+    assert_eq!(out.rank[(0, 0)], 2);
+    assert_eq!(out.regression_dof[(0, 0)], 2);
+    assert_eq!(
+        out.uncertainty_status[(0, 0)],
+        VelocityUncertaintyStatus::IidConditional
+    );
+}
+
+#[test]
+fn iid_conditional_se_is_invariant_to_common_precision_scale() {
+    let x = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let series = Array3::from_shape_vec((5, 1, 1), vec![0.2, 0.9, 2.3, 2.8, 4.5]).unwrap();
+    let relative = Array3::from_shape_vec((5, 1, 1), vec![1.0, 2.0, 0.5, 3.0, 1.5]).unwrap();
+    let scaled = relative.mapv(|weight| weight * 1_000.0);
+    let first = estimate_velocity_with_uncertainty(&x, series.view(), relative.view());
+    let second = estimate_velocity_with_uncertainty(&x, series.view(), scaled.view());
+    assert!((first.velocity[(0, 0)] - second.velocity[(0, 0)]).abs() < 1e-10);
+    assert!((first.sigma[(0, 0)] - second.sigma[(0, 0)]).abs() < 1e-10);
+}
+
+#[test]
+fn iid_conditional_status_requires_full_rank_and_positive_dof() {
+    let two_dates = [0.0, 1.0];
+    let two_values = Array3::from_shape_vec((2, 1, 1), vec![1.0, 3.0]).unwrap();
+    let two_precisions = Array3::from_elem((2, 1, 1), 1.0);
+    let zero_dof =
+        estimate_velocity_with_uncertainty(&two_dates, two_values.view(), two_precisions.view());
+    assert_eq!(zero_dof.rank[(0, 0)], 2);
+    assert_eq!(zero_dof.regression_dof[(0, 0)], 0);
+    assert_eq!(
+        zero_dof.uncertainty_status[(0, 0)],
+        VelocityUncertaintyStatus::Unavailable
+    );
+    assert!(zero_dof.sigma[(0, 0)].is_nan());
+    assert!((zero_dof.velocity[(0, 0)] - 2.0 * 365.25).abs() < 1e-9);
+
+    let repeated_dates = [2.0, 2.0, 2.0];
+    let repeated_values = Array3::from_shape_vec((3, 1, 1), vec![1.0, 2.0, 4.0]).unwrap();
+    let repeated_precisions = Array3::from_elem((3, 1, 1), 1.0);
+    let deficient = estimate_velocity_with_uncertainty(
+        &repeated_dates,
+        repeated_values.view(),
+        repeated_precisions.view(),
+    );
+    assert_eq!(deficient.rank[(0, 0)], 1);
+    assert_eq!(deficient.regression_dof[(0, 0)], 2);
+    assert_eq!(
+        deficient.uncertainty_status[(0, 0)],
+        VelocityUncertaintyStatus::Unavailable
+    );
+    assert!(deficient.velocity[(0, 0)].is_nan());
+    assert!(deficient.sigma[(0, 0)].is_nan());
 }
 
 #[test]
@@ -141,11 +223,11 @@ fn date_precision_changes_velocity_fit() {
     assert!(weighted[(0, 0)] < unweighted[(0, 0)] / 2.0);
 }
 
-// ------------------- temporal-correlation (N_eff) uncertainty correction -------
+// ---------------- temporal-correlation diagnostics (non-inferential) ----------
 
 /// Deterministic xorshift64 sequence mapped to ~unit variance — reproducible,
-/// no RNG dependency. Not a statistical-quality PRNG; good enough to build an
-/// AR(1) fixture with a known target correlation.
+/// no RNG dependency. Not a statistical-quality PRNG; sufficient for a stable
+/// noisy-fit fixture.
 fn deterministic_white_noise(n: usize, seed: u64) -> Vec<f64> {
     let mut state = seed;
     (0..n)
@@ -159,71 +241,124 @@ fn deterministic_white_noise(n: usize, seed: u64) -> Vec<f64> {
         .collect()
 }
 
-/// AR(1) sequence `e[t] = rho*e[t-1] + sqrt(1-rho^2)*w[t]` from unit-variance white
-/// noise `w`; theoretical lag-1 autocorrelation of `e` is `rho`.
-fn ar1_series(n: usize, rho: f64, seed: u64) -> Vec<f64> {
-    let w = deterministic_white_noise(n, seed);
-    let scale = (1.0 - rho * rho).sqrt();
-    let mut e = vec![0.0; n];
-    e[0] = w[0];
-    for t in 1..n {
-        e[t] = rho * e[t - 1] + scale * w[t];
-    }
-    e
+#[test]
+fn exact_linear_fit_reports_point_estimate_but_no_iid_se() {
+    let x: Vec<f64> = (0..6).map(|t| t as f64).collect();
+    let series = Array3::from_shape_fn((6, 1, 1), |(t, _, _)| 3.0 + 2.0 * x[t]);
+    let precision = Array3::from_elem((6, 1, 1), 1.0);
+    let out = estimate_velocity_with_diagnostics(&x, series.view(), precision.view());
+    assert!((out.velocity[(0, 0)] - 2.0 * 365.25).abs() < 1e-9);
+    assert!(out.sigma[(0, 0)].is_nan());
+    assert_eq!(out.valid_date_count[(0, 0)], 6);
+    assert_eq!(out.rank[(0, 0)], 2);
+    assert_eq!(out.regression_dof[(0, 0)], 4);
+    assert_eq!(
+        out.uncertainty_status[(0, 0)],
+        VelocityUncertaintyStatus::Unavailable
+    );
+    assert!(!out.correlation_available[(0, 0)]);
+    assert!(out.lag1_rho[(0, 0)].is_nan());
+    assert!(out.diagnostic_inflation_factor[(0, 0)].is_nan());
+    assert!(out.diagnostic_effective_sample_size[(0, 0)].is_nan());
 }
 
 #[test]
-fn temporal_correlation_inflation_matches_known_ar1_factor() {
-    const N: usize = 400;
-    let x: Vec<f64> = (0..N).map(|t| t as f64 * 6.0).collect();
-    let rho_true = 0.6;
-    let noise = ar1_series(N, rho_true, 0xC0FFEE);
-    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 3.0 + 0.01 * x[t] + noise[t]);
-    let precision = Array3::from_elem((N, 1, 1), 1.0);
-
-    let out = estimate_velocity_with_uncertainty_neff(&x, series.view(), precision.view());
-    let baseline = estimate_velocity_with_uncertainty(&x, series.view(), precision.view());
-
-    // Existing fields are untouched (regression-safety): the opt-in path never
-    // silently changes today's velocity/sigma.
-    assert!((out.velocity[(0, 0)] - baseline.velocity[(0, 0)]).abs() < 1e-9);
-    assert!((out.sigma[(0, 0)] - baseline.sigma[(0, 0)]).abs() < 1e-9);
-
-    let closed_form_factor = ((1.0 + rho_true) / (1.0 - rho_true)).sqrt(); // 2.0 at rho=0.6
-    let factor = out.inflation_factor[(0, 0)];
-    assert!(
-        (factor - closed_form_factor).abs() < 0.3,
-        "inflation factor {factor} far from closed-form {closed_form_factor} (rho={rho_true})"
+fn irregular_and_missing_cadence_disable_correlation_diagnostics() {
+    let irregular_x = [0.0, 6.0, 13.0, 19.0, 25.0];
+    let series = Array3::from_shape_vec((5, 1, 1), vec![0.0, 1.0, 0.2, 1.5, 0.7]).unwrap();
+    let precision = Array3::from_elem((5, 1, 1), 1.0);
+    let irregular =
+        estimate_velocity_with_diagnostics(&irregular_x, series.view(), precision.view());
+    assert_eq!(
+        irregular.cadence_status[(0, 0)],
+        VelocityCadenceStatus::Irregular
     );
-    assert!(
-        factor > 1.2,
-        "expected clear inflation for strong AR(1) correlation, got {factor}"
-    );
+    assert!(!irregular.correlation_available[(0, 0)]);
+    assert_eq!(irregular.correlation_pair_count[(0, 0)], 0);
 
-    // sigma_temporal_corrected is definitionally sigma * inflation_factor.
-    let expected = out.sigma[(0, 0)] * factor;
-    assert!((out.sigma_temporal_corrected[(0, 0)] - expected).abs() < 1e-9);
-    assert!(out.sigma_temporal_corrected[(0, 0)] > out.sigma[(0, 0)]);
+    let regular_x = [0.0, 6.0, 12.0, 18.0, 24.0];
+    let mut missing_precision = precision;
+    missing_precision[(2, 0, 0)] = 0.0;
+    let missing =
+        estimate_velocity_with_diagnostics(&regular_x, series.view(), missing_precision.view());
+    assert_eq!(
+        missing.cadence_status[(0, 0)],
+        VelocityCadenceStatus::Missing
+    );
+    assert_eq!(missing.valid_date_count[(0, 0)], 4);
+    assert!(!missing.correlation_available[(0, 0)]);
+    assert_eq!(missing.correlation_pair_count[(0, 0)], 0);
 }
 
 #[test]
-fn temporal_correlation_correction_is_noop_at_zero_correlation() {
-    const N: usize = 400;
-    let x: Vec<f64> = (0..N).map(|t| t as f64 * 6.0).collect();
-    let noise = deterministic_white_noise(N, 0xC0FFEE); // rho == 0 by construction
-    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 3.0 + 0.01 * x[t] + noise[t]);
-    let precision = Array3::from_elem((N, 1, 1), 1.0);
+fn fewer_than_four_dates_disable_correlation_diagnostics() {
+    let x = [0.0, 6.0, 12.0];
+    let series = Array3::from_shape_vec((3, 1, 1), vec![0.0, 1.0, 0.2]).unwrap();
+    let precision = Array3::from_elem((3, 1, 1), 1.0);
+    let out = estimate_velocity_with_diagnostics(&x, series.view(), precision.view());
+    assert_eq!(
+        out.uncertainty_status[(0, 0)],
+        VelocityUncertaintyStatus::IidConditional
+    );
+    assert_eq!(
+        out.cadence_status[(0, 0)],
+        VelocityCadenceStatus::RegularContiguous
+    );
+    assert!(!out.correlation_available[(0, 0)]);
+    assert_eq!(out.correlation_pair_count[(0, 0)], 0);
+    assert!(out.lag1_rho[(0, 0)].is_nan());
+}
 
-    let out = estimate_velocity_with_uncertainty_neff(&x, series.view(), precision.view());
-    let factor = out.inflation_factor[(0, 0)];
-    assert!(
-        (factor - 1.0).abs() < 0.15,
-        "expected ~no inflation for uncorrelated residuals, got {factor}"
+#[test]
+fn negative_raw_rho_is_retained_without_diagnostic_deflation() {
+    let x: Vec<f64> = (0..8).map(|t| t as f64).collect();
+    let series = Array3::from_shape_fn((8, 1, 1), |(t, _, _)| {
+        0.1 * x[t] + if t % 2 == 0 { 1.0 } else { -1.0 }
+    });
+    let precision = Array3::from_elem((8, 1, 1), 1.0);
+    let out = estimate_velocity_with_diagnostics(&x, series.view(), precision.view());
+    assert_eq!(
+        out.cadence_status[(0, 0)],
+        VelocityCadenceStatus::RegularContiguous
     );
+    assert!(out.correlation_available[(0, 0)]);
+    assert_eq!(out.correlation_pair_count[(0, 0)], 7);
+    assert!(out.lag1_rho[(0, 0)] < 0.0);
+    assert_eq!(out.diagnostic_inflation_factor[(0, 0)], 1.0);
+    assert_eq!(out.diagnostic_effective_sample_size[(0, 0)], 8.0);
+}
+
+#[test]
+fn diagnostic_effective_sample_size_is_clamped_to_one_and_n() {
+    const N: usize = 120;
+    let x: Vec<f64> = (0..N).map(|t| t as f64).collect();
+    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| {
+        (3.0 * std::f64::consts::TAU * t as f64 / N as f64).sin()
+    });
+    let precision = Array3::from_elem((N, 1, 1), 1.0);
+    let out = estimate_velocity_with_diagnostics(&x, series.view(), precision.view());
     assert!(
-        (out.sigma_temporal_corrected[(0, 0)] - out.sigma[(0, 0)]).abs() < 0.15 * out.sigma[(0, 0)],
-        "corrected sigma should stay close to uncorrected sigma at rho~0"
+        out.lag1_rho[(0, 0)] > 0.98,
+        "fixture rho={}",
+        out.lag1_rho[(0, 0)]
     );
+    assert_eq!(out.diagnostic_effective_sample_size[(0, 0)], 1.0);
+    assert_eq!(out.diagnostic_inflation_factor[(0, 0)], (N as f64).sqrt());
+}
+
+#[test]
+fn diagnostic_and_plain_weighted_fits_preserve_the_same_point_estimate() {
+    const N: usize = 12;
+    let x: Vec<f64> = (0..N).map(|t| t as f64 * 6.0).collect();
+    let noise = deterministic_white_noise(N, 0xC0FFEE);
+    let series = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 3.0 + 0.01 * x[t] + noise[t]);
+    let precision = Array3::from_shape_fn((N, 1, 1), |(t, _, _)| 0.5 + t as f64 / N as f64);
+    let direct = estimate_velocity_with_precisions(&x, series.view(), precision.view());
+    let iid = estimate_velocity_with_uncertainty(&x, series.view(), precision.view());
+    let diagnostics = estimate_velocity_with_diagnostics(&x, series.view(), precision.view());
+    assert_eq!(iid.velocity, direct);
+    assert_eq!(diagnostics.velocity, direct);
+    assert_eq!(diagnostics.sigma, iid.sigma);
 }
 
 // ------------------------------- oracle (secondary) ---------------------------

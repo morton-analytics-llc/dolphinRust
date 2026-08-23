@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-cli"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-core"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "ndarray",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-corrections"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "dolphin-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-filtering"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-ingest"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "futures",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-io"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "gdal",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-phaselink"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "bytemuck",
  "dolphin-core",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-ps"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-shp"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "dolphin-phaselink",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-stack"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "dolphin-core",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-timeseries"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "faer",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-unwrap"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-workflows"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "chrono",

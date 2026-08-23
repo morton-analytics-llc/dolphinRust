@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 rust-version = "1.94"
 license = "MIT"
@@ -47,18 +47,18 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 # Internal crates (version pinned so the workspace is publishable)
-dolphin-core = { path = "crates/dolphin-core", version = "1.5.0" }
-dolphin-io = { path = "crates/dolphin-io", version = "1.5.0" }
-dolphin-phaselink = { path = "crates/dolphin-phaselink", version = "1.5.0", default-features = false }
-dolphin-shp = { path = "crates/dolphin-shp", version = "1.5.0" }
-dolphin-ps = { path = "crates/dolphin-ps", version = "1.5.0" }
-dolphin-stack = { path = "crates/dolphin-stack", version = "1.5.0" }
-dolphin-timeseries = { path = "crates/dolphin-timeseries", version = "1.5.0" }
-dolphin-filtering = { path = "crates/dolphin-filtering", version = "1.5.0" }
-dolphin-unwrap = { path = "crates/dolphin-unwrap", version = "1.5.0" }
-dolphin-corrections = { path = "crates/dolphin-corrections", version = "1.5.0" }
-dolphin-ingest = { path = "crates/dolphin-ingest", version = "1.5.0" }
-dolphin-workflows = { path = "crates/dolphin-workflows", version = "1.5.0", default-features = false }
+dolphin-core = { path = "crates/dolphin-core", version = "1.6.0" }
+dolphin-io = { path = "crates/dolphin-io", version = "1.6.0" }
+dolphin-phaselink = { path = "crates/dolphin-phaselink", version = "1.6.0", default-features = false }
+dolphin-shp = { path = "crates/dolphin-shp", version = "1.6.0" }
+dolphin-ps = { path = "crates/dolphin-ps", version = "1.6.0" }
+dolphin-stack = { path = "crates/dolphin-stack", version = "1.6.0" }
+dolphin-timeseries = { path = "crates/dolphin-timeseries", version = "1.6.0" }
+dolphin-filtering = { path = "crates/dolphin-filtering", version = "1.6.0" }
+dolphin-unwrap = { path = "crates/dolphin-unwrap", version = "1.6.0" }
+dolphin-corrections = { path = "crates/dolphin-corrections", version = "1.6.0" }
+dolphin-ingest = { path = "crates/dolphin-ingest", version = "1.6.0" }
+dolphin-workflows = { path = "crates/dolphin-workflows", version = "1.6.0", default-features = false }
 
 # Enforced idiomatic-Rust standards. Each crate opts in via `[lints] workspace = true`.
 # `cargo clippy --all-targets -- -D warnings` is the per-phase gate.

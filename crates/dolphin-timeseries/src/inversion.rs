@@ -16,13 +16,14 @@ use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use rayon::prelude::*;
 
-/// Full weighted-L2 solution for one pixel. The covariance is kept on demand
+/// Full weighted-L2 solution for one pixel. The parameter-covariance
+/// approximation assumes independent interferogram errors and is kept on demand
 /// rather than materialized as an `n_dates^2 * area` workflow cube.
 #[derive(Debug, Clone)]
 pub struct PixelL2Solution {
     /// Fitted phase parameters.
     pub parameters: Vec<f64>,
-    /// Full posterior parameter covariance.
+    /// Parameter-covariance approximation under an independent-IFG error model.
     pub covariance: Array2<f64>,
     /// Residual root-mean-square in observation units.
     pub residual_rms: f64,
@@ -32,47 +33,91 @@ pub struct PixelL2Solution {
 pub struct L2InversionOutput {
     /// Fitted phase stack.
     pub phase: Array3<f64>,
-    /// Diagonal posterior parameter variance.
+    /// Diagonal parameter-covariance approximation under an independent-IFG
+    /// error model. The legacy field name is retained for API compatibility.
     pub posterior_variance: Array3<f64>,
     /// Residual root-mean-square in observation units.
     pub residual_rms: Array2<f64>,
 }
 
-/// Linear-rate estimate and its one-sigma standard error, both per year.
+/// Linear-rate estimate and its IID-conditional one-sigma standard error, both
+/// per year. The standard error is conditional on the supplied relative
+/// precisions and independent residuals.
 pub struct VelocityOutput {
     /// Linear velocity per year.
     pub velocity: Array2<f64>,
-    /// One-sigma slope uncertainty per year.
+    /// IID-conditional one-sigma slope standard error per year. `NaN` unless
+    /// [`Self::uncertainty_status`] is [`VelocityUncertaintyStatus::IidConditional`].
     pub sigma: Array2<f64>,
     /// Regression residual root-mean-square in series units.
     pub residual_rms: Array2<f64>,
+    /// Number of dates with finite observations and positive finite precision.
+    pub valid_date_count: Array2<u32>,
+    /// Per-pixel weighted design-matrix rank, at most two for intercept plus slope.
+    pub rank: Array2<u32>,
+    /// Residual degrees of freedom, `valid_date_count - rank`.
+    pub regression_dof: Array2<u32>,
+    /// Availability and interpretation of [`Self::sigma`].
+    pub uncertainty_status: Array2<VelocityUncertaintyStatus>,
 }
 
-/// [`VelocityOutput`] plus an opt-in temporal-correlation (N_eff) correction.
-///
-/// InSAR displacement series carry temporally correlated (e.g. atmospheric) noise,
-/// so `dof = n_valid_dates - 2` overstates the number of independent observations
-/// and `sigma` alone understates the true slope uncertainty (Agram & Zebker 2015).
-/// `sigma` is untouched here (regression-safe with [`estimate_velocity_with_uncertainty`]);
-/// `sigma_temporal_corrected` and `inflation_factor` are reported alongside it rather
-/// than silently replacing it, since a larger `sigma` can flip a downstream risk-tier
-/// threshold and that change needs its own reviewed rollout.
-pub struct VelocityOutputNeff {
-    /// Linear velocity per year (identical to [`VelocityOutput::velocity`]).
+/// Interpretation of an IID-conditional velocity standard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VelocityUncertaintyStatus {
+    /// The design is rank deficient, residual DOF is zero, or residual scale is
+    /// zero/non-finite; no IID-conditional slope standard error is reported.
+    Unavailable = 0,
+    /// A full-rank fit with positive residual DOF and positive finite residual
+    /// scale supports the reported IID-conditional slope standard error.
+    IidConditional = 1,
+}
+
+/// Cadence classification used to gate lag-one residual diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VelocityCadenceStatus {
+    /// Fewer than two valid dates are available to classify cadence.
+    Unavailable = 0,
+    /// Every acquisition is valid and consecutive day gaps are exactly equal.
+    RegularContiguous = 1,
+    /// Every acquisition is valid, but consecutive day gaps differ or are invalid.
+    Irregular = 2,
+    /// One or more acquisitions are absent from the otherwise ordered series.
+    Missing = 3,
+}
+
+/// Linear velocity and IID-conditional fit evidence plus non-inferential temporal
+/// correlation diagnostics. The diagnostic inflation and effective sample size
+/// are not standard-error corrections.
+pub struct VelocityDiagnosticsOutput {
+    /// Linear velocity per year.
     pub velocity: Array2<f64>,
-    /// One-sigma slope uncertainty per year, uncorrected (identical to
-    /// [`VelocityOutput::sigma`]).
+    /// IID-conditional one-sigma slope standard error per year.
     pub sigma: Array2<f64>,
-    /// `sigma * inflation_factor` — the temporal-correlation-corrected one-sigma
-    /// slope uncertainty per year.
-    pub sigma_temporal_corrected: Array2<f64>,
-    /// `sqrt(n_valid / n_eff) = sqrt((1 + rho) / (1 - rho))`, `rho` the estimated
-    /// lag-1 residual autocorrelation clamped to `[0, 1)`. `1.0` where residuals are
-    /// uncorrelated or too few to estimate `rho`.
-    pub inflation_factor: Array2<f64>,
-    /// Regression residual root-mean-square in series units (identical to
-    /// [`VelocityOutput::residual_rms`]).
+    /// Regression residual root-mean-square in series units.
     pub residual_rms: Array2<f64>,
+    /// Number of dates with finite observations and positive finite precision.
+    pub valid_date_count: Array2<u32>,
+    /// Per-pixel weighted design-matrix rank.
+    pub rank: Array2<u32>,
+    /// Residual degrees of freedom, `valid_date_count - rank`.
+    pub regression_dof: Array2<u32>,
+    /// Availability and interpretation of [`Self::sigma`].
+    pub uncertainty_status: Array2<VelocityUncertaintyStatus>,
+    /// Raw lag-one correlation of standardized residuals, including negative values.
+    pub lag1_rho: Array2<f64>,
+    /// Number of adjacent residual pairs used for [`Self::lag1_rho`].
+    pub correlation_pair_count: Array2<u32>,
+    /// Exact cadence classification for the valid date sequence.
+    pub cadence_status: Array2<VelocityCadenceStatus>,
+    /// Whether all requirements for the lag-one diagnostics were met.
+    pub correlation_available: Array2<bool>,
+    /// Diagnostic-only `sqrt(n / n_effective)`, with no deflation and effective
+    /// sample size clamped to `[1, n]`. This does not rescale [`Self::sigma`].
+    pub diagnostic_inflation_factor: Array2<f64>,
+    /// Diagnostic-only AR(1) effective sample size clamped to `[1, n]`.
+    pub diagnostic_effective_sample_size: Array2<f64>,
 }
 
 struct PixelUncertaintySummary {
@@ -129,7 +174,8 @@ pub fn invert_stack(
     Array3::from_shape_fn((n_dates, rows, cols), |(d, r, c)| columns[r * cols + c][d])
 }
 
-/// Solve weighted L2 while retaining only covariance diagonals at stack scale.
+/// Solve weighted L2 while retaining only independent-IFG parameter-covariance
+/// diagonals at stack scale.
 #[must_use]
 pub fn invert_stack_with_uncertainty(
     a: ArrayView2<f64>,
@@ -276,7 +322,8 @@ fn solve_pixel(
         .map_or_else(|| vec![f64::NAN; a.ncols()], |value| value.parameters)
 }
 
-/// Solve one L2 pixel and return its full covariance on demand.
+/// Solve one L2 pixel and return its independent-IFG parameter-covariance
+/// approximation on demand.
 #[must_use]
 pub fn solve_pixel_with_covariance(
     a: ArrayView2<f64>,
@@ -360,7 +407,11 @@ pub fn estimate_velocity(
     Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
 }
 
-/// Weighted linear velocity with residual and one-sigma slope uncertainty.
+/// Weighted linear velocity with residual evidence and an IID-conditional slope
+/// standard error. `precisions` are relative weights: multiplying all valid
+/// values at a pixel by one positive constant leaves `sigma` unchanged. The
+/// reported standard error is conditional on those relative precisions and
+/// independent residuals; it is not calibrated by their absolute scale.
 #[must_use]
 pub fn estimate_velocity_with_uncertainty(
     x: &[f64],
@@ -368,66 +419,67 @@ pub fn estimate_velocity_with_uncertainty(
     precisions: ArrayView3<f64>,
 ) -> VelocityOutput {
     let (_, rows, cols) = series.dim();
-    let values: Vec<(f64, f64, f64)> = (0..rows * cols)
+    let values: Vec<PixelUncertaintyFit> = (0..rows * cols)
         .into_par_iter()
-        .map(|idx| velocity_pixel_with_uncertainty(x, series, precisions, (idx / cols, idx % cols)))
+        .map(|idx| velocity_pixel_uncertainty_fit(x, series, precisions, (idx / cols, idx % cols)))
         .collect();
-    let layer = |index: usize| {
-        Array2::from_shape_fn((rows, cols), |(r, c)| {
-            let value = values[r * cols + c];
-            [value.0, value.1, value.2][index]
-        })
-    };
     VelocityOutput {
-        velocity: layer(0),
-        sigma: layer(1),
-        residual_rms: layer(2),
+        velocity: pixel_layer(&values, rows, cols, |fit| fit.velocity_per_year),
+        sigma: pixel_layer(&values, rows, cols, |fit| fit.sigma_per_year),
+        residual_rms: pixel_layer(&values, rows, cols, |fit| fit.residual_rms),
+        valid_date_count: pixel_layer(&values, rows, cols, |fit| fit.valid_date_count),
+        rank: pixel_layer(&values, rows, cols, |fit| fit.rank),
+        regression_dof: pixel_layer(&values, rows, cols, |fit| fit.regression_dof),
+        uncertainty_status: pixel_layer(&values, rows, cols, |fit| fit.uncertainty_status),
     }
 }
 
-/// Weighted linear velocity with uncertainty, plus an opt-in AR(1) temporal-
-/// correlation (N_eff) correction reported alongside the uncorrected `sigma`
-/// (see [`VelocityOutputNeff`]). `velocity`, `sigma`, and `residual_rms` are
-/// identical to [`estimate_velocity_with_uncertainty`]'s output.
+/// Weighted linear velocity with IID-conditional uncertainty evidence and
+/// diagnostic-only lag-one correlation summaries. `sigma` is conditional on
+/// the supplied relative precisions and independent residuals; the correlation
+/// diagnostics do not rescale it.
 #[must_use]
-pub fn estimate_velocity_with_uncertainty_neff(
+pub fn estimate_velocity_with_diagnostics(
     x: &[f64],
     series: ArrayView3<f64>,
     precisions: ArrayView3<f64>,
-) -> VelocityOutputNeff {
+) -> VelocityDiagnosticsOutput {
     let (_, rows, cols) = series.dim();
-    let values: Vec<(f64, f64, f64, f64)> = (0..rows * cols)
+    let values: Vec<PixelVelocityDiagnostics> = (0..rows * cols)
         .into_par_iter()
         .map(|idx| {
-            velocity_pixel_with_temporal_correlation(
-                x,
-                series,
-                precisions,
-                (idx / cols, idx % cols),
-            )
+            let fit =
+                velocity_pixel_uncertainty_fit(x, series, precisions, (idx / cols, idx % cols));
+            let correlation = correlation_diagnostics(&fit);
+            PixelVelocityDiagnostics { fit, correlation }
         })
         .collect();
-    let layer = |index: usize| {
-        Array2::from_shape_fn((rows, cols), |(r, c)| {
-            let value = values[r * cols + c];
-            [value.0, value.1, value.2, value.3][index]
-        })
-    };
-    let sigma = layer(1);
-    let inflation_factor = layer(2);
-    let sigma_temporal_corrected = Array2::from_shape_fn((rows, cols), |(r, c)| {
-        sigma[(r, c)] * inflation_factor[(r, c)]
-    });
-    VelocityOutputNeff {
-        velocity: layer(0),
-        sigma,
-        sigma_temporal_corrected,
-        inflation_factor,
-        residual_rms: layer(3),
+    VelocityDiagnosticsOutput {
+        velocity: pixel_layer(&values, rows, cols, |value| value.fit.velocity_per_year),
+        sigma: pixel_layer(&values, rows, cols, |value| value.fit.sigma_per_year),
+        residual_rms: pixel_layer(&values, rows, cols, |value| value.fit.residual_rms),
+        valid_date_count: pixel_layer(&values, rows, cols, |value| value.fit.valid_date_count),
+        rank: pixel_layer(&values, rows, cols, |value| value.fit.rank),
+        regression_dof: pixel_layer(&values, rows, cols, |value| value.fit.regression_dof),
+        uncertainty_status: pixel_layer(&values, rows, cols, |value| value.fit.uncertainty_status),
+        lag1_rho: pixel_layer(&values, rows, cols, |value| value.correlation.lag1_rho),
+        correlation_pair_count: pixel_layer(&values, rows, cols, |value| {
+            value.correlation.pair_count
+        }),
+        cadence_status: pixel_layer(&values, rows, cols, |value| value.fit.cadence_status),
+        correlation_available: pixel_layer(&values, rows, cols, |value| {
+            value.correlation.available
+        }),
+        diagnostic_inflation_factor: pixel_layer(&values, rows, cols, |value| {
+            value.correlation.inflation_factor
+        }),
+        diagnostic_effective_sample_size: pixel_layer(&values, rows, cols, |value| {
+            value.correlation.effective_sample_size
+        }),
     }
 }
 
-/// Linear velocity using direct observation precisions without uncertainty outputs.
+/// Linear velocity using relative observation precisions without uncertainty outputs.
 #[must_use]
 pub fn estimate_velocity_with_precisions(
     x: &[f64],
@@ -438,20 +490,47 @@ pub fn estimate_velocity_with_precisions(
     let values: Vec<f64> = (0..rows * cols)
         .into_par_iter()
         .map(|idx| {
-            velocity_pixel_with_uncertainty(x, series, precisions, (idx / cols, idx % cols)).0
+            velocity_pixel_uncertainty_fit(x, series, precisions, (idx / cols, idx % cols))
+                .velocity_per_year
         })
         .collect();
     Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
 }
 
-/// Shared weighted-linear fit for one pixel: velocity, uncorrected sigma,
-/// residual RMS, and the in-time-order residuals (feeding the opt-in temporal-
-/// correlation correction). All non-finite when the normal equations are singular.
+fn pixel_layer<T, U: Copy>(
+    values: &[T],
+    rows: usize,
+    cols: usize,
+    pick: impl Fn(&T) -> U,
+) -> Array2<U> {
+    Array2::from_shape_fn((rows, cols), |(row, col)| pick(&values[row * cols + col]))
+}
+
+/// Shared weighted-linear fit for one pixel. The velocity remains available for
+/// a full-rank fit even when the residual evidence cannot support an IID SE.
 struct PixelUncertaintyFit {
     velocity_per_year: f64,
     sigma_per_year: f64,
     residual_rms: f64,
-    residuals: Vec<f64>,
+    valid_date_count: u32,
+    rank: u32,
+    regression_dof: u32,
+    uncertainty_status: VelocityUncertaintyStatus,
+    cadence_status: VelocityCadenceStatus,
+    standardized_residuals: Vec<f64>,
+}
+
+struct PixelCorrelationDiagnostics {
+    lag1_rho: f64,
+    pair_count: u32,
+    available: bool,
+    inflation_factor: f64,
+    effective_sample_size: f64,
+}
+
+struct PixelVelocityDiagnostics {
+    fit: PixelUncertaintyFit,
+    correlation: PixelCorrelationDiagnostics,
 }
 
 fn velocity_pixel_uncertainty_fit(
@@ -463,10 +542,14 @@ fn velocity_pixel_uncertainty_fit(
     let valid = |t: usize| {
         let p = precisions[(t, pixel.0, pixel.1)];
         let y = series[(t, pixel.0, pixel.1)];
-        p.is_finite() && p > 0.0 && y.is_finite()
+        x[t].is_finite() && p.is_finite() && p > 0.0 && y.is_finite()
     };
+    let indices: Vec<_> = (0..x.len()).filter(|&t| valid(t)).collect();
+    let valid_date_count = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+    let cadence_status = velocity_cadence_status(x, &indices);
     let (mut sw, mut swx, mut swxx, mut swy, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for (t, &xt) in x.iter().enumerate().filter(|(t, _)| valid(*t)) {
+    for &t in &indices {
+        let xt = x[t];
         let p = precisions[(t, pixel.0, pixel.1)];
         let y = series[(t, pixel.0, pixel.1)];
         sw += p;
@@ -476,17 +559,27 @@ fn velocity_pixel_uncertainty_fit(
         swxy += p * xt * y;
     }
     let det = sw * swxx - swx * swx;
+    let rank = match (sw.is_finite() && sw > 0.0, det.is_finite() && det > 0.0) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    let regression_dof = valid_date_count.saturating_sub(rank);
     if !det.is_finite() || det <= 0.0 {
         return PixelUncertaintyFit {
             velocity_per_year: f64::NAN,
             sigma_per_year: f64::NAN,
             residual_rms: f64::NAN,
-            residuals: Vec::new(),
+            valid_date_count,
+            rank,
+            regression_dof,
+            uncertainty_status: VelocityUncertaintyStatus::Unavailable,
+            cadence_status,
+            standardized_residuals: Vec::new(),
         };
     }
     let slope = (sw * swxy - swx * swy) / det;
     let intercept = (swy - slope * swx) / sw;
-    let indices: Vec<_> = (0..x.len()).filter(|&t| valid(t)).collect();
     let residuals: Vec<f64> = indices
         .iter()
         .map(|&t| series[(t, pixel.0, pixel.1)] - (intercept + slope * x[t]))
@@ -497,73 +590,117 @@ fn velocity_pixel_uncertainty_fit(
         .map(|(&t, residual)| precisions[(t, pixel.0, pixel.1)] * residual * residual)
         .sum();
     let residual_sse: f64 = residuals.iter().map(|residual| residual * residual).sum();
-    let dof = indices.len().saturating_sub(2);
-    let variance_inflation = if dof == 0 {
-        1.0
-    } else {
-        (weighted_sse / dof as f64).max(1.0)
+    let residual_rms = match residual_sse.is_finite() && !indices.is_empty() {
+        true => (residual_sse / indices.len() as f64).sqrt(),
+        false => f64::NAN,
+    };
+    let residual_scale = match regression_dof {
+        0 => f64::NAN,
+        dof => weighted_sse / f64::from(dof),
+    };
+    let slope_variance = residual_scale * sw / det;
+    let uncertainty_available = rank == 2
+        && regression_dof > 0
+        && residual_scale.is_finite()
+        && residual_scale > 0.0
+        && slope_variance.is_finite()
+        && slope_variance > 0.0;
+    let sigma_per_year = match uncertainty_available {
+        true => slope_variance.sqrt() * 365.25,
+        false => f64::NAN,
+    };
+    let standardized_residuals = match uncertainty_available {
+        true => indices
+            .iter()
+            .zip(&residuals)
+            .map(|(&t, &residual)| {
+                precisions[(t, pixel.0, pixel.1)].sqrt() * residual / residual_scale.sqrt()
+            })
+            .collect(),
+        false => Vec::new(),
     };
     PixelUncertaintyFit {
         velocity_per_year: slope * 365.25,
-        sigma_per_year: (variance_inflation * sw / det).sqrt() * 365.25,
-        residual_rms: (residual_sse / indices.len() as f64).sqrt(),
-        residuals,
+        sigma_per_year,
+        residual_rms,
+        valid_date_count,
+        rank,
+        regression_dof,
+        uncertainty_status: match uncertainty_available {
+            true => VelocityUncertaintyStatus::IidConditional,
+            false => VelocityUncertaintyStatus::Unavailable,
+        },
+        cadence_status,
+        standardized_residuals,
     }
 }
 
-fn velocity_pixel_with_uncertainty(
-    x: &[f64],
-    series: ArrayView3<f64>,
-    precisions: ArrayView3<f64>,
-    pixel: (usize, usize),
-) -> (f64, f64, f64) {
-    let fit = velocity_pixel_uncertainty_fit(x, series, precisions, pixel);
-    (fit.velocity_per_year, fit.sigma_per_year, fit.residual_rms)
+fn velocity_cadence_status(x: &[f64], indices: &[usize]) -> VelocityCadenceStatus {
+    if indices.len() < 2 {
+        return VelocityCadenceStatus::Unavailable;
+    }
+    if indices.len() != x.len() || indices.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+        return VelocityCadenceStatus::Missing;
+    }
+    let cadence = x[1] - x[0];
+    if !cadence.is_finite()
+        || cadence <= 0.0
+        || x.windows(2).any(|pair| pair[1] - pair[0] != cadence)
+    {
+        return VelocityCadenceStatus::Irregular;
+    }
+    VelocityCadenceStatus::RegularContiguous
 }
 
-fn velocity_pixel_with_temporal_correlation(
-    x: &[f64],
-    series: ArrayView3<f64>,
-    precisions: ArrayView3<f64>,
-    pixel: (usize, usize),
-) -> (f64, f64, f64, f64) {
-    let fit = velocity_pixel_uncertainty_fit(x, series, precisions, pixel);
-    let inflation_factor = if fit.sigma_per_year.is_finite() {
-        temporal_correlation_inflation(&fit.residuals)
-    } else {
-        f64::NAN
+fn correlation_diagnostics(fit: &PixelUncertaintyFit) -> PixelCorrelationDiagnostics {
+    let unavailable = || PixelCorrelationDiagnostics {
+        lag1_rho: f64::NAN,
+        pair_count: 0,
+        available: false,
+        inflation_factor: f64::NAN,
+        effective_sample_size: f64::NAN,
     };
-    (
-        fit.velocity_per_year,
-        fit.sigma_per_year,
-        inflation_factor,
-        fit.residual_rms,
-    )
-}
-
-/// Lag-1 sample autocorrelation of `residuals`, clamped to `[0, 0.98]`. Negative
-/// or undersampled estimates do not warrant inflating sigma below the uncorrected
-/// value, and a clamp short of 1.0 keeps the inflation factor finite.
-fn lag1_autocorrelation(residuals: &[f64]) -> f64 {
-    if residuals.len() < 3 {
-        return 0.0;
+    let n = fit.standardized_residuals.len();
+    if fit.uncertainty_status != VelocityUncertaintyStatus::IidConditional
+        || fit.cadence_status != VelocityCadenceStatus::RegularContiguous
+        || n < 4
+        || n != fit.valid_date_count as usize
+        || fit
+            .standardized_residuals
+            .iter()
+            .any(|value| !value.is_finite())
+    {
+        return unavailable();
     }
-    let mean = residuals.iter().sum::<f64>() / residuals.len() as f64;
-    let centered: Vec<f64> = residuals.iter().map(|r| r - mean).collect();
-    let denom: f64 = centered.iter().map(|c| c * c).sum();
-    if denom <= 0.0 {
-        return 0.0;
+    let mean = fit.standardized_residuals.iter().sum::<f64>() / n as f64;
+    let centered: Vec<f64> = fit
+        .standardized_residuals
+        .iter()
+        .map(|residual| residual - mean)
+        .collect();
+    let denominator = centered.iter().map(|value| value * value).sum::<f64>();
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return unavailable();
     }
-    let numer: f64 = centered.windows(2).map(|w| w[0] * w[1]).sum();
-    (numer / denom).clamp(0.0, 0.98)
-}
-
-/// `sqrt((1 + rho) / (1 - rho))` — the AR(1) effective-sample-size inflation
-/// factor for the slope standard error (Zhang et al. 1997; Agram & Zebker 2015),
-/// `rho` the lag-1 residual autocorrelation. `1.0` at `rho == 0`.
-pub(crate) fn temporal_correlation_inflation(residuals: &[f64]) -> f64 {
-    let rho = lag1_autocorrelation(residuals);
-    ((1.0 + rho) / (1.0 - rho)).sqrt()
+    let numerator = centered
+        .windows(2)
+        .map(|pair| pair[0] * pair[1])
+        .sum::<f64>();
+    let rho = numerator / denominator;
+    if !rho.is_finite() {
+        return unavailable();
+    }
+    let n_f64 = n as f64;
+    let applied_rho = rho.clamp(0.0, 1.0);
+    let effective_sample_size =
+        (n_f64 * (1.0 - applied_rho) / (1.0 + applied_rho)).clamp(1.0, n_f64);
+    PixelCorrelationDiagnostics {
+        lag1_rho: rho,
+        pair_count: u32::try_from(n - 1).unwrap_or(u32::MAX),
+        available: true,
+        inflation_factor: (n_f64 / effective_sample_size).sqrt(),
+        effective_sample_size,
+    }
 }
 
 /// Slope of a weighted degree-1 fit (numpy `polyfit` weighting), scaled to /year.

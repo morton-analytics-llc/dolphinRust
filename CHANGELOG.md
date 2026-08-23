@@ -7,6 +7,21 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Breaking changes
+- **Velocity uncertainty is now an uncalibrated IID-conditional component.**
+  `write_velocity_uncertainty` fits the finite post-gauge dates from the final corrected,
+  spatially referenced displacement series with unit relative precision. `velocity_sigma`
+  no longer consumes the stitched CRLB or applies the scalar AR(1) effective-N multiplier.
+  `correct_velocity_temporal_correlation: true` is rejected; the field remains readable only
+  for YAML compatibility. `write_velocity_uncertainty: true` currently supports only the
+  linear model and rejects seasonal or step terms. The public `VelocityOutputNeff` type and
+  `estimate_velocity_with_uncertainty_neff` function are replaced by
+  `VelocityDiagnosticsOutput` and `estimate_velocity_with_diagnostics`. Existing consumers
+  must treat the component as unavailable unless its per-pixel status is `iid_conditional`.
+  Enabling the flag also changes the point velocity from the full reconstructed-series fit using
+  stitched-CRLB relative precision with whole-pixel unit fallback to the unit-weighted post-gauge
+  fit, so served rates can change.
+  `DisplacementOutput.velocity_estimator` and `VELOCITY_ESTIMATOR` metadata expose the exact
+  path. Consumers must compare both estimators in a field canary before enabling the flag.
 - **Modeled but unsupported dolphin config values now fail before input I/O** (issue #50).
   The public config tree has an exhaustive `Consumed` / `Conditional` /
   `CompatibilityOnly` registry. Compatibility-only fields still deserialize and round-trip,
@@ -18,6 +33,16 @@ All notable changes to dolphinRust are documented here. The format follows
   its programmatic configs retain supported defaults.
 
 ### Added
+- **Per-pixel temporal-fit support and diagnostics.** Velocity output now retains valid-date
+  count, regression rank/DOF, uncertainty status, cadence status, raw lag-1 residual
+  correlation, pair count, diagnostic-only inflation, and diagnostic-only effective sample
+  size. The same fields are written as co-registered rasters. Metadata states
+  `TEMPORAL_GAUGE=acquisition_0_excluded`, `TEMPORAL_COVARIANCE=not_modeled`, and
+  `CALIBRATION_STATUS=uncalibrated_component`. Exact-linear fits report the point estimate but
+  abstain on sigma because the residual scale is zero.
+- **Uncertainty COGs now carry physical-unit and spatial-reference metadata.**
+  `velocity_sigma.tif` declares `m/yr` or `rad/yr`; `displacement_variance_NN.tif` declares
+  `m^2` or `rad^2` and states that target/reference covariance is not modeled.
 - **Per-burst layover/shadow masks now enter before covariance and phase linking** (issue
   #50). `layover_shadow_mask_files` accepts one single-band native-grid GTiff per active burst, maps
   OPERA masks by burst ID independent of list order, and rejects missing, duplicate, extra,
@@ -28,6 +53,17 @@ All notable changes to dolphinRust are documented here. The format follows
   reported by GDAL. The later unwrap `mask_file` remains independent.
   GroundPulse does not yet extract or populate these masks; caller wiring requires a separate
   released-engine integration.
+
+### Fixed
+- **Deterministic corrections now precede the final spatial reference.** Atmospheric and tide
+  corrections are applied before subtracting the selected reference history. Automatic whole-
+  frame and bounded selection excludes mask-invalid or non-finite displacement pixels, and the
+  bounded path reselects a target-local reference and refits through the same velocity fitting
+  path. The emitted CRLB is labeled as a changing-reference ministack diagnostic. Displacement
+  variance is labeled as a parameter-covariance diagonal under an independent-IFG error model,
+  which is uncalibrated because the interferograms share acquisitions. Full stitched-reference,
+  corrected temporal, and spatial-reference covariance remain tracked in #52, #53, and #54
+  rather than being inferred from the current products.
 
 ## [v1.5.0] — 2026-08-17
 

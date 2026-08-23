@@ -21,6 +21,7 @@ pub use crop::{BoundsError, ProcessingBoundsProvenance};
 pub use displacement::{
     run_displacement, run_displacement_resumable, run_displacement_with_output_policy,
     update_displacement, DisplacementOutput, DisplacementOutputPolicy, DisplacementState,
+    VelocityEstimator,
 };
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
