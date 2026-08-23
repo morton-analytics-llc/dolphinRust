@@ -20,21 +20,34 @@ pub mod fused;
 pub mod gpu;
 pub mod phasebias;
 pub mod quality;
+pub mod source_influence;
 
 pub use closure::estimate_closure_phases;
-pub use covariance::estimate_stack_covariance;
+pub use covariance::{
+    estimate_stack_covariance, normalize_numerator_jvp, rect_pixel_source_coherence_jvp,
+    rect_source_values_coherence_jvp, replay_rect_pixel_covariance, replay_rect_source_values,
+    CovarianceReplayError, NativeSourcePixel, RectPixelReplay, RectReplayDescriptor,
+};
 pub use crlb::estimate_crlb;
 pub use engine::{ComputeEngine, ResolvedBackend};
 pub use estimator::{
-    process_coherence_matrices, process_coherence_matrix, PixelEstimate, StackEstimate,
+    phase_angle_jvp, process_coherence_matrices, process_coherence_matrix, EstimatorJvpError,
+    FixedEstimatorBranch, PixelEstimate, StackEstimate,
 };
 pub use fused::{
-    all_non_finite_acquisition_indices, link_fused, AverageCoherenceAggregate, FusedEstimate,
-    FusedParams,
+    all_non_finite_acquisition_indices, link_fused, link_fused_with_source_replay,
+    AverageCoherenceAggregate, FixedBranchStatus, FusedEstimate, FusedParams, PhaseReplayGrid,
+    SourceReplayEstimate,
 };
 pub use phasebias::{
     correct_phase_bias, estimate_bias_velocity, mean_abs_closure, residual_closure,
 };
 pub use quality::{
-    average_coherence_per_date, compress, estimate_average_coherence, estimate_temp_coh,
+    average_coherence_per_date, compress, compress_pixel_jvp, compress_with_replay,
+    estimate_average_coherence, estimate_temp_coh, CompressionJvp, CompressionJvpError,
+    CompressionReplayGrid, CompressionReplayStatus,
+};
+pub use source_influence::{
+    InfluenceDag, InfluenceError, InfluenceNode, NodeId, ParentEdge, ProperComplexFactor,
+    SourceDefinition, SourceEdge, SourceId, SourceModelError, TemporalCoordinate,
 };
