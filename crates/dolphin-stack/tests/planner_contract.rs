@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_core::config::CompressedSlcPlan;
-use dolphin_stack::{MiniStack, MiniStackPlanner};
+use dolphin_stack::{resolve_reference_index, MiniStack, MiniStackPlanner};
 use ndarray::Array2;
 
 fn planner(num_slc: usize, max_num_compressed: usize, plan: CompressedSlcPlan) -> MiniStackPlanner {
@@ -70,6 +70,69 @@ fn plan_with_offset_resumes_full_plan() {
 fn rejects_degenerate_size() {
     assert!(planner(10, 10, CompressedSlcPlan::AlwaysFirst)
         .plan(1)
+        .is_err());
+}
+
+#[test]
+fn reference_indices_are_checked_before_consumers_index() {
+    assert_eq!(resolve_reference_index(0, 4).unwrap(), 0);
+    assert_eq!(resolve_reference_index(-1, 4).unwrap(), 3);
+    assert!(resolve_reference_index(-2, 4).is_err());
+    assert!(resolve_reference_index(4, 4).is_err());
+    assert!(resolve_reference_index(-1, 0).is_err());
+
+    let mut p = planner(4, 2, CompressedSlcPlan::AlwaysFirst);
+    p.output_reference_idx = -1;
+    let stack = p.plan(4).unwrap().remove(0);
+    assert_eq!(stack.resolved_output_reference_idx().unwrap(), 3);
+    assert_eq!(stack.resolved_compressed_reference_idx().unwrap(), 3);
+
+    p.output_reference_idx = -2;
+    assert!(p.plan(4).is_err());
+    p.output_reference_idx = 4;
+    assert!(p.plan(4).is_err());
+}
+
+#[test]
+fn block_and_carried_parent_ids_are_global_and_cap_aware() {
+    let stacks = planner(12, 2, CompressedSlcPlan::AlwaysFirst)
+        .plan(3)
+        .unwrap();
+    assert_eq!(
+        stacks
+            .iter()
+            .map(|stack| stack.block_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        stacks
+            .iter()
+            .map(|stack| stack.carried_parent_ids().collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![], vec![0], vec![0, 1], vec![1, 2]],
+    );
+
+    let resumed = planner(3, 2, CompressedSlcPlan::AlwaysFirst)
+        .plan_with_offset(3, 3)
+        .unwrap();
+    assert_eq!(resumed[0].block_id, 3);
+    assert_eq!(
+        resumed[0].carried_parent_ids().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn zero_carry_is_rejected_for_multi_ministack_plans() {
+    assert!(planner(3, 0, CompressedSlcPlan::AlwaysFirst)
+        .plan(3)
+        .is_ok());
+    assert!(planner(6, 0, CompressedSlcPlan::AlwaysFirst)
+        .plan(3)
+        .is_err());
+    assert!(planner(3, 0, CompressedSlcPlan::AlwaysFirst)
+        .plan_with_offset(3, 1)
         .is_err());
 }
 
