@@ -515,6 +515,25 @@ impl CovarianceOperatorGrid {
         usize::try_from(u64::from(self.rows) * u64::from(self.cols))
             .map_err(|_| invalid("covariance operator grid area exceeds usize"))
     }
+
+    fn contains(self, other: Self) -> bool {
+        if self.stride_y != other.stride_y || self.stride_x != other.stride_x {
+            return false;
+        }
+        let self_row_stop = self.row_start.checked_add(u64::from(self.rows));
+        let self_col_stop = self.col_start.checked_add(u64::from(self.cols));
+        let other_row_stop = other.row_start.checked_add(u64::from(other.rows));
+        let other_col_stop = other.col_start.checked_add(u64::from(other.cols));
+        match (self_row_stop, self_col_stop, other_row_stop, other_col_stop) {
+            (Some(sr), Some(sc), Some(or), Some(oc)) => {
+                other.row_start >= self.row_start
+                    && other.col_start >= self.col_start
+                    && or <= sr
+                    && oc <= sc
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Persisted numeric state for one block of the implicit source-keyed replay DAG.
@@ -528,8 +547,11 @@ pub struct CovarianceOperatorBlock {
     pub generation: u32,
     /// Native source/compressed-raster grid.
     pub native_grid: CovarianceOperatorGrid,
-    /// Looked phase/output grid.
+    /// Full looked phase replay grid, including any tile halo needed by owned outputs.
     pub output_grid: CovarianceOperatorGrid,
+    /// Public output rectangle owned by this record; must be contained in
+    /// [`Self::output_grid`]. Halo phase nodes are replay dependencies only.
+    pub owned_output_grid: CovarianceOperatorGrid,
     /// Reference date index used by the block.
     pub reference_date_index: u32,
     /// Ordered raw real-acquisition indices in each native source vector.
@@ -630,8 +652,7 @@ impl CovarianceOperatorBlock {
             "covariance operator phase component map does not match carried parents and source dates",
         )?;
 
-        let native_area = self.native_grid.area()?;
-        let output_area = self.output_grid.area()?;
+        let (native_area, output_area) = self.validate_grids()?;
         for (name, actual) in [
             ("source_ids", self.source_ids.len()),
             ("compressed_node_ids", self.compressed_node_ids.len()),
@@ -677,6 +698,17 @@ impl CovarianceOperatorBlock {
             "nearest_output_map contains an out-of-range index",
         )?;
         Ok(())
+    }
+
+    fn validate_grids(&self) -> Result<(usize, usize)> {
+        let native_area = self.native_grid.area()?;
+        let output_area = self.output_grid.area()?;
+        self.owned_output_grid.area()?;
+        ensure_valid(
+            self.output_grid.contains(self.owned_output_grid),
+            "owned output grid is not contained in replay output grid",
+        )?;
+        Ok((native_area, output_area))
     }
 }
 
@@ -918,6 +950,7 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
     write_string(group, "burst_id", &block.burst_id)?;
     write_grid(group, "native_grid", block.native_grid)?;
     write_grid(group, "output_grid", block.output_grid)?;
+    write_grid(group, "owned_output_grid", block.owned_output_grid)?;
 
     write_chunked_1d(group, "source_date_indices", &block.source_date_indices)?;
     write_chunked_1d(group, "ordered_date_indices", &block.ordered_date_indices)?;
@@ -1042,6 +1075,7 @@ fn read_block(group: &Group) -> Result<CovarianceOperatorBlock> {
         generation: read_scalar_attr(group, "generation")?,
         native_grid: read_grid(group, "native_grid")?,
         output_grid: read_grid(group, "output_grid")?,
+        owned_output_grid: read_grid(group, "owned_output_grid")?,
         reference_date_index: read_scalar_attr(group, "reference_date_index")?,
         source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
         ordered_date_indices: group.dataset("ordered_date_indices")?.read_raw()?,

@@ -68,6 +68,14 @@ fn block() -> CovarianceOperatorBlock {
             stride_y: 2,
             stride_x: 2,
         },
+        owned_output_grid: CovarianceOperatorGrid {
+            row_start: 5,
+            col_start: 11,
+            rows: 1,
+            cols: 1,
+            stride_y: 2,
+            stride_x: 2,
+        },
         reference_date_index: 0,
         source_date_indices: vec![3, 4],
         ordered_date_indices: vec![3, 4],
@@ -153,6 +161,16 @@ fn c52_17_block_operator_hdf5_round_trip_preserves_replay_state() {
     let phase_angles = block_group.dataset("phase_angles").unwrap();
     assert_eq!(phase_angles.shape(), vec![2, 4]);
     assert!(phase_angles.chunk().is_some());
+    assert_eq!(
+        block_group
+            .group("owned_output_grid")
+            .unwrap()
+            .attr("col_start")
+            .unwrap()
+            .read_scalar::<u64>()
+            .unwrap(),
+        11
+    );
 
     std::fs::remove_file(path).unwrap();
 }
