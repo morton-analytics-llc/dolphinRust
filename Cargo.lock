@@ -572,6 +572,8 @@ dependencies = [
  "num-complex",
  "pollster",
  "rayon",
+ "serde",
+ "serde_json",
  "tracing",
  "wgpu",
 ]

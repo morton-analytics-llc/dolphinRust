@@ -33,6 +33,8 @@ no-gpu = []
 
 [dev-dependencies]
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
+serde.workspace = true
+serde_json.workspace = true
 # getrusage CPU·s + max-RSS sampling for the intra-PL microbench (`examples/pl_bench.rs`).
 libc = "0.2"
 
