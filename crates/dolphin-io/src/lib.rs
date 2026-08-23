@@ -23,11 +23,12 @@ pub mod nisar_fixture;
 pub use covariance::{
     read_covariance_operator, CovarianceEstimatorBranch, CovarianceOperatorArtifact,
     CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
-    CovarianceOperatorStatus, CovarianceOperatorWriter, CovarianceRegistryEntry,
-    CovarianceReplayStatus, DownstreamInferenceStatus, SourceReplayIdentity,
-    StitchedCovarianceStatus, COVARIANCE_ESTIMATOR_BRANCH_REGISTRY, COVARIANCE_METHOD_REGISTRY,
-    COVARIANCE_OPERATOR_METHOD, COVARIANCE_OPERATOR_METHOD_VERSION,
-    COVARIANCE_OPERATOR_SCHEMA_VERSION, COVARIANCE_OPERATOR_STATUS_REGISTRY,
+    CovarianceOperatorStatus, CovarianceOperatorWriter, CovariancePhaseComponent,
+    CovariancePhaseComponentKind, CovarianceRegistryEntry, CovarianceReplayStatus,
+    DownstreamInferenceStatus, SourceReplayIdentity, StitchedCovarianceStatus,
+    COVARIANCE_ESTIMATOR_BRANCH_REGISTRY, COVARIANCE_METHOD_REGISTRY, COVARIANCE_OPERATOR_METHOD,
+    COVARIANCE_OPERATOR_METHOD_VERSION, COVARIANCE_OPERATOR_SCHEMA_VERSION,
+    COVARIANCE_OPERATOR_STATUS_REGISTRY, COVARIANCE_PHASE_COMPONENT_KIND_REGISTRY,
     COVARIANCE_REPLAY_STATUS_REGISTRY, DOWNSTREAM_INFERENCE_STATUS_REGISTRY,
     STITCHED_COVARIANCE_STATUS_REGISTRY,
 };

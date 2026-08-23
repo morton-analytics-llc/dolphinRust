@@ -5,9 +5,10 @@ use std::sync::Mutex;
 use dolphin_io::{
     read_covariance_operator, CovarianceEstimatorBranch, CovarianceOperatorBlock,
     CovarianceOperatorGrid, CovarianceOperatorMetadata, CovarianceOperatorStatus,
-    CovarianceOperatorWriter, CovarianceReplayStatus, DownstreamInferenceStatus,
-    SourceReplayIdentity, StitchedCovarianceStatus, COVARIANCE_OPERATOR_METHOD,
-    COVARIANCE_OPERATOR_METHOD_VERSION, COVARIANCE_OPERATOR_SCHEMA_VERSION,
+    CovarianceOperatorWriter, CovariancePhaseComponent, CovariancePhaseComponentKind,
+    CovarianceReplayStatus, DownstreamInferenceStatus, SourceReplayIdentity,
+    StitchedCovarianceStatus, COVARIANCE_OPERATOR_METHOD, COVARIANCE_OPERATOR_METHOD_VERSION,
+    COVARIANCE_OPERATOR_SCHEMA_VERSION,
 };
 use num_complex::Complex64;
 
@@ -49,7 +50,7 @@ fn metadata() -> CovarianceOperatorMetadata {
 fn block() -> CovarianceOperatorBlock {
     CovarianceOperatorBlock {
         burst_id: "t087_185678_iw2".to_owned(),
-        block_id: 7,
+        block_id: 2,
         generation: 2,
         native_grid: CovarianceOperatorGrid {
             row_start: 10,
@@ -68,18 +69,43 @@ fn block() -> CovarianceOperatorBlock {
             stride_x: 2,
         },
         reference_date_index: 0,
-        ordered_date_indices: vec![0, 1, 2],
+        source_date_indices: vec![3, 4],
+        ordered_date_indices: vec![3, 4],
         source_ids: vec![100, 101, 102, 103],
         phase_node_ids: vec![200, 201],
         compressed_node_ids: vec![300, 301, 302, 303],
-        carry_parent_ids: vec![90, 91],
+        carry_parent_ids: vec![0, 1],
         nearest_output_map: vec![0, 0, 1, 1],
-        phase_angles: vec![0.0, 0.1, 0.2, 0.0, 0.3, 0.4],
+        phase_components: vec![
+            CovariancePhaseComponent {
+                kind: CovariancePhaseComponentKind::CompressedParent,
+                id: 0,
+            },
+            CovariancePhaseComponent {
+                kind: CovariancePhaseComponentKind::CompressedParent,
+                id: 1,
+            },
+            CovariancePhaseComponent {
+                kind: CovariancePhaseComponentKind::RetainedDate,
+                id: 3,
+            },
+            CovariancePhaseComponent {
+                kind: CovariancePhaseComponentKind::RetainedDate,
+                id: 4,
+            },
+        ],
+        phase_angles: vec![0.0, 0.1, 0.2, 0.3, 0.0, 0.4, 0.5, 0.6],
         compressed_raster: vec![
             Complex64::new(1.0, 0.0),
             Complex64::new(0.9, 0.1),
             Complex64::new(0.8, 0.2),
             Complex64::new(0.7, 0.3),
+        ],
+        compressed_status: vec![
+            CovarianceOperatorStatus::Valid,
+            CovarianceOperatorStatus::Masked,
+            CovarianceOperatorStatus::InvalidCompression,
+            CovarianceOperatorStatus::Nondifferentiable,
         ],
         projection_accumulator: vec![
             Complex64::new(3.0, 0.2),
@@ -117,19 +143,34 @@ fn c52_17_block_operator_hdf5_round_trip_preserves_replay_state() {
     assert_eq!(artifact.blocks, vec![expected_block]);
 
     let file = hdf5::File::open(&path).unwrap();
-    let block_group = file.group("blocks/00000000000000000007").unwrap();
+    let block_group = file.group("blocks/00000000000000000002").unwrap();
     for dataset_name in block_group.member_names().unwrap() {
         assert!(
             !dataset_name.contains("incidence") && !dataset_name.contains("ancestor"),
             "expanded numeric operator leaked into {dataset_name}"
         );
     }
-    assert!(block_group
-        .dataset("phase_angles")
-        .unwrap()
-        .chunk()
-        .is_some());
+    let phase_angles = block_group.dataset("phase_angles").unwrap();
+    assert_eq!(phase_angles.shape(), vec![2, 4]);
+    assert!(phase_angles.chunk().is_some());
 
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn phase_component_map_rejects_a_carried_parent_mislabeled_as_a_date() {
+    let _hdf5 = HDF5_LOCK.lock().unwrap();
+    let path = temporary_hdf5_path();
+    let mut invalid_block = block();
+    invalid_block.phase_components[1] = CovariancePhaseComponent {
+        kind: CovariancePhaseComponentKind::RetainedDate,
+        id: 1,
+    };
+
+    let mut writer = CovarianceOperatorWriter::create(&path, &metadata()).unwrap();
+    let error = writer.write_block(&invalid_block).unwrap_err().to_string();
+    assert!(error.contains("phase component map"), "{error}");
+    drop(writer);
     std::fs::remove_file(path).unwrap();
 }
 

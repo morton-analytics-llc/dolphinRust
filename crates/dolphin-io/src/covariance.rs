@@ -68,6 +68,60 @@ pub const COVARIANCE_ESTIMATOR_BRANCH_REGISTRY: &[CovarianceRegistryEntry] = &[
     },
 ];
 
+/// Kind of one ordered component in a block's combined phase solution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CovariancePhaseComponentKind {
+    /// The exact acquisition-zero gauge in the first block.
+    GaugeDate = 0,
+    /// A new real acquisition retained in the public date series.
+    RetainedDate = 1,
+    /// A compressed parent block prepended to a later ministack.
+    CompressedParent = 2,
+}
+
+impl CovariancePhaseComponentKind {
+    const fn code(self) -> u16 {
+        self as u16
+    }
+
+    fn from_code(code: u16) -> Result<Self> {
+        match code {
+            0 => Ok(Self::GaugeDate),
+            1 => Ok(Self::RetainedDate),
+            2 => Ok(Self::CompressedParent),
+            _ => Err(invalid(format!(
+                "unknown covariance phase component kind {code}"
+            ))),
+        }
+    }
+}
+
+/// Stable combined-phase-component-kind registry.
+pub const COVARIANCE_PHASE_COMPONENT_KIND_REGISTRY: &[CovarianceRegistryEntry] = &[
+    CovarianceRegistryEntry {
+        code: CovariancePhaseComponentKind::GaugeDate as u16,
+        name: "gauge_date",
+    },
+    CovarianceRegistryEntry {
+        code: CovariancePhaseComponentKind::RetainedDate as u16,
+        name: "retained_date",
+    },
+    CovarianceRegistryEntry {
+        code: CovariancePhaseComponentKind::CompressedParent as u16,
+        name: "compressed_parent",
+    },
+];
+
+/// One ordered component of the production combined phase solution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovariancePhaseComponent {
+    /// Component kind, which determines the identity namespace.
+    pub kind: CovariancePhaseComponentKind,
+    /// Global date index or compact parent block ID according to [`Self::kind`].
+    pub id: u64,
+}
+
 /// Per-output-node validity of the persisted replay state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -478,6 +532,8 @@ pub struct CovarianceOperatorBlock {
     pub output_grid: CovarianceOperatorGrid,
     /// Reference date index used by the block.
     pub reference_date_index: u32,
+    /// Ordered raw real-acquisition indices in each native source vector.
+    pub source_date_indices: Vec<u32>,
     /// Ordered global acquisition-date indices represented by phase angles.
     pub ordered_date_indices: Vec<u32>,
     /// Deterministic primitive-source IDs, one per native pixel.
@@ -486,14 +542,18 @@ pub struct CovarianceOperatorBlock {
     pub phase_node_ids: Vec<u64>,
     /// Deterministic compressed-node IDs, one per native pixel.
     pub compressed_node_ids: Vec<u64>,
-    /// Ordered carried compressed parents from earlier generations.
+    /// Ordered compact parent block IDs from earlier generations.
     pub carry_parent_ids: Vec<u64>,
     /// Native-pixel to nearest looked-output mapping.
     pub nearest_output_map: Vec<u32>,
-    /// Linked phase angles in output-pixel-major, date-minor order.
+    /// Ordered carried-plus-real component map for the linked solution.
+    pub phase_components: Vec<CovariancePhaseComponent>,
+    /// Linked phase angles in output-pixel-major, component-minor order.
     pub phase_angles: Vec<f64>,
     /// Complex compressed SLC raster.
     pub compressed_raster: Vec<Complex64>,
+    /// Stable compression status, one per native pixel.
+    pub compressed_status: Vec<CovarianceOperatorStatus>,
     /// Complex compression projection accumulator.
     pub projection_accumulator: Vec<Complex64>,
     /// Mean amplitude used by compression.
@@ -516,62 +576,86 @@ pub struct CovarianceOperatorBlock {
 
 impl CovarianceOperatorBlock {
     fn validate(&self, gauge_date_index: u32) -> Result<()> {
-        if self.burst_id.is_empty() {
-            return Err(invalid("covariance operator burst_id is empty"));
-        }
-        if self.ordered_date_indices.is_empty() {
-            return Err(invalid("covariance operator block has no dates"));
-        }
-        if self.reference_date_index != gauge_date_index {
-            return Err(invalid(
-                "covariance operator block reference does not match gauge",
-            ));
-        }
-        if self.ordered_date_indices.first() != Some(&gauge_date_index) {
-            return Err(invalid(
-                "covariance operator block dates do not start at the gauge",
-            ));
-        }
-        if self
-            .ordered_date_indices
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
-            return Err(invalid(
-                "covariance operator date indices are not strictly ordered",
-            ));
-        }
+        ensure_valid(!self.burst_id.is_empty(), "empty covariance burst_id")?;
+        let dates_present =
+            !self.source_date_indices.is_empty() && !self.ordered_date_indices.is_empty();
+        ensure_valid(dates_present, "empty covariance source/output date map")?;
+        ensure_valid(
+            self.reference_date_index == gauge_date_index,
+            "gauge mismatch",
+        )?;
+        ensure_valid(
+            strictly_increasing(&self.source_date_indices)
+                && strictly_increasing(&self.ordered_date_indices),
+            "unordered covariance source/output dates",
+        )?;
+        ensure_valid(
+            self.source_date_indices == self.ordered_date_indices,
+            "source/output date maps differ",
+        )?;
+        ensure_valid(
+            strictly_increasing(&self.carry_parent_ids)
+                && self
+                    .carry_parent_ids
+                    .iter()
+                    .all(|&parent| parent < self.block_id),
+            "carried parent IDs are not ordered predecessors",
+        )?;
+        ensure_valid(
+            !self.carry_parent_ids.is_empty()
+                || self.source_date_indices.first() == Some(&gauge_date_index),
+            "first block source omits gauge date",
+        )?;
+        ensure_valid(
+            self.carry_parent_ids.is_empty()
+                || !self.source_date_indices.contains(&gauge_date_index),
+            "later block source repeats gauge date",
+        )?;
+        let parents = self
+            .carry_parent_ids
+            .iter()
+            .map(|&id| (CovariancePhaseComponentKind::CompressedParent, id));
+        let dates = self.source_date_indices.iter().map(|&date| {
+            let kind = match date == gauge_date_index {
+                true => CovariancePhaseComponentKind::GaugeDate,
+                false => CovariancePhaseComponentKind::RetainedDate,
+            };
+            (kind, u64::from(date))
+        });
+        ensure_valid(
+            self.phase_components
+                .iter()
+                .map(|component| (component.kind, component.id))
+                .eq(parents.chain(dates)),
+            "covariance operator phase component map does not match carried parents and source dates",
+        )?;
 
         let native_area = self.native_grid.area()?;
         let output_area = self.output_grid.area()?;
-        check_len("source_ids", self.source_ids.len(), native_area)?;
-        check_len(
-            "compressed_node_ids",
-            self.compressed_node_ids.len(),
-            native_area,
-        )?;
-        check_len(
-            "nearest_output_map",
-            self.nearest_output_map.len(),
-            native_area,
-        )?;
-        check_len(
-            "compressed_raster",
-            self.compressed_raster.len(),
-            native_area,
-        )?;
-        check_len(
-            "projection_accumulator",
-            self.projection_accumulator.len(),
-            native_area,
-        )?;
-        check_len("mean_amplitude", self.mean_amplitude.len(), native_area)?;
-        check_len("phase_node_ids", self.phase_node_ids.len(), output_area)?;
+        for (name, actual) in [
+            ("source_ids", self.source_ids.len()),
+            ("compressed_node_ids", self.compressed_node_ids.len()),
+            ("nearest_output_map", self.nearest_output_map.len()),
+            ("compressed_raster", self.compressed_raster.len()),
+            ("compressed_status", self.compressed_status.len()),
+            ("projection_accumulator", self.projection_accumulator.len()),
+            ("mean_amplitude", self.mean_amplitude.len()),
+        ] {
+            check_len(name, actual, native_area)?;
+        }
+        for (name, actual) in [
+            ("phase_node_ids", self.phase_node_ids.len()),
+            ("selected_eigenvalue", self.selected_eigenvalue.len()),
+            ("eigen_gap", self.eigen_gap.len()),
+            ("status", self.status.len()),
+        ] {
+            check_len(name, actual, output_area)?;
+        }
         check_len(
             "phase_angles",
             self.phase_angles.len(),
             output_area
-                .checked_mul(self.ordered_date_indices.len())
+                .checked_mul(self.phase_components.len())
                 .ok_or_else(|| invalid("phase angle dimensions overflow usize"))?,
         )?;
         check_len(
@@ -586,20 +670,12 @@ impl CovarianceOperatorBlock {
             self.native_validity_bits.len(),
             native_area.div_ceil(8),
         )?;
-        check_len(
-            "selected_eigenvalue",
-            self.selected_eigenvalue.len(),
-            output_area,
+        ensure_valid(
+            self.nearest_output_map
+                .iter()
+                .all(|&index| usize::try_from(index).is_ok_and(|i| i < output_area)),
+            "nearest_output_map contains an out-of-range index",
         )?;
-        check_len("eigen_gap", self.eigen_gap.len(), output_area)?;
-        check_len("status", self.status.len(), output_area)?;
-        if self
-            .nearest_output_map
-            .iter()
-            .any(|&index| usize::try_from(index).map_or(true, |i| i >= output_area))
-        {
-            return Err(invalid("nearest_output_map contains an out-of-range index"));
-        }
         Ok(())
     }
 }
@@ -773,6 +849,10 @@ fn write_registries(file: &hdf5::File) -> Result<()> {
     for (name, registry) in [
         ("method", COVARIANCE_METHOD_REGISTRY),
         ("estimator_branch", COVARIANCE_ESTIMATOR_BRANCH_REGISTRY),
+        (
+            "phase_component_kind",
+            COVARIANCE_PHASE_COMPONENT_KIND_REGISTRY,
+        ),
         ("operator_status", COVARIANCE_OPERATOR_STATUS_REGISTRY),
         ("replay_status", COVARIANCE_REPLAY_STATUS_REGISTRY),
         ("stitched_status", STITCHED_COVARIANCE_STATUS_REGISTRY),
@@ -798,6 +878,10 @@ fn validate_registries(file: &hdf5::File) -> Result<()> {
     for (name, registry) in [
         ("method", COVARIANCE_METHOD_REGISTRY),
         ("estimator_branch", COVARIANCE_ESTIMATOR_BRANCH_REGISTRY),
+        (
+            "phase_component_kind",
+            COVARIANCE_PHASE_COMPONENT_KIND_REGISTRY,
+        ),
         ("operator_status", COVARIANCE_OPERATOR_STATUS_REGISTRY),
         ("replay_status", COVARIANCE_REPLAY_STATUS_REGISTRY),
         ("stitched_status", STITCHED_COVARIANCE_STATUS_REGISTRY),
@@ -835,11 +919,24 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
     write_grid(group, "native_grid", block.native_grid)?;
     write_grid(group, "output_grid", block.output_grid)?;
 
+    write_chunked_1d(group, "source_date_indices", &block.source_date_indices)?;
     write_chunked_1d(group, "ordered_date_indices", &block.ordered_date_indices)?;
     write_chunked_1d(group, "source_ids", &block.source_ids)?;
     write_chunked_1d(group, "phase_node_ids", &block.phase_node_ids)?;
     write_chunked_1d(group, "compressed_node_ids", &block.compressed_node_ids)?;
     write_chunked_1d(group, "carry_parent_ids", &block.carry_parent_ids)?;
+    let phase_component_kinds = block
+        .phase_components
+        .iter()
+        .map(|component| component.kind.code())
+        .collect::<Vec<_>>();
+    let phase_component_ids = block
+        .phase_components
+        .iter()
+        .map(|component| component.id)
+        .collect::<Vec<_>>();
+    write_chunked_1d(group, "phase_component_kinds", &phase_component_kinds)?;
+    write_chunked_1d(group, "phase_component_ids", &phase_component_ids)?;
 
     let native_shape = (
         usize::try_from(block.native_grid.rows).map_err(|_| invalid("native rows exceed usize"))?,
@@ -862,7 +959,7 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
         "phase_angles",
         (
             output_shape.0 * output_shape.1,
-            block.ordered_date_indices.len(),
+            block.phase_components.len(),
         ),
         &block.phase_angles,
     )?;
@@ -871,6 +968,17 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
         "compressed_raster",
         native_shape,
         &block.compressed_raster,
+    )?;
+    let compressed_statuses = block
+        .compressed_status
+        .iter()
+        .map(|status| status.code())
+        .collect::<Vec<_>>();
+    write_chunked_2d(
+        group,
+        "compressed_status",
+        native_shape,
+        &compressed_statuses,
     )?;
     write_chunked_2d(
         group,
@@ -906,6 +1014,28 @@ fn read_block(group: &Group) -> Result<CovarianceOperatorBlock> {
         .into_iter()
         .map(CovarianceOperatorStatus::from_code)
         .collect::<Result<_>>()?;
+    let compressed_status_codes: Vec<u16> = group.dataset("compressed_status")?.read_raw()?;
+    let compressed_status = compressed_status_codes
+        .into_iter()
+        .map(CovarianceOperatorStatus::from_code)
+        .collect::<Result<_>>()?;
+    let phase_component_kinds: Vec<u16> = group.dataset("phase_component_kinds")?.read_raw()?;
+    let phase_component_ids: Vec<u64> = group.dataset("phase_component_ids")?.read_raw()?;
+    if phase_component_kinds.len() != phase_component_ids.len() {
+        return Err(invalid(
+            "covariance phase component kind and ID counts differ",
+        ));
+    }
+    let phase_components = phase_component_kinds
+        .into_iter()
+        .zip(phase_component_ids)
+        .map(|(kind, id)| {
+            Ok(CovariancePhaseComponent {
+                kind: CovariancePhaseComponentKind::from_code(kind)?,
+                id,
+            })
+        })
+        .collect::<Result<_>>()?;
     Ok(CovarianceOperatorBlock {
         burst_id: read_string(group, "burst_id")?,
         block_id: read_scalar_attr(group, "block_id")?,
@@ -913,14 +1043,17 @@ fn read_block(group: &Group) -> Result<CovarianceOperatorBlock> {
         native_grid: read_grid(group, "native_grid")?,
         output_grid: read_grid(group, "output_grid")?,
         reference_date_index: read_scalar_attr(group, "reference_date_index")?,
+        source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
         ordered_date_indices: group.dataset("ordered_date_indices")?.read_raw()?,
         source_ids: group.dataset("source_ids")?.read_raw()?,
         phase_node_ids: group.dataset("phase_node_ids")?.read_raw()?,
         compressed_node_ids: group.dataset("compressed_node_ids")?.read_raw()?,
         carry_parent_ids: group.dataset("carry_parent_ids")?.read_raw()?,
         nearest_output_map: group.dataset("nearest_output_map")?.read_raw()?,
+        phase_components,
         phase_angles: group.dataset("phase_angles")?.read_raw()?,
         compressed_raster: group.dataset("compressed_raster")?.read_raw()?,
+        compressed_status,
         projection_accumulator: group.dataset("projection_accumulator")?.read_raw()?,
         mean_amplitude: group.dataset("mean_amplitude")?.read_raw()?,
         support_bits_per_output: read_scalar_attr(group, "support_bits_per_output")?,
@@ -1029,6 +1162,17 @@ fn check_len(name: &str, actual: usize, expected: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn ensure_valid(condition: bool, message: &'static str) -> Result<()> {
+    if !condition {
+        return Err(invalid(message));
+    }
+    Ok(())
+}
+
+fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn invalid(message: impl Into<String>) -> IoError {
