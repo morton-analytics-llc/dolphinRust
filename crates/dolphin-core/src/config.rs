@@ -313,10 +313,9 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-VELOCITY-MODEL",
         "timeseries_options.write_velocity_uncertainty is true"
     ),
-    conditional!(
+    compatibility_only!(
         "timeseries_options.correct_velocity_temporal_correlation",
-        "CFG-VELOCITY-MODEL",
-        "write_velocity_uncertainty and correct_velocity_temporal_correlation are true"
+        "the scalar effective-sample-size multiplier is retained only for YAML compatibility; it is not a valid inferential slope correction"
     ),
     conditional!(
         "timeseries_options.velocity_seasonal",
@@ -731,20 +730,22 @@ pub struct TimeseriesOptions {
     pub block_shape: (usize, usize),
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub num_parallel_blocks: usize,
-    /// Use CRLB-derived observation precision for L2 SBAS and velocity fits.
+    /// Use stitched CRLB-derived quality weights for L2 SBAS and legacy
+    /// point-only velocity fits. The sequential CRLB cube omits cross-date and
+    /// compressed-reference covariance, so it does not calibrate velocity
+    /// standard errors.
     pub use_coherence_weights: bool,
-    /// Emit L2 posterior displacement variance and residual RMS products.
+    /// Emit the diagonal-IFG L2 covariance approximation and network misclosure
+    /// products. Redundant interferograms share acquisitions, so network residual
+    /// DOF is algebraic diagnostics rather than independent empirical evidence.
     pub write_posterior_uncertainty: bool,
-    /// Emit velocity one-sigma uncertainty.
+    /// Emit the independent-residual conditional slope standard error and raw
+    /// temporal-fit diagnostics from the final corrected, spatially referenced
+    /// displacement series. This is not total or field-calibrated uncertainty.
     pub write_velocity_uncertainty: bool,
-    /// Inflate the velocity one-sigma by the AR(1) effective-sample-size factor
-    /// `sqrt((1+rho)/(1-rho))` (Zhang et al. 1997 / Agram & Zebker 2015), `rho`
-    /// the lag-1 autocorrelation of the velocity-fit residuals. InSAR series
-    /// carry temporally correlated noise, so the uncorrected sigma understates
-    /// the slope uncertainty. **Forward divergence from dolphin, opt-in and off
-    /// by default** — a larger sigma can flip a downstream risk-tier threshold,
-    /// so enabling it is the reviewed rollout. Requires
-    /// `write_velocity_uncertainty`.
+    /// Deprecated YAML compatibility field. A scalar effective-sample-size
+    /// multiplier is not a valid slope-variance correction for an irregular,
+    /// heteroskedastic series, so non-default values are rejected.
     pub correct_velocity_temporal_correlation: bool,
     /// Fit an annual sinusoid (period 365.25 d) jointly with the linear rate, so
     /// a real seasonal cycle (groundwater, thermal) is reported as an amplitude
@@ -1290,6 +1291,11 @@ impl DisplacementWorkflow {
                 "timeseries_options.write_posterior_uncertainty requires timeseries_options.method: l2".into(),
             ));
         }
+        require_compatibility_default!(
+            self,
+            defaults,
+            timeseries_options.correct_velocity_temporal_correlation
+        );
         require_compatibility_default!(self, defaults, output_options.add_overviews);
         require_compatibility_default!(self, defaults, output_options.overview_levels);
         require_compatibility_default!(self, defaults, ps_options.amp_dispersion_threshold);

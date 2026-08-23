@@ -544,6 +544,10 @@ fn compatibility_only_cases() -> Vec<(&'static str, MutateConfig)> {
         ("timeseries_options.num_parallel_blocks", |c| {
             c.timeseries_options.num_parallel_blocks = 2
         }),
+        (
+            "timeseries_options.correct_velocity_temporal_correlation",
+            |c| c.timeseries_options.correct_velocity_temporal_correlation = true,
+        ),
         ("worker_settings.gpu_enabled", |c| {
             c.worker_settings.gpu_enabled = true
         }),

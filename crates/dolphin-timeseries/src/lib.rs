@@ -13,10 +13,11 @@ pub mod reference;
 pub mod velocity_model;
 
 pub use inversion::{
-    estimate_velocity, estimate_velocity_with_precisions, estimate_velocity_with_uncertainty,
-    estimate_velocity_with_uncertainty_neff, get_incidence_matrix, invert_stack, invert_stack_l1,
+    estimate_velocity, estimate_velocity_with_diagnostics, estimate_velocity_with_precisions,
+    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
     invert_stack_with_uncertainty, solve_pixel_with_covariance, L1Config, L2InversionOutput,
-    PixelL2Solution, VelocityOutput, VelocityOutputNeff,
+    PixelL2Solution, VelocityCadenceStatus, VelocityDiagnosticsOutput, VelocityOutput,
+    VelocityUncertaintyStatus,
 };
 pub use loop_closure::{
     loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, Triplet,

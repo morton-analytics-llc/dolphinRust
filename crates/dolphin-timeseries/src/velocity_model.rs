@@ -11,9 +11,8 @@
 //! This module fits those terms **jointly** with the rate in one weighted
 //! least-squares solve, so the rate is the rate and the rest is reported
 //! separately. It is a **forward divergence from the pinned dolphin oracle**
-//! (dolphin does not do this), following the `correct_phase_bias` /
-//! `correct_velocity_temporal_correlation` precedent: config-gated and off by
-//! default, so the parity-critical path is untouched. With
+//! (dolphin does not do this), config-gated and off by default, so the
+//! parity-critical path is untouched. With
 //! [`VelocityModel::is_linear`] the caller stays on the existing degree-1
 //! functions — there is no "linear through the general path" to drift.
 //!
@@ -28,8 +27,6 @@ use faer::prelude::SpSolver;
 use faer::{Mat, Side};
 use ndarray::{Array2, ArrayView3};
 use rayon::prelude::*;
-
-use crate::inversion::temporal_correlation_inflation;
 
 /// Days in a Julian year — the period of the seasonal basis and the rate scaling.
 const DAYS_PER_YEAR: f64 = 365.25;
@@ -88,12 +85,9 @@ impl VelocityModel {
 pub struct VelocityModelOutput {
     /// Linear rate per year, with the optional terms fitted out.
     pub velocity: Array2<f64>,
-    /// One-sigma rate uncertainty per year.
+    /// IID-conditional one-sigma rate standard error per year. This is `NaN`
+    /// when the fitted residual scale is zero or non-finite.
     pub sigma: Array2<f64>,
-    /// AR(1) effective-sample-size inflation of `sigma`, from this model's
-    /// residuals (`1.0` when uncorrelated). The caller applies it or not, exactly
-    /// as with [`VelocityOutputNeff`](crate::inversion::VelocityOutputNeff).
-    pub inflation_factor: Array2<f64>,
     /// Regression residual root-mean-square in series units.
     pub residual_rms: Array2<f64>,
     /// `hypot(a, b)` of the annual `a·sin + b·cos` pair, series units — the
@@ -113,7 +107,6 @@ struct PixelModelFit {
     parameters: Vec<f64>,
     sigma_per_year: f64,
     residual_rms: f64,
-    inflation_factor: f64,
 }
 
 /// Joint weighted least-squares fit of the rate and the configured optional
@@ -153,7 +146,6 @@ pub fn estimate_velocity_with_model(
     VelocityModelOutput {
         velocity: layer(&|fit| fit.parameters[1] * DAYS_PER_YEAR),
         sigma: layer(&|fit| fit.sigma_per_year),
-        inflation_factor: layer(&|fit| fit.inflation_factor),
         residual_rms: layer(&|fit| fit.residual_rms),
         seasonal_amplitude: model
             .seasonal
@@ -228,17 +220,20 @@ fn pixel_model_fit(
         .map(|(&t, r)| precision(t) * r * r)
         .sum();
     let residual_sse: f64 = residuals.iter().map(|r| r * r).sum();
-    let inflation = (weighted_sse / (valid.len() - n) as f64).max(1.0);
+    let residual_scale = weighted_sse / (valid.len() - n) as f64;
     // Rate variance is the (1,1) entry of the inverted normal matrix; solving
     // against e1 costs one back-substitution instead of a full inverse.
     let unit_rate = Mat::from_fn(n, 1, |i, _| f64::from(i == 1));
-    let rate_variance = llt.solve(unit_rate)[(1, 0)] * inflation;
+    let rate_variance = llt.solve(unit_rate)[(1, 0)] * residual_scale;
+    let sigma_per_year = match rate_variance.is_finite() && rate_variance > 0.0 {
+        true => rate_variance.sqrt() * DAYS_PER_YEAR,
+        false => f64::NAN,
+    };
 
     PixelModelFit {
         parameters,
-        sigma_per_year: rate_variance.sqrt() * DAYS_PER_YEAR,
+        sigma_per_year,
         residual_rms: (residual_sse / valid.len() as f64).sqrt(),
-        inflation_factor: temporal_correlation_inflation(&residuals),
     }
 }
 
@@ -247,7 +242,6 @@ fn singular_fit(n: usize) -> PixelModelFit {
         parameters: vec![f64::NAN; n],
         sigma_per_year: f64::NAN,
         residual_rms: f64::NAN,
-        inflation_factor: f64::NAN,
     }
 }
 

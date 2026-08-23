@@ -1251,3 +1251,45 @@ ROWS=512 NSLC=16 ITERS=1 FUSED_ONLY=1 STRIDE_Y=3 STRIDE_X=6 AVERAGE_COH=1 \
   cargo run --release --example pl_bench -p dolphin-phaselink \
   --no-default-features --features no-gpu
 ```
+
+## Velocity uncertainty contract correction (2026-08-23)
+
+The July/August sections that recommend an unweighted or over-determined posterior, describe
+that posterior as empirical, or apply the scalar effective-N correction contain superseded
+uncertainty interpretations. Their measured artifacts remain historical evidence.
+Interferograms share acquisition errors, so redundant edges do not add independent statistical
+observations. The sequential CRLB cube changes compressed ministack references without
+propagating their covariance or cross-date terms, so it is not a global per-date covariance
+matrix.
+
+The replacement is narrower:
+
+- deterministic corrections run before the final spatial reference;
+- acquisition 0 is treated as a structural gauge and excluded from stochastic fitting;
+- finite post-gauge dates are fit with unit relative precision;
+- enabling `write_velocity_uncertainty` therefore changes the point estimator as well as adding
+  evidence: the prior default is full-series stitched-CRLB-relative weighting with whole-pixel
+  unit fallback, while the enabled estimator is post-gauge unit-weighted. Estimator identity is
+  explicit and a consumer must compare both in a field canary before enabling it;
+- `velocity_sigma` is the independent-residual conditional slope SE from
+  `s^2 (X'X)^-1`, with `s^2 = SSE / (n_valid - 2)`;
+- exact-linear, rank-deficient, and zero-DOF fits retain any supported point estimate but report
+  the component unavailable;
+- missing post-gauge dates are excluded from the fit, classify cadence as `missing`, and disable
+  lag-1 diagnostics without automatically suppressing an otherwise supported IID component;
+- an uncertainty-enabled workflow rejects a missing or non-exact final spatial reference;
+- whole-frame and bounded automatic reference selection excludes mask-invalid or non-finite
+  displacement candidates;
+- lag-1 correlation, pair count, cadence, diagnostic inflation, and effective N are retained
+  without changing sigma;
+- the parameter-covariance diagonal under an independent-IFG error model and the stitched CRLB
+  remain quality/network diagnostics and carry no calibrated, empirical, corrected-temporal,
+  or total-uncertainty claim. Its spatial-reference propagation adds marginal target/reference
+  variances without their covariance and says so in artifact metadata.
+
+The analytic contracts cover closed-form slope SE, scale invariance of relative weights, no
+residual floor, gauge exclusion, exact final-reference abstention, CRLB invariance, cadence and
+missing-date states, negative raw correlation without deflation, bounded re-reference/refit,
+mask propagation, and output metadata. These are implementation contracts, not field
+calibration. dolphinRust #52 owns compressed-reference/cross-date covariance. #53 owns selection
+and preregistered coverage validation of any future temporal-covariance slope estimator.

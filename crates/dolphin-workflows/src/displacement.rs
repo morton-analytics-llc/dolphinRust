@@ -24,11 +24,11 @@ use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
 use dolphin_timeseries::{
-    build_network, estimate_velocity, estimate_velocity_with_model,
-    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
-    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
-    loop_closure_qc, mask_failed_loops, network_triplets, reference_to_point,
-    select_reference_point, L1Config, LoopClosureQc, NetworkConfig, VelocityModel,
+    build_network, estimate_velocity, estimate_velocity_with_diagnostics,
+    estimate_velocity_with_model, estimate_velocity_with_uncertainty, get_incidence_matrix,
+    invert_stack, invert_stack_l1, invert_stack_with_uncertainty, loop_closure_qc,
+    mask_failed_loops, network_triplets, reference_to_point, select_reference_point, L1Config,
+    LoopClosureQc, NetworkConfig, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
     DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
@@ -82,6 +82,43 @@ pub enum StitchError {
     },
 }
 
+/// Point estimator used for the emitted linear velocity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VelocityEstimator {
+    /// Full reconstructed series, ordinary least squares.
+    LinearFullSeriesUnitPrecision,
+    /// Full reconstructed series, weighted by stitched-CRLB-derived relative
+    /// precision where every date has a finite bound, with unit precision for
+    /// an entire pixel otherwise. The stitched CRLB is not global calibrated
+    /// covariance.
+    LinearFullSeriesStitchedCrlbWithUnitFallback,
+    /// Finite post-gauge dates, ordinary least squares. This is selected when
+    /// the IID-conditional velocity component is enabled.
+    LinearPostGaugeUnitPrecision,
+    /// Full reconstructed series with configured seasonal/step terms and unit
+    /// relative precision.
+    TimeFunctionFullSeriesUnitPrecision,
+    /// Full reconstructed series with configured seasonal/step terms and
+    /// stitched-CRLB-derived relative precision with whole-pixel unit fallback.
+    TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
+}
+
+impl VelocityEstimator {
+    const fn metadata_value(self) -> &'static str {
+        match self {
+            Self::LinearFullSeriesUnitPrecision => "linear_full_series_unit_precision",
+            Self::LinearFullSeriesStitchedCrlbWithUnitFallback => {
+                "linear_full_series_stitched_crlb_with_unit_fallback"
+            }
+            Self::LinearPostGaugeUnitPrecision => "linear_post_gauge_unit_precision",
+            Self::TimeFunctionFullSeriesUnitPrecision => "time_function_full_series_unit_precision",
+            Self::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback => {
+                "time_function_full_series_stitched_crlb_with_unit_fallback"
+            }
+        }
+    }
+}
+
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
 pub struct DisplacementOutput {
     /// Per-date cumulative displacement, `(n_dates-1, rows, cols)`, referenced
@@ -91,13 +128,23 @@ pub struct DisplacementOutput {
     /// Linear velocity per pixel in raster units/year (m/yr with wavelength,
     /// else rad/yr), `(rows, cols)`.
     pub velocity: Array2<f64>,
-    /// Linear velocity per pixel in **mm/yr** (the rate eo stores for risk
-    /// scoring). Derived from the LOS phase rate via `-λ/4π`, using the config
-    /// wavelength or the Sentinel-1 default, `(rows, cols)`.
+    /// Exact point-estimator identity for [`Self::velocity`] and
+    /// [`Self::velocity_mm_yr`].
+    pub velocity_estimator: VelocityEstimator,
+    /// Linear LOS ground velocity per pixel in **mm/yr**. GroundPulse may retain
+    /// this as local motion evidence, but it is not asset response or asset risk.
+    /// Derived from the LOS phase rate via `-λ/4π`, using the config wavelength
+    /// or the Sentinel-1 default, `(rows, cols)`.
     pub velocity_mm_yr: Array2<f64>,
-    /// One-sigma linear-rate uncertainty in the same units/year as `velocity`.
+    /// Independent-residual conditional linear-rate standard error in the same
+    /// units/year as `velocity`. This is not total or field-calibrated uncertainty.
     pub velocity_sigma: Option<Array2<f64>>,
-    /// L2 posterior displacement variance in the same units squared as `displacement`.
+    /// Per-pixel temporal-fit support and non-inferential correlation diagnostics.
+    pub velocity_diagnostics: Option<VelocityTemporalDiagnostics>,
+    /// L2 network-parameter covariance diagonal under an independent-IFG error
+    /// assumption, in the same units squared as `displacement`. Interferograms
+    /// sharing acquisitions are correlated, so this is not a calibrated posterior
+    /// or independent empirical uncertainty.
     pub displacement_variance: Option<Array3<f64>>,
     /// SBAS network-inversion misclosure RMS (residual of `A*phi = dphi` in the
     /// same units as `displacement`) — how well the interferogram network
@@ -124,10 +171,11 @@ pub struct DisplacementOutput {
     pub phase_linking_coherence: Option<Array2<f64>>,
     /// Pixels with complete temporal input support after burst mosaicking and trim.
     pub validity_mask: Array2<bool>,
-    /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
-    /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
-    /// feeds GroundPulse's `confidence_score`. `None` when `phase_linking.write_crlb`
-    /// is off. Present by default (dolphin defaults `write_crlb = true`).
+    /// Per-ministack marginal CRLB phase-estimate σ (radians), stitched as
+    /// `(n_dates, rows, cols)`. Band 0 is a structural gauge zero and later
+    /// ministacks use changing compressed references; cross-date covariance is
+    /// not propagated. This is a quality diagnostic, not global per-date or
+    /// predictive uncertainty. `None` when `phase_linking.write_crlb` is off.
     pub crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet nearest-neighbour closure phase (radians), band-major; the
     /// non-closure diagnostic. `None` unless `phase_linking.write_closure_phase`
@@ -166,6 +214,32 @@ pub struct DisplacementOutput {
     /// eo #120), mirrored on disk as `geometry_provenance.json`. Always present;
     /// unsourceable fields are explicitly absent inside it, never defaulted.
     pub geometry_provenance: GeometryProvenance,
+}
+
+/// Temporal-fit evidence emitted with [`DisplacementOutput::velocity_sigma`].
+/// Correlation-derived fields are diagnostics only and never rescale the standard error.
+#[derive(Debug, PartialEq)]
+pub struct VelocityTemporalDiagnostics {
+    /// Number of finite post-gauge dates used by the fit.
+    pub valid_date_count: Array2<u32>,
+    /// Rank of the intercept-plus-slope design.
+    pub regression_rank: Array2<u32>,
+    /// Residual degrees of freedom, `valid_date_count - regression_rank`.
+    pub regression_dof: Array2<u32>,
+    /// Availability and interpretation of the conditional standard error.
+    pub uncertainty_status: Array2<VelocityUncertaintyStatus>,
+    /// Raw lag-one correlation of standardized residuals.
+    pub lag1_rho: Array2<f64>,
+    /// Number of adjacent residual pairs used for `lag1_rho`.
+    pub correlation_pair_count: Array2<u32>,
+    /// Cadence classification gating lag-one diagnostics.
+    pub cadence_status: Array2<VelocityCadenceStatus>,
+    /// Whether the lag-one diagnostics passed their support gates.
+    pub correlation_available: Array2<bool>,
+    /// Diagnostic-only no-deflation factor; it does not rescale `velocity_sigma`.
+    pub diagnostic_inflation_factor: Array2<f64>,
+    /// Diagnostic-only effective sample size clamped to `[1, valid_date_count]`.
+    pub diagnostic_effective_sample_size: Array2<f64>,
 }
 
 /// Current and high-water resident memory from Linux procfs, in KiB. Zeros mean
@@ -273,9 +347,10 @@ pub fn run_displacement_with_output_policy(
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
-/// inversion → reference → atmospheric corrections → velocity → write COGs.
+/// inversion → atmospheric corrections → reference → velocity → write COGs.
 /// Identical for a full run and an incremental update — both feed it the same
 /// per-burst phase-linking products, so both produce the same output.
+#[allow(clippy::too_many_lines)]
 fn finish_displacement(
     cfg: &DisplacementWorkflow,
     bursts: Vec<BurstLink>,
@@ -337,28 +412,44 @@ fn finish_displacement(
     })?;
     let (mut inversion, loop_closure) =
         solve_time_series(cfg, unwrap.unwrapped, &pairs, stitched.crlb_sigma.as_ref())?;
-    // Spatially reference the series to a stable pixel (dolphin parity): the
-    // configured point, else the center-of-mass of the high-coherence region.
-    let analysis_reference_point = configured_reference.or_else(|| {
-        select_reference_point(
-            temporal_coherence.view(),
-            cfg.timeseries_options.correlation_threshold,
-        )
-    });
-    if let Some(point) = analysis_reference_point {
-        reference_to_point(&mut inversion.displacement, point);
-    }
-    // Atmospheric corrections subtract per-date delay from the inverted series,
-    // before velocity (opt-in; no-op when no correction files are configured).
+    // Atmospheric corrections subtract per-date delay from the inverted series
+    // before the final spatial reference and velocity. Reference selection runs
+    // on the corrected series so it cannot choose a high-coherence pixel whose
+    // displacement became non-finite.
     let date_files = first_burst_files(cfg, &groups);
-    let corrections = timed("corrections", || {
-        apply_corrections(
-            &cfg.correction_options,
-            cfg.input_options.wavelength,
+    let (corrections, analysis_reference_point) = timed("corrections", || {
+        correct_then_reference(
             &mut inversion.displacement,
-            &date_files,
-            epsg.unwrap_or(0),
-            geotransform,
+            |displacement| {
+                apply_corrections(
+                    &cfg.correction_options,
+                    cfg.input_options.wavelength,
+                    displacement,
+                    &date_files,
+                    epsg.unwrap_or(0),
+                    geotransform,
+                )
+            },
+            |displacement| {
+                if let Some(point) = configured_reference {
+                    anyhow::ensure!(
+                        reference_pixel_is_valid(validity_mask.view(), displacement, point),
+                        "timeseries_options.reference_point has non-finite corrected displacement"
+                    );
+                    return Ok(Some(point));
+                }
+                let selected = select_valid_reference_point(
+                    temporal_coherence.view(),
+                    validity_mask.view(),
+                    displacement,
+                    cfg.timeseries_options.correlation_threshold,
+                );
+                anyhow::ensure!(
+                    selected.is_some() || !cfg.timeseries_options.write_velocity_uncertainty,
+                    "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
+                );
+                Ok(selected)
+            },
         )
     })?;
     let (velocity_model, fit) = frame_velocity(
@@ -366,11 +457,13 @@ fn finish_displacement(
         inversion.displacement.view(),
         &days,
         stitched.crlb_sigma.as_ref(),
+        analysis_reference_point,
         &date_files,
     )?;
     let spatial = SpatialProducts {
         disp_rad: inversion.displacement,
         vel_rad: fit.velocity,
+        velocity_estimator: fit.estimator,
         velocity_model,
         velocity_terms: fit.terms,
         loop_closure,
@@ -385,12 +478,58 @@ fn finish_displacement(
         network_misclosure_rad: inversion.network_misclosure_rms,
         timeseries_residual_rad: fit.residual_rms,
         velocity_sigma_rad: fit.sigma,
+        velocity_diagnostics: fit.diagnostics,
         interferogram_pairs: pairs,
         unwrap_connected_components: unwrap.connected_components,
         geotransform,
         reference_point: analysis_reference_point,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
+}
+
+fn correct_then_reference(
+    displacement: &mut Array3<f64>,
+    correct: impl FnOnce(&mut Array3<f64>) -> Result<CorrectionLayers>,
+    select_reference: impl FnOnce(ArrayView3<f64>) -> Result<Option<(usize, usize)>>,
+) -> Result<(CorrectionLayers, Option<(usize, usize)>)> {
+    let corrections = correct(displacement)?;
+    let reference_point = select_reference(displacement.view())?;
+    if let Some(point) = reference_point {
+        reference_to_point(displacement, point);
+    }
+    Ok((corrections, reference_point))
+}
+
+fn reference_pixel_is_valid(
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+    point: (usize, usize),
+) -> bool {
+    validity_mask[point]
+        && displacement
+            .axis_iter(Axis(0))
+            .all(|band| band[point].is_finite())
+}
+
+fn select_valid_reference_point(
+    quality: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+    threshold: f64,
+) -> Option<(usize, usize)> {
+    if quality.dim() != validity_mask.dim()
+        || quality.dim() != (displacement.dim().1, displacement.dim().2)
+    {
+        return None;
+    }
+    let eligible_quality = Array2::from_shape_fn(quality.dim(), |point| {
+        if reference_pixel_is_valid(validity_mask, displacement, point) {
+            quality[point]
+        } else {
+            f64::NAN
+        }
+    });
+    select_reference_point(eligible_quality.view(), threshold)
 }
 
 struct InversionProducts {
@@ -469,28 +608,6 @@ fn invert_time_series(
     }
 }
 
-/// Weighted velocity and its one-sigma, applying the opt-in AR(1)
-/// temporal-correlation inflation when configured. The residual RMS is
-/// identical between the two branches (the correction rescales sigma, not the
-/// fit), so it is returned once alongside whichever sigma was requested.
-fn velocity_and_sigma(
-    correct_temporal_correlation: bool,
-    days: &[f64],
-    series: ArrayView3<f64>,
-    precision: ArrayView3<f64>,
-) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-    if !correct_temporal_correlation {
-        let output = estimate_velocity_with_uncertainty(days, series, precision);
-        return (output.velocity, output.sigma, output.residual_rms);
-    }
-    let output = estimate_velocity_with_uncertainty_neff(days, series, precision);
-    (
-        output.velocity,
-        output.sigma_temporal_corrected,
-        output.residual_rms,
-    )
-}
-
 /// Optional velocity time-function terms, in the same phase units (rad) as the
 /// velocity fit — except `seasonal_phase_days`, which is days. Empty unless
 /// `timeseries_options.velocity_seasonal` / `velocity_step_dates` are configured.
@@ -505,7 +622,9 @@ struct VelocityTerms {
 /// whole-frame and bounded/tiled paths cannot drift apart.
 struct VelocityFit {
     velocity: Array2<f64>,
+    estimator: VelocityEstimator,
     sigma: Option<Array2<f64>>,
+    diagnostics: Option<VelocityTemporalDiagnostics>,
     /// Temporal motion-model fit residual RMS: the per-pixel scatter of
     /// displacement around the fitted rate (+ seasonal/step terms), in the same
     /// units as `displacement` (issue #40). Distinct from the SBAS
@@ -679,11 +798,12 @@ fn frame_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     crlb_sigma: Option<&Array3<f64>>,
+    reference_point: Option<(usize, usize)>,
     date_files: &[PathBuf],
 ) -> Result<(VelocityModel, VelocityFit)> {
     let model = velocity_model(cfg, date_files)?;
     let fit = timed("velocity", || {
-        fit_velocity(cfg, displacement, days, crlb_sigma, &model)
+        fit_velocity(cfg, displacement, days, crlb_sigma, reference_point, &model)
     })?;
     Ok((model, fit))
 }
@@ -693,30 +813,73 @@ fn fit_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     crlb_sigma: Option<&Array3<f64>>,
+    reference_point: Option<(usize, usize)>,
     model: &VelocityModel,
 ) -> Result<VelocityFit> {
-    let weighted = cfg.timeseries_options.use_coherence_weights
-        || cfg.timeseries_options.write_velocity_uncertainty;
-    if !weighted && model.is_linear() {
+    let options = &cfg.timeseries_options;
+    if options.write_velocity_uncertainty {
+        anyhow::ensure!(
+            model.is_linear(),
+            "velocity uncertainty is validated only for the linear temporal model"
+        );
+        let reference = reference_point
+            .context("velocity uncertainty requires a final spatial reference point")?;
+        anyhow::ensure!(
+            displacement
+                .axis_iter(Axis(0))
+                .all(|band| band[reference] == 0.0),
+            "velocity uncertainty requires an exact zero at the final spatial reference"
+        );
+        anyhow::ensure!(
+            days.len() == displacement.dim().0 + 1,
+            "velocity dates do not match the displacement series"
+        );
+        let series = series_with_reference(displacement);
+        let post_gauge = series.slice(s![1.., .., ..]);
+        let precision = post_gauge.mapv(|value| f64::from(value.is_finite()));
+        let output = estimate_velocity_with_diagnostics(&days[1..], post_gauge, precision.view());
+        return Ok(VelocityFit {
+            velocity: output.velocity,
+            estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            sigma: Some(output.sigma),
+            diagnostics: Some(VelocityTemporalDiagnostics {
+                valid_date_count: output.valid_date_count,
+                regression_rank: output.rank,
+                regression_dof: output.regression_dof,
+                uncertainty_status: output.uncertainty_status,
+                lag1_rho: output.lag1_rho,
+                correlation_pair_count: output.correlation_pair_count,
+                cadence_status: output.cadence_status,
+                correlation_available: output.correlation_available,
+                diagnostic_inflation_factor: output.diagnostic_inflation_factor,
+                diagnostic_effective_sample_size: output.diagnostic_effective_sample_size,
+            }),
+            residual_rms: Some(output.residual_rms),
+            terms: VelocityTerms::default(),
+        });
+    }
+    if !options.use_coherence_weights && model.is_linear() {
         // The cheapest path: no precision, no fit statistics at all. Computing a
         // residual here would mean fitting a second, otherwise-unneeded model per
         // pixel just to report it, so this path stays a rate-only estimate,
         // matching `sigma`'s existing `None` rule.
         return Ok(VelocityFit {
             velocity: velocity_of(displacement, days),
+            estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             sigma: None,
+            diagnostics: None,
             residual_rms: None,
             terms: VelocityTerms::default(),
         });
     }
     let series = series_with_reference(displacement);
-    if !weighted {
+    if !options.use_coherence_weights {
         return Ok(fit_velocity_with_model(
-            cfg,
             days,
             series.view(),
             None,
             model,
+            VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
         ));
     }
     let sigma = crlb_sigma
@@ -725,60 +888,43 @@ fn fit_velocity(
     let valid = uncertainty_valid(sigma);
     let precision = date_precisions(sigma, valid.view());
     if !model.is_linear() {
-        let mut fit =
-            fit_velocity_with_model(cfg, days, series.view(), Some(precision.view()), model);
-        if let Some(sigma) = fit.sigma.as_mut() {
-            clear_unbounded_uncertainty(sigma, valid.view());
-        }
-        return Ok(fit);
+        return Ok(fit_velocity_with_model(
+            days,
+            series.view(),
+            Some(precision.view()),
+            model,
+            VelocityEstimator::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
+        ));
     }
-    if !cfg.timeseries_options.write_velocity_uncertainty {
-        // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
-        // (velocity is bit-identical); the uncertainty variant is used instead so
-        // the residual it already computes is not thrown away.
-        let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
-        return Ok(VelocityFit {
-            velocity: output.velocity,
-            sigma: None,
-            residual_rms: Some(output.residual_rms),
-            terms: VelocityTerms::default(),
-        });
-    }
-    let (velocity, mut sigma, residual_rms) = velocity_and_sigma(
-        cfg.timeseries_options.correct_velocity_temporal_correlation,
-        days,
-        series.view(),
-        precision.view(),
-    );
-    clear_unbounded_uncertainty(&mut sigma, valid.view());
+    // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
+    // (velocity is bit-identical); the uncertainty variant is used instead so
+    // the residual it already computes is not thrown away.
+    let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
     Ok(VelocityFit {
-        velocity,
-        sigma: Some(sigma),
-        residual_rms: Some(residual_rms),
+        velocity: output.velocity,
+        estimator: VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback,
+        sigma: None,
+        diagnostics: None,
+        residual_rms: Some(output.residual_rms),
         terms: VelocityTerms::default(),
     })
 }
 
-/// The joint seasonal/step fit, sharing the linear path's uncertainty switches:
-/// sigma is emitted only when `write_velocity_uncertainty`, and the AR(1)
-/// inflation applies to this model's own residuals when configured.
+/// The joint seasonal/step fit. Conditional standard-error output is currently
+/// restricted to the linear path, so this returns point estimates and residuals.
 fn fit_velocity_with_model(
-    cfg: &DisplacementWorkflow,
     days: &[f64],
     series: ArrayView3<f64>,
     precision: Option<ArrayView3<f64>>,
     model: &VelocityModel,
+    estimator: VelocityEstimator,
 ) -> VelocityFit {
     let output = estimate_velocity_with_model(days, series, precision, model);
-    let sigma = cfg.timeseries_options.write_velocity_uncertainty.then(|| {
-        match cfg.timeseries_options.correct_velocity_temporal_correlation {
-            true => &output.sigma * &output.inflation_factor,
-            false => output.sigma.clone(),
-        }
-    });
     VelocityFit {
         velocity: output.velocity,
-        sigma,
+        estimator,
+        sigma: None,
+        diagnostics: None,
         // Unlike sigma, the residual is not gated by write_velocity_uncertainty:
         // estimate_velocity_with_model always computes it as part of the fit, so
         // reporting it here costs nothing extra.
@@ -794,6 +940,7 @@ fn fit_velocity_with_model(
 struct SpatialProducts {
     disp_rad: Array3<f64>,
     vel_rad: Array2<f64>,
+    velocity_estimator: VelocityEstimator,
     velocity_model: VelocityModel,
     velocity_terms: VelocityTerms,
     loop_closure: Option<LoopClosureQc>,
@@ -816,6 +963,7 @@ struct SpatialProducts {
     /// `network_misclosure_rad` (issue #40).
     timeseries_residual_rad: Option<Array2<f64>>,
     velocity_sigma_rad: Option<Array2<f64>>,
+    velocity_diagnostics: Option<VelocityTemporalDiagnostics>,
     interferogram_pairs: Vec<(usize, usize)>,
     unwrap_connected_components: Array3<u32>,
 }
@@ -841,7 +989,7 @@ fn emit_displacement(
     }
     let scaled = scale_outputs(cfg, &spatial);
     let quality = QualityLayers {
-        posterior_dof: spatial
+        network_residual_dof: spatial
             .interferogram_pairs
             .len()
             .saturating_sub(spatial.disp_rad.dim().0),
@@ -856,6 +1004,7 @@ fn emit_displacement(
         network_misclosure_rms: scaled.network_misclosure_rms.as_ref(),
         timeseries_residual_rms: scaled.timeseries_residual_rms.as_ref(),
         velocity_sigma: scaled.velocity_sigma.as_ref(),
+        velocity_diagnostics: spatial.velocity_diagnostics.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
         velocity_terms: VelocityTermLayers {
             seasonal_amplitude: scaled.seasonal_amplitude.as_ref(),
@@ -878,6 +1027,7 @@ fn emit_displacement(
                     cfg,
                     scaled.displacement.view(),
                     scaled.velocity.view(),
+                    spatial.velocity_estimator,
                     spatial.temporal_coherence.view(),
                     quality,
                     epsg,
@@ -907,8 +1057,10 @@ fn emit_displacement(
     Ok(DisplacementOutput {
         displacement: scaled.displacement,
         velocity: scaled.velocity,
+        velocity_estimator: spatial.velocity_estimator,
         velocity_mm_yr: scaled.velocity_mm_yr,
         velocity_sigma: scaled.velocity_sigma,
+        velocity_diagnostics: spatial.velocity_diagnostics,
         displacement_variance: scaled.displacement_variance,
         network_misclosure_rms: scaled.network_misclosure_rms,
         timeseries_residual_rms: scaled.timeseries_residual_rms,
@@ -1001,6 +1153,26 @@ impl SpatialProducts {
         if let Some(layer) = self.velocity_sigma_rad.as_mut() {
             mask2_f64(layer, mask);
         }
+        if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
+            mask2_value(&mut diagnostics.valid_date_count, mask, 0);
+            mask2_value(&mut diagnostics.regression_rank, mask, 0);
+            mask2_value(&mut diagnostics.regression_dof, mask, 0);
+            mask2_value(
+                &mut diagnostics.uncertainty_status,
+                mask,
+                VelocityUncertaintyStatus::Unavailable,
+            );
+            mask2_f64(&mut diagnostics.lag1_rho, mask);
+            mask2_value(&mut diagnostics.correlation_pair_count, mask, 0);
+            mask2_value(
+                &mut diagnostics.cadence_status,
+                mask,
+                VelocityCadenceStatus::Unavailable,
+            );
+            mask2_value(&mut diagnostics.correlation_available, mask, false);
+            mask2_f64(&mut diagnostics.diagnostic_inflation_factor, mask);
+            mask2_f64(&mut diagnostics.diagnostic_effective_sample_size, mask);
+        }
         if let Some(layer) = self.velocity_terms.seasonal_amplitude_rad.as_mut() {
             mask2_f64(layer, mask);
         }
@@ -1042,6 +1214,7 @@ impl SpatialProducts {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     fn trim(
         &mut self,
         target: BlockIndices,
@@ -1061,12 +1234,23 @@ impl SpatialProducts {
                 target.row_start..target.row_stop,
                 target.col_start..target.col_stop
             ]);
-            let local = select_reference_point(
+            let target_validity = self.validity_mask.slice(s![
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let target_displacement = self.disp_rad.slice(s![
+                ..,
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let local = select_valid_reference_point(
                 target_coherence,
+                target_validity,
+                target_displacement,
                 cfg.timeseries_options.correlation_threshold,
             )
             .context(
-                "bounded target has no pixel meeting the configured reference coherence threshold",
+                "bounded target has no displacement-valid pixel meeting the configured reference coherence threshold",
             )?;
             let global = (target.row_start + local.0, target.col_start + local.1);
             reference_to_point(&mut self.disp_rad, global);
@@ -1077,11 +1261,14 @@ impl SpatialProducts {
                 self.disp_rad.view(),
                 days,
                 self.crlb_sigma.as_ref(),
+                Some(global),
                 &self.velocity_model,
             )
             .context("bounded velocity re-fit after re-referencing")?;
             self.vel_rad = fit.velocity;
+            self.velocity_estimator = fit.estimator;
             self.velocity_sigma_rad = fit.sigma;
+            self.velocity_diagnostics = fit.diagnostics;
             // Re-referencing shifts every date's displacement, which shifts the
             // temporal-fit residual too; the network misclosure is unaffected (it
             // is computed upstream, from the inversion, before re-referencing).
@@ -1130,6 +1317,20 @@ impl SpatialProducts {
             .velocity_sigma_rad
             .take()
             .map(|layer| trim2(&layer, target));
+        if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
+            diagnostics.valid_date_count = trim2(&diagnostics.valid_date_count, target);
+            diagnostics.regression_rank = trim2(&diagnostics.regression_rank, target);
+            diagnostics.regression_dof = trim2(&diagnostics.regression_dof, target);
+            diagnostics.uncertainty_status = trim2(&diagnostics.uncertainty_status, target);
+            diagnostics.lag1_rho = trim2(&diagnostics.lag1_rho, target);
+            diagnostics.correlation_pair_count = trim2(&diagnostics.correlation_pair_count, target);
+            diagnostics.cadence_status = trim2(&diagnostics.cadence_status, target);
+            diagnostics.correlation_available = trim2(&diagnostics.correlation_available, target);
+            diagnostics.diagnostic_inflation_factor =
+                trim2(&diagnostics.diagnostic_inflation_factor, target);
+            diagnostics.diagnostic_effective_sample_size =
+                trim2(&diagnostics.diagnostic_effective_sample_size, target);
+        }
         if let Some(qc) = self.loop_closure.as_mut() {
             qc.bad_loop_count = trim2(&qc.bad_loop_count, target);
             qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
@@ -2048,6 +2249,16 @@ fn mask2_f64(values: &mut Array2<f64>, mask: &Array2<bool>) {
         });
 }
 
+fn mask2_value<T: Clone>(values: &mut Array2<T>, mask: &Array2<bool>, fill: T) {
+    ndarray::Zip::from(values)
+        .and(mask)
+        .for_each(|value, &valid| {
+            if !valid {
+                *value = fill.clone();
+            }
+        });
+}
+
 fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
     for mut band in values.axis_iter_mut(Axis(0)) {
         ndarray::Zip::from(&mut band)
@@ -2484,11 +2695,10 @@ fn update_one_burst(
 fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
     cfg.validate_supported_options()?;
     anyhow::ensure!(
-        !cfg
-            .timeseries_options
-            .correct_velocity_temporal_correlation
-            || cfg.timeseries_options.write_velocity_uncertainty,
-        "timeseries_options.correct_velocity_temporal_correlation requires write_velocity_uncertainty"
+        !cfg.timeseries_options.write_velocity_uncertainty
+            || (!cfg.timeseries_options.velocity_seasonal
+                && cfg.timeseries_options.velocity_step_dates.is_empty()),
+        "timeseries_options.write_velocity_uncertainty is validated only for the linear temporal model"
     );
     Ok(())
 }
@@ -2765,9 +2975,7 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         zero_correlation_threshold: cfg.phase_linking.zero_correlation_threshold,
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
-        compute_crlb: cfg.phase_linking.write_crlb
-            || cfg.timeseries_options.use_coherence_weights
-            || cfg.timeseries_options.write_velocity_uncertainty,
+        compute_crlb: cfg.phase_linking.write_crlb || cfg.timeseries_options.use_coherence_weights,
         // The phase-bias correction consumes the closure layer, so force it on
         // when the correction is enabled even if the raster isn't written.
         compute_closure_phase: cfg.phase_linking.write_closure_phase
@@ -3110,14 +3318,7 @@ fn date_precisions(sigma: ArrayView3<f64>, valid: ArrayView2<bool>) -> Array3<f6
     })
 }
 
-/// Blank an uncertainty layer wherever the pixel has no usable bound. Uniform
-/// weights recover the displacement; they do not manufacture an uncertainty, so
-/// the derived σ must still read as absent.
-fn clear_unbounded_uncertainty(layer: &mut Array2<f64>, valid: ArrayView2<bool>) {
-    clear_unbounded_uncertainty_2d(&mut layer.view_mut(), valid);
-}
-
-/// [`clear_unbounded_uncertainty`] over a borrowed 2-D view (one band of a cube).
+/// Blank a diagonal network-covariance band wherever the pixel has no usable bound.
 fn clear_unbounded_uncertainty_2d(
     layer: &mut ndarray::ArrayViewMut2<f64>,
     valid: ArrayView2<bool>,
@@ -3134,10 +3335,12 @@ fn clear_unbounded_uncertainty_2d(
 /// Write the velocity, temporal-coherence, per-date displacement, and (when
 /// enabled) per-band CRLB σ + closure-phase rasters as GeoTIFFs, all sharing the
 /// resolved geotransform + EPSG.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_outputs(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     velocity: ArrayView2<f64>,
+    velocity_estimator: VelocityEstimator,
     temporal_coherence: ArrayView2<f64>,
     quality: QualityLayers,
     epsg: Option<u32>,
@@ -3148,17 +3351,66 @@ fn write_outputs(
     let write_f32 = |name: &str, a: ArrayView2<f64>| {
         write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
     };
-    // Issue #36: which layer is *the* uncertainty is not a matter of taste, it
-    // depends on whether the interferogram system has residual degrees of freedom.
-    // Say so in the raster rather than leaving it to the reader.
-    let (scale, scale_note) = uncertainty_scale(quality.posterior_dof);
-    let dof_text = quality.posterior_dof.to_string();
-    let posterior_tags = [
-        ("UNCERTAINTY_SCALE", scale),
-        ("POSTERIOR_DOF", dof_text.as_str()),
-        ("DESCRIPTION", scale_note),
+    let write_f32_with_metadata = |name: &str, a: ArrayView2<f64>, metadata: &[(&str, &str)]| {
+        write_raster_with_metadata(
+            &dir.join(name),
+            a.mapv(|v| v as f32).view(),
+            gt,
+            epsg,
+            None,
+            metadata,
+        )
+    };
+    let temporal_support_tags = [
+        ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+        ("EVIDENCE_ROLE", "fit_support"),
+        ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+        ("TEMPORAL_COVARIANCE", "not_modeled"),
+        ("CALIBRATION_STATUS", "not_calibrated"),
     ];
-    write_f32("velocity.tif", velocity)?;
+    let temporal_diagnostic_tags = [
+        ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+        ("EVIDENCE_ROLE", "diagnostic_only"),
+        ("INFERENTIAL_USE", "prohibited"),
+        ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+        ("TEMPORAL_COVARIANCE", "not_modeled"),
+        ("CALIBRATION_STATUS", "not_calibrated"),
+    ];
+    let (velocity_unit, variance_unit) = match cfg.input_options.wavelength {
+        Some(_) => ("m/yr", "m^2"),
+        None => ("rad/yr", "rad^2"),
+    };
+    let network_dof_text = quality.network_residual_dof.to_string();
+    let network_covariance_tags = [
+        ("UNITTYPE", variance_unit),
+        (
+            "UNCERTAINTY_SCOPE",
+            "independent_ifg_parameter_covariance_diagonal_approximation",
+        ),
+        ("IFG_ERROR_ASSUMPTION", "independent"),
+        (
+            "SPATIAL_COVARIANCE",
+            "target_reference_covariance_not_modeled",
+        ),
+        (
+            "SPATIAL_REFERENCE_PROPAGATION",
+            "independent_pixel_variances_added",
+        ),
+        ("NETWORK_RESIDUAL_DOF", network_dof_text.as_str()),
+        ("CALIBRATION_STATUS", "not_calibrated"),
+        ("DESCRIPTION", NETWORK_COVARIANCE_NOTE),
+    ];
+    write_raster_with_metadata(
+        &dir.join("velocity.tif"),
+        velocity.mapv(|v| v as f32).view(),
+        gt,
+        epsg,
+        None,
+        &[
+            ("UNITTYPE", velocity_unit),
+            ("VELOCITY_ESTIMATOR", velocity_estimator.metadata_value()),
+        ],
+    )?;
     if let Some(sigma) = quality.velocity_sigma {
         write_raster_with_metadata(
             &dir.join("velocity_sigma.tif"),
@@ -3166,7 +3418,99 @@ fn write_outputs(
             gt,
             epsg,
             None,
-            &posterior_tags,
+            &[
+                ("UNITTYPE", velocity_unit),
+                ("UNCERTAINTY_COMPONENT", "independent_residual_conditional"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "uncalibrated_component"),
+                ("DESCRIPTION", VELOCITY_CONDITIONAL_SE_NOTE),
+            ],
+        )?;
+    }
+    if let Some(diagnostics) = quality.velocity_diagnostics {
+        write_f32_with_metadata(
+            "velocity_valid_date_count.tif",
+            diagnostics.valid_date_count.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_regression_rank.tif",
+            diagnostics.regression_rank.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_regression_dof.tif",
+            diagnostics.regression_dof.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_uncertainty_status.tif"),
+            diagnostics
+                .uncertainty_status
+                .mapv(|status| status as u8)
+                .view(),
+            gt,
+            epsg,
+            None,
+            &[
+                ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+                ("EVIDENCE_ROLE", "component_status"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "uncalibrated_component"),
+                ("VALUE_MAP", "0=unavailable;1=iid_conditional"),
+            ],
+        )?;
+        write_f32_with_metadata(
+            "velocity_lag1_rho.tif",
+            diagnostics.lag1_rho.view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_correlation_pair_count.tif",
+            diagnostics.correlation_pair_count.mapv(f64::from).view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_cadence_status.tif"),
+            diagnostics
+                .cadence_status
+                .mapv(|status| status as u8)
+                .view(),
+            gt,
+            epsg,
+            None,
+            &[
+                ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+                ("EVIDENCE_ROLE", "diagnostic_only"),
+                ("INFERENTIAL_USE", "prohibited"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "not_calibrated"),
+                (
+                    "VALUE_MAP",
+                    "0=unavailable;1=regular_contiguous;2=irregular;3=missing",
+                ),
+            ],
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_correlation_available.tif"),
+            diagnostics.correlation_available.mapv(u8::from).view(),
+            gt,
+            epsg,
+            None,
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_diagnostic_inflation_factor.tif",
+            diagnostics.diagnostic_inflation_factor.view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_diagnostic_effective_sample_size.tif",
+            diagnostics.diagnostic_effective_sample_size.view(),
+            &temporal_diagnostic_tags,
         )?;
     }
     if let Some(residual) = quality.timeseries_residual_rms {
@@ -3230,7 +3574,7 @@ fn write_outputs(
                 gt,
                 epsg,
                 None,
-                &posterior_tags,
+                &network_covariance_tags,
             )?;
         }
     }
@@ -3291,38 +3635,27 @@ fn write_correction_outputs(
 /// what it is not is a predictive sigma, and a consumer reading the band without
 /// this would have no way to know (#36).
 const CRLB_BOUND_NOTE: &str =
-    "Cramer-Rao LOWER BOUND on the phase-linking sigma, not a predictive uncertainty. \
-     It under-covers the true spread by construction. Do not publish it as the \
-     uncertainty layer.";
+    "Per-ministack marginal Cramer-Rao lower bound on phase-linking sigma. The sequential \
+     cube changes compressed temporal reference and omits cross-date covariance, so it is a \
+     quality diagnostic, not global per-date covariance or predictive uncertainty.";
 
-/// In-band note on the posterior layers when the interferogram system is exactly
-/// determined, so their scale is not empirical.
-const POSTERIOR_BOUND_NOTE: &str =
-    "dof=0: the interferogram system is exactly determined (single-reference network), so \
-     the residual-based inflation is pinned to 1 and this sigma traces entirely to the \
-     CRLB lower bound. It is NOT an empirically scaled uncertainty. Set \
-     interferogram_network.max_bandwidth for a posterior scaled by the data.";
+const NETWORK_COVARIANCE_NOTE: &str =
+    "Network-parameter covariance diagonal under an independent-interferogram error \
+     assumption. Interferograms sharing acquisitions are correlated, so network residual DOF \
+     is algebraic diagnostics rather than independent empirical evidence. Spatial referencing \
+     adds target and reference variances but omits their covariance. Do not use this product as \
+     calibrated uncertainty.";
 
-/// In-band note on the posterior layers when they do carry empirical scale.
-const POSTERIOR_EMPIRICAL_NOTE: &str =
-    "Posterior sigma scaled by the fit residuals (dof>0). This is the layer to carry as \
-     the uncertainty product.";
-
-/// Where an uncertainty layer's scale comes from, given the posterior degrees of
-/// freedom `n_interferograms - n_unknowns`.
-fn uncertainty_scale(posterior_dof: usize) -> (&'static str, &'static str) {
-    match posterior_dof {
-        0 => ("crlb_bound", POSTERIOR_BOUND_NOTE),
-        _ => ("empirical", POSTERIOR_EMPIRICAL_NOTE),
-    }
-}
+const VELOCITY_CONDITIONAL_SE_NOTE: &str =
+    "Independent-residual conditional slope standard error from the final corrected and \
+     spatially referenced displacement series, excluding the structural acquisition-0 gauge. \
+     Temporal covariance and total field calibration are not included.";
 
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
-    /// Residual degrees of freedom of the SBAS solve,
-    /// `n_interferograms - (n_dates - 1)`. Zero on a single-reference network,
-    /// which is what decides whether the posterior layers carry empirical scale.
-    posterior_dof: usize,
+    /// Algebraic residual degrees of freedom of the SBAS network solve,
+    /// `n_interferograms - (n_dates - 1)`.
+    network_residual_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
@@ -3330,6 +3663,7 @@ struct QualityLayers<'a> {
     network_misclosure_rms: Option<&'a Array2<f64>>,
     timeseries_residual_rms: Option<&'a Array2<f64>>,
     velocity_sigma: Option<&'a Array2<f64>>,
+    velocity_diagnostics: Option<&'a VelocityTemporalDiagnostics>,
     connected_components: &'a Array3<u32>,
     /// Seasonal amplitude in displacement units, peak day, and per-step
     /// magnitudes — present only when the time-function model is configured.
@@ -3509,6 +3843,7 @@ mod tests {
         let mut products = SpatialProducts {
             disp_rad: Array3::from_elem((2, 2, 2), 1.0),
             vel_rad: velocity,
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms {
                 seasonal_amplitude_rad: Some(Array2::from_elem((2, 2), 1.0)),
@@ -3545,6 +3880,21 @@ mod tests {
             network_misclosure_rad: Some(Array2::from_elem((2, 2), 1.0)),
             timeseries_residual_rad: Some(Array2::from_elem((2, 2), 1.0)),
             velocity_sigma_rad: Some(Array2::from_elem((2, 2), 1.0)),
+            velocity_diagnostics: Some(VelocityTemporalDiagnostics {
+                valid_date_count: Array2::from_elem((2, 2), 8),
+                regression_rank: Array2::from_elem((2, 2), 2),
+                regression_dof: Array2::from_elem((2, 2), 6),
+                uncertainty_status: Array2::from_elem(
+                    (2, 2),
+                    VelocityUncertaintyStatus::IidConditional,
+                ),
+                lag1_rho: Array2::from_elem((2, 2), 0.5),
+                correlation_pair_count: Array2::from_elem((2, 2), 7),
+                cadence_status: Array2::from_elem((2, 2), VelocityCadenceStatus::RegularContiguous),
+                correlation_available: Array2::from_elem((2, 2), true),
+                diagnostic_inflation_factor: Array2::from_elem((2, 2), 1.5),
+                diagnostic_effective_sample_size: Array2::from_elem((2, 2), 4.0),
+            }),
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::from_elem((2, 2, 2), 1),
         };
@@ -3559,6 +3909,14 @@ mod tests {
             assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.velocity_sigma_rad.as_ref().unwrap()[(row, col)].is_nan());
+            let diagnostics = products.velocity_diagnostics.as_ref().unwrap();
+            assert_eq!(diagnostics.valid_date_count[(row, col)], 0);
+            assert_eq!(
+                diagnostics.uncertainty_status[(row, col)],
+                VelocityUncertaintyStatus::Unavailable
+            );
+            assert!(!diagnostics.correlation_available[(row, col)]);
+            assert!(diagnostics.lag1_rho[(row, col)].is_nan());
             assert!(products
                 .velocity_terms
                 .seasonal_amplitude_rad
@@ -3623,6 +3981,7 @@ mod tests {
                 date as f64 + row as f64 * 0.1 + col as f64 * 0.01
             }),
             vel_rad: Array2::zeros((6, 8)),
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: Some(LoopClosureQc {
@@ -3648,6 +4007,7 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 6, 8)),
         };
@@ -3657,9 +4017,9 @@ mod tests {
             col_start: 3,
             col_stop: 7,
         };
-        products
-            .trim(target, &[0.0, 12.0, 24.0], &unweighted_cfg(0.5))
-            .unwrap();
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        products.trim(target, &[0.0, 12.0, 24.0], &cfg).unwrap();
         products.apply_validity_mask();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
@@ -3668,6 +4028,10 @@ mod tests {
             .slice(s![.., reference.0, reference.1])
             .iter()
             .all(|value| value.abs() < 1e-12));
+        let diagnostics = products.velocity_diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.valid_date_count.dim(), (3, 4));
+        assert_eq!(diagnostics.valid_date_count[(0, 0)], 2);
+        assert!(products.velocity_sigma_rad.as_ref().unwrap()[reference].is_nan());
         let qc = products.loop_closure.as_ref().unwrap();
         assert_eq!(qc.bad_loop_count.dim(), (3, 4));
         assert_eq!(qc.evaluable_loop_count.dim(), (3, 4));
@@ -3676,14 +4040,17 @@ mod tests {
     }
 
     #[test]
-    fn bounded_trim_rejects_low_quality_target_when_reference_is_in_halo() {
+    fn bounded_trim_rejects_target_without_a_displacement_valid_reference() {
+        let mut displacement = Array3::zeros((2, 4, 4));
+        displacement.slice_mut(s![.., 1..4, 1..4]).fill(f64::NAN);
         let mut products = SpatialProducts {
-            disp_rad: Array3::zeros((2, 4, 4)),
+            disp_rad: displacement,
             vel_rad: Array2::zeros((4, 4)),
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
-            temporal_coherence: Array2::from_elem((4, 4), 0.1),
+            temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
@@ -3701,6 +4068,7 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
         };
@@ -3716,7 +4084,9 @@ mod tests {
                 &unweighted_cfg(0.5),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("reference coherence threshold"));
+        assert!(error.to_string().contains(
+            "no displacement-valid pixel meeting the configured reference coherence threshold"
+        ));
     }
 
     #[test]
@@ -3899,6 +4269,64 @@ mod tests {
         assert!(error.to_string().contains("only for L2"));
     }
 
+    #[test]
+    fn corrections_precede_the_final_spatial_reference() {
+        let mut displacement =
+            Array3::from_shape_vec((2, 1, 2), vec![10.0, 3.0, 20.0, 5.0]).unwrap();
+        let corrections = Array3::from_shape_vec((2, 1, 2), vec![1.0, 4.0, 2.0, 1.0]).unwrap();
+
+        correct_then_reference(
+            &mut displacement,
+            |series| {
+                *series -= &corrections;
+                Ok(CorrectionLayers {
+                    ionosphere: None,
+                    troposphere: None,
+                    solid_earth_tide: None,
+                    los_geometry: None,
+                })
+            },
+            |_| Ok(Some((0, 1))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            displacement,
+            Array3::from_shape_vec((2, 1, 2), vec![10.0, 0.0, 14.0, 0.0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_reference_skips_a_nonfinite_displacement_candidate() {
+        let quality = Array2::from_elem((5, 5), 0.9);
+        let validity = Array2::from_elem((5, 5), true);
+        let mut displacement = Array3::from_elem((3, 5, 5), 1.0);
+        displacement[(1, 2, 2)] = f64::NAN;
+
+        let reference =
+            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5)
+                .expect("another coherent finite reference remains");
+
+        assert_ne!(reference, (2, 2));
+        assert!(reference_pixel_is_valid(
+            validity.view(),
+            displacement.view(),
+            reference
+        ));
+    }
+
+    #[test]
+    fn automatic_reference_abstains_when_every_displacement_candidate_is_invalid() {
+        let quality = Array2::from_elem((3, 3), 0.9);
+        let validity = Array2::from_elem((3, 3), true);
+        let displacement = Array3::from_elem((2, 3, 3), f64::NAN);
+
+        assert_eq!(
+            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5,),
+            None
+        );
+    }
+
     /// Issue #40: the SBAS network-inversion misclosure and the temporal
     /// motion-model fit residual are different physical quantities and must not
     /// share one field. A redundant network whose interferograms are perfectly
@@ -3935,14 +4363,17 @@ mod tests {
 
         // The same true phase history as a velocity-fit input: date 0 is the
         // dropped reference (implicit zero), dates 1..3 are the fitted bands.
-        let series = Array3::from_shape_fn((3, 1, 1), |(d, _, _)| true_phi[d + 1]);
+        let series = Array3::from_shape_fn((3, 1, 2), |(d, _, col)| match col {
+            0 => true_phi[d + 1],
+            _ => 0.0,
+        });
         cfg.timeseries_options.write_velocity_uncertainty = true;
-        let crlb = Array3::from_elem((4, 1, 1), 1.0);
         let fit = fit_velocity(
             &cfg,
             series.view(),
             &days,
-            Some(&crlb),
+            None,
+            Some((0, 1)),
             &VelocityModel::default(),
         )
         .unwrap();
@@ -3953,79 +4384,122 @@ mod tests {
         );
     }
 
-    /// The correction changes only the emitted uncertainty product, so enabling
-    /// it without that product must fail rather than silently doing nothing.
+    /// The legacy scalar N_eff correction is retained only for YAML compatibility.
     #[test]
-    fn temporal_correlation_requires_velocity_uncertainty_output() {
+    fn scalar_temporal_correlation_correction_is_rejected() {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.correct_velocity_temporal_correlation = true;
 
         let error = validate_config(&cfg).unwrap_err();
         assert!(error
             .to_string()
-            .contains("requires write_velocity_uncertainty"));
-
+            .contains("correct_velocity_temporal_correlation"));
+        assert!(error.to_string().contains("not supported"));
         cfg.timeseries_options.write_velocity_uncertainty = true;
-        validate_config(&cfg).expect("valid uncertainty options");
+        assert!(validate_config(&cfg).is_err());
     }
 
-    /// Issue #33: velocity sigma understates the slope uncertainty because the
-    /// residuals are temporally correlated. Opt-in AR(1) inflation, off by
-    /// default so no downstream threshold moves unreviewed.
+    /// The stitched CRLB cube is a per-ministack quality diagnostic, not a global
+    /// temporal covariance. Velocity evidence therefore fits post-gauge dates with
+    /// unit precision and is invariant to the CRLB input.
     #[test]
-    fn temporal_correlation_inflates_velocity_sigma_only_when_enabled() {
-        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
-        // A drifting (positively autocorrelated) departure from the trend.
-        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| {
-            let time = days[t + 1];
-            0.01 * time + 4.0 * (f64::from(t as i32) * 0.45).sin()
+    fn velocity_uncertainty_excludes_the_gauge_and_does_not_consume_crlb() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let target = [0.2, 1.0, 1.4, 2.8, 2.5];
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(t, _, col)| match col {
+            0 => target[t],
+            _ => 0.0,
         });
-        let crlb = Array3::from_elem((12, 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let linear = VelocityModel::default();
+        let crlb = Array3::from_shape_fn((6, 1, 2), |(date, _, col)| {
+            0.01 + (date * 2 + col) as f64 * 100.0
+        });
+        let without_crlb = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            None,
+            Some((0, 1)),
+            &linear,
+        )
+        .unwrap();
+        let with_crlb = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &linear,
+        )
+        .unwrap();
 
-        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-
-        let plain = plain.expect("velocity sigma")[(0, 0)];
-        let corrected = corrected.expect("velocity sigma")[(0, 0)];
-        assert!(plain.is_finite() && corrected.is_finite());
-        assert!(
-            corrected > plain,
-            "correlated residuals must inflate sigma: {corrected} !> {plain}"
+        assert_eq!(without_crlb.velocity, with_crlb.velocity);
+        assert_eq!(
+            without_crlb.estimator,
+            VelocityEstimator::LinearPostGaugeUnitPrecision
+        );
+        let sigma = without_crlb.sigma.as_ref().unwrap();
+        assert_eq!(sigma[(0, 0)], with_crlb.sigma.as_ref().unwrap()[(0, 0)]);
+        assert!(sigma[(0, 0)].is_finite());
+        assert!(sigma[(0, 1)].is_nan(), "the spatial reference must abstain");
+        let diagnostics = without_crlb.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.valid_date_count[(0, 0)], 5);
+        assert_eq!(diagnostics.regression_rank[(0, 0)], 2);
+        assert_eq!(diagnostics.regression_dof[(0, 0)], 3);
+        assert_eq!(
+            diagnostics.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::IidConditional
+        );
+        assert_eq!(
+            diagnostics.cadence_status[(0, 0)],
+            VelocityCadenceStatus::RegularContiguous
         );
     }
 
-    /// The correction is a no-op on uncorrelated residuals — it must not inflate
-    /// sigma just because it is switched on.
     #[test]
-    fn temporal_correlation_correction_is_a_no_op_without_correlation() {
-        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
-        // Exactly linear: zero residual, so no autocorrelation to find.
-        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| 0.01 * days[t + 1]);
-        let crlb = Array3::from_elem((12, 1, 1), 0.5);
+    fn enabling_velocity_uncertainty_names_and_can_change_the_point_estimator() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let target = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(date, _, col)| match col {
+            0 => target[date],
+            _ => 0.0,
+        });
+        let crlb = Array3::from_elem((6, 1, 2), 1.0);
         let mut cfg = DisplacementWorkflow::default();
-        cfg.timeseries_options.write_velocity_uncertainty = true;
-        let linear = VelocityModel::default();
+        let default_fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &VelocityModel::default(),
+        )
+        .unwrap();
 
-        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        let plain = plain.expect("velocity sigma")[(0, 0)];
-        let corrected = corrected.expect("velocity sigma")[(0, 0)];
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let evidence_fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &VelocityModel::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            default_fit.estimator,
+            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
+        );
+        assert_eq!(
+            evidence_fit.estimator,
+            VelocityEstimator::LinearPostGaugeUnitPrecision
+        );
         assert!(
-            (corrected - plain).abs() < 1e-12,
-            "uncorrelated residuals must not inflate sigma: {corrected} vs {plain}"
+            (default_fit.velocity[(0, 0)] - evidence_fit.velocity[(0, 0)]).abs() > 1.0,
+            "the fixture must expose the served-rate migration"
         );
     }
 
@@ -4063,20 +4537,93 @@ mod tests {
         assert!((ifg[(0, 0, 1)] - 1.0).abs() < 1e-12);
     }
 
-    /// The bound must still be reported as absent — falling back to uniform
-    /// weights recovers the displacement, it does not manufacture an uncertainty.
     #[test]
-    fn an_unbounded_pixel_reports_no_uncertainty() {
-        let mut sigma = Array3::from_elem((2, 1, 2), 2.0);
-        sigma[(1, 0, 1)] = f64::NAN;
-        let valid = uncertainty_valid(sigma.view());
-        let mut velocity_sigma = ndarray::array![[0.5_f64, 0.5]];
-        clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
-        assert!(velocity_sigma[(0, 0)].is_finite());
-        assert!(
-            velocity_sigma[(0, 1)].is_nan(),
-            "a pixel without a usable CRLB must not report a velocity sigma"
+    fn mixed_crlb_validity_is_named_as_a_whole_pixel_unit_fallback_policy() {
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let values = [5.0, 1.0, 8.0];
+        let displacement = Array3::from_shape_fn((3, 1, 2), |(date, _, _)| values[date]);
+        let mut sigma = Array3::from_shape_fn((4, 1, 2), |(date, _, _)| match date {
+            0 | 2 => 0.5,
+            _ => 10.0,
+        });
+        sigma[(2, 0, 1)] = f64::NAN;
+        let cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join("dolphin_mixed_velocity_precision"),
+            ..Default::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.work_directory);
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&sigma),
+            None,
+            &VelocityModel::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fit.estimator,
+            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
         );
+        let uniform = velocity_of(displacement.view(), &days);
+        assert!((fit.velocity[(0, 1)] - uniform[(0, 1)]).abs() < 1e-9);
+        assert!((fit.velocity[(0, 0)] - uniform[(0, 0)]).abs() > 1.0);
+
+        let connected_components = Array3::<u32>::zeros((0, 1, 2));
+        write_outputs(
+            &cfg,
+            displacement.view(),
+            fit.velocity.view(),
+            fit.estimator,
+            Array2::from_elem((1, 2), 0.9).view(),
+            QualityLayers {
+                network_residual_dof: 0,
+                phase_linking_coherence: None,
+                crlb_sigma: None,
+                closure_phase: None,
+                displacement_variance: None,
+                network_misclosure_rms: None,
+                timeseries_residual_rms: None,
+                velocity_sigma: None,
+                velocity_diagnostics: None,
+                connected_components: &connected_components,
+                velocity_terms: VelocityTermLayers::default(),
+                loop_closure: None,
+            },
+            Some(32611),
+            [0.0, 30.0, 0.0, 30.0, 0.0, -30.0],
+        )
+        .unwrap();
+        use gdal::Metadata;
+        let dataset = gdal::Dataset::open(cfg.work_directory.join("velocity.tif")).unwrap();
+        assert_eq!(
+            dataset.metadata_item("VELOCITY_ESTIMATOR", "").as_deref(),
+            Some("linear_full_series_stitched_crlb_with_unit_fallback")
+        );
+        let _ = std::fs::remove_dir_all(&cfg.work_directory);
+    }
+
+    /// Conditional velocity evidence requires the final spatial reference to have
+    /// been applied exactly; an absent or merely finite candidate is not enough.
+    #[test]
+    fn velocity_uncertainty_requires_an_exact_final_spatial_reference() {
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let mut displacement =
+            Array3::from_shape_fn((3, 1, 2), |(date, _, col)| (date + col) as f64);
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let model = VelocityModel::default();
+
+        let missing = fit_velocity(&cfg, displacement.view(), &days, None, None, &model)
+            .err()
+            .expect("missing reference must fail");
+        assert!(missing.to_string().contains("spatial reference point"));
+
+        displacement[(1, 0, 1)] = f64::NAN;
+        let nonzero = fit_velocity(&cfg, displacement.view(), &days, None, Some((0, 1)), &model)
+            .err()
+            .expect("nonzero reference must fail");
+        assert!(nonzero.to_string().contains("exact zero"));
     }
 
     #[test]
@@ -4542,12 +5089,11 @@ mod tests {
         assert!((v6 - phase_per_yr).abs() < 1e-9);
     }
 
-    /// Issue #36: the emitted rasters must say where their scale comes from. On a
-    /// single-reference network `dof = 0`, the residual inflation is inert, and
-    /// every uncertainty layer traces to the CRLB bound — so the bands are tagged
-    /// `crlb_bound`, not left for a consumer to misread as a predictive sigma.
+    /// Network DOF never upgrades correlated interferograms into independent
+    /// empirical evidence, and the velocity component carries separate metadata.
     #[test]
-    fn uncertainty_layers_declare_their_scale_in_band() {
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn uncertainty_layers_declare_scope_without_an_empirical_claim() {
         let dir = std::env::temp_dir().join("dolphin_uncertainty_scale_tags");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = DisplacementWorkflow {
@@ -4560,15 +5106,31 @@ mod tests {
         let sigma = Array2::from_elem((2, 2), 2.0);
         let crlb = Array3::from_elem((2, 2, 2), 1.0);
         let conncomp = Array3::<u32>::zeros((0, 2, 2));
+        let diagnostics = VelocityTemporalDiagnostics {
+            valid_date_count: Array2::from_elem((2, 2), 8),
+            regression_rank: Array2::from_elem((2, 2), 2),
+            regression_dof: Array2::from_elem((2, 2), 6),
+            uncertainty_status: Array2::from_elem(
+                (2, 2),
+                VelocityUncertaintyStatus::IidConditional,
+            ),
+            lag1_rho: Array2::from_elem((2, 2), 0.4),
+            correlation_pair_count: Array2::from_elem((2, 2), 7),
+            cadence_status: Array2::from_elem((2, 2), VelocityCadenceStatus::RegularContiguous),
+            correlation_available: Array2::from_elem((2, 2), true),
+            diagnostic_inflation_factor: Array2::from_elem((2, 2), 1.2),
+            diagnostic_effective_sample_size: Array2::from_elem((2, 2), 5.0),
+        };
 
         let write = |dof: usize| {
             write_outputs(
                 &cfg,
                 displacement.view(),
                 Array2::zeros((2, 2)).view(),
+                VelocityEstimator::LinearPostGaugeUnitPrecision,
                 Array2::from_elem((2, 2), 0.9).view(),
                 QualityLayers {
-                    posterior_dof: dof,
+                    network_residual_dof: dof,
                     phase_linking_coherence: None,
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
@@ -4576,6 +5138,7 @@ mod tests {
                     network_misclosure_rms: None,
                     timeseries_residual_rms: None,
                     velocity_sigma: Some(&sigma),
+                    velocity_diagnostics: Some(&diagnostics),
                     connected_components: &conncomp,
                     velocity_terms: VelocityTermLayers::default(),
                     loop_closure: None,
@@ -4594,31 +5157,200 @@ mod tests {
         };
 
         write(0);
-        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
-        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "0");
         assert_eq!(
-            tag("displacement_variance_00.tif", "UNCERTAINTY_SCALE"),
-            "crlb_bound"
+            tag("velocity_sigma.tif", "UNCERTAINTY_COMPONENT"),
+            "independent_residual_conditional"
         );
-        assert!(tag("velocity_sigma.tif", "DESCRIPTION").contains("NOT an empirically scaled"));
-        // The bound is always a bound, whatever the network.
+        assert_eq!(
+            tag("velocity_sigma.tif", "TEMPORAL_GAUGE"),
+            "acquisition_0_excluded"
+        );
+        assert_eq!(
+            tag("velocity_sigma.tif", "CALIBRATION_STATUS"),
+            "uncalibrated_component"
+        );
+        assert_eq!(tag("velocity.tif", "UNITTYPE"), "rad/yr");
+        assert_eq!(
+            tag("velocity.tif", "VELOCITY_ESTIMATOR"),
+            "linear_post_gauge_unit_precision"
+        );
+        assert_eq!(tag("velocity_sigma.tif", "UNITTYPE"), "rad/yr");
+        assert!(tag("velocity_sigma.tif", "POSTERIOR_DOF").is_empty());
+        assert_eq!(
+            tag("displacement_variance_00.tif", "UNCERTAINTY_SCOPE"),
+            "independent_ifg_parameter_covariance_diagonal_approximation"
+        );
+        assert_eq!(
+            tag("displacement_variance_00.tif", "IFG_ERROR_ASSUMPTION"),
+            "independent"
+        );
+        assert_eq!(tag("displacement_variance_00.tif", "UNITTYPE"), "rad^2");
+        assert_eq!(
+            tag("displacement_variance_00.tif", "SPATIAL_COVARIANCE"),
+            "target_reference_covariance_not_modeled"
+        );
+        assert_eq!(
+            tag(
+                "displacement_variance_00.tif",
+                "SPATIAL_REFERENCE_PROPAGATION"
+            ),
+            "independent_pixel_variances_added"
+        );
+        assert_eq!(
+            tag("displacement_variance_00.tif", "NETWORK_RESIDUAL_DOF"),
+            "0"
+        );
         assert_eq!(tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
-        assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("LOWER BOUND"));
+        assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("not global per-date"));
         assert_eq!(tag("crlb_sigma_00.tif", "UNITTYPE"), "rad");
+        assert_eq!(
+            tag("velocity_uncertainty_status.tif", "VALUE_MAP"),
+            "0=unavailable;1=iid_conditional"
+        );
+        assert_eq!(
+            tag("velocity_cadence_status.tif", "VALUE_MAP"),
+            "0=unavailable;1=regular_contiguous;2=irregular;3=missing"
+        );
+        assert_eq!(
+            tag("velocity_valid_date_count.tif", "EVIDENCE_ROLE"),
+            "fit_support"
+        );
+        assert_eq!(
+            tag("velocity_lag1_rho.tif", "EVIDENCE_ROLE"),
+            "diagnostic_only"
+        );
+        assert_eq!(
+            tag(
+                "velocity_diagnostic_inflation_factor.tif",
+                "INFERENTIAL_USE"
+            ),
+            "prohibited"
+        );
+        for name in [
+            "velocity_uncertainty_status.tif",
+            "velocity_cadence_status.tif",
+            "velocity_correlation_available.tif",
+        ] {
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert!(
+                dataset.rasterband(1).unwrap().no_data_value().is_none(),
+                "zero is valid data in {name}"
+            );
+        }
+        assert!(dir.join("velocity_valid_date_count.tif").exists());
+        assert!(dir
+            .join("velocity_diagnostic_effective_sample_size.tif")
+            .exists());
+        for (name, expected) in [
+            ("velocity_sigma.tif", 2.0_f32),
+            ("displacement_variance_00.tif", 4.0_f32),
+        ] {
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert_eq!(dataset.raster_size(), (2, 2));
+            assert_eq!(dataset.geo_transform().unwrap(), gt);
+            assert_eq!(dataset.spatial_ref().unwrap().auth_code().unwrap(), 32614);
+            assert!(dataset.rasterband(1).unwrap().no_data_value().is_none());
+            let raster = dolphin_io::read_raster::<f32>(&dir.join(name)).unwrap();
+            assert!(raster.data.iter().all(|&value| value == expected));
+        }
 
-        // An over-determined network is the case where the posterior earns the name.
         write(3);
-        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "empirical");
-        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "3");
         assert_eq!(
-            tag("displacement_variance_01.tif", "UNCERTAINTY_SCALE"),
-            "empirical"
+            tag("displacement_variance_01.tif", "UNCERTAINTY_SCOPE"),
+            "independent_ifg_parameter_covariance_diagonal_approximation"
         );
         assert_eq!(
-            tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"),
-            "crlb_bound",
-            "the CRLB is a bound regardless of the network"
+            tag("displacement_variance_01.tif", "NETWORK_RESIDUAL_DOF"),
+            "3"
         );
+        assert_eq!(
+            tag("displacement_variance_01.tif", "CALIBRATION_STATUS"),
+            "not_calibrated"
+        );
+        assert!(tag("displacement_variance_01.tif", "DESCRIPTION")
+            .contains("rather than independent empirical evidence"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uncertainty_cogs_preserve_meter_scaling_and_units() {
+        let dir = std::env::temp_dir().join("dolphin_uncertainty_meter_units");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = DisplacementWorkflow {
+            work_directory: dir.clone(),
+            ..Default::default()
+        };
+        cfg.input_options.wavelength = Some(2.0 * std::f64::consts::PI);
+        let spatial = SpatialProducts {
+            disp_rad: Array3::zeros((1, 2, 2)),
+            vel_rad: Array2::from_elem((2, 2), 6.0),
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
+            temporal_coherence: Array2::from_elem((2, 2), 0.9),
+            validity_mask: Array2::from_elem((2, 2), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+            reference_point: Some((0, 0)),
+            posterior_variance_rad: Some(Array3::from_elem((1, 2, 2), 4.0)),
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: Some(Array2::from_elem((2, 2), 2.0)),
+            velocity_diagnostics: None,
+            interferogram_pairs: vec![(0, 1)],
+            unwrap_connected_components: Array3::zeros((0, 2, 2)),
+        };
+        let scaled = scale_outputs(&cfg, &spatial);
+        write_outputs(
+            &cfg,
+            scaled.displacement.view(),
+            scaled.velocity.view(),
+            spatial.velocity_estimator,
+            spatial.temporal_coherence.view(),
+            QualityLayers {
+                network_residual_dof: 0,
+                phase_linking_coherence: None,
+                crlb_sigma: None,
+                closure_phase: None,
+                displacement_variance: scaled.displacement_variance.as_ref(),
+                network_misclosure_rms: None,
+                timeseries_residual_rms: None,
+                velocity_sigma: scaled.velocity_sigma.as_ref(),
+                velocity_diagnostics: None,
+                connected_components: &spatial.unwrap_connected_components,
+                velocity_terms: VelocityTermLayers::default(),
+                loop_closure: None,
+            },
+            Some(32614),
+            spatial.geotransform,
+        )
+        .unwrap();
+
+        for (name, expected, unit) in [
+            ("velocity.tif", -3.0_f32, "m/yr"),
+            ("velocity_sigma.tif", 1.0_f32, "m/yr"),
+            ("displacement_variance_00.tif", 1.0_f32, "m^2"),
+        ] {
+            use gdal::Metadata;
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert_eq!(dataset.metadata_item("UNITTYPE", "").as_deref(), Some(unit));
+            assert_eq!(dataset.raster_size(), (2, 2));
+            assert_eq!(dataset.geo_transform().unwrap(), spatial.geotransform);
+            assert_eq!(dataset.spatial_ref().unwrap().auth_code().unwrap(), 32614);
+            assert!(dataset.rasterband(1).unwrap().no_data_value().is_none());
+            let raster = dolphin_io::read_raster::<f32>(&dir.join(name)).unwrap();
+            assert!(raster.data.iter().all(|&value| value == expected));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5240,7 +5972,8 @@ mod tests {
         let days = vec![0.0, 12.0];
         let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
         let crlb = Array3::from_elem((2, 1, 1), 0.5);
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        let fit =
+            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
         assert!(fit.terms.seasonal_amplitude_rad.is_none());
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
@@ -5282,11 +6015,11 @@ mod tests {
         });
         let crlb = Array3::from_elem((days.len(), 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
-        cfg.timeseries_options.write_velocity_uncertainty = true;
         cfg.timeseries_options.velocity_seasonal = true;
         let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
 
-        let seasonal = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        let seasonal =
+            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
         assert!(
             (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
             "rate {} != {rate_per_year}",
@@ -5297,10 +6030,7 @@ mod tests {
             (recovered - amplitude).abs() < 1e-6,
             "amplitude {recovered}"
         );
-        assert!(
-            seasonal.sigma.is_some(),
-            "sigma follows write_velocity_uncertainty"
-        );
+        assert!(seasonal.sigma.is_none());
 
         cfg.timeseries_options.velocity_seasonal = false;
         let linear = fit_velocity(
@@ -5308,6 +6038,7 @@ mod tests {
             displacement.view(),
             &days,
             Some(&crlb),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -5316,6 +6047,15 @@ mod tests {
             "fixture must show the linear fit absorbing the cycle, got {}",
             linear.velocity[(0, 0)]
         );
+    }
+
+    #[test]
+    fn velocity_uncertainty_rejects_optional_time_function_models() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.velocity_seasonal = true;
+        let error = validate_config(&cfg).unwrap_err();
+        assert!(error.to_string().contains("linear temporal model"));
     }
 
     /// The bounded/tiled path re-fits through the same front door, so a configured
@@ -5334,6 +6074,7 @@ mod tests {
                 (0.01 * time + f64::from(time >= step_day) * 3.0) * scale
             }),
             vel_rad: Array2::zeros((4, 4)),
+            velocity_estimator: VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
             velocity_model: VelocityModel {
                 seasonal: false,
                 step_days: vec![step_day],
@@ -5359,6 +6100,7 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
         };
