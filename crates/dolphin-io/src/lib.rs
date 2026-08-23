@@ -9,6 +9,7 @@
 //! (see STATUS.md); S3 read-staging lives in the feature-gated `dolphin-ingest`.
 #![warn(missing_docs)]
 
+pub mod covariance;
 pub mod cslc;
 pub mod cslc_metadata;
 pub mod error;
@@ -19,6 +20,17 @@ pub mod nisar;
 #[cfg(any(test, feature = "nisar-fixture"))]
 pub mod nisar_fixture;
 
+pub use covariance::{
+    read_covariance_operator, CovarianceEstimatorBranch, CovarianceOperatorArtifact,
+    CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
+    CovarianceOperatorStatus, CovarianceOperatorWriter, CovarianceRegistryEntry,
+    CovarianceReplayStatus, DownstreamInferenceStatus, SourceReplayIdentity,
+    StitchedCovarianceStatus, COVARIANCE_ESTIMATOR_BRANCH_REGISTRY, COVARIANCE_METHOD_REGISTRY,
+    COVARIANCE_OPERATOR_METHOD, COVARIANCE_OPERATOR_METHOD_VERSION,
+    COVARIANCE_OPERATOR_SCHEMA_VERSION, COVARIANCE_OPERATOR_STATUS_REGISTRY,
+    COVARIANCE_REPLAY_STATUS_REGISTRY, DOWNSTREAM_INFERENCE_STATUS_REGISTRY,
+    STITCHED_COVARIANCE_STATUS_REGISTRY,
+};
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use cslc_metadata::{
     read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, CslcBurstMetadata,

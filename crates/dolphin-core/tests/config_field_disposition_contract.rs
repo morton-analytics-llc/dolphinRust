@@ -48,6 +48,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "phase_linking.mask_input_ps",
     "phase_linking.baseline_lag",
     "phase_linking.compressed_slc_plan",
+    "phase_linking.write_covariance_operator",
     "phase_linking.write_crlb",
     "phase_linking.write_closure_phase",
     "phase_linking.calc_average_coh",
@@ -238,6 +239,7 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
             mask_input_ps,
             baseline_lag,
             compressed_slc_plan,
+            write_covariance_operator,
             write_crlb,
             write_closure_phase,
             calc_average_coh,
@@ -257,6 +259,7 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
         mask_input_ps,
         baseline_lag,
         compressed_slc_plan,
+        write_covariance_operator,
         write_crlb,
         write_closure_phase,
         calc_average_coh,
@@ -798,4 +801,16 @@ fn zero_output_stride_fails_before_workflow_io() {
         assert!(error.contains("output_options.strides"), "{error}");
         assert!(error.contains("must both be positive"), "{error}");
     }
+}
+
+#[test]
+fn covariance_operator_is_opt_in_and_round_trips_without_changing_legacy_defaults() {
+    let defaults = DisplacementWorkflow::default();
+    assert!(!defaults.phase_linking.write_covariance_operator);
+
+    let mut enabled = defaults;
+    enabled.phase_linking.write_covariance_operator = true;
+    let reparsed = DisplacementWorkflow::from_yaml(&enabled.to_yaml().unwrap()).unwrap();
+    assert!(reparsed.phase_linking.write_covariance_operator);
+    reparsed.validate_supported_options().unwrap();
 }
