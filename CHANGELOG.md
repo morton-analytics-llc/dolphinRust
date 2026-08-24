@@ -33,6 +33,11 @@ All notable changes to dolphinRust are documented here. The format follows
   its programmatic configs retain supported defaults.
 
 ### Added
+- **Orbit ephemeris provenance.** Geometry provenance now reads the sourced
+  `/metadata/orbit/orbit_type` field, normalizing `POEORB`/`RESORB` to `precise`/`restituted`
+  while keeping missing, unknown, and mixed values explicit and non-fatal to other geometry
+  metadata. The artifact schema is `dolphinrust-geometry-provenance/4`; prior `/2` and `/3`
+  artifacts remain deserializable.
 - **A bounded sequential source-covariance replay operator is available behind an opt-in flag**
   (issue #52). `phase_linking.write_covariance_operator` streams fixed-branch phase-link and
   compression replay blocks into `phase_covariance_operator.h5`; a SHA-256-bound JSON manifest is
