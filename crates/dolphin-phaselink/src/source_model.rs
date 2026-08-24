@@ -525,7 +525,8 @@ pub fn estimate_empirical_proper_complex_factor(
     receipt_digest.update(config.config_digest);
     receipt_digest.update(summary.content_digest);
     let digest = receipt_digest.finalize().into();
-    let factor = ProperComplexFactor::new(source, component_ids.to_vec(), digest, lower)?;
+    let factor =
+        ProperComplexFactor::new(source, component_ids.to_vec(), config.config_digest, lower)?;
     let receipt = EmpiricalProperComplexReceipt {
         source,
         window_origin: window.global_origin,

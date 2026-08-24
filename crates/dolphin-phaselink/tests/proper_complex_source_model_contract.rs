@@ -237,6 +237,7 @@ fn relative_diagonal_floor_rejects_underpowered_component() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn receipt_digest_binds_content_config_and_date_order() {
     let values = stack();
     let valid = Array2::from_elem((4, 5), true);
@@ -311,6 +312,10 @@ fn receipt_digest_binds_content_config_and_date_order() {
         changed_floor.receipt().digest()
     );
     assert_ne!(
+        baseline.receipt().digest(),
+        changed_data_identity.receipt().digest()
+    );
+    assert_eq!(
         baseline.factor().model_hash(),
         content.factor().model_hash()
     );
@@ -318,11 +323,11 @@ fn receipt_digest_binds_content_config_and_date_order() {
         baseline.factor().model_hash(),
         changed_config.factor().model_hash()
     );
-    assert_ne!(
+    assert_eq!(
         baseline.factor().model_hash(),
         reversed.factor().model_hash()
     );
-    assert_ne!(
+    assert_eq!(
         baseline.factor().model_hash(),
         changed_data_identity.factor().model_hash()
     );
@@ -330,8 +335,24 @@ fn receipt_digest_binds_content_config_and_date_order() {
         baseline.factor().model_hash(),
         changed_model_identity.factor().model_hash()
     );
-    assert_ne!(
+    assert_eq!(
         baseline.factor().model_hash(),
         changed_source.factor().model_hash()
+    );
+    assert_ne!(
+        baseline.factor().numeric_receipt_digest(),
+        content.factor().numeric_receipt_digest()
+    );
+    assert_ne!(
+        baseline.factor().numeric_receipt_digest(),
+        reversed.factor().numeric_receipt_digest()
+    );
+    assert_eq!(
+        baseline.factor().numeric_receipt_digest(),
+        changed_data_identity.factor().numeric_receipt_digest()
+    );
+    assert_ne!(
+        baseline.factor().numeric_receipt_digest(),
+        changed_source.factor().numeric_receipt_digest()
     );
 }
