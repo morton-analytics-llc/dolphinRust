@@ -3905,9 +3905,16 @@ fn write_chunked_2d<T: H5Type>(
 }
 
 /// HDF5 schema version for bounded reference-specific covariance factors.
-pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 2;
+pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 3;
+const SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION: u16 = 2;
 /// Stable method identity for issue #54 reference-specific factors.
 pub const SPATIAL_REFERENCE_COVARIANCE_METHOD: &str = "reference_specific_influence_v1";
+/// Persisted sentinel for an approximation bound that is unavailable or has not
+/// passed the frozen validation scope.
+pub const SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE: f64 = f64::NAN;
+/// Persisted source-burst index for a masked, failed, mixed, or ambiguous target
+/// that cannot claim one source-burst owner.
+pub const SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE: u32 = u32::MAX;
 
 const SPATIAL_ROOT_MEMBERS: &[&str] = &["metadata", "full_grid", "blocks"];
 const SPATIAL_ROOT_ATTRIBUTES: &[&str] = &[
@@ -3985,47 +3992,190 @@ impl SpatialReferenceCalibrationScope {
 
 /// Per-target disposition stored with a reference-specific factor block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum SpatialReferenceCovarianceStatus {
     /// The target factor is finite and evaluable for the declared scope.
-    Valid,
+    Valid = 0,
     /// The target or selected reference is invalid.
-    InvalidReference,
-    /// Phase-link or sequential replay is not differentiable.
-    ReplayUnsupported,
+    InvalidReference = 1,
+    /// Legacy coarse status for phase-link or sequential replay failure.
+    ReplayUnsupported = 2,
     /// The fixed-valid-observation L2 map is rank deficient.
-    L2RankDeficient,
+    L2RankDeficient = 3,
     /// An input identity or calibration scope does not match.
-    ScopeMismatch,
+    ScopeMismatch = 4,
     /// Target/reference ownership is mixed, ambiguous, or date-varying.
-    UnsupportedMultiburstReference,
+    UnsupportedMultiburstReference = 5,
+    /// The target is excluded by the production validity mask.
+    MaskedTarget = 6,
+    /// The exact temporal propagation factor cannot be constructed.
+    TemporalFactorInvalid = 7,
+    /// The persisted replay source is unavailable.
+    ReplayUnavailable = 8,
+    /// The persisted replay identity differs from the requested scope.
+    ReplayMismatch = 9,
+    /// The target/reference influence contraction is invalid.
+    InfluenceInvalid = 10,
+    /// The selected phase estimator is on a nondifferentiable branch.
+    NondifferentiableEstimator = 11,
+    /// Adaptive support changed relative to its frozen realization.
+    UnstableAdaptiveSupport = 12,
+    /// L1 inversion has no fixed production L2 propagation map.
+    UnsupportedL1 = 13,
+    /// Phase-bias correction is outside the supported covariance scope.
+    UnsupportedPhaseBias = 14,
+    /// The configured correction/reference order is unsupported.
+    UnsupportedCorrectionOrder = 15,
+    /// The EVD branch has a tied selected eigenvalue.
+    TiedEigenvalue = 16,
+    /// The target or reference has no usable source support.
+    EmptySupport = 17,
+    /// A primitive proper-complex source contains a non-finite sample.
+    NonfiniteSource = 18,
+    /// The requested downstream estimator/model is outside the supported scope.
+    UnsupportedModel = 19,
+    /// The production factor or solve exceeded its frozen condition limit.
+    IllConditioned = 20,
+    /// Realized support identity differs from the frozen support receipt.
+    SupportIdentityMismatch = 21,
 }
 
 impl SpatialReferenceCovarianceStatus {
     const fn code(self) -> u16 {
-        match self {
-            Self::Valid => 0,
-            Self::InvalidReference => 1,
-            Self::ReplayUnsupported => 2,
-            Self::L2RankDeficient => 3,
-            Self::ScopeMismatch => 4,
-            Self::UnsupportedMultiburstReference => 5,
-        }
+        self as u16
     }
 
-    fn from_code(code: u16) -> Result<Self> {
-        match code {
+    fn from_code(code: u16, schema_version: u16) -> Result<Self> {
+        let status = match code {
             0 => Ok(Self::Valid),
             1 => Ok(Self::InvalidReference),
             2 => Ok(Self::ReplayUnsupported),
             3 => Ok(Self::L2RankDeficient),
             4 => Ok(Self::ScopeMismatch),
             5 => Ok(Self::UnsupportedMultiburstReference),
+            6 => Ok(Self::MaskedTarget),
+            7 => Ok(Self::TemporalFactorInvalid),
+            8 => Ok(Self::ReplayUnavailable),
+            9 => Ok(Self::ReplayMismatch),
+            10 => Ok(Self::InfluenceInvalid),
+            11 => Ok(Self::NondifferentiableEstimator),
+            12 => Ok(Self::UnstableAdaptiveSupport),
+            13 => Ok(Self::UnsupportedL1),
+            14 => Ok(Self::UnsupportedPhaseBias),
+            15 => Ok(Self::UnsupportedCorrectionOrder),
+            16 => Ok(Self::TiedEigenvalue),
+            17 => Ok(Self::EmptySupport),
+            18 => Ok(Self::NonfiniteSource),
+            19 => Ok(Self::UnsupportedModel),
+            20 => Ok(Self::IllConditioned),
+            21 => Ok(Self::SupportIdentityMismatch),
             _ => Err(invalid(format!(
                 "unknown spatial reference covariance status {code}"
             ))),
-        }
+        }?;
+        ensure_valid(
+            schema_version != SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION || code <= 5,
+            "legacy spatial reference covariance status is outside schema v2",
+        )?;
+        Ok(status)
     }
 }
+
+/// Stable reference-specific covariance status registry.
+///
+/// Codes `0..=5` retain the schema-v2 meanings already written by older
+/// producers. New producers should prefer the detailed statuses over the legacy
+/// [`SpatialReferenceCovarianceStatus::ReplayUnsupported`] catch-all.
+pub const SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY: &[CovarianceRegistryEntry] = &[
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::Valid as u16,
+        name: "valid",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::InvalidReference as u16,
+        name: "invalid_reference",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::ReplayUnsupported as u16,
+        name: "replay_unsupported",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::L2RankDeficient as u16,
+        name: "l2_rank_deficient",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::ScopeMismatch as u16,
+        name: "scope_mismatch",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnsupportedMultiburstReference as u16,
+        name: "unsupported_multiburst_reference",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::MaskedTarget as u16,
+        name: "masked_target",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::TemporalFactorInvalid as u16,
+        name: "temporal_factor_invalid",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::ReplayUnavailable as u16,
+        name: "replay_unavailable",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::ReplayMismatch as u16,
+        name: "replay_mismatch",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::InfluenceInvalid as u16,
+        name: "influence_invalid",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::NondifferentiableEstimator as u16,
+        name: "nondifferentiable_estimator",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnstableAdaptiveSupport as u16,
+        name: "unstable_adaptive_support",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnsupportedL1 as u16,
+        name: "unsupported_l1",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnsupportedPhaseBias as u16,
+        name: "unsupported_phase_bias",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnsupportedCorrectionOrder as u16,
+        name: "unsupported_correction_order",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::TiedEigenvalue as u16,
+        name: "tied_eigenvalue",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::EmptySupport as u16,
+        name: "empty_support",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::NonfiniteSource as u16,
+        name: "nonfinite_source",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::UnsupportedModel as u16,
+        name: "unsupported_model",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::IllConditioned as u16,
+        name: "ill_conditioned",
+    },
+    CovarianceRegistryEntry {
+        code: SpatialReferenceCovarianceStatus::SupportIdentityMismatch as u16,
+        name: "support_identity_mismatch",
+    },
+];
 
 /// Artifact-level identity for bounded reference-specific covariance blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4102,7 +4252,11 @@ impl SpatialReferenceCovarianceMetadata {
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
         ensure_valid(
-            self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+            matches!(
+                self.schema_version,
+                SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+                    | SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION
+            ),
             "unsupported spatial reference covariance schema",
         )?;
         ensure_valid(
@@ -4196,14 +4350,42 @@ impl SpatialReferenceCovarianceMetadata {
                 "uncalibrated spatial reference scope cannot carry promotion receipts",
             )?,
             SpatialReferenceCalibrationScope::CalibratedScopeMatch => {
-                for value in [
-                    &self.review_receipt_digest,
-                    &self.method_manifest_digest,
-                    &self.calibration_scope_digest,
-                ] {
+                let required = match self.schema_version {
+                    SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => vec![
+                        &self.review_receipt_digest,
+                        &self.method_manifest_digest,
+                        &self.calibration_scope_digest,
+                    ],
+                    _ => vec![
+                        &self.review_receipt_digest,
+                        &self.method_manifest_digest,
+                        &self.calibration_scope_digest,
+                        &self.mask_digest,
+                        &self.source_replay_digest,
+                        &self.l2_map_digest,
+                        &self.reference_signature_digest,
+                        &self.approximation_receipt_digest,
+                        &self.resource_receipt_digest,
+                        &self.source_model_digest,
+                        &self.effective_looks_digest,
+                        &self.support_digest,
+                        &self.correction_order_digest,
+                        &self.unwrap_branch_digest,
+                        &self.burst_ownership_digest,
+                    ],
+                };
+                for value in required {
                     ensure_valid(
                         is_nonzero_sha256_digest(value),
                         "calibrated spatial reference scope requires strong promotion receipts",
+                    )?;
+                }
+                if self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+                    ensure_valid(
+                        self.producer_commit
+                            .as_deref()
+                            .is_some_and(is_exact_producer_code_identity),
+                        "calibrated spatial reference scope requires an exact producer code identity",
                     )?;
                 }
                 ensure_valid(
@@ -4215,6 +4397,14 @@ impl SpatialReferenceCovarianceMetadata {
         }
         Ok(())
     }
+
+    fn validate_for_write(&self) -> Result<()> {
+        ensure_valid(
+            self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+            "new spatial reference covariance writes require the current schema version",
+        )?;
+        self.validate()
+    }
 }
 
 /// Compute the immutable calibrated scope identity, excluding promotion state.
@@ -4223,7 +4413,12 @@ pub fn spatial_reference_calibration_scope_digest(
     metadata: &SpatialReferenceCovarianceMetadata,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"dolphinrust:spatial-reference-calibration-scope:v1");
+    let legacy = metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION;
+    digest.update(if legacy {
+        b"dolphinrust:spatial-reference-calibration-scope:v1".as_slice()
+    } else {
+        b"dolphinrust:spatial-reference-calibration-scope:v2".as_slice()
+    });
     for value in [
         metadata.method.as_str(),
         metadata.crate_version.as_str(),
@@ -4246,6 +4441,12 @@ pub fn spatial_reference_calibration_scope_digest(
     ] {
         digest.update((value.len() as u64).to_le_bytes());
         digest.update(value.as_bytes());
+    }
+    if !legacy {
+        let producer_identity = metadata.producer_commit.as_deref().unwrap_or_default();
+        digest.update((producer_identity.len() as u64).to_le_bytes());
+        digest.update(producer_identity.as_bytes());
+        digest.update(metadata.schema_version.to_le_bytes());
     }
     digest.update(metadata.method_version.to_le_bytes());
     digest.update(metadata.full_grid.row_start.to_le_bytes());
@@ -4282,11 +4483,13 @@ pub struct SpatialReferenceCovarianceBlock {
     pub rank_by_target: Vec<u32>,
     /// Stable disposition for each target.
     pub status: Vec<SpatialReferenceCovarianceStatus>,
-    /// Source-burst registry index for every target.
+    /// Source-burst registry index for every target. Non-valid targets may use
+    /// [`SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE`].
     pub source_burst_index_by_target: Vec<u32>,
     /// Target-major, date-major, rank-minor difference factor.
     pub difference_factor: Vec<f64>,
-    /// Preregistered approximation-error bound for each target.
+    /// Validated approximation-error bound for each target. Uncalibrated and
+    /// non-valid targets use [`SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE`].
     pub approximation_error_bound: Vec<f64>,
     /// Digest of the exact replayed source factors represented by this block.
     pub source_factor_digest: String,
@@ -4322,6 +4525,7 @@ impl SpatialReferenceCovarianceBlock {
             .ok_or_else(|| invalid("spatial reference block byte count overflow"))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self, metadata: &SpatialReferenceCovarianceMetadata) -> Result<()> {
         let targets = self.target_grid.area()?;
         ensure_valid(
@@ -4352,13 +4556,17 @@ impl SpatialReferenceCovarianceBlock {
             "spatial reference source factor digest is not strong",
         )?;
         ensure_valid(
-            self.difference_factor.iter().all(|value| value.is_finite())
-                && self
-                    .approximation_error_bound
+            self.difference_factor.iter().all(|value| value.is_finite()),
+            "spatial reference factor contains non-finite values",
+        )?;
+        if metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
+            ensure_valid(
+                self.approximation_error_bound
                     .iter()
                     .all(|value| value.is_finite() && *value >= 0.0),
-            "spatial reference block contains non-finite values",
-        )?;
+                "legacy spatial reference approximation bounds are invalid",
+            )?;
+        }
         for target in 0..targets {
             let realized = usize::try_from(self.rank_by_target[target])
                 .map_err(|_| invalid("spatial reference rank exceeds usize"))?;
@@ -4366,22 +4574,52 @@ impl SpatialReferenceCovarianceBlock {
                 realized <= rank,
                 "spatial reference target rank exceeds maximum",
             )?;
+            let legacy =
+                metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION;
             ensure_valid(
-                matches!(self.status[target], SpatialReferenceCovarianceStatus::Valid)
-                    == (realized > 0),
+                if legacy {
+                    (self.status[target] == SpatialReferenceCovarianceStatus::Valid)
+                        == (realized > 0)
+                } else {
+                    self.status[target] == SpatialReferenceCovarianceStatus::Valid || realized == 0
+                },
                 "spatial reference status and target rank disagree",
             )?;
-            let source_burst = usize::try_from(self.source_burst_index_by_target[target])
-                .map_err(|_| invalid("spatial reference source-burst index exceeds usize"))?;
+            if !legacy {
+                let approximation_bound = self.approximation_error_bound[target];
+                let validated_bound_required = self.status[target]
+                    == SpatialReferenceCovarianceStatus::Valid
+                    && metadata.calibration_scope
+                        == SpatialReferenceCalibrationScope::CalibratedScopeMatch;
+                ensure_valid(
+                    match validated_bound_required {
+                        true => approximation_bound.is_finite() && approximation_bound >= 0.0,
+                        false => approximation_bound.is_nan(),
+                    },
+                    "spatial reference approximation bound disagrees with status or calibration scope",
+                )?;
+            }
+            let source_burst_index = self.source_burst_index_by_target[target];
+            let source_burst_unavailable =
+                source_burst_index == SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE;
+            let source_burst = usize::try_from(source_burst_index).ok();
             ensure_valid(
-                source_burst < metadata.source_burst_ids.len(),
+                (!legacy && source_burst_unavailable)
+                    || source_burst.is_some_and(|index| index < metadata.source_burst_ids.len()),
                 "spatial reference source-burst index is outside the registry",
             )?;
             ensure_valid(
-                realized == 0
-                    || self.source_burst_index_by_target[target]
-                        == metadata.reference_source_burst_index,
+                (legacy && realized == 0)
+                    || self.status[target] != SpatialReferenceCovarianceStatus::Valid
+                    || source_burst_index == metadata.reference_source_burst_index,
                 "valid spatial reference factor crosses source-burst ownership",
+            )?;
+            ensure_valid(
+                legacy
+                    || self.status[target]
+                        != SpatialReferenceCovarianceStatus::UnsupportedMultiburstReference
+                    || source_burst_unavailable,
+                "unsupported multiburst target cannot claim one source-burst owner",
             )?;
             for date in 0..dates {
                 for component in 0..rank {
@@ -4438,7 +4676,7 @@ impl SpatialReferenceCovarianceWriter {
         path: impl AsRef<Path>,
         metadata: &SpatialReferenceCovarianceMetadata,
     ) -> Result<Self> {
-        metadata.validate()?;
+        metadata.validate_for_write()?;
         let path = path.as_ref().to_owned();
         let file = hdf5::File::create(&path)?;
         write_spatial_reference_metadata(&file, metadata)?;
@@ -4756,7 +4994,7 @@ pub fn read_spatial_reference_covariance_block(
         .dataset("status")?
         .read_raw::<u16>()?
         .into_iter()
-        .map(SpatialReferenceCovarianceStatus::from_code)
+        .map(|code| SpatialReferenceCovarianceStatus::from_code(code, metadata.schema_version))
         .collect::<Result<Vec<_>>>()?;
     let block = SpatialReferenceCovarianceBlock {
         block_id: read_scalar_attr(&group, "block_id")?,
@@ -5333,6 +5571,11 @@ fn is_nonzero_sha256_digest(value: &str) -> bool {
             .unwrap_or(value)
             .bytes()
             .any(|byte| byte != b'0')
+}
+
+fn is_exact_producer_code_identity(value: &str) -> bool {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    matches!(digest.len(), 40 | 64) && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn sha256_digest_bytes(value: &str) -> Option<[u8; 32]> {
