@@ -16,11 +16,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Final reference-specific factor filename.
-pub const SPATIAL_REFERENCE_COVARIANCE_FILENAME: &str = "spatial_reference_covariance.h5";
+pub const SPATIAL_REFERENCE_COVARIANCE_FILENAME: &str =
+    "referenced_displacement_covariance_factor.h5";
 /// JSON completion marker written after the HDF5 rename.
 pub const SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME: &str =
-    "spatial_reference_covariance.json";
-const LOCK_FILENAME: &str = "spatial_reference_covariance.capture.lock";
+    "referenced_displacement_covariance_provenance.json";
+/// Canonical HDF5 scratch filename admitted for finalization.
+pub const SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME: &str =
+    "referenced_displacement_covariance_factor.h5.scratch";
+/// Canonical provenance scratch filename committed last.
+pub const SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME: &str =
+    "referenced_displacement_covariance_provenance.json.scratch";
+/// Reader/writer lock filename for the complete factor/provenance pair.
+pub const SPATIAL_REFERENCE_COVARIANCE_LOCK_FILENAME: &str =
+    "referenced_displacement_covariance.capture.lock";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const METADATA_READ_CAP: u64 = 1024 * 1024;
 
@@ -104,7 +113,7 @@ impl SpatialReferenceCovarianceArtifactTransaction {
     /// Returns an error while another reader/writer owns the artifact.
     #[cfg(unix)]
     pub fn acquire(directory: &Path) -> Result<Self> {
-        let lock_path = directory.join(LOCK_FILENAME);
+        let lock_path = directory.join(SPATIAL_REFERENCE_COVARIANCE_LOCK_FILENAME);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -115,10 +124,12 @@ impl SpatialReferenceCovarianceArtifactTransaction {
         // SAFETY: `lock` owns this descriptor for the transaction lifetime.
         let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         anyhow::ensure!(result == 0, "spatial covariance artifact is already locked");
-        Ok(Self {
+        let transaction = Self {
             directory: directory.to_owned(),
             _lock: lock,
-        })
+        };
+        recover_incomplete_artifact(&transaction.directory)?;
+        Ok(transaction)
     }
 
     /// Non-Unix targets cannot provide the required durable lock.
@@ -126,6 +137,31 @@ impl SpatialReferenceCovarianceArtifactTransaction {
     pub fn acquire(_directory: &Path) -> Result<Self> {
         anyhow::bail!("spatial covariance artifact locking is unsupported on this platform")
     }
+}
+
+struct SpatialReferenceCovarianceArtifactReadLock {
+    _lock: File,
+}
+
+#[cfg(unix)]
+fn acquire_read_lock(directory: &Path) -> Result<SpatialReferenceCovarianceArtifactReadLock> {
+    let lock_path = directory.join(SPATIAL_REFERENCE_COVARIANCE_LOCK_FILENAME);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening spatial covariance lock {}", lock_path.display()))?;
+    // SAFETY: `lock` owns this descriptor for the read-lock lifetime.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    anyhow::ensure!(result == 0, "spatial covariance artifact is being replaced");
+    Ok(SpatialReferenceCovarianceArtifactReadLock { _lock: lock })
+}
+
+#[cfg(not(unix))]
+fn acquire_read_lock(_directory: &Path) -> Result<SpatialReferenceCovarianceArtifactReadLock> {
+    anyhow::bail!("spatial covariance artifact read locking is unsupported on this platform")
 }
 
 /// Validate, atomically install, and commit a reference-specific factor artifact.
@@ -143,8 +179,8 @@ pub fn finalize_spatial_reference_covariance_artifact(
 ) -> Result<SpatialReferenceCovarianceArtifactManifest> {
     let directory = &transaction.directory;
     anyhow::ensure!(
-        hdf5_scratch.parent() == Some(directory.as_path()),
-        "spatial covariance scratch file must be inside the work directory"
+        hdf5_scratch == directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME),
+        "spatial covariance scratch file must use the canonical transaction path"
     );
     let embedded = read_spatial_reference_covariance_header(hdf5_scratch, METADATA_READ_CAP)
         .context("validating spatial covariance HDF5 metadata")?;
@@ -152,6 +188,7 @@ pub fn finalize_spatial_reference_covariance_artifact(
         embedded == *metadata,
         "spatial covariance HDF5 metadata differs from finalization metadata"
     );
+    validate_calibration_evidence(metadata)?;
     File::open(hdf5_scratch)?.sync_all()?;
     let (hdf5_sha256, hdf5_bytes) = sha256_file(hdf5_scratch)?;
     anyhow::ensure!(
@@ -165,19 +202,19 @@ pub fn finalize_spatial_reference_covariance_artifact(
     );
     let manifest = manifest(metadata, hdf5_sha256, hdf5_bytes);
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    let scratch_manifest = directory.join(format!(
-        ".{SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME}.scratch"
-    ));
-    write_synced(&scratch_manifest, &manifest_bytes)?;
-
     let final_manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
     let final_hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
-    match fs::remove_file(&final_manifest) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("removing prior spatial covariance manifest"),
+    if final_manifest.exists() || final_hdf5.exists() {
+        anyhow::ensure!(
+            read_manifest_unlocked(directory).is_err(),
+            "a valid spatial covariance artifact already exists"
+        );
+        remove_if_exists(&final_manifest)?;
+        remove_if_exists(&final_hdf5)?;
+        sync_directory(directory)?;
     }
-    sync_directory(directory)?;
+    let scratch_manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME);
+    write_synced(&scratch_manifest, &manifest_bytes)?;
     fs::rename(hdf5_scratch, &final_hdf5).context("finalizing spatial covariance HDF5")?;
     sync_directory(directory)?;
     fs::rename(&scratch_manifest, &final_manifest)
@@ -194,6 +231,11 @@ pub fn finalize_spatial_reference_covariance_artifact(
 pub fn read_spatial_reference_covariance_artifact_manifest(
     directory: &Path,
 ) -> Result<SpatialReferenceCovarianceArtifactManifest> {
+    let _lock = acquire_read_lock(directory)?;
+    read_manifest_unlocked(directory)
+}
+
+fn read_manifest_unlocked(directory: &Path) -> Result<SpatialReferenceCovarianceArtifactManifest> {
     let manifest_path = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
     let bytes = fs::read(&manifest_path).with_context(|| {
         format!(
@@ -220,11 +262,80 @@ pub fn read_spatial_reference_covariance_artifact_manifest(
         "spatial covariance HDF5 does not match its manifest"
     );
     let embedded = read_spatial_reference_covariance_header(&hdf5_path, METADATA_READ_CAP)?;
+    validate_calibration_evidence(&embedded)?;
     anyhow::ensure!(
         manifest(&embedded, digest, byte_count) == parsed,
         "spatial covariance embedded scope does not match its manifest"
     );
     Ok(parsed)
+}
+
+fn recover_incomplete_artifact(directory: &Path) -> Result<()> {
+    let final_manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
+    let final_hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    let valid_final =
+        final_manifest.exists() && final_hdf5.exists() && read_manifest_unlocked(directory).is_ok();
+    let mut changed = false;
+    if !valid_final {
+        changed |= remove_if_exists(&final_manifest)?;
+        changed |= remove_if_exists(&final_hdf5)?;
+    }
+    changed |=
+        remove_if_exists(&directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME))?;
+    changed |=
+        remove_if_exists(&directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME))?;
+    if changed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn validate_calibration_evidence(metadata: &SpatialReferenceCovarianceMetadata) -> Result<()> {
+    match metadata.calibration_scope {
+        SpatialReferenceCalibrationScope::Uncalibrated => {
+            anyhow::ensure!(
+                metadata.review_receipt_digest.is_empty()
+                    && metadata.method_manifest_digest.is_empty()
+                    && metadata.calibration_scope_digest.is_empty(),
+                "uncalibrated spatial covariance cannot carry promotion receipts"
+            );
+            Ok(())
+        }
+        SpatialReferenceCalibrationScope::CalibratedScopeMatch => {
+            for digest in [
+                &metadata.source_replay_digest,
+                &metadata.l2_map_digest,
+                &metadata.source_model_digest,
+                &metadata.effective_looks_digest,
+                &metadata.approximation_receipt_digest,
+                &metadata.resource_receipt_digest,
+                &metadata.review_receipt_digest,
+                &metadata.method_manifest_digest,
+                &metadata.calibration_scope_digest,
+            ] {
+                anyhow::ensure!(
+                    is_nonzero_sha256(digest),
+                    "calibrated spatial covariance requires exact nonzero evidence hashes"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn is_nonzero_sha256(value: &str) -> bool {
+    let hex = value.strip_prefix("sha256:").unwrap_or(value);
+    hex.len() == 64
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && hex.bytes().any(|byte| byte != b'0')
 }
 
 fn manifest(

@@ -1,8 +1,12 @@
 use dolphin_io::{
-    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
-    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
-    SpatialReferenceCovarianceStatus, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
+    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+};
+use dolphin_workflows::spatial_covariance_artifact::{
+    SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME, SPATIAL_REFERENCE_COVARIANCE_LOCK_FILENAME,
+    SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME,
 };
 use dolphin_workflows::{
     finalize_spatial_reference_covariance_artifact,
@@ -74,6 +78,39 @@ fn block() -> SpatialReferenceCovarianceBlock {
     }
 }
 
+fn calibrated_metadata() -> SpatialReferenceCovarianceMetadata {
+    let mut value = metadata();
+    value.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
+    value.review_receipt_digest = digest(0x81);
+    value.method_manifest_digest = digest(0x82);
+    value.calibration_scope_digest = spatial_reference_calibration_scope_digest(&value);
+    value
+}
+
+#[test]
+fn product_boundary_uses_frozen_final_scratch_and_lock_names() {
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_FILENAME,
+        "referenced_displacement_covariance_factor.h5"
+    );
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
+        "referenced_displacement_covariance_provenance.json"
+    );
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME,
+        "referenced_displacement_covariance_factor.h5.scratch"
+    );
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME,
+        "referenced_displacement_covariance_provenance.json.scratch"
+    );
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_LOCK_FILENAME,
+        "referenced_displacement_covariance.capture.lock"
+    );
+}
+
 #[test]
 fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     let directory = std::env::temp_dir().join(format!(
@@ -83,7 +120,7 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
     let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
-    let scratch = directory.join("spatial-reference.scratch.h5");
+    let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
     let receipt = write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
     assert!(!directory
         .join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME)
@@ -101,11 +138,11 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     assert!(directory
         .join(SPATIAL_REFERENCE_COVARIANCE_FILENAME)
         .exists());
+    drop(transaction);
     assert_eq!(
         read_spatial_reference_covariance_artifact_manifest(&directory).unwrap(),
         manifest
     );
-    drop(transaction);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -118,7 +155,7 @@ fn tampered_hdf5_or_manifest_identity_fails_closed() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
     let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
-    let scratch = directory.join("spatial-reference.scratch.h5");
+    let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
     let receipt = write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
     finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &metadata(), &receipt)
         .unwrap();
@@ -142,4 +179,201 @@ fn tampered_hdf5_or_manifest_identity_fails_closed() {
     std::fs::write(&hdf5, bytes).unwrap();
     assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn noncanonical_scratch_and_active_writer_are_unreadable() {
+    let directory = std::env::temp_dir().join(format!(
+        "dolphin_spatial_covariance_lock_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    let scratch = directory.join("replacement.h5.scratch");
+    let receipt = write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
+    let error = finalize_spatial_reference_covariance_artifact(
+        &transaction,
+        &scratch,
+        &metadata(),
+        &receipt,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("canonical transaction path"), "{error}");
+    let error = read_spatial_reference_covariance_artifact_manifest(&directory)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("being replaced"), "{error}");
+    drop(transaction);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn valid_pair_is_immutable_and_stale_scratch_is_recovered() {
+    let directory = std::env::temp_dir().join(format!(
+        "dolphin_spatial_covariance_immutable_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let first_transaction =
+        SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
+    let receipt = write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
+    let first = finalize_spatial_reference_covariance_artifact(
+        &first_transaction,
+        &scratch,
+        &metadata(),
+        &receipt,
+    )
+    .unwrap();
+    drop(first_transaction);
+    let final_hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    let final_manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
+    let original_hdf5 = std::fs::read(&final_hdf5).unwrap();
+    let original_manifest = std::fs::read(&final_manifest).unwrap();
+
+    std::fs::write(
+        directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME),
+        b"stale",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME),
+        b"stale",
+    )
+    .unwrap();
+    let replacement_transaction =
+        SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    assert!(!directory
+        .join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME)
+        .exists());
+    assert!(!directory
+        .join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME)
+        .exists());
+    let replacement_receipt =
+        write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
+    let error = finalize_spatial_reference_covariance_artifact(
+        &replacement_transaction,
+        &scratch,
+        &metadata(),
+        &replacement_receipt,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(std::fs::read(&final_hdf5).unwrap(), original_hdf5);
+    assert_eq!(std::fs::read(&final_manifest).unwrap(), original_manifest);
+    drop(replacement_transaction);
+
+    let recovery = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    assert!(!scratch.exists());
+    drop(recovery);
+    assert_eq!(
+        read_spatial_reference_covariance_artifact_manifest(&directory).unwrap(),
+        first
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn incomplete_and_corrupt_final_pairs_are_unreadable_then_recoverable() {
+    let directory = std::env::temp_dir().join(format!(
+        "dolphin_spatial_covariance_recovery_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let orphan = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    write_spatial_reference_covariance(&orphan, &metadata(), &[block()]).unwrap();
+    std::fs::write(
+        directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME),
+        b"interrupted manifest commit",
+    )
+    .unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+    let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    assert!(!orphan.exists());
+    assert!(!directory
+        .join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_SCRATCH_FILENAME)
+        .exists());
+    let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
+    let receipt = write_spatial_reference_covariance(&scratch, &metadata(), &[block()]).unwrap();
+    finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &metadata(), &receipt)
+        .unwrap();
+    drop(transaction);
+
+    let final_manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
+    std::fs::write(&final_manifest, b"corrupt").unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+    let recovery = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    assert!(!directory
+        .join(SPATIAL_REFERENCE_COVARIANCE_FILENAME)
+        .exists());
+    assert!(!final_manifest.exists());
+    drop(recovery);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn calibration_requires_complete_nonzero_evidence_and_never_follows_file_presence() {
+    let directory = std::env::temp_dir().join(format!(
+        "dolphin_spatial_covariance_calibration_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
+    let uncalibrated = metadata();
+    let receipt = write_spatial_reference_covariance(&scratch, &uncalibrated, &[block()]).unwrap();
+    let manifest = finalize_spatial_reference_covariance_artifact(
+        &transaction,
+        &scratch,
+        &uncalibrated,
+        &receipt,
+    )
+    .unwrap();
+    assert_eq!(manifest.calibration_scope, "uncalibrated");
+    drop(transaction);
+    std::fs::remove_dir_all(&directory).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    let mut missing_analytic = calibrated_metadata();
+    missing_analytic.source_replay_digest = format!("sha256:{}", "00".repeat(32));
+    missing_analytic.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&missing_analytic);
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &missing_analytic, &[block()]).unwrap();
+    let error = finalize_spatial_reference_covariance_artifact(
+        &transaction,
+        &scratch,
+        &missing_analytic,
+        &receipt,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("nonzero evidence hashes"), "{error}");
+    assert!(!directory
+        .join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME)
+        .exists());
+    drop(transaction);
+    std::fs::remove_dir_all(&directory).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
+    let calibrated = calibrated_metadata();
+    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+    let manifest = finalize_spatial_reference_covariance_artifact(
+        &transaction,
+        &scratch,
+        &calibrated,
+        &receipt,
+    )
+    .unwrap();
+    assert_eq!(manifest.calibration_scope, "calibrated_scope_match");
+    drop(transaction);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
