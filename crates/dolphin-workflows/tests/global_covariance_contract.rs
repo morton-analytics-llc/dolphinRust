@@ -799,6 +799,194 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         .all(|value| *value == 0.0));
     assert!(result.covariance[(1, 1)] > 0.0);
 
+    let joint_selection = [
+        (GlobalDateId::new(0), 0),
+        (GlobalDateId::new(1), 0),
+        (GlobalDateId::new(3), 0),
+        (GlobalDateId::new(6), 0),
+    ];
+    let shared_reference = [
+        (GlobalDateId::new(0), 1),
+        (GlobalDateId::new(1), 1),
+        (GlobalDateId::new(3), 1),
+        (GlobalDateId::new(6), 1),
+    ];
+    let reads_before_joint = provider.source_reads;
+    let shared = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    assert!(provider.source_reads > reads_before_joint);
+    assert!(shared
+        .difference_covariance
+        .iter()
+        .all(|value| value.is_finite()));
+    assert!(shared.difference_covariance[(3, 3)] > 0.0);
+    assert!(shared.source_cache_peak_bytes <= shared.dependency_cone.source_window_bytes);
+    assert_eq!(shared.dependency_cone.provider_bytes, 256);
+    assert_ne!(shared.reference_signature, [0; 32]);
+
+    let mut disjoint_cfg = cfg;
+    disjoint_cfg.half_window = dolphin_core::HalfWindow { y: 0, x: 0 };
+    let mut disjoint_blocks = Vec::new();
+    run_sequential_with_covariance_capture(
+        provider.stack.view(),
+        &disjoint_cfg,
+        &engine,
+        &request,
+        |block| {
+            disjoint_blocks.push(block);
+            Ok(())
+        },
+    )
+    .unwrap();
+    bind_test_factor_receipts(&mut disjoint_blocks);
+    let disjoint_topology = SequentialReplayTopology::plan_identified(
+        8,
+        (4, 4),
+        (2, 2),
+        1,
+        Array2::from_elem((4, 4), true).view(),
+        &disjoint_cfg,
+        scope(),
+        ReplayIdNamespace {
+            burst_id: request.burst_id.clone(),
+            source_manifest_digest: request.source_manifest_digest,
+            source_model_version_digest: request.source_model_version_digest,
+            native_origin: (10, 20),
+            output_origin: (5, 10),
+            owned_output_origin: (5, 10),
+            owned_output_shape: (2, 2),
+        },
+    )
+    .unwrap();
+    let disjoint_blocks = disjoint_blocks
+        .into_iter()
+        .map(|block| (GlobalBlockId::new(block.block_id), block))
+        .collect();
+    let disjoint_identity = provider.identity.clone();
+    let mut disjoint_provider = CapturedProvider {
+        identity: disjoint_identity,
+        blocks: disjoint_blocks,
+        stack: provider.stack.clone(),
+        source_reads: 0,
+        fail_source_model: false,
+        dishonest_samples: false,
+    };
+    let disjoint_reference = [
+        (GlobalDateId::new(0), 3),
+        (GlobalDateId::new(1), 3),
+        (GlobalDateId::new(3), 3),
+        (GlobalDateId::new(6), 3),
+    ];
+    let disjoint = disjoint_topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &disjoint_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+            &mut disjoint_provider,
+        )
+        .unwrap();
+    assert!(disjoint
+        .target_reference_covariance
+        .iter()
+        .all(|value| value.abs() < 1.0e-12));
+    assert_ne!(disjoint.reference_signature, shared.reference_signature);
+
+    let coincident = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &joint_selection,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    assert_eq!(
+        coincident.difference_covariance,
+        Array2::<f64>::zeros((4, 4))
+    );
+    assert_ne!(coincident.reference_signature, shared.reference_signature);
+
+    let reads_before_cap = provider.source_reads;
+    let error = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: 0,
+            },
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::DependencyConeExceedsBudget);
+    assert_eq!(provider.source_reads, reads_before_cap);
+
+    let error = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &[
+                (GlobalDateId::new(0), 1),
+                (GlobalDateId::new(1), 1),
+                (GlobalDateId::new(4), 1),
+                (GlobalDateId::new(6), 1),
+            ],
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::InvalidReference);
+    assert_eq!(provider.source_reads, reads_before_cap);
+
+    let target_marginal = topology
+        .replay_temporal_covariance_from_provider(
+            &joint_selection,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    for row in 0..4 {
+        for column in 0..4 {
+            assert!(
+                (shared.target_covariance[(row, column)]
+                    - target_marginal.covariance[(row, column)])
+                    .abs()
+                    < 1.0e-10
+            );
+        }
+    }
+
     provider.dishonest_samples = true;
     let error = topology
         .replay_temporal_covariance_from_provider(

@@ -10,6 +10,7 @@ pub mod inversion;
 pub mod loop_closure;
 pub mod network;
 pub mod reference;
+pub mod spatial_covariance;
 pub mod temporal_validation;
 pub mod velocity_model;
 
@@ -26,6 +27,12 @@ pub use loop_closure::{
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};
+pub use spatial_covariance::{
+    convert_covariance_units, date_contrast, solve_fixed_l2_spatial_covariance,
+    solve_fixed_l2_spatial_covariance_from_factor, spatial_l2_branch_status, SpatialL2Branch,
+    SpatialL2Covariance, SpatialL2Error, SpatialL2FactorCovariance, SpatialL2Status,
+    FIXED_L2_SPATIAL_COVARIANCE_METHOD,
+};
 pub use temporal_validation::{
     preregistered_grid, run_preregistered_validation, TemporalValidationReceipt, ValidationCell,
     ValidationCellResult, ValidationCellStatus, TEMPORAL_VALIDATION_SCHEMA,
