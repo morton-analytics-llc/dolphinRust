@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 
 const DAYS_PER_YEAR: f64 = 365.25;
-const RHO_STEP: f64 = 0.05;
 const SYMMETRY_TOLERANCE: f64 = 1e-10;
 
 type SubsetSeries = (Vec<f64>, Vec<f64>, Vec<Vec<f64>>);
@@ -75,7 +74,7 @@ impl Default for TemporalCovarianceOptions {
             oracle_rho: 0.3,
             oracle_process_variance: 1.0,
             condition_limit: 1e12,
-            minimum_dates: 3,
+            minimum_dates: 12,
             bootstrap_replicates: 200,
             bootstrap_minimum_successes: 180,
             bootstrap_seed: 0x53_2026,
@@ -106,6 +105,33 @@ pub struct ValidationInterval {
     /// Upper empirical interval endpoint.
     pub upper: f64,
     /// Number of successful complete-refit replicates.
+    pub successful_replicates: usize,
+}
+
+/// Point and interval diagnostics for one validation comparator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparatorDiagnostics {
+    /// Comparator point estimate in units per year.
+    pub point_estimate: Option<f64>,
+    /// Diagnostic standard error, never a production raster field.
+    pub standard_error_diagnostic: Option<f64>,
+    /// Symmetric 68% validation interval.
+    pub interval_68: Option<ValidationInterval>,
+    /// Symmetric 90% validation interval.
+    pub interval_90: Option<ValidationInterval>,
+    /// Symmetric 95% validation interval.
+    pub interval_95: Option<ValidationInterval>,
+    /// Width of the 68% validation interval.
+    pub width_68: Option<f64>,
+    /// Width of the 90% validation interval.
+    pub width_90: Option<f64>,
+    /// Width of the 95% validation interval.
+    pub width_95: Option<f64>,
+    /// Stable comparator disposition.
+    pub status: TemporalInferenceStatus,
+    /// Number of attempted resamples for this comparator.
+    pub attempted_replicates: usize,
+    /// Number of successful resamples for this comparator.
     pub successful_replicates: usize,
 }
 
@@ -140,6 +166,20 @@ pub struct TemporalCovarianceFit {
     pub degrees_of_freedom: usize,
     /// Estimated condition number of the fitted covariance.
     pub covariance_condition_number: Option<f64>,
+    /// OLS point/interval diagnostics.
+    pub ols: ComparatorDiagnostics,
+    /// Oracle GLS point/interval diagnostics.
+    pub oracle_gls: ComparatorDiagnostics,
+    /// Plug-in profiled GLS point/interval diagnostics.
+    pub plugin_gls: ComparatorDiagnostics,
+    /// Profile-likelihood comparator diagnostics.
+    pub adjusted_profile: ComparatorDiagnostics,
+    /// Complete-refit bootstrap diagnostics.
+    pub complete_refit_bootstrap: ComparatorDiagnostics,
+    /// Number of bootstrap attempts.
+    pub bootstrap_attempts: usize,
+    /// Number of successful bootstrap refits.
+    pub bootstrap_successes: usize,
 }
 
 /// Construct the preregistered continuous-time AR(1) correlation matrix.
@@ -298,6 +338,13 @@ pub fn fit_temporal_covariance(
         rank: 0,
         degrees_of_freedom: 0,
         covariance_condition_number: None,
+        ols: empty_comparator(status),
+        oracle_gls: empty_comparator(status),
+        plugin_gls: empty_comparator(status),
+        adjusted_profile: empty_comparator(status),
+        complete_refit_bootstrap: empty_comparator(status),
+        bootstrap_attempts: 0,
+        bootstrap_successes: 0,
     };
     if let Err(status) = validate_dates(days) {
         return empty(status);
@@ -347,7 +394,7 @@ pub fn fit_temporal_covariance(
         Ok(value) => value,
         Err(status) => return empty(status),
     };
-    let oracle = match gls_slope(
+    let oracle_fit = match gls_fit(
         &selected_days,
         &selected_y,
         &oracle_v,
@@ -371,6 +418,38 @@ pub fn fit_temporal_covariance(
         .map(|(value, day)| value - plugin.slope * day)
         .collect();
     let raw_correlation = raw_adjacent_correlation(&selected_days, &residuals);
+    let ols_information = dot(&selected_days, &selected_days);
+    let ols_residuals: Vec<f64> = selected_y
+        .iter()
+        .zip(&selected_days)
+        .map(|(value, day)| value - ols * day)
+        .collect();
+    let ols_scale = dot(&ols_residuals, &ols_residuals) / degrees_of_freedom.max(1) as f64;
+    let ols = normal_comparator(
+        ols,
+        (ols_scale / ols_information).sqrt(),
+        TemporalInferenceStatus::Evaluated,
+    );
+    let oracle = normal_comparator(
+        oracle_fit.slope,
+        oracle_fit.information_variance.sqrt(),
+        TemporalInferenceStatus::Evaluated,
+    );
+    let plugin_fit = gls_fit(
+        &selected_days,
+        &selected_y,
+        &plugin.covariance,
+        options.condition_limit,
+    );
+    let plugin_comparator = plugin_fit.map_or_else(empty_comparator, |fit| {
+        normal_comparator(
+            fit.slope,
+            fit.information_variance.sqrt(),
+            TemporalInferenceStatus::Evaluated,
+        )
+    });
+    let adjusted_profile = profile_comparator(&plugin, degrees_of_freedom);
+    let bootstrap_comparator = bootstrap_comparator(&bootstrap);
     let status = if bootstrap.successes < options.bootstrap_minimum_successes {
         TemporalInferenceStatus::BootstrapInsufficientSuccess
     } else {
@@ -378,18 +457,12 @@ pub fn fit_temporal_covariance(
     };
     TemporalCovarianceFit {
         status,
-        ols_slope: Some(ols * DAYS_PER_YEAR),
-        oracle_gls_slope: Some(oracle * DAYS_PER_YEAR),
+        ols_slope: ols.point_estimate,
+        oracle_gls_slope: oracle.point_estimate,
         plugin_gls_slope: Some(plugin.slope * DAYS_PER_YEAR),
-        adjusted_profile_slope: Some(plugin.slope * DAYS_PER_YEAR),
-        bootstrap_slope: (bootstrap.successes > 0).then_some(bootstrap.mean * DAYS_PER_YEAR),
-        bootstrap_interval: (bootstrap.successes > 0
-            && bootstrap.successes >= options.bootstrap_minimum_successes)
-            .then_some(ValidationInterval {
-                lower: bootstrap.lower * DAYS_PER_YEAR,
-                upper: bootstrap.upper * DAYS_PER_YEAR,
-                successful_replicates: bootstrap.successes,
-            }),
+        adjusted_profile_slope: adjusted_profile.point_estimate,
+        bootstrap_slope: bootstrap_comparator.point_estimate,
+        bootstrap_interval: bootstrap_comparator.interval_95,
         fitted_rho: Some(plugin.rho),
         fitted_process_variance: Some(plugin.process_variance),
         raw_correlation,
@@ -397,6 +470,13 @@ pub fn fit_temporal_covariance(
         rank,
         degrees_of_freedom,
         covariance_condition_number: Some(plugin.condition_number),
+        ols,
+        oracle_gls: oracle,
+        plugin_gls: plugin_comparator,
+        adjusted_profile,
+        complete_refit_bootstrap: bootstrap_comparator,
+        bootstrap_attempts: bootstrap.attempts,
+        bootstrap_successes: bootstrap.successes,
     }
 }
 
@@ -447,13 +527,136 @@ struct PluginFit {
     process_variance: f64,
     covariance: Vec<Vec<f64>>,
     condition_number: f64,
+    information_variance: f64,
+}
+
+fn empty_comparator(status: TemporalInferenceStatus) -> ComparatorDiagnostics {
+    ComparatorDiagnostics {
+        point_estimate: None,
+        standard_error_diagnostic: None,
+        interval_68: None,
+        interval_90: None,
+        interval_95: None,
+        width_68: None,
+        width_90: None,
+        width_95: None,
+        status,
+        attempted_replicates: 0,
+        successful_replicates: 0,
+    }
 }
 
 struct BootstrapSummary {
     mean: f64,
-    lower: f64,
-    upper: f64,
+    interval_68: Option<ValidationInterval>,
+    interval_90: Option<ValidationInterval>,
+    interval_95: Option<ValidationInterval>,
+    attempts: usize,
     successes: usize,
+    variance: f64,
+    minimum_successes: usize,
+}
+
+fn normal_comparator(
+    slope_per_day: f64,
+    standard_error_per_day: f64,
+    status: TemporalInferenceStatus,
+) -> ComparatorDiagnostics {
+    let point = slope_per_day * DAYS_PER_YEAR;
+    let standard_error = standard_error_per_day * DAYS_PER_YEAR;
+    ComparatorDiagnostics {
+        point_estimate: point.is_finite().then_some(point),
+        standard_error_diagnostic: standard_error.is_finite().then_some(standard_error),
+        interval_68: interval(point, standard_error, 0.9944579, 0, 0),
+        interval_90: interval(point, standard_error, 1.6448536, 0, 0),
+        interval_95: interval(point, standard_error, 1.959964, 0, 0),
+        width_68: Some(2.0 * 0.9944579 * standard_error),
+        width_90: Some(2.0 * 1.6448536 * standard_error),
+        width_95: Some(2.0 * 1.959964 * standard_error),
+        status,
+        attempted_replicates: 0,
+        successful_replicates: 0,
+    }
+}
+
+fn profile_comparator(plugin: &PluginFit, degrees_of_freedom: usize) -> ComparatorDiagnostics {
+    let standard_error = plugin.information_variance.sqrt() * DAYS_PER_YEAR;
+    let point = plugin.slope * DAYS_PER_YEAR;
+    let (z68, z90, z95) = t_multipliers(degrees_of_freedom);
+    ComparatorDiagnostics {
+        point_estimate: Some(point),
+        standard_error_diagnostic: Some(standard_error),
+        interval_68: interval(point, standard_error, z68, 0, 0),
+        interval_90: interval(point, standard_error, z90, 0, 0),
+        interval_95: interval(point, standard_error, z95, 0, 0),
+        width_68: Some(2.0 * z68 * standard_error),
+        width_90: Some(2.0 * z90 * standard_error),
+        width_95: Some(2.0 * z95 * standard_error),
+        status: TemporalInferenceStatus::Evaluated,
+        attempted_replicates: 0,
+        successful_replicates: 0,
+    }
+}
+
+fn bootstrap_comparator(summary: &BootstrapSummary) -> ComparatorDiagnostics {
+    let se = if summary.successes > 1 {
+        Some(summary.variance.sqrt() * DAYS_PER_YEAR)
+    } else {
+        None
+    };
+    ComparatorDiagnostics {
+        point_estimate: (summary.successes > 0).then_some(summary.mean * DAYS_PER_YEAR),
+        standard_error_diagnostic: se,
+        interval_68: scale_interval(summary.interval_68),
+        interval_90: scale_interval(summary.interval_90),
+        interval_95: scale_interval(summary.interval_95),
+        width_68: interval_width(summary.interval_68),
+        width_90: interval_width(summary.interval_90),
+        width_95: interval_width(summary.interval_95),
+        status: if summary.successes >= summary.minimum_successes {
+            TemporalInferenceStatus::Evaluated
+        } else {
+            TemporalInferenceStatus::BootstrapInsufficientSuccess
+        },
+        attempted_replicates: summary.attempts,
+        successful_replicates: summary.successes,
+    }
+}
+
+fn scale_interval(interval: Option<ValidationInterval>) -> Option<ValidationInterval> {
+    interval.map(|value| ValidationInterval {
+        lower: value.lower * DAYS_PER_YEAR,
+        upper: value.upper * DAYS_PER_YEAR,
+        successful_replicates: value.successful_replicates,
+    })
+}
+
+fn interval_width(interval: Option<ValidationInterval>) -> Option<f64> {
+    interval.map(|value| (value.upper - value.lower) * DAYS_PER_YEAR)
+}
+
+fn interval(
+    point: f64,
+    standard_error: f64,
+    multiplier: f64,
+    attempts: usize,
+    successes: usize,
+) -> Option<ValidationInterval> {
+    (point.is_finite() && standard_error.is_finite() && standard_error >= 0.0).then_some(
+        ValidationInterval {
+            lower: point - multiplier * standard_error,
+            upper: point + multiplier * standard_error,
+            successful_replicates: successes.max(attempts),
+        },
+    )
+}
+
+fn t_multipliers(degrees_of_freedom: usize) -> (f64, f64, f64) {
+    if degrees_of_freedom < 30 {
+        (1.0, 1.833, 2.262)
+    } else {
+        (0.9944579, 1.6448536, 1.959964)
+    }
 }
 
 fn profile_plugin(
@@ -472,36 +675,117 @@ fn profile_plugin(
         .map(|(y, x)| (y - initial * x).powi(2))
         .sum::<f64>()
         / observations.len() as f64;
-    let variance_candidates =
-        [0.01, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0].map(|factor| (scale * factor).max(1e-12));
+    let log_min = (scale * 1e-6).max(1e-12).ln();
+    let log_max = (scale * 1e6).max(1e-12).ln();
+    let rho_upper = (options.rho_max - 1e-8).max(options.rho_min + 1e-8);
     let mut best: Option<(f64, PluginFit)> = None;
-    let mut rho = options.rho_min;
-    while rho < options.rho_max {
-        for process_variance in variance_candidates {
-            let covariance = total_difference_covariance(
-                difference_covariance,
-                days,
-                process_variance,
-                rho,
-                options.reference_lag_days,
-            )?;
-            let fit = gls_fit(days, observations, &covariance, options.condition_limit)?;
-            let objective = fit.log_determinant + fit.quadratic_form + fit.design_information.ln();
-            let candidate = PluginFit {
-                slope: fit.slope,
-                rho,
-                process_variance,
-                covariance,
-                condition_number: fit.condition_number,
-            };
-            if best.as_ref().is_none_or(|(score, _)| objective < *score) {
-                best = Some((objective, candidate));
+    for initial_rho in [
+        options.rho_min,
+        (options.rho_min + rho_upper) / 2.0,
+        rho_upper,
+    ] {
+        let mut rho = initial_rho;
+        let mut log_variance = scale.max(1e-12).ln();
+        for _ in 0..3 {
+            rho = golden_section_minimum(options.rho_min, rho_upper, |candidate| {
+                profile_objective(
+                    days,
+                    observations,
+                    difference_covariance,
+                    candidate,
+                    log_variance,
+                    options,
+                )
+                .map_or(f64::INFINITY, |(score, _)| score)
+            });
+            log_variance = golden_section_minimum(log_min, log_max, |candidate| {
+                profile_objective(
+                    days,
+                    observations,
+                    difference_covariance,
+                    rho,
+                    candidate,
+                    options,
+                )
+                .map_or(f64::INFINITY, |(score, _)| score)
+            });
+        }
+        if let Ok(candidate) = profile_objective(
+            days,
+            observations,
+            difference_covariance,
+            rho,
+            log_variance,
+            options,
+        ) {
+            if best.as_ref().is_none_or(|(score, _)| candidate.0 < *score) {
+                best = Some(candidate);
             }
         }
-        rho += RHO_STEP;
     }
-    best.map(|(_, fit)| fit)
-        .ok_or(TemporalInferenceStatus::CovarianceParameterAtBoundary)
+    let (_, fit) = best.ok_or(TemporalInferenceStatus::CovarianceParameterAtBoundary)?;
+    if fit.rho >= rho_upper - 1e-6 || fit.process_variance <= log_min.exp() * 1.000001 {
+        return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
+    }
+    Ok(fit)
+}
+
+fn profile_objective(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    rho: f64,
+    log_process_variance: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<(f64, PluginFit), TemporalInferenceStatus> {
+    let process_variance = log_process_variance.exp();
+    let covariance = total_difference_covariance(
+        difference_covariance,
+        days,
+        process_variance,
+        rho,
+        options.reference_lag_days,
+    )?;
+    let fit = gls_fit(days, observations, &covariance, options.condition_limit)?;
+    let objective = fit.log_determinant + fit.quadratic_form + fit.design_information.ln();
+    Ok((
+        objective,
+        PluginFit {
+            slope: fit.slope,
+            rho,
+            process_variance,
+            covariance,
+            condition_number: fit.condition_number,
+            information_variance: fit.information_variance,
+        },
+    ))
+}
+
+fn golden_section_minimum<F>(mut lower: f64, mut upper: f64, mut objective: F) -> f64
+where
+    F: FnMut(f64) -> f64,
+{
+    let ratio = 0.618_033_988_749_894_9;
+    let mut left = upper - ratio * (upper - lower);
+    let mut right = lower + ratio * (upper - lower);
+    let mut left_value = objective(left);
+    let mut right_value = objective(right);
+    for _ in 0..16 {
+        if left_value < right_value {
+            upper = right;
+            right = left;
+            right_value = left_value;
+            left = upper - ratio * (upper - lower);
+            left_value = objective(left);
+        } else {
+            lower = left;
+            left = right;
+            left_value = right_value;
+            right = lower + ratio * (upper - lower);
+            right_value = objective(right);
+        }
+    }
+    (lower + upper) / 2.0
 }
 
 struct GlsFit {
@@ -509,16 +793,8 @@ struct GlsFit {
     quadratic_form: f64,
     log_determinant: f64,
     design_information: f64,
+    information_variance: f64,
     condition_number: f64,
-}
-
-fn gls_slope(
-    days: &[f64],
-    observations: &[f64],
-    covariance: &[Vec<f64>],
-    condition_limit: f64,
-) -> Result<f64, TemporalInferenceStatus> {
-    Ok(gls_fit(days, observations, covariance, condition_limit)?.slope)
 }
 
 fn gls_fit(
@@ -527,6 +803,8 @@ fn gls_fit(
     covariance: &[Vec<f64>],
     condition_limit: f64,
 ) -> Result<GlsFit, TemporalInferenceStatus> {
+    let lower =
+        cholesky(covariance).ok_or(TemporalInferenceStatus::TotalCovarianceNotPositiveDefinite)?;
     let inverse = invert_positive_definite(covariance, condition_limit)?;
     let transformed_x = mat_vec(&inverse, days);
     let transformed_y = mat_vec(&inverse, observations);
@@ -541,16 +819,18 @@ fn gls_fit(
         .map(|(y, x)| y - slope * x)
         .collect();
     let quadratic_form = dot(&residuals, &mat_vec(&inverse, &residuals));
-    let log_determinant = covariance
-        .iter()
-        .enumerate()
-        .map(|(index, row)| row[index].abs().ln())
-        .sum();
+    let log_determinant = 2.0
+        * lower
+            .iter()
+            .enumerate()
+            .map(|(index, row)| row[index].ln())
+            .sum::<f64>();
     Ok(GlsFit {
         slope,
         quadratic_form,
         log_determinant,
         design_information: information,
+        information_variance: 1.0 / information,
         condition_number: condition_number(covariance),
     })
 }
@@ -564,17 +844,25 @@ fn bootstrap_refit(
     if options.bootstrap_replicates == 0 {
         return BootstrapSummary {
             mean: f64::NAN,
-            lower: f64::NAN,
-            upper: f64::NAN,
+            interval_68: None,
+            interval_90: None,
+            interval_95: None,
+            attempts: 0,
             successes: 0,
+            variance: f64::NAN,
+            minimum_successes: options.bootstrap_minimum_successes,
         };
     }
     let Some(cholesky) = cholesky(&plugin.covariance) else {
         return BootstrapSummary {
             mean: f64::NAN,
-            lower: f64::NAN,
-            upper: f64::NAN,
+            interval_68: None,
+            interval_90: None,
+            interval_95: None,
+            attempts: options.bootstrap_replicates,
             successes: 0,
+            variance: f64::NAN,
+            minimum_successes: options.bootstrap_minimum_successes,
         };
     };
     let mut state = options.bootstrap_seed;
@@ -614,19 +902,31 @@ fn bootstrap_refit(
         let position = fraction * (successes.saturating_sub(1)) as f64;
         slopes[position.round() as usize]
     };
+    let variance = if successes > 1 {
+        slopes
+            .iter()
+            .map(|slope| (slope - mean).powi(2))
+            .sum::<f64>()
+            / (successes - 1) as f64
+    } else {
+        f64::NAN
+    };
+    let validation_interval = |fraction: f64| {
+        (successes > 0).then_some(ValidationInterval {
+            lower: quantile((1.0 - fraction) / 2.0),
+            upper: quantile(1.0 - (1.0 - fraction) / 2.0),
+            successful_replicates: successes,
+        })
+    };
     BootstrapSummary {
         mean,
-        lower: if successes > 0 {
-            quantile(0.025)
-        } else {
-            f64::NAN
-        },
-        upper: if successes > 0 {
-            quantile(0.975)
-        } else {
-            f64::NAN
-        },
+        interval_68: validation_interval(0.68),
+        interval_90: validation_interval(0.90),
+        interval_95: validation_interval(0.95),
+        attempts: options.bootstrap_replicates,
         successes,
+        variance,
+        minimum_successes: options.bootstrap_minimum_successes,
     }
 }
 
@@ -728,17 +1028,52 @@ fn solve_cholesky(lower: &[Vec<f64>], rhs: &[f64]) -> Vec<f64> {
 }
 
 fn condition_number(matrix: &[Vec<f64>]) -> f64 {
-    let diagonal = matrix
+    let eigenvalues = symmetric_eigenvalues(matrix);
+    let largest = eigenvalues.iter().copied().fold(0.0, f64::max);
+    let smallest = eigenvalues
         .iter()
-        .enumerate()
-        .map(|(index, row)| row[index].abs())
-        .collect::<Vec<_>>();
-    diagonal.iter().copied().fold(0.0, f64::max)
-        / diagonal
-            .iter()
-            .copied()
-            .filter(|value| *value > 0.0)
-            .fold(f64::INFINITY, f64::min)
+        .copied()
+        .filter(|value| *value > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    largest / smallest
+}
+
+#[allow(clippy::needless_range_loop)]
+fn symmetric_eigenvalues(matrix: &[Vec<f64>]) -> Vec<f64> {
+    let n = matrix.len();
+    let mut work = matrix.to_vec();
+    for _ in 0..(n * n * 5).max(20) {
+        let mut pivot = (0, 0);
+        let mut largest = 0.0;
+        for row in 0..n {
+            for column in (row + 1)..n {
+                if work[row][column].abs() > largest {
+                    largest = work[row][column].abs();
+                    pivot = (row, column);
+                }
+            }
+        }
+        if largest < 1e-14 {
+            break;
+        }
+        let (row, column) = pivot;
+        let angle = 0.5 * (2.0 * work[row][column]).atan2(work[row][row] - work[column][column]);
+        let cosine = angle.cos();
+        let sine = angle.sin();
+        for index in 0..n {
+            let left = work[index][row];
+            let right = work[index][column];
+            work[index][row] = cosine * left - sine * right;
+            work[index][column] = sine * left + cosine * right;
+        }
+        for index in 0..n {
+            let top = work[row][index];
+            let bottom = work[column][index];
+            work[row][index] = cosine * top - sine * bottom;
+            work[column][index] = sine * top + cosine * bottom;
+        }
+    }
+    (0..n).map(|index| work[index][index]).collect()
 }
 
 fn mat_vec(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
