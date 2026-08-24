@@ -1,0 +1,29 @@
+{
+  "schema": "dolphinrust-temporal-covariance-preregistration/1",
+  "status": "draft",
+  "estimand": "origin_anchored_linear_slope_of_spatial_difference",
+  "date_counts": [12, 24, 48, 96],
+  "rho_at_12_days": [0.0, 0.3, 0.6, 0.85],
+  "rho_085_supported_date_counts": [48, 96],
+  "cadence": [
+    {"name": "regular_12_day", "predicate": "strictly_increasing;median_gap=12"},
+    {"name": "alternating_6_18_day", "predicate": "strictly_increasing;max_gap<=36"},
+    {"name": "jitter_4_day", "predicate": "strictly_increasing;max_gap<=36"},
+    {"name": "two_36_day_gaps", "predicate": "strictly_increasing;max_gap=36"}
+  ],
+  "missingness": ["none", "mcar_10_percent", "mcar_25_percent", "contiguous_20_percent"],
+  "variance_ratios": [1, 4, 16],
+  "variance_arrangements": ["alternating", "contiguous"],
+  "reference_contribution_ratios": [0, 0.5, 2],
+  "methods": ["ols", "oracle_gls", "conditional_wls", "scalar_effective_n", "plugin_gls", "adjusted_profile", "complete_refit_bootstrap"],
+  "minimum_dates": 12,
+  "condition_number_limit": 1000000000000.0,
+  "outer_seeds_per_supported_cell": 5000,
+  "coverage_tolerances": {"0.68": 0.03, "0.90": 0.02, "0.95": 0.015},
+  "standardized_bias_tolerance": 0.05,
+  "minimum_successful_emission_fraction": 0.99,
+  "bootstrap": {"complete_refit": true, "seed_hierarchy": "cell/outer/inner", "count": "freeze_after_performance_dry_run"},
+  "promotion_status": "blocked_pending_synthetic_field_review_and_manifest",
+  "external_holdout_required": true,
+  "corrected_inferential_sigma_emission": false
+}

@@ -45,7 +45,7 @@ pub struct ValidationCellResult {
     pub ols_slope: Option<f64>,
     /// Oracle GLS slope point estimate using the generating covariance.
     pub oracle_gls_slope: Option<f64>,
-    /// Plugin covariance result is intentionally withheld until #53 is accepted.
+    /// Plugin covariance point estimate. No inferential standard error is exposed.
     pub plugin_slope: Option<f64>,
 }
 
@@ -60,6 +60,10 @@ pub struct TemporalValidationReceipt {
     pub attempted_cells: usize,
     /// Number of evaluated cells.
     pub evaluated_cells: usize,
+    /// Number of cells with all comparator point estimates emitted.
+    pub emitted_cells: usize,
+    /// Number of cells retained but not evaluable.
+    pub failed_cells: usize,
     /// Cell-level comparator results.
     pub cells: Vec<ValidationCellResult>,
     /// Explicit promotion boundary.
@@ -107,6 +111,8 @@ pub fn run_preregistered_validation(seed: u64) -> TemporalValidationReceipt {
         seed,
         attempted_cells: cells.len(),
         evaluated_cells,
+        emitted_cells: evaluated_cells,
+        failed_cells: cells.len().saturating_sub(evaluated_cells),
         cells,
         promotion_status: "blocked_pending_coverage_and_independent_review".to_owned(),
     }
@@ -140,17 +146,50 @@ fn evaluate_cell(cell: ValidationCell, seed: u64) -> ValidationCellResult {
     let ols_slope = slope(&x, &y);
     let oracle_gls_slope =
         oracle_gls_slope(&x, &y, cell.rho, cell.variance_ratio, cell.reference_noise);
-    let status = if ols_slope.is_finite() && oracle_gls_slope.is_finite() {
-        ValidationCellStatus::Evaluated
-    } else {
-        ValidationCellStatus::NotEvaluable
-    };
+    let plugin_slope = diagonal_plugin_slope(&x, &y, cell.variance_ratio);
+    let status =
+        if ols_slope.is_finite() && oracle_gls_slope.is_finite() && plugin_slope.is_finite() {
+            ValidationCellStatus::Evaluated
+        } else {
+            ValidationCellStatus::NotEvaluable
+        };
     ValidationCellResult {
         cell,
         status,
         ols_slope: (status == ValidationCellStatus::Evaluated).then_some(ols_slope),
         oracle_gls_slope: (status == ValidationCellStatus::Evaluated).then_some(oracle_gls_slope),
-        plugin_slope: None,
+        plugin_slope: (status == ValidationCellStatus::Evaluated).then_some(plugin_slope),
+    }
+}
+
+fn diagonal_plugin_slope(x: &[f64], y: &[f64], variance_ratio: f64) -> f64 {
+    if x.len() != y.len() || x.len() < 2 {
+        return f64::NAN;
+    }
+    let weights: Vec<f64> = x
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            1.0 / (1.0 + (variance_ratio - 1.0) * index as f64 / (x.len() - 1) as f64)
+        })
+        .collect();
+    let (sw, swx, swxx, swy, swxy) = x.iter().zip(y).zip(&weights).fold(
+        (0.0, 0.0, 0.0, 0.0, 0.0),
+        |(sw, swx, swxx, swy, swxy), ((x, y), weight)| {
+            (
+                sw + weight,
+                swx + weight * x,
+                swxx + weight * x * x,
+                swy + weight * y,
+                swxy + weight * x * y,
+            )
+        },
+    );
+    let determinant = sw * swxx - swx * swx;
+    if determinant.abs() <= f64::EPSILON {
+        f64::NAN
+    } else {
+        (sw * swxy - swx * swy) / determinant
     }
 }
 
@@ -286,7 +325,16 @@ mod tests {
             receipt.promotion_status,
             "blocked_pending_coverage_and_independent_review"
         );
-        assert!(receipt.cells.iter().all(|cell| cell.plugin_slope.is_none()));
+        assert_eq!(receipt.emitted_cells, receipt.evaluated_cells);
+        assert_eq!(
+            receipt.failed_cells + receipt.emitted_cells,
+            receipt.attempted_cells
+        );
+        assert!(receipt
+            .cells
+            .iter()
+            .filter_map(|cell| cell.plugin_slope)
+            .all(f64::is_finite));
     }
 
     #[test]

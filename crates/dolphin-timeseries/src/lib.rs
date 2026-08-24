@@ -11,6 +11,7 @@ pub mod loop_closure;
 pub mod network;
 pub mod reference;
 pub mod spatial_covariance;
+pub mod temporal_covariance;
 pub mod temporal_validation;
 pub mod velocity_model;
 
@@ -32,6 +33,12 @@ pub use spatial_covariance::{
     solve_fixed_l2_spatial_covariance_from_factor, spatial_l2_branch_status, SpatialL2Branch,
     SpatialL2Covariance, SpatialL2Error, SpatialL2FactorCovariance, SpatialL2Status,
     FIXED_L2_SPATIAL_COVARIANCE_METHOD,
+};
+pub use temporal_covariance::{
+    continuous_time_ar1_correlation, fit_temporal_covariance, raw_adjacent_correlation,
+    relative_standard_deviation_shape, subset_origin_anchored_covariance,
+    total_difference_covariance, RawCorrelationDiagnostics, TemporalCovarianceFit,
+    TemporalCovarianceOptions, TemporalInferenceStatus, ValidationInterval,
 };
 pub use temporal_validation::{
     preregistered_grid, run_preregistered_validation, TemporalValidationReceipt, ValidationCell,
