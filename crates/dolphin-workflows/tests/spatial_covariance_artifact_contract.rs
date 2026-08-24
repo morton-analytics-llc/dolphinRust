@@ -1,8 +1,8 @@
 use dolphin_io::{
     write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
     SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
-    SpatialReferenceCovarianceStatus, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SpatialReferenceCovarianceStatus, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
 use dolphin_workflows::{
     finalize_spatial_reference_covariance_artifact,
@@ -69,7 +69,7 @@ fn block() -> SpatialReferenceCovarianceBlock {
         status: vec![SpatialReferenceCovarianceStatus::Valid],
         source_burst_index_by_target: vec![0],
         difference_factor: vec![0.0, 1.0],
-        approximation_error_bound: vec![0.01],
+        approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE],
         source_factor_digest: digest(0x77),
     }
 }
