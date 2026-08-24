@@ -36,8 +36,127 @@ pub const SPATIAL_REFERENCE_COVARIANCE_REVIEW_RECEIPT_FILENAME: &str =
 /// Reviewed method manifest required for calibrated promotion.
 pub const SPATIAL_REFERENCE_COVARIANCE_METHOD_MANIFEST_FILENAME: &str =
     "referenced_displacement_covariance_method_manifest.json";
+/// Approximation-validation receipt required for calibrated promotion.
+pub const SPATIAL_REFERENCE_COVARIANCE_APPROXIMATION_RECEIPT_FILENAME: &str =
+    "referenced_displacement_covariance_approximation_receipt.json";
+/// Numeric approximation result bound by the approximation receipt.
+pub const SPATIAL_REFERENCE_COVARIANCE_APPROXIMATION_RESULT_FILENAME: &str =
+    "referenced_displacement_covariance_approximation_result.json";
+/// Resource receipt required for calibrated promotion.
+pub const SPATIAL_REFERENCE_COVARIANCE_RESOURCE_RECEIPT_FILENAME: &str =
+    "referenced_displacement_covariance_resource_receipt.json";
+/// Frozen preregistration copied into the artifact evidence directory.
+pub const SPATIAL_REFERENCE_COVARIANCE_PREREGISTRATION_FILENAME: &str =
+    "referenced_displacement_covariance_preregistration.json";
+/// Frozen design copied into the artifact evidence directory.
+pub const SPATIAL_REFERENCE_COVARIANCE_DESIGN_FILENAME: &str =
+    "referenced_displacement_covariance_design.md";
+/// Exact producer executable copied or linked into the artifact evidence directory.
+pub const SPATIAL_REFERENCE_COVARIANCE_PRODUCER_BINARY_FILENAME: &str =
+    "referenced_displacement_covariance_producer_binary";
 const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const METADATA_READ_CAP: u64 = 1024 * 1024;
+const BINARY_READ_CAP: u64 = 512 * 1024 * 1024;
+const PREREGISTRATION_BYTES: &[u8] =
+    include_bytes!("../../../validation/spatial_covariance_preregistration.json");
+const DESIGN_BYTES: &[u8] = include_bytes!("../../../md/design/spatial-reference-covariance.md");
+const CODE_BYTES: &[&[u8]] = &[
+    include_bytes!("spatial_covariance_artifact.rs"),
+    include_bytes!("sequential.rs"),
+    include_bytes!("sequential_covariance.rs"),
+    include_bytes!("../../dolphin-timeseries/src/inversion.rs"),
+    include_bytes!("../../dolphin-timeseries/src/spatial_covariance.rs"),
+    include_bytes!("../../dolphin-phaselink/src/engine.rs"),
+    include_bytes!("../../dolphin-phaselink/src/fused.rs"),
+    include_bytes!("../../dolphin-phaselink/src/source_model.rs"),
+    include_bytes!("../../dolphin-phaselink/src/spatial_covariance.rs"),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpatialCovarianceApproximationReceipt {
+    schema_version: u16,
+    method: String,
+    method_version: u16,
+    crate_version: String,
+    producer_commit: String,
+    status: String,
+    code_sha256: String,
+    producer_binary_file: String,
+    producer_binary_sha256: String,
+    preregistration_file: String,
+    preregistration_sha256: String,
+    design_file: String,
+    design_sha256: String,
+    result_file: String,
+    result_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpatialCovarianceApproximationResult {
+    schema_version: u16,
+    method: String,
+    method_version: u16,
+    crate_version: String,
+    producer_commit: String,
+    status: String,
+    scope: SpatialCovarianceResultScope,
+    evaluated_cases: u64,
+    maximum_absolute_error: f64,
+    tolerance: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpatialCovarianceResourceReceipt {
+    schema_version: u16,
+    method: String,
+    method_version: u16,
+    crate_version: String,
+    producer_commit: String,
+    status: String,
+    code_sha256: String,
+    producer_binary_sha256: String,
+    preregistration_sha256: String,
+    design_sha256: String,
+    result_sha256: String,
+    peak_resident_set_bytes: u64,
+    wall_micros: u64,
+    maximum_block_bytes: u64,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SpatialCovarianceResultScope {
+    burst_id: String,
+    crs: String,
+    units: String,
+    grid_row_start: u64,
+    grid_col_start: u64,
+    grid_rows: u32,
+    grid_cols: u32,
+    grid_stride_y: u32,
+    grid_stride_x: u32,
+    reference_row: u64,
+    reference_col: u64,
+    gauge_date_index: u32,
+    ordered_date_indices: Vec<u32>,
+    mask_digest: String,
+    source_replay_digest: String,
+    l2_map_digest: String,
+    reference_signature_digest: String,
+    source_model_digest: String,
+    effective_looks_digest: String,
+    support_method: String,
+    support_digest: String,
+    correction_order_digest: String,
+    unwrap_branch_digest: String,
+    burst_ownership_digest: String,
+    source_burst_ids: Vec<String>,
+    reference_source_burst_index: u32,
+    maximum_block_bytes: u64,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,11 +165,15 @@ struct SpatialCovarianceReviewReceipt {
     method: String,
     method_version: u16,
     crate_version: String,
-    producer_commit: Option<String>,
+    producer_commit: String,
     reviewer: String,
     review_status: String,
     unresolved_findings: u32,
-    analytic_receipt_digest: String,
+    code_sha256: String,
+    producer_binary_sha256: String,
+    preregistration_sha256: String,
+    design_sha256: String,
+    result_sha256: String,
     approximation_receipt_digest: String,
     resource_receipt_digest: String,
     calibration_scope_digest: String,
@@ -63,13 +186,23 @@ struct SpatialCovarianceMethodManifest {
     method: String,
     method_version: u16,
     crate_version: String,
-    producer_commit: Option<String>,
+    producer_commit: String,
     manifest_status: String,
-    analytic_receipt_digest: String,
+    code_sha256: String,
+    producer_binary_sha256: String,
+    preregistration_sha256: String,
+    design_sha256: String,
+    result_sha256: String,
     approximation_receipt_digest: String,
     resource_receipt_digest: String,
     review_receipt_digest: String,
     calibration_scope_digest: String,
+}
+
+#[derive(Clone, Copy)]
+enum EvidenceValidationMode {
+    Finalize,
+    Read,
 }
 
 /// Durable receipt binding factor bytes to every scope identity.
@@ -227,7 +360,7 @@ pub fn finalize_spatial_reference_covariance_artifact(
         embedded == *metadata,
         "spatial covariance HDF5 metadata differs from finalization metadata"
     );
-    validate_calibration_evidence(directory, metadata)?;
+    validate_calibration_evidence(directory, metadata, EvidenceValidationMode::Finalize)?;
     File::open(hdf5_scratch)?.sync_all()?;
     let (hdf5_sha256, hdf5_bytes) = sha256_file(hdf5_scratch)?;
     anyhow::ensure!(
@@ -296,7 +429,7 @@ fn read_manifest_unlocked(directory: &Path) -> Result<SpatialReferenceCovariance
         "spatial covariance HDF5 does not match its manifest"
     );
     let embedded = read_spatial_reference_covariance_header(&hdf5_path, METADATA_READ_CAP)?;
-    validate_calibration_evidence(directory, &embedded)?;
+    validate_calibration_evidence(directory, &embedded, EvidenceValidationMode::Read)?;
     anyhow::ensure!(
         manifest(&embedded, digest, byte_count) == parsed,
         "spatial covariance embedded scope does not match its manifest"
@@ -377,8 +510,8 @@ fn verification_error_is_deterministic(error: &anyhow::Error) -> bool {
         if source.is::<std::collections::TryReserveError>() {
             return false;
         }
-        if source.is::<std::io::Error>() {
-            return false;
+        if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+            return io_error.kind() == std::io::ErrorKind::NotFound;
         }
     }
     let message = error.to_string();
@@ -393,6 +526,10 @@ fn verification_error_is_deterministic(error: &anyhow::Error) -> bool {
         "requires exact nonzero scope identities",
         "cannot carry promotion receipts",
         "embedded scope does not match",
+        "calibration evidence",
+        "approximation result",
+        "resource receipt",
+        "producer commit",
     ]
     .iter()
     .any(|fragment| message.contains(fragment))
@@ -445,6 +582,7 @@ fn remove_if_exists(path: &Path) -> Result<bool> {
 fn validate_calibration_evidence(
     directory: &Path,
     metadata: &SpatialReferenceCovarianceMetadata,
+    mode: EvidenceValidationMode,
 ) -> Result<()> {
     match metadata.calibration_scope {
         SpatialReferenceCalibrationScope::Uncalibrated => {
@@ -457,13 +595,17 @@ fn validate_calibration_evidence(
             Ok(())
         }
         SpatialReferenceCalibrationScope::CalibratedScopeMatch => {
+            let producer_commit = metadata.producer_commit.as_deref().unwrap_or_default();
             anyhow::ensure!(
-                metadata
-                    .producer_commit
-                    .as_ref()
-                    .is_some_and(|commit| !commit.trim().is_empty()),
+                is_git_commit(producer_commit),
                 "calibrated spatial covariance requires an exact producer commit"
             );
+            if let Some(compiled_commit) = option_env!("DOLPHIN_GIT_COMMIT") {
+                anyhow::ensure!(
+                    producer_commit == compiled_commit,
+                    "calibrated spatial covariance producer commit does not bind the current code"
+                );
+            }
             for digest in [
                 &metadata.mask_digest,
                 &metadata.reference_signature_digest,
@@ -486,15 +628,139 @@ fn validate_calibration_evidence(
                     "calibrated spatial covariance requires exact nonzero scope identities"
                 );
             }
-            validate_promotion_files(directory, metadata)
+            validate_promotion_files(directory, metadata, mode)
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_promotion_files(
     directory: &Path,
     metadata: &SpatialReferenceCovarianceMetadata,
+    mode: EvidenceValidationMode,
 ) -> Result<()> {
+    let producer_commit = metadata.producer_commit.as_deref().unwrap_or_default();
+    let code_sha256 = spatial_reference_covariance_code_digest();
+    let preregistration_bytes = read_file_with_cap(
+        &directory.join(SPATIAL_REFERENCE_COVARIANCE_PREREGISTRATION_FILENAME),
+        "spatial covariance preregistration",
+    )?;
+    let preregistration_sha256 = spatial_reference_covariance_preregistration_digest();
+    anyhow::ensure!(
+        content_digest(&preregistration_bytes) == preregistration_sha256,
+        "spatial covariance calibration evidence preregistration does not bind the current design"
+    );
+    let design_bytes = read_file_with_cap(
+        &directory.join(SPATIAL_REFERENCE_COVARIANCE_DESIGN_FILENAME),
+        "spatial covariance design",
+    )?;
+    let design_sha256 = spatial_reference_covariance_design_digest();
+    anyhow::ensure!(
+        content_digest(&design_bytes) == design_sha256,
+        "spatial covariance calibration evidence design does not bind the current design"
+    );
+    let result_bytes = read_file_with_cap(
+        &directory.join(SPATIAL_REFERENCE_COVARIANCE_APPROXIMATION_RESULT_FILENAME),
+        "spatial covariance approximation result",
+    )?;
+    let result_sha256 = content_digest(&result_bytes);
+    let result: SpatialCovarianceApproximationResult = serde_json::from_slice(&result_bytes)
+        .context("parsing spatial covariance approximation result")?;
+    anyhow::ensure!(
+        result.schema_version == 1
+            && result.method == metadata.method
+            && result.method_version == metadata.method_version
+            && result.crate_version == metadata.crate_version
+            && result.producer_commit == producer_commit
+            && result.status == "passed"
+            && result.scope == result_scope(metadata)
+            && result.evaluated_cases > 0
+            && result.maximum_absolute_error.is_finite()
+            && result.maximum_absolute_error >= 0.0
+            && result.tolerance.is_finite()
+            && result.tolerance >= 0.0
+            && result.maximum_absolute_error <= result.tolerance,
+        "spatial covariance approximation result does not bind the current scope or passed result"
+    );
+    let binary_path = directory.join(SPATIAL_REFERENCE_COVARIANCE_PRODUCER_BINARY_FILENAME);
+    let (producer_binary_digest, _) = sha256_file_with_cap(
+        &binary_path,
+        BINARY_READ_CAP,
+        "spatial covariance producer binary",
+    )?;
+    let producer_binary_sha256 = format!("sha256:{producer_binary_digest}");
+    if matches!(mode, EvidenceValidationMode::Finalize) {
+        let current_exe = std::env::current_exe().context("locating current producer binary")?;
+        let (current_binary_digest, _) = sha256_file_with_cap(
+            &current_exe,
+            BINARY_READ_CAP,
+            "current spatial covariance producer binary",
+        )?;
+        let current_binary_sha256 = format!("sha256:{current_binary_digest}");
+        anyhow::ensure!(
+            producer_binary_sha256 == current_binary_sha256,
+            "spatial covariance calibration evidence producer binary does not bind the current binary"
+        );
+    }
+    let approximation_bytes = read_file_with_cap(
+        &directory.join(SPATIAL_REFERENCE_COVARIANCE_APPROXIMATION_RECEIPT_FILENAME),
+        "spatial covariance approximation receipt",
+    )?;
+    anyhow::ensure!(
+        content_digest_matches(&metadata.approximation_receipt_digest, &approximation_bytes),
+        "spatial covariance approximation receipt content hash does not match metadata"
+    );
+    let approximation: SpatialCovarianceApproximationReceipt =
+        serde_json::from_slice(&approximation_bytes)
+            .context("parsing spatial covariance approximation receipt")?;
+    anyhow::ensure!(
+        approximation.schema_version == 1
+            && approximation.method == metadata.method
+            && approximation.method_version == metadata.method_version
+            && approximation.crate_version == metadata.crate_version
+            && approximation.producer_commit == producer_commit
+            && approximation.status == "passed"
+            && approximation.code_sha256 == code_sha256
+            && approximation.producer_binary_file
+                == SPATIAL_REFERENCE_COVARIANCE_PRODUCER_BINARY_FILENAME
+            && approximation.producer_binary_sha256 == producer_binary_sha256
+            && approximation.preregistration_file
+                == SPATIAL_REFERENCE_COVARIANCE_PREREGISTRATION_FILENAME
+            && approximation.preregistration_sha256 == preregistration_sha256
+            && approximation.design_file == SPATIAL_REFERENCE_COVARIANCE_DESIGN_FILENAME
+            && approximation.design_sha256 == design_sha256
+            && approximation.result_file
+                == SPATIAL_REFERENCE_COVARIANCE_APPROXIMATION_RESULT_FILENAME
+            && approximation.result_sha256 == result_sha256,
+        "spatial covariance approximation receipt does not bind current code, design, binary, and result"
+    );
+    let resource_bytes = read_file_with_cap(
+        &directory.join(SPATIAL_REFERENCE_COVARIANCE_RESOURCE_RECEIPT_FILENAME),
+        "spatial covariance resource receipt",
+    )?;
+    anyhow::ensure!(
+        content_digest_matches(&metadata.resource_receipt_digest, &resource_bytes),
+        "spatial covariance resource receipt content hash does not match metadata"
+    );
+    let resource: SpatialCovarianceResourceReceipt = serde_json::from_slice(&resource_bytes)
+        .context("parsing spatial covariance resource receipt")?;
+    anyhow::ensure!(
+        resource.schema_version == 1
+            && resource.method == metadata.method
+            && resource.method_version == metadata.method_version
+            && resource.crate_version == metadata.crate_version
+            && resource.producer_commit == producer_commit
+            && resource.status == "passed"
+            && resource.code_sha256 == code_sha256
+            && resource.producer_binary_sha256 == producer_binary_sha256
+            && resource.preregistration_sha256 == preregistration_sha256
+            && resource.design_sha256 == design_sha256
+            && resource.result_sha256 == result_sha256
+            && resource.peak_resident_set_bytes > 0
+            && resource.wall_micros > 0
+            && resource.maximum_block_bytes == metadata.maximum_block_bytes,
+        "spatial covariance resource receipt does not bind current code, result, and resource scope"
+    );
     let review_path = directory.join(SPATIAL_REFERENCE_COVARIANCE_REVIEW_RECEIPT_FILENAME);
     let review_bytes = read_file_with_cap(&review_path, "spatial covariance review receipt")?;
     anyhow::ensure!(
@@ -503,17 +769,20 @@ fn validate_promotion_files(
     );
     let review: SpatialCovarianceReviewReceipt = serde_json::from_slice(&review_bytes)
         .context("parsing spatial covariance review receipt")?;
-    let analytic_receipt_digest = spatial_reference_covariance_analytic_receipt_digest(metadata);
     anyhow::ensure!(
         review.schema_version == 1
             && review.method == metadata.method
             && review.method_version == metadata.method_version
             && review.crate_version == metadata.crate_version
-            && review.producer_commit == metadata.producer_commit
+            && review.producer_commit == producer_commit
             && !review.reviewer.trim().is_empty()
             && review.review_status == "approved_no_unresolved_findings"
             && review.unresolved_findings == 0
-            && review.analytic_receipt_digest == analytic_receipt_digest,
+            && review.code_sha256 == code_sha256
+            && review.producer_binary_sha256 == producer_binary_sha256
+            && review.preregistration_sha256 == preregistration_sha256
+            && review.design_sha256 == design_sha256
+            && review.result_sha256 == result_sha256,
         "spatial covariance review receipt does not bind the current code and analytic result"
     );
     anyhow::ensure!(
@@ -542,9 +811,13 @@ fn validate_promotion_files(
             && method.method == metadata.method
             && method.method_version == metadata.method_version
             && method.crate_version == metadata.crate_version
-            && method.producer_commit == metadata.producer_commit
+            && method.producer_commit == producer_commit
             && method.manifest_status == "reviewed_scope_match"
-            && method.analytic_receipt_digest == analytic_receipt_digest,
+            && method.code_sha256 == code_sha256
+            && method.producer_binary_sha256 == producer_binary_sha256
+            && method.preregistration_sha256 == preregistration_sha256
+            && method.design_sha256 == design_sha256
+            && method.result_sha256 == result_sha256,
         "spatial covariance method manifest does not bind the current code and analytic result"
     );
     anyhow::ensure!(
@@ -566,39 +839,68 @@ fn validate_promotion_files(
     Ok(())
 }
 
-/// Derive the analytic receipt identity bound by calibrated review evidence.
+/// Derive the exact production-code identity required by calibrated evidence.
 #[must_use]
-pub fn spatial_reference_covariance_analytic_receipt_digest(
-    metadata: &SpatialReferenceCovarianceMetadata,
-) -> String {
+pub fn spatial_reference_covariance_code_digest() -> String {
     let mut digest = Sha256::new();
-    digest.update(b"dolphinrust:spatial-reference-analytic-receipt:v1");
-    digest.update(metadata.method_version.to_le_bytes());
-    for value in [
-        metadata.method.as_str(),
-        metadata.crate_version.as_str(),
-        metadata.producer_commit.as_deref().unwrap_or(""),
-        metadata.source_replay_digest.as_str(),
-        metadata.l2_map_digest.as_str(),
-        metadata.source_model_digest.as_str(),
-        metadata.effective_looks_digest.as_str(),
-        metadata.mask_digest.as_str(),
-        metadata.reference_signature_digest.as_str(),
-        metadata.support_method.as_str(),
-        metadata.support_digest.as_str(),
-        metadata.correction_order_digest.as_str(),
-        metadata.unwrap_branch_digest.as_str(),
-        metadata.burst_ownership_digest.as_str(),
-    ] {
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
+    digest.update(b"dolphinrust:spatial-reference-production-code:v1");
+    for bytes in CODE_BYTES {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
     }
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// Derive the embedded preregistration identity required by calibrated evidence.
+#[must_use]
+pub fn spatial_reference_covariance_preregistration_digest() -> String {
+    content_digest(PREREGISTRATION_BYTES)
+}
+
+/// Derive the embedded design identity required by calibrated evidence.
+#[must_use]
+pub fn spatial_reference_covariance_design_digest() -> String {
+    content_digest(DESIGN_BYTES)
+}
+
+fn result_scope(metadata: &SpatialReferenceCovarianceMetadata) -> SpatialCovarianceResultScope {
+    SpatialCovarianceResultScope {
+        burst_id: metadata.burst_id.clone(),
+        crs: metadata.crs.clone(),
+        units: metadata.units.clone(),
+        grid_row_start: metadata.full_grid.row_start,
+        grid_col_start: metadata.full_grid.col_start,
+        grid_rows: metadata.full_grid.rows,
+        grid_cols: metadata.full_grid.cols,
+        grid_stride_y: metadata.full_grid.stride_y,
+        grid_stride_x: metadata.full_grid.stride_x,
+        reference_row: metadata.reference_row,
+        reference_col: metadata.reference_col,
+        gauge_date_index: metadata.gauge_date_index,
+        ordered_date_indices: metadata.ordered_date_indices.clone(),
+        mask_digest: metadata.mask_digest.clone(),
+        source_replay_digest: metadata.source_replay_digest.clone(),
+        l2_map_digest: metadata.l2_map_digest.clone(),
+        reference_signature_digest: metadata.reference_signature_digest.clone(),
+        source_model_digest: metadata.source_model_digest.clone(),
+        effective_looks_digest: metadata.effective_looks_digest.clone(),
+        support_method: metadata.support_method.clone(),
+        support_digest: metadata.support_digest.clone(),
+        correction_order_digest: metadata.correction_order_digest.clone(),
+        unwrap_branch_digest: metadata.unwrap_branch_digest.clone(),
+        burst_ownership_digest: metadata.burst_ownership_digest.clone(),
+        source_burst_ids: metadata.source_burst_ids.clone(),
+        reference_source_burst_index: metadata.reference_source_burst_index,
+        maximum_block_bytes: metadata.maximum_block_bytes,
+    }
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 fn content_digest_matches(expected: &str, bytes: &[u8]) -> bool {
-    let observed = format!("{:x}", Sha256::digest(bytes));
-    expected.strip_prefix("sha256:").unwrap_or(expected) == observed
+    expected == content_digest(bytes)
 }
 
 fn read_file_with_cap(path: &Path, label: &str) -> Result<Vec<u8>> {
@@ -632,6 +934,13 @@ fn is_nonzero_sha256(value: &str) -> bool {
     hex.len() == 64
         && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
         && hex.bytes().any(|byte| byte != b'0')
+}
+
+fn is_git_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn manifest(
@@ -694,6 +1003,23 @@ fn sha256_file(path: &Path) -> Result<(String, u64)> {
             .context("spatial covariance byte count overflow")?;
     }
     Ok((format!("{:x}", digest.finalize()), bytes))
+}
+
+fn sha256_file_with_cap(path: &Path, cap: u64, label: &str) -> Result<(String, u64)> {
+    let expected_bytes = fs::metadata(path)
+        .with_context(|| format!("reading {label} metadata {}", path.display()))?
+        .len();
+    anyhow::ensure!(
+        expected_bytes <= cap,
+        "{label} byte count {expected_bytes} exceeds byte cap {cap}"
+    );
+    let result =
+        sha256_file(path).with_context(|| format!("hashing {label} {}", path.display()))?;
+    anyhow::ensure!(
+        result.1 == expected_bytes,
+        "{label} changed while it was read"
+    );
+    Ok(result)
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
