@@ -22,6 +22,9 @@ RECEIPT_HASH_FIELDS = {
     "manifest_sha256",
     "factor_scope_sha256",
     "gnss_catalog_sha256",
+    "approximation_receipt_sha256",
+    "resource_receipt_sha256",
+    "calibration_scope_receipt_sha256",
 }
 OBSERVATION_FIELDS = {
     "insar_slope_difference",
@@ -123,18 +126,55 @@ def exact_binomial_noninferiority(covered: int, evaluated: int, nominal: float, 
     }
 
 
+def holm_step_down(p_values: Mapping[str, float], familywise_alpha: float) -> dict[str, Any]:
+    """Apply Holm's step-down rule to the three preregistered level tests."""
+
+    if set(p_values) != set(LEVELS) or any(not _finite(value) for value in p_values.values()):
+        raise CohortValidationError("Holm input must contain finite p-values for all levels")
+    ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
+    decisions: dict[str, bool] = {}
+    first_non_rejection = None
+    for rank, (level, p_value) in enumerate(ordered):
+        critical = familywise_alpha / (len(ordered) - rank)
+        reject = first_non_rejection is None and p_value <= critical
+        decisions[level] = reject
+        if not reject and first_non_rejection is None:
+            first_non_rejection = level
+    return {
+        "method": "holm_step_down",
+        "ordered_levels": [level for level, _ in ordered],
+        "critical_values": {level: familywise_alpha / (len(ordered) - rank) for rank, (level, _) in enumerate(ordered)},
+        "reject": decisions,
+    }
+
+
 def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
     binding = cluster.get("difference_covariance")
     required = preregistration["factor_binding"]
     if not isinstance(binding, Mapping):
         raise CohortValidationError("cluster is missing direct #54 difference covariance binding")
-    for field in ("operation", "schema", "mode", "reference_specific", "stitched_burst_count"):
+    for field in (
+        "operation",
+        "operator_method",
+        "operator_method_version",
+        "operator_schema_version",
+        "artifact_hdf5",
+        "artifact_manifest",
+        "mode",
+        "reference_specific",
+        "stitched_burst_count",
+        "producer_calibration_status",
+        "producer_downstream_inference_status",
+        "required_calibration_status",
+    ):
         if binding.get(field) != required[field]:
             raise CohortValidationError("#54 factor identity or scope mismatch")
     if binding.get("marginal_rss_combination_allowed") is not False:
         raise CohortValidationError("#54 factor must be a direct difference covariance")
     if not _hash(binding.get("factor_sha256")) or not _hash(binding.get("scope_sha256")):
         raise CohortValidationError("#54 factor hashes are missing or invalid")
+    if binding.get("calibration_status") != required["required_calibration_status"]:
+        raise CohortValidationError("#54 factor is uncalibrated for held-out scoring")
     if not isinstance(binding.get("scope"), Mapping):
         raise CohortValidationError("#54 factor scope is missing")
     scope = binding["scope"]
@@ -144,6 +184,8 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
         raise CohortValidationError("#54 target/control station scope mismatch")
     if not _hash(scope["common_dates_sha256"]):
         raise CohortValidationError("#54 common-date identity is missing")
+    if binding["scope_sha256"] != canonical_digest(scope):
+        raise CohortValidationError("#54 factor scope digest mismatch")
 
 
 def _validate_gnss_provenance(cluster: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
@@ -198,6 +240,8 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
         errors.append("manifest identity mismatch")
     if receipt.get("scope_hash") != canonical_digest(preregistration["field_scope"]):
         errors.append("field scope mismatch")
+    if receipt.get("calibrated_scope_match") is not True:
+        errors.append("#54 calibrated scope match is not asserted")
     if receipt.get("factor_binding") != preregistration["factor_binding"]:
         errors.append("#54 configuration identity mismatch")
     hashes = receipt.get("hashes")
@@ -218,61 +262,143 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
         return {"status": "fail", "errors": ["receipt clusters do not exactly match frozen primary and surplus clusters"]}
     by_id = {cluster["cluster_id"]: cluster for cluster in clusters}
     candidates = {candidate["candidate_id"]: candidate for candidate in manifest["frozen_clusters"] + manifest["surplus_clusters"]}
-    level_values = {level: [] for level in LEVELS}
-    statuses: list[str] = []
+    primary_ids = [candidate["candidate_id"] for candidate in manifest["frozen_clusters"]]
+    surplus_ids = sorted(candidate["candidate_id"] for candidate in manifest["surplus_clusters"])
+    metrics_by_id: dict[str, dict[str, Any]] = {}
+    statuses: dict[str, str] = {}
+    reasons: dict[str, str] = {}
     for cluster_id, candidate in candidates.items():
         cluster = by_id[cluster_id]
         if cluster.get("station_ids") != candidate["station_ids"] or cluster.get("burst_id") != candidate["burst_id"] or cluster.get("site_id") != candidate["site_id"]:
             errors.append("cluster %s has scope metadata different from its frozen candidate" % cluster_id)
             continue
         status = cluster.get("status")
-        statuses.append(status)
-        if status not in {"pass", "fail", "not_evaluable"}:
+        statuses[cluster_id] = status
+        if status not in {"pass", "fail", "not_evaluable", "not_used"}:
             errors.append("cluster %s has an invalid status" % cluster_id)
+            continue
         if status == "not_evaluable":
-            if cluster.get("reason_code") not in preregistration["attrition"]["allowed_codes"]:
+            reason = cluster.get("reason_code")
+            if reason not in preregistration["attrition"]["allowed_codes"]:
                 errors.append("cluster %s uses an unregistered attrition reason" % cluster_id)
+            else:
+                reasons[cluster_id] = reason
+            continue
+        if status == "not_used":
+            if cluster_id not in surplus_ids:
+                errors.append("only surplus clusters may be not_used")
             continue
         if status == "fail":
             continue
         try:
-            metrics = _cluster_metrics(cluster, candidate, preregistration)
+            metrics_by_id[cluster_id] = _cluster_metrics(cluster, candidate, preregistration)
         except (CohortValidationError, KeyError) as error:
             errors.append("cluster %s is not evaluable: %s" % (cluster_id, error))
+    if errors:
+        return {"status": "fail", "errors": errors}
+    if any(statuses[cluster_id] == "fail" for cluster_id in primary_ids):
+        return {"status": "fail", "errors": ["at least one frozen primary cluster reported fail"]}
+
+    attrited_primary_ids = [cluster_id for cluster_id in primary_ids if statuses[cluster_id] == "not_evaluable"]
+    used_surplus_ids: list[str] = []
+    for surplus_id in surplus_ids:
+        if len(used_surplus_ids) >= len(attrited_primary_ids):
+            break
+        if statuses[surplus_id] == "not_evaluable":
+            continue
+        if statuses[surplus_id] == "not_used":
+            errors.append("surplus status must be pass, fail, or not_evaluable before deterministic fill")
+            continue
+        used_surplus_ids.append(surplus_id)
+    if len(used_surplus_ids) != len(attrited_primary_ids):
+        return {
+            "status": "not_evaluable",
+            "errors": ["frozen surplus is insufficient for deterministic primary attrition"],
+            "attrited_primary_ids": attrited_primary_ids,
+            "used_surplus_ids": used_surplus_ids,
+            "reasons_by_cluster": reasons,
+        }
+    unused_surplus_ids = [surplus_id for surplus_id in surplus_ids if surplus_id not in used_surplus_ids]
+    if any(statuses[surplus_id] != "not_used" for surplus_id in unused_surplus_ids if statuses[surplus_id] != "not_evaluable"):
+        return {"status": "fail", "errors": ["unused surplus clusters must be explicitly marked not_used"]}
+    expected_attrition = {
+        "attrited_primary_ids": attrited_primary_ids,
+        "used_surplus_ids": used_surplus_ids,
+        "unused_surplus_ids": unused_surplus_ids,
+        "reasons_by_cluster": reasons,
+    }
+    if receipt.get("attrition") != expected_attrition:
+        return {"status": "fail", "errors": ["receipt attrition record does not match frozen-order selection"]}
+    if any(statuses[surplus_id] == "fail" for surplus_id in used_surplus_ids):
+        return {"status": "fail", "errors": ["a deterministic surplus replacement reported fail"]}
+    selected_ids = [cluster_id for cluster_id in primary_ids if statuses[cluster_id] == "pass"] + used_surplus_ids
+    level_values = {level: [] for level in LEVELS}
+    for cluster_id in selected_ids:
+        metrics = metrics_by_id.get(cluster_id)
+        if metrics is None:
+            errors.append("selected cluster %s has no valid metrics" % cluster_id)
             continue
         for level in LEVELS:
             level_values[level].append(metrics["levels"][level])
     if errors:
         return {"status": "fail", "errors": errors}
-    if any(status == "fail" for status in statuses):
-        return {"status": "fail", "errors": ["at least one frozen cluster reported fail"]}
-    emission_rate = len(level_values["68"]) / len(clusters)
+    attempted_slots = len(selected_ids)
+    emission_rate = len(metrics_by_id) / attempted_slots if attempted_slots else 0.0
     if emission_rate < preregistration["thresholds"]["minimum_emission_rate"]:
-        return {"status": "not_evaluable", "errors": ["field emission rate is below the frozen threshold"], "emission_rate": emission_rate}
+        return {
+            "status": "not_evaluable",
+            "errors": ["field emission rate is below the frozen threshold"],
+            "emission_rate": emission_rate,
+            "attrited_primary_ids": attrited_primary_ids,
+            "used_surplus_ids": used_surplus_ids,
+            "unused_surplus_ids": unused_surplus_ids,
+            "reasons_by_cluster": reasons,
+        }
     required = preregistration["power"]["required_evaluable_clusters"]
     levels: dict[str, Any] = {}
+    p_values: dict[str, float] = {}
     for level in LEVELS:
         values = level_values[level]
         if len(values) < required[level]:
             levels[level] = {"status": "not_evaluable", "evaluated": len(values), "required": required[level]}
             continue
         covered = sum(value["covered"] for value in values)
-        alpha = preregistration["power"]["per_level_alpha"]
-        coverage_test = exact_binomial_noninferiority(covered, len(values), float(level) / 100.0, alpha)
+        coverage_test = exact_binomial_noninferiority(covered, len(values), float(level) / 100.0, preregistration["power"]["familywise_alpha"])
+        p_values[level] = coverage_test["p_value"]
         score_improves = sum(value["interval_score"] for value in values) < sum(value["baseline_interval_score"] for value in values)
         width_ratio = median(value["width"] for value in values) / median(value["baseline_width"] for value in values)
+        coverage_error = abs(coverage_test["observed_coverage"] - float(level) / 100.0)
         levels[level] = {
-            "status": "pass" if coverage_test["status"] == "pass" and score_improves and width_ratio < preregistration["thresholds"]["median_width_ratio_max"] else "fail",
+            "status": "pending_holm",
             "coverage": coverage_test,
+            "coverage_absolute_error": coverage_error,
+            "coverage_absolute_gate": coverage_error <= preregistration["thresholds"]["coverage_error_max"][level],
             "mean_interval_score": sum(value["interval_score"] for value in values) / len(values),
             "mean_baseline_interval_score": sum(value["baseline_interval_score"] for value in values) / len(values),
             "median_width_ratio": width_ratio,
             "proper_score_improves": score_improves,
         }
+    holm = holm_step_down(p_values, preregistration["power"]["familywise_alpha"]) if len(p_values) == len(LEVELS) else None
+    for level, values in levels.items():
+        if values["status"] == "not_evaluable":
+            continue
+        values["holm_reject"] = holm["reject"][level] if holm is not None else False
+        values["status"] = "pass" if values["holm_reject"] and values["coverage_absolute_gate"] and values["proper_score_improves"] and values["median_width_ratio"] < preregistration["thresholds"]["median_width_ratio_max"] else "fail"
     if any(level["status"] == "fail" for level in levels.values()):
         status = "fail"
-    elif any(level["status"] == "not_evaluable" for level in levels.values()) or any(status == "not_evaluable" for status in statuses):
+    elif any(level["status"] == "not_evaluable" for level in levels.values()):
         status = "not_evaluable"
     else:
         status = "pass"
-    return {"status": status, "errors": [], "levels": levels, "evaluated_clusters": len(level_values["68"]), "emission_rate": emission_rate}
+    return {
+        "status": status,
+        "errors": [],
+        "levels": levels,
+        "holm": holm,
+        "evaluated_clusters": len(level_values["68"]),
+        "emission_rate": emission_rate,
+        "attrited_primary_ids": attrited_primary_ids,
+        "used_surplus_ids": used_surplus_ids,
+        "unused_surplus_ids": unused_surplus_ids,
+        "reasons_by_cluster": reasons,
+    }

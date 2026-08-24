@@ -6,7 +6,7 @@
   "outcomes_present": false,
   "generation_id": "f53-06-v1",
   "candidate_query": {
-    "query_digest": "f53-06-metadata-query-v1",
+    "query_digest": "dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b",
     "source": "catalog_metadata_only",
     "required_fields": [
       "burst_id",
@@ -21,7 +21,14 @@
     ],
     "ordering": "candidate_id_lexical",
     "bulk_fetch_allowed": false,
-    "outcome_fields_allowed": false
+    "outcome_fields_allowed": false,
+    "query": {
+      "source": "catalog_metadata_only",
+      "required_fields": ["burst_id", "orbit_id", "footprint_id", "site_id", "station_ids", "date_start", "date_end", "epoch_count", "metadata_hashes"],
+      "ordering": "candidate_id_lexical",
+      "bulk_fetch_allowed": false,
+      "outcome_fields_allowed": false
+    }
   },
   "exclusions": {
     "site_ids": ["fresno"],
@@ -50,7 +57,8 @@
   },
   "attrition": {
     "frozen_surplus_clusters": 20,
-    "replacement_allowed": false,
+    "replacement_allowed": true,
+    "replacement_policy": "primary_clusters_first_then_frozen_lexical_surplus_only",
     "outcome_informed_replacement_allowed": false,
     "allowed_codes": [
       "insufficient_dates",
@@ -73,7 +81,8 @@
     "test": "one_sided_exact_cluster_binomial_noninferiority",
     "familywise_alpha": 0.05,
     "multiplicity": "holm_step_down_three_nominal_levels",
-    "per_level_alpha": 0.016666666666666668,
+    "holm_order": "ascending_p_value; stop after first non-rejection",
+    "planning_rule": "required_n_uses_the_worst_case_first_Holm_critical_value_familywise_alpha_divided_by_three",
     "unacceptable_coverage_delta": 0.2,
     "planning_coverage_delta": 0.05,
     "minimum_power": 0.8,
@@ -94,11 +103,18 @@
     "no_fresno": true
   },
   "factor_binding": {
-    "operation": "difference_covariance(primary,control,common_dates)",
-    "schema": "dolphinrust-spatial-reference-covariance-contract/1",
-    "mode": "sealed",
+    "operation": "replay_reference_difference_covariance",
+    "operator_method": "sequential_source_dag_v1",
+    "operator_method_version": 1,
+    "operator_schema_version": 1,
+    "artifact_hdf5": "phase_covariance_operator.h5",
+    "artifact_manifest": "phase_covariance_provenance.json",
+    "mode": "batch",
     "reference_specific": true,
     "stitched_burst_count": 1,
+    "producer_calibration_status": "uncalibrated",
+    "producer_downstream_inference_status": "blocked_pending_issue_54_and_53",
+    "required_calibration_status": "calibrated",
     "marginal_rss_combination_allowed": false,
     "scope_fields": ["target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel", "common_dates_sha256", "window", "overlap", "distance"]
   },
@@ -128,7 +144,12 @@
     "preregistration_sha256",
     "manifest_sha256",
     "factor_scope_sha256",
-    "gnss_catalog_sha256"
+    "gnss_catalog_sha256",
+    "approximation_receipt_sha256",
+    "resource_receipt_sha256",
+    "calibration_scope_receipt_sha256"
   ],
+  "emission_denominator": "primary_slots_plus_used_surplus_only",
+  "attrition_receipt_fields": ["attrited_primary_ids", "used_surplus_ids", "unused_surplus_ids", "reasons_by_cluster"],
   "receipt_statuses": ["pass", "fail", "not_evaluable"]
 }

@@ -85,6 +85,9 @@ def validate_candidate(record: Mapping[str, Any], preregistration: Mapping[str, 
     if not isinstance(record, Mapping):
         raise CohortValidationError("candidate must be an object")
     _reject_outcomes(record)
+    query = preregistration["candidate_query"].get("query")
+    if not isinstance(query, Mapping) or preregistration["candidate_query"].get("query_digest") != canonical_digest(query):
+        raise CohortValidationError("frozen candidate query identity is not a SHA-256 of its query")
     missing = RECORD_FIELDS - set(record)
     if missing:
         raise CohortValidationError("candidate is missing metadata fields: %s" % ", ".join(sorted(missing)))

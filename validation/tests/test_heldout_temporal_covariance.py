@@ -12,6 +12,7 @@ from validation.heldout_temporal_covariance.cohort import (
 )
 from validation.heldout_temporal_covariance.scorer import (
     exact_binomial_noninferiority,
+    holm_step_down,
     score_receipt,
     score_slope_difference,
 )
@@ -21,7 +22,7 @@ VALIDATION = Path(__file__).parents[1]
 PREREGISTRATION_PATH = VALIDATION / "temporal_covariance_heldout_preregistration.json"
 
 
-def candidate(index: int, **overrides):
+def candidate(index: int, query_digest="dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b", **overrides):
     value = {
         "candidate_id": "candidate-%03d" % index,
         "source_kind": "catalog_metadata",
@@ -39,10 +40,115 @@ def candidate(index: int, **overrides):
             "burst_metadata_sha256": "1" * 64,
             "gnss_station_metadata_sha256": "2" * 64,
         },
-        "query_digest": "f53-06-metadata-query-v1",
+        "query_digest": query_digest,
     }
     value.update(overrides)
     return value
+
+
+def outcome_cluster(candidate_value, preregistration, status="pass", difference=0.0):
+    scope = {
+        "target_station_id": candidate_value["station_ids"][0],
+        "control_station_id": candidate_value["station_ids"][1],
+        "target_station_pixel": [10, 10],
+        "control_station_pixel": [20, 20],
+        "common_dates_sha256": "4" * 64,
+        "window": "frozen",
+        "overlap": "coincident",
+        "distance": "same_frame",
+    }
+    cluster = {
+        "cluster_id": candidate_value["candidate_id"],
+        "station_ids": candidate_value["station_ids"],
+        "burst_id": candidate_value["burst_id"],
+        "site_id": candidate_value["site_id"],
+        "status": status,
+    }
+    if status == "not_evaluable":
+        cluster["reason_code"] = "gnss_solution_missing"
+        return cluster
+    if status == "not_used":
+        return cluster
+    cluster.update(
+        {
+            "difference_covariance": {
+                **preregistration["factor_binding"],
+                "calibration_status": "calibrated",
+                "factor_sha256": "5" * 64,
+                "scope_sha256": canonical_digest(scope),
+                "scope": scope,
+            },
+            "gnss_provenance": {
+                "solution_source": "frozen-gnss-catalog",
+                "solution_sha256": "6" * 64,
+                "coordinate_frame": "ENU",
+                "los_source": "run_specific_sourced_los_components",
+                "los_sha256": "7" * 64,
+                "los_vector": [0.0, 0.0, 1.0],
+                "projection_convention": "signed_ground_to_sensor_los_dot_enu",
+                "epoch_zero_reference_sha256": "8" * 64,
+                "covariance_projection": "u_transpose_C_u",
+            },
+            "observation": {
+                "insar_slope_difference": difference,
+                "gnss_slope_difference": 0.0,
+                "insar_difference_variance": 1.0,
+                "gnss_slope_variance": 1.0,
+                "sensor_cross_covariance": 0.0,
+                "baseline_sigma": {"68": 10.0, "90": 10.0, "95": 10.0},
+            },
+        }
+    )
+    return cluster
+
+
+def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), surplus_not_evaluable=(), difference=0.0):
+    primary_ids = {candidate_value["candidate_id"] for candidate_value in manifest["frozen_clusters"]}
+    surplus_ids = {candidate_value["candidate_id"] for candidate_value in manifest["surplus_clusters"]}
+    clusters = []
+    for candidate_value in manifest["frozen_clusters"]:
+        status = "not_evaluable" if candidate_value["candidate_id"] in primary_not_evaluable else "pass"
+        clusters.append(outcome_cluster(candidate_value, preregistration, status, difference))
+    surplus_order = sorted(candidate_value["candidate_id"] for candidate_value in manifest["surplus_clusters"])
+    usable = [candidate_id for candidate_id in surplus_order if candidate_id not in surplus_not_evaluable]
+    used = usable[: len(primary_not_evaluable)]
+    for candidate_value in manifest["surplus_clusters"]:
+        candidate_id = candidate_value["candidate_id"]
+        status = "not_evaluable" if candidate_id in surplus_not_evaluable else ("pass" if candidate_id in used else "not_used")
+        clusters.append(outcome_cluster(candidate_value, preregistration, status, difference))
+    attrited = sorted(primary_not_evaluable)
+    unused = [candidate_id for candidate_id in surplus_order if candidate_id not in used]
+    receipt = {
+        "schema": "dolphinrust.temporal_covariance.heldout_receipt",
+        "schema_version": 1,
+        "outcomes_present": True,
+        "one_shot_unblinding": True,
+        "generation_id": preregistration["generation_id"],
+        "preregistration_sha256": canonical_digest(preregistration),
+        "manifest_sha256": canonical_digest(manifest),
+        "scope_hash": canonical_digest(preregistration["field_scope"]),
+        "calibrated_scope_match": True,
+        "factor_binding": preregistration["factor_binding"],
+        "hashes": {
+            "binary_sha256": "0" * 64,
+            "scorer_sha256": "1" * 64,
+            "preregistration_sha256": canonical_digest(preregistration),
+            "manifest_sha256": canonical_digest(manifest),
+            "factor_scope_sha256": canonical_digest(preregistration["factor_binding"]),
+            "gnss_catalog_sha256": "2" * 64,
+            "approximation_receipt_sha256": "3" * 64,
+            "resource_receipt_sha256": "4" * 64,
+            "calibration_scope_receipt_sha256": "5" * 64,
+        },
+        "attrition": {
+            "attrited_primary_ids": attrited,
+            "used_surplus_ids": used,
+            "unused_surplus_ids": unused,
+            "reasons_by_cluster": {candidate_id: "gnss_solution_missing" for candidate_id in attrited + sorted(surplus_not_evaluable)},
+        },
+        "clusters": clusters,
+    }
+    return receipt
 
 
 class HeldoutCohortTests(unittest.TestCase):
@@ -52,10 +158,10 @@ class HeldoutCohortTests(unittest.TestCase):
 
     def test_metadata_discovery_excludes_exposed_and_outcome_records(self):
         records = [
-            candidate(0),
-            candidate(1, site_id="fresno"),
-            candidate(2, station_ids=["A002", "MMX1"]),
-            candidate(3, displacement=[1.0]),
+            candidate(0, query_digest=self.preregistration["candidate_query"]["query_digest"]),
+            candidate(1, query_digest=self.preregistration["candidate_query"]["query_digest"], site_id="fresno"),
+            candidate(2, query_digest=self.preregistration["candidate_query"]["query_digest"], station_ids=["A002", "MMX1"]),
+            candidate(3, query_digest=self.preregistration["candidate_query"]["query_digest"], displacement=[1.0]),
         ]
         discovered = discover_candidates(records, self.preregistration)
         self.assertTrue(discovered["metadata_only"])
@@ -63,8 +169,16 @@ class HeldoutCohortTests(unittest.TestCase):
         self.assertEqual([item["candidate_id"] for item in discovered["candidates"]], ["candidate-000"])
         self.assertEqual(len(discovered["rejected"]), 3)
 
+    def test_query_identity_is_a_real_sha256(self):
+        self.assertEqual(
+            self.preregistration["candidate_query"]["query_digest"],
+            canonical_digest(self.preregistration["candidate_query"]["query"]),
+        )
+        rejected = discover_candidates([candidate(0, query_digest="f53-06-metadata-query-v1")], self.preregistration)
+        self.assertEqual(rejected["candidates"], [])
+
     def test_manifest_freezes_lexical_disjoint_primary_and_surplus_clusters(self):
-        discovered = discover_candidates([candidate(index) for index in range(116)], self.preregistration)
+        discovered = discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration)
         manifest = build_manifest(discovered, self.preregistration)
         self.assertEqual(manifest["status"], "frozen_metadata_only")
         self.assertTrue(manifest["selection_outcome_blind"])
@@ -73,7 +187,7 @@ class HeldoutCohortTests(unittest.TestCase):
         validate_manifest(manifest, self.preregistration)
 
     def test_manifest_stale_or_overlapping_clusters_fail_closed(self):
-        discovered = discover_candidates([candidate(index) for index in range(116)], self.preregistration)
+        discovered = discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration)
         manifest = build_manifest(discovered, self.preregistration)
         stale = copy.deepcopy(manifest)
         stale["preregistration_sha256"] = "f" * 64
@@ -87,8 +201,76 @@ class HeldoutCohortTests(unittest.TestCase):
     def test_exact_power_contract_is_frozen(self):
         expected = {"68": 96, "90": 72, "95": 62}
         self.assertEqual(self.preregistration["power"]["required_evaluable_clusters"], expected)
-        result = exact_binomial_noninferiority(61, 96, 0.68, self.preregistration["power"]["per_level_alpha"])
+        result = exact_binomial_noninferiority(61, 96, 0.68, self.preregistration["power"]["familywise_alpha"] / 3)
         self.assertEqual(result["status"], "pass")
+
+    def test_holm_step_down_preserves_order_and_stops_after_nonrejection(self):
+        result = holm_step_down({"68": 0.001, "90": 0.03, "95": 0.03}, 0.05)
+        self.assertEqual(result["ordered_levels"], ["68", "90", "95"])
+        self.assertTrue(result["reject"]["68"])
+        self.assertFalse(result["reject"]["90"])
+        self.assertFalse(result["reject"]["95"])
+
+    def test_deterministic_surplus_fill_can_keep_power_evaluable(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        primary_id = manifest["frozen_clusters"][0]["candidate_id"]
+        receipt = receipt_for_manifest(self.preregistration, manifest, primary_not_evaluable={primary_id})
+        for cluster in receipt["clusters"][:24]:
+            if cluster["status"] == "pass":
+                cluster["observation"]["insar_slope_difference"] = 2.0
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["attrited_primary_ids"], [primary_id])
+        self.assertEqual(len(report["used_surplus_ids"]), 1)
+        self.assertEqual(report["emission_rate"], 1.0)
+
+    def test_insufficient_surplus_is_not_evaluable(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        primary_id = manifest["frozen_clusters"][0]["candidate_id"]
+        surplus_ids = {candidate_value["candidate_id"] for candidate_value in manifest["surplus_clusters"]}
+        receipt = receipt_for_manifest(self.preregistration, manifest, primary_not_evaluable={primary_id}, surplus_not_evaluable=surplus_ids)
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "not_evaluable")
+        self.assertIn("insufficient", report["errors"][0])
+
+    def test_absolute_coverage_gate_fails_even_when_intervals_emit(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest, difference=1.0)
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any(not level.get("coverage_absolute_gate", True) for level in report["levels"].values()))
+
+    def test_uncalibrated_factor_is_rejected(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["clusters"][0]["difference_covariance"]["calibration_status"] = "uncalibrated"
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("uncalibrated" in error for error in report["errors"]))
+
+    def test_stale_factor_scope_receipt_hash_is_rejected(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["hashes"]["approximation_receipt_sha256"] = "f" * 64
+        receipt["calibrated_scope_match"] = False
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("calibrated scope" in error for error in report["errors"]))
 
     def test_combined_slope_difference_uses_direct_factor_variance_and_levels(self):
         result = score_slope_difference(
@@ -119,7 +301,7 @@ class HeldoutCohortTests(unittest.TestCase):
 
     def test_receipt_stale_generation_and_identity_fail_closed(self):
         manifest = build_manifest(
-            discover_candidates([candidate(index) for index in range(116)], self.preregistration),
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
             self.preregistration,
         )
         receipt = {
@@ -140,7 +322,7 @@ class HeldoutCohortTests(unittest.TestCase):
 
     def test_candidate_pool_shortfall_is_not_evaluable_not_a_pass(self):
         manifest = build_manifest(
-            discover_candidates([candidate(index) for index in range(10)], self.preregistration),
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(10)], self.preregistration),
             self.preregistration,
         )
         self.assertEqual(manifest["status"], "not_evaluable_candidate_pool")
