@@ -34,6 +34,8 @@ fn estimate<'a>(
         values,
         valid,
         grid_origin,
+        (0, 0),
+        (4, 5),
         source_pixel,
         [17; 32],
         config,
@@ -145,6 +147,29 @@ fn identical_global_source_window_is_tile_equivalent() {
 }
 
 #[test]
+fn tile_without_canonical_native_halo_fails_instead_of_reclamping() {
+    let values = stack();
+    let valid = Array2::from_elem((4, 5), true);
+
+    assert_eq!(
+        estimate_empirical_proper_complex_factor(
+            SourceId::new(41),
+            &[20240101, 20240113],
+            values.slice(s![.., 2..4, 2..5]),
+            valid.slice(s![2..4, 2..5]),
+            (2, 2),
+            (0, 0),
+            (4, 5),
+            (2, 2),
+            [17; 32],
+            &config(0.2),
+        )
+        .unwrap_err(),
+        EmpiricalSourceModelError::MissingSupport
+    );
+}
+
+#[test]
 fn invalid_nonfinite_and_missing_support_fail_closed() {
     assert_eq!(
         EmpiricalProperComplexConfig::new(1, 1, 0.0, 1.0e-12, [11; 32]),
@@ -169,6 +194,8 @@ fn invalid_nonfinite_and_missing_support_fail_closed() {
             values.view(),
             valid.view(),
             (0, 0),
+            (0, 0),
+            (4, 5),
             (2, 2),
             [17; 32],
             &config(0.2),
@@ -186,6 +213,8 @@ fn invalid_nonfinite_and_missing_support_fail_closed() {
             values.view(),
             missing.view(),
             (0, 0),
+            (0, 0),
+            (4, 5),
             (2, 2),
             [17; 32],
             &config(0.2),
@@ -202,6 +231,8 @@ fn invalid_nonfinite_and_missing_support_fail_closed() {
             values.slice(s![.., ..2, ..2]),
             too_small.view(),
             (0, 0),
+            (0, 0),
+            (4, 5),
             (0, 0),
             [17; 32],
             &config(0.2),
@@ -227,12 +258,37 @@ fn relative_diagonal_floor_rejects_underpowered_component() {
             values.view(),
             valid.view(),
             (0, 0),
+            (0, 0),
+            (3, 3),
             (1, 1),
             [17; 32],
             &config(0.2),
         )
         .unwrap_err(),
         EmpiricalSourceModelError::DiagonalBelowRelativeFloor(1)
+    );
+}
+
+#[test]
+fn relative_rank_floor_rejects_nearly_collinear_components() {
+    let values = Array3::from_elem((2, 3, 3), Cf64::new(1.0, 0.0));
+    let valid = Array2::from_elem((3, 3), true);
+
+    assert_eq!(
+        estimate_empirical_proper_complex_factor(
+            SourceId::new(41),
+            &[1, 2],
+            values.view(),
+            valid.view(),
+            (0, 0),
+            (0, 0),
+            (3, 3),
+            (1, 1),
+            [17; 32],
+            &config(1.0e-15),
+        )
+        .unwrap_err(),
+        EmpiricalSourceModelError::RankBelowRelativeFloor(1)
     );
 }
 
@@ -266,6 +322,8 @@ fn receipt_digest_binds_content_config_and_date_order() {
         values.slice(s![..;-1, .., ..]),
         valid.view(),
         (0, 0),
+        (0, 0),
+        (4, 5),
         (2, 2),
         [17; 32],
         &config(0.2),
@@ -277,6 +335,8 @@ fn receipt_digest_binds_content_config_and_date_order() {
         values.view(),
         valid.view(),
         (0, 0),
+        (0, 0),
+        (4, 5),
         (2, 2),
         [18; 32],
         &config(0.2),
@@ -295,6 +355,8 @@ fn receipt_digest_binds_content_config_and_date_order() {
         values.view(),
         valid.view(),
         (0, 0),
+        (0, 0),
+        (4, 5),
         (2, 2),
         [17; 32],
         &config(0.2),

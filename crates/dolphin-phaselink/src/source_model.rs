@@ -195,7 +195,7 @@ impl EmpiricalProperComplexReceipt {
     }
 }
 
-/// Empirical factor paired with the exact receipt used as its model hash.
+/// Empirical factor paired with its source-specific content/configuration receipt.
 #[derive(Debug, Clone)]
 pub struct EmpiricalProperComplexEstimate {
     factor: ProperComplexFactor,
@@ -209,7 +209,7 @@ impl EmpiricalProperComplexEstimate {
         &self.factor
     }
 
-    /// Source-model receipt whose digest is the factor model hash.
+    /// Source-specific receipt; the factor model hash is the common configuration digest.
     #[must_use]
     pub const fn receipt(&self) -> &EmpiricalProperComplexReceipt {
         &self.receipt
@@ -247,6 +247,8 @@ pub enum EmpiricalSourceModelError {
     NoPositiveDiagonal,
     /// A covariance component was below the declared relative diagonal floor.
     DiagonalBelowRelativeFloor(usize),
+    /// A factor pivot was below the declared relative rank floor.
+    RankBelowRelativeFloor(usize),
     /// Deterministic complex Cholesky could not factor the shrunk covariance.
     CholeskyFailure,
     /// The generated factor violated the common proper-complex factor contract.
@@ -273,6 +275,10 @@ impl Display for EmpiricalSourceModelError {
             Self::DiagonalBelowRelativeFloor(component) => write!(
                 f,
                 "empirical source component {component} is below the relative diagonal floor"
+            ),
+            Self::RankBelowRelativeFloor(component) => write!(
+                f,
+                "empirical source factor pivot {component} is below the relative rank floor"
             ),
             Self::CholeskyFailure => {
                 write!(f, "empirical source covariance is not positive definite")
@@ -303,43 +309,60 @@ struct SampleSummary {
 }
 
 fn resolve_window(
-    grid_shape: (usize, usize),
-    grid_origin: (usize, usize),
+    supplied_shape: (usize, usize),
+    supplied_origin: (usize, usize),
+    native_origin: (usize, usize),
+    native_shape: (usize, usize),
     source_pixel: (usize, usize),
     config: &EmpiricalProperComplexConfig,
 ) -> Result<ResolvedWindow, EmpiricalSourceModelError> {
-    let (grid_rows, grid_columns) = grid_shape;
+    let (native_rows, native_columns) = native_shape;
     let (support_rows, support_columns) = config.support_shape();
-    if grid_rows < support_rows || grid_columns < support_columns {
+    if native_rows < support_rows || native_columns < support_columns {
         return Err(EmpiricalSourceModelError::MissingSupport);
     }
     let source_row = source_pixel
         .0
-        .checked_sub(grid_origin.0)
+        .checked_sub(native_origin.0)
         .ok_or(EmpiricalSourceModelError::SourceOutsideGrid)?;
     let source_column = source_pixel
         .1
-        .checked_sub(grid_origin.1)
+        .checked_sub(native_origin.1)
         .ok_or(EmpiricalSourceModelError::SourceOutsideGrid)?;
-    if source_row >= grid_rows || source_column >= grid_columns {
+    if source_row >= native_rows || source_column >= native_columns {
         return Err(EmpiricalSourceModelError::SourceOutsideGrid);
     }
     let window_row = source_row
         .saturating_sub(config.half_window_rows)
-        .min(grid_rows - support_rows);
+        .min(native_rows - support_rows);
     let window_column = source_column
         .saturating_sub(config.half_window_columns)
-        .min(grid_columns - support_columns);
-    let global_row = grid_origin
+        .min(native_columns - support_columns);
+    let global_row = native_origin
         .0
         .checked_add(window_row)
         .ok_or(EmpiricalSourceModelError::InvalidSupport)?;
-    let global_column = grid_origin
+    let global_column = native_origin
         .1
         .checked_add(window_column)
         .ok_or(EmpiricalSourceModelError::InvalidSupport)?;
+    let local_row = global_row
+        .checked_sub(supplied_origin.0)
+        .ok_or(EmpiricalSourceModelError::MissingSupport)?;
+    let local_column = global_column
+        .checked_sub(supplied_origin.1)
+        .ok_or(EmpiricalSourceModelError::MissingSupport)?;
+    let local_row_stop = local_row
+        .checked_add(support_rows)
+        .ok_or(EmpiricalSourceModelError::InvalidSupport)?;
+    let local_column_stop = local_column
+        .checked_add(support_columns)
+        .ok_or(EmpiricalSourceModelError::InvalidSupport)?;
+    if local_row_stop > supplied_shape.0 || local_column_stop > supplied_shape.1 {
+        return Err(EmpiricalSourceModelError::MissingSupport);
+    }
     Ok(ResolvedWindow {
-        local_origin: (window_row, window_column),
+        local_origin: (local_row, local_column),
         global_origin: (global_row, global_column),
         shape: (support_rows, support_columns),
     })
@@ -451,8 +474,12 @@ fn shrunk_second_moment(
 
 fn deterministic_complex_cholesky(
     covariance: &Array2<Cf64>,
+    relative_rank_floor: f64,
 ) -> Result<Array2<Cf64>, EmpiricalSourceModelError> {
     let date_count = covariance.nrows();
+    let mean_diagonal =
+        covariance.diag().iter().map(|value| value.re).sum::<f64>() / date_count as f64;
+    let minimum_pivot = relative_rank_floor * mean_diagonal;
     let mut lower = Array2::from_elem((date_count, date_count), Cf64::new(0.0, 0.0));
     for row in 0..date_count {
         for column in 0..=row {
@@ -471,6 +498,9 @@ fn deterministic_complex_cholesky(
                 {
                     return Err(EmpiricalSourceModelError::CholeskyFailure);
                 }
+                if residual.re < minimum_pivot {
+                    return Err(EmpiricalSourceModelError::RankBelowRelativeFloor(row));
+                }
                 lower[(row, column)] = Cf64::new(residual.re.sqrt(), 0.0);
             } else {
                 lower[(row, column)] = residual / lower[(column, column)].re;
@@ -485,10 +515,11 @@ fn deterministic_complex_cholesky(
 
 /// Estimate a source-centered empirical proper-complex primitive factor.
 ///
-/// `values` is ordered `(date, native row, native column)`. `grid_origin`
-/// maps its local upper-left pixel to the global native grid. The fixed support
-/// is shifted inward at supplied-grid borders rather than truncated. The API
-/// intentionally has no target, reference, or consuming tile identity.
+/// `values` is ordered `(date, native row, native column)`. `supplied_origin`
+/// maps its local upper-left pixel into the canonical native grid described by
+/// `native_origin` and `native_shape`. The support is inward-clamped only at the
+/// canonical native-grid border; a supplied tile without that full support fails.
+/// The API intentionally has no target, reference, or consuming tile identity.
 ///
 /// # Errors
 /// Returns a fail-closed error for missing identities or support, mismatched
@@ -500,7 +531,9 @@ pub fn estimate_empirical_proper_complex_factor(
     component_ids: &[u64],
     values: ArrayView3<'_, Cf64>,
     valid: ArrayView2<'_, bool>,
-    grid_origin: (usize, usize),
+    supplied_origin: (usize, usize),
+    native_origin: (usize, usize),
+    native_shape: (usize, usize),
     source_pixel: (usize, usize),
     data_identity: [u8; 32],
     config: &EmpiricalProperComplexConfig,
@@ -515,10 +548,17 @@ pub fn estimate_empirical_proper_complex_factor(
     {
         return Err(EmpiricalSourceModelError::ShapeMismatch);
     }
-    let window = resolve_window((grid_rows, grid_columns), grid_origin, source_pixel, config)?;
+    let window = resolve_window(
+        (grid_rows, grid_columns),
+        supplied_origin,
+        native_origin,
+        native_shape,
+        source_pixel,
+        config,
+    )?;
     let summary = summarize_samples(component_ids, values, valid, window, data_identity)?;
     let covariance = shrunk_second_moment(values, valid, window, &summary, config)?;
-    let lower = deterministic_complex_cholesky(&covariance)?;
+    let lower = deterministic_complex_cholesky(&covariance, config.relative_diagonal_floor)?;
     let mut receipt_digest = Sha256::new();
     receipt_digest.update(b"dolphinrust:empirical_proper_complex_receipt:v1");
     receipt_digest.update(source.get().to_le_bytes());
@@ -550,7 +590,7 @@ mod tests {
         let covariance = array![[Cf64::new(1.0, 1.0e-8)]];
 
         assert_eq!(
-            deterministic_complex_cholesky(&covariance).unwrap_err(),
+            deterministic_complex_cholesky(&covariance, 1.0e-12).unwrap_err(),
             EmpiricalSourceModelError::CholeskyFailure
         );
     }
