@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod phasebias;
 pub mod quality;
 pub mod source_influence;
+pub mod spatial_covariance;
 
 pub use closure::estimate_closure_phases;
 pub use covariance::{
@@ -51,4 +52,9 @@ pub use quality::{
 pub use source_influence::{
     InfluenceDag, InfluenceError, InfluenceNode, NodeId, ParentEdge, ProperComplexFactor,
     SourceDefinition, SourceEdge, SourceId, SourceModelError, TemporalCoordinate,
+};
+pub use spatial_covariance::{
+    contract_source_factors, reference_specific_influence_v1, SpatialInfluenceError,
+    SpatialInfluenceResult, SpatialInfluenceStatus, EFFECTIVE_LOOKS_MODEL,
+    SPATIAL_INFLUENCE_METHOD,
 };
