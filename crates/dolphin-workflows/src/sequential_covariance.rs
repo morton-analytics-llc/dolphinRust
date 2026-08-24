@@ -1041,6 +1041,71 @@ pub struct DependencyConeQuery {
     pub byte_cap: u64,
 }
 
+/// Execution mode for a reference-specific covariance replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceSpecificExecutionMode {
+    /// Whole, tiled, or bounded batch execution.
+    Batch,
+    /// Resumable or near-real-time execution.
+    Nrt,
+}
+
+/// Version-1 execution scope for a reference-specific covariance replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceSpecificReplayScope {
+    execution_mode: ReferenceSpecificExecutionMode,
+    stitched_burst_count: usize,
+}
+
+impl ReferenceSpecificReplayScope {
+    /// Construct a scope from the actual execution mode and stitched burst count.
+    #[must_use]
+    pub const fn new(
+        execution_mode: ReferenceSpecificExecutionMode,
+        stitched_burst_count: usize,
+    ) -> Self {
+        Self {
+            execution_mode,
+            stitched_burst_count,
+        }
+    }
+
+    /// Return the stable version-1 disposition without performing numeric replay.
+    #[must_use]
+    pub const fn disposition(self) -> SpatialCovarianceStatus {
+        if matches!(self.execution_mode, ReferenceSpecificExecutionMode::Nrt) {
+            return SpatialCovarianceStatus::UnsupportedNrtReplay;
+        }
+        if self.stitched_burst_count != 1 {
+            return SpatialCovarianceStatus::UnsupportedMultiburstReference;
+        }
+        SpatialCovarianceStatus::Valid
+    }
+}
+
+/// Stable version-1 disposition for reference-specific spatial covariance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpatialCovarianceStatus {
+    /// One single-burst batch target/reference query is eligible for replay.
+    Valid,
+    /// Artifact-backed sealed/open replay is not supported for NRT.
+    UnsupportedNrtReplay,
+    /// Stitched multiburst covariance is not modeled.
+    UnsupportedMultiburstReference,
+}
+
+impl SpatialCovarianceStatus {
+    /// Stable serialized status name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::UnsupportedNrtReplay => "unsupported_nrt_replay",
+            Self::UnsupportedMultiburstReference => "unsupported_multiburst_reference",
+        }
+    }
+}
+
 /// Successful byte-capped temporal covariance replay.
 #[derive(Debug)]
 pub struct TemporalCovarianceReplay {
@@ -1050,6 +1115,21 @@ pub struct TemporalCovarianceReplay {
     pub dependency_cone: DependencyConeEstimate,
     /// Peak logical raw-source and factor payload retained by the query cache.
     pub source_cache_peak_bytes: u64,
+}
+
+/// Successful joint target/reference covariance replay.
+#[derive(Debug)]
+pub struct ReferenceDifferenceCovarianceReplay {
+    /// Target marginal covariance in the requested common-date order.
+    pub target_covariance: Array2<f64>,
+    /// Reference marginal covariance in the requested common-date order.
+    pub reference_covariance: Array2<f64>,
+    /// Target/reference cross covariance in the requested common-date order.
+    pub target_reference_covariance: Array2<f64>,
+    /// Covariance of target minus reference, with the exact gauge retained.
+    pub difference_covariance: Array2<f64>,
+    /// Topology-only allocation receipt checked before graph contraction.
+    pub dependency_cone: DependencyConeEstimate,
 }
 
 struct SpatialQueryCone {
@@ -1665,6 +1745,7 @@ impl SequentialReplayTopology {
         &self,
         selection: &[(GlobalDateId, usize)],
         microbatch: usize,
+        maximum_output_pixels: usize,
     ) -> Result<SpatialQueryCone, SequentialReplayError> {
         if microbatch != 1 {
             return Err(SequentialReplayError::Invalid(
@@ -1684,9 +1765,15 @@ impl SequentialReplayTopology {
                 selected_dates[block_index].insert((date, output_index));
             }
         }
-        if distinct_outputs.len() != 1 {
+        if maximum_output_pixels == 1 && distinct_outputs.len() != 1 {
             return Err(SequentialReplayError::Invalid(
                 "version-1 temporal covariance selection must use one output pixel",
+            ));
+        }
+        if maximum_output_pixels == 2 && (distinct_outputs.is_empty() || distinct_outputs.len() > 2)
+        {
+            return Err(SequentialReplayError::Invalid(
+                "reference-specific covariance selection must use one target and one reference",
             ));
         }
 
@@ -1738,7 +1825,7 @@ impl SequentialReplayTopology {
                 "dependency-cone selection, source rank, and microbatch must be nonzero",
             ));
         }
-        let cone = self.spatial_query_cone(selection, microbatch)?;
+        let cone = self.spatial_query_cone(selection, microbatch, 1)?;
         self.estimate_dependency_cone_for_spatial_query(selection, source_rank, &cone)
     }
 
@@ -1986,6 +2073,111 @@ impl SequentialReplayTopology {
         })
     }
 
+    /// Replay one target/reference pair against a shared source graph.
+    ///
+    /// The target and reference selections must contain the same unique,
+    /// increasing dates and one output pixel each. The method plans one union
+    /// dependency cone, performs one graph contraction, and then applies the
+    /// exact target-minus-reference contrast. It does not call the single-pixel
+    /// temporal replay twice.
+    ///
+    /// # Errors
+    /// Returns a topology, byte-cap, or influence-graph error.
+    #[allow(clippy::too_many_lines)]
+    pub fn replay_reference_difference_covariance<F>(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        reference_selection: &[(GlobalDateId, usize)],
+        query: DependencyConeQuery,
+        build_graph: F,
+    ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
+    where
+        F: FnOnce(&DependencyConeEstimate) -> Result<InfluenceDag, InfluenceError>,
+    {
+        if target_selection.is_empty()
+            || target_selection.len() != reference_selection.len()
+            || query.source_rank == 0
+            || query.microbatch != 1
+        {
+            return Err(SequentialReplayError::Invalid(
+                "reference-specific covariance requires aligned selections, nonzero source rank, and one target",
+            ));
+        }
+        let target_outputs = target_selection
+            .iter()
+            .map(|&(_, output)| output)
+            .collect::<BTreeSet<_>>();
+        let reference_outputs = reference_selection
+            .iter()
+            .map(|&(_, output)| output)
+            .collect::<BTreeSet<_>>();
+        if target_outputs.len() != 1 || reference_outputs.len() != 1 {
+            return Err(SequentialReplayError::Invalid(
+                "reference-specific covariance requires one target and one reference pixel",
+            ));
+        }
+        let target_dates = target_selection
+            .iter()
+            .map(|&(date, _)| date)
+            .collect::<Vec<_>>();
+        let reference_dates = reference_selection
+            .iter()
+            .map(|&(date, _)| date)
+            .collect::<Vec<_>>();
+        if target_dates != reference_dates
+            || target_dates.first().is_none_or(|date| date.get() != 0)
+            || !target_dates
+                .windows(2)
+                .all(|pair| pair[0].get() < pair[1].get())
+        {
+            return Err(SequentialReplayError::Invalid(
+                "reference-specific covariance requires identical increasing dates with acquisition zero first",
+            ));
+        }
+
+        let selection = target_selection
+            .iter()
+            .chain(reference_selection)
+            .copied()
+            .collect::<Vec<_>>();
+        let cone = self.spatial_query_cone(&selection, query.microbatch, 2)?;
+        let dependency_cone =
+            self.estimate_dependency_cone_for_spatial_query(&selection, query.source_rank, &cone)?;
+        if dependency_cone.total_bytes > query.byte_cap {
+            return Err(SequentialReplayError::Budget(dependency_cone));
+        }
+        let coordinates = selection
+            .iter()
+            .map(|&(date, output)| self.temporal_coordinate(date, output))
+            .collect::<Result<Vec<_>, _>>()?;
+        let dag = build_graph(&dependency_cone)?;
+        let joint = dag.temporal_covariance(&coordinates)?;
+        let dates = target_selection.len();
+        let target_covariance =
+            Array2::from_shape_fn((dates, dates), |(row, column)| joint[(row, column)]);
+        let reference_covariance = Array2::from_shape_fn((dates, dates), |(row, column)| {
+            joint[(dates + row, dates + column)]
+        });
+        let target_reference_covariance =
+            Array2::from_shape_fn((dates, dates), |(row, column)| joint[(row, dates + column)]);
+        let coincident = target_selection == reference_selection;
+        let difference_covariance = Array2::from_shape_fn((dates, dates), |(row, column)| {
+            if coincident {
+                return 0.0;
+            }
+            target_covariance[(row, column)] + reference_covariance[(row, column)]
+                - target_reference_covariance[(row, column)]
+                - target_reference_covariance[(column, row)]
+        });
+        Ok(ReferenceDifferenceCovarianceReplay {
+            target_covariance,
+            reference_covariance,
+            target_reference_covariance,
+            difference_covariance,
+            dependency_cone,
+        })
+    }
+
     /// Stream a production fixed-branch replay from immutable captured state.
     ///
     /// The byte cap is enforced before the provider is called. Local phase and
@@ -2012,7 +2204,7 @@ impl SequentialReplayTopology {
                 "replay branch tolerance must be finite and positive",
             ));
         }
-        let cone = self.spatial_query_cone(selection, query.microbatch)?;
+        let cone = self.spatial_query_cone(selection, query.microbatch, 1)?;
         let mut dependency_cone =
             self.estimate_dependency_cone_for_spatial_query(selection, query.source_rank, &cone)?;
         if selection.iter().all(|(date, _)| date.get() == 0) {

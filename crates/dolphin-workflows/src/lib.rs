@@ -52,11 +52,12 @@ pub use sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest, CovarianceArtifactReplayMetrics,
     CovarianceArtifactReplayProvider, DependencyConeEstimate, DependencyConeQuery, GlobalBlockId,
-    GlobalDateId, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace, ReplayStatus,
-    ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
+    GlobalDateId, ReferenceDifferenceCovarianceReplay, ReferenceSpecificExecutionMode,
+    ReferenceSpecificReplayScope, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace,
+    ReplayStatus, ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
     SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, TemporalCovarianceReplay,
-    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
+    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SpatialCovarianceStatus,
+    TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
