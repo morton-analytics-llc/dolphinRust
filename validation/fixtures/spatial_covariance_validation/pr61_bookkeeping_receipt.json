@@ -1,0 +1,10 @@
+{
+  "schema": "dolphinrust.spatial_reference_covariance.validation",
+  "schema_version": 1,
+  "promotion_status": "blocked_pending_approximation_review",
+  "attempted_cells": 36,
+  "evaluated_cells": 36,
+  "window_sizes": [1, 3, 5],
+  "distances": [0, 1, 4],
+  "labels_are_bookkeeping_only": true
+}

@@ -1,0 +1,121 @@
+{
+  "schema": "dolphinrust.spatial_covariance.preregistration",
+  "schema_version": 1,
+  "validation_id": "F54-07-spatial-covariance-approximation",
+  "status": "preregistered",
+  "outcomes_present": false,
+  "design": "full-factorial-supported-cells-with-pairwise-and-worst-corner-receipts",
+  "seed_schedule": {
+    "attempted_seeds_per_cell": 5000,
+    "seed_derivation": "sha256(validation_seed||cell_id||seed_index)",
+    "validation_seed": "spatial-covariance-f54-07-v1",
+    "no_top_up": true
+  },
+  "dimensions": {
+    "half_window": [
+      {"id": "hw_1x1", "value": [1, 1]},
+      {"id": "hw_3x6", "value": [3, 6]},
+      {"id": "hw_7x14", "value": [7, 14]}
+    ],
+    "stride": [
+      {"id": "stride_1", "value": [1, 1]},
+      {"id": "stride_2", "value": [2, 2]},
+      {"id": "stride_4", "value": [4, 4]}
+    ],
+    "support": [
+      {"id": "rect", "mask": "rect"},
+      {"id": "glrt_frozen", "mask": "glrt_frozen"},
+      {"id": "ks_frozen", "mask": "ks_frozen"}
+    ],
+    "position": [
+      {"id": "interior", "boundary": "interior"},
+      {"id": "border_clamped", "boundary": "border_clamped"},
+      {"id": "tile_edge", "boundary": "tile_edge"},
+      {"id": "bounded_halo", "boundary": "bounded_halo"},
+      {"id": "masked", "boundary": "masked"}
+    ],
+    "pair_geometry": [
+      {"id": "coincident", "overlap_percent": 100, "distance": "coincident", "signed_influence": "zero"},
+      {"id": "shared_75_positive", "overlap_percent": 75, "distance": "shared", "signed_influence": "positive"},
+      {"id": "shared_75_negative", "overlap_percent": 75, "distance": "shared", "signed_influence": "negative"},
+      {"id": "shared_50_positive", "overlap_percent": 50, "distance": "shared", "signed_influence": "positive"},
+      {"id": "shared_50_negative", "overlap_percent": 50, "distance": "shared", "signed_influence": "negative"},
+      {"id": "shared_25_positive", "overlap_percent": 25, "distance": "shared", "signed_influence": "positive"},
+      {"id": "shared_25_negative", "overlap_percent": 25, "distance": "shared", "signed_influence": "negative"},
+      {"id": "disjoint_immediate", "overlap_percent": 0, "distance": "disjoint_immediate", "signed_influence": "none"},
+      {"id": "disjoint_after_depth_1", "overlap_percent": 0, "distance": "disjoint_after_depth_1", "signed_influence": "none"},
+      {"id": "disjoint_after_depth_2", "overlap_percent": 0, "distance": "disjoint_after_depth_2", "signed_influence": "none"},
+      {"id": "disjoint_after_depth_4", "overlap_percent": 0, "distance": "disjoint_after_depth_4", "signed_influence": "none"}
+    ],
+    "block_topology": [
+      {"id": "one_block", "blocks": 1, "edge_case": "none"},
+      {"id": "two_blocks", "blocks": 2, "edge_case": "none"},
+      {"id": "four_blocks", "blocks": 4, "edge_case": "none"},
+      {"id": "two_blocks_cap_eviction", "blocks": 2, "edge_case": "cap_eviction"},
+      {"id": "four_blocks_partial_final", "blocks": 4, "edge_case": "partial_final"}
+    ],
+    "estimator": [
+      {"id": "emi", "method": "EMI"},
+      {"id": "evd", "method": "EVD"}
+    ],
+    "eigen_stress": [
+      {"id": "well_separated", "condition": "well_separated"},
+      {"id": "tied_eigenvalue", "condition": "tied_eigenvalue"},
+      {"id": "near_tie", "condition": "near_tie"}
+    ],
+    "source_process": [
+      {"id": "independent_complex_looks", "correlation": "independent"},
+      {"id": "spatial_correlation_stress", "correlation": "spatial_correlation_stress"}
+    ]
+  },
+  "cell_policy": {
+    "required_design": "cartesian_product_of_dimensions",
+    "allowed_not_evaluable": ["tied_eigenvalue"],
+    "correlated_source_requires_same_gates": true,
+    "aggregate_receipts_allowed": false,
+    "outcome_top_up_allowed": false
+  },
+  "thresholds": {
+    "deterministic_operator_relative_error_max": 1e-10,
+    "stochastic_operator_relative_error_max": 0.1,
+    "contrast_variance_relative_error_max": 0.1,
+    "psd_min_eigenvalue_min": -1e-10,
+    "coverage_probability": 0.95,
+    "coverage_absolute_error_max": 0.02,
+    "emission_rate_min": 0.99,
+    "weak_zero_variance_max": 1e-14,
+    "resource_rss_bytes_max": 25769803776,
+    "resource_growth": "area_or_dates_linear; no quadratic axis",
+    "resource_buffer_policy": "no_tile_area_times_s_b_times_d_b_squared_buffer"
+  },
+  "hash_fields": {
+    "algorithm": "sha256",
+    "receipt_required": [
+      "preregistration_sha256",
+      "code_sha256",
+      "fixture_sha256",
+      "operator_sha256",
+      "variance_sha256",
+      "resource_sha256"
+    ],
+    "cell_required": ["operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash"],
+    "resource_required": ["resource_hash"]
+  },
+  "resource_matrix": [
+    {"id": "tile_256_dates_13", "tile_pixels": 65536, "dates": 13},
+    {"id": "tile_256_dates_26", "tile_pixels": 65536, "dates": 26},
+    {"id": "tile_256_dates_52", "tile_pixels": 65536, "dates": 52}
+  ],
+  "receipt_contract": {
+    "cell_statuses": ["pass", "fail", "not_evaluable"],
+    "required_cell_fields": [
+      "cell_id", "half_window", "stride", "support", "position", "pair_geometry",
+      "block_topology", "estimator", "eigen_stress", "source_process", "status",
+      "attempted_seeds", "emitted_seeds", "top_up_seeds", "operator_relative_error",
+      "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error",
+      "psd_min_eigenvalue", "coverage_95", "emission_rate",
+      "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash"
+    ],
+    "required_resource_fields": ["resource_id", "status", "rss_bytes", "growth_class", "resource_hash"]
+  }
+}
