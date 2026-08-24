@@ -512,12 +512,18 @@ fn adaptive_receipt_preserves_output_and_records_exact_valid_support() {
             }
         }
     }
+    let mut realized_neighbors = neighbors.clone();
+    for output_row in 0..3 {
+        for output_col in 0..3 {
+            realized_neighbors[(output_row, output_col, 0, 2)] = false;
+        }
+    }
     let legacy = engine
         .link(
             stack.view(),
             half,
             strides,
-            Some(neighbors.view()),
+            Some(realized_neighbors.view()),
             fused_params(),
         )
         .unwrap();
@@ -540,6 +546,7 @@ fn adaptive_receipt_preserves_output_and_records_exact_valid_support() {
     assert!(replay.phase.realized_support[(1, 1, 0, 0)]);
     assert!(!replay.phase.realized_support[(1, 1, 0, 2)]);
     assert!(replay.phase.realized_support[(1, 1, 2, 1)]);
+    assert_eq!(replay.phase.branch_status[(1, 1)], FixedBranchStatus::Evd);
     assert_eq!(
         replay
             .phase

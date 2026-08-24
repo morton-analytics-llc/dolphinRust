@@ -272,9 +272,8 @@ pub(crate) fn link_fused_with_source_replay_support(
     let out_shape = rect.output_shape;
     let support = realized_support(rect, native_validity, neighbors)?;
     let replay_pixels = match neighbors {
-        Some(neighbors) => fused_pixels_masked_with_replay(
+        Some(_) => fused_pixels_masked_with_replay(
             stack,
-            neighbors,
             params,
             out_shape,
             rect,
@@ -441,7 +440,6 @@ fn fused_pixels_sliding_with_replay(
 #[allow(clippy::too_many_arguments)]
 fn fused_pixels_masked_with_replay(
     stack: ArrayView3<Cf64>,
-    neighbors: ArrayView4<bool>,
     params: FusedParams,
     out_shape: (usize, usize),
     rect: RectReplayDescriptor,
@@ -453,13 +451,7 @@ fn fused_pixels_masked_with_replay(
         .into_par_iter()
         .map(|index| {
             let output = (index / out_cols, index % out_cols);
-            let coherence = pixel_coh(
-                stack,
-                output,
-                rect.half_window,
-                rect.strides,
-                Some(neighbors),
-            );
+            let coherence = pixel_coh(stack, output, rect.half_window, rect.strides, Some(support));
             let status = adaptive_source_replay_status(
                 stack,
                 rect,
