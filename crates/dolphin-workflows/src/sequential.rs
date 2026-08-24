@@ -220,6 +220,7 @@ where
             topology,
             request,
             ministack,
+            combined.view(),
             captured.result.cpx.view(),
             &captured.phase,
             &captured.compression,

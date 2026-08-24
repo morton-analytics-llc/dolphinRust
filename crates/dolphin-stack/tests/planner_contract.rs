@@ -124,16 +124,18 @@ fn block_and_carried_parent_ids_are_global_and_cap_aware() {
 }
 
 #[test]
-fn zero_carry_is_rejected_for_multi_ministack_plans() {
-    assert!(planner(3, 0, CompressedSlcPlan::AlwaysFirst)
+fn zero_carry_remains_available_to_legacy_independent_ministacks() {
+    let planned = planner(6, 0, CompressedSlcPlan::AlwaysFirst)
         .plan(3)
-        .is_ok());
-    assert!(planner(6, 0, CompressedSlcPlan::AlwaysFirst)
-        .plan(3)
-        .is_err());
-    assert!(planner(3, 0, CompressedSlcPlan::AlwaysFirst)
+        .unwrap();
+    assert_eq!(planned.len(), 2);
+    assert!(planned.iter().all(|stack| stack.num_compressed == 0));
+
+    let resumed = planner(3, 0, CompressedSlcPlan::AlwaysFirst)
         .plan_with_offset(3, 1)
-        .is_err());
+        .unwrap();
+    assert_eq!(resumed[0].block_id, 1);
+    assert_eq!(resumed[0].num_compressed, 0);
 }
 
 // ------------------------------- oracle (secondary) ---------------------------

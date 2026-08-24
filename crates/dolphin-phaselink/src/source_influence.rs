@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 
 use dolphin_core::Cf64;
 use ndarray::{Array2, ArrayView2};
+use sha2::{Digest, Sha256};
 
 /// Stable identifier for one primitive stochastic source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -388,6 +389,29 @@ impl ProperComplexFactor {
     #[must_use]
     pub const fn lower(&self) -> &Array2<Cf64> {
         &self.lower
+    }
+
+    /// Canonical digest of the source, components, model receipt, and numeric factor.
+    #[must_use]
+    pub fn numeric_receipt_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"dolphinrust:proper_complex_factor_receipt:v1");
+        digest.update(self.source.get().to_le_bytes());
+        digest.update((self.component_ids.len() as u64).to_le_bytes());
+        for component in &self.component_ids {
+            digest.update(component.to_le_bytes());
+        }
+        digest.update(self.model_hash);
+        digest.update((self.lower.nrows() as u64).to_le_bytes());
+        digest.update((self.lower.ncols() as u64).to_le_bytes());
+        for row in 0..self.lower.nrows() {
+            for column in 0..self.lower.ncols() {
+                let value = self.lower[(row, column)];
+                digest.update(value.re.to_bits().to_le_bytes());
+                digest.update(value.im.to_bits().to_le_bytes());
+            }
+        }
+        digest.finalize().into()
     }
 
     /// Canonical real embedding of the proper-complex factor.

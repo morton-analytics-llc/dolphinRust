@@ -10,7 +10,6 @@
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use ndarray::{s, Array1, Array2, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -323,12 +322,6 @@ pub fn replay_rect_source_values(
     }) {
         return Err(CovarianceReplayError::SourceOutsideWindow);
     }
-    let positions: BTreeMap<NativeSourcePixel, usize> = source_pixels
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, source)| (source, index))
-        .collect();
     let nslc = source_values.nrows();
     let mut numerator = Array2::zeros((nslc, nslc));
     for i in 0..nslc {
@@ -338,7 +331,7 @@ pub fn replay_rect_source_values(
                 let mut vertical = Cf64::new(0.0, 0.0);
                 for row in row_start..row_start + window.0 {
                     let source = NativeSourcePixel::new(row, column);
-                    if let Some(&index) = positions.get(&source) {
+                    if let Ok(index) = source_pixels.binary_search(&source) {
                         vertical += source_values[(i, index)] * source_values[(j, index)].conj();
                     }
                 }

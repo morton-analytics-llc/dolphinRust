@@ -54,6 +54,20 @@ fn proper_complex_factor_has_canonical_real_embedding() {
     ];
     let factor =
         ProperComplexFactor::new(SourceId::new(7), vec![101, 102], [9; 32], lower.clone()).unwrap();
+    let same =
+        ProperComplexFactor::new(SourceId::new(7), vec![101, 102], [9; 32], lower.clone()).unwrap();
+    let mut changed_lower = lower.clone();
+    changed_lower[(1, 0)].re += 0.01;
+    let changed =
+        ProperComplexFactor::new(SourceId::new(7), vec![101, 102], [9; 32], changed_lower).unwrap();
+    assert_eq!(
+        factor.numeric_receipt_digest(),
+        same.numeric_receipt_digest()
+    );
+    assert_ne!(
+        factor.numeric_receipt_digest(),
+        changed.numeric_receipt_digest()
+    );
     let got = factor.real_embedding();
     let scale = std::f64::consts::FRAC_1_SQRT_2;
     let expected = array![

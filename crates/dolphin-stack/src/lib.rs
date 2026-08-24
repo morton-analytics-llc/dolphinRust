@@ -127,12 +127,6 @@ impl MiniStackPlanner {
         if ministack_size < 2 {
             return Err("cannot create ministacks with size < 2");
         }
-        if self.max_num_compressed == 0
-            && self.num_slc > 0
-            && (batch_offset > 0 || self.num_slc > ministack_size)
-        {
-            return Err("multi-ministack plans require at least one carried compressed SLC");
-        }
         let ministacks = (0..self.num_slc)
             .step_by(ministack_size)
             .enumerate()

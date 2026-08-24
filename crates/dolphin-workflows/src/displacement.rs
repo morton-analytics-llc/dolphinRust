@@ -13,16 +13,23 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{
-    ComputeBackend, DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod,
+    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, ShpMethod,
+    TimeseriesMethod, UnwrapMethod,
 };
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
+    covariance_identity_index_peak_bytes, covariance_source_model_identity_digest,
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
-    read_nisar_geotransform, read_nisar_window, write_raster, write_raster_with_metadata, GeoInfo,
+    read_nisar_geotransform, read_nisar_window, recover_incomplete_covariance_operator,
+    write_raster, write_raster_with_metadata, CovarianceBurstPlan, CovarianceOperatorBlock,
+    CovarianceOperatorGrid, CovarianceOperatorMetadata, CovarianceOperatorPlan,
+    CovarianceOperatorWriter, CovarianceReplayStatus, GeoInfo, SourceReplayIdentity,
+    StitchedCovarianceStatus,
 };
 use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
+use dolphin_stack::MiniStackPlanner;
 use dolphin_timeseries::{
     build_network, estimate_velocity, estimate_velocity_with_diagnostics,
     estimate_velocity_with_model, estimate_velocity_with_uncertainty, get_incidence_matrix,
@@ -40,6 +47,10 @@ use crate::burst::{
     burst_offset, frame_grid, group_by_burst, resolve_layover_shadow_masks, BurstGeo, FrameGrid,
 };
 use crate::corrections::{apply_corrections, CorrectionLayers};
+use crate::covariance_artifact::{
+    finalize_covariance_artifact, preflight_covariance_artifact_disk_with_identity_index,
+    CovarianceArtifactDiskAdmission, CovarianceArtifactTransaction,
+};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
 use crate::dates::{decimal_days, parse_date};
 use crate::provenance::{
@@ -47,9 +58,13 @@ use crate::provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
-    run_sequential, run_sequential_masked, run_sequential_resumable,
-    run_sequential_resumable_masked, update_sequential, update_sequential_masked, SequentialConfig,
-    SequentialOutput, SequentialState,
+    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    run_sequential_resumable, run_sequential_resumable_masked,
+    run_sequential_with_covariance_capture, update_sequential, update_sequential_masked,
+    SequentialConfig, SequentialCovarianceCaptureRequest, SequentialOutput, SequentialState,
+};
+use crate::sequential_covariance::{
+    sequential_replay_config_digest, sequential_replay_kernel_digest,
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
@@ -63,6 +78,11 @@ const SENTINEL1_WAVELENGTH_M: f64 = 0.055_465_76;
 const MIN_SEAM_SUPPORT: usize = 4;
 const MIN_SEAM_COHERENCE: f64 = 0.5;
 const MASK_PREFLIGHT_STRIPE_ROWS: usize = 1_024;
+const COVARIANCE_BRANCH_TOLERANCE: f64 = 1e-10;
+const COVARIANCE_SOURCE_PROVIDER: &str = "dolphin_workflows_cslc_path_manifest";
+const COVARIANCE_SOURCE_PROVIDER_VERSION: &str = "2";
+const COVARIANCE_SOURCE_MODEL: &str = "unavailable_proper_complex_source_factor";
+const COVARIANCE_SOURCE_MODEL_VERSION: &str = "0";
 
 /// Typed failure from multi-burst phase-offset reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -311,6 +331,11 @@ pub fn run_displacement_with_output_policy(
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator
+            || output_policy == DisplacementOutputPolicy::Full,
+        "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
+    );
     let groups = group_by_burst(&cfg.cslc_file_list);
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -321,6 +346,14 @@ pub fn run_displacement_with_output_policy(
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    let mut covariance = match cfg.phase_linking.write_covariance_operator {
+        true => Some(CovarianceCaptureArtifact::create(
+            cfg,
+            &groups,
+            crop.as_ref(),
+        )?),
+        false => None,
+    };
     // One compute engine for the whole run: it acquires a single GPU context (if
     // selected and available) and is reused across every burst + ministack.
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
@@ -335,14 +368,19 @@ pub fn run_displacement_with_output_policy(
                 Some(link_one_burst(
                     cfg,
                     idxs,
+                    id,
                     index,
                     &engine,
                     window,
                     prepared_masks[id].as_ref(),
+                    covariance.as_mut(),
                 ))
             })
             .collect::<Result<Vec<_>>>()
     })?;
+    if let Some(covariance) = covariance {
+        covariance.finish()?;
+    }
     finish_displacement(cfg, bursts, crop.as_ref(), output_policy)
 }
 
@@ -1365,19 +1403,435 @@ struct BurstLink {
     days: Vec<f64>,
 }
 
+struct CovarianceCaptureArtifact {
+    writer: Option<CovarianceOperatorWriter>,
+    scratch_path: PathBuf,
+    metadata: CovarianceOperatorMetadata,
+    disk_admission: CovarianceArtifactDiskAdmission,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    transaction: CovarianceArtifactTransaction,
+}
+
+struct CovarianceArtifactProjection {
+    hdf5_bytes: u64,
+    identity_index_peak_bytes: u64,
+    plan: CovarianceOperatorPlan,
+}
+
+impl CovarianceCaptureArtifact {
+    fn create(
+        cfg: &DisplacementWorkflow,
+        groups: &BTreeMap<String, Vec<usize>>,
+        crop: Option<&BoundedPlan>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&cfg.work_directory)?;
+        let transaction = CovarianceArtifactTransaction::acquire(&cfg.work_directory)?;
+        let scratch_path = cfg
+            .work_directory
+            .join("phase_covariance_operator.h5.scratch");
+        recover_incomplete_covariance_operator(&scratch_path)
+            .context("recovering prior covariance scratch artifact")?;
+        let source_manifest_digest = covariance_source_manifest_digest(cfg)?;
+        let source_model_version_digest = covariance_source_model_identity_digest(
+            COVARIANCE_SOURCE_PROVIDER,
+            COVARIANCE_SOURCE_PROVIDER_VERSION,
+            COVARIANCE_SOURCE_MODEL,
+            COVARIANCE_SOURCE_MODEL_VERSION,
+        );
+        let projection = projected_covariance_artifact(
+            cfg,
+            groups,
+            crop,
+            source_manifest_digest,
+            source_model_version_digest,
+        )?;
+        let disk_admission = preflight_covariance_artifact_disk_with_identity_index(
+            &cfg.work_directory,
+            projection.hdf5_bytes,
+            projection.identity_index_peak_bytes,
+        )?;
+        let included_bursts = crop.map_or(groups.len(), |plan| {
+            plan.windows
+                .iter()
+                .filter(|window| window.is_some())
+                .count()
+        });
+        let metadata = CovarianceOperatorMetadata {
+            producer_commit: option_env!("DOLPHIN_GIT_COMMIT").map(str::to_owned),
+            normalized_config_digest: format!(
+                "sha256:{}",
+                hex_digest(sequential_replay_config_digest(&sequential_config(cfg)))
+            ),
+            kernel_digest: format!("sha256:{}", hex_digest(sequential_replay_kernel_digest())),
+            source: SourceReplayIdentity {
+                manifest_digest: Some(format!("sha256:{}", hex_digest(source_manifest_digest))),
+                provider: Some(COVARIANCE_SOURCE_PROVIDER.to_owned()),
+                provider_version: Some(COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned()),
+                model: Some(COVARIANCE_SOURCE_MODEL.to_owned()),
+                model_version: Some(COVARIANCE_SOURCE_MODEL_VERSION.to_owned()),
+                model_version_digest: Some(format!(
+                    "sha256:{}",
+                    hex_digest(source_model_version_digest)
+                )),
+                model_receipt_digest: None,
+            },
+            replay_status: CovarianceReplayStatus::SourceModelUnavailable,
+            stitched_status: match included_bursts {
+                0 | 1 => StitchedCovarianceStatus::NotStitched,
+                _ => StitchedCovarianceStatus::UnsupportedSeamCovariance,
+            },
+            ..CovarianceOperatorMetadata::default()
+        };
+        let writer = CovarianceOperatorWriter::create_with_identity_index_disk_cap(
+            &scratch_path,
+            &metadata,
+            &projection.plan,
+            projection.identity_index_peak_bytes,
+        )
+        .context("creating covariance operator scratch artifact")?;
+        Ok(Self {
+            writer: Some(writer),
+            scratch_path,
+            metadata,
+            disk_admission,
+            source_manifest_digest,
+            source_model_version_digest,
+            transaction,
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let write_receipt = self
+            .writer
+            .take()
+            .context("covariance operator writer was already finalized")?
+            .finish()
+            .context("finishing covariance operator HDF5")?;
+        anyhow::ensure!(
+            write_receipt.peak_identity_index_disk_bytes
+                <= self.disk_admission.projected_identity_index_peak_bytes,
+            "covariance identity-index peak exceeded its preflight projection"
+        );
+        finalize_covariance_artifact(
+            &self.transaction,
+            &self.scratch_path,
+            &self.metadata,
+            self.disk_admission,
+            &write_receipt,
+        )?;
+        Ok(())
+    }
+}
+
+struct TileCovarianceCapture<'a> {
+    burst_id: String,
+    source_origin: (usize, usize),
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    sink: &'a mut dyn CovarianceBlockSink,
+}
+
+trait CovarianceBlockSink {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str>;
+}
+
+impl CovarianceBlockSink for CovarianceOperatorWriter {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str> {
+        CovarianceOperatorWriter::write_block(self, &block)
+            .map_err(|_| "writing covariance operator block")
+    }
+}
+
+#[cfg(test)]
+impl CovarianceBlockSink for Vec<CovarianceOperatorBlock> {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str> {
+        self.push(block);
+        Ok(())
+    }
+}
+
+impl TileCovarianceCapture<'_> {
+    fn request(
+        &self,
+        plan: &TilePlan,
+        strides: dolphin_core::Strides,
+    ) -> Result<SequentialCovarianceCaptureRequest> {
+        let grids = covariance_tile_plan(self.source_origin, plan, strides)?;
+        Ok(SequentialCovarianceCaptureRequest {
+            burst_id: self.burst_id.clone(),
+            source_manifest_digest: self.source_manifest_digest,
+            source_model_version_digest: self.source_model_version_digest,
+            native_grid: grids.native_grid,
+            output_grid: grids.output_grid,
+            owned_output_grid: grids.owned_output_grid,
+            branch_tolerance: COVARIANCE_BRANCH_TOLERANCE,
+        })
+    }
+}
+
+fn covariance_tile_plan(
+    source_origin: (usize, usize),
+    plan: &TilePlan,
+    strides: dolphin_core::Strides,
+) -> Result<dolphin_io::CovarianceTilePlan> {
+    let native_row = source_origin
+        .0
+        .checked_add(plan.read.row_start)
+        .context("covariance native row origin overflow")?;
+    let native_col = source_origin
+        .1
+        .checked_add(plan.read.col_start)
+        .context("covariance native column origin overflow")?;
+    anyhow::ensure!(
+        native_row % strides.y == 0 && native_col % strides.x == 0,
+        "covariance bounded/tiled source origin is not on the output stride lattice"
+    );
+    let output_shape = strides.out_shape((plan.read.height(), plan.read.width()));
+    let output_row = native_row / strides.y;
+    let output_col = native_col / strides.x;
+    Ok(dolphin_io::CovarianceTilePlan {
+        native_grid: covariance_grid(
+            (native_row, native_col),
+            (plan.read.height(), plan.read.width()),
+            (1, 1),
+        )?,
+        output_grid: covariance_grid(
+            (output_row, output_col),
+            output_shape,
+            (strides.y, strides.x),
+        )?,
+        owned_output_grid: covariance_grid(
+            (
+                output_row
+                    .checked_add(plan.local_row0)
+                    .context("covariance owned output row overflow")?,
+                output_col
+                    .checked_add(plan.local_col0)
+                    .context("covariance owned output column overflow")?,
+            ),
+            (plan.out.height(), plan.out.width()),
+            (strides.y, strides.x),
+        )?,
+    })
+}
+
+fn covariance_grid(
+    origin: (usize, usize),
+    shape: (usize, usize),
+    strides: (usize, usize),
+) -> Result<CovarianceOperatorGrid> {
+    Ok(CovarianceOperatorGrid {
+        row_start: u64::try_from(origin.0).context("covariance grid row origin exceeds u64")?,
+        col_start: u64::try_from(origin.1).context("covariance grid column origin exceeds u64")?,
+        rows: u32::try_from(shape.0).context("covariance grid rows exceed u32")?,
+        cols: u32::try_from(shape.1).context("covariance grid columns exceed u32")?,
+        stride_y: u32::try_from(strides.0).context("covariance grid row stride exceeds u32")?,
+        stride_x: u32::try_from(strides.1).context("covariance grid column stride exceeds u32")?,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn projected_covariance_artifact(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    crop: Option<&BoundedPlan>,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+) -> Result<CovarianceArtifactProjection> {
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to size the covariance artifact")?;
+    let strides = cfg.output_options.strides;
+    let support_rows = (cfg.phase_linking.half_window.y as u128)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("covariance support row count overflow")?;
+    let support_cols = (cfg.phase_linking.half_window.x as u128)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("covariance support column count overflow")?;
+    let support_slots = support_rows
+        .checked_mul(support_cols)
+        .context("covariance support area overflow")?;
+    let support_bytes = support_slots.div_ceil(8);
+    let max_phase_components =
+        cfg.phase_linking
+            .ministack_size
+            .checked_add(cfg.phase_linking.max_num_compressed)
+            .context("covariance phase-component count overflow")? as u128;
+    let mut projected = 16_u128 * 1024 * 1024;
+    let mut identity_records = 0_u128;
+    let mut burst_plans = Vec::new();
+    for (burst_index, (burst_id, indices)) in groups.iter().enumerate() {
+        let Some(&first_index) = indices.first() else {
+            continue;
+        };
+        let bounded = crop.and_then(|plan| plan.windows[burst_index]);
+        if crop.is_some() && bounded.is_none() {
+            continue;
+        }
+        let source = burst_source_window(&cfg.cslc_file_list[first_index], subdataset, bounded)?;
+        let shape = (source.height(), source.width());
+        let window_rows = cfg
+            .phase_linking
+            .half_window
+            .y
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .context("covariance Rect row window overflow")?;
+        let window_cols = cfg
+            .phase_linking
+            .half_window
+            .x
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .context("covariance Rect column window overflow")?;
+        anyhow::ensure!(
+            window_rows <= shape.0 && window_cols <= shape.1,
+            "covariance Rect support exceeds the bounded source grid"
+        );
+        let sequential_plan = MiniStackPlanner {
+            num_slc: indices.len(),
+            max_num_compressed: cfg.phase_linking.max_num_compressed,
+            output_reference_idx: isize::try_from(
+                cfg.phase_linking.output_reference_idx.unwrap_or(0),
+            )
+            .context("covariance output reference exceeds isize")?,
+            compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
+        }
+        .plan(cfg.phase_linking.ministack_size)
+        .map_err(anyhow::Error::msg)?;
+        let depth = sequential_plan.len();
+        let source_dates_by_generation = sequential_plan
+            .iter()
+            .map(|block| {
+                let stop = block
+                    .real_start
+                    .checked_add(block.num_real)
+                    .context("covariance generation date range overflow")?;
+                (block.real_start..stop)
+                    .map(|date| {
+                        u32::try_from(date).context("covariance generation date exceeds u32")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (block_rows, block_cols) = cfg.worker_settings.block_shape;
+        let out_block = (
+            (block_rows / strides.y).max(1),
+            (block_cols / strides.x).max(1),
+        );
+        let tiles = plan_tiles(
+            shape,
+            strides,
+            cfg.phase_linking.half_window,
+            depth,
+            out_block,
+        );
+        let mut planned_tiles = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            let native_area = tile.read.height() as u128 * tile.read.width() as u128;
+            let output_shape = strides.out_shape((tile.read.height(), tile.read.width()));
+            let output_area = output_shape.0 as u128 * output_shape.1 as u128;
+            let native_payload = native_area
+                .checked_mul(16 + 16 + 8 + 8 + 32 + 32 + 8 + 4 + 2)
+                .and_then(|bytes| bytes.checked_add(native_area.div_ceil(8)))
+                .context("covariance native payload projection overflow")?;
+            let phase_bytes = max_phase_components
+                .checked_mul(8)
+                .context("covariance phase payload projection overflow")?;
+            let output_payload = output_area
+                .checked_mul(8 + 8 + 8 + 2 + phase_bytes + support_bytes)
+                .context("covariance output payload projection overflow")?;
+            let numeric_payload = native_payload
+                .checked_add(output_payload)
+                .context("covariance block payload projection overflow")?;
+            let projected_block = numeric_payload
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(256 * 1024))
+                .context("covariance HDF5 block projection overflow")?;
+            projected = projected
+                .checked_add(
+                    (depth as u128)
+                        .checked_mul(projected_block)
+                        .context("covariance artifact projection overflow")?,
+                )
+                .context("covariance artifact projection overflow")?;
+            let identities_per_block = native_area
+                .checked_mul(2)
+                .and_then(|records| records.checked_add(output_area))
+                .context("covariance identity record projection overflow")?;
+            identity_records = identity_records
+                .checked_add(
+                    (depth as u128)
+                        .checked_mul(identities_per_block)
+                        .context("covariance identity projection overflow")?,
+                )
+                .context("covariance identity projection overflow")?;
+            planned_tiles.push(covariance_tile_plan(
+                (source.row_start, source.col_start),
+                &tile,
+                strides,
+            )?);
+        }
+        burst_plans.push(CovarianceBurstPlan {
+            burst_id: burst_id.clone(),
+            source_dates_by_generation,
+            tiles: planned_tiles,
+        });
+    }
+    let identity_records =
+        u64::try_from(identity_records).context("covariance identity projection exceeds u64")?;
+    Ok(CovarianceArtifactProjection {
+        hdf5_bytes: u64::try_from(projected)
+            .context("covariance artifact projection exceeds u64")?,
+        identity_index_peak_bytes: covariance_identity_index_peak_bytes(identity_records)
+            .context("projecting covariance identity-index peak")?,
+        plan: CovarianceOperatorPlan {
+            source_manifest_digest,
+            source_model_version_digest,
+            bursts: burst_plans,
+        },
+    })
+}
+
+fn covariance_source_manifest_digest(cfg: &DisplacementWorkflow) -> Result<[u8; 32]> {
+    let mut manifest = Sha256::new();
+    manifest.update(b"dolphinrust:cslc_path_manifest:v2");
+    manifest.update((cfg.cslc_file_list.len() as u64).to_le_bytes());
+    manifest.update(serde_json::to_vec(&cfg.input_options)?);
+    for (index, path) in cfg.cslc_file_list.iter().enumerate() {
+        let path_text = path.to_string_lossy();
+        manifest.update((index as u64).to_le_bytes());
+        manifest.update((path_text.len() as u64).to_le_bytes());
+        manifest.update(path_text.as_bytes());
+    }
+    Ok(manifest.finalize().into())
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Phase-link a single burst from the CSLC files at `idxs` in `cfg.cslc_file_list`.
 ///
 /// Block-tiled: the burst is read and phase-linked one tile at a time (see
 /// [`crate::tiling`]) so peak memory is bounded by a tile (block + halo) and its
 /// `N×N` coherence cube, never the whole stack. The result is bit-identical to a
 /// whole-burst run.
+#[allow(clippy::too_many_arguments)]
 fn link_one_burst(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
+    burst_id: &str,
     burst_index: usize,
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
     mask: Option<&PreparedBurstMask>,
+    covariance: Option<&mut CovarianceCaptureArtifact>,
 ) -> Result<BurstLink> {
     let files = burst_files(cfg, idxs);
     let days = acquisition_days(cfg, &files)?;
@@ -1387,7 +1841,17 @@ fn link_one_burst(
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
     let source = burst_source_window(&files[0], &subdataset, bounded)?;
-    let tiled = phase_link_tiled(
+    let tile_capture = covariance.map(|artifact| TileCovarianceCapture {
+        burst_id: burst_id.to_owned(),
+        source_origin: (source.row_start, source.col_start),
+        source_manifest_digest: artifact.source_manifest_digest,
+        source_model_version_digest: artifact.source_model_version_digest,
+        sink: artifact
+            .writer
+            .as_mut()
+            .expect("unfinished covariance writer"),
+    });
+    let tiled = phase_link_tiled_impl(
         cfg,
         (source.height(), source.width()),
         files.len(),
@@ -1404,6 +1868,7 @@ fn link_one_burst(
             mask.as_ref()
                 .map_or(Ok(None), |mask| mask.reader.read(block).map(Some))
         },
+        tile_capture,
     )
     .with_context(|| format!("burst ordinal {burst_index} phase linking failed"))?;
     let mut link = burst_link(
@@ -1483,6 +1948,7 @@ impl TiledPhaseLinkStats {
 /// input (block + halo) across all epochs as `Cf64`; tiling guarantees each
 /// output pixel sees the same window it would in a whole-burst run, so the
 /// assembled result is bit-identical.
+#[cfg(test)]
 fn phase_link_tiled(
     cfg: &DisplacementWorkflow,
     full_shape: (usize, usize),
@@ -1490,6 +1956,19 @@ fn phase_link_tiled(
     engine: &ComputeEngine,
     read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
     read_mask: impl Fn(BlockIndices) -> Result<Option<Array2<bool>>>,
+) -> Result<TiledPhaseLinkOutput> {
+    phase_link_tiled_impl(cfg, full_shape, nslc, engine, read_tile, read_mask, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn phase_link_tiled_impl(
+    cfg: &DisplacementWorkflow,
+    full_shape: (usize, usize),
+    nslc: usize,
+    engine: &ComputeEngine,
+    read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
+    read_mask: impl Fn(BlockIndices) -> Result<Option<Array2<bool>>>,
+    mut covariance: Option<TileCovarianceCapture<'_>>,
 ) -> Result<TiledPhaseLinkOutput> {
     let strides = cfg.output_options.strides;
     let half = cfg.phase_linking.half_window;
@@ -1541,6 +2020,9 @@ fn phase_link_tiled(
         let stack = read_tile(plan.read)?;
         let tile_mask = read_mask(plan.read)?;
         stats.read_s += t_read.elapsed().as_secs_f64();
+        let all_masked = tile_mask
+            .as_ref()
+            .is_some_and(|mask| !mask.iter().any(|valid| *valid));
         let missing = record_finite_acquisitions(stack.view(), &mut stats.acquisition_has_finite);
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
@@ -1552,22 +2034,46 @@ fn phase_link_tiled(
             peak_rss_kib,
             "phase-linking tile read complete"
         );
-        if !missing.is_empty() {
+        if !(missing.is_empty() || all_masked && covariance.is_some()) {
+            anyhow::ensure!(
+                covariance.is_none(),
+                "covariance operator capture requires finite source data for every acquisition in every owned tile; missing ordinals {missing:?}"
+            );
             stats.nodata_tiles += 1;
             acc.place_nodata(&plan);
             continue;
         }
-        let all_masked = tile_mask
-            .as_ref()
-            .is_some_and(|mask| !mask.iter().any(|valid| *valid));
-        if all_masked {
+        if all_masked && covariance.is_none() {
             stats.nodata_tiles += 1;
             acc.place_nodata(&plan);
             continue;
         }
         let t_pl = Instant::now();
         let valid_mask = tile_mask.as_ref().map(Array2::view);
-        let out = phase_link(cfg, stack.view(), engine, valid_mask)?;
+        let out = match covariance.as_mut() {
+            Some(capture) => {
+                let request = capture.request(&plan, cfg.output_options.strides)?;
+                match valid_mask {
+                    Some(mask) => run_sequential_masked_with_covariance_capture(
+                        stack.view(),
+                        mask,
+                        &sequential_config(cfg),
+                        engine,
+                        &request,
+                        |block| capture.sink.write_block(block),
+                    ),
+                    None => run_sequential_with_covariance_capture(
+                        stack.view(),
+                        &sequential_config(cfg),
+                        engine,
+                        &request,
+                        |block| capture.sink.write_block(block),
+                    ),
+                }
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+            None => phase_link(cfg, stack.view(), engine, valid_mask)?,
+        };
         stats.compute_s += t_pl.elapsed().as_secs_f64();
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
@@ -2507,6 +3013,10 @@ pub fn run_displacement_resumable(
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
     validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator,
+        "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
+    );
     let groups = group_by_burst(&cfg.cslc_file_list);
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -2583,6 +3093,10 @@ pub fn update_displacement(
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
     validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator,
+        "phase_linking.write_covariance_operator is unsupported for resumable updates"
+    );
     let groups = group_by_burst(&cfg.cslc_file_list);
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -2700,6 +3214,32 @@ fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
                 && cfg.timeseries_options.velocity_step_dates.is_empty()),
         "timeseries_options.write_velocity_uncertainty is validated only for the linear temporal model"
     );
+    if cfg.phase_linking.write_covariance_operator {
+        anyhow::ensure!(
+            cfg.phase_linking.max_num_compressed > 0,
+            "phase_linking.write_covariance_operator requires max_num_compressed > 0"
+        );
+        anyhow::ensure!(
+            cfg.worker_settings.compute_backend == ComputeBackend::Cpu,
+            "phase_linking.write_covariance_operator requires the CPU f64 backend"
+        );
+        anyhow::ensure!(
+            cfg.phase_linking.shp_method == ShpMethod::Rect,
+            "phase_linking.write_covariance_operator requires shp_method = rect"
+        );
+        anyhow::ensure!(
+            cfg.phase_linking.output_reference_idx.unwrap_or(0) == 0,
+            "phase_linking.write_covariance_operator requires output_reference_idx = 0"
+        );
+        anyhow::ensure!(
+            cfg.phase_linking.compressed_slc_plan == CompressedSlcPlan::AlwaysFirst,
+            "phase_linking.write_covariance_operator requires compressed_slc_plan = always_first"
+        );
+        anyhow::ensure!(
+            !cfg.phase_linking.correct_phase_bias,
+            "phase_linking.write_covariance_operator requires correct_phase_bias = false"
+        );
+    }
     Ok(())
 }
 
@@ -3535,6 +4075,10 @@ fn write_outputs(
                 &[
                     ("UNITTYPE", "rad"),
                     ("UNCERTAINTY_SCALE", "crlb_bound"),
+                    ("UNCERTAINTY_SCOPE", "per_ministack_marginal_crlb"),
+                    ("TEMPORAL_COVARIANCE", "not_propagated"),
+                    ("CALIBRATION_STATUS", "not_calibrated"),
+                    ("INFERENCE_READY", "false"),
                     ("DESCRIPTION", CRLB_BOUND_NOTE),
                 ],
             )?;
@@ -4774,6 +5318,144 @@ mod tests {
     }
 
     #[test]
+    fn tiled_covariance_capture_streams_blocks_without_changing_phase_output() {
+        let strides = Strides { y: 2, x: 2 };
+        let half = HalfWindow { y: 1, x: 1 };
+        let dims = (8, 8);
+        let mut cfg = tiled_cfg(strides, half, (4, 4));
+        cfg.phase_linking.ministack_size = 3;
+        cfg.phase_linking.max_num_compressed = 2;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.phase_linking.use_evd = true;
+        let stack = Array3::from_shape_fn((6, dims.0, dims.1), |(date, row, col)| {
+            let amplitude = 1.0 + 0.07 * date as f64 + 0.01 * (row + col) as f64;
+            let phase = 0.11 * date as f64 + 0.017 * row as f64 - 0.013 * col as f64;
+            Cf64::from_polar(amplitude, phase)
+        });
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let expected = phase_link_tiled(
+            &cfg,
+            dims,
+            6,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+
+        let source_manifest_digest = [3; 32];
+        let source_model_version_digest = [4; 32];
+        let mut blocks = Vec::new();
+        let captured = phase_link_tiled_impl(
+            &cfg,
+            dims,
+            6,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+            Some(TileCovarianceCapture {
+                burst_id: "fixture-burst".to_owned(),
+                source_origin: (0, 0),
+                source_manifest_digest,
+                source_model_version_digest,
+                sink: &mut blocks,
+            }),
+        )
+        .unwrap();
+
+        assert_c64_eq(
+            captured.output.cpx_phase.view(),
+            expected.output.cpx_phase.view(),
+            "captured cpx_phase",
+        );
+        let tile_count = plan_tiles(dims, strides, half, 2, (2, 2)).len();
+        assert_eq!(blocks.len(), tile_count * 2);
+        assert!(blocks.iter().all(|block| {
+            block.burst_id == "fixture-burst"
+                && block.owned_output_grid.rows > 0
+                && block.owned_output_grid.cols > 0
+        }));
+        let mut source_ids = BTreeMap::new();
+        let mut shared_overlap = false;
+        for block in blocks.iter().filter(|block| block.generation == 0) {
+            let columns = block.native_grid.cols as usize;
+            for (local, &source_id) in block.source_ids.iter().enumerate() {
+                let key = (
+                    block.native_grid.row_start + (local / columns) as u64,
+                    block.native_grid.col_start + (local % columns) as u64,
+                );
+                if let Some(previous) = source_ids.insert(key, source_id) {
+                    assert_eq!(previous, source_id, "overlap source identity drifted");
+                    shared_overlap = true;
+                }
+            }
+        }
+        assert!(
+            shared_overlap,
+            "fixture must exercise an overlapping tile halo"
+        );
+    }
+
+    #[test]
+    fn covariance_path_manifest_does_not_reread_cslc_bytes() {
+        let mut cfg = DisplacementWorkflow {
+            cslc_file_list: vec![PathBuf::from("/nonexistent/covariance-source-a.h5")],
+            ..DisplacementWorkflow::default()
+        };
+        let first = covariance_source_manifest_digest(&cfg).unwrap();
+        assert_eq!(covariance_source_manifest_digest(&cfg).unwrap(), first);
+        cfg.cslc_file_list[0] = PathBuf::from("/nonexistent/covariance-source-b.h5");
+        assert_ne!(covariance_source_manifest_digest(&cfg).unwrap(), first);
+    }
+
+    #[test]
+    fn tiled_covariance_capture_accepts_all_masked_nonfinite_tiles() {
+        let dims = (8, 16);
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (4, 4));
+        cfg.phase_linking.ministack_size = 2;
+        cfg.phase_linking.max_num_compressed = 1;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.phase_linking.use_evd = true;
+        let mut stack = synth_stack(4, dims.0, dims.1);
+        stack
+            .slice_mut(s![.., .., ..8])
+            .fill(Cf64::new(f64::NAN, f64::NAN));
+        let mut validity = Array2::from_elem(dims, true);
+        validity.slice_mut(s![.., ..8]).fill(false);
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let mut blocks = Vec::new();
+        let captured = phase_link_tiled_impl(
+            &cfg,
+            dims,
+            4,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| {
+                Ok(Some(
+                    validity.slice(s![block.rows(), block.cols()]).to_owned(),
+                ))
+            },
+            Some(TileCovarianceCapture {
+                burst_id: "masked-fixture".to_owned(),
+                source_origin: (0, 0),
+                source_manifest_digest: [21; 32],
+                source_model_version_digest: [22; 32],
+                sink: &mut blocks,
+            }),
+        )
+        .unwrap();
+
+        assert!(captured.validity_mask.iter().any(|valid| !*valid));
+        assert!(captured.validity_mask.iter().any(|valid| *valid));
+        assert!(blocks.iter().any(|block| {
+            block
+                .status
+                .iter()
+                .all(|status| *status == dolphin_io::CovarianceOperatorStatus::Masked)
+        }));
+    }
+
+    #[test]
     fn locally_empty_edge_tile_becomes_nodata_without_aborting_burst() {
         use std::cell::Cell;
 
@@ -5201,6 +5883,19 @@ mod tests {
             "0"
         );
         assert_eq!(tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "UNCERTAINTY_SCOPE"),
+            "per_ministack_marginal_crlb"
+        );
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "TEMPORAL_COVARIANCE"),
+            "not_propagated"
+        );
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "CALIBRATION_STATUS"),
+            "not_calibrated"
+        );
+        assert_eq!(tag("crlb_sigma_00.tif", "INFERENCE_READY"), "false");
         assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("not global per-date"));
         assert_eq!(tag("crlb_sigma_00.tif", "UNITTYPE"), "rad");
         assert_eq!(
@@ -5442,6 +6137,69 @@ mod tests {
         cfg.unwrap_options.run_interpolation = true;
         let error = validate_config(&cfg).unwrap_err();
         assert!(error.to_string().contains("run_interpolation"), "{error}");
+    }
+
+    #[test]
+    fn covariance_operator_rejects_unsupported_producer_scope_before_io() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.write_covariance_operator = true;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        validate_config(&cfg).expect("the frozen CPU/Rect/AlwaysFirst/gauge-0 scope is supported");
+
+        cfg.phase_linking.max_num_compressed = 0;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("max_num_compressed > 0"));
+        cfg.phase_linking.max_num_compressed = 10;
+
+        cfg.worker_settings.compute_backend = ComputeBackend::Gpu;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("CPU f64"));
+        cfg.worker_settings.compute_backend = ComputeBackend::Cpu;
+
+        cfg.phase_linking.output_reference_idx = Some(1);
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("output_reference_idx = 0"));
+        cfg.phase_linking.output_reference_idx = None;
+
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::FirstPerMinistack;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("compressed_slc_plan = always_first"));
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::AlwaysFirst;
+
+        cfg.phase_linking.correct_phase_bias = true;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("correct_phase_bias = false"));
+    }
+
+    #[test]
+    fn covariance_operator_rejects_groundpulse_and_resumable_modes_before_source_io() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.write_covariance_operator = true;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.cslc_file_list = vec![PathBuf::from("definitely-missing-covariance-source.h5")];
+
+        let error =
+            run_displacement_with_output_policy(&cfg, DisplacementOutputPolicy::GroundPulse)
+                .err()
+                .expect("GroundPulse covariance capture must fail")
+                .to_string();
+        assert!(error.contains("GroundPulse output policy"), "{error}");
+
+        let error = run_displacement_resumable(&cfg)
+            .err()
+            .expect("resumable covariance capture must fail")
+            .to_string();
+        assert!(error.contains("full batch"), "{error}");
     }
 
     #[test]

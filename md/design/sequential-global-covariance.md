@@ -136,7 +136,8 @@ Each primitive source has one consumer-independent identity:
 
 ```text
 SourceKey = (source manifest, burst, logical block, ordered new-real dates,
-             global native row, global native column, model version)
+             global native row, global native column, model version,
+             raw source content digest)
 ```
 
 For source `q` in block `b`, a proper-complex tangent factor supplied by the caller defines
@@ -164,12 +165,17 @@ phase/date coordinates; it does not remove or condition away that raw source com
 and imaginary perturbations still affect coherence contrasts and compression.
 
 Raw source samples and their `L_bq` factors are immutable external replay inputs. The artifact
-binds their resolver, ordered component IDs, provider method/version, model receipt, and content
-digests. A query verifies and loads them through that provider. Missing bytes, a stale digest, or
-an unavailable provider returns `source_unavailable` or `source_model_unavailable`; it never
-substitutes stored linked phases, identity covariance, or a window-specific factor. Persisting the
-raw inputs or source factors inside the artifact is an alternate schema whose bytes must be
-counted separately.
+binds their resolver, ordered component IDs, provider method/version, model receipt, raw-content
+digest, and per-source numeric-factor receipt. Capture hashes each block/native pixel's ordered raw
+samples and derives the source ID from that digest and the source locator. A Replayable writer also
+requires the caller to bind the canonical digest of the exact `L_bq`; descriptor-only CLI capture
+stores no factor receipt and remains `source_model_unavailable`. During replay, the resolver must
+reproduce both receipts. The query resolves each source once within its reverse block and reuses
+that exact sample/factor pair. A mismatch returns `source_identity_mismatch`; missing raw bytes
+return `source_unavailable`, and an unavailable factor model returns `source_model_unavailable`.
+Replay never substitutes stored linked phases, identity covariance, or a window-specific factor.
+Persisting the raw inputs or source factors inside the artifact is an alternate schema whose bytes
+must be counted separately.
 
 Different source keys are independent conditional on carried history. This is the frozen #52
 source model, not a field-calibration claim. #54 validates or rejects it for a target/reference
@@ -217,7 +223,8 @@ matrices:
 - linked solution, estimator branch, reference transform, selected eigenvalue/eigengap, and
   status;
 - compressed complex raster, projection accumulator, mean amplitude, and reference identity;
-- normalized config, source manifest, kernel version, and content digests.
+- normalized config, source manifest, kernel version, raw-content digests, and numeric-factor
+  receipts.
 
 ### Local derivatives
 
@@ -319,23 +326,31 @@ Approximate persistent payload per block is
 16 * native_area                 compressed complex raster
 + 16 * native_area               complex projection accumulator
 + 8 * native_area                mean amplitude
++ 64 * native_area               raw-content and numeric-factor SHA-256 receipts
 + 8 * output_area * d_b          linked phase angles
 + output_area * ceil(S_b/8)      realized support
 + O(native_area + output_area)   IDs, status, branch, eigenvalue/gap, maps
 ```
 
-At `native_area = output_area = 256^2`, `d_b=22`, and `S_b=435`, this is about
-18.0 MiB before HDF5 metadata and fixed registries. Full Fisher matrices and eigensystems are not
-persisted. Replay recomputes them from verified external sources and checks the stored branch,
-selected eigenvalue/eigengap, phase solution, and kernel digest before differentiation.
+At `native_area = output_area = 256^2`, `d_b=22`, and `S_b=435`, the listed terms are about
+20.9 MiB before IDs, status, HDF5 metadata, and fixed registries. Full Fisher matrices and
+eigensystems are not persisted. Replay recomputes them from verified external sources and checks
+the stored branch, selected eigenvalue/eigengap, phase solution, and kernel digest before
+differentiation.
 
 Before loading source windows or allocating adjoints, a query enumerates its topology-only
 dependency cone and computes a conservative byte bound from node dimensions, support, requested
 dates, source rank, and microbatch. A cone above the configured cap returns
 `dependency_cone_exceeds_budget`. Query memory is then bounded by the target microbatch, active
-reverse frontier, one local source window, and the requested `D x D` covariance. Runtime and
-dependency-cone growth are reported; the rejected factor-disabled `2x` runtime gate does not apply
-to an intentional replay operator.
+reverse frontier, one local source window, and the requested `D x D` covariance. The local bound
+charges worst-case sparse B-tree nodes, exact support-vector capacities, every live Rect
+replay/JVP matrix, and cache-line-padded Faer EVD, Cholesky, and solve scratch. Runtime and
+dependency-cone growth are reported; the rejected
+factor-disabled `2x` runtime gate does not apply to an intentional replay operator.
+
+The byte cap covers query-owned heap after Faer runtime initialization. Faer's process-global
+runtime state is retained across queries and is not included; this is not a cold-process total-heap
+bound.
 
 This payload excludes immutable external raw SLC bytes and caller-owned source-factor/model bytes.
 Every resource receipt reports their resolved byte counts, read throughput, cache size, and
@@ -379,7 +394,12 @@ used to normalize or overwrite source-influence covariance.
 ## Gate disposition
 
 - T52-01: original factor failed; replacement design approved for a new red contract.
-- T52-02 through T52-06: not started at the time of this revision.
+- T52-02: analytic source-DAG and central-difference `J J^T` contracts pass.
+- T52-03: canonical schema, replay identity, gauge, and fail-closed contracts pass.
+- T52-04: full-batch whole/tiled/bounded capture and block-local capped replay are implemented;
+  resumable and multiburst seam covariance remain unsupported.
+- T52-05: release smoke emits storage, disk, cache, source-resolution, timing, and RSS receipts.
+- T52-06: independent final review is pending.
 - Inference wiring, release, and GroundPulse pin remain outside #52.
 - PR #55's conditional-IID output and the legacy per-ministack CRLB diagnostic remain unchanged.
 

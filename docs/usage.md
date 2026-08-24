@@ -93,6 +93,7 @@ phase_linking:
   ministack_size: 15           # SLCs per ministack (sequential estimator)
   half_window: { y: 7, x: 14 } # covariance/SHP window half-extent
   use_evd: false               # false = EMI (default), true = EVD
+  write_covariance_operator: false # uncalibrated source-DAG capture; CPU full-batch only
   write_crlb: true             # per-ministack marginal CRLB quality diagnostic (default on)
   write_closure_phase: false   # per-triplet closure-phase layer (default off)
 interferogram_network:
@@ -136,6 +137,17 @@ reprojection or resampling.
 Zero, non-finite, raster-nodata, and GDAL-invalid pixels are excluded before covariance;
 finite nonzero pixels are valid. Resumable updates bind the mask and every effective backing
 file reported by GDAL and reject any identity or validity change before new CSLC I/O.
+
+`write_covariance_operator: true` is restricted to the CPU/f64 Rect path with
+`max_num_compressed > 0`, `compressed_slc_plan: always_first`, output reference 0, and
+`correct_phase_bias: false`. It is available only for a full batch under the full output policy;
+GroundPulse serialization and resumable entry points reject it before source reads. Capture
+writes an implicit source-keyed replay operator rather than a dense temporal covariance cube.
+The CLI does not supply the proper-complex source model needed for replay, so its artifact is
+marked `source_model_unavailable`. A low-level query must provide verified immutable raw samples,
+ordered component IDs, and exact numeric factors matching the artifact's per-source receipts. The
+method is uncalibrated and cannot feed displacement or velocity inference until #54 and #53 pass
+their separate gates.
 
 ### 3a. Atmospheric corrections (ionospheric + tropospheric)
 
@@ -302,6 +314,17 @@ and its ten support/status/diagnostic rasters require `write_velocity_uncertaint
 | `closure_phase_NN.tif` | nearest-neighbour closure of triplet `NN` (only if `write_closure_phase`) | radians |
 | `ionosphere_NN.tif` | ionospheric range delay at date `NN` (only if `ionosphere_files`) | meters |
 | `troposphere_NN.tif` | tropospheric range delay at date `NN` (only if `troposphere_files`) | meters |
+
+With `phase_linking.write_covariance_operator: true`, a successful full-batch phase-link stage
+also writes:
+
+| File | Contents |
+|---|---|
+| `phase_covariance_operator.h5` | chunked `sequential_source_dag_v1` topology and fixed-branch numeric replay state |
+| `phase_covariance_provenance.json` | final commit marker binding the HDF5 digest, method/schema, gauge, source/model status, disk admission, and inference block |
+
+The manifest must verify before the HDF5 file is consumed. Both files are uncalibrated sidecars.
+Current displacement and velocity inference code does not read them.
 
 Continuous evidence uses `NaN` when unavailable. Status and availability rasters use `0` as a
 valid unavailable/false value and do not declare `0` as nodata. Apply the validity/status

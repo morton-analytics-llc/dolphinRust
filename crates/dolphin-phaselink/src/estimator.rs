@@ -14,8 +14,10 @@
 //! phase is referenced to `reference_idx`: `θ ← θ · exp(-j∠θ[ref])`.
 
 use dolphin_core::Cf64;
+use faer::linalg::cholesky::llt::{compute, solve};
+use faer::linalg::evd::{compute_hermitian_evd_req, ComputeVectors};
 use faer::prelude::{c64, SpSolver};
-use faer::{Mat, Side};
+use faer::{get_global_parallelism, Mat, Side};
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView4};
 use rayon::prelude::*;
 use std::error::Error;
@@ -89,6 +91,71 @@ impl Display for EstimatorJvpError {
 }
 
 impl Error for EstimatorJvpError {}
+
+/// Conservative heap-payload bound for one fixed-branch phase-angle JVP.
+///
+/// This includes every owned matrix/vector in the Rust kernel and faer's
+/// dimension- and parallelism-specific EVD, Cholesky, and solve scratch. It
+/// excludes faer's process-global runtime initialization retained across
+/// queries; callers must initialize that baseline before enforcing a per-query
+/// heap cap.
+#[must_use]
+pub fn phase_angle_jvp_workspace_bytes(
+    dimension: usize,
+    branch: FixedEstimatorBranch,
+) -> Option<u64> {
+    let n = u64::try_from(dimension).ok()?;
+    // faer pads owned matrix rows to its cache-line alignment. Across its
+    // supported architectures that is at most 32 scalar slots; applying the
+    // same padding to every listed matrix/vector also conservatively covers
+    // the ndarray-owned members in this kernel.
+    let padded_n = n.checked_add(31)?.checked_div(32)?.checked_mul(32)?;
+    let padded_square = padded_n.checked_mul(n)?;
+    let complex_matrix = padded_square.checked_mul(16)?;
+    let real_matrix = padded_square.checked_mul(8)?;
+    let complex_vector = padded_n.checked_mul(16)?;
+    let real_vector = padded_n.checked_mul(8)?;
+    let parallelism = get_global_parallelism();
+    let evd_scratch = u64::try_from(
+        compute_hermitian_evd_req::<c64>(
+            dimension,
+            ComputeVectors::Yes,
+            parallelism,
+            Default::default(),
+        )
+        .ok()?
+        .size_bytes(),
+    )
+    .ok()?;
+    let eig_owned = complex_matrix
+        .checked_mul(2)?
+        .checked_add(complex_vector.checked_mul(5)?)?
+        .checked_add(real_vector.checked_mul(3)?)?
+        .checked_add(evd_scratch)?;
+    let branch_owned = match branch {
+        FixedEstimatorBranch::Evd => complex_matrix.checked_mul(2)?,
+        FixedEstimatorBranch::Emi { .. } => {
+            let cholesky_scratch = u64::try_from(
+                compute::cholesky_in_place_req::<f64>(dimension, parallelism, Default::default())
+                    .ok()?
+                    .size_bytes(),
+            )
+            .ok()?;
+            let solve_scratch = u64::try_from(
+                solve::solve_in_place_req::<f64>(dimension, dimension, parallelism)
+                    .ok()?
+                    .size_bytes(),
+            )
+            .ok()?;
+            complex_matrix
+                .checked_mul(2)?
+                .checked_add(real_matrix.checked_mul(6)?)?
+                .checked_add(cholesky_scratch)?
+                .checked_add(solve_scratch)?
+        }
+    };
+    eig_owned.checked_add(branch_owned)
+}
 
 /// Stacked phase-linking output over an `(out_rows, out_cols)` grid.
 pub struct StackEstimate {

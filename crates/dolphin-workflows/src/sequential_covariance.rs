@@ -9,19 +9,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::mem::size_of;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_io::{
-    read_covariance_operator_block, read_covariance_operator_metadata_with_byte_cap,
-    CovarianceEstimatorBranch, CovarianceOperatorBlock, CovarianceOperatorGrid,
+    covariance_content_bound_source_id, covariance_identified_id, covariance_record_block_id,
+    CovarianceBurstPlan, CovarianceEstimatorBranch, CovarianceOperatorBlock,
+    CovarianceOperatorBlockReader, CovarianceOperatorGrid, CovarianceOperatorPlan,
     CovarianceOperatorStatus, CovariancePhaseComponent, CovariancePhaseComponentKind,
-    CovarianceRectSupport, CovarianceReplayStatus, CovarianceSupportOrdering,
+    CovarianceRectSupport, CovarianceReplayStatus, CovarianceSupportOrdering, CovarianceTilePlan,
 };
 use dolphin_phaselink::{
-    compress_pixel_jvp, phase_angle_jvp, process_coherence_matrix,
+    compress_pixel_jvp, phase_angle_jvp, phase_angle_jvp_workspace_bytes, process_coherence_matrix,
     rect_source_values_coherence_jvp, replay_rect_source_values, CompressionJvpError,
     CompressionReplayGrid, CompressionReplayStatus, CovarianceReplayError, EstimatorJvpError,
     FixedBranchStatus, FixedEstimatorBranch, InfluenceDag, InfluenceError, NativeSourcePixel,
@@ -32,13 +34,32 @@ use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use sha2::{Digest, Sha256};
 
+use crate::covariance_artifact::{
+    acquire_covariance_artifact_read_lock, read_covariance_artifact_manifest_with_byte_cap,
+    CovarianceArtifactReadLock, COVARIANCE_OPERATOR_FILENAME,
+};
 use crate::sequential::SequentialConfig;
 
 /// Stable method name for the replayable global covariance operator.
 pub const SEQUENTIAL_SOURCE_DAG_METHOD: &str = "sequential_source_dag_v1";
+/// Versioned identity of the production derivative and contraction kernels.
+pub const SEQUENTIAL_SOURCE_DAG_KERNEL_ID: &str = "dolphinrust:sequential_source_dag_v1:kernel_v1";
 
 const NODE_KIND_SHIFT: u32 = 62;
 const NODE_MAJOR_LIMIT: u32 = 1 << 30;
+// `std` does not expose B-tree node occupancy. Reserve one whole node for each
+// logical record using the current standard-library node capacities. Actual
+// node count cannot exceed record count, so this remains conservative for a
+// sparsely populated tree and independent of allocator reuse.
+const BTREE_NODE_HEADER_BYTES: u64 = 64;
+const BTREE_NODE_KEY_VALUE_SLOTS: u64 = 11;
+const BTREE_NODE_CHILD_POINTERS: u64 = 12;
+
+fn btree_record_reservation_bytes<K, V>() -> u64 {
+    BTREE_NODE_HEADER_BYTES
+        + BTREE_NODE_KEY_VALUE_SLOTS * (size_of::<K>() + size_of::<V>()) as u64
+        + BTREE_NODE_CHILD_POINTERS * size_of::<usize>() as u64
+}
 
 /// Strong namespace used to derive tile-independent source and node IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,10 +104,29 @@ pub struct SequentialCovarianceCaptureRequest {
 pub struct SequentialSourceProviderIdentity {
     /// Ordered source-manifest digest whose members the provider verifies.
     pub source_manifest_digest: [u8; 32],
-    /// Frozen source-model version digest.
+    /// Resolver/provider name persisted with the artifact.
+    pub provider: String,
+    /// Resolver/provider version persisted with the artifact.
+    pub provider_version: String,
+    /// Proper-complex source-model name persisted with the artifact.
+    pub model: String,
+    /// Proper-complex source-model version persisted with the artifact.
+    pub model_version: String,
+    /// Digest of the four ordered provider/model identity strings.
     pub source_model_version_digest: [u8; 32],
     /// Digest of the ordered proper-complex factor model.
     pub source_model_hash: [u8; 32],
+}
+
+/// Reviewed code/config identity required before an HDF5 operator can replay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SequentialReplayBuildIdentity {
+    /// Digest of the normalized producer configuration expected by the caller.
+    pub normalized_config_digest: [u8; 32],
+    /// Digest of the fixed derivative/replay kernel expected by the caller.
+    pub kernel_digest: [u8; 32],
+    /// Exact branch tolerance used during capture and replay.
+    pub branch_tolerance: f64,
 }
 
 /// Verified raw values and proper-complex factor for one primitive source.
@@ -173,6 +213,96 @@ pub trait SequentialSourceReplayProvider {
     ) -> Result<ResolvedCompressionReplay, SequentialReplayError>;
 }
 
+struct QuerySourceCache<'a, P: ?Sized> {
+    provider: &'a mut P,
+    sources: BTreeMap<(GlobalBlockId, usize), ResolvedPrimitiveSource>,
+    current_payload_bytes: u64,
+    peak_payload_bytes: u64,
+}
+
+impl<'a, P: ?Sized> QuerySourceCache<'a, P> {
+    fn new(provider: &'a mut P) -> Self {
+        Self {
+            provider,
+            sources: BTreeMap::new(),
+            current_payload_bytes: 0,
+            peak_payload_bytes: 0,
+        }
+    }
+
+    fn clear_block(&mut self) {
+        self.sources.clear();
+        self.current_payload_bytes = 0;
+    }
+
+    const fn peak_payload_bytes(&self) -> u64 {
+        self.peak_payload_bytes
+    }
+}
+
+fn resolved_source_payload_bytes(
+    source: &ResolvedPrimitiveSource,
+) -> Result<u64, SequentialReplayError> {
+    let samples = u64::try_from(source.samples.len())
+        .map_err(|_| SequentialReplayError::Invalid("source sample count exceeds u64"))?;
+    let factor = u64::try_from(source.factor.lower().len())
+        .map_err(|_| SequentialReplayError::Invalid("source factor size exceeds u64"))?;
+    let components = u64::try_from(source.factor.component_ids().len())
+        .map_err(|_| SequentialReplayError::Invalid("source component count exceeds u64"))?;
+    checked_add(
+        checked_add(checked_mul(samples, 16)?, checked_mul(factor, 16)?)?,
+        checked_add(checked_mul(components, 8)?, 32)?,
+    )
+}
+
+impl<P> SequentialSourceReplayProvider for QuerySourceCache<'_, P>
+where
+    P: SequentialSourceReplayProvider + ?Sized,
+{
+    fn identity(&self) -> &SequentialSourceProviderIdentity {
+        self.provider.identity()
+    }
+
+    fn maximum_resident_bytes(&self) -> u64 {
+        self.provider.maximum_resident_bytes()
+    }
+
+    fn resolve_source(
+        &mut self,
+        block: &SequentialReplayBlock,
+        native_index: usize,
+    ) -> Result<ResolvedPrimitiveSource, SequentialReplayError> {
+        let key = (block.id, native_index);
+        if let Some(source) = self.sources.get(&key) {
+            return Ok(source.clone());
+        }
+        let source = self.provider.resolve_source(block, native_index)?;
+        self.current_payload_bytes = checked_add(
+            self.current_payload_bytes,
+            resolved_source_payload_bytes(&source)?,
+        )?;
+        self.peak_payload_bytes = self.peak_payload_bytes.max(self.current_payload_bytes);
+        self.sources.insert(key, source.clone());
+        Ok(source)
+    }
+
+    fn resolve_phase(
+        &mut self,
+        block: &SequentialReplayBlock,
+        output_index: usize,
+    ) -> Result<ResolvedPhaseReplay, SequentialReplayError> {
+        self.provider.resolve_phase(block, output_index)
+    }
+
+    fn resolve_compression(
+        &mut self,
+        block: &SequentialReplayBlock,
+        native_index: usize,
+    ) -> Result<ResolvedCompressionReplay, SequentialReplayError> {
+        self.provider.resolve_compression(block, native_index)
+    }
+}
+
 /// Immutable raw-source/model resolver used by the capped artifact provider.
 pub trait SequentialPrimitiveSourceResolver {
     /// Verified source manifest and proper-complex model identity.
@@ -200,13 +330,13 @@ pub struct CovarianceArtifactReplayMetrics {
     pub operator_block_reads: u64,
     /// Logical block resolutions served from the one-block cache.
     pub operator_block_cache_hits: u64,
-    /// Logical block bytes read, unavailable from the current IO receipt.
+    /// Cumulative selected-block logical payload bytes loaded from HDF5.
     pub logical_block_bytes_read: Option<u64>,
     /// Wall-clock time spent in physical capped block reads.
     pub operator_block_read_elapsed: Duration,
-    /// Current cached logical payload bytes, unavailable from the IO receipt.
+    /// Current cached selected-block logical payload bytes.
     pub current_cached_payload_bytes: Option<u64>,
-    /// Peak cached logical payload bytes, unavailable from the IO receipt.
+    /// Peak cached selected-block logical payload bytes.
     pub peak_cached_payload_bytes: Option<u64>,
     /// Configured cap reserved for metadata and one cached block read.
     pub block_reservation_bytes: u64,
@@ -220,29 +350,38 @@ pub struct CovarianceArtifactReplayMetrics {
 /// phase/compression resolver call loads at most `operator_block_byte_cap`
 /// payload bytes through [`read_covariance_operator_block`] and discards the
 /// block after extracting the requested state.
-pub struct CovarianceArtifactReplayProvider<R> {
-    operator_path: PathBuf,
+pub struct CovarianceArtifactReplayProvider<'a, R> {
+    _artifact_read_lock: CovarianceArtifactReadLock,
+    operator_reader: CovarianceOperatorBlockReader,
     operator_block_byte_cap: u64,
+    topology: &'a SequentialReplayTopology,
+    build_identity: SequentialReplayBuildIdentity,
     identity: SequentialSourceProviderIdentity,
     source_resolver: R,
     cached_block: Option<CovarianceOperatorBlock>,
     operator_block_reads: u64,
     operator_block_cache_hits: u64,
+    logical_block_bytes_read: u64,
+    current_cached_payload_bytes: u64,
+    peak_cached_payload_bytes: u64,
     operator_block_read_elapsed: Duration,
 }
 
-impl<R> CovarianceArtifactReplayProvider<R>
+impl<'a, R> CovarianceArtifactReplayProvider<'a, R>
 where
     R: SequentialPrimitiveSourceResolver,
 {
-    /// Open and metadata-check a completed operator without loading its numeric blocks.
+    /// Open a manifest-committed operator directory without loading numeric blocks.
     ///
     /// # Errors
     /// Returns an explicit status for a zero cap, non-replayable metadata, or
     /// source manifest/model receipt mismatch.
+    #[allow(clippy::too_many_lines)]
     pub fn open(
-        operator_path: impl AsRef<Path>,
+        artifact_directory: impl AsRef<Path>,
         operator_block_byte_cap: u64,
+        topology: &'a SequentialReplayTopology,
+        build_identity: SequentialReplayBuildIdentity,
         source_resolver: R,
     ) -> Result<Self, SequentialReplayError> {
         if operator_block_byte_cap == 0 {
@@ -250,52 +389,131 @@ where
                 "operator block byte cap must be positive",
             ));
         }
-        let metadata = read_covariance_operator_metadata_with_byte_cap(
-            operator_path.as_ref(),
+        let artifact_directory = artifact_directory.as_ref();
+        let artifact_read_lock = acquire_covariance_artifact_read_lock(artifact_directory)
+            .map_err(|_| {
+                SequentialReplayError::Provider(
+                    ReplayStatus::SourceUnavailable,
+                    "covariance artifact is not stable for replay",
+                )
+            })?;
+        read_covariance_artifact_manifest_with_byte_cap(
+            artifact_directory,
             operator_block_byte_cap,
         )
         .map_err(|_| {
             SequentialReplayError::Provider(
                 ReplayStatus::SourceUnavailable,
-                "capped covariance operator metadata read failed",
+                "capped covariance artifact manifest verification failed",
             )
         })?;
-        if metadata.replay_status != CovarianceReplayStatus::Replayable {
+        let operator_path = artifact_directory.join(COVARIANCE_OPERATOR_FILENAME);
+        let operator_reader =
+            CovarianceOperatorBlockReader::open(&operator_path, operator_block_byte_cap).map_err(
+                |_| {
+                    SequentialReplayError::Provider(
+                        ReplayStatus::SourceUnavailable,
+                        "capped covariance operator metadata read failed",
+                    )
+                },
+            )?;
+        let metadata = operator_reader.metadata();
+        if let Some(status) = persisted_replay_failure(metadata.replay_status) {
             return Err(SequentialReplayError::Provider(
-                ReplayStatus::SourceUnavailable,
+                status,
                 "covariance operator metadata is not replayable",
             ));
         }
+        if build_identity
+            .normalized_config_digest
+            .iter()
+            .all(|byte| *byte == 0)
+            || build_identity.kernel_digest.iter().all(|byte| *byte == 0)
+            || !build_identity.branch_tolerance.is_finite()
+            || build_identity.branch_tolerance <= 0.0
+            || build_identity.normalized_config_digest != topology.normalized_config_digest()
+            || build_identity.kernel_digest != sequential_replay_kernel_digest()
+            || !digest_matches(
+                &metadata.normalized_config_digest,
+                build_identity.normalized_config_digest,
+            )
+            || !digest_matches(&metadata.kernel_digest, build_identity.kernel_digest)
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "artifact kernel or normalized configuration differs from the reviewed replay identity",
+            ));
+        }
         let identity = source_resolver.identity().clone();
+        let identity_strings_are_valid = [
+            identity.provider.as_str(),
+            identity.provider_version.as_str(),
+            identity.model.as_str(),
+            identity.model_version.as_str(),
+        ]
+        .iter()
+        .all(|value| !value.is_empty());
+        let identity_mismatch = |message| {
+            SequentialReplayError::Provider(ReplayStatus::SourceIdentityMismatch, message)
+        };
         if !metadata
             .source
             .manifest_digest
             .as_deref()
             .is_some_and(|value| digest_matches(value, identity.source_manifest_digest))
-            || !metadata
-                .source
-                .model_version
-                .as_deref()
-                .is_some_and(|value| digest_matches(value, identity.source_model_version_digest))
-            || !metadata
-                .source
-                .model_receipt_digest
-                .as_deref()
-                .is_some_and(|value| digest_matches(value, identity.source_model_hash))
         {
-            return Err(SequentialReplayError::Provider(
-                ReplayStatus::SourceIdentityMismatch,
-                "artifact manifest/model receipt differs from the source resolver",
+            return Err(identity_mismatch(
+                "artifact source manifest differs from the source resolver",
             ));
         }
+        if !identity_strings_are_valid
+            || metadata.source.provider.as_deref() != Some(identity.provider.as_str())
+            || metadata.source.provider_version.as_deref()
+                != Some(identity.provider_version.as_str())
+            || metadata.source.model.as_deref() != Some(identity.model.as_str())
+            || metadata.source.model_version.as_deref() != Some(identity.model_version.as_str())
+        {
+            return Err(identity_mismatch(
+                "artifact provider/model name or version differs from the source resolver",
+            ));
+        }
+        if identity.source_model_version_digest
+            != sequential_source_model_identity_digest(
+                &identity.provider,
+                &identity.provider_version,
+                &identity.model,
+                &identity.model_version,
+            )
+        {
+            return Err(identity_mismatch(
+                "source resolver provider/model identity digest is inconsistent",
+            ));
+        }
+        if !metadata
+            .source
+            .model_receipt_digest
+            .as_deref()
+            .is_some_and(|value| digest_matches(value, identity.source_model_hash))
+        {
+            return Err(identity_mismatch(
+                "artifact source-model receipt differs from the source resolver",
+            ));
+        }
+        topology.validate_provider_identity(&identity)?;
         Ok(Self {
-            operator_path: operator_path.as_ref().to_path_buf(),
+            _artifact_read_lock: artifact_read_lock,
+            operator_reader,
             operator_block_byte_cap,
+            topology,
+            build_identity,
             identity,
             source_resolver,
             cached_block: None,
             operator_block_reads: 0,
             operator_block_cache_hits: 0,
+            logical_block_bytes_read: 0,
+            current_cached_payload_bytes: 0,
+            peak_cached_payload_bytes: 0,
             operator_block_read_elapsed: Duration::ZERO,
         })
     }
@@ -306,10 +524,14 @@ where
         CovarianceArtifactReplayMetrics {
             operator_block_reads: self.operator_block_reads,
             operator_block_cache_hits: self.operator_block_cache_hits,
-            logical_block_bytes_read: None,
+            logical_block_bytes_read: Some(self.logical_block_bytes_read),
             operator_block_read_elapsed: self.operator_block_read_elapsed,
-            current_cached_payload_bytes: None,
-            peak_cached_payload_bytes: None,
+            current_cached_payload_bytes: self
+                .cached_block
+                .as_ref()
+                .map(|_| self.current_cached_payload_bytes),
+            peak_cached_payload_bytes: (self.operator_block_reads > 0)
+                .then_some(self.peak_cached_payload_bytes),
             block_reservation_bytes: self.operator_block_byte_cap,
             cached_block_id: self.cached_block.as_ref().map(|block| block.block_id),
         }
@@ -324,26 +546,50 @@ where
             .as_ref()
             .is_some_and(|stored| stored.block_id == block.id.get())
         {
-            self.operator_block_cache_hits = self.operator_block_cache_hits.saturating_add(1);
+            self.operator_block_cache_hits = self.operator_block_cache_hits.checked_add(1).ok_or(
+                SequentialReplayError::Invalid("operator block cache-hit metric overflow"),
+            )?;
         } else {
             self.cached_block = None;
+            self.current_cached_payload_bytes = 0;
             let started = Instant::now();
-            let stored = read_covariance_operator_block(
-                &self.operator_path,
-                block.id.get(),
-                self.operator_block_byte_cap,
-            )
-            .map_err(|_| {
-                SequentialReplayError::Provider(
-                    ReplayStatus::SourceUnavailable,
-                    "capped covariance operator block read failed",
-                )
-            })?;
+            let receipt = self
+                .operator_reader
+                .read_block_with_receipt(block.id.get(), self.operator_block_byte_cap)
+                .map_err(|_| {
+                    SequentialReplayError::Provider(
+                        ReplayStatus::SourceUnavailable,
+                        "capped covariance operator block read failed",
+                    )
+                })?;
+            self.topology.validate_operator_block_contract(
+                block,
+                &receipt.block,
+                self.build_identity.branch_tolerance,
+            )?;
             self.operator_block_read_elapsed = self
                 .operator_block_read_elapsed
-                .saturating_add(started.elapsed());
-            self.operator_block_reads = self.operator_block_reads.saturating_add(1);
-            self.cached_block = Some(stored);
+                .checked_add(started.elapsed())
+                .ok_or(SequentialReplayError::Invalid(
+                    "operator block read duration overflow",
+                ))?;
+            self.operator_block_reads =
+                self.operator_block_reads
+                    .checked_add(1)
+                    .ok_or(SequentialReplayError::Invalid(
+                        "operator block read metric overflow",
+                    ))?;
+            self.logical_block_bytes_read = self
+                .logical_block_bytes_read
+                .checked_add(receipt.logical_payload_bytes)
+                .ok_or(SequentialReplayError::Invalid(
+                    "operator block payload metric overflow",
+                ))?;
+            self.current_cached_payload_bytes = receipt.logical_payload_bytes;
+            self.peak_cached_payload_bytes = self
+                .peak_cached_payload_bytes
+                .max(receipt.logical_payload_bytes);
+            self.cached_block = Some(receipt.block);
         }
         let stored = self
             .cached_block
@@ -352,36 +598,27 @@ where
                 ReplayStatus::SourceUnavailable,
                 "capped covariance operator block cache is empty",
             ))?;
-        let expected_dates = (block.real_date_start.get()
-            ..block
-                .real_date_start
-                .get()
-                .checked_add(u32::try_from(block.num_real_dates).map_err(|_| {
-                    SequentialReplayError::Invalid("replay block date count exceeds u32")
-                })?)
-                .ok_or(SequentialReplayError::Invalid(
-                    "replay block date range overflows u32",
-                ))?)
-            .collect::<Vec<_>>();
-        if stored.generation != block.generation
-            || stored.source_date_indices != expected_dates
-            || stored.carry_parent_ids
-                != block
-                    .carried_parent_ids
-                    .iter()
-                    .map(|parent| parent.get())
-                    .collect::<Vec<_>>()
-        {
-            return Err(SequentialReplayError::Provider(
-                ReplayStatus::ReplayStateMismatch,
-                "operator block topology differs from the planned replay",
-            ));
-        }
         Ok(stored)
     }
 }
 
-impl<R> SequentialSourceReplayProvider for CovarianceArtifactReplayProvider<R>
+const fn persisted_replay_failure(status: CovarianceReplayStatus) -> Option<ReplayStatus> {
+    match status {
+        CovarianceReplayStatus::Replayable => None,
+        CovarianceReplayStatus::SourceManifestMissing
+        | CovarianceReplayStatus::SourceManifestMismatch => {
+            Some(ReplayStatus::SourceIdentityMismatch)
+        }
+        CovarianceReplayStatus::SupportNotFrozen => Some(ReplayStatus::ReplayStateMismatch),
+        CovarianceReplayStatus::UnsupportedBackend => Some(ReplayStatus::UnsupportedBackend),
+        CovarianceReplayStatus::SourceUnavailable => Some(ReplayStatus::SourceUnavailable),
+        CovarianceReplayStatus::SourceModelUnavailable => {
+            Some(ReplayStatus::SourceModelUnavailable)
+        }
+    }
+}
+
+impl<R> SequentialSourceReplayProvider for CovarianceArtifactReplayProvider<'_, R>
 where
     R: SequentialPrimitiveSourceResolver,
 {
@@ -405,16 +642,39 @@ where
                 "source resolver identity changed after artifact admission",
             ));
         }
-        let stored_source_id = self
-            .read_block(block)?
-            .source_ids
-            .get(native_index)
-            .copied();
+        let stored = self.read_block(block)?;
+        let stored_source_id = stored.source_ids.get(native_index).copied();
+        let digest_start = native_index
+            .checked_mul(32)
+            .ok_or(SequentialReplayError::Invalid(
+                "source content digest offset overflows usize",
+            ))?;
+        let digest = stored
+            .source_content_digests
+            .get(digest_start..digest_start + 32)
+            .ok_or(SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "artifact source content digest is missing",
+            ))?;
+        let mut stored_content_digest = [0_u8; 32];
+        stored_content_digest.copy_from_slice(digest);
+        let factor_digest = stored
+            .source_factor_digests
+            .get(digest_start..digest_start + 32)
+            .ok_or(SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "artifact source factor receipt is missing",
+            ))?;
+        let mut stored_factor_digest = [0_u8; 32];
+        stored_factor_digest.copy_from_slice(factor_digest);
         let source = self.source_resolver.resolve_source(block, native_index)?;
-        if stored_source_id != Some(source.id.get()) {
+        if stored_source_id != Some(source.id.get())
+            || stored_content_digest != source.content_digest
+            || stored_factor_digest != source.factor.numeric_receipt_digest()
+        {
             return Err(SequentialReplayError::Provider(
                 ReplayStatus::SourceIdentityMismatch,
-                "artifact source ID differs from the immutable source resolver",
+                "artifact source, content, or numeric factor differs from the immutable resolver",
             ));
         }
         Ok(source)
@@ -753,7 +1013,7 @@ pub struct DependencyConeEstimate {
     pub block_ids: Vec<GlobalBlockId>,
     /// Bytes for active source/node adjoints in the requested microbatch.
     pub frontier_bytes: u64,
-    /// Bytes for one raw-complex source window and its real source factor.
+    /// Bytes for query-cached raw sources/factors plus one factor working copy.
     pub source_window_bytes: u64,
     /// Peak bytes for one streamed JVP plus topology/adjoint control records.
     /// Regenerated coefficients are contracted and discarded immediately.
@@ -788,6 +1048,8 @@ pub struct TemporalCovarianceReplay {
     pub covariance: Array2<f64>,
     /// Topology-only allocation receipt checked before graph contraction.
     pub dependency_cone: DependencyConeEstimate,
+    /// Peak logical raw-source and factor payload retained by the query cache.
+    pub source_cache_peak_bytes: u64,
 }
 
 struct SpatialQueryCone {
@@ -803,7 +1065,6 @@ struct StreamingAdjoints {
 }
 
 struct PhaseWindowReplay {
-    source_pixels: Vec<NativeSourcePixel>,
     source_values: Array2<Cf64>,
     replay: RectPixelReplay,
 }
@@ -886,6 +1147,7 @@ pub struct SequentialReplayTopology {
     native_validity: Vec<bool>,
     id_namespace: Option<ReplayIdNamespace>,
     estimator_branch: FixedEstimatorBranch,
+    normalized_config_digest: [u8; 32],
 }
 
 impl SequentialReplayTopology {
@@ -992,6 +1254,11 @@ impl SequentialReplayTopology {
         if num_real_dates == 0 {
             return Err(SequentialReplayError::Invalid(
                 "sequential replay requires at least one real acquisition",
+            ));
+        }
+        if cfg.max_num_compressed == 0 && num_real_dates > cfg.ministack_size {
+            return Err(SequentialReplayError::Invalid(
+                "multi-ministack covariance replay requires at least one carried compressed SLC",
             ));
         }
         let native_area = checked_area(native_shape)?;
@@ -1134,6 +1401,7 @@ impl SequentialReplayTopology {
                     zero_correlation_threshold: cfg.zero_correlation_threshold,
                 },
             },
+            normalized_config_digest: sequential_replay_config_digest(cfg),
         })
     }
 
@@ -1149,7 +1417,89 @@ impl SequentialReplayTopology {
         &self.blocks
     }
 
-    /// Deterministic primitive source ID for one block/native pixel.
+    /// Build the complete writer plan for this topology and one burst identity.
+    ///
+    /// # Errors
+    /// Returns an error for an empty burst ID or overflowing date range.
+    pub fn covariance_operator_plan(
+        &self,
+        burst_id: &str,
+    ) -> Result<CovarianceOperatorPlan, SequentialReplayError> {
+        if burst_id.is_empty() {
+            return Err(SequentialReplayError::Invalid(
+                "covariance writer plan requires a burst ID",
+            ));
+        }
+        let namespace = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Invalid(
+                "covariance writer plan requires strongly identified grids",
+            ))?;
+        let grid = |origin: (u64, u64),
+                    shape: (usize, usize),
+                    strides: (usize, usize)|
+         -> Result<CovarianceOperatorGrid, SequentialReplayError> {
+            Ok(CovarianceOperatorGrid {
+                row_start: origin.0,
+                col_start: origin.1,
+                rows: u32::try_from(shape.0).map_err(|_| {
+                    SequentialReplayError::Invalid("covariance writer grid rows exceed u32")
+                })?,
+                cols: u32::try_from(shape.1).map_err(|_| {
+                    SequentialReplayError::Invalid("covariance writer grid columns exceed u32")
+                })?,
+                stride_y: u32::try_from(strides.0).map_err(|_| {
+                    SequentialReplayError::Invalid("covariance writer row stride exceeds u32")
+                })?,
+                stride_x: u32::try_from(strides.1).map_err(|_| {
+                    SequentialReplayError::Invalid("covariance writer column stride exceeds u32")
+                })?,
+            })
+        };
+        let source_dates_by_generation = self
+            .blocks
+            .iter()
+            .map(|block| {
+                let count = u32::try_from(block.num_real_dates).map_err(|_| {
+                    SequentialReplayError::Invalid("covariance writer plan date count exceeds u32")
+                })?;
+                let stop = block.real_date_start.get().checked_add(count).ok_or(
+                    SequentialReplayError::Invalid("covariance writer plan date range overflows"),
+                )?;
+                Ok((block.real_date_start.get()..stop).collect())
+            })
+            .collect::<Result<Vec<Vec<u32>>, SequentialReplayError>>()?;
+        Ok(CovarianceOperatorPlan {
+            source_manifest_digest: namespace.source_manifest_digest,
+            source_model_version_digest: namespace.source_model_version_digest,
+            bursts: vec![CovarianceBurstPlan {
+                burst_id: burst_id.to_owned(),
+                source_dates_by_generation,
+                tiles: vec![CovarianceTilePlan {
+                    native_grid: grid(namespace.native_origin, self.native_shape, (1, 1))?,
+                    output_grid: grid(
+                        namespace.output_origin,
+                        self.output_shape,
+                        (self.strides.y, self.strides.x),
+                    )?,
+                    owned_output_grid: grid(
+                        namespace.owned_output_origin,
+                        namespace.owned_output_shape,
+                        (self.strides.y, self.strides.x),
+                    )?,
+                }],
+            }],
+        })
+    }
+
+    /// Digest of every sequential configuration field bound by this topology.
+    #[must_use]
+    pub const fn normalized_config_digest(&self) -> [u8; 32] {
+        self.normalized_config_digest
+    }
+
+    /// Deterministic source-locator ID before raw-content binding.
     ///
     /// # Errors
     /// Returns `Err` for an unknown block or native pixel.
@@ -1172,6 +1522,29 @@ impl SequentialReplayTopology {
             None => (block.get() << 32) | native_index as u64,
         };
         Ok(SourceId::new(value))
+    }
+
+    /// Deterministic primitive source ID bound to its raw-content digest.
+    ///
+    /// # Errors
+    /// Returns `Err` for an unknown source coordinate or an all-zero digest.
+    pub fn source_id_for_content_digest(
+        &self,
+        block: GlobalBlockId,
+        native_index: usize,
+        content_digest: &[u8; 32],
+    ) -> Result<SourceId, SequentialReplayError> {
+        if content_digest.iter().all(|byte| *byte == 0) {
+            return Err(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ));
+        }
+        let locator = self.source_id(block, native_index)?;
+        covariance_content_bound_source_id(locator.get(), content_digest)
+            .map(SourceId::new)
+            .map_err(|_| {
+                SequentialReplayError::Unsupported(ReplayStatus::UnsupportedSourceIdentity)
+            })
     }
 
     /// Deterministic phase-node ID for one block/output pixel.
@@ -1293,20 +1666,27 @@ impl SequentialReplayTopology {
         selection: &[(GlobalDateId, usize)],
         microbatch: usize,
     ) -> Result<SpatialQueryCone, SequentialReplayError> {
+        if microbatch != 1 {
+            return Err(SequentialReplayError::Invalid(
+                "version-1 temporal covariance replay requires one output pixel",
+            ));
+        }
         let mut selected_dates = vec![BTreeSet::new(); self.blocks.len()];
         let mut active_outputs = vec![BTreeSet::new(); self.blocks.len()];
         let mut distinct_outputs = BTreeSet::new();
         for &(date, output_index) in selection {
             self.validate_date_output(date, output_index)?;
-            let block = self.block_for_date(date)?;
-            let block_index = block.generation as usize;
-            active_outputs[block_index].insert(output_index);
-            selected_dates[block_index].insert((date, output_index));
             distinct_outputs.insert(output_index);
+            if date.get() != 0 {
+                let block = self.block_for_date(date)?;
+                let block_index = block.generation as usize;
+                active_outputs[block_index].insert(output_index);
+                selected_dates[block_index].insert((date, output_index));
+            }
         }
-        if distinct_outputs.len() != microbatch {
+        if distinct_outputs.len() != 1 {
             return Err(SequentialReplayError::Invalid(
-                "dependency-cone microbatch must equal the selected output-pixel count",
+                "version-1 temporal covariance selection must use one output pixel",
             ));
         }
 
@@ -1359,23 +1739,40 @@ impl SequentialReplayTopology {
             ));
         }
         let cone = self.spatial_query_cone(selection, microbatch)?;
-        let block_ids: Vec<_> = (0..self.blocks.len())
-            .rev()
-            .filter(|&index| {
-                !cone.active_outputs[index].is_empty()
-                    || !cone.active_sources[index].is_empty()
-                    || !cone.required_compressed[index].is_empty()
-            })
-            .map(|index| self.blocks[index].id)
-            .collect();
+        self.estimate_dependency_cone_for_spatial_query(selection, source_rank, &cone)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn estimate_dependency_cone_for_spatial_query(
+        &self,
+        selection: &[(GlobalDateId, usize)],
+        source_rank: usize,
+        cone: &SpatialQueryCone,
+    ) -> Result<DependencyConeEstimate, SequentialReplayError> {
+        let mut block_ids = Vec::with_capacity(self.blocks.len());
+        for index in (0..self.blocks.len()).rev() {
+            if !cone.active_outputs[index].is_empty()
+                || !cone.active_sources[index].is_empty()
+                || !cone.required_compressed[index].is_empty()
+            {
+                block_ids.push(self.blocks[index].id);
+            }
+        }
 
         let mut frontier_coordinates = 0_u64;
         let mut max_real = 0_u64;
         let mut max_combined = 0_u64;
         let mut max_phase_dimension = 0_u64;
         let mut support_bits = 0_u64;
-        let mut resident_control_records = 0_u64;
+        let mut resident_control_bytes = 0_u64;
         let mut baseline_bytes = 0_u64;
+        let mut source_cache_bytes = 0_u64;
+        let set_record_bytes = btree_record_reservation_bytes::<usize, ()>();
+        let selected_date_record_bytes =
+            btree_record_reservation_bytes::<(GlobalDateId, usize), ()>();
+        let adjoint_record_bytes = btree_record_reservation_bytes::<usize, Array2<f64>>();
+        let source_cache_record_bytes =
+            btree_record_reservation_bytes::<(GlobalBlockId, usize), ResolvedPrimitiveSource>();
         for &block_id in &block_ids {
             let block = self.block(block_id)?;
             let block_index = block.generation as usize;
@@ -1384,7 +1781,10 @@ impl SequentialReplayTopology {
             let real = block.num_real_dates as u64;
             let compressed = cone.required_compressed[block_index].len() as u64;
             let selected_dates = cone.selected_dates[block_index].len() as u64;
-            let source_coordinates = checked_mul(checked_mul(2, real)?, native)?;
+            // Production replay pads every active root adjoint to the declared
+            // maximum source rank so blocks can share one query contract. Charge
+            // that actual allocation even when the final ministack is partial.
+            let source_coordinates = checked_mul(source_rank as u64, native)?;
             let phase_coordinates = checked_mul(block.phase_dimension as u64, output)?;
             let compressed_coordinates = checked_mul(2, compressed)?;
             let date_coordinates = cone.selected_dates[block_index]
@@ -1402,28 +1802,58 @@ impl SequentialReplayTopology {
             max_phase_dimension = max_phase_dimension.max(block.phase_dimension as u64);
             let combined = checked_add(real, block.carried_parent_ids.len() as u64)?;
             max_combined = max_combined.max(combined);
-
-            let cone_records = checked_add(
-                1,
-                checked_add(
-                    checked_add(native, output)?,
-                    checked_add(compressed, selected_dates)?,
-                )?,
+            let cached_source_bytes = checked_add(
+                checked_mul(checked_mul(real, real)?, 16)?,
+                checked_add(checked_mul(real, 24)?, source_cache_record_bytes)?,
             )?;
-            let adjoint_records = checked_add(checked_add(native, output)?, compressed)?;
-            resident_control_records = checked_add(
-                resident_control_records,
-                checked_add(checked_add(cone_records, adjoint_records)?, 7)?,
+            source_cache_bytes = source_cache_bytes.max(checked_mul(native, cached_source_bytes)?);
+
+            let cone_control_bytes = checked_add(
+                checked_mul(
+                    checked_add(checked_add(native, output)?, compressed)?,
+                    set_record_bytes,
+                )?,
+                checked_mul(selected_dates, selected_date_record_bytes)?,
+            )?;
+            let adjoint_control_bytes = checked_mul(
+                checked_add(checked_add(native, output)?, compressed)?,
+                adjoint_record_bytes,
+            )?;
+            resident_control_bytes = checked_add(
+                resident_control_bytes,
+                checked_add(cone_control_bytes, adjoint_control_bytes)?,
             )?;
             for &output_index in &cone.active_outputs[block_index] {
                 let support = self.native_support_indices(output_index)?.len() as u64;
                 support_bits = checked_add(support_bits, support)?;
                 let source_values = checked_mul(checked_mul(support, combined)?, 16)?;
-                let matrix_buffers = checked_mul(checked_mul(combined, combined)?, 16 * 6)?;
-                let vector_buffers = checked_mul(combined, 16 * 4)?;
+                let native_index_buffer = checked_mul(
+                    self.support_slots_per_output() as u64,
+                    size_of::<usize>() as u64,
+                )?;
+                let source_pixel_buffers = checked_mul(
+                    checked_mul(support, 2)?,
+                    size_of::<NativeSourcePixel>() as u64,
+                )?;
+                let source_index_buffers = checked_add(native_index_buffer, source_pixel_buffers)?;
+                let complex_matrix = checked_mul(checked_mul(combined, combined)?, 16)?;
+                let replay_and_rect_jvp_matrices = checked_mul(complex_matrix, 5)?;
+                let combined_direction = checked_mul(combined, 16)?;
+                let estimator_workspace = phase_angle_jvp_workspace_bytes(
+                    usize::try_from(combined).map_err(|_| {
+                        SequentialReplayError::Invalid("phase dimension exceeds usize")
+                    })?,
+                    self.estimator_branch,
+                )
+                .ok_or(SequentialReplayError::Invalid(
+                    "phase estimator workspace estimate overflowed",
+                ))?;
                 baseline_bytes = baseline_bytes.max(checked_add(
-                    source_values,
-                    checked_add(matrix_buffers, vector_buffers)?,
+                    checked_add(source_values, source_index_buffers)?,
+                    checked_add(
+                        replay_and_rect_jvp_matrices,
+                        checked_add(combined_direction, estimator_workspace)?,
+                    )?,
                 )?);
             }
         }
@@ -1438,8 +1868,18 @@ impl SequentialReplayTopology {
             checked_mul(checked_mul(source_rank as u64, source_rank as u64)?, 8)?;
         let raw_vector_bytes = checked_mul(max_real, 16 * 2)?;
         let source_window_bytes = checked_add(
-            checked_add(lower_factor_bytes, component_id_bytes)?,
-            checked_add(real_embedding_bytes, raw_vector_bytes)?,
+            source_cache_bytes,
+            checked_add(
+                checked_add(lower_factor_bytes, component_id_bytes)?,
+                checked_add(
+                    checked_add(real_embedding_bytes, raw_vector_bytes)?,
+                    checked_add(
+                        size_of::<ResolvedPrimitiveSource>() as u64,
+                        size_of::<BTreeMap<(GlobalBlockId, usize), ResolvedPrimitiveSource>>()
+                            as u64,
+                    )?,
+                )?,
+            )?,
         )?;
         let one_jvp_bytes = checked_add(
             checked_add(checked_mul(max_real, 16)?, checked_mul(max_combined, 16)?)?,
@@ -1451,8 +1891,22 @@ impl SequentialReplayTopology {
                 16,
             )?,
         )?;
-        let operator_bytes =
-            checked_add(checked_mul(resident_control_records, 64)?, one_jvp_bytes)?;
+        let per_block_collection_headers = (4 * size_of::<BTreeSet<usize>>()
+            + 2 * size_of::<BTreeMap<usize, Array2<f64>>>())
+            as u64;
+        let collection_header_bytes =
+            checked_mul(self.blocks.len() as u64, per_block_collection_headers)?;
+        let block_id_bytes = checked_mul(
+            block_ids.capacity() as u64,
+            size_of::<GlobalBlockId>() as u64,
+        )?;
+        let operator_bytes = checked_add(
+            checked_add(
+                resident_control_bytes,
+                checked_add(collection_header_bytes, block_id_bytes)?,
+            )?,
+            one_jvp_bytes,
+        )?;
         let support_bytes = checked_add(support_bits, 7)? / 8;
         let selected = selection.len() as u64;
         let covariance_bytes = checked_mul(checked_mul(selected, selected)?, 8)?;
@@ -1528,6 +1982,7 @@ impl SequentialReplayTopology {
         Ok(TemporalCovarianceReplay {
             covariance,
             dependency_cone,
+            source_cache_peak_bytes: 0,
         })
     }
 
@@ -1557,10 +2012,20 @@ impl SequentialReplayTopology {
                 "replay branch tolerance must be finite and positive",
             ));
         }
-        self.validate_provider_identity(provider.identity())?;
         let cone = self.spatial_query_cone(selection, query.microbatch)?;
         let mut dependency_cone =
-            self.estimate_dependency_cone(selection, query.source_rank, query.microbatch)?;
+            self.estimate_dependency_cone_for_spatial_query(selection, query.source_rank, &cone)?;
+        if selection.iter().all(|(date, _)| date.get() == 0) {
+            if dependency_cone.total_bytes > query.byte_cap {
+                return Err(SequentialReplayError::Budget(dependency_cone));
+            }
+            return Ok(TemporalCovarianceReplay {
+                covariance: Array2::zeros((selection.len(), selection.len())),
+                dependency_cone,
+                source_cache_peak_bytes: 0,
+            });
+        }
+        self.validate_provider_identity(provider.identity())?;
         let expected_rank = dependency_cone
             .block_ids
             .iter()
@@ -1582,6 +2047,7 @@ impl SequentialReplayTopology {
         if dependency_cone.total_bytes > query.byte_cap {
             return Err(SequentialReplayError::Budget(dependency_cone));
         }
+        let mut provider = QuerySourceCache::new(provider);
 
         let selected = selection.len();
         let mut adjoints = StreamingAdjoints {
@@ -1608,7 +2074,7 @@ impl SequentialReplayTopology {
             phase[(reduced_component, column)] += 1.0;
         }
 
-        let mut covariance = Array2::zeros((selected, selected));
+        let mut covariance = Array2::<f64>::zeros((selected, selected));
         for block_index in (0..self.blocks.len()).rev() {
             let block = &self.blocks[block_index];
             let mut source_adjoints: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
@@ -1622,7 +2088,7 @@ impl SequentialReplayTopology {
                     compressed.view(),
                     query.source_rank,
                     branch_tolerance,
-                    provider,
+                    &mut provider,
                     &mut adjoints.phase[block_index],
                     &mut source_adjoints,
                 )?;
@@ -1637,14 +2103,21 @@ impl SequentialReplayTopology {
                     phase.view(),
                     query.source_rank,
                     branch_tolerance,
-                    provider,
+                    &mut provider,
                     &mut adjoints.compressed,
                     &mut source_adjoints,
                 )?;
             }
             for root in source_adjoints.values() {
-                covariance += &root.t().dot(root);
+                for row in 0..selected {
+                    for column in 0..selected {
+                        covariance[(row, column)] += (0..root.nrows())
+                            .map(|basis| root[(basis, row)] * root[(basis, column)])
+                            .sum::<f64>();
+                    }
+                }
             }
+            provider.clear_block();
         }
         if covariance.iter().any(|value| !value.is_finite()) {
             return Err(SequentialReplayError::Provider(
@@ -1655,6 +2128,7 @@ impl SequentialReplayTopology {
         Ok(TemporalCovarianceReplay {
             covariance,
             dependency_cone,
+            source_cache_peak_bytes: provider.peak_payload_bytes(),
         })
     }
 
@@ -1681,6 +2155,157 @@ impl SequentialReplayTopology {
                 ReplayStatus::SourceIdentityMismatch,
                 "source provider identity does not match the replay namespace",
             ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_operator_block_contract(
+        &self,
+        block: &SequentialReplayBlock,
+        stored: &CovarianceOperatorBlock,
+        branch_tolerance: f64,
+    ) -> Result<(), SequentialReplayError> {
+        let mismatch = || {
+            SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "operator block geometry, support, or component identity differs from the planned replay",
+            )
+        };
+        let namespace = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        let native_grid = CovarianceOperatorGrid {
+            row_start: namespace.native_origin.0,
+            col_start: namespace.native_origin.1,
+            rows: u32::try_from(self.native_shape.0).map_err(|_| mismatch())?,
+            cols: u32::try_from(self.native_shape.1).map_err(|_| mismatch())?,
+            stride_y: 1,
+            stride_x: 1,
+        };
+        let output_grid = CovarianceOperatorGrid {
+            row_start: namespace.output_origin.0,
+            col_start: namespace.output_origin.1,
+            rows: u32::try_from(self.output_shape.0).map_err(|_| mismatch())?,
+            cols: u32::try_from(self.output_shape.1).map_err(|_| mismatch())?,
+            stride_y: u32::try_from(self.strides.y).map_err(|_| mismatch())?,
+            stride_x: u32::try_from(self.strides.x).map_err(|_| mismatch())?,
+        };
+        let owned_output_grid = CovarianceOperatorGrid {
+            row_start: namespace.owned_output_origin.0,
+            col_start: namespace.owned_output_origin.1,
+            rows: u32::try_from(namespace.owned_output_shape.0).map_err(|_| mismatch())?,
+            cols: u32::try_from(namespace.owned_output_shape.1).map_err(|_| mismatch())?,
+            stride_y: output_grid.stride_y,
+            stride_x: output_grid.stride_x,
+        };
+        let rect_support = CovarianceRectSupport {
+            half_window_rows: u32::try_from(self.half_window.y).map_err(|_| mismatch())?,
+            half_window_cols: u32::try_from(self.half_window.x).map_err(|_| mismatch())?,
+            ordering: CovarianceSupportOrdering::RowMajorInwardClampV1,
+        };
+        let estimator_branch = match self.estimator_branch {
+            FixedEstimatorBranch::Evd => CovarianceEstimatorBranch::Evd,
+            FixedEstimatorBranch::Emi { .. } => CovarianceEstimatorBranch::Emi,
+        };
+        if stored.burst_id != namespace.burst_id
+            || stored.block_id != block.id.get()
+            || stored.native_grid != native_grid
+            || stored.output_grid != output_grid
+            || stored.owned_output_grid != owned_output_grid
+            || stored.rect_support != rect_support
+            || stored.reference_date_index != 0
+            || stored.estimator_branch != estimator_branch
+            || stored.branch_tolerance.to_bits() != branch_tolerance.to_bits()
+            || usize::try_from(stored.support_bits_per_output)
+                != Ok(self.support_slots_per_output())
+        {
+            return Err(mismatch());
+        }
+        let expected_date_stop = block
+            .real_date_start
+            .get()
+            .checked_add(u32::try_from(block.num_real_dates).map_err(|_| mismatch())?)
+            .ok_or_else(mismatch)?;
+        if !stored
+            .source_date_indices
+            .iter()
+            .copied()
+            .eq(block.real_date_start.get()..expected_date_stop)
+            || stored.ordered_date_indices != stored.source_date_indices
+            || !stored
+                .carry_parent_ids
+                .iter()
+                .copied()
+                .eq(block.carried_parent_ids.iter().map(|parent| parent.get()))
+        {
+            return Err(mismatch());
+        }
+        if stored.phase_components.len() != block.carried_parent_ids.len() + block.num_real_dates {
+            return Err(mismatch());
+        }
+        for (index, component) in stored.phase_components.iter().enumerate() {
+            let expected = if index < block.carried_parent_ids.len() {
+                (
+                    CovariancePhaseComponentKind::CompressedParent,
+                    block.carried_parent_ids[index].get(),
+                )
+            } else {
+                let date = block.real_date_start.get()
+                    + u32::try_from(index - block.carried_parent_ids.len())
+                        .map_err(|_| mismatch())?;
+                (
+                    match date {
+                        0 => CovariancePhaseComponentKind::GaugeDate,
+                        _ => CovariancePhaseComponentKind::RetainedDate,
+                    },
+                    u64::from(date),
+                )
+            };
+            if (component.kind, component.id) != expected {
+                return Err(mismatch());
+            }
+        }
+        for native_index in 0..self.native_area {
+            let digest_start = native_index * 32;
+            let content_digest: &[u8; 32] = stored.source_content_digests
+                [digest_start..digest_start + 32]
+                .try_into()
+                .map_err(|_| mismatch())?;
+            if stored.source_ids[native_index]
+                != self
+                    .source_id_for_content_digest(block.id, native_index, content_digest)?
+                    .get()
+                || stored.compressed_node_ids[native_index]
+                    != self.compressed_node_id(block.id, native_index)?.get()
+                || usize::try_from(stored.nearest_output_map[native_index])
+                    != Ok(self.nearest_output_index(native_index)?)
+                || packed_bit_value(&stored.native_validity_bits, native_index)
+                    != self.native_validity[native_index]
+            {
+                return Err(mismatch());
+            }
+        }
+        let support_bytes = self.support_slots_per_output().div_ceil(8);
+        for output_index in 0..self.output_area {
+            if stored.phase_node_ids[output_index]
+                != self.phase_node_id(block.id, output_index)?.get()
+            {
+                return Err(mismatch());
+            }
+            let expected = self.support_slot_validity(output_index)?;
+            let start = output_index * support_bytes;
+            let actual = &stored.support_bits[start..start + support_bytes];
+            if expected
+                .iter()
+                .enumerate()
+                .any(|(slot, value)| packed_bit_value(actual, slot) != *value)
+            {
+                return Err(mismatch());
+            }
         }
         Ok(())
     }
@@ -1802,7 +2427,7 @@ impl SequentialReplayTopology {
             self.load_phase_window(block, output_index, branch_tolerance, source_rank, provider)?;
         let selected = child_adjoint.ncols();
         let first_real = block.carried_parent_ids.len();
-        for (support_index, &source_pixel) in window.source_pixels.iter().enumerate() {
+        for (support_index, &source_pixel) in window.replay.source_pixels.iter().enumerate() {
             let native_index = source_pixel.row * self.native_shape.1 + source_pixel.column;
             let source = self.resolve_source_checked(block, native_index, source_rank, provider)?;
             let embedding = source.factor.real_embedding();
@@ -1851,7 +2476,7 @@ impl SequentialReplayTopology {
                     let coherence_direction = rect_source_values_coherence_jvp(
                         window.source_values.view(),
                         &window.replay,
-                        window.source_pixels[support_index],
+                        window.replay.source_pixels[support_index],
                         direction.view(),
                         branch_tolerance,
                     )
@@ -1919,7 +2544,6 @@ impl SequentialReplayTopology {
                 .map_err(covariance_replay_error)?;
         self.validate_phase_baseline(&phase, &replay, branch_tolerance)?;
         Ok(PhaseWindowReplay {
-            source_pixels,
             source_values,
             replay,
         })
@@ -1982,7 +2606,8 @@ impl SequentialReplayTopology {
         P: SequentialSourceReplayProvider + ?Sized,
     {
         let source = provider.resolve_source(block, native_index)?;
-        let expected_id = self.source_id(block.id, native_index)?;
+        let expected_id =
+            self.source_id_for_content_digest(block.id, native_index, &source.content_digest)?;
         let date_count = u32::try_from(block.num_real_dates).map_err(|_| {
             SequentialReplayError::Invalid("replay block source-date count exceeds u32")
         })?;
@@ -1994,6 +2619,8 @@ impl SequentialReplayTopology {
             .collect::<Vec<_>>();
         let expected_rank = 2 * block.num_real_dates;
         let identity = provider.identity();
+        let recomputed_content_digest =
+            primitive_source_content_digest(source.samples.iter().copied());
         if source.id != expected_id
             || source.factor.source() != expected_id
             || source.samples.len() != block.num_real_dates
@@ -2002,6 +2629,7 @@ impl SequentialReplayTopology {
             || source.factor.real_embedding().dim() != (expected_rank, expected_rank)
             || expected_rank > source_rank
             || source.content_digest.iter().all(|byte| *byte == 0)
+            || source.content_digest != recomputed_content_digest
         {
             return Err(SequentialReplayError::Provider(
                 ReplayStatus::SourceIdentityMismatch,
@@ -2162,14 +2790,16 @@ impl SequentialReplayTopology {
         let (row_start, col_start) = self.window_origin(output_index);
         let window_rows = 2 * self.half_window.y + 1;
         let window_cols = 2 * self.half_window.x + 1;
-        Ok((row_start..row_start + window_rows)
-            .flat_map(|row| {
-                (col_start..col_start + window_cols).filter_map(move |col| {
-                    let index = row * self.native_shape.1 + col;
-                    self.native_validity[index].then_some(index)
-                })
-            })
-            .collect())
+        let mut indices = Vec::with_capacity(self.support_slots_per_output());
+        for row in row_start..row_start + window_rows {
+            for col in col_start..col_start + window_cols {
+                let index = row * self.native_shape.1 + col;
+                if self.native_validity[index] {
+                    indices.push(index);
+                }
+            }
+        }
+        Ok(indices)
     }
 
     fn support_slots_per_output(&self) -> usize {
@@ -2255,27 +2885,33 @@ impl SequentialReplayTopology {
             true => namespace.native_origin,
             false => namespace.output_origin,
         };
-        let row = origin.0 + (local / shape.1) as u64;
-        let column = origin.1 + (local % shape.1) as u64;
-        let mut digest = Sha256::new();
-        digest.update(SEQUENTIAL_SOURCE_DAG_METHOD.as_bytes());
-        digest.update(kind);
-        digest.update(namespace.burst_id.as_bytes());
-        digest.update(namespace.source_manifest_digest);
-        digest.update(namespace.source_model_version_digest);
-        digest.update(major.to_le_bytes());
-        digest.update(secondary.to_le_bytes());
-        digest.update(row.to_le_bytes());
-        digest.update(column.to_le_bytes());
-        u64::from_le_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
+        covariance_identified_id(
+            kind,
+            &namespace.burst_id,
+            namespace.source_manifest_digest,
+            namespace.source_model_version_digest,
+            major,
+            secondary,
+            CovarianceOperatorGrid {
+                row_start: origin.0,
+                col_start: origin.1,
+                rows: u32::try_from(shape.0).expect("validated replay rows fit u32"),
+                cols: u32::try_from(shape.1).expect("validated replay columns fit u32"),
+                stride_y: 1,
+                stride_x: 1,
+            },
+            local,
+        )
+        .expect("validated replay ID coordinate")
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn build_covariance_operator_block(
     topology: &SequentialReplayTopology,
     request: &SequentialCovarianceCaptureRequest,
     ministack: MiniStack,
+    combined_source: ArrayView3<dolphin_core::Cf64>,
     linked_phase: ArrayView3<dolphin_core::Cf64>,
     phase_replay: &PhaseReplayGrid,
     compression_replay: &CompressionReplayGrid,
@@ -2288,6 +2924,8 @@ pub(crate) fn build_covariance_operator_block(
             "captured ministack has no replay topology block",
         ))?;
     if block.generation as usize != ministack.block_id
+        || combined_source.dim().0 != ministack.size()
+        || combined_source.dim().1 * combined_source.dim().2 != topology.native_area
         || linked_phase.dim().0 != ministack.size()
         || linked_phase.dim().1 * linked_phase.dim().2 != topology.output_area
         || phase_replay.branch_status.len() != topology.output_area
@@ -2331,8 +2969,34 @@ pub(crate) fn build_covariance_operator_block(
         ));
     }
 
-    let source_ids = (0..topology.native_area)
-        .map(|native| topology.source_id(block.id, native).map(SourceId::get))
+    let source_digest_bytes =
+        topology
+            .native_area
+            .checked_mul(32)
+            .ok_or(SequentialReplayError::Invalid(
+                "captured source digest dimensions overflow usize",
+            ))?;
+    let mut source_content_digests = Vec::with_capacity(source_digest_bytes);
+    for native in 0..topology.native_area {
+        let row = native / topology.native_shape.1;
+        let column = native % topology.native_shape.1;
+        let digest = primitive_source_content_digest(
+            (ministack.num_compressed..ministack.size())
+                .map(|component| combined_source[(component, row, column)]),
+        );
+        source_content_digests.extend_from_slice(&digest);
+    }
+    let source_ids = source_content_digests
+        .chunks_exact(32)
+        .enumerate()
+        .map(|(native, digest)| {
+            let content_digest: &[u8; 32] = digest.try_into().map_err(|_| {
+                SequentialReplayError::Invalid("captured source digest width is not SHA-256")
+            })?;
+            topology
+                .source_id_for_content_digest(block.id, native, content_digest)
+                .map(SourceId::get)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let compressed_node_ids = (0..topology.native_area)
         .map(|native| {
@@ -2365,7 +3029,9 @@ pub(crate) fn build_covariance_operator_block(
         .flat_map(|output| {
             let row = output / topology.output_shape.1;
             let column = output % topology.output_shape.1;
-            (0..ministack.size()).map(move |component| linked_phase[(component, row, column)].arg())
+            (0..ministack.size()).map(move |component| {
+                persisted_phase_angle(component, linked_phase[(component, row, column)])
+            })
         })
         .collect();
 
@@ -2379,6 +3045,8 @@ pub(crate) fn build_covariance_operator_block(
         .map_err(|_| SequentialReplayError::Invalid("captured Rect support count exceeds u32"))?;
     Ok(CovarianceOperatorBlock {
         burst_id: request.burst_id.clone(),
+        source_manifest_digest: request.source_manifest_digest,
+        source_model_version_digest: request.source_model_version_digest,
         block_id: block.id.get(),
         generation: block.generation,
         native_grid: request.native_grid,
@@ -2394,6 +3062,8 @@ pub(crate) fn build_covariance_operator_block(
         source_date_indices: source_date_indices.clone(),
         ordered_date_indices: source_date_indices,
         source_ids,
+        source_content_digests,
+        source_factor_digests: vec![0; source_digest_bytes],
         phase_node_ids,
         compressed_node_ids,
         carry_parent_ids: block
@@ -2544,6 +3214,67 @@ fn digest_matches(encoded: &str, digest: [u8; 32]) -> bool {
     encoded == expected || encoded.strip_prefix("sha256:") == Some(expected.as_str())
 }
 
+/// Digest of the versioned production replay kernel identity.
+#[must_use]
+pub fn sequential_replay_kernel_digest() -> [u8; 32] {
+    Sha256::digest(SEQUENTIAL_SOURCE_DAG_KERNEL_ID.as_bytes()).into()
+}
+
+/// Digest the ordered resolver and source-model identity used in source IDs.
+#[must_use]
+pub fn sequential_source_model_identity_digest(
+    provider: &str,
+    provider_version: &str,
+    model: &str,
+    model_version: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:sequential_source_model_identity:v1");
+    for value in [provider, provider_version, model, model_version] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// Digest of the normalized sequential producer configuration used by replay.
+#[must_use]
+pub fn sequential_replay_config_digest(cfg: &SequentialConfig) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:sequential_source_dag_config:v1");
+    for value in [
+        cfg.ministack_size,
+        cfg.max_num_compressed,
+        cfg.half_window.y,
+        cfg.half_window.x,
+        cfg.strides.y,
+        cfg.strides.x,
+        cfg.output_reference_idx,
+    ] {
+        digest.update((value as u64).to_le_bytes());
+    }
+    digest.update(cfg.beta.to_bits().to_le_bytes());
+    digest.update(cfg.zero_correlation_threshold.to_bits().to_le_bytes());
+    digest.update(cfg.shp_alpha.to_bits().to_le_bytes());
+    digest.update([
+        u8::from(cfg.use_evd),
+        u8::from(cfg.compute_crlb),
+        u8::from(cfg.compute_closure_phase),
+        u8::from(cfg.compute_average_coherence),
+        match cfg.compressed_slc_plan {
+            CompressedSlcPlan::AlwaysFirst => 0,
+            CompressedSlcPlan::FirstPerMinistack => 1,
+            CompressedSlcPlan::LastPerMinistack => 2,
+        },
+        match cfg.shp_method {
+            ShpMethod::Glrt => 0,
+            ShpMethod::Ks => 1,
+            ShpMethod::Rect => 2,
+        },
+    ]);
+    digest.finalize().into()
+}
+
 fn phase_status(status: FixedBranchStatus) -> CovarianceOperatorStatus {
     match status {
         FixedBranchStatus::Evd | FixedBranchStatus::Emi => CovarianceOperatorStatus::Valid,
@@ -2569,6 +3300,15 @@ fn compression_status(status: CompressionReplayStatus) -> CovarianceOperatorStat
     }
 }
 
+fn primitive_source_content_digest(samples: impl IntoIterator<Item = Cf64>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for sample in samples {
+        digest.update(sample.re.to_le_bytes());
+        digest.update(sample.im.to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
 fn pack_bits(bits: &[bool]) -> Vec<u8> {
     let mut packed = vec![0_u8; bits.len().div_ceil(8)];
     for (index, &value) in bits.iter().enumerate() {
@@ -2577,6 +3317,10 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
         }
     }
     packed
+}
+
+fn packed_bit_value(bits: &[u8], index: usize) -> bool {
+    bits[index / 8] & (1 << (index % 8)) != 0
 }
 
 fn assess_support(
@@ -2634,27 +3378,33 @@ fn record_block_id(
     native_shape: (usize, usize),
     output_shape: (usize, usize),
 ) -> u64 {
-    let mut digest = Sha256::new();
-    digest.update(SEQUENTIAL_SOURCE_DAG_METHOD.as_bytes());
-    digest.update(b"record_block");
-    digest.update(namespace.burst_id.as_bytes());
-    digest.update(namespace.source_manifest_digest);
-    digest.update(namespace.source_model_version_digest);
-    digest.update(namespace.native_origin.0.to_le_bytes());
-    digest.update(namespace.native_origin.1.to_le_bytes());
-    digest.update((native_shape.0 as u64).to_le_bytes());
-    digest.update((native_shape.1 as u64).to_le_bytes());
-    digest.update(namespace.output_origin.0.to_le_bytes());
-    digest.update(namespace.output_origin.1.to_le_bytes());
-    digest.update((output_shape.0 as u64).to_le_bytes());
-    digest.update((output_shape.1 as u64).to_le_bytes());
-    digest.update(namespace.owned_output_origin.0.to_le_bytes());
-    digest.update(namespace.owned_output_origin.1.to_le_bytes());
-    digest.update((namespace.owned_output_shape.0 as u64).to_le_bytes());
-    digest.update((namespace.owned_output_shape.1 as u64).to_le_bytes());
-    let tile_hash = u64::from_le_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
-        & ((1_u64 << 48) - 1);
-    (u64::from(generation) << 48) | tile_hash
+    let grid = |origin: (u64, u64), shape: (usize, usize), strides: (usize, usize)| {
+        CovarianceOperatorGrid {
+            row_start: origin.0,
+            col_start: origin.1,
+            rows: u32::try_from(shape.0).expect("validated replay rows fit u32"),
+            cols: u32::try_from(shape.1).expect("validated replay columns fit u32"),
+            stride_y: u32::try_from(strides.0).expect("validated replay row stride fits u32"),
+            stride_x: u32::try_from(strides.1).expect("validated replay column stride fits u32"),
+        }
+    };
+    let output_strides = (
+        native_shape.0 / output_shape.0,
+        native_shape.1 / output_shape.1,
+    );
+    covariance_record_block_id(
+        &namespace.burst_id,
+        namespace.source_manifest_digest,
+        namespace.source_model_version_digest,
+        generation,
+        grid(namespace.native_origin, native_shape, (1, 1)),
+        grid(namespace.output_origin, output_shape, output_strides),
+        grid(
+            namespace.owned_output_origin,
+            namespace.owned_output_shape,
+            output_strides,
+        ),
+    )
 }
 
 fn grid_contains(outer: CovarianceOperatorGrid, inner: CovarianceOperatorGrid) -> bool {
@@ -2692,4 +3442,30 @@ fn checked_mul(left: u64, right: u64) -> Result<u64, SequentialReplayError> {
         .ok_or(SequentialReplayError::Invalid(
             "dependency-cone byte estimate overflowed u64",
         ))
+}
+
+fn persisted_phase_angle(component: usize, phase: Cf64) -> f64 {
+    match component {
+        0 => 0.0,
+        _ => phase.arg(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_reference_phase_canonicalizes_floating_rotation_residue() {
+        let shifted = (1..100_000)
+            .find_map(|step| {
+                let source = Cf64::from_polar(1.234_567, step as f64 / 997.0);
+                let shifted = source * Cf64::from_polar(1.0, -source.arg());
+                (shifted.arg() != 0.0).then_some(shifted)
+            })
+            .expect("fixture scan must find a nonzero floating phase residue");
+        assert_ne!(shifted.arg(), 0.0);
+        assert_eq!(persisted_phase_angle(0, shifted), 0.0);
+        assert_eq!(persisted_phase_angle(1, shifted), shifted.arg());
+    }
 }

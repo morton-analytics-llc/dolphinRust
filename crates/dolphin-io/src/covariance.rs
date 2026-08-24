@@ -1,11 +1,15 @@
 //! Block-indexed HDF5 persistence for the sequential covariance replay operator.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hdf5::{Group, H5Type, LinkType};
 use ndarray::ArrayView2;
 use num_complex::Complex64;
+use sha2::{Digest, Sha256};
 
 use crate::{IoError, Result};
 
@@ -42,6 +46,7 @@ const COVARIANCE_SOURCE_MEMBERS: &[&str] = &[
     "provider_version",
     "model",
     "model_version",
+    "model_version_digest",
     "model_receipt_digest",
 ];
 const COVARIANCE_REGISTRY_MEMBERS: &[&str] = &[
@@ -84,9 +89,45 @@ const COVARIANCE_RECT_SUPPORT_ATTRIBUTES: &[&str] =
     &["half_window_rows", "half_window_cols", "ordering"];
 const BLOCK_NAME_BUDGET_BYTES: u64 = 64;
 const TOPOLOGY_WORKSPACE_MULTIPLIER: u64 = 8;
+const IDENTITY_RECORD_BYTES: u64 = 32;
+const SOURCE_IDENTITY_KIND: u8 = 0;
+const NODE_IDENTITY_KIND: u8 = 1;
+static IDENTITY_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Conservative peak temporary disk for a sorted-run identity index.
+///
+/// The bound holds the current unique runs plus one same-sized merge output.
+///
+/// # Errors
+/// Returns an error when the record projection exceeds `u64`.
+pub fn covariance_identity_index_peak_bytes(identity_records: u64) -> Result<u64> {
+    identity_records
+        .checked_mul(IDENTITY_RECORD_BYTES)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| invalid("covariance identity-index peak projection overflow"))
+}
+
+/// Digest the ordered resolver and source-model identity used by replay IDs.
+#[must_use]
+pub fn covariance_source_model_identity_digest(
+    provider: &str,
+    provider_version: &str,
+    model: &str,
+    model_version: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:sequential_source_model_identity:v1");
+    for value in [provider, provider_version, model, model_version] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.finalize().into()
+}
 
 const COVARIANCE_BLOCK_MEMBERS: &[&str] = &[
     "burst_id",
+    "source_manifest_digest",
+    "source_model_version_digest",
     "native_grid",
     "output_grid",
     "owned_output_grid",
@@ -94,6 +135,8 @@ const COVARIANCE_BLOCK_MEMBERS: &[&str] = &[
     "source_date_indices",
     "ordered_date_indices",
     "source_ids",
+    "source_content_digests",
+    "source_factor_digests",
     "phase_node_ids",
     "compressed_node_ids",
     "carry_parent_ids",
@@ -540,6 +583,8 @@ pub struct SourceReplayIdentity {
     pub model: Option<String>,
     /// Caller-supplied source model version.
     pub model_version: Option<String>,
+    /// Digest of the ordered provider/model names and versions used by replay IDs.
+    pub model_version_digest: Option<String>,
     /// Digest of the source-model receipt and ordered component identity.
     pub model_receipt_digest: Option<String>,
 }
@@ -552,6 +597,7 @@ impl SourceReplayIdentity {
             ("source.provider_version", &self.provider_version),
             ("source.model", &self.model),
             ("source.model_version", &self.model_version),
+            ("source.model_version_digest", &self.model_version_digest),
             ("source.model_receipt_digest", &self.model_receipt_digest),
         ] {
             if value.as_ref().is_some_and(|text| text.is_empty()) {
@@ -565,6 +611,7 @@ impl SourceReplayIdentity {
                 self.provider_version.as_ref(),
                 self.model.as_ref(),
                 self.model_version.as_ref(),
+                self.model_version_digest.as_ref(),
                 self.model_receipt_digest.as_ref(),
             ]
             .contains(&None)
@@ -576,6 +623,10 @@ impl SourceReplayIdentity {
         for (name, value) in [
             ("source manifest", self.manifest_digest.as_deref()),
             ("source model receipt", self.model_receipt_digest.as_deref()),
+            (
+                "source model version identity",
+                self.model_version_digest.as_deref(),
+            ),
         ] {
             if let Some(value) = value {
                 ensure_valid(
@@ -584,10 +635,45 @@ impl SourceReplayIdentity {
                         "source manifest" => {
                             "source manifest digest is not a strong SHA-256 digest"
                         }
-                        _ => "source model receipt digest is not a strong SHA-256 digest",
+                        "source model receipt" => {
+                            "source model receipt digest is not a strong SHA-256 digest"
+                        }
+                        _ => "source model version digest is not a strong SHA-256 digest",
                     },
                 )?;
             }
+        }
+        let identity = [
+            self.provider.as_deref(),
+            self.provider_version.as_deref(),
+            self.model.as_deref(),
+            self.model_version.as_deref(),
+        ];
+        let identity_count = identity.iter().filter(|value| value.is_some()).count();
+        ensure_valid(
+            identity_count == 0 || identity_count == identity.len(),
+            "source provider/model identity must be entirely present or absent",
+        )?;
+        if let [Some(provider), Some(provider_version), Some(model), Some(model_version)] = identity
+        {
+            let expected = covariance_source_model_identity_digest(
+                provider,
+                provider_version,
+                model,
+                model_version,
+            );
+            ensure_valid(
+                self.model_version_digest
+                    .as_deref()
+                    .and_then(sha256_digest_bytes)
+                    == Some(expected),
+                "source model version digest differs from provider/model identity",
+            )?;
+        } else {
+            ensure_valid(
+                self.model_version_digest.is_none(),
+                "source model version digest requires provider/model identity",
+            )?;
         }
         Ok(())
     }
@@ -707,6 +793,167 @@ impl CovarianceOperatorMetadata {
     }
 }
 
+/// Expected source-date generations for one burst in a complete operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovarianceBurstPlan {
+    /// Burst identity used by every planned block chain.
+    pub burst_id: String,
+    /// Ordered source-date indices for generation 0 through the final generation.
+    pub source_dates_by_generation: Vec<Vec<u32>>,
+    /// Exact row-major tile grids expected once for this burst.
+    pub tiles: Vec<CovarianceTilePlan>,
+}
+
+/// Exact native, replay-output, and owned-output grids for one tile chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovarianceTilePlan {
+    /// Full native read grid, including the sequential dependency halo.
+    pub native_grid: CovarianceOperatorGrid,
+    /// Full looked replay grid produced from the native read.
+    pub output_grid: CovarianceOperatorGrid,
+    /// Non-overlapping public output grid owned by this tile.
+    pub owned_output_grid: CovarianceOperatorGrid,
+}
+
+/// Complete burst and generation plan supplied before operator capture starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovarianceOperatorPlan {
+    /// Ordered source-manifest digest used by every captured block namespace.
+    pub source_manifest_digest: [u8; 32],
+    /// Provider/model identity digest used by every captured block namespace.
+    pub source_model_version_digest: [u8; 32],
+    /// Expected burst plans. Each burst must be written in one contiguous run.
+    pub bursts: Vec<CovarianceBurstPlan>,
+}
+
+impl CovarianceOperatorPlan {
+    fn validate(&self, metadata: &CovarianceOperatorMetadata) -> Result<()> {
+        ensure_valid(
+            self.source_manifest_digest.iter().any(|byte| *byte != 0)
+                && self
+                    .source_model_version_digest
+                    .iter()
+                    .any(|byte| *byte != 0),
+            "covariance operator plan requires strong source namespace digests",
+        )?;
+        ensure_valid(
+            metadata
+                .source
+                .manifest_digest
+                .as_deref()
+                .and_then(sha256_digest_bytes)
+                == Some(self.source_manifest_digest),
+            "covariance capture plan source manifest differs from metadata",
+        )?;
+        ensure_valid(
+            metadata
+                .source
+                .model_version_digest
+                .as_deref()
+                .and_then(sha256_digest_bytes)
+                == Some(self.source_model_version_digest),
+            "covariance capture plan source-model identity differs from metadata",
+        )?;
+        ensure_valid(
+            !self.bursts.is_empty(),
+            "covariance operator plan requires at least one burst",
+        )?;
+        ensure_valid(
+            self.bursts.len() == 1
+                || metadata.stitched_status == StitchedCovarianceStatus::UnsupportedSeamCovariance,
+            "multiple covariance burst plans require unsupported-seam stitched status",
+        )?;
+        let mut burst_ids = BTreeSet::new();
+        for burst in &self.bursts {
+            ensure_valid(
+                !burst.burst_id.is_empty() && burst_ids.insert(burst.burst_id.as_str()),
+                "covariance operator plan has an empty or repeated burst ID",
+            )?;
+            ensure_valid(
+                !burst.source_dates_by_generation.is_empty(),
+                "covariance burst plan requires at least one generation",
+            )?;
+            ensure_valid(
+                !burst.tiles.is_empty(),
+                "covariance burst plan requires at least one tile",
+            )?;
+            let mut expected_date = 0_u32;
+            for dates in &burst.source_dates_by_generation {
+                ensure_valid(
+                    consecutive(dates) && dates.first().copied() == Some(expected_date),
+                    "covariance burst plan dates are not one contiguous acquisition sequence",
+                )?;
+                expected_date = dates
+                    .last()
+                    .and_then(|date| date.checked_add(1))
+                    .ok_or_else(|| invalid("covariance burst plan date index overflow"))?;
+            }
+            let mut prior: Option<CovarianceTilePlan> = None;
+            let mut ownership_frontier = Vec::<CovarianceOperatorGrid>::new();
+            for tile in &burst.tiles {
+                tile.native_grid.area()?;
+                tile.output_grid.area()?;
+                tile.owned_output_grid.area()?;
+                ensure_valid(
+                    tile.output_grid.contains(tile.owned_output_grid),
+                    "covariance planned owned output grid is outside its replay grid",
+                )?;
+                if let Some(prior) = prior {
+                    ensure_valid(
+                        (
+                            tile.owned_output_grid.row_start,
+                            tile.owned_output_grid.col_start,
+                        ) > (
+                            prior.owned_output_grid.row_start,
+                            prior.owned_output_grid.col_start,
+                        ),
+                        "covariance burst tiles are not in strict row-major order",
+                    )?;
+                }
+                ownership_frontier.retain(|grid| {
+                    grid_stop(grid.row_start, grid.rows)
+                        .is_ok_and(|stop| stop > tile.owned_output_grid.row_start)
+                });
+                ensure_valid(
+                    ownership_frontier
+                        .iter()
+                        .all(|grid| !grids_overlap(*grid, tile.owned_output_grid)),
+                    "covariance planned owned output grids overlap",
+                )?;
+                ownership_frontier.push(tile.owned_output_grid);
+                prior = Some(*tile);
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_generations(&self) -> Result<BTreeMap<String, BTreeMap<u32, Vec<u32>>>> {
+        self.bursts
+            .iter()
+            .map(|burst| {
+                let generations = burst
+                    .source_dates_by_generation
+                    .iter()
+                    .enumerate()
+                    .map(|(generation, dates)| {
+                        u32::try_from(generation)
+                            .map(|generation| (generation, dates.clone()))
+                            .map_err(|_| invalid("covariance burst generation index exceeds u32"))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                Ok((burst.burst_id.clone(), generations))
+            })
+            .collect()
+    }
+
+    fn expected_tiles(&self) -> BTreeMap<String, Vec<CovarianceTilePlan>> {
+        self.bursts
+            .iter()
+            .map(|burst| (burst.burst_id.clone(), burst.tiles.clone()))
+            .collect()
+    }
+}
+
 /// Global origin, shape, and sampling stride of one operator grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CovarianceOperatorGrid {
@@ -758,11 +1005,122 @@ impl CovarianceOperatorGrid {
     }
 }
 
+/// Derive the stable block ID for one identified burst/tile generation.
+#[must_use]
+pub fn covariance_record_block_id(
+    burst_id: &str,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    generation: u32,
+    native_grid: CovarianceOperatorGrid,
+    output_grid: CovarianceOperatorGrid,
+    owned_output_grid: CovarianceOperatorGrid,
+) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(COVARIANCE_OPERATOR_METHOD.as_bytes());
+    digest.update(b"record_block");
+    digest.update(burst_id.as_bytes());
+    digest.update(source_manifest_digest);
+    digest.update(source_model_version_digest);
+    for value in [
+        native_grid.row_start,
+        native_grid.col_start,
+        u64::from(native_grid.rows),
+        u64::from(native_grid.cols),
+        output_grid.row_start,
+        output_grid.col_start,
+        u64::from(output_grid.rows),
+        u64::from(output_grid.cols),
+        owned_output_grid.row_start,
+        owned_output_grid.col_start,
+        u64::from(owned_output_grid.rows),
+        u64::from(owned_output_grid.cols),
+    ] {
+        digest.update(value.to_le_bytes());
+    }
+    let tile_hash = u64::from_le_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
+        & ((1_u64 << 48) - 1);
+    (u64::from(generation) << 48) | tile_hash
+}
+
+/// Derive one stable source/node locator in the replay namespace.
+///
+/// # Errors
+/// Returns an error when `local` is outside `grid` or its coordinate overflows.
+#[allow(clippy::too_many_arguments)]
+pub fn covariance_identified_id(
+    kind: &[u8],
+    burst_id: &str,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    major: u64,
+    secondary: u64,
+    grid: CovarianceOperatorGrid,
+    local: usize,
+) -> Result<u64> {
+    let area = grid.area()?;
+    ensure_valid(local < area, "covariance ID index is outside its grid")?;
+    let columns =
+        usize::try_from(grid.cols).map_err(|_| invalid("covariance grid columns exceed usize"))?;
+    let local_row =
+        u64::try_from(local / columns).map_err(|_| invalid("covariance ID row exceeds u64"))?;
+    let local_column =
+        u64::try_from(local % columns).map_err(|_| invalid("covariance ID column exceeds u64"))?;
+    let row = grid
+        .row_start
+        .checked_add(local_row)
+        .ok_or_else(|| invalid("covariance ID row overflows u64"))?;
+    let column = grid
+        .col_start
+        .checked_add(local_column)
+        .ok_or_else(|| invalid("covariance ID column overflows u64"))?;
+    let mut digest = Sha256::new();
+    digest.update(COVARIANCE_OPERATOR_METHOD.as_bytes());
+    digest.update(kind);
+    digest.update(burst_id.as_bytes());
+    digest.update(source_manifest_digest);
+    digest.update(source_model_version_digest);
+    digest.update(major.to_le_bytes());
+    digest.update(secondary.to_le_bytes());
+    digest.update(row.to_le_bytes());
+    digest.update(column.to_le_bytes());
+    Ok(u64::from_le_bytes(
+        digest.finalize()[..8].try_into().expect("SHA-256 prefix"),
+    ))
+}
+
+/// Bind a primitive-source locator to its exact raw-sample digest.
+///
+/// # Errors
+/// Returns an error for an all-zero content digest.
+pub fn covariance_content_bound_source_id(
+    locator_id: u64,
+    content_digest: &[u8; 32],
+) -> Result<u64> {
+    ensure_valid(
+        content_digest.iter().any(|byte| *byte != 0),
+        "covariance source content digest is all zero",
+    )?;
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:content_bound_source_id:v1");
+    digest.update(locator_id.to_le_bytes());
+    digest.update(content_digest);
+    Ok(u64::from_le_bytes(
+        digest.finalize()[..8]
+            .try_into()
+            .expect("SHA-256 prefix has eight bytes"),
+    ))
+}
+
 /// Persisted numeric state for one block of the implicit source-keyed replay DAG.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CovarianceOperatorBlock {
     /// Burst identity owning the block.
     pub burst_id: String,
+    /// Full ordered source-manifest digest used by the capture namespace.
+    pub source_manifest_digest: [u8; 32],
+    /// Full provider/model identity digest used by the capture namespace.
+    pub source_model_version_digest: [u8; 32],
     /// Deterministic block identifier.
     pub block_id: u64,
     /// Sequential generation/ministack number.
@@ -786,6 +1144,12 @@ pub struct CovarianceOperatorBlock {
     pub ordered_date_indices: Vec<u32>,
     /// Deterministic primitive-source IDs, one per native pixel.
     pub source_ids: Vec<u64>,
+    /// SHA-256 digest bytes for each ordered raw source vector, native-pixel
+    /// major. Exactly 32 bytes are stored per primitive source.
+    pub source_content_digests: Vec<u8>,
+    /// SHA-256 digest bytes for each exact proper-complex numeric factor,
+    /// native-pixel major. Replayable artifacts store 32 bytes per source.
+    pub source_factor_digests: Vec<u8>,
     /// Deterministic phase-node IDs, one per output pixel.
     pub phase_node_ids: Vec<u64>,
     /// Deterministic compressed-node IDs, one per native pixel.
@@ -823,8 +1187,17 @@ pub struct CovarianceOperatorBlock {
 }
 
 impl CovarianceOperatorBlock {
+    #[allow(clippy::too_many_lines)]
     fn validate(&self, gauge_date_index: u32) -> Result<()> {
         ensure_valid(!self.burst_id.is_empty(), "empty covariance burst_id")?;
+        ensure_valid(
+            self.source_manifest_digest.iter().any(|byte| *byte != 0)
+                && self
+                    .source_model_version_digest
+                    .iter()
+                    .any(|byte| *byte != 0),
+            "covariance block source namespace digest is missing",
+        )?;
         ensure_valid(!self.source_date_indices.is_empty(), "no source dates")?;
         ensure_valid(!self.ordered_date_indices.is_empty(), "no output dates")?;
         ensure_valid(
@@ -832,13 +1205,9 @@ impl CovarianceOperatorBlock {
             "gauge mismatch",
         )?;
         ensure_valid(
-            strictly_increasing(&self.source_date_indices)
-                && strictly_increasing(&self.ordered_date_indices),
-            "unordered covariance source/output dates",
-        )?;
-        ensure_valid(
-            self.source_date_indices == self.ordered_date_indices,
-            "source/output date maps differ",
+            consecutive(&self.source_date_indices)
+                && self.ordered_date_indices == self.source_date_indices,
+            "covariance source/output dates are not one contiguous ordered range",
         )?;
         ensure_valid(
             strictly_increasing(&self.carry_parent_ids)
@@ -888,6 +1257,26 @@ impl CovarianceOperatorBlock {
         ] {
             check_len(name, actual, native_area)?;
         }
+        check_len(
+            "source_content_digests",
+            self.source_content_digests.len(),
+            native_area
+                .checked_mul(32)
+                .ok_or_else(|| invalid("source digest dimensions overflow usize"))?,
+        )?;
+        check_len(
+            "source_factor_digests",
+            self.source_factor_digests.len(),
+            native_area
+                .checked_mul(32)
+                .ok_or_else(|| invalid("source factor digest dimensions overflow usize"))?,
+        )?;
+        ensure_valid(
+            self.source_content_digests
+                .chunks_exact(32)
+                .all(|digest| digest.iter().any(|byte| *byte != 0)),
+            "primitive source has an all-zero content digest",
+        )?;
         for (name, actual) in [
             ("phase_node_ids", self.phase_node_ids.len()),
             ("selected_eigenvalue", self.selected_eigenvalue.len()),
@@ -1134,6 +1523,8 @@ struct CovarianceBlockTopology {
     block_id: u64,
     generation: u32,
     burst_id: String,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
     native_grid: CovarianceOperatorGrid,
     output_grid: CovarianceOperatorGrid,
     owned_output_grid: CovarianceOperatorGrid,
@@ -1142,6 +1533,11 @@ struct CovarianceBlockTopology {
     source_date_indices: Vec<u32>,
     ordered_date_indices: Vec<u32>,
     source_ids: Vec<u64>,
+    source_content_digests: Vec<u8>,
+    source_factor_digests: Vec<u8>,
+    native_validity_bits: Vec<u8>,
+    estimator_branch: CovarianceEstimatorBranch,
+    branch_tolerance_bits: u64,
     phase_node_ids: Vec<u64>,
     compressed_node_ids: Vec<u64>,
     carry_parent_ids: Vec<u64>,
@@ -1154,6 +1550,8 @@ impl From<&CovarianceOperatorBlock> for CovarianceBlockTopology {
             block_id: block.block_id,
             generation: block.generation,
             burst_id: block.burst_id.clone(),
+            source_manifest_digest: block.source_manifest_digest,
+            source_model_version_digest: block.source_model_version_digest,
             native_grid: block.native_grid,
             output_grid: block.output_grid,
             owned_output_grid: block.owned_output_grid,
@@ -1162,6 +1560,11 @@ impl From<&CovarianceOperatorBlock> for CovarianceBlockTopology {
             source_date_indices: block.source_date_indices.clone(),
             ordered_date_indices: block.ordered_date_indices.clone(),
             source_ids: block.source_ids.clone(),
+            source_content_digests: block.source_content_digests.clone(),
+            source_factor_digests: block.source_factor_digests.clone(),
+            native_validity_bits: block.native_validity_bits.clone(),
+            estimator_branch: block.estimator_branch,
+            branch_tolerance_bits: block.branch_tolerance.to_bits(),
             phase_node_ids: block.phase_node_ids.clone(),
             compressed_node_ids: block.compressed_node_ids.clone(),
             carry_parent_ids: block.carry_parent_ids.clone(),
@@ -1170,10 +1573,147 @@ impl From<&CovarianceOperatorBlock> for CovarianceBlockTopology {
     }
 }
 
+fn validate_replayable_ids(block: &CovarianceBlockTopology) -> Result<()> {
+    ensure_valid(
+        block
+            .source_factor_digests
+            .chunks_exact(32)
+            .all(|digest| digest.iter().any(|byte| *byte != 0)),
+        "replayable covariance source has no numeric factor receipt",
+    )?;
+    let expected_block_id = covariance_record_block_id(
+        &block.burst_id,
+        block.source_manifest_digest,
+        block.source_model_version_digest,
+        block.generation,
+        block.native_grid,
+        block.output_grid,
+        block.owned_output_grid,
+    );
+    ensure_valid(
+        block.block_id == expected_block_id,
+        "replayable covariance block ID is not canonically derived",
+    )?;
+    let date_count = u64::try_from(block.source_date_indices.len())
+        .map_err(|_| invalid("covariance source date count exceeds u64"))?;
+    let first_date = block
+        .source_date_indices
+        .first()
+        .copied()
+        .ok_or_else(|| invalid("replayable covariance block has no source date"))?;
+    let source_secondary = (u64::from(first_date) << 32) | date_count;
+    for (native_index, (&actual, digest)) in block
+        .source_ids
+        .iter()
+        .zip(block.source_content_digests.chunks_exact(32))
+        .enumerate()
+    {
+        let digest: &[u8; 32] = digest
+            .try_into()
+            .map_err(|_| invalid("covariance source digest width changed"))?;
+        let locator = covariance_identified_id(
+            b"source",
+            &block.burst_id,
+            block.source_manifest_digest,
+            block.source_model_version_digest,
+            u64::from(block.generation),
+            source_secondary,
+            block.native_grid,
+            native_index,
+        )?;
+        let expected = covariance_content_bound_source_id(locator, digest)?;
+        ensure_valid(
+            actual == expected,
+            "replayable covariance source ID is not canonically derived",
+        )?;
+    }
+    for (output_index, &actual) in block.phase_node_ids.iter().enumerate() {
+        let expected = covariance_identified_id(
+            b"phase",
+            &block.burst_id,
+            block.source_manifest_digest,
+            block.source_model_version_digest,
+            block.block_id,
+            0,
+            block.output_grid,
+            output_index,
+        )?;
+        ensure_valid(
+            actual == expected,
+            "replayable covariance phase-node ID is not canonically derived",
+        )?;
+    }
+    for (native_index, &actual) in block.compressed_node_ids.iter().enumerate() {
+        let expected = covariance_identified_id(
+            b"compressed",
+            &block.burst_id,
+            block.source_manifest_digest,
+            block.source_model_version_digest,
+            block.block_id,
+            0,
+            block.native_grid,
+            native_index,
+        )?;
+        ensure_valid(
+            actual == expected,
+            "replayable covariance compressed-node ID is not canonically derived",
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CovarianceSourceLocation {
     block_id: u64,
     native_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CovarianceChainIndex {
+    burst_id: String,
+    native_grid: CovarianceOperatorGrid,
+    block_ids_by_generation: BTreeMap<u32, u64>,
+}
+
+impl CovarianceChainIndex {
+    fn from_state(state: &CovarianceTopologyState) -> Result<Self> {
+        let first = state
+            .blocks
+            .values()
+            .next()
+            .ok_or_else(|| invalid("covariance tile chain is empty"))?;
+        let mut block_ids_by_generation = BTreeMap::new();
+        for block in state.blocks.values() {
+            ensure_valid(
+                block.burst_id == first.burst_id && block.native_grid == first.native_grid,
+                "covariance tile chain changes burst or native grid",
+            )?;
+            ensure_valid(
+                block_ids_by_generation
+                    .insert(block.generation, block.block_id)
+                    .is_none(),
+                "covariance tile chain repeats a generation",
+            )?;
+        }
+        Ok(Self {
+            burst_id: first.burst_id.clone(),
+            native_grid: first.native_grid,
+            block_ids_by_generation,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CovarianceBurstInvariant {
+    output_stride: (u32, u32),
+    rect_support: CovarianceRectSupport,
+    estimator_branch: CovarianceEstimatorBranch,
+    branch_tolerance_bits: u64,
+    dates_by_generation: BTreeMap<u32, Vec<u32>>,
+    expected_tiles: Vec<CovarianceTilePlan>,
+    future_min_native_rows: Vec<u64>,
+    next_tile_index: usize,
+    last_owned_origin: (u64, u64),
 }
 
 #[derive(Debug, Default)]
@@ -1209,6 +1749,463 @@ impl CovarianceTopologyState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CovarianceIdentityRecord {
+    kind: u8,
+    id: u64,
+    fingerprint: [u8; 16],
+}
+
+impl CovarianceIdentityRecord {
+    const fn same_key(self, other: Self) -> bool {
+        self.kind == other.kind && self.id == other.id
+    }
+}
+
+#[derive(Debug)]
+struct CovarianceIdentityRun {
+    path: PathBuf,
+    record_count: u64,
+}
+
+impl CovarianceIdentityRun {
+    fn bytes(&self) -> Result<u64> {
+        self.record_count
+            .checked_mul(IDENTITY_RECORD_BYTES)
+            .ok_or_else(|| invalid("covariance identity-index byte count overflow"))
+    }
+}
+
+impl Drop for CovarianceIdentityRun {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct CovarianceIdentityRunReader {
+    reader: BufReader<File>,
+    remaining: u64,
+}
+
+impl CovarianceIdentityRunReader {
+    fn open(run: &CovarianceIdentityRun) -> Result<Self> {
+        let file =
+            File::open(&run.path).map_err(|error| identity_io("opening a sorted run", error))?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            remaining: run.record_count,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<CovarianceIdentityRecord>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut encoded = [0_u8; IDENTITY_RECORD_BYTES as usize];
+        self.reader
+            .read_exact(&mut encoded)
+            .map_err(|error| identity_io("reading a sorted run", error))?;
+        self.remaining -= 1;
+        let kind = encoded[0];
+        ensure_valid(
+            matches!(kind, SOURCE_IDENTITY_KIND | NODE_IDENTITY_KIND),
+            "covariance identity index contains an unknown kind",
+        )?;
+        ensure_valid(
+            encoded[1..8].iter().all(|byte| *byte == 0),
+            "covariance identity index contains nonzero reserved bytes",
+        )?;
+        let id = u64::from_le_bytes(
+            encoded[8..16]
+                .try_into()
+                .map_err(|_| invalid("covariance identity ID width changed"))?,
+        );
+        let fingerprint = encoded[16..32]
+            .try_into()
+            .map_err(|_| invalid("covariance identity fingerprint width changed"))?;
+        Ok(Some(CovarianceIdentityRecord {
+            kind,
+            id,
+            fingerprint,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct CovarianceIdentityIndex {
+    directory: PathBuf,
+    disk_cap_bytes: u64,
+    levels: Vec<Option<CovarianceIdentityRun>>,
+    current_disk_bytes: u64,
+    peak_disk_bytes: u64,
+    bytes_read: u64,
+    bytes_written: u64,
+    merge_count: u64,
+    peak_block_records: usize,
+}
+
+impl CovarianceIdentityIndex {
+    fn create(scratch_path: &Path, disk_cap_bytes: u64) -> Result<Self> {
+        ensure_valid(
+            disk_cap_bytes > 0,
+            "covariance identity-index disk cap must be positive",
+        )?;
+        let directory = identity_workspace_path(scratch_path)?;
+        std::fs::create_dir(&directory).map_err(|error| {
+            identity_io(
+                "creating the exclusive workspace; recover the exact incomplete scratch before retrying",
+                error,
+            )
+        })?;
+        Ok(Self {
+            directory,
+            disk_cap_bytes,
+            levels: Vec::new(),
+            current_disk_bytes: 0,
+            peak_disk_bytes: 0,
+            bytes_read: 0,
+            bytes_written: 0,
+            merge_count: 0,
+            peak_block_records: 0,
+        })
+    }
+
+    fn add_block(&mut self, block: &CovarianceBlockTopology) -> Result<()> {
+        let records = covariance_identity_records(block)?;
+        self.peak_block_records = self.peak_block_records.max(records.len());
+        let maximum_run_bytes = u64::try_from(records.len())
+            .ok()
+            .and_then(|count| count.checked_mul(IDENTITY_RECORD_BYTES))
+            .ok_or_else(|| invalid("covariance identity-index block byte count overflow"))?;
+        self.ensure_disk_room(maximum_run_bytes)?;
+        let run = write_identity_run(&self.directory, records)?;
+        let run_bytes = run.bytes()?;
+        self.add_written_run(run_bytes)?;
+        self.insert_run(run, 0)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let mut carry: Option<CovarianceIdentityRun> = None;
+        for level in 0..self.levels.len() {
+            let Some(run) = self.levels[level].take() else {
+                continue;
+            };
+            carry = Some(match carry.take() {
+                None => run,
+                Some(prior) => self.merge_runs(prior, run)?,
+            });
+        }
+        self.levels.clear();
+        if let Some(run) = carry {
+            self.levels.push(Some(run));
+        }
+        Ok(())
+    }
+
+    fn insert_run(&mut self, mut carry: CovarianceIdentityRun, mut level: usize) -> Result<()> {
+        loop {
+            if self.levels.len() <= level {
+                self.levels.resize_with(level + 1, || None);
+            }
+            let Some(prior) = self.levels[level].take() else {
+                self.levels[level] = Some(carry);
+                return Ok(());
+            };
+            carry = self.merge_runs(prior, carry)?;
+            level = level
+                .checked_add(1)
+                .ok_or_else(|| invalid("covariance identity-index level overflow"))?;
+        }
+    }
+
+    fn merge_runs(
+        &mut self,
+        left: CovarianceIdentityRun,
+        right: CovarianceIdentityRun,
+    ) -> Result<CovarianceIdentityRun> {
+        let left_bytes = left.bytes()?;
+        let right_bytes = right.bytes()?;
+        let maximum_merged_bytes = left_bytes
+            .checked_add(right_bytes)
+            .ok_or_else(|| invalid("covariance identity-index merge byte count overflow"))?;
+        self.ensure_disk_room(maximum_merged_bytes)?;
+        let merged = merge_identity_runs(&self.directory, &left, &right)?;
+        let merged_bytes = merged.bytes()?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(left_bytes)
+            .and_then(|bytes| bytes.checked_add(right_bytes))
+            .ok_or_else(|| invalid("covariance identity-index read count overflow"))?;
+        self.merge_count = self
+            .merge_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("covariance identity-index merge count overflow"))?;
+        self.add_written_run(merged_bytes)?;
+        self.current_disk_bytes = self
+            .current_disk_bytes
+            .checked_sub(left_bytes)
+            .and_then(|bytes| bytes.checked_sub(right_bytes))
+            .ok_or_else(|| invalid("covariance identity-index disk accounting underflow"))?;
+        drop(left);
+        drop(right);
+        Ok(merged)
+    }
+
+    fn add_written_run(&mut self, bytes: u64) -> Result<()> {
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("covariance identity-index write count overflow"))?;
+        self.current_disk_bytes = self
+            .current_disk_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("covariance identity-index disk count overflow"))?;
+        self.peak_disk_bytes = self.peak_disk_bytes.max(self.current_disk_bytes);
+        Ok(())
+    }
+
+    fn ensure_disk_room(&self, additional_bytes: u64) -> Result<()> {
+        let required = self
+            .current_disk_bytes
+            .checked_add(additional_bytes)
+            .ok_or_else(|| invalid("covariance identity-index disk count overflow"))?;
+        if required > self.disk_cap_bytes {
+            return Err(invalid(format!(
+                "covariance identity index requires {required} temporary bytes but its cap is {}",
+                self.disk_cap_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CovarianceIdentityIndex {
+    fn drop(&mut self) {
+        self.levels.clear();
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+fn covariance_identity_records(
+    block: &CovarianceBlockTopology,
+) -> Result<Vec<CovarianceIdentityRecord>> {
+    let count = block
+        .source_ids
+        .len()
+        .checked_add(block.phase_node_ids.len())
+        .and_then(|count| count.checked_add(block.compressed_node_ids.len()))
+        .ok_or_else(|| invalid("covariance block identity count overflow"))?;
+    let mut records = Vec::with_capacity(count);
+    for (native_index, &id) in block.source_ids.iter().enumerate() {
+        records.push(CovarianceIdentityRecord {
+            kind: SOURCE_IDENTITY_KIND,
+            id,
+            fingerprint: source_identity_fingerprint(block, native_index),
+        });
+    }
+    records.extend(
+        block
+            .phase_node_ids
+            .iter()
+            .chain(block.compressed_node_ids.iter())
+            .map(|&id| CovarianceIdentityRecord {
+                kind: NODE_IDENTITY_KIND,
+                id,
+                fingerprint: [0; 16],
+            }),
+    );
+    Ok(records)
+}
+
+fn source_identity_fingerprint(block: &CovarianceBlockTopology, native_index: usize) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:covariance_source_identity:v2");
+    digest.update((block.burst_id.len() as u64).to_le_bytes());
+    digest.update(block.burst_id.as_bytes());
+    digest.update(block.generation.to_le_bytes());
+    digest.update((block.source_date_indices.len() as u64).to_le_bytes());
+    for date in &block.source_date_indices {
+        digest.update(date.to_le_bytes());
+    }
+    let (row, column) = native_coordinate(block.native_grid, native_index);
+    digest.update(row.to_le_bytes());
+    digest.update(column.to_le_bytes());
+    digest.update(source_digest(block, native_index));
+    digest.update(source_factor_digest(block, native_index));
+    digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 has at least 16 bytes")
+}
+
+fn write_identity_run(
+    directory: &Path,
+    mut records: Vec<CovarianceIdentityRecord>,
+) -> Result<CovarianceIdentityRun> {
+    records.sort_unstable();
+    let (path, file) = create_identity_run_file(directory)?;
+    let mut run = CovarianceIdentityRun {
+        path,
+        record_count: 0,
+    };
+    let mut writer = BufWriter::new(file);
+    let mut prior = None;
+    for record in records {
+        if prior.is_some_and(|value: CovarianceIdentityRecord| value.same_key(record)) {
+            identity_duplicate_allowed(prior.expect("prior identity exists"), record)?;
+            continue;
+        }
+        write_identity_record(&mut writer, record)?;
+        run.record_count = run
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("covariance identity-index record count overflow"))?;
+        prior = Some(record);
+    }
+    writer
+        .flush()
+        .map_err(|error| identity_io("flushing a sorted run", error))?;
+    Ok(run)
+}
+
+fn merge_identity_runs(
+    directory: &Path,
+    left: &CovarianceIdentityRun,
+    right: &CovarianceIdentityRun,
+) -> Result<CovarianceIdentityRun> {
+    let mut left_reader = CovarianceIdentityRunReader::open(left)?;
+    let mut right_reader = CovarianceIdentityRunReader::open(right)?;
+    let (path, file) = create_identity_run_file(directory)?;
+    let mut run = CovarianceIdentityRun {
+        path,
+        record_count: 0,
+    };
+    let mut writer = BufWriter::new(file);
+    let mut left_record = left_reader.next()?;
+    let mut right_record = right_reader.next()?;
+    while left_record.is_some() || right_record.is_some() {
+        let (record, advance_left, advance_right) = match (left_record, right_record) {
+            (Some(left), Some(right)) if left.same_key(right) => {
+                identity_duplicate_allowed(left, right)?;
+                (left, true, true)
+            }
+            (Some(left), Some(right)) if left < right => (left, true, false),
+            (Some(_), Some(right)) => (right, false, true),
+            (Some(left), None) => (left, true, false),
+            (None, Some(right)) => (right, false, true),
+            (None, None) => break,
+        };
+        write_identity_record(&mut writer, record)?;
+        run.record_count = run
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("covariance identity-index record count overflow"))?;
+        if advance_left {
+            left_record = left_reader.next()?;
+        }
+        if advance_right {
+            right_record = right_reader.next()?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| identity_io("flushing a merged run", error))?;
+    Ok(run)
+}
+
+fn identity_duplicate_allowed(
+    left: CovarianceIdentityRecord,
+    right: CovarianceIdentityRecord,
+) -> Result<()> {
+    if left.kind == SOURCE_IDENTITY_KIND && left.fingerprint == right.fingerprint {
+        return Ok(());
+    }
+    let message = match left.kind {
+        SOURCE_IDENTITY_KIND => "one covariance source ID identifies different primitive sources",
+        _ => "covariance phase/compressed node ID is not globally unique",
+    };
+    Err(invalid(message))
+}
+
+fn write_identity_record(
+    writer: &mut BufWriter<File>,
+    record: CovarianceIdentityRecord,
+) -> Result<()> {
+    let mut encoded = [0_u8; IDENTITY_RECORD_BYTES as usize];
+    encoded[0] = record.kind;
+    encoded[8..16].copy_from_slice(&record.id.to_le_bytes());
+    encoded[16..32].copy_from_slice(&record.fingerprint);
+    writer
+        .write_all(&encoded)
+        .map_err(|error| identity_io("writing a sorted run", error))
+}
+
+fn create_identity_run_file(directory: &Path) -> Result<(PathBuf, File)> {
+    for _ in 0..1024 {
+        let nonce = IDENTITY_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("{nonce:016x}.run"));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(identity_io("creating a sorted run", error)),
+        }
+    }
+    Err(invalid(
+        "covariance identity index exhausted temporary run names",
+    ))
+}
+
+fn identity_workspace_path(scratch_path: &Path) -> Result<PathBuf> {
+    let file_name = scratch_path
+        .file_name()
+        .ok_or_else(|| invalid("covariance scratch path has no file name"))?;
+    let mut workspace_name = file_name.to_os_string();
+    workspace_name.push(".identity-index");
+    Ok(scratch_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(workspace_name))
+}
+
+/// Remove one explicitly named incomplete scratch artifact and its identity workspace.
+///
+/// The path must end in `.scratch`; committed operator paths are rejected.
+///
+/// # Errors
+/// Returns an error for a non-scratch path or a filesystem cleanup failure.
+pub fn recover_incomplete_covariance_operator(scratch_path: impl AsRef<Path>) -> Result<()> {
+    let scratch_path = scratch_path.as_ref();
+    let name = scratch_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("covariance scratch path has no UTF-8 file name"))?;
+    ensure_valid(
+        name.ends_with(".scratch"),
+        "covariance recovery refuses a path that does not end in .scratch",
+    )?;
+    let workspace = identity_workspace_path(scratch_path)?;
+    match std::fs::remove_dir_all(&workspace) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(identity_io("removing the identity workspace", error)),
+    }
+    match std::fs::remove_file(scratch_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(identity_io("removing the incomplete HDF5 scratch", error)),
+    }
+}
+
+fn identity_io(operation: &str, error: std::io::Error) -> IoError {
+    invalid(format!(
+        "covariance identity index failed while {operation}: {error}"
+    ))
+}
+
 /// A checked covariance replay artifact loaded from HDF5.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CovarianceOperatorArtifact {
@@ -1223,13 +2220,76 @@ pub struct CovarianceOperatorArtifact {
 pub struct CovarianceOperatorWriter {
     file: hdf5::File,
     metadata: CovarianceOperatorMetadata,
-    topology: CovarianceTopologyState,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    expected_generations: BTreeMap<String, BTreeMap<u32, Vec<u32>>>,
+    expected_tiles: BTreeMap<String, Vec<CovarianceTilePlan>>,
+    identity_index: CovarianceIdentityIndex,
+    poisoned: bool,
+    current_chain: CovarianceTopologyState,
+    overlap_frontier: Vec<CovarianceChainIndex>,
+    active_overlap_chains: Vec<CovarianceChainIndex>,
+    burst_invariants: BTreeMap<String, CovarianceBurstInvariant>,
+    active_burst: Option<String>,
+    block_count: u64,
+    overlap_topology_reads: u64,
+    overlap_topology_bytes: u64,
+    peak_retained_topology_blocks: usize,
+    peak_frontier_chains: usize,
+}
+
+/// Resource receipt returned after an operator scratch file is sealed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovarianceOperatorWriteReceipt {
+    /// Exact cap required by the header-only metadata validation pass.
+    pub metadata_validation_bytes: u64,
+    /// Prior overlap blocks streamed from HDF5 during cross-tile validation.
+    pub overlap_topology_reads: u64,
+    /// Logical topology bytes streamed for those overlap checks.
+    pub overlap_topology_bytes: u64,
+    /// Maximum full topology blocks retained in memory by the active tile chain.
+    pub peak_retained_topology_blocks: usize,
+    /// Maximum lightweight tile descriptors retained in the spatial frontier.
+    pub peak_frontier_chains: usize,
+    /// Sorted-run identity-index bytes read while enforcing global uniqueness.
+    pub identity_index_bytes_read: u64,
+    /// Sorted-run identity-index bytes written while enforcing global uniqueness.
+    pub identity_index_bytes_written: u64,
+    /// Maximum temporary disk occupied by the bounded identity index.
+    pub peak_identity_index_disk_bytes: u64,
+    /// Maximum source plus node identity records allocated for one block.
+    pub peak_identity_block_records: usize,
+    /// Number of bounded sorted-run merges performed by the identity index.
+    pub identity_index_merges: u64,
+    /// Fail-closed cap applied to the temporary disk-backed identity index.
+    pub identity_index_disk_cap_bytes: u64,
+    /// HDF5 byte count sealed after the complete marker was flushed.
+    pub sealed_hdf5_bytes: u64,
+    /// Lowercase SHA-256 digest sealed after the complete marker was flushed.
+    pub sealed_hdf5_sha256: String,
 }
 
 impl CovarianceOperatorWriter {
     /// Create an incomplete scratch artifact and persist its checked registries.
-    pub fn create(path: impl AsRef<Path>, metadata: &CovarianceOperatorMetadata) -> Result<Self> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        metadata: &CovarianceOperatorMetadata,
+        plan: &CovarianceOperatorPlan,
+    ) -> Result<Self> {
+        Self::create_with_identity_index_disk_cap(path, metadata, plan, u64::MAX)
+    }
+
+    /// Create a scratch artifact with an explicit temporary identity-index disk cap.
+    pub fn create_with_identity_index_disk_cap(
+        path: impl AsRef<Path>,
+        metadata: &CovarianceOperatorMetadata,
+        plan: &CovarianceOperatorPlan,
+        identity_index_disk_cap_bytes: u64,
+    ) -> Result<Self> {
         metadata.validate()?;
+        plan.validate(metadata)?;
+        let path = path.as_ref();
+        let identity_index = CovarianceIdentityIndex::create(path, identity_index_disk_cap_bytes)?;
         let file = hdf5::File::create(path)?;
         write_metadata(&file, metadata)?;
         write_registries(&file)?;
@@ -1239,16 +2299,41 @@ impl CovarianceOperatorWriter {
         Ok(Self {
             file,
             metadata: metadata.clone(),
-            topology: CovarianceTopologyState::default(),
+            source_manifest_digest: plan.source_manifest_digest,
+            source_model_version_digest: plan.source_model_version_digest,
+            expected_generations: plan.expected_generations()?,
+            expected_tiles: plan.expected_tiles(),
+            identity_index,
+            poisoned: false,
+            current_chain: CovarianceTopologyState::default(),
+            overlap_frontier: Vec::new(),
+            active_overlap_chains: Vec::new(),
+            burst_invariants: BTreeMap::new(),
+            active_burst: None,
+            block_count: 0,
+            overlap_topology_reads: 0,
+            overlap_topology_bytes: 0,
+            peak_retained_topology_blocks: 0,
+            peak_frontier_chains: 0,
         })
     }
 
     /// Append one validated block without constructing expanded incidence tensors.
     pub fn write_block(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
+        ensure_valid(
+            !self.poisoned,
+            "covariance operator writer is poisoned by an earlier rejected block",
+        )?;
+        let result = self.write_block_inner(block);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn write_block_inner(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
         block.validate(self.metadata.gauge_date_index)?;
         let topology = CovarianceBlockTopology::from(block);
-        self.topology
-            .validate(&topology, self.metadata.stitched_status)?;
         let group_name = format!("blocks/{:020}", block.block_id);
         if self.file.link_exists(&group_name) {
             return Err(invalid(format!(
@@ -1256,15 +2341,271 @@ impl CovarianceOperatorWriter {
                 block.block_id
             )));
         }
+        if topology.generation == 0 {
+            self.begin_tile_chain(&topology)?;
+        }
+        ensure_valid(
+            topology.source_manifest_digest == self.source_manifest_digest
+                && topology.source_model_version_digest == self.source_model_version_digest,
+            "covariance block source namespace differs from the capture plan",
+        )?;
+        ensure_valid(
+            self.current_chain
+                .blocks
+                .values()
+                .all(|prior| prior.generation != topology.generation),
+            "covariance tile chain repeats a generation",
+        )?;
+        self.validate_burst_invariant(&topology)?;
+        self.current_chain
+            .validate(&topology, self.metadata.stitched_status)?;
+        self.validate_active_overlaps(&topology)?;
+        if self.metadata.replay_status == CovarianceReplayStatus::Replayable {
+            validate_replayable_ids(&topology)?;
+        }
+        self.identity_index.add_block(&topology)?;
         let group = self.file.create_group(&group_name)?;
         write_block(&group, block)?;
+        inspect_block_layout(&group)?;
         self.file.flush()?;
-        self.topology.insert(topology);
+        self.current_chain.insert(topology);
+        self.peak_retained_topology_blocks = self
+            .peak_retained_topology_blocks
+            .max(self.current_chain.blocks.len());
+        self.block_count = self
+            .block_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("covariance operator block count overflow"))?;
         Ok(())
     }
 
-    /// Mark the artifact complete and flush all block data.
-    pub fn finish(self) -> Result<()> {
+    fn begin_tile_chain(&mut self, topology: &CovarianceBlockTopology) -> Result<()> {
+        if !self.current_chain.blocks.is_empty() {
+            self.validate_current_chain_complete()?;
+            self.overlap_frontier
+                .push(CovarianceChainIndex::from_state(&self.current_chain)?);
+            self.current_chain = CovarianceTopologyState::default();
+        }
+        if self.active_burst.as_deref() != Some(topology.burst_id.as_str()) {
+            ensure_valid(
+                !self.burst_invariants.contains_key(&topology.burst_id),
+                "covariance burst tile chains are not contiguous",
+            )?;
+            self.overlap_frontier.clear();
+            self.active_burst = Some(topology.burst_id.clone());
+        }
+        let future_min_native_row = match self.burst_invariants.get(&topology.burst_id) {
+            Some(invariant) => invariant
+                .future_min_native_rows
+                .get(invariant.next_tile_index)
+                .copied(),
+            None => self
+                .expected_tiles
+                .get(&topology.burst_id)
+                .and_then(|tiles| future_min_native_rows(tiles).first().copied()),
+        }
+        .ok_or_else(|| invalid("covariance operator writes an unplanned tile chain"))?;
+        self.overlap_frontier.retain(|chain| {
+            chain.burst_id == topology.burst_id
+                && grid_stop(chain.native_grid.row_start, chain.native_grid.rows)
+                    .is_ok_and(|stop| stop > future_min_native_row)
+        });
+        self.active_overlap_chains = self
+            .overlap_frontier
+            .iter()
+            .filter(|chain| grids_overlap(chain.native_grid, topology.native_grid))
+            .cloned()
+            .collect();
+        self.peak_frontier_chains = self.peak_frontier_chains.max(self.overlap_frontier.len());
+        Ok(())
+    }
+
+    fn validate_burst_invariant(&mut self, topology: &CovarianceBlockTopology) -> Result<()> {
+        if !self.burst_invariants.contains_key(&topology.burst_id) {
+            let dates_by_generation = self
+                .expected_generations
+                .get(&topology.burst_id)
+                .ok_or_else(|| invalid("covariance block burst is absent from the capture plan"))?
+                .clone();
+            let expected_tiles = self
+                .expected_tiles
+                .get(&topology.burst_id)
+                .ok_or_else(|| invalid("covariance block burst is absent from the tile plan"))?
+                .clone();
+            let future_min_native_rows = future_min_native_rows(&expected_tiles);
+            ensure_valid(
+                self.burst_invariants.is_empty()
+                    || self.metadata.stitched_status
+                        == StitchedCovarianceStatus::UnsupportedSeamCovariance,
+                "multiple covariance bursts require unsupported-seam stitched status",
+            )?;
+            self.burst_invariants.insert(
+                topology.burst_id.clone(),
+                CovarianceBurstInvariant {
+                    output_stride: (topology.output_grid.stride_y, topology.output_grid.stride_x),
+                    rect_support: topology.rect_support,
+                    estimator_branch: topology.estimator_branch,
+                    branch_tolerance_bits: topology.branch_tolerance_bits,
+                    dates_by_generation,
+                    expected_tiles,
+                    future_min_native_rows,
+                    next_tile_index: 0,
+                    last_owned_origin: (
+                        topology.owned_output_grid.row_start,
+                        topology.owned_output_grid.col_start,
+                    ),
+                },
+            );
+        }
+        let invariant = self
+            .burst_invariants
+            .get_mut(&topology.burst_id)
+            .ok_or_else(|| invalid("covariance burst invariant is missing"))?;
+        ensure_valid(
+            invariant.output_stride
+                == (topology.output_grid.stride_y, topology.output_grid.stride_x)
+                && invariant.rect_support == topology.rect_support
+                && invariant.estimator_branch == topology.estimator_branch
+                && invariant.branch_tolerance_bits == topology.branch_tolerance_bits,
+            "covariance records in one burst differ in geometry, estimator branch, or tolerance",
+        )?;
+        if topology.generation == 0 {
+            let owned_origin = (
+                topology.owned_output_grid.row_start,
+                topology.owned_output_grid.col_start,
+            );
+            if invariant.next_tile_index > 0 {
+                ensure_valid(
+                    owned_origin > invariant.last_owned_origin,
+                    "covariance tile chains are not written in strict row-major order",
+                )?;
+            }
+            let planned_tile = invariant
+                .expected_tiles
+                .get(invariant.next_tile_index)
+                .ok_or_else(|| invalid("covariance operator writes an unplanned tile chain"))?;
+            ensure_valid(
+                planned_tile.native_grid == topology.native_grid
+                    && planned_tile.output_grid == topology.output_grid
+                    && planned_tile.owned_output_grid == topology.owned_output_grid,
+                "covariance tile grids differ from the capture plan",
+            )?;
+            invariant.next_tile_index = invariant
+                .next_tile_index
+                .checked_add(1)
+                .ok_or_else(|| invalid("covariance tile-plan index overflow"))?;
+            invariant.last_owned_origin = owned_origin;
+        }
+        match invariant.dates_by_generation.get(&topology.generation) {
+            Some(dates) => ensure_valid(
+                dates == &topology.source_date_indices,
+                "covariance tiles in one generation date map differ",
+            ),
+            None => Err(invalid(
+                "covariance block generation is absent from the capture plan",
+            )),
+        }
+    }
+
+    fn validate_current_chain_complete(&self) -> Result<()> {
+        let Some(first) = self.current_chain.blocks.values().next() else {
+            return Ok(());
+        };
+        let expected = self
+            .burst_invariants
+            .get(&first.burst_id)
+            .ok_or_else(|| invalid("covariance burst invariant is missing"))?;
+        let actual = self
+            .current_chain
+            .blocks
+            .values()
+            .map(|block| block.generation)
+            .collect::<BTreeSet<_>>();
+        let planned = expected
+            .dates_by_generation
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        ensure_valid(
+            actual == planned && self.current_chain.blocks.len() == planned.len(),
+            "covariance tile chain omits a planned generation",
+        )
+    }
+
+    fn validate_active_overlaps(&mut self, topology: &CovarianceBlockTopology) -> Result<()> {
+        let block_ids = self
+            .active_overlap_chains
+            .iter()
+            .map(|chain| {
+                chain
+                    .block_ids_by_generation
+                    .get(&topology.generation)
+                    .copied()
+                    .ok_or_else(|| invalid("overlapping covariance tile omits a generation"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for block_id in block_ids {
+            let name = format!("blocks/{block_id:020}");
+            let group = self.file.group(&name)?;
+            let topology_bytes = inspect_topology_layout(&group)?;
+            let prior = read_topology_header(&group)?;
+            validate_topology_header(
+                &prior,
+                self.metadata.gauge_date_index,
+                usize::try_from(self.block_count)
+                    .map_err(|_| invalid("covariance operator block count exceeds usize"))?,
+            )?;
+            let mut state = CovarianceTopologyState::default();
+            state.insert(prior);
+            validate_cross_record_topology(topology, &state, self.metadata.stitched_status)?;
+            self.overlap_topology_reads = self
+                .overlap_topology_reads
+                .checked_add(1)
+                .ok_or_else(|| invalid("covariance overlap topology-read count overflow"))?;
+            self.overlap_topology_bytes =
+                self.overlap_topology_bytes
+                    .checked_add(topology_bytes)
+                    .ok_or_else(|| invalid("covariance overlap topology byte count overflow"))?;
+        }
+        Ok(())
+    }
+
+    /// Number of topology blocks retained for rolling validation.
+    ///
+    /// The writer keeps only the current spatial tile chain. Cross-tile checks
+    /// read only prior blocks whose native grids overlap the current tile.
+    #[must_use]
+    pub fn retained_topology_block_count(&self) -> usize {
+        self.current_chain.blocks.len()
+    }
+
+    /// Mark the artifact complete, flush all block data, and return the exact
+    /// header-allocation cap and the sealed HDF5 byte receipt.
+    pub fn finish(mut self) -> Result<CovarianceOperatorWriteReceipt> {
+        ensure_valid(
+            !self.poisoned,
+            "covariance operator writer is poisoned by an earlier rejected block",
+        )?;
+        ensure_valid(
+            self.block_count > 0,
+            "covariance operator requires at least one block",
+        )?;
+        self.validate_current_chain_complete()?;
+        ensure_valid(
+            self.burst_invariants.len() == self.expected_generations.len()
+                && self
+                    .expected_generations
+                    .keys()
+                    .all(|burst| self.burst_invariants.contains_key(burst)),
+            "covariance operator omits a planned burst",
+        )?;
+        ensure_valid(
+            self.burst_invariants
+                .values()
+                .all(|invariant| invariant.next_tile_index == invariant.expected_tiles.len()),
+            "covariance operator omits a planned tile chain",
+        )?;
+        self.identity_index.finish()?;
         validate_root_schema(&self.file)?;
         inspect_metadata_layout(&self.file)?;
         validate_registries(&self.file)?;
@@ -1272,29 +2613,56 @@ impl CovarianceOperatorWriter {
             read_metadata(&self.file)? == self.metadata,
             "covariance operator metadata changed before finalization",
         )?;
-        let names = block_names(&self.file)?;
+        let blocks = self.file.group("blocks")?;
         ensure_valid(
-            !names.is_empty(),
-            "covariance operator requires at least one block",
-        )?;
-        let expected_names = self
-            .topology
-            .blocks
-            .keys()
-            .map(|block_id| format!("{block_id:020}"))
-            .collect::<Vec<_>>();
-        ensure_valid(
-            names == expected_names,
+            blocks.len() == self.block_count,
             "covariance operator block index changed before finalization",
         )?;
-        for name in &names {
-            inspect_block_layout(&self.file.group(&format!("blocks/{name}"))?)?;
-        }
-        validate_topology_headers(&self.file, &names, &self.metadata)?;
+        drop(blocks);
+        let metadata_validation_bytes = inspect_metadata_layout(&self.file)?;
         self.file.attr("complete")?.write_scalar(&1u8)?;
         self.file.flush()?;
-        Ok(())
+        let filename = self.file.filename();
+        self.file.close()?;
+        let (sealed_hdf5_sha256, sealed_hdf5_bytes) = sha256_path(Path::new(&filename))?;
+        Ok(CovarianceOperatorWriteReceipt {
+            metadata_validation_bytes,
+            overlap_topology_reads: self.overlap_topology_reads,
+            overlap_topology_bytes: self.overlap_topology_bytes,
+            peak_retained_topology_blocks: self.peak_retained_topology_blocks,
+            peak_frontier_chains: self.peak_frontier_chains,
+            identity_index_bytes_read: self.identity_index.bytes_read,
+            identity_index_bytes_written: self.identity_index.bytes_written,
+            peak_identity_index_disk_bytes: self.identity_index.peak_disk_bytes,
+            peak_identity_block_records: self.identity_index.peak_block_records,
+            identity_index_merges: self.identity_index.merge_count,
+            identity_index_disk_cap_bytes: self.identity_index.disk_cap_bytes,
+            sealed_hdf5_bytes,
+            sealed_hdf5_sha256,
+        })
     }
+}
+
+fn sha256_path(path: &Path) -> Result<(String, u64)> {
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|error| identity_io("opening the sealed HDF5", error))?,
+    );
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut byte_count = 0_u64;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| identity_io("hashing the sealed HDF5", error))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        byte_count = byte_count
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("covariance HDF5 byte count overflow"))?;
+    }
+    Ok((format!("{:x}", digest.finalize()), byte_count))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1358,6 +2726,99 @@ pub fn read_covariance_operator_metadata_with_byte_cap(
     Ok(metadata)
 }
 
+/// Read and validate only the committed operator header under an allocation cap.
+///
+/// This streams the block-link names to reject noncanonical or non-hard links,
+/// but does not retain those names or load block topology. Production replay
+/// validates each selected block against the caller's planned topology.
+pub fn read_covariance_operator_header_with_byte_cap(
+    path: impl AsRef<Path>,
+    byte_cap: u64,
+) -> Result<CovarianceOperatorMetadata> {
+    let file = hdf5::File::open(path)?;
+    let mut budget = ReadBudget::new(byte_cap);
+    let metadata = read_checked_metadata(&file, &mut budget)?;
+    let blocks = file.group("blocks")?;
+    validate_exact_schema(
+        &blocks,
+        None,
+        &[],
+        "covariance blocks schema contains unexpected attributes",
+    )?;
+    ensure_valid(
+        !blocks.is_empty(),
+        "covariance operator requires at least one block",
+    )?;
+    validate_block_links_streaming(&blocks)?;
+    Ok(metadata)
+}
+
+/// One validated block plus the logical bytes retained in its cache payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovarianceOperatorBlockRead {
+    /// Validated persisted replay block.
+    pub block: CovarianceOperatorBlock,
+    /// Sum of selected-block dataset payload bytes inspected before allocation.
+    pub logical_payload_bytes: u64,
+}
+
+/// Reusable reader whose block-link index is validated once at open.
+#[derive(Debug)]
+pub struct CovarianceOperatorBlockReader {
+    file: hdf5::File,
+    metadata: CovarianceOperatorMetadata,
+}
+
+impl CovarianceOperatorBlockReader {
+    /// Open an operator and validate its header plus every block link once.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metadata, a missing block set, non-hard or
+    /// noncanonical block links, or a metadata allocation above `byte_cap`.
+    pub fn open(path: impl AsRef<Path>, byte_cap: u64) -> Result<Self> {
+        let file = hdf5::File::open(path)?;
+        let mut budget = ReadBudget::new(byte_cap);
+        let metadata = read_checked_metadata(&file, &mut budget)?;
+        let blocks = file.group("blocks")?;
+        validate_exact_schema(
+            &blocks,
+            None,
+            &[],
+            "covariance blocks schema contains unexpected attributes",
+        )?;
+        ensure_valid(
+            !blocks.is_empty(),
+            "covariance operator requires at least one block",
+        )?;
+        validate_block_links_streaming(&blocks)?;
+        Ok(Self { file, metadata })
+    }
+
+    /// Checked operator metadata loaded at open.
+    #[must_use]
+    pub const fn metadata(&self) -> &CovarianceOperatorMetadata {
+        &self.metadata
+    }
+
+    /// Read one block without rescanning the already validated block-link set.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/malformed block or allocation above `byte_cap`.
+    pub fn read_block_with_receipt(
+        &self,
+        block_id: u64,
+        byte_cap: u64,
+    ) -> Result<CovarianceOperatorBlockRead> {
+        read_covariance_operator_block_from_file(
+            &self.file,
+            &self.metadata,
+            block_id,
+            byte_cap,
+            false,
+        )
+    }
+}
+
 /// Read and validate one block after rejecting payloads above `byte_cap`.
 ///
 /// Dataset types, ranks, shapes, and element counts are checked before any
@@ -1367,39 +2828,72 @@ pub fn read_covariance_operator_block(
     block_id: u64,
     byte_cap: u64,
 ) -> Result<CovarianceOperatorBlock> {
+    Ok(read_covariance_operator_block_with_receipt(path, block_id, byte_cap)?.block)
+}
+
+/// Read one validated block and return its exact logical payload-byte receipt.
+///
+/// Header metadata, the selected block name, selected payload, and selected
+/// topology workspace are covered by `byte_cap`; unrelated block topology is
+/// not loaded. `logical_payload_bytes` is the block retained by a one-block
+/// replay cache.
+pub fn read_covariance_operator_block_with_receipt(
+    path: impl AsRef<Path>,
+    block_id: u64,
+    byte_cap: u64,
+) -> Result<CovarianceOperatorBlockRead> {
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    let names = nonempty_block_names_with_budget(&file, &mut budget)?;
-    let name = format!("{block_id:020}");
-    ensure_valid(
-        names.binary_search(&name).is_ok(),
-        "covariance block is missing",
+    read_covariance_operator_block_from_file(&file, &metadata, block_id, byte_cap, true)
+}
+
+fn read_covariance_operator_block_from_file(
+    file: &hdf5::File,
+    metadata: &CovarianceOperatorMetadata,
+    block_id: u64,
+    byte_cap: u64,
+    validate_link: bool,
+) -> Result<CovarianceOperatorBlockRead> {
+    let mut budget = ReadBudget::new(byte_cap);
+    budget.charge(inspect_metadata_layout(file)?)?;
+    let blocks = file.group("blocks")?;
+    validate_exact_schema(
+        &blocks,
+        None,
+        &[],
+        "covariance blocks schema contains unexpected attributes",
     )?;
-    let mut selected_payload_bytes = None;
-    let mut topology_bytes = 0_u64;
-    for candidate in &names {
-        let candidate_group = file.group(&format!("blocks/{candidate}"))?;
-        let payload_bytes = inspect_block_layout(&candidate_group)?;
-        checked_add_bytes(
-            &mut topology_bytes,
-            inspect_topology_layout(&candidate_group)?,
-        )?;
-        if candidate == &name {
-            selected_payload_bytes = Some(payload_bytes);
-        }
+    let name = format!("{block_id:020}");
+    budget.charge(
+        u64::try_from(name.len())
+            .ok()
+            .and_then(|length| length.checked_add(BLOCK_NAME_BUDGET_BYTES))
+            .ok_or_else(|| invalid("covariance block-name byte count overflow"))?,
+    )?;
+    if validate_link {
+        validate_selected_block_link(&blocks, &name)?;
     }
-    budget.charge(selected_payload_bytes.ok_or_else(|| invalid("covariance block is missing"))?)?;
+    let group = blocks.group(&name)?;
+    let logical_payload_bytes = inspect_block_layout(&group)?;
+    let topology_bytes = inspect_topology_layout(&group)?;
+    budget.charge(logical_payload_bytes)?;
     budget.charge(topology_workspace_bytes(topology_bytes)?)?;
-    validate_topology_headers(&file, &names, &metadata)?;
-    let group = file.group(&format!("blocks/{name}"))?;
     let block = read_block(&group)?;
     block.validate(metadata.gauge_date_index)?;
+    let topology = CovarianceBlockTopology::from(&block);
+    validate_block_namespace(&topology, metadata)?;
+    if metadata.replay_status == CovarianceReplayStatus::Replayable {
+        validate_replayable_ids(&topology)?;
+    }
     ensure_valid(
         block.block_id == block_id,
         "covariance block group ID mismatch",
     )?;
-    Ok(block)
+    Ok(CovarianceOperatorBlockRead {
+        block,
+        logical_payload_bytes,
+    })
 }
 
 /// Read a complete artifact after rejecting its aggregate block payload above a cap.
@@ -1461,10 +2955,6 @@ fn read_checked_metadata(
     let metadata = read_metadata(file)?;
     metadata.validate()?;
     Ok(metadata)
-}
-
-fn block_names(file: &hdf5::File) -> Result<Vec<String>> {
-    block_names_with_budget(file, &mut ReadBudget::new(u64::MAX))
 }
 
 fn block_names_with_budget(file: &hdf5::File, budget: &mut ReadBudget) -> Result<Vec<String>> {
@@ -1534,6 +3024,72 @@ fn nonempty_block_names_with_budget(
     Ok(names)
 }
 
+fn validate_block_links_streaming(blocks: &Group) -> Result<()> {
+    let error = blocks.iter_visit_default(None, |group, name, info, error| {
+        let checked = (|| {
+            ensure_valid(
+                info.link_type == LinkType::Hard,
+                "covariance block entry is not a hard link",
+            )?;
+            let parsed = name
+                .parse::<u64>()
+                .map_err(|_| invalid("invalid covariance block group name"))?;
+            ensure_valid(
+                name == format!("{parsed:020}"),
+                "covariance block group is not a canonical padded ID",
+            )?;
+            group.group(name)?;
+            Ok(())
+        })();
+        match checked {
+            Ok(()) => true,
+            Err(cause) => {
+                *error = Some(cause);
+                false
+            }
+        }
+    })?;
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn validate_selected_block_link(blocks: &Group, selected: &str) -> Result<()> {
+    struct SelectedLink {
+        found: bool,
+        error: Option<IoError>,
+    }
+    let result = blocks.iter_visit_default(
+        SelectedLink {
+            found: false,
+            error: None,
+        },
+        |group, name, info, selected_link| {
+            if name != selected {
+                return true;
+            }
+            selected_link.found = true;
+            let checked = (|| {
+                ensure_valid(
+                    info.link_type == LinkType::Hard,
+                    "covariance block entry is not a hard link",
+                )?;
+                group.group(name)?;
+                Ok(())
+            })();
+            if let Err(error) = checked {
+                selected_link.error = Some(error);
+            }
+            false
+        },
+    )?;
+    if let Some(error) = result.error {
+        return Err(error);
+    }
+    ensure_valid(result.found, "covariance block is missing")
+}
+
 fn inspect_block_layout(group: &Group) -> Result<u64> {
     validate_exact_schema(
         group,
@@ -1566,6 +3122,8 @@ fn inspect_block_layout(group: &Group) -> Result<u64> {
         "burst_id shape is not a nonempty vector",
     )?;
     checked_add_bytes(&mut bytes, burst_bytes)?;
+    add_exact_dataset::<u8>(group, "source_manifest_digest", &[32], &mut bytes)?;
+    add_exact_dataset::<u8>(group, "source_model_version_digest", &[32], &mut bytes)?;
 
     let (date_shape, date_bytes) = inspect_dataset::<u32>(group, "source_date_indices", None)?;
     ensure_valid(
@@ -1575,6 +3133,18 @@ fn inspect_block_layout(group: &Group) -> Result<u64> {
     checked_add_bytes(&mut bytes, date_bytes)?;
     add_exact_dataset::<u32>(group, "ordered_date_indices", &date_shape, &mut bytes)?;
     add_exact_dataset::<u64>(group, "source_ids", &[native_area], &mut bytes)?;
+    add_exact_dataset::<u8>(
+        group,
+        "source_content_digests",
+        &[native_area, 32],
+        &mut bytes,
+    )?;
+    add_exact_dataset::<u8>(
+        group,
+        "source_factor_digests",
+        &[native_area, 32],
+        &mut bytes,
+    )?;
     add_exact_dataset::<u64>(group, "phase_node_ids", &[output_area], &mut bytes)?;
     add_exact_dataset::<u64>(group, "compressed_node_ids", &[native_area], &mut bytes)?;
 
@@ -1649,9 +3219,14 @@ fn inspect_topology_layout(group: &Group) -> Result<u64> {
     let mut bytes = 0_u64;
     for (name, element_size) in [
         ("burst_id", 1_u64),
+        ("source_manifest_digest", 1),
+        ("source_model_version_digest", 1),
         ("source_date_indices", 4),
         ("ordered_date_indices", 4),
         ("source_ids", 8),
+        ("source_content_digests", 1),
+        ("source_factor_digests", 1),
+        ("native_validity_bits", 1),
         ("phase_node_ids", 8),
         ("compressed_node_ids", 8),
         ("carry_parent_ids", 8),
@@ -1699,33 +3274,81 @@ fn validate_topology_headers(
     let mut topology = CovarianceTopologyState::default();
     for name in names {
         let group = file.group(&format!("blocks/{name}"))?;
-        let block_id = read_scalar_attr(&group, "block_id")?;
+        let entry = read_topology_header(&group)?;
         ensure_valid(
-            *name == format!("{block_id:020}"),
+            *name == format!("{:020}", entry.block_id),
             "covariance block group ID mismatch",
         )?;
-        let entry = CovarianceBlockTopology {
-            block_id,
-            generation: read_scalar_attr(&group, "generation")?,
-            burst_id: read_string(&group, "burst_id")?,
-            native_grid: read_grid(&group, "native_grid")?,
-            output_grid: read_grid(&group, "output_grid")?,
-            owned_output_grid: read_grid(&group, "owned_output_grid")?,
-            rect_support: read_rect_support(&group)?,
-            reference_date_index: read_scalar_attr(&group, "reference_date_index")?,
-            source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
-            ordered_date_indices: group.dataset("ordered_date_indices")?.read_raw()?,
-            source_ids: group.dataset("source_ids")?.read_raw()?,
-            phase_node_ids: group.dataset("phase_node_ids")?.read_raw()?,
-            compressed_node_ids: group.dataset("compressed_node_ids")?.read_raw()?,
-            carry_parent_ids: group.dataset("carry_parent_ids")?.read_raw()?,
-            phase_components: read_phase_components(&group)?,
-        };
+        validate_block_namespace(&entry, metadata)?;
         validate_topology_header(&entry, metadata.gauge_date_index, names.len())?;
+        if metadata.replay_status == CovarianceReplayStatus::Replayable {
+            validate_replayable_ids(&entry)?;
+        }
         topology.validate(&entry, metadata.stitched_status)?;
         topology.insert(entry);
     }
     Ok(())
+}
+
+fn validate_block_namespace(
+    block: &CovarianceBlockTopology,
+    metadata: &CovarianceOperatorMetadata,
+) -> Result<()> {
+    ensure_valid(
+        metadata
+            .source
+            .manifest_digest
+            .as_deref()
+            .and_then(sha256_digest_bytes)
+            == Some(block.source_manifest_digest),
+        "covariance block source manifest differs from operator metadata",
+    )?;
+    ensure_valid(
+        metadata
+            .source
+            .model_version_digest
+            .as_deref()
+            .and_then(sha256_digest_bytes)
+            == Some(block.source_model_version_digest),
+        "covariance block source-model identity differs from operator metadata",
+    )
+}
+
+fn read_topology_header(group: &Group) -> Result<CovarianceBlockTopology> {
+    Ok(CovarianceBlockTopology {
+        block_id: read_scalar_attr(group, "block_id")?,
+        generation: read_scalar_attr(group, "generation")?,
+        burst_id: read_string(group, "burst_id")?,
+        source_manifest_digest: read_digest_dataset(group, "source_manifest_digest")?,
+        source_model_version_digest: read_digest_dataset(group, "source_model_version_digest")?,
+        native_grid: read_grid(group, "native_grid")?,
+        output_grid: read_grid(group, "output_grid")?,
+        owned_output_grid: read_grid(group, "owned_output_grid")?,
+        rect_support: read_rect_support(group)?,
+        reference_date_index: read_scalar_attr(group, "reference_date_index")?,
+        source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
+        ordered_date_indices: group.dataset("ordered_date_indices")?.read_raw()?,
+        source_ids: group.dataset("source_ids")?.read_raw()?,
+        source_content_digests: group.dataset("source_content_digests")?.read_raw()?,
+        source_factor_digests: group.dataset("source_factor_digests")?.read_raw()?,
+        native_validity_bits: group.dataset("native_validity_bits")?.read_raw()?,
+        estimator_branch: CovarianceEstimatorBranch::from_code(read_scalar_attr(
+            group,
+            "estimator_branch",
+        )?)?,
+        branch_tolerance_bits: read_scalar_attr::<f64>(group, "branch_tolerance")?.to_bits(),
+        phase_node_ids: group.dataset("phase_node_ids")?.read_raw()?,
+        compressed_node_ids: group.dataset("compressed_node_ids")?.read_raw()?,
+        carry_parent_ids: group.dataset("carry_parent_ids")?.read_raw()?,
+        phase_components: read_phase_components(group)?,
+    })
+}
+
+fn read_digest_dataset(group: &Group, name: &str) -> Result<[u8; 32]> {
+    let bytes: Vec<u8> = group.dataset(name)?.read_raw()?;
+    bytes
+        .try_into()
+        .map_err(|_| invalid(format!("{name} is not a 32-byte digest")))
 }
 
 fn validate_root_schema(file: &hdf5::File) -> Result<()> {
@@ -1889,6 +3512,11 @@ fn write_metadata(file: &hdf5::File, metadata: &CovarianceOperatorMetadata) -> R
     )?;
     write_optional_string(
         &source,
+        "model_version_digest",
+        metadata.source.model_version_digest.as_deref(),
+    )?;
+    write_optional_string(
+        &source,
         "model_receipt_digest",
         metadata.source.model_receipt_digest.as_deref(),
     )
@@ -1911,6 +3539,7 @@ fn read_metadata(file: &hdf5::File) -> Result<CovarianceOperatorMetadata> {
             provider_version: read_optional_string(&source, "provider_version")?,
             model: read_optional_string(&source, "model")?,
             model_version: read_optional_string(&source, "model_version")?,
+            model_version_digest: read_optional_string(&source, "model_version_digest")?,
             model_receipt_digest: read_optional_string(&source, "model_receipt_digest")?,
         },
         replay_status: CovarianceReplayStatus::from_code(read_scalar_attr(file, "replay_status")?)?,
@@ -1962,6 +3591,7 @@ fn validate_registries(file: &hdf5::File) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
     write_scalar_attr(group, "block_id", block.block_id)?;
     write_scalar_attr(group, "generation", block.generation)?;
@@ -1974,6 +3604,16 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
     write_scalar_attr(group, "estimator_branch", block.estimator_branch.code())?;
     write_scalar_attr(group, "branch_tolerance", block.branch_tolerance)?;
     write_string(group, "burst_id", &block.burst_id)?;
+    write_chunked_1d(
+        group,
+        "source_manifest_digest",
+        &block.source_manifest_digest,
+    )?;
+    write_chunked_1d(
+        group,
+        "source_model_version_digest",
+        &block.source_model_version_digest,
+    )?;
     write_grid(group, "native_grid", block.native_grid)?;
     write_grid(group, "output_grid", block.output_grid)?;
     write_grid(group, "owned_output_grid", block.owned_output_grid)?;
@@ -1981,6 +3621,18 @@ fn write_block(group: &Group, block: &CovarianceOperatorBlock) -> Result<()> {
     write_chunked_1d(group, "source_date_indices", &block.source_date_indices)?;
     write_chunked_1d(group, "ordered_date_indices", &block.ordered_date_indices)?;
     write_chunked_1d(group, "source_ids", &block.source_ids)?;
+    write_chunked_2d(
+        group,
+        "source_content_digests",
+        (block.source_ids.len(), 32),
+        &block.source_content_digests,
+    )?;
+    write_chunked_2d(
+        group,
+        "source_factor_digests",
+        (block.source_ids.len(), 32),
+        &block.source_factor_digests,
+    )?;
     write_chunked_1d(group, "phase_node_ids", &block.phase_node_ids)?;
     write_chunked_1d(group, "compressed_node_ids", &block.compressed_node_ids)?;
     write_chunked_1d(group, "carry_parent_ids", &block.carry_parent_ids)?;
@@ -2078,6 +3730,8 @@ fn read_block(group: &Group) -> Result<CovarianceOperatorBlock> {
     let phase_components = read_phase_components(group)?;
     Ok(CovarianceOperatorBlock {
         burst_id: read_string(group, "burst_id")?,
+        source_manifest_digest: read_digest_dataset(group, "source_manifest_digest")?,
+        source_model_version_digest: read_digest_dataset(group, "source_model_version_digest")?,
         block_id: read_scalar_attr(group, "block_id")?,
         generation: read_scalar_attr(group, "generation")?,
         native_grid: read_grid(group, "native_grid")?,
@@ -2089,6 +3743,8 @@ fn read_block(group: &Group) -> Result<CovarianceOperatorBlock> {
         source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
         ordered_date_indices: group.dataset("ordered_date_indices")?.read_raw()?,
         source_ids: group.dataset("source_ids")?.read_raw()?,
+        source_content_digests: group.dataset("source_content_digests")?.read_raw()?,
+        source_factor_digests: group.dataset("source_factor_digests")?.read_raw()?,
         phase_node_ids: group.dataset("phase_node_ids")?.read_raw()?,
         compressed_node_ids: group.dataset("compressed_node_ids")?.read_raw()?,
         carry_parent_ids: group.dataset("carry_parent_ids")?.read_raw()?,
@@ -2280,6 +3936,7 @@ fn window_origin(output: usize, half_window: usize, stride: usize, native_len: u
         .min(native_len - window_len)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_topology_header(
     block: &CovarianceBlockTopology,
     gauge_date_index: u32,
@@ -2293,7 +3950,7 @@ fn validate_topology_header(
     ensure_valid(
         !block.source_date_indices.is_empty()
             && block.source_date_indices == block.ordered_date_indices
-            && strictly_increasing(&block.source_date_indices),
+            && consecutive(&block.source_date_indices),
         "invalid covariance topology date map",
     )?;
     ensure_valid(
@@ -2374,14 +4031,49 @@ fn validate_topology_header(
     for (name, actual, expected) in [
         ("source_ids", block.source_ids.len(), native_area),
         (
+            "source_content_digests",
+            block.source_content_digests.len(),
+            native_area
+                .checked_mul(32)
+                .ok_or_else(|| invalid("source digest dimensions overflow usize"))?,
+        ),
+        (
+            "source_factor_digests",
+            block.source_factor_digests.len(),
+            native_area
+                .checked_mul(32)
+                .ok_or_else(|| invalid("source factor digest dimensions overflow usize"))?,
+        ),
+        (
             "compressed_node_ids",
             block.compressed_node_ids.len(),
             native_area,
         ),
         ("phase_node_ids", block.phase_node_ids.len(), output_area),
+        (
+            "native_validity_bits",
+            block.native_validity_bits.len(),
+            native_area.div_ceil(8),
+        ),
     ] {
         check_len(name, actual, expected)?;
     }
+    ensure_valid(
+        block
+            .source_content_digests
+            .chunks_exact(32)
+            .all(|digest| digest.iter().any(|byte| *byte != 0)),
+        "primitive source has an all-zero content digest",
+    )?;
+    ensure_valid(
+        packed_trailing_bits_are_zero(&block.native_validity_bits, native_area),
+        "native validity sets bits outside the native grid",
+    )?;
+    ensure_valid(
+        f64::from_bits(block.branch_tolerance_bits).is_finite()
+            && f64::from_bits(block.branch_tolerance_bits) > 0.0,
+        "branch tolerance must be finite and positive",
+    )?;
     Ok(())
 }
 
@@ -2411,8 +4103,11 @@ fn validate_block_topology(
             parent.burst_id == block.burst_id
                 && parent.native_grid == block.native_grid
                 && parent.output_grid == block.output_grid
-                && parent.owned_output_grid == block.owned_output_grid,
-            "covariance parent burst or replay/owned/native grid differs from child",
+                && parent.owned_output_grid == block.owned_output_grid
+                && parent.rect_support == block.rect_support
+                && parent.estimator_branch == block.estimator_branch
+                && parent.branch_tolerance_bits == block.branch_tolerance_bits,
+            "covariance parent burst, geometry, estimator branch, or tolerance differs from child",
         )?;
     }
     ensure_valid(
@@ -2450,6 +4145,15 @@ fn validate_cross_record_topology(
                 source_key_matches(block, native_index, block, prior_index),
                 "one covariance source ID identifies different primitive sources",
             )?;
+            ensure_valid(
+                source_digest(block, native_index) == source_digest(block, prior_index),
+                "one covariance source ID has different content digests",
+            )?;
+            ensure_valid(
+                source_factor_digest(block, native_index)
+                    == source_factor_digest(block, prior_index),
+                "one covariance source ID has different numeric factor receipts",
+            )?;
         }
         if let Some(location) = state.source_locations.get(&source_id) {
             let prior = state.blocks.get(&location.block_id).ok_or_else(|| {
@@ -2458,6 +4162,15 @@ fn validate_cross_record_topology(
             ensure_valid(
                 source_key_matches(block, native_index, prior, location.native_index),
                 "one covariance source ID identifies different primitive sources",
+            )?;
+            ensure_valid(
+                source_digest(block, native_index) == source_digest(prior, location.native_index),
+                "one covariance source ID has different content digests",
+            )?;
+            ensure_valid(
+                source_factor_digest(block, native_index)
+                    == source_factor_digest(prior, location.native_index),
+                "one covariance source ID has different numeric factor receipts",
             )?;
         }
     }
@@ -2482,6 +4195,14 @@ fn validate_cross_record_topology(
             )?;
             continue;
         }
+        ensure_valid(
+            prior.output_grid.stride_y == block.output_grid.stride_y
+                && prior.output_grid.stride_x == block.output_grid.stride_x
+                && prior.rect_support == block.rect_support
+                && prior.estimator_branch == block.estimator_branch
+                && prior.branch_tolerance_bits == block.branch_tolerance_bits,
+            "covariance records in one burst differ in geometry, estimator branch, or tolerance",
+        )?;
         if prior.generation != block.generation {
             continue;
         }
@@ -2492,7 +4213,9 @@ fn validate_cross_record_topology(
         ensure_valid(
             prior.output_grid.stride_y == block.output_grid.stride_y
                 && prior.output_grid.stride_x == block.output_grid.stride_x
-                && prior.rect_support == block.rect_support,
+                && prior.rect_support == block.rect_support
+                && prior.estimator_branch == block.estimator_branch
+                && prior.branch_tolerance_bits == block.branch_tolerance_bits,
             "covariance tiles in one generation geometry differ",
         )?;
         ensure_valid(
@@ -2515,6 +4238,14 @@ fn source_key_matches(
         && left.source_date_indices == right.source_date_indices
         && native_coordinate(left.native_grid, left_index)
             == native_coordinate(right.native_grid, right_index)
+}
+
+fn source_digest(block: &CovarianceBlockTopology, native_index: usize) -> &[u8] {
+    &block.source_content_digests[native_index * 32..(native_index + 1) * 32]
+}
+
+fn source_factor_digest(block: &CovarianceBlockTopology, native_index: usize) -> &[u8] {
+    &block.source_factor_digests[native_index * 32..(native_index + 1) * 32]
 }
 
 fn native_coordinate(grid: CovarianceOperatorGrid, index: usize) -> (u64, u64) {
@@ -2554,6 +4285,19 @@ fn validate_shared_native_sources(
                 left.source_ids[left_index] == right.source_ids[right_index],
                 "shared native source has different consumer IDs across tiles",
             )?;
+            ensure_valid(
+                source_digest(left, left_index) == source_digest(right, right_index),
+                "shared native source has different content digests across tiles",
+            )?;
+            ensure_valid(
+                source_factor_digest(left, left_index) == source_factor_digest(right, right_index),
+                "shared native source has different numeric factor receipts across tiles",
+            )?;
+            ensure_valid(
+                packed_bit(&left.native_validity_bits, left_index)
+                    == packed_bit(&right.native_validity_bits, right_index),
+                "shared native source has different validity across tiles",
+            )?;
         }
     }
     Ok(())
@@ -2576,6 +4320,20 @@ fn grids_overlap(left: CovarianceOperatorGrid, right: CovarianceOperatorGrid) ->
         }
         _ => true,
     }
+}
+
+fn future_min_native_rows(tiles: &[CovarianceTilePlan]) -> Vec<u64> {
+    let mut minimum = u64::MAX;
+    let mut rows = tiles
+        .iter()
+        .rev()
+        .map(|tile| {
+            minimum = minimum.min(tile.native_grid.row_start);
+            minimum
+        })
+        .collect::<Vec<_>>();
+    rows.reverse();
+    rows
 }
 
 fn grid_stop(start: u64, len: u32) -> Result<u64> {
@@ -2604,9 +4362,39 @@ fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+fn consecutive(values: &[u32]) -> bool {
+    !values.is_empty()
+        && values
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+}
+
 fn is_sha256_digest(value: &str) -> bool {
     let hex = value.strip_prefix("sha256:").unwrap_or(value);
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_digest_bytes(value: &str) -> Option<[u8; 32]> {
+    let hexadecimal = value.strip_prefix("sha256:").unwrap_or(value).as_bytes();
+    if hexadecimal.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in hexadecimal.chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        digest[index] = (high << 4) | low;
+    }
+    Some(digest)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn invalid(message: impl Into<String>) -> IoError {
