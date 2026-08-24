@@ -17,6 +17,7 @@ pub mod fixed_cube;
 pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
+pub mod spatial_covariance_artifact;
 pub mod tiling;
 pub mod unwrap_backend;
 
@@ -59,5 +60,11 @@ pub use sequential_covariance::{
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
     SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SpatialCovarianceStatus,
     TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
+};
+pub use spatial_covariance_artifact::{
+    finalize_spatial_reference_covariance_artifact,
+    read_spatial_reference_covariance_artifact_manifest,
+    SpatialReferenceCovarianceArtifactManifest, SpatialReferenceCovarianceArtifactTransaction,
+    SPATIAL_REFERENCE_COVARIANCE_FILENAME, SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
