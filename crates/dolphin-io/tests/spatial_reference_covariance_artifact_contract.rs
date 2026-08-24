@@ -1,13 +1,34 @@
 use dolphin_io::{
     read_spatial_reference_covariance_block, read_spatial_reference_covariance_header,
-    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
-    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
-    SpatialReferenceCovarianceStatus, SPATIAL_REFERENCE_COVARIANCE_METHOD,
+    spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
+    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_COVARIANCE_METHOD,
     SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
 
 fn digest(byte: u8) -> String {
     format!("sha256:{}", format!("{byte:02x}").repeat(32))
+}
+
+#[test]
+fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_blocks() {
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_streaming_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut writer = SpatialReferenceCovarianceWriter::create(&path, &metadata()).unwrap();
+    assert!(read_spatial_reference_covariance_header(&path, 4096).is_err());
+    writer.write_block(&block()).unwrap();
+    assert!(writer.write_block(&block()).is_err());
+    let receipt = writer.finish().unwrap();
+    assert_eq!(receipt.block_count, 1);
+    assert_eq!(
+        read_spatial_reference_covariance_header(&path, 4096).unwrap(),
+        metadata()
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 fn grid(row_start: u64, rows: u32) -> CovarianceOperatorGrid {
@@ -42,6 +63,18 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_signature_digest: digest(0x44),
         approximation_receipt_digest: digest(0x55),
         resource_receipt_digest: digest(0x66),
+        review_receipt_digest: String::new(),
+        method_manifest_digest: String::new(),
+        calibration_scope_digest: String::new(),
+        source_model_digest: digest(0x67),
+        effective_looks_digest: digest(0x68),
+        support_method: "rect".to_owned(),
+        support_digest: digest(0x69),
+        correction_order_digest: digest(0x6a),
+        unwrap_branch_digest: digest(0x6b),
+        burst_ownership_digest: digest(0x6c),
+        source_burst_ids: vec!["T078-165482-IW1".to_owned()],
+        reference_source_burst_index: 0,
         calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
         maximum_block_bytes: 4096,
     }
@@ -57,6 +90,7 @@ fn block() -> SpatialReferenceCovarianceBlock {
             SpatialReferenceCovarianceStatus::Valid,
             SpatialReferenceCovarianceStatus::Valid,
         ],
+        source_burst_index_by_target: vec![0, 0],
         difference_factor: vec![
             0.0, 0.0, 0.0, 0.0, 1.0, 0.0, // target 0
             0.0, 0.0, 0.5, 0.0, 1.5, 0.0, // target 1
@@ -82,7 +116,10 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
     assert_eq!(read_metadata, metadata());
     let read = read_spatial_reference_covariance_block(&path, 7, 4096).unwrap();
     assert_eq!(read.block, block());
-    assert_eq!(read.logical_payload_bytes, 12 * 8 + 2 * 4 + 2 * 2 + 2 * 8);
+    assert_eq!(
+        read.logical_payload_bytes,
+        12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8
+    );
 
     let error = read_spatial_reference_covariance_block(&path, 7, 32).unwrap_err();
     assert!(error.to_string().contains("byte cap"));
@@ -115,11 +152,33 @@ fn malformed_scope_gauge_hash_and_factor_fail_before_commit() {
 
     invalid_metadata = metadata();
     invalid_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
-    invalid_metadata.approximation_receipt_digest.clear();
+    invalid_metadata.review_receipt_digest = digest(0x81);
+    invalid_metadata.method_manifest_digest = digest(0x82);
+    invalid_metadata.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&invalid_metadata);
+    invalid_metadata.source_model_digest = digest(0x83);
     assert!(write_spatial_reference_covariance(
         base.with_extension("scope.h5"),
         &invalid_metadata,
         &[block()]
+    )
+    .is_err());
+
+    invalid_metadata.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&invalid_metadata);
+    write_spatial_reference_covariance(
+        base.with_extension("calibrated.h5"),
+        &invalid_metadata,
+        &[block()],
+    )
+    .unwrap();
+
+    let mut cross_burst = block();
+    cross_burst.source_burst_index_by_target[0] = 1;
+    assert!(write_spatial_reference_covariance(
+        base.with_extension("ownership.h5"),
+        &metadata(),
+        &[cross_burst]
     )
     .is_err());
 

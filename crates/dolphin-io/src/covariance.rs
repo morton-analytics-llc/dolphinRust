@@ -3905,7 +3905,7 @@ fn write_chunked_2d<T: H5Type>(
 }
 
 /// HDF5 schema version for bounded reference-specific covariance factors.
-pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 1;
+pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 2;
 /// Stable method identity for issue #54 reference-specific factors.
 pub const SPATIAL_REFERENCE_COVARIANCE_METHOD: &str = "reference_specific_influence_v1";
 
@@ -3932,11 +3932,23 @@ const SPATIAL_METADATA_MEMBERS: &[&str] = &[
     "reference_signature_digest",
     "approximation_receipt_digest",
     "resource_receipt_digest",
+    "review_receipt_digest",
+    "method_manifest_digest",
+    "calibration_scope_digest",
+    "source_model_digest",
+    "effective_looks_digest",
+    "support_method",
+    "support_digest",
+    "correction_order_digest",
+    "unwrap_branch_digest",
+    "burst_ownership_digest",
+    "source_burst_ids",
 ];
 const SPATIAL_BLOCK_MEMBERS: &[&str] = &[
     "target_grid",
     "rank_by_target",
     "status",
+    "source_burst_index_by_target",
     "difference_factor",
     "approximation_error_bound",
     "source_factor_digest",
@@ -3984,6 +3996,8 @@ pub enum SpatialReferenceCovarianceStatus {
     L2RankDeficient,
     /// An input identity or calibration scope does not match.
     ScopeMismatch,
+    /// Target/reference ownership is mixed, ambiguous, or date-varying.
+    UnsupportedMultiburstReference,
 }
 
 impl SpatialReferenceCovarianceStatus {
@@ -3994,6 +4008,7 @@ impl SpatialReferenceCovarianceStatus {
             Self::ReplayUnsupported => 2,
             Self::L2RankDeficient => 3,
             Self::ScopeMismatch => 4,
+            Self::UnsupportedMultiburstReference => 5,
         }
     }
 
@@ -4004,6 +4019,7 @@ impl SpatialReferenceCovarianceStatus {
             2 => Ok(Self::ReplayUnsupported),
             3 => Ok(Self::L2RankDeficient),
             4 => Ok(Self::ScopeMismatch),
+            5 => Ok(Self::UnsupportedMultiburstReference),
             _ => Err(invalid(format!(
                 "unknown spatial reference covariance status {code}"
             ))),
@@ -4052,6 +4068,30 @@ pub struct SpatialReferenceCovarianceMetadata {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
+    /// Independent-review receipt authorizing this exact scope, when calibrated.
+    pub review_receipt_digest: String,
+    /// Immutable method manifest binding code, configuration, and evidence.
+    pub method_manifest_digest: String,
+    /// Digest of the exact calibrated metadata scope, excluding this field.
+    pub calibration_scope_digest: String,
+    /// Proper-complex primitive source-model identity.
+    pub source_model_digest: String,
+    /// Effective-look rule and parameter identity.
+    pub effective_looks_digest: String,
+    /// Realized fixed support method (`rect`, `glrt_frozen`, or `ks_frozen`).
+    pub support_method: String,
+    /// Digest of the realized native support masks.
+    pub support_digest: String,
+    /// Digest proving corrections were applied before spatial subtraction.
+    pub correction_order_digest: String,
+    /// Fixed unwrap/estimator branch identity.
+    pub unwrap_branch_digest: String,
+    /// Source-burst ownership and seam-leveling identity.
+    pub burst_ownership_digest: String,
+    /// Ordered source bursts represented by per-target ownership indices.
+    pub source_burst_ids: Vec<String>,
+    /// Source-burst index of the selected reference.
+    pub reference_source_burst_index: u32,
     /// Calibration scope authorized by matching receipts.
     pub calibration_scope: SpatialReferenceCalibrationScope,
     /// Maximum logical numeric bytes allowed in one persisted block.
@@ -4059,6 +4099,7 @@ pub struct SpatialReferenceCovarianceMetadata {
 }
 
 impl SpatialReferenceCovarianceMetadata {
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
         ensure_valid(
             self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
@@ -4116,14 +4157,118 @@ impl SpatialReferenceCovarianceMetadata {
             &self.reference_signature_digest,
             &self.approximation_receipt_digest,
             &self.resource_receipt_digest,
+            &self.source_model_digest,
+            &self.effective_looks_digest,
+            &self.support_digest,
+            &self.correction_order_digest,
+            &self.unwrap_branch_digest,
+            &self.burst_ownership_digest,
         ] {
             ensure_valid(
                 is_sha256_digest(value),
                 "spatial reference identity is not a strong SHA-256 digest",
             )?;
         }
+        ensure_valid(
+            matches!(
+                self.support_method.as_str(),
+                "rect" | "glrt_frozen" | "ks_frozen"
+            ),
+            "spatial reference support method is unsupported",
+        )?;
+        ensure_valid(
+            !self.source_burst_ids.is_empty()
+                && self
+                    .source_burst_ids
+                    .iter()
+                    .all(|burst| !burst.is_empty() && !burst.contains('\n'))
+                && self.source_burst_ids.iter().collect::<BTreeSet<_>>().len()
+                    == self.source_burst_ids.len()
+                && usize::try_from(self.reference_source_burst_index)
+                    .is_ok_and(|index| index < self.source_burst_ids.len()),
+            "spatial reference burst ownership registry is invalid",
+        )?;
+        match self.calibration_scope {
+            SpatialReferenceCalibrationScope::Uncalibrated => ensure_valid(
+                self.review_receipt_digest.is_empty()
+                    && self.method_manifest_digest.is_empty()
+                    && self.calibration_scope_digest.is_empty(),
+                "uncalibrated spatial reference scope cannot carry promotion receipts",
+            )?,
+            SpatialReferenceCalibrationScope::CalibratedScopeMatch => {
+                for value in [
+                    &self.review_receipt_digest,
+                    &self.method_manifest_digest,
+                    &self.calibration_scope_digest,
+                ] {
+                    ensure_valid(
+                        is_nonzero_sha256_digest(value),
+                        "calibrated spatial reference scope requires strong promotion receipts",
+                    )?;
+                }
+                ensure_valid(
+                    self.calibration_scope_digest
+                        == spatial_reference_calibration_scope_digest(self),
+                    "calibrated spatial reference scope digest is stale or mismatched",
+                )?;
+            }
+        }
         Ok(())
     }
+}
+
+/// Compute the immutable calibrated scope identity, excluding promotion state.
+#[must_use]
+pub fn spatial_reference_calibration_scope_digest(
+    metadata: &SpatialReferenceCovarianceMetadata,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:spatial-reference-calibration-scope:v1");
+    for value in [
+        metadata.method.as_str(),
+        metadata.crate_version.as_str(),
+        metadata.burst_id.as_str(),
+        metadata.crs.as_str(),
+        metadata.units.as_str(),
+        metadata.mask_digest.as_str(),
+        metadata.source_replay_digest.as_str(),
+        metadata.l2_map_digest.as_str(),
+        metadata.reference_signature_digest.as_str(),
+        metadata.approximation_receipt_digest.as_str(),
+        metadata.resource_receipt_digest.as_str(),
+        metadata.review_receipt_digest.as_str(),
+        metadata.method_manifest_digest.as_str(),
+        metadata.source_model_digest.as_str(),
+        metadata.effective_looks_digest.as_str(),
+        metadata.support_method.as_str(),
+        metadata.support_digest.as_str(),
+        metadata.correction_order_digest.as_str(),
+        metadata.unwrap_branch_digest.as_str(),
+        metadata.burst_ownership_digest.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(metadata.method_version.to_le_bytes());
+    digest.update(metadata.full_grid.row_start.to_le_bytes());
+    digest.update(metadata.full_grid.col_start.to_le_bytes());
+    digest.update(metadata.full_grid.rows.to_le_bytes());
+    digest.update(metadata.full_grid.cols.to_le_bytes());
+    digest.update(metadata.full_grid.stride_y.to_le_bytes());
+    digest.update(metadata.full_grid.stride_x.to_le_bytes());
+    digest.update(metadata.reference_row.to_le_bytes());
+    digest.update(metadata.reference_col.to_le_bytes());
+    digest.update(metadata.gauge_date_index.to_le_bytes());
+    for date in &metadata.ordered_date_indices {
+        digest.update(date.to_le_bytes());
+    }
+    for burst in &metadata.source_burst_ids {
+        digest.update((burst.len() as u64).to_le_bytes());
+        digest.update(burst.as_bytes());
+    }
+    digest.update(metadata.reference_source_burst_index.to_le_bytes());
+    digest.update(metadata.maximum_block_bytes.to_le_bytes());
+    format!("sha256:{:x}", digest.finalize())
 }
 
 /// One bounded target block of a reference-specific difference factor.
@@ -4139,6 +4284,8 @@ pub struct SpatialReferenceCovarianceBlock {
     pub rank_by_target: Vec<u32>,
     /// Stable disposition for each target.
     pub status: Vec<SpatialReferenceCovarianceStatus>,
+    /// Source-burst registry index for every target.
+    pub source_burst_index_by_target: Vec<u32>,
     /// Target-major, date-major, rank-minor difference factor.
     pub difference_factor: Vec<f64>,
     /// Preregistered approximation-error bound for each target.
@@ -4165,9 +4312,14 @@ impl SpatialReferenceCovarianceBlock {
             .ok()
             .and_then(|count| count.checked_mul(8))
             .ok_or_else(|| invalid("spatial reference bound byte count overflow"))?;
+        let ownership = u64::try_from(self.source_burst_index_by_target.len())
+            .ok()
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| invalid("spatial reference ownership byte count overflow"))?;
         factor
             .checked_add(rank)
             .and_then(|value| value.checked_add(status))
+            .and_then(|value| value.checked_add(ownership))
             .and_then(|value| value.checked_add(bounds))
             .ok_or_else(|| invalid("spatial reference block byte count overflow"))
     }
@@ -4188,6 +4340,7 @@ impl SpatialReferenceCovarianceBlock {
         ensure_valid(
             self.rank_by_target.len() == targets
                 && self.status.len() == targets
+                && self.source_burst_index_by_target.len() == targets
                 && self.approximation_error_bound.len() == targets
                 && self.difference_factor.len()
                     == targets
@@ -4219,6 +4372,18 @@ impl SpatialReferenceCovarianceBlock {
                 matches!(self.status[target], SpatialReferenceCovarianceStatus::Valid)
                     == (realized > 0),
                 "spatial reference status and target rank disagree",
+            )?;
+            let source_burst = usize::try_from(self.source_burst_index_by_target[target])
+                .map_err(|_| invalid("spatial reference source-burst index exceeds usize"))?;
+            ensure_valid(
+                source_burst < metadata.source_burst_ids.len(),
+                "spatial reference source-burst index is outside the registry",
+            )?;
+            ensure_valid(
+                realized == 0
+                    || self.source_burst_index_by_target[target]
+                        == metadata.reference_source_burst_index,
+                "valid spatial reference factor crosses source-burst ownership",
             )?;
             for date in 0..dates {
                 for component in 0..rank {
@@ -4257,42 +4422,93 @@ pub struct SpatialReferenceCovarianceBlockRead {
     pub logical_payload_bytes: u64,
 }
 
-/// Write and seal a bounded reference-specific HDF5 factor artifact.
-///
-/// # Errors
-/// Returns an error for invalid metadata, invalid/duplicate blocks, byte-cap
-/// violations, or HDF5/I/O failures.
-#[allow(clippy::too_many_lines)]
-pub fn write_spatial_reference_covariance(
-    path: impl AsRef<Path>,
-    metadata: &SpatialReferenceCovarianceMetadata,
-    blocks: &[SpatialReferenceCovarianceBlock],
-) -> Result<SpatialReferenceCovarianceWriteReceipt> {
-    metadata.validate()?;
-    ensure_valid(
-        !blocks.is_empty(),
-        "spatial reference artifact has no blocks",
-    )?;
-    let mut block_ids = BTreeSet::new();
-    for block in blocks {
-        block.validate(metadata)?;
+/// Streaming writer for one bounded reference-specific factor artifact.
+pub struct SpatialReferenceCovarianceWriter {
+    file: Option<hdf5::File>,
+    path: PathBuf,
+    metadata: SpatialReferenceCovarianceMetadata,
+    block_ids: BTreeSet<u64>,
+}
+
+impl SpatialReferenceCovarianceWriter {
+    /// Create an incomplete artifact and persist its immutable metadata.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metadata or HDF5/I/O failure.
+    pub fn create(
+        path: impl AsRef<Path>,
+        metadata: &SpatialReferenceCovarianceMetadata,
+    ) -> Result<Self> {
+        metadata.validate()?;
+        let path = path.as_ref().to_owned();
+        let file = hdf5::File::create(&path)?;
+        write_spatial_reference_metadata(&file, metadata)?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            metadata: metadata.clone(),
+            block_ids: BTreeSet::new(),
+        })
+    }
+
+    /// Append one validated non-overlapping target block.
+    ///
+    /// # Errors
+    /// Returns an error for invalid/duplicate blocks, byte-cap violations, or
+    /// HDF5/I/O failure.
+    pub fn write_block(&mut self, block: &SpatialReferenceCovarianceBlock) -> Result<()> {
+        block.validate(&self.metadata)?;
         ensure_valid(
-            block_ids.insert(block.block_id),
+            self.block_ids.insert(block.block_id),
             "duplicate spatial reference block ID",
         )?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
+        let block_group = file.group("blocks")?;
+        let group = block_group.create_group(&format!("{:020}", block.block_id))?;
+        write_spatial_reference_block(&group, &self.metadata, block)
     }
-    let file = hdf5::File::create(path.as_ref())?;
-    write_scalar_attr(&file, "schema_version", metadata.schema_version)?;
-    write_scalar_attr(&file, "method_version", metadata.method_version)?;
-    write_scalar_attr(&file, "gauge_date_index", metadata.gauge_date_index)?;
-    write_scalar_attr(
-        &file,
-        "calibration_scope",
-        metadata.calibration_scope.code(),
-    )?;
-    write_scalar_attr(&file, "maximum_block_bytes", metadata.maximum_block_bytes)?;
-    write_scalar_attr(&file, "complete", 0_u8)?;
+
+    /// Mark the artifact complete, validate its exact schema, and return its digest.
+    ///
+    /// # Errors
+    /// Returns an error for an empty artifact or HDF5/I/O failure.
+    pub fn finish(mut self) -> Result<SpatialReferenceCovarianceWriteReceipt> {
+        ensure_valid(
+            !self.block_ids.is_empty(),
+            "spatial reference artifact has no blocks",
+        )?;
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
+        file.attr("complete")?.write_scalar(&1_u8)?;
+        validate_spatial_root_schema(&file)?;
+        file.flush()?;
+        file.close()?;
+        let (hdf5_sha256, hdf5_bytes) = sha256_path(&self.path)?;
+        Ok(SpatialReferenceCovarianceWriteReceipt {
+            block_count: self.block_ids.len(),
+            hdf5_bytes,
+            hdf5_sha256,
+        })
+    }
+}
+
+fn write_spatial_reference_metadata(
+    file: &hdf5::File,
+    metadata: &SpatialReferenceCovarianceMetadata,
+) -> Result<()> {
+    write_scalar_attr(file, "schema_version", metadata.schema_version)?;
+    write_scalar_attr(file, "method_version", metadata.method_version)?;
+    write_scalar_attr(file, "gauge_date_index", metadata.gauge_date_index)?;
+    write_scalar_attr(file, "calibration_scope", metadata.calibration_scope.code())?;
+    write_scalar_attr(file, "maximum_block_bytes", metadata.maximum_block_bytes)?;
+    write_scalar_attr(file, "complete", 0_u8)?;
     let identity = file.create_group("metadata")?;
+    let source_burst_ids = metadata.source_burst_ids.join("\n");
     for (name, value) in [
         ("method", metadata.method.as_str()),
         ("crate_version", metadata.crate_version.as_str()),
@@ -4321,6 +4537,38 @@ pub fn write_spatial_reference_covariance(
             "resource_receipt_digest",
             metadata.resource_receipt_digest.as_str(),
         ),
+        (
+            "review_receipt_digest",
+            metadata.review_receipt_digest.as_str(),
+        ),
+        (
+            "method_manifest_digest",
+            metadata.method_manifest_digest.as_str(),
+        ),
+        (
+            "calibration_scope_digest",
+            metadata.calibration_scope_digest.as_str(),
+        ),
+        ("source_model_digest", metadata.source_model_digest.as_str()),
+        (
+            "effective_looks_digest",
+            metadata.effective_looks_digest.as_str(),
+        ),
+        ("support_method", metadata.support_method.as_str()),
+        ("support_digest", metadata.support_digest.as_str()),
+        (
+            "correction_order_digest",
+            metadata.correction_order_digest.as_str(),
+        ),
+        (
+            "unwrap_branch_digest",
+            metadata.unwrap_branch_digest.as_str(),
+        ),
+        (
+            "burst_ownership_digest",
+            metadata.burst_ownership_digest.as_str(),
+        ),
+        ("source_burst_ids", source_burst_ids.as_str()),
     ] {
         write_string(&identity, name, value)?;
     }
@@ -4331,54 +4579,73 @@ pub fn write_spatial_reference_covariance(
     )?;
     write_scalar_attr(&identity, "reference_row", metadata.reference_row)?;
     write_scalar_attr(&identity, "reference_col", metadata.reference_col)?;
-    write_grid(&file, "full_grid", metadata.full_grid)?;
-    let block_group = file.create_group("blocks")?;
-    for block in blocks {
-        let group = block_group.create_group(&format!("{:020}", block.block_id))?;
-        write_scalar_attr(&group, "block_id", block.block_id)?;
-        write_scalar_attr(&group, "maximum_rank", block.maximum_rank)?;
-        write_grid(&group, "target_grid", block.target_grid)?;
-        write_chunked_1d(&group, "rank_by_target", &block.rank_by_target)?;
-        write_chunked_1d(
-            &group,
-            "status",
-            &block
-                .status
-                .iter()
-                .map(|status| status.code())
-                .collect::<Vec<_>>(),
-        )?;
-        let target_count = block.target_grid.area()?;
-        let date_count = metadata.ordered_date_indices.len();
-        let rank = block.maximum_rank as usize;
-        let view =
-            ArrayView3::from_shape((target_count, date_count, rank), &block.difference_factor)
-                .map_err(|error| invalid(format!("spatial reference factor shape: {error}")))?;
-        group
-            .new_dataset_builder()
-            .with_data(view)
-            .chunk((1, date_count.min(32), rank.min(32)))
-            .create("difference_factor")?;
-        write_chunked_1d(
-            &group,
-            "approximation_error_bound",
-            &block.approximation_error_bound,
-        )?;
-        write_string(&group, "source_factor_digest", &block.source_factor_digest)?;
-    }
-    drop(block_group);
+    write_scalar_attr(
+        &identity,
+        "reference_source_burst_index",
+        metadata.reference_source_burst_index,
+    )?;
+    write_grid(file, "full_grid", metadata.full_grid)?;
+    file.create_group("blocks")?;
     drop(identity);
-    file.attr("complete")?.write_scalar(&1_u8)?;
-    validate_spatial_root_schema(&file)?;
-    file.flush()?;
-    let filename = file.filename();
-    file.close()?;
-    let (hdf5_sha256, hdf5_bytes) = sha256_path(Path::new(&filename))?;
-    Ok(SpatialReferenceCovarianceWriteReceipt {
-        block_count: blocks.len(),
-        hdf5_bytes,
-        hdf5_sha256,
-    })
+    Ok(())
+}
+
+fn write_spatial_reference_block(
+    group: &Group,
+    metadata: &SpatialReferenceCovarianceMetadata,
+    block: &SpatialReferenceCovarianceBlock,
+) -> Result<()> {
+    write_scalar_attr(group, "block_id", block.block_id)?;
+    write_scalar_attr(group, "maximum_rank", block.maximum_rank)?;
+    write_grid(group, "target_grid", block.target_grid)?;
+    write_chunked_1d(group, "rank_by_target", &block.rank_by_target)?;
+    write_chunked_1d(
+        group,
+        "status",
+        &block
+            .status
+            .iter()
+            .map(|status| status.code())
+            .collect::<Vec<_>>(),
+    )?;
+    write_chunked_1d(
+        group,
+        "source_burst_index_by_target",
+        &block.source_burst_index_by_target,
+    )?;
+    let target_count = block.target_grid.area()?;
+    let date_count = metadata.ordered_date_indices.len();
+    let rank = block.maximum_rank as usize;
+    let view = ArrayView3::from_shape((target_count, date_count, rank), &block.difference_factor)
+        .map_err(|error| invalid(format!("spatial reference factor shape: {error}")))?;
+    group
+        .new_dataset_builder()
+        .with_data(view)
+        .chunk((1, date_count.min(32), rank.min(32)))
+        .create("difference_factor")?;
+    write_chunked_1d(
+        group,
+        "approximation_error_bound",
+        &block.approximation_error_bound,
+    )?;
+    write_string(group, "source_factor_digest", &block.source_factor_digest)
+}
+
+/// Write and seal a bounded reference-specific HDF5 factor artifact.
+///
+/// # Errors
+/// Returns an error for invalid metadata, invalid/duplicate blocks, byte-cap
+/// violations, or HDF5/I/O failures.
+pub fn write_spatial_reference_covariance(
+    path: impl AsRef<Path>,
+    metadata: &SpatialReferenceCovarianceMetadata,
+    blocks: &[SpatialReferenceCovarianceBlock],
+) -> Result<SpatialReferenceCovarianceWriteReceipt> {
+    let mut writer = SpatialReferenceCovarianceWriter::create(path, metadata)?;
+    for block in blocks {
+        writer.write_block(block)?;
+    }
+    writer.finish()
 }
 
 /// Read and validate only bounded-factor metadata under an allocation cap.
@@ -4444,6 +4711,12 @@ pub fn read_spatial_reference_covariance_block(
         &mut logical_payload_bytes,
     )?;
     add_exact_dataset::<u16>(&group, "status", &[targets], &mut logical_payload_bytes)?;
+    add_exact_dataset::<u32>(
+        &group,
+        "source_burst_index_by_target",
+        &[targets],
+        &mut logical_payload_bytes,
+    )?;
     add_exact_dataset::<f64>(
         &group,
         "difference_factor",
@@ -4474,6 +4747,7 @@ pub fn read_spatial_reference_covariance_block(
         maximum_rank,
         rank_by_target: group.dataset("rank_by_target")?.read_raw()?,
         status,
+        source_burst_index_by_target: group.dataset("source_burst_index_by_target")?.read_raw()?,
         difference_factor: group.dataset("difference_factor")?.read_raw()?,
         approximation_error_bound: group.dataset("approximation_error_bound")?.read_raw()?,
         source_factor_digest: read_string(&group, "source_factor_digest")?,
@@ -4504,7 +4778,11 @@ fn validate_spatial_root_schema(file: &hdf5::File) -> Result<()> {
     validate_exact_schema(
         &identity,
         Some(SPATIAL_METADATA_MEMBERS),
-        &["reference_row", "reference_col"],
+        &[
+            "reference_row",
+            "reference_col",
+            "reference_source_burst_index",
+        ],
         "spatial reference metadata schema contains missing or unexpected members",
     )?;
     let blocks = file.group("blocks")?;
@@ -4536,6 +4814,21 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         reference_signature_digest: read_string(&identity, "reference_signature_digest")?,
         approximation_receipt_digest: read_string(&identity, "approximation_receipt_digest")?,
         resource_receipt_digest: read_string(&identity, "resource_receipt_digest")?,
+        review_receipt_digest: read_string(&identity, "review_receipt_digest")?,
+        method_manifest_digest: read_string(&identity, "method_manifest_digest")?,
+        calibration_scope_digest: read_string(&identity, "calibration_scope_digest")?,
+        source_model_digest: read_string(&identity, "source_model_digest")?,
+        effective_looks_digest: read_string(&identity, "effective_looks_digest")?,
+        support_method: read_string(&identity, "support_method")?,
+        support_digest: read_string(&identity, "support_digest")?,
+        correction_order_digest: read_string(&identity, "correction_order_digest")?,
+        unwrap_branch_digest: read_string(&identity, "unwrap_branch_digest")?,
+        burst_ownership_digest: read_string(&identity, "burst_ownership_digest")?,
+        source_burst_ids: read_string(&identity, "source_burst_ids")?
+            .split('\n')
+            .map(str::to_owned)
+            .collect(),
+        reference_source_burst_index: read_scalar_attr(&identity, "reference_source_burst_index")?,
         calibration_scope: SpatialReferenceCalibrationScope::from_code(read_scalar_attr(
             file,
             "calibration_scope",
@@ -5014,6 +5307,15 @@ fn consecutive(values: &[u32]) -> bool {
 fn is_sha256_digest(value: &str) -> bool {
     let hex = value.strip_prefix("sha256:").unwrap_or(value);
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_nonzero_sha256_digest(value: &str) -> bool {
+    is_sha256_digest(value)
+        && value
+            .strip_prefix("sha256:")
+            .unwrap_or(value)
+            .bytes()
+            .any(|byte| byte != b'0')
 }
 
 fn sha256_digest_bytes(value: &str) -> Option<[u8; 32]> {

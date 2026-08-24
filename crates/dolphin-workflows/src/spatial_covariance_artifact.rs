@@ -21,7 +21,7 @@ pub const SPATIAL_REFERENCE_COVARIANCE_FILENAME: &str = "spatial_reference_covar
 pub const SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME: &str =
     "spatial_reference_covariance.json";
 const LOCK_FILENAME: &str = "spatial_reference_covariance.capture.lock";
-const MANIFEST_SCHEMA_VERSION: u16 = 1;
+const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const METADATA_READ_CAP: u64 = 1024 * 1024;
 
 /// Durable receipt binding factor bytes to every scope identity.
@@ -61,6 +61,30 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
+    /// Independent-review receipt identity.
+    pub review_receipt_digest: String,
+    /// Immutable reviewed method-manifest identity.
+    pub method_manifest_digest: String,
+    /// Exact calibrated scope identity, empty while uncalibrated.
+    pub calibration_scope_digest: String,
+    /// Proper-complex primitive source-model identity.
+    pub source_model_digest: String,
+    /// Effective-look rule identity.
+    pub effective_looks_digest: String,
+    /// Realized fixed-support method.
+    pub support_method: String,
+    /// Realized fixed-support identity.
+    pub support_digest: String,
+    /// Corrections-before-reference ordering identity.
+    pub correction_order_digest: String,
+    /// Fixed unwrap/estimator branch identity.
+    pub unwrap_branch_digest: String,
+    /// Source-burst ownership and seam lineage identity.
+    pub burst_ownership_digest: String,
+    /// Ordered source-burst registry represented by the factor blocks.
+    pub source_burst_ids: Vec<String>,
+    /// Source-burst registry index of the selected reference.
+    pub reference_source_burst_index: u32,
     /// Exact calibration scope; never inferred from file presence.
     pub calibration_scope: String,
     /// Maximum logical numeric bytes admitted for one block.
@@ -230,6 +254,18 @@ fn manifest(
         l2_map_digest: metadata.l2_map_digest.clone(),
         approximation_receipt_digest: metadata.approximation_receipt_digest.clone(),
         resource_receipt_digest: metadata.resource_receipt_digest.clone(),
+        review_receipt_digest: metadata.review_receipt_digest.clone(),
+        method_manifest_digest: metadata.method_manifest_digest.clone(),
+        calibration_scope_digest: metadata.calibration_scope_digest.clone(),
+        source_model_digest: metadata.source_model_digest.clone(),
+        effective_looks_digest: metadata.effective_looks_digest.clone(),
+        support_method: metadata.support_method.clone(),
+        support_digest: metadata.support_digest.clone(),
+        correction_order_digest: metadata.correction_order_digest.clone(),
+        unwrap_branch_digest: metadata.unwrap_branch_digest.clone(),
+        burst_ownership_digest: metadata.burst_ownership_digest.clone(),
+        source_burst_ids: metadata.source_burst_ids.clone(),
+        reference_source_burst_index: metadata.reference_source_burst_index,
         calibration_scope: calibration_scope.to_owned(),
         maximum_block_bytes: metadata.maximum_block_bytes,
     }
