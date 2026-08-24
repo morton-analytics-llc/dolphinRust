@@ -4,6 +4,7 @@
 import hashlib
 import itertools
 import json
+import math
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
@@ -12,9 +13,10 @@ PASS = "pass"
 FAIL = "fail"
 NOT_EVALUABLE = "not_evaluable"
 STATUSES = {PASS, FAIL, NOT_EVALUABLE}
+ATTEMPT_STATUSES = {"valid", "masked_target", "tied_eigenvalue"}
 HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 5000
-FROZEN_GENERATOR_SHA256 = "8332973bb64ff7fbb3211106fb447c373d5dd6000ed0122df57999cd7e1398fe"
+FROZEN_GENERATOR_SHA256 = "40427ff2dcb44a57832c8300202168f896c8b2b6baf4c0daf48b1c7f3c807960"
 FROZEN_RESOURCE_IDS = ("tile_256_dates_13", "tile_256_dates_26", "tile_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -43,8 +45,8 @@ FROZEN_THRESHOLDS = {
 }
 RECEIPT_HASHES = {"code_sha256", "fixture_sha256", "operator_sha256", "variance_sha256", "resource_sha256", "generator_protocol_sha256", "config_sha256", "source_model_sha256", "result_sha256", "binary_sha256"}
 RECEIPT_KEYS = {"schema", "schema_version", "preregistration_sha256", "seed_schedule_sha256", "protocol", "binary", "hashes", "cells", "resources"}
-CELL_KEYS = {"cell_id", *DIMENSION_NAMES, "status", "not_evaluable_reason", "attempted_seeds", "emitted_seeds", "top_up_seeds", "target_coordinate", "reference_coordinate", "acquisition_count", "date_axis_sha256", "realized_overlap_percent", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "generator_hash", "truth_hash", "operator_relative_error", "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error", "psd_min_eigenvalue", "coverage_95", "emission_rate", "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash", "attempts"}
-ATTEMPT_KEYS = {"seed_index", "seed_sha256", "status", "emitted", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_coordinate", "reference_coordinate", "realized_overlap_percent", "signed_cross_influence", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width"}
+CELL_KEYS = {"cell_id", *DIMENSION_NAMES, "status", "not_evaluable_reason", "attempted_seeds", "emitted_seeds", "top_up_seeds", "target_coordinate", "reference_coordinate", "acquisition_count", "date_axis_sha256", "target_source_count_total", "reference_source_count_total", "intersection_source_count_total", "union_source_count_total", "realized_overlap_jaccard_mean", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "generator_hash", "truth_hash", "operator_relative_error", "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error", "psd_min_eigenvalue", "coverage_95", "emission_rate", "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash", "attempts"}
+ATTEMPT_KEYS = {"seed_index", "seed_sha256", "status", "emitted", "factor_emitted", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_coordinate", "reference_coordinate", "target_support_sha256", "reference_support_sha256", "target_source_count", "reference_source_count", "intersection_source_count", "union_source_count", "realized_overlap_jaccard", "signed_cross_influence", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width"}
 RESOURCE_KEYS = {"resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs", "measured_repetitions", "tool_versions", "growth_observation", "growth_regression", "acceptance"}
 
 
@@ -131,24 +133,17 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
         shape = spec.get("support_shape", [])
         if shape != [2 * spec.get("half_window", [0, 0])[0] + 1, 2 * spec.get("half_window", [0, 0])[1] + 1]:
             errors.append("coordinate %s support shape does not match production half-window" % key)
-        if set(spec.get("reference_delta_by_pair_geometry", {})) != set(PAIR_OVERLAP):
+        if set(spec.get("reference_delta_by_pair_geometry", {})) != set(PAIR_SIGN):
             errors.append("coordinate %s is missing a pair-geometry realization" % key)
-    overlap_fixture = coordinates.get("overlap_fixture", {})
-    target_units = set(overlap_fixture.get("target_units", []))
-    if target_units != {0, 1, 2, 3}:
-        errors.append("overlap fixture target support is not the frozen four-unit support")
-    if set(overlap_fixture.get("reference_units_by_geometry", {})) != set(PAIR_OVERLAP):
-        errors.append("overlap fixture is missing a pair-geometry realization")
-    for geometry, units in overlap_fixture.get("reference_units_by_geometry", {}).items():
-        if round(100 * len(target_units.intersection(units)) / 4) != PAIR_OVERLAP.get(geometry, -1):
-            errors.append("overlap fixture does not realize declared percentage for %s" % geometry)
+    if coordinates.get("geometry_labels_are_nominal_distance_strata") is not True or "Jaccard" not in coordinates.get("realized_overlap", "") or "overlap_fixture" in coordinates:
+        errors.append("geometry labels must be nominal and realized overlap must use per-attempt Jaccard")
     neighbors = generator.get("neighbor_generation", {})
     if neighbors.get("full_half_window") is not True or neighbors.get("offset_order") != "neighbor_grid_row_major_from_clamped_start" or neighbors.get("glrt", {}).get("alpha") != 0.001 or neighbors.get("ks", {}).get("alpha") != 0.001 or neighbors.get("fixed_support_reuse") is not True:
         errors.append("GLRT/KS support contract does not match production algorithms")
     if generator.get("effective_looks", {}).get("application") != "source_factor_divided_by_sqrt_fraction" or generator.get("effective_looks", {}).get("recompute_per_cell") is not True:
         errors.append("effective-look application or support-union recomputation is not frozen")
     supported = generator.get("supported", {})
-    if supported.get("not_evaluable_if") != ["tied_eigenvalue"] or "missing_attempt_record" not in supported.get("receipt_failure_if", []):
+    if supported.get("stable_attempt_statuses") != ["valid", "masked_target", "tied_eigenvalue"] or supported.get("not_evaluable_if") != ["tied_eigenvalue"] or supported.get("expected_abstention_if") != ["masked_target"] or "missing_attempt_record" not in supported.get("receipt_failure_if", []):
         errors.append("missing attempts must fail receipt validation; only tied eigenvalue is not-evaluable")
     sampling = preregistration.get("resource_sampling", {})
     if not all(key in sampling for key in ("os", "rss_field", "warmup_runs", "measured_repetitions", "growth_regression", "acceptance")):
@@ -215,19 +210,6 @@ def _expected_coordinates(preregistration: Mapping[str, Any], cell: Mapping[str,
     return target, [target[0] + delta[0], target[1] + delta[1]]
 
 
-PAIR_OVERLAP = {
-    "coincident": 100,
-    "shared_75_positive": 75,
-    "shared_75_negative": 75,
-    "shared_50_positive": 50,
-    "shared_50_negative": 50,
-    "shared_25_positive": 25,
-    "shared_25_negative": 25,
-    "disjoint_immediate": 0,
-    "disjoint_after_depth_1": 0,
-    "disjoint_after_depth_2": 0,
-    "disjoint_after_depth_4": 0,
-}
 PAIR_SIGN = {
     "coincident": "zero",
     "shared_75_positive": "positive",
@@ -241,6 +223,7 @@ PAIR_SIGN = {
     "disjoint_after_depth_2": "none",
     "disjoint_after_depth_4": "none",
 }
+DISJOINT_GEOMETRIES = {geometry for geometry, sign in PAIR_SIGN.items() if sign == "none"}
 
 
 def _expected_date_axis(preregistration: Mapping[str, Any], topology: str) -> list[str]:
@@ -252,20 +235,33 @@ def _expected_seed_hash(preregistration: Mapping[str, Any], cell_id: str, index:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistration: Mapping[str, Any], errors: List[str]) -> None:
+def realized_overlap_jaccard(target_count: Any, reference_count: Any, intersection_count: Any, union_count: Any) -> float:
+    counts = (target_count, reference_count, intersection_count, union_count)
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts):
+        raise SchemaError("source-key overlap counts must be non-negative integers")
+    if intersection_count > min(target_count, reference_count) or union_count != target_count + reference_count - intersection_count or union_count == 0:
+        raise SchemaError("source-key intersection/union arithmetic is invalid")
+    return intersection_count / union_count
+
+
+def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistration: Mapping[str, Any], errors: List[str]) -> Dict[str, Any] | None:
     attempts = cell.get("attempts")
     if not isinstance(attempts, list) or len(attempts) != FROZEN_SEED_COUNT:
         errors.append("cell %s requires exactly 5000 complete per-attempt records" % expected_id)
-        return
+        return None
     expected_target, expected_reference = _expected_coordinates(preregistration, cell)
     date_digest = sha256_json(_expected_date_axis(preregistration, cell["block_topology"]))
     expected_generator = sha256_json(preregistration["generator"])
     expected_config = sha256_json(preregistration["generator"])
     expected_source_model = sha256_json(preregistration["generator"]["source_centered_empirical"])
-    expected_overlap = PAIR_OVERLAP.get(cell.get("pair_geometry"), -1)
     expected_sign = PAIR_SIGN.get(cell.get("pair_geometry"), "invalid")
     seen = set()
     emitted = 0
+    target_total = 0
+    reference_total = 0
+    intersection_total = 0
+    union_total = 0
+    overlap_total = 0.0
     for attempt in attempts:
         if not isinstance(attempt, dict):
             errors.append("cell %s has a non-object attempt" % expected_id)
@@ -280,10 +276,10 @@ def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistratio
         seen.add(index)
         if attempt.get("seed_sha256") != _expected_seed_hash(preregistration, expected_id, index):
             errors.append("cell %s has a seed derivation mismatch" % expected_id)
-        if attempt.get("status") not in STATUSES or not isinstance(attempt.get("emitted"), bool):
+        if attempt.get("status") not in ATTEMPT_STATUSES or not isinstance(attempt.get("emitted"), bool) or not isinstance(attempt.get("factor_emitted"), bool):
             errors.append("cell %s has invalid attempt status/emission" % expected_id)
         emitted += int(attempt.get("emitted") is True)
-        _require_hashes(attempt, ("seed_sha256", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash"), "attempt", errors)
+        _require_hashes(attempt, ("seed_sha256", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_support_sha256", "reference_support_sha256"), "attempt", errors)
         if attempt.get("date_axis_sha256") != date_digest:
             errors.append("cell %s has a date-axis identity mismatch" % expected_id)
         if attempt.get("generator_hash") != expected_generator:
@@ -292,25 +288,53 @@ def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistratio
             errors.append("cell %s has a configuration/source-model identity mismatch" % expected_id)
         if attempt.get("target_coordinate") != expected_target or attempt.get("reference_coordinate") != expected_reference:
             errors.append("cell %s has a coordinate identity mismatch" % expected_id)
-        if attempt.get("realized_overlap_percent") != expected_overlap or attempt.get("signed_influence_sign") != expected_sign:
-            errors.append("cell %s has a realized overlap/sign mismatch" % expected_id)
+        try:
+            overlap = realized_overlap_jaccard(attempt.get("target_source_count"), attempt.get("reference_source_count"), attempt.get("intersection_source_count"), attempt.get("union_source_count"))
+        except SchemaError as exc:
+            errors.append("cell %s attempt %s: %s" % (expected_id, index, exc))
+            overlap = -1.0
+        if not _number(attempt.get("realized_overlap_jaccard")) or not math.isclose(attempt.get("realized_overlap_jaccard"), overlap, rel_tol=0.0, abs_tol=1e-15):
+            errors.append("cell %s attempt %s realized Jaccard does not match source-key counts" % (expected_id, index))
+        if cell.get("pair_geometry") == "coincident" and (overlap != 1.0 or attempt.get("target_support_sha256") != attempt.get("reference_support_sha256")):
+            errors.append("cell %s coincident supports must be identical with Jaccard 1" % expected_id)
+        if cell.get("pair_geometry") in DISJOINT_GEOMETRIES and overlap != 0.0:
+            errors.append("cell %s disjoint supports must have Jaccard 0" % expected_id)
+        if attempt.get("signed_influence_sign") != expected_sign:
+            errors.append("cell %s has a signed-influence mismatch" % expected_id)
+        target_total += attempt.get("target_source_count", 0) if isinstance(attempt.get("target_source_count"), int) else 0
+        reference_total += attempt.get("reference_source_count", 0) if isinstance(attempt.get("reference_source_count"), int) else 0
+        intersection_total += attempt.get("intersection_source_count", 0) if isinstance(attempt.get("intersection_source_count"), int) else 0
+        union_total += attempt.get("union_source_count", 0) if isinstance(attempt.get("union_source_count"), int) else 0
+        overlap_total += overlap
         if not _number(attempt.get("effective_looks_fraction")) or attempt["effective_looks_fraction"] <= 0 or attempt.get("effective_looks_application") != "source_factor_divided_by_sqrt_fraction":
             errors.append("cell %s has an invalid effective-look realization" % expected_id)
-        if expected_sign in {"positive", "negative"} and (not _number(attempt.get("signed_cross_influence")) or (attempt["signed_cross_influence"] > 0) != (expected_sign == "positive")):
-            errors.append("cell %s has a signed cross-influence mismatch" % expected_id)
-        if expected_sign == "zero" and attempt.get("signed_cross_influence") != 0.0:
-            errors.append("cell %s coincident influence must be exactly zero" % expected_id)
-        if expected_sign == "none" and attempt.get("signed_cross_influence") != 0.0:
-            errors.append("cell %s disjoint influence must be exactly zero" % expected_id)
-        for metric in ("operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "interval_score", "interval_width", "signed_cross_influence"):
-            if not _number(attempt.get(metric)):
-                errors.append("cell %s attempt %s is missing %s" % (expected_id, index, metric))
-        if not isinstance(attempt.get("covered_95"), bool):
-            errors.append("cell %s attempt %s is missing covered_95" % (expected_id, index))
+        if cell.get("position") == "masked":
+            if attempt.get("status") != "masked_target" or attempt.get("emitted") is not False or attempt.get("factor_emitted") is not False:
+                errors.append("cell %s masked attempt must abstain with factor_emitted=false" % expected_id)
+            for metric in ("operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width", "signed_cross_influence"):
+                if attempt.get(metric) is not None:
+                    errors.append("cell %s masked attempt %s must report null %s" % (expected_id, index, metric))
+        else:
+            if attempt.get("status") == "masked_target":
+                errors.append("cell %s non-masked attempt cannot use masked_target" % expected_id)
+            if attempt.get("status") == "tied_eigenvalue" and cell.get("eigen_stress") != "tied_eigenvalue":
+                errors.append("cell %s arbitrary attempt abstention is not permitted" % expected_id)
+            if attempt.get("factor_emitted") != attempt.get("emitted"):
+                errors.append("cell %s factor/emission flags disagree" % expected_id)
+            if expected_sign in {"positive", "negative"} and (not _number(attempt.get("signed_cross_influence")) or (attempt["signed_cross_influence"] > 0) != (expected_sign == "positive")):
+                errors.append("cell %s has a signed cross-influence mismatch" % expected_id)
+            if expected_sign in {"zero", "none"} and attempt.get("signed_cross_influence") != 0.0:
+                errors.append("cell %s zero/disjoint influence must be exactly zero" % expected_id)
+            for metric in ("operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "interval_score", "interval_width", "signed_cross_influence"):
+                if not _number(attempt.get(metric)):
+                    errors.append("cell %s attempt %s is missing %s" % (expected_id, index, metric))
+            if not isinstance(attempt.get("covered_95"), bool):
+                errors.append("cell %s attempt %s is missing covered_95" % (expected_id, index))
     if seen != set(range(FROZEN_SEED_COUNT)):
         errors.append("cell %s is missing one or more seed indices" % expected_id)
     if cell.get("emitted_seeds") != emitted:
         errors.append("cell %s emitted_seeds does not equal per-attempt emission" % expected_id)
+    return {"target_total": target_total, "reference_total": reference_total, "intersection_total": intersection_total, "union_total": union_total, "overlap_mean": overlap_total / FROZEN_SEED_COUNT}
 
 
 def _validate_cell(cell: Any, expected_id: str, preregistration: Mapping[str, Any], errors: List[str]) -> str:
@@ -335,8 +359,8 @@ def _validate_cell(cell: Any, expected_id: str, preregistration: Mapping[str, An
     expected_target, expected_reference = _expected_coordinates(preregistration, cell)
     if cell.get("target_coordinate") != expected_target or cell.get("reference_coordinate") != expected_reference:
         errors.append("cell %s coordinates do not match frozen position/geometry mapping" % expected_id)
-    if cell.get("realized_overlap_percent") != PAIR_OVERLAP.get(cell.get("pair_geometry")) or cell.get("signed_influence_sign") != PAIR_SIGN.get(cell.get("pair_geometry")):
-        errors.append("cell %s realized overlap/sign does not match frozen geometry" % expected_id)
+    if cell.get("signed_influence_sign") != PAIR_SIGN.get(cell.get("pair_geometry")):
+        errors.append("cell %s signed influence does not match frozen geometry" % expected_id)
     if not _number(cell.get("effective_looks_fraction")) or cell["effective_looks_fraction"] <= 0 or cell.get("effective_looks_application") != "source_factor_divided_by_sqrt_fraction":
         errors.append("cell %s effective-look fraction/application is missing or invalid" % expected_id)
     topology = preregistration["generator"]["acquisition"]["topologies"].get(cell.get("block_topology"), {})
@@ -345,7 +369,20 @@ def _validate_cell(cell: Any, expected_id: str, preregistration: Mapping[str, An
     _require_hashes(cell, ("operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash", "generator_hash", "truth_hash"), "cell", errors)
     if cell.get("generator_hash") != sha256_json(preregistration["generator"]):
         errors.append("cell %s generator hash does not match preregistration" % expected_id)
-    _validate_attempts(cell, expected_id, preregistration, errors)
+    aggregate = _validate_attempts(cell, expected_id, preregistration, errors)
+    if aggregate is not None:
+        for cell_field, aggregate_field in (("target_source_count_total", "target_total"), ("reference_source_count_total", "reference_total"), ("intersection_source_count_total", "intersection_total"), ("union_source_count_total", "union_total")):
+            if cell.get(cell_field) != aggregate[aggregate_field]:
+                errors.append("cell %s %s does not match per-attempt support counts" % (expected_id, cell_field))
+        if not _number(cell.get("realized_overlap_jaccard_mean")) or not math.isclose(cell["realized_overlap_jaccard_mean"], aggregate["overlap_mean"], rel_tol=0.0, abs_tol=1e-15):
+            errors.append("cell %s realized-overlap aggregate does not match per-attempt Jaccard" % expected_id)
+    if cell.get("position") == "masked":
+        if status != PASS or cell.get("emitted_seeds") != 0 or cell.get("emission_rate") != 0.0 or cell.get("variance_evaluable") is not False:
+            errors.append("cell %s masked target must pass through expected abstention" % expected_id)
+        for metric in ("operator_relative_error", "contrast_variance_reference", "contrast_variance_relative_error", "psd_min_eigenvalue", "coverage_95"):
+            if cell.get(metric) is not None:
+                errors.append("cell %s masked target must report null %s" % (expected_id, metric))
+        return status
     if status == NOT_EVALUABLE:
         return status
     thresholds = preregistration["thresholds"]

@@ -15,6 +15,9 @@ from validation.score_spatial_covariance import (
     validate_preregistration,
     sha256_json,
     SchemaError,
+    _expected_seed_hash,
+    _validate_cell,
+    realized_overlap_jaccard,
 )
 
 
@@ -45,6 +48,8 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(raw["hermitian_rule"], "C_ba=conjugate(C_ab)")
         self.assertEqual(raw["spatial_correlation"]["distance_scale_pixels"], 1.5)
         self.assertEqual(generator["source_centered_empirical"]["mean"], "zero; no sample-mean subtraction")
+        self.assertIn("zero_mean_second_moment_sha256", generator["source_centered_empirical"]["identity_hashes"])
+        self.assertNotIn("centered_values_sha256", generator["source_centered_empirical"]["identity_hashes"])
         planner = generator["acquisition"]["planner"]
         for topology in generator["acquisition"]["topologies"].values():
             starts = list(range(0, topology["acquisition_count"], planner["ministack_size"]))
@@ -55,13 +60,14 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
             self.assertEqual(topology["expected_blocks"], expected)
             self.assertEqual(len(topology["date_axis"]), topology["acquisition_count"])
 
-    def test_every_window_stride_has_realized_coordinates_and_exact_overlap_contract(self):
+    def test_every_window_stride_uses_nominal_geometry_and_attempt_overlap(self):
         coordinates = self.preregistration["generator"]["coordinates"]
         # The labels, rather than a single fallback delta, identify every production support.
         expected = {f"{item['id']}|{stride['id']}" for item in self.preregistration["dimensions"]["half_window"] for stride in self.preregistration["dimensions"]["stride"]}
         self.assertEqual(set(coordinates["window_stride"]), expected)
-        self.assertEqual(coordinates["overlap_counts"], {"shared_75": 3, "shared_50": 2, "shared_25": 1})
-        self.assertEqual(set(coordinates["overlap_fixture"]["reference_units_by_geometry"]), {item["id"] for item in self.preregistration["dimensions"]["pair_geometry"]})
+        self.assertTrue(coordinates["geometry_labels_are_nominal_distance_strata"])
+        self.assertIn("Jaccard", coordinates["realized_overlap"])
+        self.assertNotIn("overlap_fixture", coordinates)
         for spec in coordinates["window_stride"].values():
             self.assertEqual(spec["support_shape"], [2 * spec["half_window"][0] + 1, 2 * spec["half_window"][1] + 1])
             self.assertEqual(set(spec["reference_delta_by_pair_geometry"]), set(item["id"] for item in self.preregistration["dimensions"]["pair_geometry"]))
@@ -79,16 +85,12 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
         with self.assertRaises(SchemaError):
             validate_preregistration(changed)
 
-    def test_cell_overlap_and_sign_drift_is_rejected(self):
-        receipt = self._receipt_shell()
-        cell_id = expected_cell_ids(self.preregistration)[0]
-        labels = cell_id.split("|")
-        cell = dict(zip(("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process"), labels))
-        cell.update({"cell_id": cell_id, "status": NOT_EVALUABLE, "not_evaluable_reason": "test-only", "attempted_seeds": 5000, "emitted_seeds": 0, "top_up_seeds": 0, "realized_overlap_percent": 25, "signed_influence_sign": "negative", "attempts": []})
-        receipt["cells"] = [cell]
-        report = score_receipt(self.preregistration, receipt)
-        self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("realized overlap/sign" in error for error in report["errors"]))
+    def test_realized_overlap_uses_exact_jaccard_arithmetic(self):
+        self.assertEqual(realized_overlap_jaccard(4, 4, 4, 4), 1.0)
+        self.assertEqual(realized_overlap_jaccard(4, 4, 0, 8), 0.0)
+        self.assertAlmostEqual(realized_overlap_jaccard(4, 4, 2, 6), 1 / 3)
+        with self.assertRaises(SchemaError):
+            realized_overlap_jaccard(4, 4, 2, 7)
 
     def test_frozen_threshold_and_generator_changes_are_rejected(self):
         changed = copy.deepcopy(self.preregistration)
@@ -113,6 +115,103 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
             candidate["generator"][section][field] = value
             with self.subTest(section=section, field=field), self.assertRaises(SchemaError):
                 validate_preregistration(candidate)
+
+    def _masked_attempt(self, cell_id, seed_index):
+        generator = self.preregistration["generator"]
+        target = generator["coordinates"]["window_stride"]["hw_1x1|stride_1"]["target_by_position"]["masked"]
+        date_axis = generator["acquisition"]["topologies"]["one_block"]["date_axis"]
+        return {
+            "seed_index": seed_index,
+            "seed_sha256": _expected_seed_hash(self.preregistration, cell_id, seed_index),
+            "status": "masked_target",
+            "emitted": False,
+            "factor_emitted": False,
+            "raw_input_sha256": "1" * 64,
+            "truth_sha256": "2" * 64,
+            "operator_hash": "3" * 64,
+            "variance_hash": "4" * 64,
+            "emission_hash": "5" * 64,
+            "date_axis_sha256": sha256_json(date_axis),
+            "generator_hash": sha256_json(generator),
+            "config_hash": sha256_json(generator),
+            "source_model_hash": sha256_json(generator["source_centered_empirical"]),
+            "target_coordinate": target,
+            "reference_coordinate": target,
+            "target_support_sha256": "6" * 64,
+            "reference_support_sha256": "6" * 64,
+            "target_source_count": 4,
+            "reference_source_count": 4,
+            "intersection_source_count": 4,
+            "union_source_count": 4,
+            "realized_overlap_jaccard": 1.0,
+            "signed_cross_influence": None,
+            "signed_influence_sign": "zero",
+            "effective_looks_fraction": 1.0,
+            "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
+            "operator_relative_error": None,
+            "contrast_variance_relative_error": None,
+            "psd_min_eigenvalue": None,
+            "covered_95": None,
+            "interval_score": None,
+            "interval_width": None,
+        }
+
+    def _masked_cell(self):
+        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
+        labels = cell_id.split("|")
+        cell = dict(zip(("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process"), labels))
+        generator = self.preregistration["generator"]
+        target = generator["coordinates"]["window_stride"]["hw_1x1|stride_1"]["target_by_position"]["masked"]
+        date_axis = generator["acquisition"]["topologies"]["one_block"]["date_axis"]
+        cell.update({
+            "cell_id": cell_id,
+            "status": PASS,
+            "attempted_seeds": 5000,
+            "emitted_seeds": 0,
+            "top_up_seeds": 0,
+            "target_coordinate": target,
+            "reference_coordinate": target,
+            "acquisition_count": 5,
+            "date_axis_sha256": sha256_json(date_axis),
+            "target_source_count_total": 20000,
+            "reference_source_count_total": 20000,
+            "intersection_source_count_total": 20000,
+            "union_source_count_total": 20000,
+            "realized_overlap_jaccard_mean": 1.0,
+            "signed_influence_sign": "zero",
+            "effective_looks_fraction": 1.0,
+            "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
+            "generator_hash": sha256_json(generator),
+            "truth_hash": "7" * 64,
+            "operator_relative_error": None,
+            "contrast_variance_reference": None,
+            "variance_evaluable": False,
+            "contrast_variance_relative_error": None,
+            "psd_min_eigenvalue": None,
+            "coverage_95": None,
+            "emission_rate": 0.0,
+            "operator_hash": "8" * 64,
+            "variance_hash": "9" * 64,
+            "psd_hash": "a" * 64,
+            "coverage_hash": "b" * 64,
+            "emission_hash": "c" * 64,
+            "attempts": [self._masked_attempt(cell_id, index) for index in range(5000)],
+        })
+        return cell_id, cell
+
+    def test_masked_target_abstention_passes_without_coverage_or_emission(self):
+        cell_id, cell = self._masked_cell()
+        errors = []
+        self.assertEqual(_validate_cell(cell, cell_id, self.preregistration, errors), PASS)
+        self.assertEqual(errors, [])
+
+    def test_attempt_overlap_and_cell_aggregate_drift_are_rejected(self):
+        cell_id, cell = self._masked_cell()
+        cell["attempts"][0]["union_source_count"] = 5
+        errors = []
+        _validate_cell(cell, cell_id, self.preregistration, errors)
+        self.assertTrue(any("intersection/union arithmetic" in error for error in errors))
+        self.assertTrue(any("realized-overlap aggregate" in error for error in errors))
 
     def _receipt_shell(self):
         generator = self.preregistration["generator"]
