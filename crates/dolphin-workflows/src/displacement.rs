@@ -337,6 +337,7 @@ pub fn run_displacement_with_output_policy(
         "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
@@ -2881,6 +2882,32 @@ fn acquisition_days(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Vec
         .context("parsing acquisition dates from CSLC filenames")
 }
 
+fn validate_common_burst_dates(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+) -> Result<()> {
+    let mut axes = Vec::with_capacity(groups.len());
+    for (id, indices) in groups {
+        let files = burst_files(cfg, indices);
+        acquisition_days(cfg, &files).with_context(|| format!("burst {id}"))?;
+        let dates = files
+            .iter()
+            .map(|file| parse_date(file, &cfg.input_options.cslc_date_fmt))
+            .collect::<Result<Vec<_>>>()?;
+        axes.push((id, dates));
+    }
+    let Some((reference_id, reference_dates)) = axes.first() else {
+        return Ok(());
+    };
+    for (id, dates) in axes.iter().skip(1) {
+        anyhow::ensure!(
+            dates == reference_dates,
+            "bursts have different ordered acquisition dates: {reference_id} and {id}"
+        );
+    }
+    Ok(())
+}
+
 fn capture_input_groups(
     cfg: &DisplacementWorkflow,
     groups: &BTreeMap<String, Vec<usize>>,
@@ -3018,6 +3045,7 @@ pub fn run_displacement_resumable(
         "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
@@ -3098,6 +3126,7 @@ pub fn update_displacement(
         "phase_linking.write_covariance_operator is unsupported for resumable updates"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
