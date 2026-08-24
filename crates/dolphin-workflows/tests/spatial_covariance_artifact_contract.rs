@@ -2,7 +2,8 @@ use dolphin_io::{
     spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
     CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
     SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
+    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
 use dolphin_workflows::spatial_covariance_artifact::{
     spatial_reference_covariance_code_digest, spatial_reference_covariance_design_digest,
@@ -84,9 +85,15 @@ fn block() -> SpatialReferenceCovarianceBlock {
         status: vec![SpatialReferenceCovarianceStatus::Valid],
         source_burst_index_by_target: vec![0],
         difference_factor: vec![0.0, 1.0],
-        approximation_error_bound: vec![0.01],
+        approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE],
         source_factor_digest: digest(0x77),
     }
+}
+
+fn calibrated_block() -> SpatialReferenceCovarianceBlock {
+    let mut value = block();
+    value.approximation_error_bound = vec![0.01];
+    value
 }
 
 fn calibrated_metadata() -> SpatialReferenceCovarianceMetadata {
@@ -558,7 +565,8 @@ fn calibration_requires_complete_nonzero_evidence_and_never_follows_file_presenc
     let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
     let missing_evidence = calibrated_metadata();
     let receipt =
-        write_spatial_reference_covariance(&scratch, &missing_evidence, &[block()]).unwrap();
+        write_spatial_reference_covariance(&scratch, &missing_evidence, &[calibrated_block()])
+            .unwrap();
     let error = finalize_spatial_reference_covariance_artifact(
         &transaction,
         &scratch,
@@ -578,7 +586,8 @@ fn calibration_requires_complete_nonzero_evidence_and_never_follows_file_presenc
     let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
     let mut calibrated = metadata();
     write_promotion_evidence(&directory, &mut calibrated);
-    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()]).unwrap();
     let manifest = finalize_spatial_reference_covariance_artifact(
         &transaction,
         &scratch,
@@ -610,7 +619,8 @@ fn promotion_evidence_hashes_and_bindings_must_match_actual_files() {
     let method_bytes = serde_json::to_vec_pretty(&method).unwrap();
     std::fs::write(&method_path, &method_bytes).unwrap();
     stale.method_manifest_digest = content_digest(&method_bytes);
-    let receipt = write_spatial_reference_covariance(&scratch, &stale, &[block()]).unwrap();
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &stale, &[calibrated_block()]).unwrap();
     let error =
         finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &stale, &receipt)
             .unwrap_err()
@@ -623,7 +633,8 @@ fn promotion_evidence_hashes_and_bindings_must_match_actual_files() {
     let transaction = SpatialReferenceCovarianceArtifactTransaction::acquire(&directory).unwrap();
     let mut calibrated = metadata();
     write_promotion_evidence(&directory, &mut calibrated);
-    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()]).unwrap();
     finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &calibrated, &receipt)
         .unwrap();
     drop(transaction);
@@ -657,7 +668,8 @@ fn tampered_design_numeric_result_and_resource_receipt_fail_closed() {
         write_promotion_evidence(&directory, &mut calibrated);
         std::fs::write(directory.join(evidence_file), b"{}\n").unwrap();
         let receipt =
-            write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+            write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()])
+                .unwrap();
         let error = finalize_spatial_reference_covariance_artifact(
             &transaction,
             &scratch,
@@ -768,7 +780,8 @@ fn self_consistent_wrapper_hashes_cannot_replace_current_code_design_or_binary()
         calibrated.method_manifest_digest = content_digest(&method_bytes);
 
         let receipt =
-            write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+            write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()])
+                .unwrap();
         let error = finalize_spatial_reference_covariance_artifact(
             &transaction,
             &scratch,
@@ -800,7 +813,8 @@ fn missing_calibrated_evidence_is_quarantined_as_deterministically_incomplete() 
     let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
     let mut calibrated = metadata();
     write_promotion_evidence(&directory, &mut calibrated);
-    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()]).unwrap();
     finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &calibrated, &receipt)
         .unwrap();
     drop(transaction);
@@ -840,7 +854,8 @@ fn permission_denied_calibrated_evidence_preserves_the_final_pair() {
     let scratch = directory.join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
     let mut calibrated = metadata();
     write_promotion_evidence(&directory, &mut calibrated);
-    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
+    let receipt =
+        write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()]).unwrap();
     finalize_spatial_reference_covariance_artifact(&transaction, &scratch, &calibrated, &receipt)
         .unwrap();
     drop(transaction);
@@ -913,17 +928,21 @@ fn calibrated_scope_requires_every_nonzero_scope_identity() {
             _ => {}
         }
         value.calibration_scope_digest = spatial_reference_calibration_scope_digest(&value);
-        let receipt = write_spatial_reference_covariance(&scratch, &value, &[block()]).unwrap();
-        let error = finalize_spatial_reference_covariance_artifact(
-            &transaction,
-            &scratch,
-            &value,
-            &receipt,
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            match write_spatial_reference_covariance(&scratch, &value, &[calibrated_block()]) {
+                Ok(receipt) => finalize_spatial_reference_covariance_artifact(
+                    &transaction,
+                    &scratch,
+                    &value,
+                    &receipt,
+                )
+                .unwrap_err()
+                .to_string(),
+                Err(error) => error.to_string(),
+            };
         assert!(
-            error.contains("nonzero scope identities"),
+            error.contains("nonzero scope identities")
+                || error.contains("strong promotion receipts"),
             "{identity}: {error}"
         );
         drop(transaction);
@@ -944,16 +963,10 @@ fn calibrated_promotion_rejects_non_commit_producer_labels() {
     let mut calibrated = metadata();
     calibrated.producer_commit = Some("abc123".to_owned());
     write_promotion_evidence(&directory, &mut calibrated);
-    let receipt = write_spatial_reference_covariance(&scratch, &calibrated, &[block()]).unwrap();
-    let error = finalize_spatial_reference_covariance_artifact(
-        &transaction,
-        &scratch,
-        &calibrated,
-        &receipt,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("exact producer commit"), "{error}");
+    let error = write_spatial_reference_covariance(&scratch, &calibrated, &[calibrated_block()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exact producer"), "{error}");
     drop(transaction);
     std::fs::remove_dir_all(directory).unwrap();
 }
