@@ -11,6 +11,7 @@ pub mod burst;
 pub mod corrections;
 pub mod covariance_artifact;
 pub mod crop;
+pub mod cslc_covariance_source;
 pub mod dates;
 pub mod displacement;
 pub mod fixed_cube;
@@ -31,6 +32,12 @@ pub use covariance_artifact::{
     COVARIANCE_OPERATOR_MANIFEST_FILENAME,
 };
 pub use crop::{BoundsError, ProcessingBoundsProvenance};
+pub use cslc_covariance_source::{
+    empirical_factor_config, CslcCovarianceManifest, CslcCovarianceResolverMetrics,
+    CslcCovarianceSourceResolver, CslcCovarianceValidityReader, CslcManifestResourceEstimate,
+    CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+    CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+};
 pub use displacement::{
     run_displacement, run_displacement_resumable, run_displacement_with_output_policy,
     update_displacement, DisplacementOutput, DisplacementOutputPolicy, DisplacementState,
@@ -45,21 +52,23 @@ pub use provenance::{
 };
 pub use sequential::{
     run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
-    run_sequential_resumable, run_sequential_resumable_masked,
-    run_sequential_with_covariance_capture, update_sequential, update_sequential_masked,
-    SequentialConfig, SequentialOutput, SequentialState,
+    run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
+    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, update_sequential,
+    update_sequential_masked, SequentialConfig, SequentialOutput, SequentialState,
 };
 pub use sequential_covariance::{
-    sequential_replay_config_digest, sequential_replay_kernel_digest,
-    sequential_source_model_identity_digest, CovarianceArtifactReplayMetrics,
-    CovarianceArtifactReplayProvider, DependencyConeEstimate, DependencyConeQuery, GlobalBlockId,
-    GlobalDateId, ReferenceDifferenceCovarianceReplay, ReferenceSpecificExecutionMode,
-    ReferenceSpecificReplayScope, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace,
-    ReplayStatus, ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
-    SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
-    SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SpatialCovarianceStatus,
-    TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
+    empirical_source_factor_receipt_digest, sequential_replay_config_digest,
+    sequential_replay_kernel_digest, sequential_source_model_identity_digest,
+    CovarianceArtifactReplayMetrics, CovarianceArtifactReplayProvider, DependencyConeEstimate,
+    DependencyConeQuery, GlobalBlockId, GlobalDateId, ReferenceDifferenceCovarianceReplay,
+    ReferenceSpecificExecutionMode, ReferenceSpecificReplayScope, ReplayBackend,
+    ReplayExecutionScope, ReplayIdNamespace, ReplayStatus, ResolvedCompressionReplay,
+    ResolvedPhaseReplay, ResolvedPrimitiveSource, SequentialCovarianceCaptureRequest,
+    SequentialPrimitiveSourceResolver, SequentialReplayBlock, SequentialReplayBuildIdentity,
+    SequentialReplayError, SequentialReplayTopology, SequentialSourceProviderIdentity,
+    SequentialSourceReplayProvider, SpatialCovarianceStatus, TemporalCovarianceReplay,
+    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use spatial_covariance_artifact::{
     finalize_spatial_reference_covariance_artifact,
