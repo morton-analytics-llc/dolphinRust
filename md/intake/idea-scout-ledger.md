@@ -34,19 +34,6 @@ Entry format:
   the existing IONEX path in `dolphin-corrections::ionosphere`, off by default.
 - **Added**: 2026-08-01 by scheduled scout run
 
-### D3 — Automated loop-closure QC gate for unwrap-network errors
-- **Source**: competitive (LiCSBAS)
-- **Issue**: #24 (enhancement-labeled, NOT yet backlog-ready)
-- **Re-entry gate**: a design review confirms this targets unwrap-network errors distinct
-  from what the existing closure-phase/phase-bias quality layer already catches, and
-  clarifies whether the existing per-ifg `conncomp_NN.tif` labels already provide enough
-  signal to build this cheaply.
-- **Design sketch**: network-level phase-closure-loop pass over the interferogram set,
-  flagging/masking pixels with inconsistent loop sums before the SBAS solve — distinct
-  from the per-pixel decorrelation-driven non-closure bias `dolphin-phaselink` already
-  measures.
-- **Added**: 2026-08-01 by scheduled scout run
-
 ### D4 — Possible output-grid geometry ambiguity under asymmetric strides
 - **Source**: inbound (cross-repo signal, `../eo`#277 — P1 production incident, unconfirmed hypothesis)
 - **Issue**: #26 (enhancement-labeled, NOT yet backlog-ready)
@@ -60,7 +47,37 @@ Entry format:
   extending the existing Phase 0 block-manager property tests.
 - **Added**: 2026-08-03 by scheduled scout run
 
+### D6 — Expose orbit ephemeris class (POE/RESORB) for processing provenance
+- **Source**: inbound (cross-repo signal, `../eo`#483 — Table 5 processing-provenance audit)
+- **Issue**: #57 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: confirm the exact HDF5 dataset/group path for orbit-file provenance
+  (e.g. `/metadata/processing_information/inputs/orbit_files` or similar) against a real
+  OPERA CSLC-S1 granule or the authoritative product spec — `dolphin-io::cslc_metadata`'s
+  existing keys were granule-verified before shipping, and this field hasn't been.
+- **Design sketch**: if confirmed, a small `dolphin-io` reader mirroring
+  `read_cslc_burst_metadata`, plus a `dolphin-workflows::provenance` classification step
+  (orbit filename pattern `*_AUX_POEORB_*` / `*_AUX_RESORB_*` → `Precise`/`Restituted`/
+  `Unknown`), keeping this module's IO-only / interpretation-elsewhere split.
+- **Added**: 2026-08-24 by scheduled scout run
+
 ## SHIPPED
+
+### D3 — Automated loop-closure QC gate for unwrap-network errors
+- **Source**: competitive (LiCSBAS)
+- **Issue**: #24
+- **Gate result**: design review confirmed the gap — wrapped-domain closure phase is
+  mathematically blind to whole-cycle (2π) unwrap errors (`.arg()` discards them by
+  construction), and the existing conncomp labels give correction granularity + a free
+  prefilter but no cross-interferogram/network-loop signal, so new machinery was needed.
+- **Design sketch**: `dolphin-timeseries::loop_closure` closes every network triangle on
+  the unwrapped stack; residual `φ_ij + φ_jk − φ_ik` ≈ 0 for a good unwrap and ±2πn for an
+  error. Masks failing pixels across every interferogram before the SBAS solve, gated by
+  `timeseries_options.mask_unwrap_loop_errors` (off by default). Emits
+  `loop_closure_bad_count.tif` / `loop_closure_worst_cycles.tif`. Noted scope finding: a
+  single-reference network has no loops (no-op, warns not errors) — ties to issue #36's
+  over-determined-network conclusion and dolphin v0.42's nearest-3 default (issue #25).
+- **Added**: 2026-08-01 by scheduled scout run
+- **Shipped**: 2026-08-09 by manual contract-first implementation (`dfdfeb1`)
 
 ### D1 — Degenerate all-non-finite input window silently yields temporal_coherence=1.0 / displacement=0.0
 - **Source**: inbound (cross-repo signal, `../eo` `dolphin-safety-report.md` Finding #2)
