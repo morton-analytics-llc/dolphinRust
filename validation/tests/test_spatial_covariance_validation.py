@@ -1,5 +1,9 @@
 import copy
+import hashlib
 import json
+import shutil
+import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -7,17 +11,36 @@ from validation.score_spatial_covariance import (
     FAIL,
     NOT_EVALUABLE,
     PASS,
+    CellAccumulator,
+    FROZEN_ATTEMPT_COUNT,
+    FROZEN_CELL_COUNT,
+    FROZEN_MAX_RECORD_BYTES,
+    FROZEN_SEED_COUNT,
+    FROZEN_SHARD_COUNT,
+    SchemaError,
+    ShardSpec,
+    _expected_seed_hash,
+    _validate_performance_probe,
     expected_cell_ids,
+    iter_shard_specs,
     load_preregistration,
     preregistration_digest,
+    result_root_sha256,
+    score_attempt_shard,
     score_receipt,
-    seed_schedule_digest,
-    validate_preregistration,
     sha256_json,
-    SchemaError,
-    _expected_seed_hash,
-    _validate_cell,
-    realized_overlap_jaccard,
+    validate_preregistration,
+    validate_shard_manifest,
+)
+from validation.spatial_covariance_simulation import (
+    committed_shard_matches,
+    commit_output_shard,
+    build_run_manifest,
+    compact_json_line,
+    derive_concurrency_receipt,
+    inspect_one_input_one_output,
+    iter_attempt_requests,
+    write_jsonl_atomic,
 )
 
 
@@ -26,117 +49,140 @@ PREREGISTRATION = VALIDATION / "spatial_covariance_preregistration.json"
 PR61_FIXTURE = VALIDATION / "fixtures" / "spatial_covariance_validation" / "pr61_bookkeeping_receipt.json"
 
 
-class SpatialCovariancePreregistrationTests(unittest.TestCase):
+class SpatialCovarianceValidationV3Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.preregistration = load_preregistration(PREREGISTRATION)
 
-    def test_v2_full_matrix_and_protocol_are_explicit(self):
-        self.assertEqual(self.preregistration["schema_version"], 2)
-        ids = expected_cell_ids(self.preregistration)
-        self.assertEqual(len(ids), 89100)
-        self.assertIn("hw_7x14|stride_4|ks_frozen|masked|disjoint_after_depth_4|four_blocks_partial_final|evd|near_tie|spatial_correlation_stress", ids)
-        self.assertEqual(self.preregistration["generator"]["binary"]["input_schema"], "dolphinrust.spatial-covariance.attempt/2")
-        self.assertTrue(self.preregistration["generator"]["binary"]["one_input_one_output"])
+    def test_v3_freezes_full_matrix_attempt_count_and_outcome_free_state(self):
+        validate_preregistration(self.preregistration)
+        self.assertEqual(self.preregistration["schema_version"], 3)
+        self.assertFalse(self.preregistration["outcomes_present"])
+        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 2)
+        self.assertFalse(self.preregistration["supersedes"]["outcomes_present"])
+        self.assertEqual(self.preregistration["matrix_contract"]["expected_cell_count"], FROZEN_CELL_COUNT)
+        self.assertEqual(self.preregistration["matrix_contract"]["expected_attempt_count"], FROZEN_ATTEMPT_COUNT)
+        self.assertEqual(len(expected_cell_ids(self.preregistration)), 89100)
+        self.assertTrue(self.preregistration["matrix_contract"]["source_process_axis_required"])
+        execution = self.preregistration["execution_protocol"]
+        self.assertLessEqual(execution["max_cells_per_shard"], 120)
+        self.assertEqual(execution["shard_count"], 891)
+        self.assertLessEqual(execution["max_cells_per_shard"] * FROZEN_SEED_COUNT * execution["max_encoded_output_record_bytes"], execution["max_uncompressed_output_bytes"])
 
-    def test_generator_is_dimensioned_and_mirrors_ministack_planner(self):
-        generator = self.preregistration["generator"]
-        raw = generator["raw_proper_complex"]
-        self.assertEqual(raw["covariance_shape"], "N_by_N_per_topology")
-        self.assertIn("C_ab", raw["covariance_formula"])
-        self.assertIn("lower_hermitian_cholesky", raw["sampler"])
-        self.assertEqual(raw["hermitian_rule"], "C_ba=conjugate(C_ab)")
-        self.assertEqual(raw["spatial_correlation"]["distance_scale_pixels"], 1.5)
-        self.assertEqual(generator["source_centered_empirical"]["mean"], "zero; no sample-mean subtraction")
-        self.assertIn("zero_mean_second_moment_sha256", generator["source_centered_empirical"]["identity_hashes"])
-        self.assertNotIn("centered_values_sha256", generator["source_centered_empirical"]["identity_hashes"])
-        planner = generator["acquisition"]["planner"]
-        for topology in generator["acquisition"]["topologies"].values():
-            starts = list(range(0, topology["acquisition_count"], planner["ministack_size"]))
-            expected = [
-                {"block_id": block, "num_compressed": min(block, topology["max_num_compressed"]), "real_start": start, "num_real": min(planner["ministack_size"], topology["acquisition_count"] - start)}
-                for block, start in enumerate(starts)
-            ]
-            self.assertEqual(topology["expected_blocks"], expected)
-            self.assertEqual(len(topology["date_axis"]), topology["acquisition_count"])
-
-    def test_every_window_stride_uses_nominal_geometry_and_attempt_overlap(self):
-        coordinates = self.preregistration["generator"]["coordinates"]
-        # The labels, rather than a single fallback delta, identify every production support.
-        expected = {f"{item['id']}|{stride['id']}" for item in self.preregistration["dimensions"]["half_window"] for stride in self.preregistration["dimensions"]["stride"]}
-        self.assertEqual(set(coordinates["window_stride"]), expected)
-        self.assertTrue(coordinates["geometry_labels_are_nominal_distance_strata"])
-        self.assertIn("Jaccard", coordinates["realized_overlap"])
-        self.assertNotIn("overlap_fixture", coordinates)
-        for spec in coordinates["window_stride"].values():
-            self.assertEqual(spec["support_shape"], [2 * spec["half_window"][0] + 1, 2 * spec["half_window"][1] + 1])
-            self.assertEqual(set(spec["reference_delta_by_pair_geometry"]), set(item["id"] for item in self.preregistration["dimensions"]["pair_geometry"]))
-
-    def test_production_support_and_status_rules_are_fail_closed(self):
-        generator = self.preregistration["generator"]
-        self.assertTrue(generator["neighbor_generation"]["full_half_window"])
-        self.assertEqual(generator["neighbor_generation"]["offset_order"], "neighbor_grid_row_major_from_clamped_start")
-        self.assertEqual(generator["neighbor_generation"]["glrt"]["alpha"], 0.001)
-        self.assertEqual(generator["neighbor_generation"]["ks"]["alpha"], 0.001)
-        self.assertEqual(generator["supported"]["not_evaluable_if"], ["tied_eigenvalue"])
-        self.assertIn("missing_attempt_record", generator["supported"]["receipt_failure_if"])
+    def test_44550_count_from_omitting_source_process_is_rejected(self):
+        product_without_source_process = 3 * 3 * 3 * 5 * 11 * 5 * 2 * 3
+        self.assertEqual(product_without_source_process, 44550)
         changed = copy.deepcopy(self.preregistration)
-        changed["generator"]["supported"]["not_evaluable_if"].append("missing_attempt_record")
-        with self.assertRaises(SchemaError):
+        changed["matrix_contract"]["expected_cell_count"] = product_without_source_process
+        changed["matrix_contract"]["expected_attempt_count"] = product_without_source_process * FROZEN_SEED_COUNT
+        changed["matrix_contract"]["source_process_axis_required"] = False
+        with self.assertRaisesRegex(SchemaError, "89100"):
             validate_preregistration(changed)
 
-    def test_realized_overlap_uses_exact_jaccard_arithmetic(self):
-        self.assertEqual(realized_overlap_jaccard(4, 4, 4, 4), 1.0)
-        self.assertEqual(realized_overlap_jaccard(4, 4, 0, 8), 0.0)
-        self.assertAlmostEqual(realized_overlap_jaccard(4, 4, 2, 6), 1 / 3)
-        with self.assertRaises(SchemaError):
-            realized_overlap_jaccard(4, 4, 2, 7)
-
-    def test_frozen_threshold_and_generator_changes_are_rejected(self):
-        changed = copy.deepcopy(self.preregistration)
-        changed["thresholds"]["coverage_absolute_error_max"] = 0.03
-        with self.assertRaises(SchemaError):
-            validate_preregistration(changed)
+    def test_scientific_axes_seeds_thresholds_and_generator_are_immutable(self):
         mutations = (
-            ("binary", "input_schema", "drift/2"),
-            ("acquisition", "cadence_days", 24),
-            ("raw_proper_complex", "noise_scale", 2.0),
-            ("source_centered_empirical", "shrinkage_alpha", 0.1),
-            ("effective_looks", "distance_scale_pixels", 2.0),
-            ("estimators", "emi", {"beta": 0.1}),
-            ("neighbor_generation", "fixed_support_reuse", False),
-            ("coordinates", "rounding", "float"),
-            ("truth", "z_95", 1.96),
-            ("supported", "supported_if", ["finite_raw_source"]),
-            ("identity", "protocol_version", 3),
+            ("thresholds", "coverage_absolute_error_max", 0.03),
+            ("seed_schedule", "attempted_seeds_per_cell", 4999),
+            ("generator", "source_centered_empirical", {"model": "drift"}),
+            ("execution_protocol", "max_cells_per_shard", 121),
+            ("cell_reducers", "coverage_95", "wrong denominator"),
         )
         for section, field, value in mutations:
-            candidate = copy.deepcopy(self.preregistration)
-            candidate["generator"][section][field] = value
+            changed = copy.deepcopy(self.preregistration)
+            changed[section][field] = value
             with self.subTest(section=section, field=field), self.assertRaises(SchemaError):
-                validate_preregistration(candidate)
+                validate_preregistration(changed)
 
-    def _masked_attempt(self, cell_id, seed_index):
+    def test_all_shards_are_contiguous_complete_and_at_most_120_cells(self):
+        expected_start = 0
+        count = 0
+        last = None
+        for spec in iter_shard_specs(self.preregistration):
+            self.assertEqual(spec.index, count)
+            self.assertEqual(spec.cell_ordinal_start, expected_start)
+            self.assertEqual(spec.cell_ordinal_end_exclusive - spec.cell_ordinal_start, len(spec.cell_ids))
+            self.assertLessEqual(len(spec.cell_ids), 120)
+            expected_start = spec.cell_ordinal_end_exclusive
+            count += 1
+            last = spec
+        self.assertEqual(count, FROZEN_SHARD_COUNT)
+        self.assertEqual(expected_start, FROZEN_CELL_COUNT)
+        self.assertEqual(len(last.cell_ids), 100)
+
+    def test_request_stream_is_exact_ordered_seed_schedule_without_top_up(self):
+        cell_id = next(iter(expected_cell_ids(self.preregistration)))
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        count = 0
+        first = None
+        last = None
+        for request in iter_attempt_requests(self.preregistration, spec):
+            first = request if first is None else first
+            last = request
+            self.assertEqual(request["seed_index"], count)
+            count += 1
+        self.assertEqual(count, 5000)
+        self.assertEqual(first["seed_index"], 0)
+        self.assertEqual(last["seed_index"], 4999)
+        self.assertEqual(last["seed_sha256"], _expected_seed_hash(self.preregistration, cell_id, 4999))
+
+    def test_byte_cap_fails_without_final_or_partial_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "attempts.jsonl"
+            with self.assertRaisesRegex(SchemaError, "byte cap"):
+                write_jsonl_atomic(({"value": "x" * 64},), destination, byte_limit=16)
+            self.assertFalse(destination.exists())
+            self.assertFalse(Path(str(destination) + ".partial").exists())
+
+    def test_one_input_one_output_rejects_missing_out_of_order_and_malformed(self):
+        records = [
+            {"cell_id": "a", "cell_ordinal": 0, "seed_index": 0, "seed_sha256": "0" * 64},
+            {"cell_id": "a", "cell_ordinal": 0, "seed_index": 1, "seed_sha256": "1" * 64},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "input.jsonl"
+            write_jsonl_atomic(records, input_path)
+            for name, outputs, message in (
+                ("missing", records[:1], "cardinality"),
+                ("order", list(reversed(records)), "order/identity"),
+            ):
+                partial = root / f"{name}.jsonl.partial"
+                partial.write_bytes(b"".join(compact_json_line(record) for record in outputs))
+                with self.subTest(name=name), self.assertRaisesRegex(SchemaError, message):
+                    inspect_one_input_one_output(input_path, partial)
+            malformed = root / "malformed.jsonl.partial"
+            malformed.write_bytes(compact_json_line(records[0]) + b"{\n")
+            with self.assertRaisesRegex(SchemaError, "malformed"):
+                inspect_one_input_one_output(input_path, malformed)
+
+    def _attempt(self, cell_id, ordinal, seed_index, status="valid", covered=True):
+        labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
         generator = self.preregistration["generator"]
-        target = generator["coordinates"]["window_stride"]["hw_1x1|stride_1"]["target_by_position"]["masked"]
-        date_axis = generator["acquisition"]["topologies"]["one_block"]["date_axis"]
+        window = generator["coordinates"]["window_stride"][f"{labels['half_window']}|{labels['stride']}"]
+        target = window["target_by_position"][labels["position"]]
+        delta = window["reference_delta_by_pair_geometry"][labels["pair_geometry"]]
+        reference = [target[0] + delta[0], target[1] + delta[1]]
+        masked = status == "masked_target"
         return {
+            "schema": "dolphinrust.spatial-covariance.attempt-receipt/3",
+            "cell_id": cell_id,
+            "cell_ordinal": ordinal,
             "seed_index": seed_index,
             "seed_sha256": _expected_seed_hash(self.preregistration, cell_id, seed_index),
-            "status": "masked_target",
-            "emitted": False,
-            "factor_emitted": False,
+            "status": status,
+            "emitted": not masked,
+            "factor_emitted": not masked,
             "raw_input_sha256": "1" * 64,
             "truth_sha256": "2" * 64,
             "operator_hash": "3" * 64,
             "variance_hash": "4" * 64,
             "emission_hash": "5" * 64,
-            "date_axis_sha256": sha256_json(date_axis),
+            "date_axis_sha256": sha256_json(generator["acquisition"]["topologies"][labels["block_topology"]]["date_axis"]),
             "generator_hash": sha256_json(generator),
             "config_hash": sha256_json(generator),
             "source_model_hash": sha256_json(generator["source_centered_empirical"]),
             "target_coordinate": target,
-            "reference_coordinate": target,
+            "reference_coordinate": reference,
             "target_support_sha256": "6" * 64,
             "reference_support_sha256": "6" * 64,
             "target_source_count": 4,
@@ -144,131 +190,220 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
             "intersection_source_count": 4,
             "union_source_count": 4,
             "realized_overlap_jaccard": 1.0,
-            "signed_cross_influence": None,
+            "signed_cross_influence": None if masked else 0.0,
             "signed_influence_sign": "zero",
             "effective_looks_fraction": 1.0,
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
-            "operator_relative_error": None,
-            "contrast_variance_relative_error": None,
-            "psd_min_eigenvalue": None,
-            "covered_95": None,
-            "interval_score": None,
-            "interval_width": None,
+            "operator_relative_error": None if masked else 0.0,
+            "contrast_variance_reference": None if masked else 1.0,
+            "contrast_variance_relative_error": None if masked else 0.0,
+            "psd_min_eigenvalue": None if masked else 0.0,
+            "covered_95": None if masked else covered,
+            "interval_score": None if masked else 1.0,
+            "interval_width": None if masked else 1.0,
         }
 
-    def _masked_cell(self):
+    def test_cell_reducers_use_frozen_max_min_and_denominators(self):
+        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=20)
+        for seed_index in range(20):
+            attempt = self._attempt(cell_id, 0, seed_index, covered=seed_index < 19)
+            attempt["operator_relative_error"] = seed_index * 1e-13
+            attempt["contrast_variance_relative_error"] = seed_index * 1e-3
+            attempt["psd_min_eigenvalue"] = seed_index * -1e-12
+            accumulator.add(attempt)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["status"], PASS)
+        self.assertEqual(summary["coverage_95"], 0.95)
+        self.assertEqual(summary["emission_rate"], 1.0)
+        self.assertEqual(summary["operator_relative_error"], 19e-13)
+        self.assertEqual(summary["contrast_variance_relative_error"], 0.019)
+        self.assertEqual(summary["psd_min_eigenvalue"], -19e-12)
+
+    def test_masked_and_tied_cells_are_complete_not_pruned(self):
+        masked_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
+        masked = CellAccumulator(self.preregistration, masked_id, 1, expected_seed_count=3)
+        for seed_index in range(3):
+            masked.add(self._attempt(masked_id, 1, seed_index, status="masked_target"))
+        self.assertEqual(masked.finalize()["status"], PASS)
+        tied_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|tied_eigenvalue|independent_complex_looks"
+        tied = CellAccumulator(self.preregistration, tied_id, 2, expected_seed_count=3)
+        for seed_index in range(3):
+            tied.add(self._attempt(tied_id, 2, seed_index, status="tied_eigenvalue"))
+        self.assertEqual(tied.finalize()["status"], NOT_EVALUABLE)
+
+    def test_weak_zero_variance_is_the_only_null_relative_error_path(self):
+        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+        weak = self._attempt(cell_id, 0, 0)
+        weak["contrast_variance_reference"] = 0.0
+        weak["contrast_variance_relative_error"] = None
+        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1)
+        accumulator.add(weak)
+        self.assertFalse(accumulator.finalize()["variance_evaluable"])
+        invalid = dict(weak)
+        invalid["contrast_variance_relative_error"] = 0.0
+        with self.assertRaisesRegex(SchemaError, "weak-zero"):
+            CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1).add(invalid)
+
+    def test_accumulator_rejects_duplicate_missing_out_of_order_top_up_and_tamper(self):
+        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=2)
+        with self.assertRaisesRegex(SchemaError, "out-of-order seed"):
+            accumulator.add(self._attempt(cell_id, 0, 1))
+        accumulator.add(self._attempt(cell_id, 0, 0))
+        with self.assertRaisesRegex(SchemaError, "out-of-order seed"):
+            accumulator.add(self._attempt(cell_id, 0, 0))
+        with self.assertRaisesRegex(SchemaError, "missing"):
+            accumulator.finalize()
+        tampered = self._attempt(cell_id, 0, 1)
+        tampered["truth_sha256"] = "bad"
+        with self.assertRaisesRegex(SchemaError, "identity hash"):
+            accumulator.add(tampered)
+        unknown = self._attempt(cell_id, 0, 1)
+        unknown["unexpected"] = True
+        with self.assertRaisesRegex(SchemaError, "unknown"):
+            accumulator.add(unknown)
+
+    def test_streaming_scorer_has_bounded_memory_and_rejects_hash_tamper(self):
         cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        labels = cell_id.split("|")
-        cell = dict(zip(("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process"), labels))
-        generator = self.preregistration["generator"]
-        target = generator["coordinates"]["window_stride"]["hw_1x1|stride_1"]["target_by_position"]["masked"]
-        date_axis = generator["acquisition"]["topologies"]["one_block"]["date_axis"]
-        cell.update({
-            "cell_id": cell_id,
-            "status": PASS,
-            "attempted_seeds": 5000,
-            "emitted_seeds": 0,
-            "top_up_seeds": 0,
-            "target_coordinate": target,
-            "reference_coordinate": target,
-            "acquisition_count": 5,
-            "date_axis_sha256": sha256_json(date_axis),
-            "target_source_count_total": 20000,
-            "reference_source_count_total": 20000,
-            "intersection_source_count_total": 20000,
-            "union_source_count_total": 20000,
-            "realized_overlap_jaccard_mean": 1.0,
-            "signed_influence_sign": "zero",
-            "effective_looks_fraction": 1.0,
-            "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
-            "generator_hash": sha256_json(generator),
-            "truth_hash": "7" * 64,
-            "operator_relative_error": None,
-            "contrast_variance_reference": None,
-            "variance_evaluable": False,
-            "contrast_variance_relative_error": None,
-            "psd_min_eigenvalue": None,
-            "coverage_95": None,
-            "emission_rate": 0.0,
-            "operator_hash": "8" * 64,
-            "variance_hash": "9" * 64,
-            "psd_hash": "a" * 64,
-            "coverage_hash": "b" * 64,
-            "emission_hash": "c" * 64,
-            "attempts": [self._masked_attempt(cell_id, index) for index in range(5000)],
-        })
-        return cell_id, cell
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "input.jsonl"
+            input_receipt = write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
+            output_path = root / "output.jsonl"
+            output = write_jsonl_atomic((self._attempt(cell_id, 0, seed, status="masked_target") for seed in range(5000)), output_path)
+            self.assertLessEqual(max(len(line) for line in output_path.read_bytes().splitlines(keepends=True)), FROZEN_MAX_RECORD_BYTES)
+            manifest = self._manifest(spec, output, input_receipt)
+            tracemalloc.start()
+            summaries = score_attempt_shard(self.preregistration, root, manifest, spec)
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertEqual(summaries[0]["status"], PASS)
+            self.assertLess(peak, 5 * 1024 * 1024)
+            tampered = dict(manifest)
+            tampered["output_sha256"] = "f" * 64
+            with self.assertRaisesRegex(SchemaError, "hash/byte"):
+                score_attempt_shard(self.preregistration, root, tampered, spec)
+            with input_path.open("ab") as handle:
+                handle.write(b"{}\n")
+            with self.assertRaisesRegex(SchemaError, "top-up"):
+                score_attempt_shard(self.preregistration, root, manifest, spec)
 
-    def test_masked_target_abstention_passes_without_coverage_or_emission(self):
-        cell_id, cell = self._masked_cell()
-        errors = []
-        self.assertEqual(_validate_cell(cell, cell_id, self.preregistration, errors), PASS)
-        self.assertEqual(errors, [])
-
-    def test_attempt_overlap_and_cell_aggregate_drift_are_rejected(self):
-        cell_id, cell = self._masked_cell()
-        cell["attempts"][0]["union_source_count"] = 5
-        errors = []
-        _validate_cell(cell, cell_id, self.preregistration, errors)
-        self.assertTrue(any("intersection/union arithmetic" in error for error in errors))
-        self.assertTrue(any("realized-overlap aggregate" in error for error in errors))
-
-    def _receipt_shell(self):
-        generator = self.preregistration["generator"]
+    def _manifest(self, spec, output, input_receipt=None):
+        input_receipt = input_receipt or {"sha256": "a" * 64, "bytes": 1}
         return {
-            "schema": "dolphinrust.spatial_covariance.receipt",
-            "schema_version": 2,
+            "schema": "dolphinrust.spatial-covariance.shard-manifest",
+            "schema_version": 3,
+            "shard_index": spec.index,
+            "cell_ordinal_start": spec.cell_ordinal_start,
+            "cell_ordinal_end_exclusive": spec.cell_ordinal_end_exclusive,
+            "expected_cells": len(spec.cell_ids),
+            "expected_attempts": spec.expected_attempts,
+            "input_path": "input.jsonl",
+            "output_path": "output.jsonl",
+            "input_sha256": input_receipt["sha256"],
+            "output_sha256": output["sha256"],
+            "input_bytes": input_receipt["bytes"],
+            "output_bytes": output["bytes"],
+            "input_records": spec.expected_attempts,
+            "output_records": spec.expected_attempts,
             "preregistration_sha256": preregistration_digest(self.preregistration),
-            "seed_schedule_sha256": seed_schedule_digest(self.preregistration),
-            "protocol": {key: generator["binary"][key] for key in ("input_schema", "output_schema", "one_input_one_output")},
-            "binary": {"release_invocation": generator["binary"]["release_invocation"], "release_only": True},
-            "hashes": {field: "0" * 64 for field in ("code_sha256", "fixture_sha256", "operator_sha256", "variance_sha256", "resource_sha256", "generator_protocol_sha256", "config_sha256", "source_model_sha256", "result_sha256", "binary_sha256")},
-            "cells": [],
-            "resources": [],
+            "code_sha256": "b" * 64,
+            "binary_sha256": "c" * 64,
+            "generator_protocol_sha256": sha256_json(self.preregistration["execution_protocol"]),
+            "elapsed_seconds": 1.0,
+            "peak_rss_bytes": 1024,
+            "committed": True,
         }
 
-    def test_pr61_bookkeeping_receipt_cannot_satisfy_v2_schema(self):
+    def test_partial_resume_and_manifest_scope_fail_closed(self):
+        cell_id = next(iter(expected_cell_ids(self.preregistration)))
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0}
+            manifest = self._manifest(spec, output)
+            path = root / "manifest.jsonl"
+            path.write_bytes(compact_json_line(manifest))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, path))
+            changed = dict(manifest)
+            changed["cell_ordinal_end_exclusive"] = 2
+            with self.assertRaisesRegex(SchemaError, "scope/order/count"):
+                validate_shard_manifest(self.preregistration, changed, spec)
+
+    def test_atomic_commit_and_resume_require_exact_immutable_shard(self):
+        cell_id = next(iter(expected_cell_ids(self.preregistration)))
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "input.jsonl"
+            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
+            output_partial = root / "output.jsonl.partial"
+            shutil.copyfile(input_path, output_partial)
+            manifest_path = root / "manifest.jsonl"
+            commit_output_shard(
+                self.preregistration,
+                spec,
+                root,
+                input_path,
+                output_partial,
+                manifest_path,
+                "a" * 64,
+                "b" * 64,
+                1.0,
+                1024,
+            )
+            self.assertFalse(output_partial.exists())
+            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest_path))
+            with (root / "output.jsonl").open("ab") as handle:
+                handle.write(b"{}\n")
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path))
+
+    def test_result_root_binds_manifest_order_and_content(self):
+        first = "1" * 64
+        second = "2" * 64
+        root = result_root_sha256((first, second))
+        self.assertNotEqual(root, result_root_sha256((second, first)))
+        self.assertNotEqual(root, result_root_sha256((first, "3" * 64)))
+        with self.assertRaisesRegex(SchemaError, "exactly 891"):
+            build_run_manifest(self.preregistration, Path("."), (), "a" * 64, "b" * 64, {}, [])
+
+    def test_performance_concurrency_is_derived_without_frozen_total_time(self):
+        probe = self.preregistration["execution_protocol"]["performance_probe"]
+        self.assertIsNone(probe["total_wall_seconds_max"])
+        self.assertTrue(probe["required_before_outcomes"])
+        self.assertTrue(probe["derived_concurrency_receipt_required"])
+        self.assertEqual(derive_concurrency_receipt(7200, 3600, 0.25), 3)
+        rate = 100000.0
+        projected = FROZEN_ATTEMPT_COUNT / rate
+        receipt = {
+            "schema": "dolphinrust.spatial-covariance.performance-probe",
+            "schema_version": 1,
+            "outcomes_persisted": False,
+            "seed_counts": probe["seed_counts"],
+            "cell_classes": probe["required_cell_classes"],
+            "attempts_per_second": rate,
+            "peak_rss_bytes": 1024,
+            "target_wall_seconds": 3600.0,
+            "reserve_fraction": 0.25,
+            "projected_serial_seconds": projected,
+            "derived_concurrency": derive_concurrency_receipt(projected, 3600.0),
+            "code_sha256": "a" * 64,
+            "binary_sha256": "b" * 64,
+            "config_sha256": sha256_json(self.preregistration["generator"]),
+        }
+        _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        receipt["derived_concurrency"] += 1
+        with self.assertRaisesRegex(SchemaError, "derived concurrency"):
+            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+
+    def test_legacy_aggregate_receipt_is_rejected(self):
         with PR61_FIXTURE.open(encoding="utf-8") as handle:
             receipt = json.load(handle)
         report = score_receipt(self.preregistration, receipt)
         self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("version 2" in error for error in report["errors"]))
-        self.assertTrue(any("aggregate-only" in error for error in report["errors"]))
-
-    def test_missing_cells_and_aggregate_receipt_are_rejected(self):
-        report = score_receipt(self.preregistration, self._receipt_shell())
-        self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("missing 89100" in error for error in report["errors"]))
-        self.assertTrue(any("resource receipts" in error for error in report["errors"]))
-
-    def test_receipt_identity_hash_drift_is_rejected(self):
-        receipt = self._receipt_shell()
-        receipt["hashes"]["generator_protocol_sha256"] = sha256_json({"protocol": "drift"})
-        report = score_receipt(self.preregistration, receipt)
-        self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("generator protocol hash" in error for error in report["errors"]))
-
-    def test_incomplete_per_attempt_evidence_is_rejected(self):
-        receipt = self._receipt_shell()
-        cell_id = expected_cell_ids(self.preregistration)[0]
-        receipt["cells"] = [{"cell_id": cell_id, "attempts": []}]
-        report = score_receipt(self.preregistration, receipt)
-        self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("per-attempt" in error for error in report["errors"]))
-
-    def test_top_up_is_rejected_even_for_a_known_cell(self):
-        receipt = self._receipt_shell()
-        cell_id = expected_cell_ids(self.preregistration)[0]
-        labels = cell_id.split("|")
-        cell = dict(zip(("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process"), labels))
-        cell.update({"cell_id": cell_id, "status": NOT_EVALUABLE, "not_evaluable_reason": "test-only", "attempted_seeds": 5000, "emitted_seeds": 0, "top_up_seeds": 1, "attempts": []})
-        receipt["cells"] = [cell]
-        report = score_receipt(self.preregistration, receipt)
-        self.assertEqual(report["status"], FAIL)
-        self.assertTrue(any("zero top-up" in error for error in report["errors"]))
-
-    def test_status_vocabulary_remains_distinct(self):
-        self.assertEqual({PASS, FAIL, NOT_EVALUABLE}, {"pass", "fail", "not_evaluable"})
+        self.assertIn("aggregate receipts are rejected", report["errors"][0])
 
 
 if __name__ == "__main__":
