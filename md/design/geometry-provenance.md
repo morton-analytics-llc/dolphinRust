@@ -19,9 +19,10 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/3",
-  "method_version": "3.0.0",
+  "schema": "dolphinrust-geometry-provenance/4",
+  "method_version": "4.0.0",
   "orbit_direction": "descending",
+  "orbit_ephemeris_class": "precise",
   "incidence_angle_deg": 39.27,
   "incidence_angle_spread_deg": 1.57,
   "incidence_angle_min_deg": 36.36,
@@ -66,8 +67,9 @@ Two surfaces, one type:
 }
 ```
 
-Version 3 adds `input_coverage`; version 2 records remain valid and deserialize with
-`input_coverage = null`. Coverage contains only aggregate counts and stable zero-based burst
+Version 4 adds `orbit_ephemeris_class`; version 3 adds `input_coverage`. Version 2 and 3 records
+remain valid and deserialize with newly added optional fields absent. Coverage contains only
+aggregate counts and stable zero-based burst
 ordinals. It must never contain source paths, object keys, AOI geometry, or acquisition
 identifiers.
 
@@ -86,6 +88,10 @@ overlap may replace nodata; later nodata never replaces an earlier finite value.
   (or vice versa) is a bug.
 - `orbit_direction` is normalized to lowercase `ascending`/`descending` (eo CHECK
   constraint); the raw product string is preserved in `raw_value`.
+- `orbit_ephemeris_class` is normalized from `/metadata/orbit/orbit_type`: `POEORB` is
+  `precise` and `RESORB` is `restituted`. The raw value and exact source key are preserved.
+  Missing, unknown, or mixed-stack values are explicitly absent and do not gate otherwise
+  readable geometry fields or `decomposition_geometry_complete`.
 - `incidence_angle_deg` is the spatial **mean**; `incidence_angle_spread_deg` (stddev),
   `_min_deg`, `_max_deg` expose representativeness over the same finite-pixel
   population. Incidence varies ~36–42° across one IW2 burst (sin(θ) varies ~12%
@@ -125,6 +131,7 @@ absent with reason. Every absent field also emits a WARN-level `tracing` event.
 | field | source | method / aggregation | absent when |
 |---|---|---|---|
 | `orbit_direction` | `/identification/orbit_pass_direction` in every CSLC granule of `cslc_file_list` | case-insensitive match to `ascending`/`descending`, normalized lowercase | any granule unreadable, unrecognized value, or granules disagree |
+| `orbit_ephemeris_class` | `/metadata/orbit/orbit_type` in every CSLC granule of `cslc_file_list` | case-insensitive consistency; `POEORB` → `precise`, `RESORB` → `restituted` | field unreadable, missing, unrecognized, or granules disagree; other geometry fields remain independent |
 | `incidence_angle_deg` (+ spread/min/max) | resolved per-pixel LOS on the output grid (CSLC-S1-STATIC `los_east`/`los_north` → derived `up`) | mean/std/min/max over finite pixels of `degrees(acos(up))` — same derivation as opera_utils (`degrees(arccos(los_up))`). Full frame coverage is already a hard error in `resolve_los_geometry` (`geometry.rs:120-129`), so no fill pixels reach the stats; "finite pixels" is not the load-bearing guard | `correction_options.geometry_files` empty. (A resolve *failure* remains a fatal run error, as today — it is never downgraded to absent, so a corrupt STATIC cannot silently degrade corrections to the 37° scalar) |
 | `heading_deg` | `/metadata/orbit/{time,velocity_x,velocity_y,velocity_z,reference_epoch}` + `/identification/zero_doppler_{start,end}_time` + `/metadata/processing_information/input_burst_metadata/center` (lon/lat), per CSLC granule | linear-interpolate ECEF velocity at mid zero-doppler time, rotate to ENU at scene center (geodetic lat), `atan2(v_e, v_n)`; vector-sum circular mean across granules | any granule unreadable, or max angular deviation from the circular mean > 1° |
 | `native_range_spacing_m` | `/metadata/processing_information/input_burst_metadata/range_pixel_spacing` (slant-range spacing) | read per granule (a constant of the acquisition mode) | any granule unreadable, or max−min > 1e-6 m |
@@ -202,7 +209,8 @@ Notes:
 ## Placement
 
 - `dolphin-io/src/cslc_metadata.rs` — HDF5 readers: identification scalars, orbit
-  state vectors, burst metadata scalars. Per-field `Result`s; no interpretation.
+  state vectors, raw orbit ephemeris class, and burst metadata scalars. Per-field `Result`s;
+  no interpretation.
 - `dolphin-corrections` — `LosGeometry::mean_incidence_deg()` (mean over finite
   pixels of existing per-pixel `incidence_deg`).
 - `dolphin-workflows/src/provenance.rs` — `GeometryProvenance` (Serialize),
@@ -221,8 +229,8 @@ script produces the committed fixtures `oracle/fixtures/geomprov_ci_{cslc,static
    real granule, 17 kB). Asserts: `orbit_direction == "descending"` (raw value
    `"Descending"` recorded), `native_range_spacing_m == 2.329562114715323` (exact —
    pure read), `heading_deg == 189.981317 ± 0.1°`,
-   `native_azimuth_spacing_m == 14.063791 ± 0.02 m`, and the provenance block names
-   the exact source keys.
+   `native_azimuth_spacing_m == 14.063791 ± 0.02 m`, `orbit_ephemeris_class == "precise"`
+   from raw `POEORB`, and the provenance block names the exact source keys.
 2. **Absence test** — existing `/data`-only cropped fixture → every scalar `null`,
    every `fields` entry `absent` with reason, `decomposition_geometry_complete ==
    false`. Plus the adversarial variant: `correction_options.incidence_angle_deg =
