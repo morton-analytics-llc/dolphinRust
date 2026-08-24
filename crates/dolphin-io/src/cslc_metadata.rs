@@ -52,6 +52,16 @@ pub struct CslcOrbit {
     pub reference_epoch: String,
 }
 
+/// Read the raw orbit ephemeris class from `/metadata/orbit/orbit_type`.
+///
+/// # Errors
+/// `Err` when the field is missing or unreadable. Workflow provenance treats
+/// this field independently from the orbit state vectors.
+pub fn read_cslc_orbit_type(path: &Path) -> Result<String> {
+    let file = hdf5::File::open(path)?;
+    read_string(&file, "/metadata/orbit/orbit_type")
+}
+
 /// Read the `/identification` provenance scalars.
 ///
 /// # Errors
@@ -158,6 +168,12 @@ mod tests {
         }
         let orbit = f.create_group("metadata/orbit").unwrap();
         orbit
+            .new_dataset::<FixedAscii<64>>()
+            .create("orbit_type")
+            .unwrap()
+            .write_scalar(&FixedAscii::<64>::from_ascii("POEORB").unwrap())
+            .unwrap();
+        orbit
             .new_dataset_builder()
             .with_data(&[0.0_f64, 10.0])
             .create("time")
@@ -228,6 +244,7 @@ mod tests {
         assert_eq!(orbit.position_m[1], [7.0e6 + 1.0, 7.0e6 + 2.0, 7.0e6 + 3.0]);
         assert_eq!(orbit.velocity_mps[0], [7.5e3, 7.5e3 + 1.0, 7.5e3 + 2.0]);
         assert_eq!(orbit.reference_epoch, "2022-10-31 14:00:26.983904");
+        assert_eq!(read_cslc_orbit_type(&path).unwrap(), "POEORB");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -240,6 +257,7 @@ mod tests {
         assert!(read_cslc_identification(&path).is_err());
         assert!(read_cslc_burst_metadata(&path).is_err());
         assert!(read_cslc_orbit(&path).is_err());
+        assert!(read_cslc_orbit_type(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }
