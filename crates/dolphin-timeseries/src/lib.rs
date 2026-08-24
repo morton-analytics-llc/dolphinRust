@@ -10,6 +10,7 @@ pub mod inversion;
 pub mod loop_closure;
 pub mod network;
 pub mod reference;
+pub mod temporal_validation;
 pub mod velocity_model;
 
 pub use inversion::{
@@ -25,4 +26,8 @@ pub use loop_closure::{
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};
+pub use temporal_validation::{
+    preregistered_grid, run_preregistered_validation, TemporalValidationReceipt, ValidationCell,
+    ValidationCellResult, ValidationCellStatus, TEMPORAL_VALIDATION_SCHEMA,
+};
 pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};
