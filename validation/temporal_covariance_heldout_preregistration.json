@@ -104,19 +104,31 @@
   },
   "factor_binding": {
     "operation": "replay_reference_difference_covariance",
-    "operator_method": "sequential_source_dag_v1",
-    "operator_method_version": 1,
-    "operator_schema_version": 1,
-    "artifact_hdf5": "phase_covariance_operator.h5",
-    "artifact_manifest": "phase_covariance_provenance.json",
+    "input_operator": {
+      "method": "sequential_source_dag_v1",
+      "method_version": 1,
+      "schema_version": 1,
+      "artifact_hdf5": "phase_covariance_operator.h5",
+      "artifact_manifest": "phase_covariance_provenance.json",
+      "scope_calibration_status": "calibrated_scope_match"
+    },
+    "output_factor": {
+      "method": "reference_specific_influence_v1",
+      "method_version": 1,
+      "schema_version": 1,
+      "artifact_hdf5": "spatial_reference_covariance.h5",
+      "artifact_manifest": "spatial_reference_covariance.json",
+      "calibration_status": "calibrated_scope_match"
+    },
     "mode": "batch",
     "reference_specific": true,
     "stitched_burst_count": 1,
-    "producer_calibration_status": "uncalibrated",
-    "producer_downstream_inference_status": "blocked_pending_issue_54_and_53",
-    "required_calibration_status": "calibrated",
     "marginal_rss_combination_allowed": false,
-    "scope_fields": ["target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel", "common_dates_sha256", "window", "overlap", "distance"]
+    "scope_fields": [
+      "target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel",
+      "common_dates_sha256", "window", "overlap", "distance", "reference_signature_sha256",
+      "source_replay_sha256", "l2_map_sha256", "mask_sha256", "burst_id", "grid_sha256", "units"
+    ]
   },
   "gnss_provenance": {
     "coordinate_frame": "ENU",
@@ -145,9 +157,14 @@
     "manifest_sha256",
     "factor_scope_sha256",
     "gnss_catalog_sha256",
+    "operator_sha256",
+    "operator_manifest_sha256",
+    "persisted_factor_sha256",
+    "persisted_factor_manifest_sha256",
     "approximation_receipt_sha256",
     "resource_receipt_sha256",
-    "calibration_scope_receipt_sha256"
+    "calibration_scope_receipt_sha256",
+    "review_receipt_sha256"
   ],
   "emission_denominator": "primary_slots_plus_used_surplus_only",
   "attrition_receipt_fields": ["attrited_primary_ids", "used_surplus_ids", "unused_surplus_ids", "reasons_by_cluster"],

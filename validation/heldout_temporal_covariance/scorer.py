@@ -25,6 +25,11 @@ RECEIPT_HASH_FIELDS = {
     "approximation_receipt_sha256",
     "resource_receipt_sha256",
     "calibration_scope_receipt_sha256",
+    "review_receipt_sha256",
+    "operator_sha256",
+    "operator_manifest_sha256",
+    "persisted_factor_sha256",
+    "persisted_factor_manifest_sha256",
 }
 OBSERVATION_FIELDS = {
     "insar_slope_difference",
@@ -153,28 +158,26 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
     required = preregistration["factor_binding"]
     if not isinstance(binding, Mapping):
         raise CohortValidationError("cluster is missing direct #54 difference covariance binding")
-    for field in (
-        "operation",
-        "operator_method",
-        "operator_method_version",
-        "operator_schema_version",
-        "artifact_hdf5",
-        "artifact_manifest",
-        "mode",
-        "reference_specific",
-        "stitched_burst_count",
-        "producer_calibration_status",
-        "producer_downstream_inference_status",
-        "required_calibration_status",
-    ):
-        if binding.get(field) != required[field]:
-            raise CohortValidationError("#54 factor identity or scope mismatch")
+    if binding.get("operation") != required["operation"]:
+        raise CohortValidationError("#54 factor operation identity mismatch")
+    for layer in ("input_operator", "output_factor"):
+        if binding.get(layer) != required[layer]:
+            raise CohortValidationError("#54 %s persistence identity mismatch" % layer)
     if binding.get("marginal_rss_combination_allowed") is not False:
         raise CohortValidationError("#54 factor must be a direct difference covariance")
-    if not _hash(binding.get("factor_sha256")) or not _hash(binding.get("scope_sha256")):
-        raise CohortValidationError("#54 factor hashes are missing or invalid")
-    if binding.get("calibration_status") != required["required_calibration_status"]:
-        raise CohortValidationError("#54 factor is uncalibrated for held-out scoring")
+    if binding.get("mode") != required["mode"] or binding.get("reference_specific") is not required["reference_specific"] or binding.get("stitched_burst_count") != required["stitched_burst_count"]:
+        raise CohortValidationError("#54 replay scope identity mismatch")
+    for field in (
+        "operator_sha256",
+        "operator_manifest_sha256",
+        "persisted_factor_sha256",
+        "persisted_factor_manifest_sha256",
+        "scope_sha256",
+    ):
+        if not _hash(binding.get(field)):
+            raise CohortValidationError("#54 factor digest is missing or invalid")
+    if binding.get("calibrated_scope_match") != "calibrated_scope_match":
+        raise CohortValidationError("#54 factor lacks calibrated_scope_match")
     if not isinstance(binding.get("scope"), Mapping):
         raise CohortValidationError("#54 factor scope is missing")
     scope = binding["scope"]
@@ -182,10 +185,15 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
         raise CohortValidationError("#54 factor scope fields are incomplete")
     if scope["target_station_id"] != candidate["station_ids"][0] or scope["control_station_id"] != candidate["station_ids"][1]:
         raise CohortValidationError("#54 target/control station scope mismatch")
-    if not _hash(scope["common_dates_sha256"]):
-        raise CohortValidationError("#54 common-date identity is missing")
+    if scope["burst_id"] != candidate["burst_id"] or scope["units"] != "radians_to_displacement_m":
+        raise CohortValidationError("#54 burst or unit scope mismatch")
+    for field in ("common_dates_sha256", "reference_signature_sha256", "source_replay_sha256", "l2_map_sha256", "mask_sha256", "grid_sha256"):
+        if not _hash(scope[field]):
+            raise CohortValidationError("#54 scope digest is missing or invalid")
     if binding["scope_sha256"] != canonical_digest(scope):
         raise CohortValidationError("#54 factor scope digest mismatch")
+    if not _hash(binding.get("factor_sha256")) or not _hash(binding.get("scope_sha256")):
+        raise CohortValidationError("#54 factor hashes are missing or invalid")
 
 
 def _validate_gnss_provenance(cluster: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
@@ -291,6 +299,10 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
         if status == "fail":
             continue
         try:
+            factor = cluster["difference_covariance"]
+            for digest_field in ("operator_sha256", "operator_manifest_sha256", "persisted_factor_sha256", "persisted_factor_manifest_sha256"):
+                if factor.get(digest_field) != hashes[digest_field]:
+                    raise CohortValidationError("#54 persisted artifact digest is cross-wired")
             metrics_by_id[cluster_id] = _cluster_metrics(cluster, candidate, preregistration)
         except (CohortValidationError, KeyError) as error:
             errors.append("cluster %s is not evaluable: %s" % (cluster_id, error))

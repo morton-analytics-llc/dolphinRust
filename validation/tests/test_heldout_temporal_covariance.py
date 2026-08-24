@@ -56,6 +56,13 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
         "window": "frozen",
         "overlap": "coincident",
         "distance": "same_frame",
+        "reference_signature_sha256": "9" * 64,
+        "source_replay_sha256": "a" * 64,
+        "l2_map_sha256": "b" * 64,
+        "mask_sha256": "c" * 64,
+        "burst_id": candidate_value["burst_id"],
+        "grid_sha256": "d" * 64,
+        "units": "radians_to_displacement_m",
     }
     cluster = {
         "cluster_id": candidate_value["candidate_id"],
@@ -72,9 +79,13 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
     cluster.update(
         {
             "difference_covariance": {
-                **preregistration["factor_binding"],
-                "calibration_status": "calibrated",
-                "factor_sha256": "5" * 64,
+                **copy.deepcopy(preregistration["factor_binding"]),
+                "calibrated_scope_match": "calibrated_scope_match",
+                "operator_sha256": "0" * 64,
+                "operator_manifest_sha256": "1" * 64,
+                "persisted_factor_sha256": "2" * 64,
+                "persisted_factor_manifest_sha256": "3" * 64,
+                "factor_sha256": "2" * 64,
                 "scope_sha256": canonical_digest(scope),
                 "scope": scope,
             },
@@ -139,6 +150,11 @@ def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), su
             "approximation_receipt_sha256": "3" * 64,
             "resource_receipt_sha256": "4" * 64,
             "calibration_scope_receipt_sha256": "5" * 64,
+            "review_receipt_sha256": "6" * 64,
+            "operator_sha256": "0" * 64,
+            "operator_manifest_sha256": "1" * 64,
+            "persisted_factor_sha256": "2" * 64,
+            "persisted_factor_manifest_sha256": "3" * 64,
         },
         "attrition": {
             "attrited_primary_ids": attrited,
@@ -255,10 +271,10 @@ class HeldoutCohortTests(unittest.TestCase):
             self.preregistration,
         )
         receipt = receipt_for_manifest(self.preregistration, manifest)
-        receipt["clusters"][0]["difference_covariance"]["calibration_status"] = "uncalibrated"
+        receipt["clusters"][0]["difference_covariance"]["calibrated_scope_match"] = "uncalibrated"
         report = score_receipt(self.preregistration, manifest, receipt)
         self.assertEqual(report["status"], "fail")
-        self.assertTrue(any("uncalibrated" in error for error in report["errors"]))
+        self.assertTrue(any("calibrated_scope_match" in error for error in report["errors"]))
 
     def test_stale_factor_scope_receipt_hash_is_rejected(self):
         manifest = build_manifest(
@@ -271,6 +287,22 @@ class HeldoutCohortTests(unittest.TestCase):
         report = score_receipt(self.preregistration, manifest, receipt)
         self.assertEqual(report["status"], "fail")
         self.assertTrue(any("calibrated scope" in error for error in report["errors"]))
+
+    def test_cross_wired_output_method_or_manifest_digest_is_rejected(self):
+        manifest = build_manifest(
+            discover_candidates([candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(116)], self.preregistration),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["clusters"][0]["difference_covariance"]["output_factor"]["method"] = "sequential_source_dag_v1"
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("persistence identity" in error for error in report["errors"]))
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["hashes"]["persisted_factor_manifest_sha256"] = "f" * 64
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("cross-wired" in error for error in report["errors"]))
 
     def test_combined_slope_difference_uses_direct_factor_variance_and_levels(self):
         result = score_slope_difference(
