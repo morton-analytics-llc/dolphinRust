@@ -16,6 +16,11 @@ use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use rayon::prelude::*;
 
+#[cfg(test)]
+thread_local! {
+    static PIXEL_L2_MAP_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Full weighted-L2 solution for one pixel. The parameter-covariance
 /// approximation assumes independent interferogram errors and is kept on demand
 /// rather than materialized as an `n_dates^2 * area` workflow cube.
@@ -27,6 +32,98 @@ pub struct PixelL2Solution {
     pub covariance: Array2<f64>,
     /// Residual root-mean-square in observation units.
     pub residual_rms: f64,
+}
+
+/// Stable construction status for one production fixed-L2 observation map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PixelL2MapStatus {
+    /// Input arrays, dimensions, or pixel coordinates disagree.
+    InvalidInput = 0,
+    /// Too few finite positive-precision observations remain.
+    InsufficientObservations = 1,
+    /// The fixed valid design has insufficient numerical rank.
+    RankDeficient = 2,
+    /// A required input or result is non-finite.
+    NonFinite = 3,
+}
+
+impl PixelL2MapStatus {
+    /// Stable serialized status name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::InsufficientObservations => "insufficient_observations",
+            Self::RankDeficient => "rank_deficient",
+            Self::NonFinite => "non_finite",
+        }
+    }
+}
+
+/// Failure to construct the exact fixed-valid-observation L2 map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixelL2MapError {
+    /// Stable fail-closed status.
+    pub status: PixelL2MapStatus,
+    /// Short diagnostic suitable for a receipt.
+    pub message: &'static str,
+}
+
+impl std::fmt::Display for PixelL2MapError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.status.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for PixelL2MapError {}
+
+/// Exact production weighted-L2 map for one pixel's fixed valid IFG set.
+#[derive(Debug, Clone)]
+pub struct PixelL2ObservationMap {
+    valid_observation_indices: Vec<usize>,
+    precisions: Vec<f64>,
+    observation_phase_map: Array2<f64>,
+    h_map: Array2<f64>,
+    condition_number: f64,
+}
+
+impl PixelL2ObservationMap {
+    /// Original IFG indices retained by the production finite/precision filter.
+    #[must_use]
+    pub fn valid_observation_indices(&self) -> &[usize] {
+        &self.valid_observation_indices
+    }
+
+    /// Positive finite production precisions in compact valid-observation order.
+    #[must_use]
+    pub fn precisions(&self) -> &[f64] {
+        &self.precisions
+    }
+
+    /// Compact full-date IFG incidence map, including the exact gauge column.
+    #[must_use]
+    pub fn observation_phase_map(&self) -> ArrayView2<'_, f64> {
+        self.observation_phase_map.view()
+    }
+
+    /// Exact compact observation-to-non-gauge-date L2 map.
+    #[must_use]
+    pub fn h_map(&self) -> ArrayView2<'_, f64> {
+        self.h_map.view()
+    }
+
+    /// Number of dates including the exact zero gauge.
+    #[must_use]
+    pub fn date_count(&self) -> usize {
+        self.h_map.nrows() + 1
+    }
+
+    /// Spectral condition number of the fixed weighted normal matrix.
+    #[must_use]
+    pub const fn condition_number(&self) -> f64 {
+        self.condition_number
+    }
 }
 
 /// Bounded stack-level uncertainty products.
@@ -391,6 +488,135 @@ pub fn solve_pixel_with_covariance(
     })
 }
 
+/// Construct the exact fixed-valid-observation weighted-L2 map used by
+/// [`solve_pixel_with_covariance`].
+#[allow(clippy::too_many_lines)]
+pub fn fixed_l2_pixel_map(
+    a: ArrayView2<f64>,
+    dphi: ArrayView3<f64>,
+    weights: Option<ArrayView3<f64>>,
+    pixel: (usize, usize),
+    n_ifgs: usize,
+) -> Result<PixelL2ObservationMap, PixelL2MapError> {
+    #[cfg(test)]
+    PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+    let (available_ifgs, rows, columns) = dphi.dim();
+    if n_ifgs == 0
+        || n_ifgs > available_ifgs
+        || a.nrows() < n_ifgs
+        || a.ncols() == 0
+        || pixel.0 >= rows
+        || pixel.1 >= columns
+        || weights.is_some_and(|values| values.dim() != dphi.dim())
+    {
+        return Err(pixel_map_error(
+            PixelL2MapStatus::InvalidInput,
+            "fixed L2 pixel-map dimensions do not agree",
+        ));
+    }
+    if a.slice(ndarray::s![..n_ifgs, ..])
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(pixel_map_error(
+            PixelL2MapStatus::NonFinite,
+            "fixed L2 design contains a non-finite value",
+        ));
+    }
+    let precision = |k: usize| {
+        let value = weights.map_or(1.0, |ws| ws[(k, pixel.0, pixel.1)]);
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        }
+    };
+    let valid_observation_indices: Vec<_> = (0..n_ifgs)
+        .filter(|&k| precision(k) > 0.0 && dphi[(k, pixel.0, pixel.1)].is_finite())
+        .collect();
+    let n_parameters = a.ncols();
+    if valid_observation_indices.len() < n_parameters {
+        return Err(pixel_map_error(
+            PixelL2MapStatus::InsufficientObservations,
+            "fixed L2 valid observation count is below the parameter count",
+        ));
+    }
+    let precisions = valid_observation_indices
+        .iter()
+        .map(|&index| precision(index))
+        .collect::<Vec<_>>();
+    let normal = Mat::from_fn(n_parameters, n_parameters, |row, column| {
+        valid_observation_indices
+            .iter()
+            .map(|&index| a[(index, row)] * precision(index) * a[(index, column)])
+            .sum::<f64>()
+    });
+    let llt = normal.cholesky(Side::Lower).map_err(|_| {
+        pixel_map_error(
+            PixelL2MapStatus::RankDeficient,
+            "fixed L2 weighted normal matrix is not positive definite",
+        )
+    })?;
+    let observation_map = Mat::from_fn(
+        n_parameters,
+        valid_observation_indices.len(),
+        |parameter, compact| {
+            let observation = valid_observation_indices[compact];
+            a[(observation, parameter)] * precisions[compact]
+        },
+    );
+    let solved_h = llt.solve(observation_map);
+    let h_map = Array2::from_shape_fn(
+        (n_parameters, valid_observation_indices.len()),
+        |(row, column)| solved_h[(row, column)],
+    );
+    if h_map.iter().any(|value| !value.is_finite()) {
+        return Err(pixel_map_error(
+            PixelL2MapStatus::NonFinite,
+            "fixed L2 pixel map is non-finite",
+        ));
+    }
+    let observation_phase_map = Array2::from_shape_fn(
+        (valid_observation_indices.len(), n_parameters + 1),
+        |(compact, date)| {
+            let observation = valid_observation_indices[compact];
+            match date {
+                0 => -(0..n_parameters)
+                    .map(|parameter| a[(observation, parameter)])
+                    .sum::<f64>(),
+                _ => a[(observation, date - 1)],
+            }
+        },
+    );
+    Ok(PixelL2ObservationMap {
+        valid_observation_indices,
+        precisions,
+        observation_phase_map,
+        h_map,
+        condition_number: normal_condition_number(&normal),
+    })
+}
+
+fn normal_condition_number(normal: &Mat<f64>) -> f64 {
+    let eigen = normal.selfadjoint_eigendecomposition(Side::Lower);
+    let values = (0..normal.nrows())
+        .map(|index| eigen.s().column_vector()[index])
+        .collect::<Vec<_>>();
+    let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !maximum.is_finite() || maximum <= 0.0 {
+        return f64::INFINITY;
+    }
+    let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
+    if !minimum.is_finite() || minimum <= 0.0 {
+        return f64::INFINITY;
+    }
+    maximum / minimum
+}
+
+const fn pixel_map_error(status: PixelL2MapStatus, message: &'static str) -> PixelL2MapError {
+    PixelL2MapError { status, message }
+}
+
 /// Per-pixel linear velocity (slope × 365.25) of a displacement series.
 /// `series` is `(n_time, rows, cols)`; `x` are the time positions (days).
 #[must_use]
@@ -725,4 +951,65 @@ fn velocity_pixel(
     let det = sww * swxx - swx * swx;
     let slope = (sww * swxy - swx * swy) / det;
     slope * 365.25
+}
+
+#[cfg(test)]
+mod production_l2_map_contract {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn production_map_reuses_exact_valid_rows_and_precisions() {
+        let design = array![[1.0, 0.0], [-1.0, 1.0], [0.0, 1.0]];
+        let observations = Array3::from_shape_vec((3, 1, 1), vec![1.0, f64::NAN, 2.0]).unwrap();
+        let precisions = Array3::from_shape_vec((3, 1, 1), vec![2.0, 0.0, 4.0]).unwrap();
+        let map = fixed_l2_pixel_map(
+            design.view(),
+            observations.view(),
+            Some(precisions.view()),
+            (0, 0),
+            3,
+        )
+        .unwrap();
+        assert_eq!(map.valid_observation_indices(), &[0, 2]);
+        assert_eq!(map.precisions(), &[2.0, 4.0]);
+        assert_eq!(
+            map.observation_phase_map(),
+            array![[-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]]
+        );
+        assert!(map
+            .h_map()
+            .iter()
+            .zip(array![[1.0, 0.0], [0.0, 1.0]].iter())
+            .all(|(actual, expected)| (actual - expected).abs() < 1.0e-12));
+        let solution = solve_pixel_with_covariance(
+            design.view(),
+            observations.view(),
+            Some(precisions.view()),
+            (0, 0),
+            3,
+        )
+        .unwrap();
+        assert!(solution
+            .parameters
+            .iter()
+            .zip([1.0, 2.0])
+            .all(|(actual, expected)| (actual - expected).abs() < 1.0e-12));
+    }
+
+    #[test]
+    fn public_pixel_solve_preserves_legacy_ill_conditioned_point_estimate() {
+        let design = array![[1.0, 0.0], [0.0, 1.0e-7]];
+        let observations = Array3::from_shape_vec((2, 1, 1), vec![1.0, 2.0]).unwrap();
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| count.set(0));
+        let solution =
+            solve_pixel_with_covariance(design.view(), observations.view(), None, (0, 0), 2)
+                .unwrap();
+        assert_eq!(solution.parameters, vec![1.0, 20_000_000.0]);
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 0));
+
+        let map = fixed_l2_pixel_map(design.view(), observations.view(), None, (0, 0), 2).unwrap();
+        assert!(map.condition_number() > 1.0e12);
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 1));
+    }
 }
