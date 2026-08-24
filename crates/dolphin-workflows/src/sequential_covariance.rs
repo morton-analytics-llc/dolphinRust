@@ -153,6 +153,8 @@ pub struct ResolvedPhaseReplay {
     pub selected_eigenvalue: f64,
     /// Captured selected eigengap.
     pub selected_eigengap: f64,
+    /// Exact row-major realized support within the fixed clamped window.
+    pub realized_support: Vec<bool>,
     /// Per-node captured validity.
     pub status: CovarianceOperatorStatus,
     /// Persisted fixed estimator branch.
@@ -720,6 +722,30 @@ where
                     "phase eigengap is missing from the capped operator block",
                 ),
             )?,
+            realized_support: {
+                let bits = usize::try_from(stored.support_bits_per_output).map_err(|_| {
+                    SequentialReplayError::Provider(
+                        ReplayStatus::ReplayStateMismatch,
+                        "phase support width exceeds usize",
+                    )
+                })?;
+                let bytes = bits.div_ceil(8);
+                let start =
+                    output_index
+                        .checked_mul(bytes)
+                        .ok_or(SequentialReplayError::Invalid(
+                            "phase support offset overflows usize",
+                        ))?;
+                let packed = stored.support_bits.get(start..start + bytes).ok_or(
+                    SequentialReplayError::Provider(
+                        ReplayStatus::ReplayStateMismatch,
+                        "phase support is missing from the capped operator block",
+                    ),
+                )?;
+                (0..bits)
+                    .map(|slot| packed_bit_value(packed, slot))
+                    .collect()
+            },
             status: *stored
                 .status
                 .get(output_index)
@@ -922,7 +948,7 @@ pub enum ReplayStatus {
     UnsupportedOutputReference,
     /// The selected execution backend is not CPU/f64.
     UnsupportedBackend,
-    /// The realized support is adaptive rather than rectangular.
+    /// Legacy status retained for version-1 receipt compatibility.
     UnsupportedShpMethod,
     /// The fixed phase-link estimator branch was not retained.
     UnsupportedEstimatorFallback,
@@ -2728,13 +2754,13 @@ impl SequentialReplayTopology {
             {
                 return Err(mismatch());
             }
-            let expected = self.support_slot_validity(output_index)?;
             let start = output_index * support_bytes;
             let actual = &stored.support_bits[start..start + support_bytes];
-            if expected
+            let fixed = self.support_slot_validity(output_index)?;
+            if fixed
                 .iter()
                 .enumerate()
-                .any(|(slot, value)| packed_bit_value(actual, slot) != *value)
+                .any(|(slot, valid)| packed_bit_value(actual, slot) && !*valid)
             {
                 return Err(mismatch());
             }
@@ -2941,7 +2967,8 @@ impl SequentialReplayTopology {
         P: SequentialSourceReplayProvider + ?Sized,
     {
         let phase = self.resolve_phase_checked(block, output_index, branch_tolerance, provider)?;
-        let native_indices = self.native_support_indices(output_index)?;
+        let native_indices =
+            self.native_support_indices_for_realized(output_index, &phase.realized_support)?;
         let source_pixels = native_indices
             .iter()
             .map(|&native| {
@@ -3097,6 +3124,12 @@ impl SequentialReplayTopology {
                     FixedEstimatorBranch::Emi { .. } => CovarianceEstimatorBranch::Emi,
                 }
             || phase.branch_tolerance != branch_tolerance
+            || phase.realized_support.len() != self.support_slots_per_output()
+            || phase
+                .realized_support
+                .iter()
+                .zip(self.support_slot_validity(output_index)?.iter())
+                .any(|(realized, fixed)| *realized && !*fixed)
             || phase.linked_phase.iter().any(|value| !value.is_finite())
             || !phase.selected_eigenvalue.is_finite()
             || !phase.selected_eigengap.is_finite()
@@ -3232,6 +3265,37 @@ impl SequentialReplayTopology {
             }
         }
         Ok(indices)
+    }
+
+    fn native_support_indices_for_realized(
+        &self,
+        output_index: usize,
+        realized: &[bool],
+    ) -> Result<Vec<usize>, SequentialReplayError> {
+        let fixed = self.support_slot_validity(output_index)?;
+        if realized.len() != fixed.len()
+            || realized
+                .iter()
+                .zip(fixed.iter())
+                .any(|(selected, valid)| *selected && !*valid)
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "captured phase support is outside fixed native validity",
+            ));
+        }
+        let (row_start, col_start) = self.window_origin(output_index);
+        let window_cols = 2 * self.half_window.x + 1;
+        Ok(realized
+            .iter()
+            .enumerate()
+            .filter(|(_, selected)| **selected)
+            .map(|(slot, _)| {
+                (row_start + slot / window_cols) * self.native_shape.1
+                    + col_start
+                    + slot % window_cols
+            })
+            .collect())
     }
 
     fn support_slots_per_output(&self) -> usize {
@@ -3450,10 +3514,40 @@ pub(crate) fn build_covariance_operator_block(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    if phase_replay.realized_support.dim()
+        != (
+            topology.output_shape.0,
+            topology.output_shape.1,
+            2 * topology.half_window.y + 1,
+            2 * topology.half_window.x + 1,
+        )
+    {
+        return Err(SequentialReplayError::Invalid(
+            "captured realized support shape differs from replay topology",
+        ));
+    }
     let bytes_per_support = topology.support_slots_per_output().div_ceil(8);
     let mut support_bits = Vec::with_capacity(topology.output_area * bytes_per_support);
     for output in 0..topology.output_area {
-        support_bits.extend(pack_bits(&topology.support_slot_validity(output)?));
+        let output_row = output / topology.output_shape.1;
+        let output_col = output % topology.output_shape.1;
+        let realized = phase_replay
+            .realized_support
+            .slice(ndarray::s![output_row, output_col, .., ..])
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let fixed = topology.support_slot_validity(output)?;
+        if realized
+            .iter()
+            .zip(fixed.iter())
+            .any(|(selected, valid)| *selected && !*valid)
+        {
+            return Err(SequentialReplayError::Invalid(
+                "captured realized support is outside fixed native validity",
+            ));
+        }
+        support_bits.extend(pack_bits(&realized));
     }
     let native_validity_bits = pack_bits(&topology.native_validity);
 
@@ -3767,8 +3861,6 @@ fn assess_support(
         ReplayStatus::UnsupportedOutputReference
     } else if scope.backend != ReplayBackend::CpuF64 {
         ReplayStatus::UnsupportedBackend
-    } else if cfg.shp_method != ShpMethod::Rect {
-        ReplayStatus::UnsupportedShpMethod
     } else if scope.estimator_fallback {
         ReplayStatus::UnsupportedEstimatorFallback
     } else if scope.phase_bias_correction {

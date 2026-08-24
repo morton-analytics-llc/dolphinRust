@@ -13,9 +13,10 @@ use dolphin_core::config::ComputeBackend;
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use ndarray::{Array4, ArrayView3, ArrayView4};
 
+use crate::fused::link_fused_with_source_replay_support;
 use crate::{
-    estimate_stack_covariance, link_fused, link_fused_with_source_replay,
-    process_coherence_matrices, FusedEstimate, FusedParams, SourceReplayEstimate, StackEstimate,
+    estimate_stack_covariance, link_fused, process_coherence_matrices, FusedEstimate, FusedParams,
+    SourceReplayEstimate, StackEstimate,
 };
 
 /// `Auto` uses the GPU at/above this output-pixel count (≈128²); below it, the
@@ -193,16 +194,16 @@ impl ComputeEngine {
         link_fused(stack, half, strides, neighbors, params)
     }
 
-    /// Run the fixed CPU/f64 Rect path and retain source-influence replay receipts.
+    /// Run the fixed CPU/f64 production support path and retain source-influence replay receipts.
     ///
-    /// This opt-in path never falls back from GPU or adaptive SHP support. Its
+    /// This opt-in path never falls back from GPU. Its
     /// returned legacy estimate uses the same fused CPU pixel kernels as
     /// [`Self::link`].
     ///
     /// # Errors
-    /// Returns an error if the resolved backend is GPU, SHP neighbors are
-    /// supplied, or the underlying fused geometry, fixed native-validity mask,
-    /// or branch tolerance is invalid.
+    /// Returns an error if the resolved backend is GPU, or the underlying fused
+    /// geometry, realized SHP support, fixed native-validity mask, or branch
+    /// tolerance is invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn link_with_source_replay(
         &self,
@@ -217,18 +218,16 @@ impl ComputeEngine {
         if strides.y == 0 || strides.x == 0 {
             return Err("phase-linking stride is zero");
         }
-        if neighbors.is_some() {
-            return Err("source influence replay supports Rect covariance only");
-        }
         let (nslc, rows, cols) = stack.dim();
         let (out_rows, out_cols) = strides.out_shape((rows, cols));
         if self.gpu_ready(out_rows * out_cols, nslc) {
             return Err("source influence replay requires the CPU f64 backend");
         }
-        link_fused_with_source_replay(
+        link_fused_with_source_replay_support(
             stack,
             half,
             strides,
+            neighbors,
             params,
             native_validity,
             branch_tolerance,
