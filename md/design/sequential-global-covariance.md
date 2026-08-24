@@ -399,7 +399,7 @@ used to normalize or overwrite source-influence covariance.
 - T52-04: full-batch whole/tiled/bounded capture and block-local capped replay are implemented;
   resumable and multiburst seam covariance remain unsupported.
 - T52-05: release smoke emits storage, disk, cache, source-resolution, timing, and RSS receipts.
-- T52-06: independent final review is pending.
+- T52-06: independent final review found no unresolved blockers or acceptance-gate findings.
 - Inference wiring, release, and GroundPulse pin remain outside #52.
 - PR #55's conditional-IID output and the legacy per-ministack CRLB diagnostic remain unchanged.
 
