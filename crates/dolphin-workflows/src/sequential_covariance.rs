@@ -934,6 +934,8 @@ pub enum ReplayStatus {
     UnsupportedSeamCovariance,
     /// Planner, grid, identifier, or query metadata is invalid.
     InvalidTopology,
+    /// Target/reference selections do not share a reproducible common date axis.
+    InvalidReference,
     /// The numeric local influence graph is inconsistent with the topology.
     InvalidReplayGraph,
     /// Immutable raw source bytes could not be resolved.
@@ -974,6 +976,7 @@ impl ReplayStatus {
             Self::UnsupportedSourceIdentity => "unsupported_source_identity",
             Self::UnsupportedSeamCovariance => "unsupported_seam_covariance",
             Self::InvalidTopology => "invalid_topology",
+            Self::InvalidReference => "invalid_reference",
             Self::InvalidReplayGraph => "invalid_replay_graph",
             Self::SourceUnavailable => "source_unavailable",
             Self::SourceModelUnavailable => "source_model_unavailable",
@@ -1130,6 +1133,10 @@ pub struct ReferenceDifferenceCovarianceReplay {
     pub difference_covariance: Array2<f64>,
     /// Topology-only allocation receipt checked before graph contraction.
     pub dependency_cone: DependencyConeEstimate,
+    /// Stable digest of the ordered target/reference selection pair.
+    pub reference_signature: [u8; 32],
+    /// Peak logical source/factor payload retained during provider replay.
+    pub source_cache_peak_bytes: u64,
 }
 
 struct SpatialQueryCone {
@@ -1147,6 +1154,19 @@ struct StreamingAdjoints {
 struct PhaseWindowReplay {
     source_values: Array2<Cf64>,
     replay: RectPixelReplay,
+}
+
+fn reference_selection_signature(
+    target_selection: &[(GlobalDateId, usize)],
+    reference_selection: &[(GlobalDateId, usize)],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:reference-selection:v1");
+    for &(date, output) in target_selection.iter().chain(reference_selection) {
+        digest.update(date.get().to_le_bytes());
+        digest.update((output as u64).to_le_bytes());
+    }
+    digest.finalize().into()
 }
 
 /// Replay topology, support, budget, or graph failure.
@@ -2175,6 +2195,11 @@ impl SequentialReplayTopology {
             target_reference_covariance,
             difference_covariance,
             dependency_cone,
+            reference_signature: reference_selection_signature(
+                target_selection,
+                reference_selection,
+            ),
+            source_cache_peak_bytes: 0,
         })
     }
 
@@ -2320,6 +2345,221 @@ impl SequentialReplayTopology {
         Ok(TemporalCovarianceReplay {
             covariance,
             dependency_cone,
+            source_cache_peak_bytes: provider.peak_payload_bytes(),
+        })
+    }
+
+    /// Replay one target/reference pair from the persisted sequential operator.
+    ///
+    /// Both paths are seeded into one reverse pass.  The source cache is shared
+    /// across the pair and evicted at each block boundary, so carried parents
+    /// are composed once and shared-source cross covariance is retained.  The
+    /// reference signature is part of the receipt and prevents a cached
+    /// reference result being reused for another output/date selection.
+    #[allow(clippy::too_many_lines)]
+    pub fn replay_reference_difference_covariance_from_provider<P>(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        reference_selection: &[(GlobalDateId, usize)],
+        query: DependencyConeQuery,
+        branch_tolerance: f64,
+        provider: &mut P,
+    ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
+    where
+        P: SequentialSourceReplayProvider + ?Sized,
+    {
+        if target_selection.is_empty()
+            || target_selection.len() != reference_selection.len()
+            || query.source_rank == 0
+            || query.microbatch == 0
+            || !branch_tolerance.is_finite()
+            || branch_tolerance <= 0.0
+        {
+            return Err(SequentialReplayError::Invalid(
+                "reference provider replay requires aligned selections, positive rank/microbatch, and branch tolerance",
+            ));
+        }
+        let target_outputs = target_selection
+            .iter()
+            .map(|&(_, output)| output)
+            .collect::<BTreeSet<_>>();
+        let reference_outputs = reference_selection
+            .iter()
+            .map(|&(_, output)| output)
+            .collect::<BTreeSet<_>>();
+        if target_outputs.len() != 1 || reference_outputs.len() != 1 {
+            return Err(SequentialReplayError::Invalid(
+                "reference provider replay requires one target and one reference pixel",
+            ));
+        }
+        let target_dates = target_selection
+            .iter()
+            .map(|&(date, _)| date)
+            .collect::<Vec<_>>();
+        let reference_dates = reference_selection
+            .iter()
+            .map(|&(date, _)| date)
+            .collect::<Vec<_>>();
+        if target_dates != reference_dates
+            || target_dates.first().is_none_or(|date| date.get() != 0)
+            || !target_dates
+                .windows(2)
+                .all(|pair| pair[0].get() < pair[1].get())
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::InvalidReference,
+                "reference provider replay requires identical increasing dates with acquisition zero first",
+            ));
+        }
+
+        let selection = target_selection
+            .iter()
+            .chain(reference_selection)
+            .copied()
+            .collect::<Vec<_>>();
+        let cone = self.spatial_query_cone(&selection, query.microbatch, 2)?;
+        let mut dependency_cone =
+            self.estimate_dependency_cone_for_spatial_query(&selection, query.source_rank, &cone)?;
+        if dependency_cone.total_bytes > query.byte_cap {
+            return Err(SequentialReplayError::Budget(dependency_cone));
+        }
+        if selection.iter().all(|(date, _)| date.get() == 0) {
+            let dates = target_selection.len();
+            return Ok(ReferenceDifferenceCovarianceReplay {
+                target_covariance: Array2::zeros((dates, dates)),
+                reference_covariance: Array2::zeros((dates, dates)),
+                target_reference_covariance: Array2::zeros((dates, dates)),
+                difference_covariance: Array2::zeros((dates, dates)),
+                dependency_cone,
+                reference_signature: reference_selection_signature(
+                    target_selection,
+                    reference_selection,
+                ),
+                source_cache_peak_bytes: 0,
+            });
+        }
+        self.validate_provider_identity(provider.identity())?;
+        let expected_rank = dependency_cone
+            .block_ids
+            .iter()
+            .map(|&block| self.block(block).map(|item| 2 * item.num_real_dates))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or(SequentialReplayError::Invalid(
+                "dependency cone contains no source block",
+            ))?;
+        if query.source_rank != expected_rank {
+            return Err(SequentialReplayError::Invalid(
+                "declared source rank does not match the active block factors",
+            ));
+        }
+        dependency_cone.provider_bytes = provider.maximum_resident_bytes();
+        dependency_cone.total_bytes =
+            checked_add(dependency_cone.total_bytes, dependency_cone.provider_bytes)?;
+        if dependency_cone.total_bytes > query.byte_cap {
+            return Err(SequentialReplayError::Budget(dependency_cone));
+        }
+
+        let mut provider = QuerySourceCache::new(provider);
+        let selected = selection.len();
+        let mut adjoints = StreamingAdjoints {
+            phase: vec![BTreeMap::new(); self.blocks.len()],
+            compressed: vec![BTreeMap::new(); self.blocks.len()],
+        };
+        for (column, &(date, output)) in selection.iter().enumerate() {
+            if date.get() == 0 {
+                continue;
+            }
+            let block = self.block_for_date(date)?;
+            let block_index = block.generation as usize;
+            let full_component = block.carried_parent_ids.len()
+                + (date.get() - block.real_date_start.get()) as usize;
+            let reduced_component =
+                full_component
+                    .checked_sub(1)
+                    .ok_or(SequentialReplayError::Invalid(
+                        "non-gauge date selected the gauge component",
+                    ))?;
+            let phase = adjoints.phase[block_index]
+                .entry(output)
+                .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
+            phase[(reduced_component, column)] += 1.0;
+        }
+
+        let mut covariance = Array2::<f64>::zeros((selected, selected));
+        for block_index in (0..self.blocks.len()).rev() {
+            let block = &self.blocks[block_index];
+            let mut source_adjoints: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+            for &native in &cone.required_compressed[block_index] {
+                let compressed = adjoints.compressed[block_index]
+                    .remove(&native)
+                    .unwrap_or_else(|| Array2::zeros((2, selected)));
+                self.propagate_compression_adjoint(
+                    block,
+                    native,
+                    compressed.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut provider,
+                    &mut adjoints.phase[block_index],
+                    &mut source_adjoints,
+                )?;
+            }
+            for &output in &cone.active_outputs[block_index] {
+                let phase = adjoints.phase[block_index]
+                    .remove(&output)
+                    .unwrap_or_else(|| Array2::zeros((block.phase_dimension, selected)));
+                self.propagate_phase_adjoint(
+                    block,
+                    output,
+                    phase.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut provider,
+                    &mut adjoints.compressed,
+                    &mut source_adjoints,
+                )?;
+            }
+            for root in source_adjoints.values() {
+                for row in 0..selected {
+                    for column in 0..selected {
+                        covariance[(row, column)] += (0..root.nrows())
+                            .map(|basis| root[(basis, row)] * root[(basis, column)])
+                            .sum::<f64>();
+                    }
+                }
+            }
+            provider.clear_block();
+        }
+        if covariance.iter().any(|value| !value.is_finite()) {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::NonFiniteReplayState,
+                "streamed reference covariance contraction is non-finite",
+            ));
+        }
+        let dates = target_selection.len();
+        let target_covariance = covariance.slice(ndarray::s![..dates, ..dates]).to_owned();
+        let reference_covariance = covariance.slice(ndarray::s![dates.., dates..]).to_owned();
+        let target_reference_covariance =
+            covariance.slice(ndarray::s![..dates, dates..]).to_owned();
+        let difference_covariance = if target_selection == reference_selection {
+            Array2::zeros((dates, dates))
+        } else {
+            &target_covariance + &reference_covariance
+                - &target_reference_covariance
+                - target_reference_covariance.t()
+        };
+        Ok(ReferenceDifferenceCovarianceReplay {
+            target_covariance,
+            reference_covariance,
+            target_reference_covariance,
+            difference_covariance,
+            dependency_cone,
+            reference_signature: reference_selection_signature(
+                target_selection,
+                reference_selection,
+            ),
             source_cache_peak_bytes: provider.peak_payload_bytes(),
         })
     }
