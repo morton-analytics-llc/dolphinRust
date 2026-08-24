@@ -4236,8 +4236,6 @@ pub fn spatial_reference_calibration_scope_digest(
         metadata.reference_signature_digest.as_str(),
         metadata.approximation_receipt_digest.as_str(),
         metadata.resource_receipt_digest.as_str(),
-        metadata.review_receipt_digest.as_str(),
-        metadata.method_manifest_digest.as_str(),
         metadata.source_model_digest.as_str(),
         metadata.effective_looks_digest.as_str(),
         metadata.support_method.as_str(),
