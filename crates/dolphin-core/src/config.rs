@@ -237,6 +237,26 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     ),
     consumed!("phase_linking.compressed_slc_plan", "CFG-PHASE-LINK"),
     conditional!(
+        "phase_linking.empirical_source_factor",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.half_window",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.shrinkage_alpha",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.relative_diagonal_floor",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
         "phase_linking.write_covariance_operator",
         "CFG-COVARIANCE-OPERATOR",
         "phase_linking.write_covariance_operator is true"
@@ -666,6 +686,8 @@ pub struct PhaseLinkingOptions {
     pub baseline_lag: Option<i64>,
     /// Plan for which date each ministack's compressed SLC references.
     pub compressed_slc_plan: CompressedSlcPlan,
+    /// Frozen empirical proper-complex model used to resolve primitive source factors.
+    pub empirical_source_factor: EmpiricalSourceFactorOptions,
     /// Persist the source-keyed sequential covariance replay operator. Off by
     /// default and disconnected from downstream inference.
     pub write_covariance_operator: bool,
@@ -698,11 +720,34 @@ impl Default for PhaseLinkingOptions {
             mask_input_ps: false,
             baseline_lag: None,
             compressed_slc_plan: CompressedSlcPlan::default(),
+            empirical_source_factor: EmpiricalSourceFactorOptions::default(),
             write_covariance_operator: false,
             write_crlb: true,
             write_closure_phase: false,
             calc_average_coh: false,
             correct_phase_bias: false,
+        }
+    }
+}
+
+/// Frozen source-centered empirical proper-complex factor configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmpiricalSourceFactorOptions {
+    /// Half-window of the canonical native support used for every source.
+    pub half_window: HalfWindow,
+    /// Shrinkage weight toward the empirical covariance diagonal.
+    pub shrinkage_alpha: f64,
+    /// Minimum component/pivot scale relative to the mean positive diagonal.
+    pub relative_diagonal_floor: f64,
+}
+
+impl Default for EmpiricalSourceFactorOptions {
+    fn default() -> Self {
+        Self {
+            half_window: HalfWindow { y: 7, x: 14 },
+            shrinkage_alpha: 0.1,
+            relative_diagonal_floor: 1e-8,
         }
     }
 }
@@ -1297,6 +1342,42 @@ impl DisplacementWorkflow {
                 "output_options.strides.y and output_options.strides.x must both be positive"
                     .into(),
             ));
+        }
+        if self.phase_linking.write_covariance_operator {
+            let source = &self.phase_linking.empirical_source_factor;
+            if source
+                .half_window
+                .y
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .is_none()
+                || source
+                    .half_window
+                    .x
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .is_none()
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.half_window support dimensions overflow usize".into(),
+                ));
+            }
+            if !(source.shrinkage_alpha.is_finite()
+                && 0.0 < source.shrinkage_alpha
+                && source.shrinkage_alpha <= 1.0)
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.shrinkage_alpha must be finite and in (0, 1]".into(),
+                ));
+            }
+            if !(source.relative_diagonal_floor.is_finite()
+                && 0.0 < source.relative_diagonal_floor
+                && source.relative_diagonal_floor <= 1.0)
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.relative_diagonal_floor must be finite and in (0, 1]".into(),
+                ));
+            }
         }
         if self.timeseries_options.write_posterior_uncertainty
             && self.timeseries_options.method != TimeseriesMethod::L2

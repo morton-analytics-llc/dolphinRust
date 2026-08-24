@@ -191,6 +191,9 @@ fn drive_with_covariance_capture<F>(
     engine: &ComputeEngine,
     topology: &SequentialReplayTopology,
     request: &SequentialCovarianceCaptureRequest,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
     emit: &mut F,
 ) -> Result<Drive, SequentialReplayError>
 where
@@ -205,6 +208,7 @@ where
         crlb: Vec::new(),
         closure: Vec::new(),
     };
+    let mut source_resolver = source_resolver;
     for &ministack in plans {
         let combined = assemble(&carry, real_stack, ministack);
         let captured = link_and_compress_with_covariance_capture(
@@ -216,16 +220,30 @@ where
             engine,
             request.branch_tolerance,
         )?;
-        let block = build_covariance_operator_block(
-            topology,
-            request,
-            ministack,
-            combined.view(),
-            captured.result.cpx.view(),
-            &captured.phase,
-            &captured.compression,
-            cfg.use_evd,
-        )?;
+        let block = match source_resolver.as_mut() {
+            Some(resolver) => build_covariance_operator_block(
+                topology,
+                request,
+                ministack,
+                combined.view(),
+                captured.result.cpx.view(),
+                &captured.phase,
+                &captured.compression,
+                cfg.use_evd,
+                Some(&mut **resolver),
+            ),
+            None => build_covariance_operator_block(
+                topology,
+                request,
+                ministack,
+                combined.view(),
+                captured.result.cpx.view(),
+                &captured.phase,
+                &captured.compression,
+                cfg.use_evd,
+                None,
+            ),
+        }?;
         emit(block).map_err(SequentialReplayError::Execution)?;
 
         let result = captured.result;
@@ -323,7 +341,30 @@ pub fn run_sequential_with_covariance_capture<F>(
 where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
 {
-    run_sequential_with_covariance_capture_impl(slc_stack, None, cfg, engine, request, emit)
+    run_sequential_with_covariance_capture_impl(slc_stack, None, cfg, engine, request, None, emit)
+}
+
+/// Run unmasked sequential capture with an immutable raw-source factor resolver.
+pub fn run_sequential_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<SequentialOutput, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    run_sequential_with_covariance_capture_impl(
+        slc_stack,
+        None,
+        cfg,
+        engine,
+        request,
+        Some(source_resolver),
+        emit,
+    )
 }
 
 /// Run masked sequential phase linking with the same immutable validity mask
@@ -349,6 +390,31 @@ where
         cfg,
         engine,
         request,
+        None,
+        emit,
+    )
+}
+
+/// Run masked sequential capture with an immutable raw-source factor resolver.
+pub fn run_sequential_masked_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<SequentialOutput, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    run_sequential_with_covariance_capture_impl(
+        slc_stack,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        Some(source_resolver),
         emit,
     )
 }
@@ -359,6 +425,9 @@ fn run_sequential_with_covariance_capture_impl<F>(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
     request: &SequentialCovarianceCaptureRequest,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
     mut emit: F,
 ) -> Result<SequentialOutput, SequentialReplayError>
 where
@@ -449,6 +518,7 @@ where
         engine,
         &topology,
         request,
+        source_resolver,
         &mut emit,
     )?;
     build_output(

@@ -44,6 +44,17 @@ fn defaults_match_dolphin() {
 }
 
 #[test]
+fn empirical_source_factor_defaults_are_frozen() {
+    let source = DisplacementWorkflow::default()
+        .phase_linking
+        .empirical_source_factor;
+    assert_eq!(source.half_window.y, 7);
+    assert_eq!(source.half_window.x, 14);
+    assert_eq!(source.shrinkage_alpha, 0.1);
+    assert_eq!(source.relative_diagonal_floor, 1e-8);
+}
+
+#[test]
 fn pinned_preprocess_default_matches_dolphin_v035() {
     assert_eq!(
         DisplacementWorkflow::default()

@@ -4,10 +4,10 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use dolphin_core::config::{
-    ConfigFieldDisposition, CorrectionOptions, DisplacementWorkflow, InputOptions,
-    InterferogramNetwork, OutputOptions, PhaseLinkingOptions, PreprocessOptions, PsOptions,
-    SnaphuOptions, TimeseriesOptions, TophuOptions, UnwrapMethod, UnwrapOptions, WorkerSettings,
-    CONFIG_BEHAVIOR_CONTRACTS, CONFIG_FIELD_DISPOSITIONS,
+    ConfigFieldDisposition, CorrectionOptions, DisplacementWorkflow, EmpiricalSourceFactorOptions,
+    InputOptions, InterferogramNetwork, OutputOptions, PhaseLinkingOptions, PreprocessOptions,
+    PsOptions, SnaphuOptions, TimeseriesOptions, TophuOptions, UnwrapMethod, UnwrapOptions,
+    WorkerSettings, CONFIG_BEHAVIOR_CONTRACTS, CONFIG_FIELD_DISPOSITIONS,
 };
 use dolphin_core::CoreError;
 
@@ -48,6 +48,10 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "phase_linking.mask_input_ps",
     "phase_linking.baseline_lag",
     "phase_linking.compressed_slc_plan",
+    "phase_linking.empirical_source_factor",
+    "phase_linking.empirical_source_factor.half_window",
+    "phase_linking.empirical_source_factor.shrinkage_alpha",
+    "phase_linking.empirical_source_factor.relative_diagonal_floor",
     "phase_linking.write_covariance_operator",
     "phase_linking.write_crlb",
     "phase_linking.write_closure_phase",
@@ -239,6 +243,7 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
             mask_input_ps,
             baseline_lag,
             compressed_slc_plan,
+            empirical_source_factor,
             write_covariance_operator,
             write_crlb,
             write_closure_phase,
@@ -265,6 +270,14 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
         calc_average_coh,
         correct_phase_bias,
     );
+    audit_fields!(
+        empirical_source_factor,
+        EmpiricalSourceFactorOptions,
+        paths,
+        "phase_linking.empirical_source_factor.",
+        [half_window, shrinkage_alpha, relative_diagonal_floor,]
+    );
+    let _ = (half_window, shrinkage_alpha, relative_diagonal_floor);
 }
 
 fn audit_network(value: InterferogramNetwork, paths: &mut Vec<&'static str>) {
@@ -807,10 +820,45 @@ fn zero_output_stride_fails_before_workflow_io() {
 fn covariance_operator_is_opt_in_and_round_trips_without_changing_legacy_defaults() {
     let defaults = DisplacementWorkflow::default();
     assert!(!defaults.phase_linking.write_covariance_operator);
+    assert_eq!(
+        defaults.phase_linking.empirical_source_factor,
+        EmpiricalSourceFactorOptions::default()
+    );
 
     let mut enabled = defaults;
     enabled.phase_linking.write_covariance_operator = true;
+    enabled
+        .phase_linking
+        .empirical_source_factor
+        .shrinkage_alpha = 0.25;
     let reparsed = DisplacementWorkflow::from_yaml(&enabled.to_yaml().unwrap()).unwrap();
     assert!(reparsed.phase_linking.write_covariance_operator);
+    assert_eq!(
+        reparsed
+            .phase_linking
+            .empirical_source_factor
+            .shrinkage_alpha,
+        0.25
+    );
     reparsed.validate_supported_options().unwrap();
+}
+
+#[test]
+fn invalid_empirical_source_factor_fails_before_covariance_source_io() {
+    let mut config = DisplacementWorkflow::default();
+    config.phase_linking.write_covariance_operator = true;
+    config.phase_linking.empirical_source_factor.half_window.y = usize::MAX;
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(
+        error.contains("empirical_source_factor.half_window"),
+        "{error}"
+    );
+
+    config.phase_linking.empirical_source_factor.half_window.y = 1;
+    config.phase_linking.empirical_source_factor.shrinkage_alpha = 0.0;
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(
+        error.contains("empirical_source_factor.shrinkage_alpha"),
+        "{error}"
+    );
 }
