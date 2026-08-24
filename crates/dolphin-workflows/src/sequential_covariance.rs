@@ -261,15 +261,23 @@ struct QuerySourceCache<'a, P: ?Sized> {
     sources: BTreeMap<(GlobalBlockId, usize), ResolvedPrimitiveSource>,
     current_payload_bytes: u64,
     peak_payload_bytes: u64,
+    source_factor_receipt: Sha256,
+    support_receipt: Sha256,
 }
 
 impl<'a, P: ?Sized> QuerySourceCache<'a, P> {
     fn new(provider: &'a mut P) -> Self {
+        let mut source_factor_receipt = Sha256::new();
+        source_factor_receipt.update(b"dolphinrust:query-source-factor-receipt:v1");
+        let mut support_receipt = Sha256::new();
+        support_receipt.update(b"dolphinrust:query-realized-support-receipt:v1");
         Self {
             provider,
             sources: BTreeMap::new(),
             current_payload_bytes: 0,
             peak_payload_bytes: 0,
+            source_factor_receipt,
+            support_receipt,
         }
     }
 
@@ -280,6 +288,18 @@ impl<'a, P: ?Sized> QuerySourceCache<'a, P> {
 
     const fn peak_payload_bytes(&self) -> u64 {
         self.peak_payload_bytes
+    }
+
+    const fn current_payload_bytes(&self) -> u64 {
+        self.current_payload_bytes
+    }
+
+    fn source_factor_receipt(&self) -> [u8; 32] {
+        self.source_factor_receipt.clone().finalize().into()
+    }
+
+    fn support_receipt(&self) -> [u8; 32] {
+        self.support_receipt.clone().finalize().into()
     }
 }
 
@@ -320,6 +340,20 @@ where
             return Ok(source.clone());
         }
         let source = self.provider.resolve_source(block, native_index)?;
+        self.source_factor_receipt
+            .update(block.generation.to_le_bytes());
+        self.source_factor_receipt
+            .update((native_index as u64).to_le_bytes());
+        self.source_factor_receipt
+            .update(source.id.get().to_le_bytes());
+        self.source_factor_receipt.update(source.content_digest);
+        self.source_factor_receipt
+            .update(source.factor.numeric_receipt_digest());
+        self.source_factor_receipt
+            .update(source.factor.model_hash());
+        for &component in source.factor.component_ids() {
+            self.source_factor_receipt.update(component.to_le_bytes());
+        }
         self.current_payload_bytes = checked_add(
             self.current_payload_bytes,
             resolved_source_payload_bytes(&source)?,
@@ -334,7 +368,21 @@ where
         block: &SequentialReplayBlock,
         output_index: usize,
     ) -> Result<ResolvedPhaseReplay, SequentialReplayError> {
-        self.provider.resolve_phase(block, output_index)
+        let phase = self.provider.resolve_phase(block, output_index)?;
+        self.support_receipt.update(block.generation.to_le_bytes());
+        self.support_receipt
+            .update((output_index as u64).to_le_bytes());
+        self.support_receipt.update(phase.id.get().to_le_bytes());
+        self.support_receipt
+            .update((phase.realized_support.len() as u64).to_le_bytes());
+        for chunk in phase.realized_support.chunks(8) {
+            let mut packed = 0_u8;
+            for (bit, &value) in chunk.iter().enumerate() {
+                packed |= u8::from(value) << bit;
+            }
+            self.support_receipt.update([packed]);
+        }
+        Ok(phase)
     }
 
     fn resolve_compression(
@@ -1265,6 +1313,61 @@ pub struct ReferenceDifferenceCovarianceReplay {
     pub reference_signature: [u8; 32],
     /// Peak logical source/factor payload retained during provider replay.
     pub source_cache_peak_bytes: u64,
+    /// Digest of every exact primitive source/factor resolved by the query.
+    pub source_factor_receipt: [u8; 32],
+    /// Digest of every exact realized phase support resolved by the query.
+    pub support_receipt: [u8; 32],
+    /// Successful target replay disposition.
+    pub target_disposition: ReplayStatus,
+    /// Successful reference replay disposition.
+    pub reference_disposition: ReplayStatus,
+}
+
+/// Global production query routed across captured phase-link tile topologies.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalReferenceCovarianceQuery<'a> {
+    /// Exact burst owning both output pixels.
+    pub burst_id: &'a str,
+    /// Global output-grid target row and column.
+    pub target: (u64, u64),
+    /// Global output-grid reference row and column.
+    pub reference: (u64, u64),
+    /// Exact increasing acquisition order, including acquisition zero first.
+    pub ordered_dates: &'a [GlobalDateId],
+    /// Maximum real source-factor rank across active blocks.
+    pub source_rank: usize,
+    /// Total admitted bytes including routing selections and the returned joint matrix.
+    pub byte_cap: u64,
+    /// Exact fixed-branch tolerance used by capture.
+    pub branch_tolerance: f64,
+}
+
+/// One topology and its separately opened, tile-scoped replay provider.
+pub struct SequentialTileReplayProvider<'a> {
+    topology: &'a SequentialReplayTopology,
+    provider: &'a mut (dyn SequentialSourceReplayProvider + 'a),
+}
+
+impl<'a> SequentialTileReplayProvider<'a> {
+    /// Bind one captured tile topology to its provider lifetime.
+    #[must_use]
+    pub fn new<P>(topology: &'a SequentialReplayTopology, provider: &'a mut P) -> Self
+    where
+        P: SequentialSourceReplayProvider + 'a,
+    {
+        Self { topology, provider }
+    }
+}
+
+/// Global routed replay with an explicit full joint covariance and high-water receipt.
+#[derive(Debug)]
+pub struct GlobalReferenceDifferenceCovarianceReplay {
+    /// Full target-then-reference `2N x 2N` joint phase covariance.
+    pub joint_phase_covariance: Array2<f64>,
+    /// Exact marginals, cross block, difference, receipts, and dispositions.
+    pub replay: ReferenceDifferenceCovarianceReplay,
+    /// Conservative query high-water including routing and joint-result allocations.
+    pub resource_high_water_bytes: u64,
 }
 
 struct SpatialQueryCone {
@@ -1293,6 +1396,65 @@ fn reference_selection_signature(
     for &(date, output) in target_selection.iter().chain(reference_selection) {
         digest.update(date.get().to_le_bytes());
         digest.update((output as u64).to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn cross_topology_reference_selection_signature(
+    target_namespace: &ReplayIdNamespace,
+    target_selection: &[(GlobalDateId, usize)],
+    target_output: (u64, u64),
+    reference_namespace: &ReplayIdNamespace,
+    reference_selection: &[(GlobalDateId, usize)],
+    reference_output: (u64, u64),
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:cross-topology-reference-selection:v1");
+    digest.update(target_namespace.burst_id.as_bytes());
+    digest.update(target_namespace.source_manifest_digest);
+    digest.update(target_namespace.source_model_version_digest);
+    for (namespace, selection, output) in [
+        (target_namespace, target_selection, target_output),
+        (reference_namespace, reference_selection, reference_output),
+    ] {
+        digest.update(namespace.native_origin.0.to_le_bytes());
+        digest.update(namespace.native_origin.1.to_le_bytes());
+        digest.update(namespace.output_origin.0.to_le_bytes());
+        digest.update(namespace.output_origin.1.to_le_bytes());
+        digest.update(output.0.to_le_bytes());
+        digest.update(output.1.to_le_bytes());
+        for &(date, _) in selection {
+            digest.update(date.get().to_le_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
+fn empty_query_receipt(domain: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.finalize().into()
+}
+
+fn combined_query_receipt(domain: &[u8], left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(left);
+    digest.update(right);
+    digest.finalize().into()
+}
+
+fn global_reference_selection_signature(query: GlobalReferenceCovarianceQuery<'_>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:global-reference-selection:v1");
+    digest.update((query.burst_id.len() as u64).to_le_bytes());
+    digest.update(query.burst_id.as_bytes());
+    for coordinate in [query.target, query.reference] {
+        digest.update(coordinate.0.to_le_bytes());
+        digest.update(coordinate.1.to_le_bytes());
+    }
+    for date in query.ordered_dates {
+        digest.update(date.get().to_le_bytes());
     }
     digest.finalize().into()
 }
@@ -2110,8 +2272,11 @@ impl SequentialReplayTopology {
                     checked_add(real_embedding_bytes, raw_vector_bytes)?,
                     checked_add(
                         size_of::<ResolvedPrimitiveSource>() as u64,
-                        size_of::<BTreeMap<(GlobalBlockId, usize), ResolvedPrimitiveSource>>()
-                            as u64,
+                        checked_add(
+                            size_of::<BTreeMap<(GlobalBlockId, usize), ResolvedPrimitiveSource>>()
+                                as u64,
+                            checked_mul(2, size_of::<Sha256>() as u64)?,
+                        )?,
                     )?,
                 )?,
             )?,
@@ -2328,6 +2493,10 @@ impl SequentialReplayTopology {
                 reference_selection,
             ),
             source_cache_peak_bytes: 0,
+            source_factor_receipt: [0; 32],
+            support_receipt: [0; 32],
+            target_disposition: ReplayStatus::Valid,
+            reference_disposition: ReplayStatus::Valid,
         })
     }
 
@@ -2564,6 +2733,12 @@ impl SequentialReplayTopology {
                     reference_selection,
                 ),
                 source_cache_peak_bytes: 0,
+                source_factor_receipt: empty_query_receipt(
+                    b"dolphinrust:empty-source-factor-query:v1",
+                ),
+                support_receipt: empty_query_receipt(b"dolphinrust:empty-support-query:v1"),
+                target_disposition: ReplayStatus::Valid,
+                reference_disposition: ReplayStatus::Valid,
             });
         }
         self.validate_provider_identity(provider.identity())?;
@@ -2689,7 +2864,726 @@ impl SequentialReplayTopology {
                 reference_selection,
             ),
             source_cache_peak_bytes: provider.peak_payload_bytes(),
+            source_factor_receipt: provider.source_factor_receipt(),
+            support_receipt: provider.support_receipt(),
+            target_disposition: ReplayStatus::Valid,
+            reference_disposition: ReplayStatus::Valid,
         })
+    }
+
+    /// Jointly replay one target/reference pair captured in separate tile topologies.
+    ///
+    /// The two reverse graphs retain independent record nodes but contract
+    /// overlapping global primitive-source coordinates together. Provider and
+    /// topology memory are admitted before the first source read, and both
+    /// per-block source caches are discarded after their shared-source cross
+    /// terms are accumulated.
+    ///
+    /// # Errors
+    /// Returns a fail-closed identity, topology, reference, replay-state, or
+    /// byte-budget error.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn replay_cross_topology_reference_difference_covariance_from_providers<T, R>(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        target_provider: &mut T,
+        reference_topology: &Self,
+        reference_selection: &[(GlobalDateId, usize)],
+        reference_provider: &mut R,
+        query: DependencyConeQuery,
+        branch_tolerance: f64,
+    ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
+    where
+        T: SequentialSourceReplayProvider + ?Sized,
+        R: SequentialSourceReplayProvider + ?Sized,
+    {
+        if target_provider.identity() != reference_provider.identity() {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceIdentityMismatch,
+                "cross-topology providers do not have one exact source/model identity",
+            ));
+        }
+        self.validate_provider_identity(target_provider.identity())?;
+        reference_topology.validate_provider_identity(reference_provider.identity())?;
+        self.validate_cross_topology(reference_topology)?;
+        self.validate_cross_reference_selections(target_selection, reference_selection, query)?;
+        if self.same_replay_graph(reference_topology) {
+            return self.replay_reference_difference_covariance_from_provider(
+                target_selection,
+                reference_selection,
+                query,
+                branch_tolerance,
+                target_provider,
+            );
+        }
+        if !branch_tolerance.is_finite() || branch_tolerance <= 0.0 {
+            return Err(SequentialReplayError::Invalid(
+                "cross-topology replay requires a positive finite branch tolerance",
+            ));
+        }
+
+        let target_cone = self.spatial_query_cone(target_selection, query.microbatch, 1)?;
+        let reference_cone =
+            reference_topology.spatial_query_cone(reference_selection, query.microbatch, 1)?;
+        let mut target_estimate = self.estimate_dependency_cone_for_spatial_query(
+            target_selection,
+            query.source_rank,
+            &target_cone,
+        )?;
+        let mut reference_estimate = reference_topology
+            .estimate_dependency_cone_for_spatial_query(
+                reference_selection,
+                query.source_rank,
+                &reference_cone,
+            )?;
+        let selected =
+            target_selection
+                .len()
+                .checked_mul(2)
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology selection size overflows usize",
+                ))?;
+        let selected_u64 = u64::try_from(selected).map_err(|_| {
+            SequentialReplayError::Invalid("cross-topology selection size exceeds u64")
+        })?;
+        let joint_covariance_bytes = checked_mul(checked_mul(selected_u64, selected_u64)?, 8)?;
+        for estimate in [&mut target_estimate, &mut reference_estimate] {
+            let doubled_frontier = checked_mul(estimate.frontier_bytes, 2)?;
+            estimate.total_bytes = estimate
+                .total_bytes
+                .checked_sub(estimate.frontier_bytes)
+                .and_then(|value| value.checked_sub(estimate.covariance_bytes))
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology dependency estimate underflowed",
+                ))?;
+            estimate.frontier_bytes = doubled_frontier;
+            estimate.covariance_bytes = joint_covariance_bytes;
+            estimate.total_bytes = checked_add(
+                estimate.total_bytes,
+                checked_add(doubled_frontier, joint_covariance_bytes)?,
+            )?;
+        }
+        let mut block_ids = target_estimate.block_ids.clone();
+        block_ids.extend(reference_estimate.block_ids.iter().copied());
+        block_ids.sort_unstable_by_key(|block| block.get());
+        block_ids.dedup();
+        let provider_bytes = checked_add(
+            target_provider.maximum_resident_bytes(),
+            reference_provider.maximum_resident_bytes(),
+        )?;
+        let mut dependency_cone = DependencyConeEstimate {
+            block_ids,
+            frontier_bytes: checked_add(
+                target_estimate.frontier_bytes,
+                reference_estimate.frontier_bytes,
+            )?,
+            source_window_bytes: checked_add(
+                target_estimate.source_window_bytes,
+                reference_estimate.source_window_bytes,
+            )?,
+            operator_bytes: checked_add(
+                target_estimate.operator_bytes,
+                reference_estimate.operator_bytes,
+            )?,
+            baseline_bytes: checked_add(
+                target_estimate.baseline_bytes,
+                reference_estimate.baseline_bytes,
+            )?,
+            support_bytes: checked_add(
+                target_estimate.support_bytes,
+                reference_estimate.support_bytes,
+            )?,
+            covariance_bytes: checked_add(
+                target_estimate.covariance_bytes,
+                reference_estimate.covariance_bytes,
+            )?,
+            provider_bytes,
+            total_bytes: 0,
+        };
+        dependency_cone.total_bytes = checked_add(
+            checked_add(target_estimate.total_bytes, reference_estimate.total_bytes)?,
+            provider_bytes,
+        )?;
+        if dependency_cone.total_bytes > query.byte_cap {
+            return Err(SequentialReplayError::Budget(dependency_cone));
+        }
+        if target_selection.iter().any(|(date, _)| date.get() != 0) {
+            let expected_target_rank = self.expected_source_rank(&target_estimate.block_ids)?;
+            let expected_reference_rank =
+                reference_topology.expected_source_rank(&reference_estimate.block_ids)?;
+            if query.source_rank != expected_target_rank
+                || query.source_rank != expected_reference_rank
+            {
+                return Err(SequentialReplayError::Invalid(
+                    "declared source rank does not match both cross-topology block factors",
+                ));
+            }
+        }
+
+        let dates = target_selection.len();
+        let target_output = target_selection[0].1;
+        let reference_output = reference_selection[0].1;
+        let target_global_output = self.global_output_coordinate(target_output)?;
+        let reference_global_output =
+            reference_topology.global_output_coordinate(reference_output)?;
+        let target_namespace =
+            self.id_namespace
+                .as_ref()
+                .ok_or(SequentialReplayError::Unsupported(
+                    ReplayStatus::UnsupportedSourceIdentity,
+                ))?;
+        let reference_namespace =
+            reference_topology
+                .id_namespace
+                .as_ref()
+                .ok_or(SequentialReplayError::Unsupported(
+                    ReplayStatus::UnsupportedSourceIdentity,
+                ))?;
+        let reference_signature = cross_topology_reference_selection_signature(
+            target_namespace,
+            target_selection,
+            target_global_output,
+            reference_namespace,
+            reference_selection,
+            reference_global_output,
+        );
+        if target_selection.iter().all(|(date, _)| date.get() == 0) {
+            return Ok(ReferenceDifferenceCovarianceReplay {
+                target_covariance: Array2::zeros((dates, dates)),
+                reference_covariance: Array2::zeros((dates, dates)),
+                target_reference_covariance: Array2::zeros((dates, dates)),
+                difference_covariance: Array2::zeros((dates, dates)),
+                dependency_cone,
+                reference_signature,
+                source_cache_peak_bytes: 0,
+                source_factor_receipt: empty_query_receipt(
+                    b"dolphinrust:empty-cross-source-factor-query:v1",
+                ),
+                support_receipt: empty_query_receipt(b"dolphinrust:empty-cross-support-query:v1"),
+                target_disposition: ReplayStatus::Valid,
+                reference_disposition: ReplayStatus::Valid,
+            });
+        }
+
+        let mut target_adjoints = StreamingAdjoints {
+            phase: vec![BTreeMap::new(); self.blocks.len()],
+            compressed: vec![BTreeMap::new(); self.blocks.len()],
+        };
+        let mut reference_adjoints = StreamingAdjoints {
+            phase: vec![BTreeMap::new(); reference_topology.blocks.len()],
+            compressed: vec![BTreeMap::new(); reference_topology.blocks.len()],
+        };
+        self.seed_cross_topology_adjoints(target_selection, 0, selected, &mut target_adjoints)?;
+        reference_topology.seed_cross_topology_adjoints(
+            reference_selection,
+            dates,
+            selected,
+            &mut reference_adjoints,
+        )?;
+        let mut target_provider = QuerySourceCache::new(target_provider);
+        let mut reference_provider = QuerySourceCache::new(reference_provider);
+        let mut covariance = Array2::<f64>::zeros((selected, selected));
+        let mut source_cache_peak_bytes = 0_u64;
+        for block_index in (0..self.blocks.len()).rev() {
+            let target_block = &self.blocks[block_index];
+            let reference_block = &reference_topology.blocks[block_index];
+            let mut target_roots: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+            let mut reference_roots: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+            for &native in &target_cone.required_compressed[block_index] {
+                let compressed = target_adjoints.compressed[block_index]
+                    .remove(&native)
+                    .unwrap_or_else(|| Array2::zeros((2, selected)));
+                self.propagate_compression_adjoint(
+                    target_block,
+                    native,
+                    compressed.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut target_provider,
+                    &mut target_adjoints.phase[block_index],
+                    &mut target_roots,
+                )?;
+            }
+            for &output in &target_cone.active_outputs[block_index] {
+                let phase = target_adjoints.phase[block_index]
+                    .remove(&output)
+                    .unwrap_or_else(|| Array2::zeros((target_block.phase_dimension, selected)));
+                self.propagate_phase_adjoint(
+                    target_block,
+                    output,
+                    phase.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut target_provider,
+                    &mut target_adjoints.compressed,
+                    &mut target_roots,
+                )?;
+            }
+            for &native in &reference_cone.required_compressed[block_index] {
+                let compressed = reference_adjoints.compressed[block_index]
+                    .remove(&native)
+                    .unwrap_or_else(|| Array2::zeros((2, selected)));
+                reference_topology.propagate_compression_adjoint(
+                    reference_block,
+                    native,
+                    compressed.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut reference_provider,
+                    &mut reference_adjoints.phase[block_index],
+                    &mut reference_roots,
+                )?;
+            }
+            for &output in &reference_cone.active_outputs[block_index] {
+                let phase = reference_adjoints.phase[block_index]
+                    .remove(&output)
+                    .unwrap_or_else(|| Array2::zeros((reference_block.phase_dimension, selected)));
+                reference_topology.propagate_phase_adjoint(
+                    reference_block,
+                    output,
+                    phase.view(),
+                    query.source_rank,
+                    branch_tolerance,
+                    &mut reference_provider,
+                    &mut reference_adjoints.compressed,
+                    &mut reference_roots,
+                )?;
+            }
+
+            for root in target_roots.values() {
+                for row in 0..dates {
+                    for column in 0..dates {
+                        covariance[(row, column)] += (0..root.nrows())
+                            .map(|basis| root[(basis, row)] * root[(basis, column)])
+                            .sum::<f64>();
+                    }
+                }
+            }
+            for root in reference_roots.values() {
+                for row in 0..dates {
+                    for column in 0..dates {
+                        covariance[(dates + row, dates + column)] += (0..root.nrows())
+                            .map(|basis| root[(basis, dates + row)] * root[(basis, dates + column)])
+                            .sum::<f64>();
+                    }
+                }
+            }
+            for (&target_native, target_root) in &target_roots {
+                let global = self.global_native_coordinate(target_native)?;
+                let Some(reference_native) = reference_topology.native_index_for_global(global)?
+                else {
+                    continue;
+                };
+                let Some(reference_root) = reference_roots.get(&reference_native) else {
+                    continue;
+                };
+                let target_source = self.resolve_source_checked(
+                    target_block,
+                    target_native,
+                    query.source_rank,
+                    &mut target_provider,
+                )?;
+                let reference_source = reference_topology.resolve_source_checked(
+                    reference_block,
+                    reference_native,
+                    query.source_rank,
+                    &mut reference_provider,
+                )?;
+                if target_source.id != reference_source.id
+                    || target_source.content_digest != reference_source.content_digest
+                    || target_source.samples != reference_source.samples
+                    || target_source.factor.component_ids()
+                        != reference_source.factor.component_ids()
+                    || target_source.factor.model_hash() != reference_source.factor.model_hash()
+                    || target_source.factor.numeric_receipt_digest()
+                        != reference_source.factor.numeric_receipt_digest()
+                    || target_source.factor.lower() != reference_source.factor.lower()
+                {
+                    return Err(SequentialReplayError::Provider(
+                        ReplayStatus::SourceIdentityMismatch,
+                        "overlapping cross-topology primitive source factors differ",
+                    ));
+                }
+                for row in 0..dates {
+                    for column in 0..dates {
+                        let cross = (0..target_root.nrows())
+                            .map(|basis| {
+                                target_root[(basis, row)] * reference_root[(basis, dates + column)]
+                            })
+                            .sum::<f64>();
+                        covariance[(row, dates + column)] += cross;
+                        covariance[(dates + column, row)] += cross;
+                    }
+                }
+            }
+            source_cache_peak_bytes = source_cache_peak_bytes.max(checked_add(
+                target_provider.current_payload_bytes(),
+                reference_provider.current_payload_bytes(),
+            )?);
+            target_provider.clear_block();
+            reference_provider.clear_block();
+        }
+        if covariance.iter().any(|value| !value.is_finite()) {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::NonFiniteReplayState,
+                "cross-topology covariance contraction is non-finite",
+            ));
+        }
+        let target_covariance = covariance.slice(ndarray::s![..dates, ..dates]).to_owned();
+        let mut reference_covariance = covariance.slice(ndarray::s![dates.., dates..]).to_owned();
+        let mut target_reference_covariance =
+            covariance.slice(ndarray::s![..dates, dates..]).to_owned();
+        let coincident = target_global_output == reference_global_output;
+        if coincident {
+            if target_covariance
+                .iter()
+                .zip(reference_covariance.iter())
+                .chain(
+                    target_covariance
+                        .iter()
+                        .zip(target_reference_covariance.iter()),
+                )
+                .any(|(&left, &right)| !scalar_close(left, right, branch_tolerance))
+            {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::ReplayStateMismatch,
+                    "globally coincident tile outputs do not replay identically",
+                ));
+            }
+            reference_covariance = target_covariance.clone();
+            target_reference_covariance = target_covariance.clone();
+        }
+        let difference_covariance = if coincident {
+            Array2::zeros((dates, dates))
+        } else {
+            &target_covariance + &reference_covariance
+                - &target_reference_covariance
+                - target_reference_covariance.t()
+        };
+        Ok(ReferenceDifferenceCovarianceReplay {
+            target_covariance,
+            reference_covariance,
+            target_reference_covariance,
+            difference_covariance,
+            dependency_cone,
+            reference_signature,
+            source_cache_peak_bytes,
+            source_factor_receipt: combined_query_receipt(
+                b"dolphinrust:cross-source-factor-query:v1",
+                target_provider.source_factor_receipt(),
+                reference_provider.source_factor_receipt(),
+            ),
+            support_receipt: combined_query_receipt(
+                b"dolphinrust:cross-support-query:v1",
+                target_provider.support_receipt(),
+                reference_provider.support_receipt(),
+            ),
+            target_disposition: ReplayStatus::Valid,
+            reference_disposition: ReplayStatus::Valid,
+        })
+    }
+
+    fn same_replay_graph(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+            && self.num_real_dates == other.num_real_dates
+            && self.native_shape == other.native_shape
+            && self.output_shape == other.output_shape
+            && self.half_window == other.half_window
+            && self.strides == other.strides
+            && self.native_validity == other.native_validity
+            && self.id_namespace == other.id_namespace
+            && self.estimator_branch == other.estimator_branch
+            && self.normalized_config_digest == other.normalized_config_digest
+    }
+
+    fn validate_cross_reference_selections(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        reference_selection: &[(GlobalDateId, usize)],
+        query: DependencyConeQuery,
+    ) -> Result<(), SequentialReplayError> {
+        if target_selection.is_empty()
+            || target_selection.len() != reference_selection.len()
+            || query.source_rank == 0
+            || query.microbatch == 0
+            || target_selection
+                .iter()
+                .map(|(_, output)| output)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 1
+            || reference_selection
+                .iter()
+                .map(|(_, output)| output)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 1
+        {
+            return Err(SequentialReplayError::Invalid(
+                "cross-topology reference replay requires aligned nonempty single-pixel selections and positive rank/microbatch",
+            ));
+        }
+        let target_dates = target_selection
+            .iter()
+            .map(|(date, _)| *date)
+            .collect::<Vec<_>>();
+        let reference_dates = reference_selection
+            .iter()
+            .map(|(date, _)| *date)
+            .collect::<Vec<_>>();
+        if target_dates != reference_dates
+            || target_dates.first().is_none_or(|date| date.get() != 0)
+            || !target_dates
+                .windows(2)
+                .all(|pair| pair[0].get() < pair[1].get())
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::InvalidReference,
+                "cross-topology reference replay requires identical increasing dates with acquisition zero first",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_cross_topology(&self, other: &Self) -> Result<(), SequentialReplayError> {
+        let left = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        let right = other
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        if left.burst_id != right.burst_id
+            || left.source_manifest_digest != right.source_manifest_digest
+            || left.source_model_version_digest != right.source_model_version_digest
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceIdentityMismatch,
+                "cross-topology source namespace identity differs",
+            ));
+        }
+        if self.num_real_dates != other.num_real_dates
+            || self.blocks.len() != other.blocks.len()
+            || self.half_window != other.half_window
+            || self.strides != other.strides
+            || self.estimator_branch != other.estimator_branch
+            || self.normalized_config_digest != other.normalized_config_digest
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::ReplayStateMismatch,
+                "cross-topology date, estimator, or support configuration differs",
+            ));
+        }
+        for (left_block, right_block) in self.blocks.iter().zip(&other.blocks) {
+            let left_parents = left_block
+                .carried_parent_ids
+                .iter()
+                .map(|parent| self.block(*parent).map(|block| block.generation))
+                .collect::<Result<Vec<_>, _>>()?;
+            let right_parents = right_block
+                .carried_parent_ids
+                .iter()
+                .map(|parent| other.block(*parent).map(|block| block.generation))
+                .collect::<Result<Vec<_>, _>>()?;
+            if left_block.generation != right_block.generation
+                || left_block.real_date_start != right_block.real_date_start
+                || left_block.num_real_dates != right_block.num_real_dates
+                || left_block.phase_dimension != right_block.phase_dimension
+                || left_parents != right_parents
+            {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::ReplayStateMismatch,
+                    "cross-topology sequential block graphs differ",
+                ));
+            }
+        }
+        let left_row_stop = left
+            .native_origin
+            .0
+            .checked_add(self.native_shape.0 as u64)
+            .ok_or(SequentialReplayError::Invalid(
+                "cross-topology left native row extent overflows u64",
+            ))?;
+        let left_col_stop = left
+            .native_origin
+            .1
+            .checked_add(self.native_shape.1 as u64)
+            .ok_or(SequentialReplayError::Invalid(
+                "cross-topology left native column extent overflows u64",
+            ))?;
+        let right_row_stop = right
+            .native_origin
+            .0
+            .checked_add(other.native_shape.0 as u64)
+            .ok_or(SequentialReplayError::Invalid(
+                "cross-topology right native row extent overflows u64",
+            ))?;
+        let right_col_stop = right
+            .native_origin
+            .1
+            .checked_add(other.native_shape.1 as u64)
+            .ok_or(SequentialReplayError::Invalid(
+                "cross-topology right native column extent overflows u64",
+            ))?;
+        for row in
+            left.native_origin.0.max(right.native_origin.0)..left_row_stop.min(right_row_stop)
+        {
+            for column in
+                left.native_origin.1.max(right.native_origin.1)..left_col_stop.min(right_col_stop)
+            {
+                let left_index = self.native_index_for_global((row, column))?.ok_or(
+                    SequentialReplayError::Invalid("overlap coordinate is outside left tile"),
+                )?;
+                let right_index = other.native_index_for_global((row, column))?.ok_or(
+                    SequentialReplayError::Invalid("overlap coordinate is outside right tile"),
+                )?;
+                if self.native_validity[left_index] != other.native_validity[right_index] {
+                    return Err(SequentialReplayError::Provider(
+                        ReplayStatus::ReplayStateMismatch,
+                        "cross-topology native validity masks differ on their overlap",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_source_rank(
+        &self,
+        block_ids: &[GlobalBlockId],
+    ) -> Result<usize, SequentialReplayError> {
+        block_ids
+            .iter()
+            .map(|&block| self.block(block).map(|item| 2 * item.num_real_dates))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or(SequentialReplayError::Invalid(
+                "dependency cone contains no source block",
+            ))
+    }
+
+    fn seed_cross_topology_adjoints(
+        &self,
+        selection: &[(GlobalDateId, usize)],
+        column_offset: usize,
+        selected: usize,
+        adjoints: &mut StreamingAdjoints,
+    ) -> Result<(), SequentialReplayError> {
+        for (selection_column, &(date, output)) in selection.iter().enumerate() {
+            if date.get() == 0 {
+                continue;
+            }
+            let block = self.block_for_date(date)?;
+            let block_index = block.generation as usize;
+            let full_component = block.carried_parent_ids.len()
+                + (date.get() - block.real_date_start.get()) as usize;
+            let reduced_component =
+                full_component
+                    .checked_sub(1)
+                    .ok_or(SequentialReplayError::Invalid(
+                        "non-gauge date selected the gauge component",
+                    ))?;
+            let phase = adjoints.phase[block_index]
+                .entry(output)
+                .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
+            phase[(reduced_component, column_offset + selection_column)] += 1.0;
+        }
+        Ok(())
+    }
+
+    fn global_native_coordinate(
+        &self,
+        native_index: usize,
+    ) -> Result<(u64, u64), SequentialReplayError> {
+        if native_index >= self.native_area {
+            return Err(SequentialReplayError::Invalid(
+                "cross-topology native index is outside its grid",
+            ));
+        }
+        let namespace = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        Ok((
+            namespace
+                .native_origin
+                .0
+                .checked_add((native_index / self.native_shape.1) as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology native row coordinate overflows u64",
+                ))?,
+            namespace
+                .native_origin
+                .1
+                .checked_add((native_index % self.native_shape.1) as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology native column coordinate overflows u64",
+                ))?,
+        ))
+    }
+
+    fn native_index_for_global(
+        &self,
+        coordinate: (u64, u64),
+    ) -> Result<Option<usize>, SequentialReplayError> {
+        let namespace = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        let Some(row) = coordinate.0.checked_sub(namespace.native_origin.0) else {
+            return Ok(None);
+        };
+        let Some(column) = coordinate.1.checked_sub(namespace.native_origin.1) else {
+            return Ok(None);
+        };
+        if row >= self.native_shape.0 as u64 || column >= self.native_shape.1 as u64 {
+            return Ok(None);
+        }
+        Ok(Some(row as usize * self.native_shape.1 + column as usize))
+    }
+
+    fn global_output_coordinate(
+        &self,
+        output_index: usize,
+    ) -> Result<(u64, u64), SequentialReplayError> {
+        if output_index >= self.output_area {
+            return Err(SequentialReplayError::Invalid(
+                "cross-topology output index is outside its grid",
+            ));
+        }
+        let namespace = self
+            .id_namespace
+            .as_ref()
+            .ok_or(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ))?;
+        Ok((
+            namespace
+                .output_origin
+                .0
+                .checked_add((output_index / self.output_shape.1) as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology output row coordinate overflows u64",
+                ))?,
+            namespace
+                .output_origin
+                .1
+                .checked_add((output_index % self.output_shape.1) as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "cross-topology output column coordinate overflows u64",
+                ))?,
+        ))
     }
 
     fn validate_provider_identity(
@@ -3502,6 +4396,203 @@ impl SequentialReplayTopology {
         )
         .expect("validated replay ID coordinate")
     }
+}
+
+/// Route and jointly replay a global target/reference query across tile-scoped providers.
+///
+/// # Errors
+/// Returns a fail-closed routing, identity, topology, replay-state, or byte-budget error.
+#[allow(clippy::too_many_lines)]
+pub fn replay_global_reference_difference_covariance_from_provider_bundle(
+    tiles: &mut [SequentialTileReplayProvider<'_>],
+    query: GlobalReferenceCovarianceQuery<'_>,
+) -> Result<GlobalReferenceDifferenceCovarianceReplay, SequentialReplayError> {
+    if tiles.is_empty()
+        || query.burst_id.is_empty()
+        || query.ordered_dates.is_empty()
+        || query.source_rank == 0
+        || !query.branch_tolerance.is_finite()
+        || query.branch_tolerance <= 0.0
+    {
+        return Err(SequentialReplayError::Invalid(
+            "global reference replay query is empty or invalid",
+        ));
+    }
+    let selected =
+        query
+            .ordered_dates
+            .len()
+            .checked_mul(2)
+            .ok_or(SequentialReplayError::Invalid(
+                "global reference selection size overflows usize",
+            ))?;
+    let selection_bytes = checked_mul(
+        u64::try_from(selected).map_err(|_| {
+            SequentialReplayError::Invalid("global reference selection size exceeds u64")
+        })?,
+        size_of::<(GlobalDateId, usize)>() as u64,
+    )?;
+    let joint_bytes = checked_mul(
+        checked_mul(
+            u64::try_from(selected).map_err(|_| {
+                SequentialReplayError::Invalid("global joint covariance size exceeds u64")
+            })?,
+            u64::try_from(selected).map_err(|_| {
+                SequentialReplayError::Invalid("global joint covariance size exceeds u64")
+            })?,
+        )?,
+        8,
+    )?;
+    let wrapper_bytes = checked_add(selection_bytes, joint_bytes)?;
+    if wrapper_bytes > query.byte_cap {
+        return Err(SequentialReplayError::Budget(DependencyConeEstimate {
+            block_ids: Vec::new(),
+            frontier_bytes: 0,
+            source_window_bytes: 0,
+            operator_bytes: 0,
+            baseline_bytes: 0,
+            support_bytes: 0,
+            covariance_bytes: joint_bytes,
+            provider_bytes: 0,
+            total_bytes: wrapper_bytes,
+        }));
+    }
+
+    let locate = |coordinate: (u64, u64)| -> Result<(usize, usize), SequentialReplayError> {
+        let mut found = None;
+        for (index, tile) in tiles.iter().enumerate() {
+            let Some(namespace) = tile.topology.id_namespace.as_ref() else {
+                continue;
+            };
+            if namespace.burst_id != query.burst_id {
+                continue;
+            }
+            let owned_row_stop = namespace
+                .owned_output_origin
+                .0
+                .checked_add(namespace.owned_output_shape.0 as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "owned output row extent overflows u64",
+                ))?;
+            let owned_col_stop = namespace
+                .owned_output_origin
+                .1
+                .checked_add(namespace.owned_output_shape.1 as u64)
+                .ok_or(SequentialReplayError::Invalid(
+                    "owned output column extent overflows u64",
+                ))?;
+            if coordinate.0 < namespace.owned_output_origin.0
+                || coordinate.0 >= owned_row_stop
+                || coordinate.1 < namespace.owned_output_origin.1
+                || coordinate.1 >= owned_col_stop
+            {
+                continue;
+            }
+            let local_row = coordinate.0.checked_sub(namespace.output_origin.0).ok_or(
+                SequentialReplayError::Invalid("owned output precedes tile output row origin"),
+            )?;
+            let local_col = coordinate.1.checked_sub(namespace.output_origin.1).ok_or(
+                SequentialReplayError::Invalid("owned output precedes tile output column origin"),
+            )?;
+            if local_row >= tile.topology.output_shape.0 as u64
+                || local_col >= tile.topology.output_shape.1 as u64
+            {
+                return Err(SequentialReplayError::Invalid(
+                    "owned global output is outside its tile replay grid",
+                ));
+            }
+            let local = local_row as usize * tile.topology.output_shape.1 + local_col as usize;
+            if found.replace((index, local)).is_some() {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::InvalidReference,
+                    "global output has multiple owning replay tiles",
+                ));
+            }
+        }
+        found.ok_or(SequentialReplayError::Provider(
+            ReplayStatus::InvalidReference,
+            "global output has no owning replay tile",
+        ))
+    };
+    let (target_tile, target_output) = locate(query.target)?;
+    let (reference_tile, reference_output) = locate(query.reference)?;
+    let target_selection = query
+        .ordered_dates
+        .iter()
+        .map(|&date| (date, target_output))
+        .collect::<Vec<_>>();
+    let reference_selection = query
+        .ordered_dates
+        .iter()
+        .map(|&date| (date, reference_output))
+        .collect::<Vec<_>>();
+    let dependency_query = DependencyConeQuery {
+        source_rank: query.source_rank,
+        microbatch: 1,
+        byte_cap: query.byte_cap - wrapper_bytes,
+    };
+    let mut replay = if target_tile == reference_tile {
+        let tile = &mut tiles[target_tile];
+        tile.topology
+            .replay_reference_difference_covariance_from_provider(
+                &target_selection,
+                &reference_selection,
+                dependency_query,
+                query.branch_tolerance,
+                tile.provider,
+            )?
+    } else if target_tile < reference_tile {
+        let (left, right) = tiles.split_at_mut(reference_tile);
+        let target = &mut left[target_tile];
+        let reference = &mut right[0];
+        target
+            .topology
+            .replay_cross_topology_reference_difference_covariance_from_providers(
+                &target_selection,
+                target.provider,
+                reference.topology,
+                &reference_selection,
+                reference.provider,
+                dependency_query,
+                query.branch_tolerance,
+            )?
+    } else {
+        let (left, right) = tiles.split_at_mut(target_tile);
+        let reference = &mut left[reference_tile];
+        let target = &mut right[0];
+        target
+            .topology
+            .replay_cross_topology_reference_difference_covariance_from_providers(
+                &target_selection,
+                target.provider,
+                reference.topology,
+                &reference_selection,
+                reference.provider,
+                dependency_query,
+                query.branch_tolerance,
+            )?
+    };
+    replay.reference_signature = global_reference_selection_signature(query);
+    let dates = query.ordered_dates.len();
+    let mut joint_phase_covariance = Array2::zeros((selected, selected));
+    joint_phase_covariance
+        .slice_mut(ndarray::s![..dates, ..dates])
+        .assign(&replay.target_covariance);
+    joint_phase_covariance
+        .slice_mut(ndarray::s![dates.., dates..])
+        .assign(&replay.reference_covariance);
+    joint_phase_covariance
+        .slice_mut(ndarray::s![..dates, dates..])
+        .assign(&replay.target_reference_covariance);
+    joint_phase_covariance
+        .slice_mut(ndarray::s![dates.., ..dates])
+        .assign(&replay.target_reference_covariance.t());
+    let resource_high_water_bytes = checked_add(replay.dependency_cone.total_bytes, wrapper_bytes)?;
+    Ok(GlobalReferenceDifferenceCovarianceReplay {
+        joint_phase_covariance,
+        replay,
+        resource_high_water_bytes,
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

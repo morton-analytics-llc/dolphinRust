@@ -24,17 +24,19 @@ use dolphin_phaselink::{
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_workflows::{
     admit_covariance_artifact_disk_with_identity_index, empirical_source_factor_receipt_digest,
-    finalize_covariance_artifact, run_sequential,
+    finalize_covariance_artifact,
+    replay_global_reference_difference_covariance_from_provider_bundle, run_sequential,
     run_sequential_masked_with_covariance_capture_and_source_factors,
     run_sequential_with_covariance_capture,
     run_sequential_with_covariance_capture_and_source_factors, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest, CovarianceArtifactReplayProvider,
     CovarianceArtifactTransaction, CslcCovarianceManifest, DependencyConeQuery, GlobalBlockId,
-    GlobalDateId, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace, ReplayStatus,
-    ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource, SequentialConfig,
-    SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
-    SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, COVARIANCE_OPERATOR_FILENAME,
+    GlobalDateId, GlobalReferenceCovarianceQuery, ReplayBackend, ReplayExecutionScope,
+    ReplayIdNamespace, ReplayStatus, ResolvedCompressionReplay, ResolvedPhaseReplay,
+    ResolvedPrimitiveSource, SequentialConfig, SequentialCovarianceCaptureRequest,
+    SequentialPrimitiveSourceResolver, SequentialReplayBlock, SequentialReplayBuildIdentity,
+    SequentialReplayError, SequentialReplayTopology, SequentialSourceProviderIdentity,
+    SequentialSourceReplayProvider, SequentialTileReplayProvider, COVARIANCE_OPERATOR_FILENAME,
     CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
     CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
@@ -1081,7 +1083,7 @@ fn dependency_cone_preflight_rejects_one_byte_below_the_exact_bound() {
             estimate.covariance_bytes,
             estimate.provider_bytes,
         ),
-        (1_944, 47_384, 47_960, 6, 72, 0)
+        (1_944, 47_608, 47_960, 6, 72, 0)
     );
     let estimator_workspace =
         phase_angle_jvp_workspace_bytes(4, FixedEstimatorBranch::Evd).unwrap();
@@ -1814,6 +1816,52 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
     assert!(shared.source_cache_peak_bytes <= shared.dependency_cone.source_window_bytes);
     assert_eq!(shared.dependency_cone.provider_bytes, 256);
     assert_ne!(shared.reference_signature, [0; 32]);
+
+    let provider_for_same_topology = || CapturedProvider {
+        identity: provider.identity.clone(),
+        blocks: provider.blocks.clone(),
+        stack: provider.stack.clone(),
+        source_reads: 0,
+        fail_source_model: false,
+        dishonest_samples: false,
+    };
+    let mut target_provider = provider_for_same_topology();
+    let mut reference_provider = provider_for_same_topology();
+    let cross_api_same_topology = topology
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &joint_selection,
+            &mut target_provider,
+            &topology,
+            &shared_reference,
+            &mut reference_provider,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+        )
+        .unwrap();
+    assert_eq!(
+        cross_api_same_topology.target_covariance,
+        shared.target_covariance
+    );
+    assert_eq!(
+        cross_api_same_topology.reference_covariance,
+        shared.reference_covariance
+    );
+    assert_eq!(
+        cross_api_same_topology.target_reference_covariance,
+        shared.target_reference_covariance
+    );
+    assert_eq!(
+        cross_api_same_topology.difference_covariance,
+        shared.difference_covariance
+    );
+    assert_eq!(
+        cross_api_same_topology.reference_signature,
+        shared.reference_signature
+    );
 
     let mut disjoint_cfg = cfg;
     disjoint_cfg.half_window = dolphin_core::HalfWindow { y: 0, x: 0 };
@@ -2757,6 +2805,488 @@ fn overlapping_tile_records_share_source_ids_but_not_record_ids() {
         right.source_id(right.blocks()[0].id, 0).unwrap(),
         "global native column 2 is one consumer-independent source",
     );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed() {
+    let cfg = config();
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let full_stack = Array3::from_shape_fn((3, 4, 8), |(date, row, column)| {
+        let amplitude = 0.9 + 0.08 * date as f64 + 0.01 * (row + column) as f64;
+        let phase = 0.2 + 0.17 * date as f64 + 0.023 * row as f64 - 0.019 * column as f64;
+        Cf64::from_polar(amplitude, phase)
+    });
+    let left_stack = full_stack.slice(ndarray::s![.., .., 0..6]).to_owned();
+    let right_stack = full_stack.slice(ndarray::s![.., .., 2..8]).to_owned();
+    let identity = SequentialSourceProviderIdentity {
+        source_manifest_digest: [61; 32],
+        provider: SOURCE_PROVIDER.to_owned(),
+        provider_version: SOURCE_PROVIDER_VERSION.to_owned(),
+        model: SOURCE_MODEL.to_owned(),
+        model_version: SOURCE_MODEL_VERSION.to_owned(),
+        source_model_version_digest: source_model_identity_digest(),
+        source_model_hash: [9; 32],
+    };
+    let capture_tile = |stack: &Array3<Cf64>, native_col: u64, output_col: u64| {
+        let owned_output_cols = if native_col == 0 { 1 } else { 3 };
+        let request = SequentialCovarianceCaptureRequest {
+            burst_id: "cross-tile-burst".to_owned(),
+            source_manifest_digest: identity.source_manifest_digest,
+            source_model_version_digest: identity.source_model_version_digest,
+            native_grid: CovarianceOperatorGrid {
+                row_start: 0,
+                col_start: native_col,
+                rows: 4,
+                cols: 6,
+                stride_y: 1,
+                stride_x: 1,
+            },
+            output_grid: CovarianceOperatorGrid {
+                row_start: 0,
+                col_start: output_col,
+                rows: 2,
+                cols: 3,
+                stride_y: 2,
+                stride_x: 2,
+            },
+            owned_output_grid: CovarianceOperatorGrid {
+                row_start: 0,
+                col_start: output_col,
+                rows: 2,
+                cols: owned_output_cols,
+                stride_y: 2,
+                stride_x: 2,
+            },
+            branch_tolerance: 1e-10,
+        };
+        let mut blocks = Vec::new();
+        run_sequential_with_covariance_capture(stack.view(), &cfg, &engine, &request, |block| {
+            blocks.push(block);
+            Ok(())
+        })
+        .unwrap();
+        bind_test_factor_receipts(&mut blocks);
+        let topology = SequentialReplayTopology::plan_identified(
+            3,
+            (4, 6),
+            (2, 3),
+            9,
+            Array2::from_elem((4, 6), true).view(),
+            &cfg,
+            scope(),
+            ReplayIdNamespace {
+                burst_id: request.burst_id.clone(),
+                source_manifest_digest: request.source_manifest_digest,
+                source_model_version_digest: request.source_model_version_digest,
+                native_origin: (0, native_col),
+                output_origin: (0, output_col),
+                owned_output_origin: (0, output_col),
+                owned_output_shape: (2, owned_output_cols as usize),
+            },
+        )
+        .unwrap();
+        let provider = CapturedProvider {
+            identity: identity.clone(),
+            blocks: blocks
+                .into_iter()
+                .map(|block| (GlobalBlockId::new(block.block_id), block))
+                .collect(),
+            stack: stack.clone(),
+            source_reads: 0,
+            fail_source_model: false,
+            dishonest_samples: false,
+        };
+        (topology, provider, request.branch_tolerance)
+    };
+    let (left, mut left_provider, branch_tolerance) = capture_tile(&left_stack, 0, 0);
+    let (right, mut right_provider, _) = capture_tile(&right_stack, 2, 1);
+    let dates = (0..3)
+        .map(|date| GlobalDateId::new(date as u32))
+        .collect::<Vec<_>>();
+    let target = dates.iter().map(|&date| (date, 0)).collect::<Vec<_>>();
+    let reference = dates.iter().map(|&date| (date, 0)).collect::<Vec<_>>();
+    let query = DependencyConeQuery {
+        source_rank: 6,
+        microbatch: 1,
+        byte_cap: u64::MAX,
+    };
+    let replay = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut left_provider,
+            &right,
+            &reference,
+            &mut right_provider,
+            query,
+            branch_tolerance,
+        )
+        .unwrap();
+    assert!(replay.target_reference_covariance[(2, 2)].abs() > 1e-12);
+    let naive_difference = &replay.target_covariance + &replay.reference_covariance;
+    assert!(
+        (naive_difference[(2, 2)] - replay.difference_covariance[(2, 2)]).abs() > 1e-12,
+        "independent marginal addition must not replace shared-source contraction",
+    );
+    assert!(replay.source_cache_peak_bytes <= replay.dependency_cone.source_window_bytes);
+    assert_eq!(replay.dependency_cone.provider_bytes, 512);
+
+    let epsilon = 1e-4;
+    let sigma = 0.02 * std::f64::consts::FRAC_1_SQRT_2;
+    let mut jacobian = Array2::<f64>::zeros((6, 3 * 4 * 8 * 2));
+    let output_values = |result: &dolphin_workflows::SequentialOutput| {
+        let target = (0..3).map(|date| result.cpx_phase[(date, 0, 0)]);
+        let reference = (0..3).map(|date| result.cpx_phase[(date, 0, 1)]);
+        target.chain(reference).collect::<Vec<_>>()
+    };
+    let mut column = 0;
+    for date in 0..3 {
+        for row in 0..4 {
+            for col in 0..8 {
+                for imaginary in [false, true] {
+                    let perturbation = match imaginary {
+                        false => Cf64::new(epsilon * sigma, 0.0),
+                        true => Cf64::new(0.0, epsilon * sigma),
+                    };
+                    let mut plus = full_stack.clone();
+                    let mut minus = full_stack.clone();
+                    plus[(date, row, col)] += perturbation;
+                    minus[(date, row, col)] -= perturbation;
+                    let plus = output_values(&run_sequential(plus.view(), &cfg, &engine).unwrap());
+                    let minus =
+                        output_values(&run_sequential(minus.view(), &cfg, &engine).unwrap());
+                    for output in 0..6 {
+                        jacobian[(output, column)] =
+                            (plus[output] * minus[output].conj()).arg() / (2.0 * epsilon);
+                    }
+                    column += 1;
+                }
+            }
+        }
+    }
+    let oracle = jacobian.dot(&jacobian.t());
+    let mut actual = Array2::<f64>::zeros((6, 6));
+    actual
+        .slice_mut(ndarray::s![..3, ..3])
+        .assign(&replay.target_covariance);
+    actual
+        .slice_mut(ndarray::s![3.., 3..])
+        .assign(&replay.reference_covariance);
+    actual
+        .slice_mut(ndarray::s![..3, 3..])
+        .assign(&replay.target_reference_covariance);
+    actual
+        .slice_mut(ndarray::s![3.., ..3])
+        .assign(&replay.target_reference_covariance.t());
+    for ((row, col), expected) in oracle.indexed_iter() {
+        let tolerance = 5e-9 + 5e-5 * expected.abs();
+        assert!(
+            (actual[(row, col)] - expected).abs() <= tolerance,
+            "joint covariance[{row},{col}] {} != dense oracle {expected}",
+            actual[(row, col)]
+        );
+    }
+
+    let provider_for = |provider: &CapturedProvider| CapturedProvider {
+        identity: provider.identity.clone(),
+        blocks: provider.blocks.clone(),
+        stack: provider.stack.clone(),
+        source_reads: 0,
+        fail_source_model: false,
+        dishonest_samples: false,
+    };
+    let mut global_left = provider_for(&left_provider);
+    let mut global_right = provider_for(&right_provider);
+    let mut bundle = [
+        SequentialTileReplayProvider::new(&left, &mut global_left),
+        SequentialTileReplayProvider::new(&right, &mut global_right),
+    ];
+    let global = replay_global_reference_difference_covariance_from_provider_bundle(
+        &mut bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: "cross-tile-burst",
+            target: (0, 0),
+            reference: (0, 1),
+            ordered_dates: &dates,
+            source_rank: 6,
+            byte_cap: u64::MAX,
+            branch_tolerance,
+        },
+    )
+    .unwrap();
+    assert_eq!(global.joint_phase_covariance, actual);
+    assert_eq!(
+        global.replay.difference_covariance,
+        replay.difference_covariance
+    );
+    assert_eq!(
+        global.replay.source_factor_receipt,
+        replay.source_factor_receipt
+    );
+    assert_eq!(global.replay.support_receipt, replay.support_receipt);
+    assert_ne!(global.replay.source_factor_receipt, [0; 32]);
+    assert_ne!(global.replay.support_receipt, [0; 32]);
+    assert_eq!(global.replay.target_disposition, ReplayStatus::Valid);
+    assert_eq!(global.replay.reference_disposition, ReplayStatus::Valid);
+    assert!(global.resource_high_water_bytes >= global.replay.dependency_cone.total_bytes);
+
+    let mut reverse_left = provider_for(&left_provider);
+    let mut reverse_right = provider_for(&right_provider);
+    let mut reverse_bundle = [
+        SequentialTileReplayProvider::new(&right, &mut reverse_right),
+        SequentialTileReplayProvider::new(&left, &mut reverse_left),
+    ];
+    let reversed = replay_global_reference_difference_covariance_from_provider_bundle(
+        &mut reverse_bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: "cross-tile-burst",
+            target: (0, 0),
+            reference: (0, 1),
+            ordered_dates: &dates,
+            source_rank: 6,
+            byte_cap: u64::MAX,
+            branch_tolerance,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reversed.joint_phase_covariance,
+        global.joint_phase_covariance
+    );
+    assert_eq!(
+        reversed.replay.reference_signature,
+        global.replay.reference_signature
+    );
+    assert_eq!(
+        reversed.replay.source_factor_receipt,
+        global.replay.source_factor_receipt
+    );
+    assert_eq!(
+        reversed.replay.support_receipt,
+        global.replay.support_receipt
+    );
+
+    let mut bounded_left = provider_for(&left_provider);
+    let mut bounded_right = provider_for(&right_provider);
+    let mut bounded_bundle = [
+        SequentialTileReplayProvider::new(&left, &mut bounded_left),
+        SequentialTileReplayProvider::new(&right, &mut bounded_right),
+    ];
+    let error = replay_global_reference_difference_covariance_from_provider_bundle(
+        &mut bounded_bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: "cross-tile-burst",
+            target: (0, 0),
+            reference: (0, 1),
+            ordered_dates: &dates,
+            source_rank: 6,
+            byte_cap: global.resource_high_water_bytes - 1,
+            branch_tolerance,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::DependencyConeExceedsBudget);
+    assert_eq!(bounded_left.source_reads, 0);
+    assert_eq!(bounded_right.source_reads, 0);
+
+    let mut coincident_left = provider_for(&left_provider);
+    let mut coincident_right = provider_for(&right_provider);
+    let mut coincident_bundle = [
+        SequentialTileReplayProvider::new(&left, &mut coincident_left),
+        SequentialTileReplayProvider::new(&right, &mut coincident_right),
+    ];
+    let coincident = replay_global_reference_difference_covariance_from_provider_bundle(
+        &mut coincident_bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: "cross-tile-burst",
+            target: (0, 1),
+            reference: (0, 1),
+            ordered_dates: &dates,
+            source_rank: 6,
+            byte_cap: u64::MAX,
+            branch_tolerance,
+        },
+    )
+    .unwrap()
+    .replay;
+    assert_eq!(
+        coincident.difference_covariance,
+        Array2::<f64>::zeros((3, 3))
+    );
+    assert_eq!(
+        coincident.target_covariance,
+        coincident.reference_covariance
+    );
+    assert_eq!(
+        coincident.target_covariance,
+        coincident.target_reference_covariance
+    );
+
+    let (far, mut far_provider, _) = capture_tile(&right_stack, 20, 10);
+    let mut disjoint_left = provider_for(&left_provider);
+    let disjoint = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut disjoint_left,
+            &far,
+            &reference,
+            &mut far_provider,
+            query,
+            branch_tolerance,
+        )
+        .unwrap();
+    assert!(disjoint
+        .target_reference_covariance
+        .iter()
+        .all(|value| *value == 0.0));
+
+    let mut cap_left = provider_for(&left_provider);
+    let mut cap_right = provider_for(&right_provider);
+    let cap_reads = (cap_left.source_reads, cap_right.source_reads);
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut cap_left,
+            &right,
+            &reference,
+            &mut cap_right,
+            DependencyConeQuery {
+                byte_cap: 0,
+                ..query
+            },
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::DependencyConeExceedsBudget);
+    assert_eq!((cap_left.source_reads, cap_right.source_reads), cap_reads);
+
+    let mut changed_identity = provider_for(&right_provider);
+    changed_identity.identity.source_model_hash = [99; 32];
+    let mut identity_left = provider_for(&left_provider);
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut identity_left,
+            &right,
+            &reference,
+            &mut changed_identity,
+            query,
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::SourceIdentityMismatch);
+
+    let mut changed_validity = Array2::from_elem((4, 6), true);
+    changed_validity[(0, 0)] = false;
+    let mismatched_mask = SequentialReplayTopology::plan_identified(
+        3,
+        (4, 6),
+        (2, 3),
+        9,
+        changed_validity.view(),
+        &cfg,
+        scope(),
+        ReplayIdNamespace {
+            burst_id: "cross-tile-burst".to_owned(),
+            source_manifest_digest: identity.source_manifest_digest,
+            source_model_version_digest: identity.source_model_version_digest,
+            native_origin: (0, 0),
+            output_origin: (0, 0),
+            owned_output_origin: (0, 0),
+            owned_output_shape: (2, 3),
+        },
+    )
+    .unwrap();
+    let mut mask_left = provider_for(&left_provider);
+    let mut mask_right = provider_for(&left_provider);
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut mask_left,
+            &mismatched_mask,
+            &reference,
+            &mut mask_right,
+            query,
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::ReplayStateMismatch);
+
+    let mut changed_cfg = cfg;
+    changed_cfg.half_window = dolphin_core::HalfWindow { y: 0, x: 0 };
+    let mismatched_support = SequentialReplayTopology::plan_identified(
+        3,
+        (4, 6),
+        (2, 3),
+        1,
+        Array2::from_elem((4, 6), true).view(),
+        &changed_cfg,
+        scope(),
+        ReplayIdNamespace {
+            burst_id: "cross-tile-burst".to_owned(),
+            source_manifest_digest: identity.source_manifest_digest,
+            source_model_version_digest: identity.source_model_version_digest,
+            native_origin: (0, 2),
+            output_origin: (0, 1),
+            owned_output_origin: (0, 1),
+            owned_output_shape: (2, 3),
+        },
+    )
+    .unwrap();
+    let mut support_left = provider_for(&left_provider);
+    let mut support_right = provider_for(&right_provider);
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut support_left,
+            &mismatched_support,
+            &reference,
+            &mut support_right,
+            query,
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::ReplayStateMismatch);
+    assert_eq!(support_left.source_reads, 0);
+    assert_eq!(support_right.source_reads, 0);
+
+    let mut invalid_left = provider_for(&left_provider);
+    let mut invalid_right = provider_for(&right_provider);
+    let invalid_dates = [(GlobalDateId::new(1), 0), (GlobalDateId::new(2), 0)];
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &invalid_dates,
+            &mut invalid_left,
+            &right,
+            &invalid_dates,
+            &mut invalid_right,
+            query,
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::InvalidReference);
+
+    let mut order_left = provider_for(&left_provider);
+    let mut order_right = provider_for(&right_provider);
+    let wrong_reference_order = [
+        (GlobalDateId::new(0), 0),
+        (GlobalDateId::new(2), 0),
+        (GlobalDateId::new(1), 0),
+    ];
+    let error = left
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &target,
+            &mut order_left,
+            &right,
+            &wrong_reference_order,
+            &mut order_right,
+            query,
+            branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::InvalidReference);
+    assert_eq!(order_left.source_reads, 0);
+    assert_eq!(order_right.source_reads, 0);
 }
 
 #[test]
