@@ -1410,8 +1410,8 @@ impl CovarianceOperatorBlock {
                 let native_col = col_start + slot % window_cols as usize;
                 let native_index = native_row * self.native_grid.cols as usize + native_col;
                 ensure_valid(
-                    packed_bit(row, slot) == packed_bit(&self.native_validity_bits, native_index),
-                    "support bits do not match native validity and Rect clamp",
+                    !packed_bit(row, slot) || packed_bit(&self.native_validity_bits, native_index),
+                    "support bits exceed native validity and Rect clamp",
                 )?;
             }
             match status {

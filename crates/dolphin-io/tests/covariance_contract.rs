@@ -591,6 +591,27 @@ fn rect_geometry_support_and_nearest_map_are_exact_contracts() {
     }
 }
 
+#[test]
+fn realized_support_may_be_a_strict_subset_of_fixed_native_validity() {
+    let _hdf5 = HDF5_LOCK.lock().unwrap();
+    let mut adaptive = block_chain().remove(0);
+    adaptive.support_bits[0] = 0b0000_0001;
+    let path = temporary_hdf5_path();
+    let mut writer = CovarianceOperatorWriter::create(
+        &path,
+        &metadata(),
+        &plan_for_blocks(std::slice::from_ref(&adaptive)),
+    )
+    .unwrap();
+    writer.write_block(&adaptive).unwrap();
+    writer.finish().unwrap();
+    let stored = read_covariance_operator_block_with_receipt(&path, adaptive.block_id, u64::MAX)
+        .unwrap()
+        .block;
+    assert_eq!(stored.support_bits, adaptive.support_bits);
+    std::fs::remove_file(path).unwrap();
+}
+
 fn offset_ids(block: &mut CovarianceOperatorBlock, offset: u64) {
     for id in &mut block.phase_node_ids {
         *id += offset;
