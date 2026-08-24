@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod phasebias;
 pub mod quality;
 pub mod source_influence;
+pub mod source_model;
 pub mod spatial_covariance;
 
 pub use closure::estimate_closure_phases;
@@ -52,6 +53,11 @@ pub use quality::{
 pub use source_influence::{
     InfluenceDag, InfluenceError, InfluenceNode, NodeId, ParentEdge, ProperComplexFactor,
     SourceDefinition, SourceEdge, SourceId, SourceModelError, TemporalCoordinate,
+};
+pub use source_model::{
+    estimate_empirical_proper_complex_factor, EmpiricalProperComplexConfig,
+    EmpiricalProperComplexEstimate, EmpiricalProperComplexReceipt, EmpiricalSourceModelError,
+    EMPIRICAL_PROPER_COMPLEX_METHOD, EMPIRICAL_PROPER_COMPLEX_VERSION,
 };
 pub use spatial_covariance::{
     contract_source_factors, reference_specific_influence_v1, SpatialInfluenceError,
