@@ -1,0 +1,134 @@
+{
+  "schema": "dolphinrust.temporal_covariance.heldout_preregistration",
+  "schema_version": 1,
+  "cohort_id": "f53-06-outer-nonfresno-v1",
+  "status": "preregistered_metadata_only",
+  "outcomes_present": false,
+  "generation_id": "f53-06-v1",
+  "candidate_query": {
+    "query_digest": "f53-06-metadata-query-v1",
+    "source": "catalog_metadata_only",
+    "required_fields": [
+      "burst_id",
+      "orbit_id",
+      "footprint_id",
+      "site_id",
+      "station_ids",
+      "date_start",
+      "date_end",
+      "epoch_count",
+      "metadata_hashes"
+    ],
+    "ordering": "candidate_id_lexical",
+    "bulk_fetch_allowed": false,
+    "outcome_fields_allowed": false
+  },
+  "exclusions": {
+    "site_ids": ["fresno"],
+    "station_ids": ["MMX1", "ICMX", "MXMX", "MXTM", "SSNX", "TNGF", "UJAL", "UNVA", "UTAC"],
+    "burst_ids": [
+      "T005_008704_IW1",
+      "T035_073270_IW1",
+      "T100_213486_IW2",
+      "T137_292316_IW3",
+      "T137_292329_IW1",
+      "T150_320250_IW3"
+    ],
+    "reason": "Fresno, MMX1, and the exposed five-burst/development data cannot enter the outer holdout"
+  },
+  "cluster_keys": ["burst_id", "orbit_id", "footprint_id", "site_id", "station_ids"],
+  "eligibility": {
+    "minimum_declared_epochs": 12,
+    "minimum_common_epochs": 12,
+    "strictly_increasing_dates": true,
+    "median_gap_days": [6, 18],
+    "maximum_gap_days": 36,
+    "same_frame": true,
+    "same_burst": true,
+    "station_pair_size": 2,
+    "pre_outcome_only": true
+  },
+  "attrition": {
+    "frozen_surplus_clusters": 20,
+    "replacement_allowed": false,
+    "outcome_informed_replacement_allowed": false,
+    "allowed_codes": [
+      "insufficient_dates",
+      "unsupported_cadence",
+      "dates_not_strictly_increasing",
+      "difference_covariance_unavailable",
+      "difference_covariance_invalid",
+      "difference_covariance_uncalibrated",
+      "factor_identity_mismatch",
+      "gnss_solution_missing",
+      "gnss_covariance_missing",
+      "sourced_los_missing",
+      "sourced_los_invalid",
+      "gnss_los_projection_invalid",
+      "total_covariance_not_positive_definite",
+      "total_covariance_ill_conditioned"
+    ]
+  },
+  "power": {
+    "test": "one_sided_exact_cluster_binomial_noninferiority",
+    "familywise_alpha": 0.05,
+    "multiplicity": "holm_step_down_three_nominal_levels",
+    "per_level_alpha": 0.016666666666666668,
+    "unacceptable_coverage_delta": 0.2,
+    "planning_coverage_delta": 0.05,
+    "minimum_power": 0.8,
+    "required_evaluable_clusters": {
+      "68": 96,
+      "90": 72,
+      "95": 62
+    },
+    "maximum_required_evaluable_clusters": 96
+  },
+  "field_scope": {
+    "estimand": "same_frame_insar_minus_gnss_station_pair_slope",
+    "levels": [68, 90, 95],
+    "target": 0.0,
+    "interval_center": "insar_slope_difference_minus_gnss_slope_difference",
+    "sensor_covariance": "independent_zero_cross_covariance",
+    "cluster_unit": "station_pair_burst_site",
+    "no_fresno": true
+  },
+  "factor_binding": {
+    "operation": "difference_covariance(primary,control,common_dates)",
+    "schema": "dolphinrust-spatial-reference-covariance-contract/1",
+    "mode": "sealed",
+    "reference_specific": true,
+    "stitched_burst_count": 1,
+    "marginal_rss_combination_allowed": false,
+    "scope_fields": ["target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel", "common_dates_sha256", "window", "overlap", "distance"]
+  },
+  "gnss_provenance": {
+    "coordinate_frame": "ENU",
+    "projection": "signed_ground_to_sensor_los_dot_enu",
+    "positive_direction": "toward_sensor",
+    "los_source": "run_specific_sourced_los_components",
+    "los_norm_tolerance": 0.00001,
+    "covariance_projection": "u_transpose_C_u",
+    "epoch_zero_reference_required": true,
+    "solution_outcome_blinded_at_freeze": true
+  },
+  "thresholds": {
+    "coverage_error_max": {
+      "68": 0.2,
+      "90": 0.2,
+      "95": 0.2
+    },
+    "proper_interval_score_must_improve": true,
+    "median_width_ratio_max": 2.0,
+    "minimum_emission_rate": 0.99
+  },
+  "receipt_hash_fields": [
+    "binary_sha256",
+    "scorer_sha256",
+    "preregistration_sha256",
+    "manifest_sha256",
+    "factor_scope_sha256",
+    "gnss_catalog_sha256"
+  ],
+  "receipt_statuses": ["pass", "fail", "not_evaluable"]
+}
