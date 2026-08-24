@@ -12,8 +12,9 @@ use dolphin_io::{
     SourceReplayIdentity, StitchedCovarianceStatus,
 };
 use dolphin_phaselink::{
-    ComputeEngine, InfluenceDag, InfluenceNode, NodeId, ParentEdge, ProperComplexFactor,
-    SourceDefinition, SourceEdge, SourceId, TemporalCoordinate,
+    phase_angle_jvp_workspace_bytes, ComputeEngine, FixedEstimatorBranch, InfluenceDag,
+    InfluenceNode, NodeId, ParentEdge, ProperComplexFactor, SourceDefinition, SourceEdge, SourceId,
+    TemporalCoordinate,
 };
 use dolphin_workflows::{
     admit_covariance_artifact_disk_with_identity_index, finalize_covariance_artifact,
@@ -373,13 +374,24 @@ fn dependency_cone_preflight_rejects_one_byte_below_the_exact_bound() {
             estimate.frontier_bytes,
             estimate.source_window_bytes,
             estimate.operator_bytes,
-            estimate.baseline_bytes,
             estimate.support_bytes,
             estimate.covariance_bytes,
             estimate.provider_bytes,
-            estimate.total_bytes,
         ),
-        (1_944, 47_384, 47_960, 18_024, 6, 72, 0, 115_390)
+        (1_944, 47_384, 47_960, 6, 72, 0)
+    );
+    let estimator_workspace =
+        phase_angle_jvp_workspace_bytes(4, FixedEstimatorBranch::Evd).unwrap();
+    assert_eq!(estimate.baseline_bytes, 2_280 + estimator_workspace);
+    assert_eq!(
+        estimate.total_bytes,
+        estimate.frontier_bytes
+            + estimate.source_window_bytes
+            + estimate.operator_bytes
+            + estimate.baseline_bytes
+            + estimate.support_bytes
+            + estimate.covariance_bytes
+            + estimate.provider_bytes
     );
 
     let error = topology
