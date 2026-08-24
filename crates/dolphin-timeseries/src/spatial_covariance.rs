@@ -13,6 +13,8 @@ use crate::inversion::PixelL2ObservationMap;
 /// Stable method identity for the fixed-valid-observation L2 map.
 pub const FIXED_L2_SPATIAL_COVARIANCE_METHOD: &str =
     "fixed_valid_observation_l2_spatial_covariance_v1";
+/// Maximum retained-spectrum condition number accepted for phase or date covariance.
+pub const FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER: f64 = 1.0e12;
 const RANK_TOLERANCE: f64 = 1.0e-10;
 
 /// Estimator branch requested by a spatial covariance query.
@@ -589,10 +591,11 @@ fn rank_revealing_psd_factor(
             condition_number: 1.0,
         });
     }
-    let tolerance = scale * RANK_TOLERANCE;
+    let psd_tolerance = scale * RANK_TOLERANCE;
+    let rank_tolerance = scale * f64::EPSILON * size as f64 * 16.0;
     for row in 0..size {
         for column in row + 1..size {
-            if (matrix[(row, column)] - matrix[(column, row)]).abs() > tolerance {
+            if (matrix[(row, column)] - matrix[(column, row)]).abs() > psd_tolerance {
                 return Err(error(
                     SpatialL2Status::InvalidInput,
                     "covariance is not symmetric",
@@ -607,7 +610,7 @@ fn rank_revealing_psd_factor(
     let values = (0..size)
         .map(|index| eigen.s().column_vector()[index])
         .collect::<Vec<_>>();
-    if values.iter().any(|&value| value < -tolerance) {
+    if values.iter().any(|&value| value < -psd_tolerance) {
         return Err(error(
             SpatialL2Status::InvalidInput,
             "covariance is not positive semidefinite",
@@ -617,7 +620,7 @@ fn rank_revealing_psd_factor(
         .iter()
         .copied()
         .enumerate()
-        .filter(|(_, value)| *value > tolerance)
+        .filter(|(_, value)| *value > rank_tolerance)
         .collect::<Vec<_>>();
     retained.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
     if retained.is_empty() {
@@ -633,18 +636,19 @@ fn rank_revealing_psd_factor(
             "covariance factor has zero rank",
         ));
     }
-    let factor = deterministic_pivoted_factor(matrix, tolerance)?;
+    let condition_number = retained[0].1 / retained[retained.len() - 1].1;
+    if !condition_number.is_finite() || condition_number > FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER
+    {
+        return Err(error(
+            SpatialL2Status::IllConditioned,
+            "covariance retained spectrum exceeds the supported condition bound",
+        ));
+    }
+    let factor = deterministic_pivoted_factor(matrix, rank_tolerance)?;
     if factor.ncols() != retained.len() {
         return Err(error(
             SpatialL2Status::RankDeficient,
             "spectral and deterministic covariance ranks disagree",
-        ));
-    }
-    let condition_number = retained[0].1 / retained[retained.len() - 1].1;
-    if !condition_number.is_finite() {
-        return Err(error(
-            SpatialL2Status::IllConditioned,
-            "covariance retained spectrum has invalid condition",
         ));
     }
     Ok(RankRevealingFactor {
@@ -906,5 +910,25 @@ mod production_l2_propagation_contract {
         )
         .unwrap_err();
         assert_eq!(error.status, SpatialL2Status::InvalidInput);
+    }
+
+    #[test]
+    fn ill_conditioned_joint_phase_covariance_fails_closed() {
+        let (target, reference) = maps();
+        let covariance = Array2::from_diag(&array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0e-13]);
+        let error = propagate_fixed_l2_difference_covariance(
+            &target,
+            &reference,
+            covariance.view(),
+            SpatialL2Branch::FixedL2,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, SpatialL2Status::IllConditioned);
+
+        let ill_conditioned_date_covariance = Array2::from_diag(&array![0.0, 1.0, 1.0e-13]);
+        let error = rank_revealing_psd_factor(ill_conditioned_date_covariance.view(), true)
+            .err()
+            .unwrap();
+        assert_eq!(error.status, SpatialL2Status::IllConditioned);
     }
 }
