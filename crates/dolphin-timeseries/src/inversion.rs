@@ -16,7 +16,10 @@ use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use rayon::prelude::*;
 
-const PIXEL_L2_MAX_CONDITION_NUMBER: f64 = 1.0e12;
+#[cfg(test)]
+thread_local! {
+    static PIXEL_L2_MAP_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Full weighted-L2 solution for one pixel. The parameter-covariance
 /// approximation assumes independent interferogram errors and is kept on demand
@@ -41,10 +44,8 @@ pub enum PixelL2MapStatus {
     InsufficientObservations = 1,
     /// The fixed valid design has insufficient numerical rank.
     RankDeficient = 2,
-    /// The fixed valid normal matrix exceeds the supported condition bound.
-    IllConditioned = 3,
     /// A required input or result is non-finite.
-    NonFinite = 4,
+    NonFinite = 3,
 }
 
 impl PixelL2MapStatus {
@@ -55,7 +56,6 @@ impl PixelL2MapStatus {
             Self::InvalidInput => "invalid_input",
             Self::InsufficientObservations => "insufficient_observations",
             Self::RankDeficient => "rank_deficient",
-            Self::IllConditioned => "ill_conditioned",
             Self::NonFinite => "non_finite",
         }
     }
@@ -85,7 +85,6 @@ pub struct PixelL2ObservationMap {
     precisions: Vec<f64>,
     observation_phase_map: Array2<f64>,
     h_map: Array2<f64>,
-    normal_inverse: Array2<f64>,
     condition_number: f64,
 }
 
@@ -430,25 +429,47 @@ pub fn solve_pixel_with_covariance(
     pixel: (usize, usize),
     n_ifgs: usize,
 ) -> Option<PixelL2Solution> {
-    let map = fixed_l2_pixel_map(a, dphi, weights, pixel, n_ifgs).ok()?;
-    let valid = map.valid_observation_indices();
-    let observations =
-        ndarray::Array1::from_iter(valid.iter().map(|&index| dphi[(index, pixel.0, pixel.1)]));
-    let parameters = map.h_map.dot(&observations);
-    let n = map.h_map.nrows();
+    let n = a.ncols();
+    let precision = |k: usize| {
+        let value = weights.map_or(1.0, |ws| ws[(k, pixel.0, pixel.1)]);
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        }
+    };
+    let valid: Vec<_> = (0..n_ifgs)
+        .filter(|&k| precision(k) > 0.0 && dphi[(k, pixel.0, pixel.1)].is_finite())
+        .collect();
+    if valid.len() < n {
+        return None;
+    }
+    let ata = Mat::from_fn(n, n, |i, j| {
+        valid
+            .iter()
+            .map(|&k| a[(k, i)] * precision(k) * a[(k, j)])
+            .sum::<f64>()
+    });
+    let atb = Mat::from_fn(n, 1, |i, _| {
+        valid
+            .iter()
+            .map(|&k| a[(k, i)] * precision(k) * dphi[(k, pixel.0, pixel.1)])
+            .sum::<f64>()
+    });
+    let llt = ata.cholesky(Side::Lower).ok()?;
+    let x = llt.solve(atb);
+    let identity = Mat::from_fn(n, n, |i, j| f64::from(i == j));
+    let inverse = llt.solve(identity);
     let residuals: Vec<_> = valid
         .iter()
-        .enumerate()
-        .map(|(compact, &original)| {
-            let predicted = (0..n)
-                .map(|parameter| a[(original, parameter)] * parameters[parameter])
-                .sum::<f64>();
-            (compact, observations[compact] - predicted)
+        .map(|&k| {
+            let predicted = (0..n).map(|i| a[(k, i)] * x[(i, 0)]).sum::<f64>();
+            (k, dphi[(k, pixel.0, pixel.1)] - predicted)
         })
         .collect();
     let weighted_sse = residuals
         .iter()
-        .map(|(compact, residual)| map.precisions[*compact] * residual * residual)
+        .map(|(k, residual)| precision(*k) * residual * residual)
         .sum::<f64>();
     let residual_sse = residuals
         .iter()
@@ -461,8 +482,8 @@ pub fn solve_pixel_with_covariance(
         (weighted_sse / dof as f64).max(1.0)
     };
     Some(PixelL2Solution {
-        parameters: parameters.to_vec(),
-        covariance: map.normal_inverse.mapv(|value| value * inflation),
+        parameters: (0..n).map(|i| x[(i, 0)]).collect(),
+        covariance: Array2::from_shape_fn((n, n), |(i, j)| inverse[(i, j)] * inflation),
         residual_rms: (residual_sse / valid.len() as f64).sqrt(),
     })
 }
@@ -477,6 +498,8 @@ pub fn fixed_l2_pixel_map(
     pixel: (usize, usize),
     n_ifgs: usize,
 ) -> Result<PixelL2ObservationMap, PixelL2MapError> {
+    #[cfg(test)]
+    PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     let (available_ifgs, rows, columns) = dphi.dim();
     if n_ifgs == 0
         || n_ifgs > available_ifgs
@@ -528,7 +551,6 @@ pub fn fixed_l2_pixel_map(
             .map(|&index| a[(index, row)] * precision(index) * a[(index, column)])
             .sum::<f64>()
     });
-    let condition_number = normal_condition_number(&normal)?;
     let llt = normal.cholesky(Side::Lower).map_err(|_| {
         pixel_map_error(
             PixelL2MapStatus::RankDeficient,
@@ -544,20 +566,11 @@ pub fn fixed_l2_pixel_map(
         },
     );
     let solved_h = llt.solve(observation_map);
-    let identity = Mat::from_fn(n_parameters, n_parameters, |i, j| f64::from(i == j));
-    let inverse = llt.solve(identity);
     let h_map = Array2::from_shape_fn(
         (n_parameters, valid_observation_indices.len()),
         |(row, column)| solved_h[(row, column)],
     );
-    let normal_inverse = Array2::from_shape_fn((n_parameters, n_parameters), |(row, column)| {
-        inverse[(row, column)]
-    });
-    if h_map
-        .iter()
-        .chain(normal_inverse.iter())
-        .any(|value| !value.is_finite())
-    {
+    if h_map.iter().any(|value| !value.is_finite()) {
         return Err(pixel_map_error(
             PixelL2MapStatus::NonFinite,
             "fixed L2 pixel map is non-finite",
@@ -580,39 +593,24 @@ pub fn fixed_l2_pixel_map(
         precisions,
         observation_phase_map,
         h_map,
-        normal_inverse,
-        condition_number,
+        condition_number: normal_condition_number(&normal),
     })
 }
 
-fn normal_condition_number(normal: &Mat<f64>) -> Result<f64, PixelL2MapError> {
+fn normal_condition_number(normal: &Mat<f64>) -> f64 {
     let eigen = normal.selfadjoint_eigendecomposition(Side::Lower);
     let values = (0..normal.nrows())
         .map(|index| eigen.s().column_vector()[index])
         .collect::<Vec<_>>();
     let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !maximum.is_finite() || maximum <= 0.0 {
-        return Err(pixel_map_error(
-            PixelL2MapStatus::RankDeficient,
-            "fixed L2 weighted normal matrix has zero rank",
-        ));
+        return f64::INFINITY;
     }
-    let rank_tolerance = maximum * f64::EPSILON * normal.nrows() as f64 * 16.0;
     let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
-    if !minimum.is_finite() || minimum <= rank_tolerance {
-        return Err(pixel_map_error(
-            PixelL2MapStatus::RankDeficient,
-            "fixed L2 weighted normal matrix is rank deficient",
-        ));
+    if !minimum.is_finite() || minimum <= 0.0 {
+        return f64::INFINITY;
     }
-    let condition_number = maximum / minimum;
-    if !condition_number.is_finite() || condition_number > PIXEL_L2_MAX_CONDITION_NUMBER {
-        return Err(pixel_map_error(
-            PixelL2MapStatus::IllConditioned,
-            "fixed L2 weighted normal matrix is ill conditioned",
-        ));
-    }
-    Ok(condition_number)
+    maximum / minimum
 }
 
 const fn pixel_map_error(status: PixelL2MapStatus, message: &'static str) -> PixelL2MapError {
@@ -1000,11 +998,18 @@ mod production_l2_map_contract {
     }
 
     #[test]
-    fn production_map_rejects_ill_conditioned_fixed_branch() {
+    fn public_pixel_solve_preserves_legacy_ill_conditioned_point_estimate() {
         let design = array![[1.0, 0.0], [0.0, 1.0e-7]];
         let observations = Array3::from_shape_vec((2, 1, 1), vec![1.0, 2.0]).unwrap();
-        let error =
-            fixed_l2_pixel_map(design.view(), observations.view(), None, (0, 0), 2).unwrap_err();
-        assert_eq!(error.status, PixelL2MapStatus::IllConditioned);
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| count.set(0));
+        let solution =
+            solve_pixel_with_covariance(design.view(), observations.view(), None, (0, 0), 2)
+                .unwrap();
+        assert_eq!(solution.parameters, vec![1.0, 20_000_000.0]);
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 0));
+
+        let map = fixed_l2_pixel_map(design.view(), observations.view(), None, (0, 0), 2).unwrap();
+        assert!(map.condition_number() > 1.0e12);
+        PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 1));
     }
 }
