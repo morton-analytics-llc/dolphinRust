@@ -13,6 +13,7 @@ pub mod covariance_artifact;
 pub mod crop;
 pub mod dates;
 pub mod displacement;
+pub mod fixed_cube;
 pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
@@ -34,6 +35,7 @@ pub use displacement::{
     update_displacement, DisplacementOutput, DisplacementOutputPolicy, DisplacementState,
     VelocityEstimator,
 };
+pub use fixed_cube::{write_fixed_cube_bundle, FixedCubeReceipt};
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
     assemble_geometry_provenance_with_coverage, write_geometry_provenance, BurstCoverageProvenance,
@@ -50,11 +52,12 @@ pub use sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest, CovarianceArtifactReplayMetrics,
     CovarianceArtifactReplayProvider, DependencyConeEstimate, DependencyConeQuery, GlobalBlockId,
-    GlobalDateId, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace, ReplayStatus,
-    ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
+    GlobalDateId, ReferenceDifferenceCovarianceReplay, ReferenceSpecificExecutionMode,
+    ReferenceSpecificReplayScope, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace,
+    ReplayStatus, ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
     SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, TemporalCovarianceReplay,
-    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
+    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SpatialCovarianceStatus,
+    TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};

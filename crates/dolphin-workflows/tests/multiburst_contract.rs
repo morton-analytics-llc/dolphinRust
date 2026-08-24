@@ -106,6 +106,31 @@ fn displacement_error(cfg: &DisplacementWorkflow) -> String {
 }
 
 #[test]
+fn equal_count_bursts_with_different_dates_fail_before_cslc_reads() {
+    let dir = std::env::temp_dir().join(format!(
+        "dolphin_multiburst_date_axis_contract_{}",
+        std::process::id()
+    ));
+    let cfg = DisplacementWorkflow {
+        cslc_file_list: vec![
+            dir.join("OPERA_T064-135518-IW1_20221119.h5"),
+            dir.join("OPERA_T064-135518-IW1_20221201.h5"),
+            dir.join("OPERA_T064-135518-IW2_20221120.h5"),
+            dir.join("OPERA_T064-135518-IW2_20221202.h5"),
+        ],
+        ..Default::default()
+    };
+
+    let detail = displacement_error(&cfg);
+    assert!(
+        detail.contains("bursts have different ordered acquisition dates"),
+        "{detail}"
+    );
+    assert!(detail.contains("T064-135518-IW1"), "{detail}");
+    assert!(detail.contains("T064-135518-IW2"), "{detail}");
+}
+
+#[test]
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn two_bursts_stitch_into_a_frame() {
     let dir = std::env::temp_dir().join(format!(

@@ -124,7 +124,7 @@ pub enum VelocityEstimator {
 }
 
 impl VelocityEstimator {
-    const fn metadata_value(self) -> &'static str {
+    pub(crate) const fn metadata_value(self) -> &'static str {
         match self {
             Self::LinearFullSeriesUnitPrecision => "linear_full_series_unit_precision",
             Self::LinearFullSeriesStitchedCrlbWithUnitFallback => {
@@ -337,6 +337,7 @@ pub fn run_displacement_with_output_policy(
         "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
@@ -1075,7 +1076,21 @@ fn emit_displacement(
                 crate::provenance::write_geometry_provenance(
                     &cfg.work_directory,
                     &geometry_provenance,
-                )
+                )?;
+                if let Some(geometry) = spatial.corrections.los_geometry.as_ref() {
+                    crate::fixed_cube::write_fixed_cube_bundle(
+                        cfg,
+                        &days,
+                        spatial.velocity_estimator,
+                        scaled.velocity_sigma.is_some(),
+                        spatial.validity_mask.view(),
+                        geometry,
+                        spatial.reference_point,
+                        epsg,
+                        spatial.geotransform,
+                    )?;
+                }
+                Ok(())
             }
             DisplacementOutputPolicy::GroundPulse => {
                 std::fs::create_dir_all(&cfg.work_directory)?;
@@ -2881,6 +2896,32 @@ fn acquisition_days(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Vec
         .context("parsing acquisition dates from CSLC filenames")
 }
 
+fn validate_common_burst_dates(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+) -> Result<()> {
+    let mut axes = Vec::with_capacity(groups.len());
+    for (id, indices) in groups {
+        let files = burst_files(cfg, indices);
+        acquisition_days(cfg, &files).with_context(|| format!("burst {id}"))?;
+        let dates = files
+            .iter()
+            .map(|file| parse_date(file, &cfg.input_options.cslc_date_fmt))
+            .collect::<Result<Vec<_>>>()?;
+        axes.push((id, dates));
+    }
+    let Some((reference_id, reference_dates)) = axes.first() else {
+        return Ok(());
+    };
+    for (id, dates) in axes.iter().skip(1) {
+        anyhow::ensure!(
+            dates == reference_dates,
+            "bursts have different ordered acquisition dates: {reference_id} and {id}"
+        );
+    }
+    Ok(())
+}
+
 fn capture_input_groups(
     cfg: &DisplacementWorkflow,
     groups: &BTreeMap<String, Vec<usize>>,
@@ -3018,6 +3059,7 @@ pub fn run_displacement_resumable(
         "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
@@ -3098,6 +3140,7 @@ pub fn update_displacement(
         "phase_linking.write_covariance_operator is unsupported for resumable updates"
     );
     let groups = group_by_burst(&cfg.cslc_file_list);
+    validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
         &groups,
