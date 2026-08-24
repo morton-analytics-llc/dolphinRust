@@ -623,6 +623,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "rayon",
+ "serde",
 ]
 
 [[package]]
