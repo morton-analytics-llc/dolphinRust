@@ -15,7 +15,7 @@ use dolphin_phaselink::{
     NodeId, ParentEdge, ProperComplexFactor, SourceDefinition, SourceEdge, SourceId,
     TemporalCoordinate,
 };
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{array, Array1, Array2, Array3, Array4};
 
 const EPS: f64 = 1e-6;
 const JVP_TOL: f64 = 2e-6;
@@ -491,6 +491,83 @@ fn opt_in_fused_receipt_preserves_legacy_output() {
         FixedBranchStatus::Masked
     );
     assert_eq!(replay.phase.branch_status[(0, 0)], FixedBranchStatus::Evd);
+}
+
+#[test]
+fn adaptive_receipt_preserves_output_and_records_exact_valid_support() {
+    let stack = stack();
+    let half = HalfWindow { y: 1, x: 1 };
+    let strides = Strides { y: 1, x: 1 };
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let mut valid = Array2::from_elem((3, 3), true);
+    valid[(0, 2)] = false;
+    let mut neighbors = Array4::from_elem((3, 3, 3, 3), false);
+    neighbors[(1, 1, 0, 0)] = true;
+    neighbors[(1, 1, 0, 2)] = true;
+    neighbors[(1, 1, 2, 1)] = true;
+    for output_row in 0..3 {
+        for output_col in 0..3 {
+            if (output_row, output_col) != (1, 1) {
+                neighbors[(output_row, output_col, 1, 1)] = true;
+            }
+        }
+    }
+    let legacy = engine
+        .link(
+            stack.view(),
+            half,
+            strides,
+            Some(neighbors.view()),
+            fused_params(),
+        )
+        .unwrap();
+    let replay = engine
+        .link_with_source_replay(
+            stack.view(),
+            half,
+            strides,
+            Some(neighbors.view()),
+            fused_params(),
+            valid.view(),
+            1e-10,
+        )
+        .unwrap();
+    assert_eq!(replay.estimate.cpx_phase, legacy.cpx_phase);
+    assert_eq!(
+        replay.estimate.temporal_coherence,
+        legacy.temporal_coherence
+    );
+    assert!(replay.phase.realized_support[(1, 1, 0, 0)]);
+    assert!(!replay.phase.realized_support[(1, 1, 0, 2)]);
+    assert!(replay.phase.realized_support[(1, 1, 2, 1)]);
+    assert_eq!(
+        replay
+            .phase
+            .realized_support
+            .slice(ndarray::s![1, 1, .., ..])
+            .iter()
+            .filter(|&&selected| selected)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn adaptive_receipt_rejects_malformed_support_shape() {
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let valid = Array2::from_elem((3, 3), true);
+    let malformed = Array4::from_elem((3, 3, 1, 1), true);
+    assert!(engine
+        .link_with_source_replay(
+            stack().view(),
+            HalfWindow { y: 1, x: 1 },
+            Strides { y: 1, x: 1 },
+            Some(malformed.view()),
+            fused_params(),
+            valid.view(),
+            1e-10,
+        )
+        .is_err());
 }
 
 #[test]

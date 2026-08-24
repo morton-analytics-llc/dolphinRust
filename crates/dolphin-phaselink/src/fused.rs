@@ -16,13 +16,14 @@
 //! exactly as the stages it replaces.
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use ndarray::{Array1, Array2, Array3, ArrayView3, ArrayView4};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView3, ArrayView4};
 use rayon::prelude::*;
 
 use crate::closure::triplet_closure;
 use crate::covariance::{
-    normalize_numerator, pixel_coh, sliding_row_numerators, sliding_row_numerators_with_validity,
-    validate_numerator_branch, CovarianceReplayError, RectReplayDescriptor,
+    normalize_numerator, pixel_coh, replay_rect_source_values, sliding_row_numerators,
+    sliding_row_numerators_with_validity, validate_numerator_branch, CovarianceReplayError,
+    NativeSourcePixel, RectReplayDescriptor,
 };
 use crate::crlb::crlb_pixel;
 use crate::estimator::{
@@ -121,6 +122,8 @@ pub struct PhaseReplayGrid {
     pub selected_eigengap: Array2<f64>,
     /// Actual fixed/fallback branch per output pixel.
     pub branch_status: Array2<FixedBranchStatus>,
+    /// Exact row-major native support used by each output pixel.
+    pub realized_support: Array4<bool>,
 }
 
 impl PhaseReplayGrid {
@@ -208,11 +211,11 @@ pub fn link_fused(
     Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
 }
 
-/// Run the CPU/f64 Rect fused path with an opt-in source-replay receipt.
+/// Run the CPU/f64 fused path with an opt-in source-replay receipt.
 ///
 /// The legacy [`FusedEstimate`] is produced by the same pixel kernels and pack
-/// function as [`link_fused`]. The extra receipt retains only bounded scalar
-/// estimator state and recomputable Rect geometry, never coherence cubes or
+/// function as [`link_fused`]. The extra receipt retains bounded scalar
+/// estimator state and exact realized support, never coherence cubes or
 /// eigensystems.
 ///
 /// # Errors
@@ -223,6 +226,27 @@ pub fn link_fused_with_source_replay(
     stack: ArrayView3<Cf64>,
     half: HalfWindow,
     strides: Strides,
+    params: FusedParams,
+    native_validity: ndarray::ArrayView2<bool>,
+    branch_tolerance: f64,
+) -> Result<SourceReplayEstimate, &'static str> {
+    link_fused_with_source_replay_support(
+        stack,
+        half,
+        strides,
+        None,
+        params,
+        native_validity,
+        branch_tolerance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn link_fused_with_source_replay_support(
+    stack: ArrayView3<Cf64>,
+    half: HalfWindow,
+    strides: Strides,
+    neighbors: Option<ArrayView4<bool>>,
     params: FusedParams,
     native_validity: ndarray::ArrayView2<bool>,
     branch_tolerance: f64,
@@ -246,15 +270,27 @@ pub fn link_fused_with_source_replay(
     let rect = RectReplayDescriptor::new((rows, cols), half, strides)
         .map_err(|_| "invalid rectangular replay geometry")?;
     let out_shape = rect.output_shape;
-    let replay_pixels = fused_pixels_sliding_with_replay(
-        stack,
-        params,
-        out_shape,
-        rect,
-        native_validity,
-        branch_tolerance,
-    );
-    let phase = phase_replay_grid(&replay_pixels, out_shape)?;
+    let support = realized_support(rect, native_validity, neighbors)?;
+    let replay_pixels = match neighbors {
+        Some(neighbors) => fused_pixels_masked_with_replay(
+            stack,
+            neighbors,
+            params,
+            out_shape,
+            rect,
+            support.view(),
+            branch_tolerance,
+        ),
+        None => fused_pixels_sliding_with_replay(
+            stack,
+            params,
+            out_shape,
+            rect,
+            native_validity,
+            branch_tolerance,
+        ),
+    };
+    let phase = phase_replay_grid(&replay_pixels, out_shape, support)?;
     let pixels = replay_pixels.into_iter().map(|(pixel, _)| pixel).collect();
     let estimate = pack(pixels, (out_shape.0, out_shape.1, nslc), &params);
     Ok(SourceReplayEstimate {
@@ -262,6 +298,31 @@ pub fn link_fused_with_source_replay(
         phase,
         rect,
     })
+}
+
+fn realized_support(
+    rect: RectReplayDescriptor,
+    native_validity: ndarray::ArrayView2<bool>,
+    neighbors: Option<ArrayView4<bool>>,
+) -> Result<Array4<bool>, &'static str> {
+    let window = (2 * rect.half_window.y + 1, 2 * rect.half_window.x + 1);
+    let expected = (rect.output_shape.0, rect.output_shape.1, window.0, window.1);
+    if neighbors.is_some_and(|values| values.dim() != expected) {
+        return Err("source replay neighbor shape mismatch");
+    }
+    Ok(Array4::from_shape_fn(
+        expected,
+        |(output_row, output_col, row, col)| {
+            let row_start = (rect.strides.y / 2 + output_row * rect.strides.y)
+                .saturating_sub(rect.half_window.y)
+                .min(rect.native_shape.0 - window.0);
+            let col_start = (rect.strides.x / 2 + output_col * rect.strides.x)
+                .saturating_sub(rect.half_window.x)
+                .min(rect.native_shape.1 - window.1);
+            native_validity[(row_start + row, col_start + col)]
+                && neighbors.is_none_or(|values| values[(output_row, output_col, row, col)])
+        },
+    ))
 }
 
 /// Return the zero-based ordinals of acquisitions containing no finite complex sample.
@@ -378,6 +439,94 @@ fn fused_pixels_sliding_with_replay(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn fused_pixels_masked_with_replay(
+    stack: ArrayView3<Cf64>,
+    neighbors: ArrayView4<bool>,
+    params: FusedParams,
+    out_shape: (usize, usize),
+    rect: RectReplayDescriptor,
+    support: ArrayView4<bool>,
+    branch_tolerance: f64,
+) -> Vec<(PixelFused, FixedBranchStatus)> {
+    let (out_rows, out_cols) = out_shape;
+    (0..out_rows * out_cols)
+        .into_par_iter()
+        .map(|index| {
+            let output = (index / out_cols, index % out_cols);
+            let coherence = pixel_coh(
+                stack,
+                output,
+                rect.half_window,
+                rect.strides,
+                Some(neighbors),
+            );
+            let status = adaptive_source_replay_status(
+                stack,
+                rect,
+                output,
+                support,
+                coherence.view(),
+                params,
+                branch_tolerance,
+            );
+            (fused_from_coh(coherence, params), status)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adaptive_source_replay_status(
+    stack: ArrayView3<Cf64>,
+    rect: RectReplayDescriptor,
+    output: (usize, usize),
+    support: ArrayView4<bool>,
+    coherence: ndarray::ArrayView2<Cf64>,
+    params: FusedParams,
+    branch_tolerance: f64,
+) -> FixedBranchStatus {
+    let window = (2 * rect.half_window.y + 1, 2 * rect.half_window.x + 1);
+    let row_start = (rect.strides.y / 2 + output.0 * rect.strides.y)
+        .saturating_sub(rect.half_window.y)
+        .min(rect.native_shape.0 - window.0);
+    let col_start = (rect.strides.x / 2 + output.1 * rect.strides.x)
+        .saturating_sub(rect.half_window.x)
+        .min(rect.native_shape.1 - window.1);
+    let sources = (0..window.0)
+        .flat_map(|row| {
+            (0..window.1)
+                .filter(move |&col| support[(output.0, output.1, row, col)])
+                .map(move |col| NativeSourcePixel::new(row_start + row, col_start + col))
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return FixedBranchStatus::Masked;
+    }
+    let values = Array2::from_shape_fn((stack.dim().0, sources.len()), |(date, source)| {
+        let pixel = sources[source];
+        stack[(date, pixel.row, pixel.column)]
+    });
+    let Ok(replay) = replay_rect_source_values(rect, output, &sources, values.view()) else {
+        return FixedBranchStatus::NonFiniteState;
+    };
+    let coherence_matches = replay.coherence.dim() == coherence.dim()
+        && replay
+            .coherence
+            .iter()
+            .zip(coherence.iter())
+            .all(|(replayed, produced)| {
+                (*replayed - *produced).norm() <= branch_tolerance.max(1e-12)
+            });
+    match validate_numerator_branch(replay.numerator.view(), branch_tolerance) {
+        Ok(()) if coherence_matches => fixed_branch_status(coherence, params, branch_tolerance),
+        Err(CovarianceReplayError::AmplitudeFloorBoundary) => {
+            FixedBranchStatus::AmplitudeFloorBoundary
+        }
+        Err(CovarianceReplayError::NonFiniteState) => FixedBranchStatus::NonFiniteState,
+        _ => FixedBranchStatus::InvalidEstimator,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn source_replay_status(
     stack: ArrayView3<Cf64>,
     rect: RectReplayDescriptor,
@@ -488,6 +637,7 @@ fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
 fn phase_replay_grid(
     pixels: &[(PixelFused, FixedBranchStatus)],
     shape: (usize, usize),
+    realized_support: Array4<bool>,
 ) -> Result<PhaseReplayGrid, &'static str> {
     let selected_eigenvalue = Array2::from_shape_vec(
         shape,
@@ -506,6 +656,7 @@ fn phase_replay_grid(
         selected_eigenvalue,
         selected_eigengap,
         branch_status,
+        realized_support,
     })
 }
 
