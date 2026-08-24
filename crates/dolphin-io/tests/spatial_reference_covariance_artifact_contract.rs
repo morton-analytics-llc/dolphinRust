@@ -35,8 +35,8 @@ const DETAILED_STATUSES: &[SpatialReferenceCovarianceStatus] = &[
     SpatialReferenceCovarianceStatus::TiedEigenvalue,
     SpatialReferenceCovarianceStatus::EmptySupport,
     SpatialReferenceCovarianceStatus::NonfiniteSource,
-    SpatialReferenceCovarianceStatus::NonPsdTruth,
-    SpatialReferenceCovarianceStatus::MissingAttemptRecord,
+    SpatialReferenceCovarianceStatus::UnsupportedModel,
+    SpatialReferenceCovarianceStatus::IllConditioned,
     SpatialReferenceCovarianceStatus::SupportIdentityMismatch,
 ];
 
@@ -47,6 +47,7 @@ fn digest(byte: u8) -> String {
 #[test]
 fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_blocks() {
     let _hdf5 = hdf5_guard();
+    assert_eq!(SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, 3);
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_streaming_{}.h5",
         std::process::id()
@@ -250,8 +251,8 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
             "tied_eigenvalue",
             "empty_support",
             "nonfinite_source",
-            "non_psd_truth",
-            "missing_attempt_record",
+            "unsupported_model",
+            "ill_conditioned",
             "support_identity_mismatch",
         ]
     );
@@ -316,6 +317,7 @@ fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
     .is_err());
 
     let mut calibrated_metadata = metadata();
+    calibrated_metadata.producer_commit = Some("a".repeat(40));
     calibrated_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
     calibrated_metadata.review_receipt_digest = digest(0x81);
     calibrated_metadata.method_manifest_digest = digest(0x82);
@@ -372,6 +374,7 @@ fn calibrated_scope_requires_nonzero_exact_identity_receipts_and_rejects_tamper(
     ));
     let _ = std::fs::remove_file(&path);
     let mut calibrated_metadata = metadata();
+    calibrated_metadata.producer_commit = Some("a".repeat(40));
     calibrated_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
     calibrated_metadata.review_receipt_digest = digest(0x81);
     calibrated_metadata.method_manifest_digest = digest(0x82);
@@ -412,6 +415,70 @@ fn calibrated_scope_requires_nonzero_exact_identity_receipts_and_rejects_tamper(
 }
 
 #[test]
+fn calibrated_scope_requires_and_binds_an_exact_producer_code_identity() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_producer_{}.h5",
+        std::process::id()
+    ));
+    let mut calibrated = metadata();
+    calibrated.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
+    calibrated.review_receipt_digest = digest(0x81);
+    calibrated.method_manifest_digest = digest(0x82);
+    calibrated.producer_commit = None;
+    calibrated.calibration_scope_digest = spatial_reference_calibration_scope_digest(&calibrated);
+    let mut calibrated_block = block();
+    calibrated_block.approximation_error_bound = vec![0.01, 0.02];
+    assert!(
+        write_spatial_reference_covariance(&path, &calibrated, &[calibrated_block.clone()])
+            .is_err()
+    );
+
+    calibrated.producer_commit = Some("a".repeat(40));
+    let first = spatial_reference_calibration_scope_digest(&calibrated);
+    calibrated.producer_commit = Some("b".repeat(40));
+    let second = spatial_reference_calibration_scope_digest(&calibrated);
+    assert_ne!(first, second);
+    calibrated.producer_commit = Some("not-an-immutable-code-identity".to_owned());
+    calibrated.calibration_scope_digest = spatial_reference_calibration_scope_digest(&calibrated);
+    assert!(write_spatial_reference_covariance(&path, &calibrated, &[calibrated_block]).is_err());
+}
+
+#[test]
+fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v3() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_legacy_v2_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    write_spatial_reference_covariance(&path, &metadata(), &[block()]).unwrap();
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.attr("schema_version")
+        .unwrap()
+        .write_scalar(&2_u16)
+        .unwrap();
+    file.dataset("blocks/00000000000000000007/approximation_error_bound")
+        .unwrap()
+        .write_raw(&[0.01_f64, 0.02])
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+
+    let legacy = read_spatial_reference_covariance_header(&path, 4096).unwrap();
+    assert_eq!(legacy.schema_version, 2);
+    assert_eq!(
+        read_spatial_reference_covariance_block(&path, 7, 4096)
+            .unwrap()
+            .block
+            .approximation_error_bound,
+        vec![0.01, 0.02]
+    );
+    assert!(SpatialReferenceCovarianceWriter::create(&path, &legacy).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn malformed_scope_gauge_hash_and_factor_fail_before_commit() {
     let _hdf5 = hdf5_guard();
     let base = std::env::temp_dir().join(format!(
@@ -437,6 +504,7 @@ fn malformed_scope_gauge_hash_and_factor_fail_before_commit() {
     .is_err());
 
     invalid_metadata = metadata();
+    invalid_metadata.producer_commit = Some("a".repeat(40));
     invalid_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
     invalid_metadata.review_receipt_digest = digest(0x81);
     invalid_metadata.method_manifest_digest = digest(0x82);
