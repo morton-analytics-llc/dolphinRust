@@ -3412,6 +3412,7 @@ pub(crate) fn build_covariance_operator_block(
     phase_replay: &PhaseReplayGrid,
     compression_replay: &CompressionReplayGrid,
     use_evd: bool,
+    mut source_resolver: Option<&mut dyn SequentialPrimitiveSourceResolver>,
 ) -> Result<CovarianceOperatorBlock, SequentialReplayError> {
     let block = topology
         .blocks
@@ -3494,6 +3495,69 @@ pub(crate) fn build_covariance_operator_block(
                 .map(SourceId::get)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut source_factor_digests = Vec::with_capacity(source_digest_bytes);
+    if let Some(resolver) = source_resolver.as_mut() {
+        let identity = resolver.identity().clone();
+        if identity.source_manifest_digest != request.source_manifest_digest
+            || resolver.identity().source_model_version_digest
+                != request.source_model_version_digest
+            || identity.source_model_hash.iter().all(|byte| *byte == 0)
+            || [
+                identity.provider.as_str(),
+                identity.provider_version.as_str(),
+                identity.model.as_str(),
+                identity.model_version.as_str(),
+            ]
+            .iter()
+            .any(|value| value.is_empty())
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceIdentityMismatch,
+                "capture source resolver identity differs from the operator request",
+            ));
+        }
+        let expected_components = source_date_indices
+            .iter()
+            .copied()
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        for native in 0..topology.native_area {
+            let source = resolver.resolve_source(block, native)?;
+            let expected_content: &[u8; 32] = source_content_digests
+                [native * 32..(native + 1) * 32]
+                .try_into()
+                .map_err(|_| {
+                    SequentialReplayError::Invalid("captured source digest width is not SHA-256")
+                })?;
+            let row = native / topology.native_shape.1;
+            let column = native % topology.native_shape.1;
+            let expected_samples = (ministack.num_compressed..ministack.size())
+                .map(|component| combined_source[(component, row, column)])
+                .collect::<Vec<_>>();
+            if source.id.get() != source_ids[native]
+                || source.factor.source() != source.id
+                || source.content_digest != *expected_content
+                || source.samples.as_slice() != Some(expected_samples.as_slice())
+                || source.factor.component_ids() != expected_components
+                || source.factor.model_hash() != &resolver.identity().source_model_hash
+            {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "capture source bytes or factor identity differ from the production tile",
+                ));
+            }
+            let factor_digest = source.factor.numeric_receipt_digest();
+            if factor_digest.iter().all(|byte| *byte == 0) {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::SourceModelUnavailable,
+                    "capture source factor has no numeric receipt",
+                ));
+            }
+            source_factor_digests.extend_from_slice(&factor_digest);
+        }
+    } else {
+        source_factor_digests.resize(source_digest_bytes, 0);
+    }
     let compressed_node_ids = (0..topology.native_area)
         .map(|native| {
             topology
@@ -3589,7 +3653,7 @@ pub(crate) fn build_covariance_operator_block(
         ordered_date_indices: source_date_indices,
         source_ids,
         source_content_digests,
-        source_factor_digests: vec![0; source_digest_bytes],
+        source_factor_digests,
         phase_node_ids,
         compressed_node_ids,
         carry_parent_ids: block
@@ -3826,7 +3890,7 @@ fn compression_status(status: CompressionReplayStatus) -> CovarianceOperatorStat
     }
 }
 
-fn primitive_source_content_digest(samples: impl IntoIterator<Item = Cf64>) -> [u8; 32] {
+pub(crate) fn primitive_source_content_digest(samples: impl IntoIterator<Item = Cf64>) -> [u8; 32] {
     let mut digest = Sha256::new();
     for sample in samples {
         digest.update(sample.re.to_le_bytes());

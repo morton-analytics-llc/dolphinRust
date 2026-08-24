@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{
-    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, ShpMethod,
-    TimeseriesMethod, UnwrapMethod,
+    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, TimeseriesMethod,
+    UnwrapMethod,
 };
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
@@ -52,6 +52,12 @@ use crate::covariance_artifact::{
     CovarianceArtifactDiskAdmission, CovarianceArtifactTransaction,
 };
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
+use crate::cslc_covariance_source::{
+    empirical_factor_config, CslcCovarianceManifest, CslcCovarianceSourceResolver,
+    CslcCovarianceValidityReader, CSLC_COVARIANCE_SOURCE_MODEL,
+    CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
+    CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+};
 use crate::dates::{decimal_days, parse_date};
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
@@ -59,9 +65,11 @@ use crate::provenance::{
 };
 use crate::sequential::{
     run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
-    run_sequential_resumable, run_sequential_resumable_masked,
-    run_sequential_with_covariance_capture, update_sequential, update_sequential_masked,
-    SequentialConfig, SequentialCovarianceCaptureRequest, SequentialOutput, SequentialState,
+    run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
+    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, update_sequential,
+    update_sequential_masked, SequentialConfig, SequentialCovarianceCaptureRequest,
+    SequentialOutput, SequentialState,
 };
 use crate::sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
@@ -79,10 +87,6 @@ const MIN_SEAM_SUPPORT: usize = 4;
 const MIN_SEAM_COHERENCE: f64 = 0.5;
 const MASK_PREFLIGHT_STRIPE_ROWS: usize = 1_024;
 const COVARIANCE_BRANCH_TOLERANCE: f64 = 1e-10;
-const COVARIANCE_SOURCE_PROVIDER: &str = "dolphin_workflows_cslc_path_manifest";
-const COVARIANCE_SOURCE_PROVIDER_VERSION: &str = "2";
-const COVARIANCE_SOURCE_MODEL: &str = "unavailable_proper_complex_source_factor";
-const COVARIANCE_SOURCE_MODEL_VERSION: &str = "0";
 
 /// Typed failure from multi-burst phase-offset reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -1425,6 +1429,8 @@ struct CovarianceCaptureArtifact {
     disk_admission: CovarianceArtifactDiskAdmission,
     source_manifest_digest: [u8; 32],
     source_model_version_digest: [u8; 32],
+    source_model_hash: [u8; 32],
+    source_manifest: CslcCovarianceManifest,
     transaction: CovarianceArtifactTransaction,
 }
 
@@ -1447,13 +1453,25 @@ impl CovarianceCaptureArtifact {
             .join("phase_covariance_operator.h5.scratch");
         recover_incomplete_covariance_operator(&scratch_path)
             .context("recovering prior covariance scratch artifact")?;
-        let source_manifest_digest = covariance_source_manifest_digest(cfg)?;
+        let subdataset = cfg
+            .input_options
+            .subdataset
+            .clone()
+            .context("input_options.subdataset is required for covariance source capture")?;
+        let source_manifest = CslcCovarianceManifest::capture(
+            cfg.input_options.input_type,
+            subdataset,
+            &cfg.cslc_file_list,
+        )?;
+        let source_manifest_digest = source_manifest.digest();
         let source_model_version_digest = covariance_source_model_identity_digest(
-            COVARIANCE_SOURCE_PROVIDER,
-            COVARIANCE_SOURCE_PROVIDER_VERSION,
-            COVARIANCE_SOURCE_MODEL,
-            COVARIANCE_SOURCE_MODEL_VERSION,
+            CSLC_COVARIANCE_SOURCE_PROVIDER,
+            CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+            CSLC_COVARIANCE_SOURCE_MODEL,
+            CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
         );
+        let source_model_hash =
+            *empirical_factor_config(&cfg.phase_linking.empirical_source_factor)?.config_digest();
         let projection = projected_covariance_artifact(
             cfg,
             groups,
@@ -1481,17 +1499,17 @@ impl CovarianceCaptureArtifact {
             kernel_digest: format!("sha256:{}", hex_digest(sequential_replay_kernel_digest())),
             source: SourceReplayIdentity {
                 manifest_digest: Some(format!("sha256:{}", hex_digest(source_manifest_digest))),
-                provider: Some(COVARIANCE_SOURCE_PROVIDER.to_owned()),
-                provider_version: Some(COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned()),
-                model: Some(COVARIANCE_SOURCE_MODEL.to_owned()),
-                model_version: Some(COVARIANCE_SOURCE_MODEL_VERSION.to_owned()),
+                provider: Some(CSLC_COVARIANCE_SOURCE_PROVIDER.to_owned()),
+                provider_version: Some(CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned()),
+                model: Some(CSLC_COVARIANCE_SOURCE_MODEL.to_owned()),
+                model_version: Some(CSLC_COVARIANCE_SOURCE_MODEL_VERSION.to_owned()),
                 model_version_digest: Some(format!(
                     "sha256:{}",
                     hex_digest(source_model_version_digest)
                 )),
-                model_receipt_digest: None,
+                model_receipt_digest: Some(format!("sha256:{}", hex_digest(source_model_hash))),
             },
-            replay_status: CovarianceReplayStatus::SourceModelUnavailable,
+            replay_status: CovarianceReplayStatus::Replayable,
             stitched_status: match included_bursts {
                 0 | 1 => StitchedCovarianceStatus::NotStitched,
                 _ => StitchedCovarianceStatus::UnsupportedSeamCovariance,
@@ -1512,6 +1530,8 @@ impl CovarianceCaptureArtifact {
             disk_admission,
             source_manifest_digest,
             source_model_version_digest,
+            source_model_hash,
+            source_manifest,
             transaction,
         })
     }
@@ -1544,6 +1564,7 @@ struct TileCovarianceCapture<'a> {
     source_origin: (usize, usize),
     source_manifest_digest: [u8; 32],
     source_model_version_digest: [u8; 32],
+    source_resolver: Option<CslcCovarianceSourceResolver<'a>>,
     sink: &'a mut dyn CovarianceBlockSink,
 }
 
@@ -1568,12 +1589,12 @@ impl CovarianceBlockSink for Vec<CovarianceOperatorBlock> {
 
 impl TileCovarianceCapture<'_> {
     fn request(
-        &self,
+        &mut self,
         plan: &TilePlan,
         strides: dolphin_core::Strides,
     ) -> Result<SequentialCovarianceCaptureRequest> {
         let grids = covariance_tile_plan(self.source_origin, plan, strides)?;
-        Ok(SequentialCovarianceCaptureRequest {
+        let request = SequentialCovarianceCaptureRequest {
             burst_id: self.burst_id.clone(),
             source_manifest_digest: self.source_manifest_digest,
             source_model_version_digest: self.source_model_version_digest,
@@ -1581,7 +1602,11 @@ impl TileCovarianceCapture<'_> {
             output_grid: grids.output_grid,
             owned_output_grid: grids.owned_output_grid,
             branch_tolerance: COVARIANCE_BRANCH_TOLERANCE,
-        })
+        };
+        if let Some(resolver) = self.source_resolver.as_mut() {
+            resolver.set_tile_grid(request.native_grid);
+        }
+        Ok(request)
     }
 }
 
@@ -1813,20 +1838,6 @@ fn projected_covariance_artifact(
     })
 }
 
-fn covariance_source_manifest_digest(cfg: &DisplacementWorkflow) -> Result<[u8; 32]> {
-    let mut manifest = Sha256::new();
-    manifest.update(b"dolphinrust:cslc_path_manifest:v2");
-    manifest.update((cfg.cslc_file_list.len() as u64).to_le_bytes());
-    manifest.update(serde_json::to_vec(&cfg.input_options)?);
-    for (index, path) in cfg.cslc_file_list.iter().enumerate() {
-        let path_text = path.to_string_lossy();
-        manifest.update((index as u64).to_le_bytes());
-        manifest.update((path_text.len() as u64).to_le_bytes());
-        manifest.update(path_text.as_bytes());
-    }
-    Ok(manifest.finalize().into())
-}
-
 fn hex_digest(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1856,16 +1867,44 @@ fn link_one_burst(
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
     let source = burst_source_window(&files[0], &subdataset, bounded)?;
-    let tile_capture = covariance.map(|artifact| TileCovarianceCapture {
-        burst_id: burst_id.to_owned(),
-        source_origin: (source.row_start, source.col_start),
-        source_manifest_digest: artifact.source_manifest_digest,
-        source_model_version_digest: artifact.source_model_version_digest,
-        sink: artifact
-            .writer
-            .as_mut()
-            .expect("unfinished covariance writer"),
-    });
+    let tile_capture = match covariance {
+        Some(artifact) => {
+            let initial_grid = CovarianceOperatorGrid {
+                row_start: source.row_start as u64,
+                col_start: source.col_start as u64,
+                rows: u32::try_from(source.height()).context("source rows exceed u32")?,
+                cols: u32::try_from(source.width()).context("source columns exceed u32")?,
+                stride_y: 1,
+                stride_x: 1,
+            };
+            let source_resolver = artifact.source_manifest.resolver(
+                idxs,
+                burst_id,
+                (source.row_start, source.col_start),
+                (source.height(), source.width()),
+                initial_grid,
+                &cfg.phase_linking.empirical_source_factor,
+                artifact.source_model_version_digest,
+                mask.map(|value| value as &dyn CslcCovarianceValidityReader),
+            )?;
+            anyhow::ensure!(
+                source_resolver.source_identity().source_model_hash == artifact.source_model_hash,
+                "covariance source-factor receipt changed after artifact creation"
+            );
+            Some(TileCovarianceCapture {
+                burst_id: burst_id.to_owned(),
+                source_origin: (source.row_start, source.col_start),
+                source_manifest_digest: artifact.source_manifest_digest,
+                source_model_version_digest: artifact.source_model_version_digest,
+                source_resolver: Some(source_resolver),
+                sink: artifact
+                    .writer
+                    .as_mut()
+                    .expect("unfinished covariance writer"),
+            })
+        }
+        None => None,
+    };
     let tiled = phase_link_tiled_impl(
         cfg,
         (source.height(), source.width()),
@@ -2068,8 +2107,29 @@ fn phase_link_tiled_impl(
         let out = match covariance.as_mut() {
             Some(capture) => {
                 let request = capture.request(&plan, cfg.output_options.strides)?;
-                match valid_mask {
-                    Some(mask) => run_sequential_masked_with_covariance_capture(
+                match (valid_mask, capture.source_resolver.as_mut()) {
+                    (Some(mask), Some(resolver)) => {
+                        run_sequential_masked_with_covariance_capture_and_source_factors(
+                            stack.view(),
+                            mask,
+                            &sequential_config(cfg),
+                            engine,
+                            &request,
+                            resolver,
+                            |block| capture.sink.write_block(block),
+                        )
+                    }
+                    (None, Some(resolver)) => {
+                        run_sequential_with_covariance_capture_and_source_factors(
+                            stack.view(),
+                            &sequential_config(cfg),
+                            engine,
+                            &request,
+                            resolver,
+                            |block| capture.sink.write_block(block),
+                        )
+                    }
+                    (Some(mask), None) => run_sequential_masked_with_covariance_capture(
                         stack.view(),
                         mask,
                         &sequential_config(cfg),
@@ -2077,7 +2137,7 @@ fn phase_link_tiled_impl(
                         &request,
                         |block| capture.sink.write_block(block),
                     ),
-                    None => run_sequential_with_covariance_capture(
+                    (None, None) => run_sequential_with_covariance_capture(
                         stack.view(),
                         &sequential_config(cfg),
                         engine,
@@ -2163,7 +2223,45 @@ struct BurstMaskState {
 struct PreparedBurstMask {
     path: PathBuf,
     semantic_fingerprint: [u8; 32],
+    source_origin: (usize, usize),
     reader: BurstMaskReader,
+}
+
+impl CslcCovarianceValidityReader for PreparedBurstMask {
+    fn read_validity(
+        &self,
+        block: BlockIndices,
+    ) -> std::result::Result<Array2<bool>, crate::sequential_covariance::SequentialReplayError>
+    {
+        let local = BlockIndices {
+            row_start: block.row_start.checked_sub(self.source_origin.0).ok_or(
+                crate::sequential_covariance::SequentialReplayError::Invalid(
+                    "source-factor validity row precedes the processed burst",
+                ),
+            )?,
+            row_stop: block.row_stop.checked_sub(self.source_origin.0).ok_or(
+                crate::sequential_covariance::SequentialReplayError::Invalid(
+                    "source-factor validity row precedes the processed burst",
+                ),
+            )?,
+            col_start: block.col_start.checked_sub(self.source_origin.1).ok_or(
+                crate::sequential_covariance::SequentialReplayError::Invalid(
+                    "source-factor validity column precedes the processed burst",
+                ),
+            )?,
+            col_stop: block.col_stop.checked_sub(self.source_origin.1).ok_or(
+                crate::sequential_covariance::SequentialReplayError::Invalid(
+                    "source-factor validity column precedes the processed burst",
+                ),
+            )?,
+        };
+        self.reader.read(local).map_err(|_| {
+            crate::sequential_covariance::SequentialReplayError::Provider(
+                crate::sequential_covariance::ReplayStatus::SourceUnavailable,
+                "reading canonical source-factor validity failed",
+            )
+        })
+    }
 }
 
 struct PreparedUpdateMask {
@@ -2270,6 +2368,7 @@ fn preflight_burst_mask(
     Ok(Some(PreparedBurstMask {
         path: path.to_path_buf(),
         semantic_fingerprint,
+        source_origin: (source.row_start, source.col_start),
         reader,
     }))
 }
@@ -3265,10 +3364,6 @@ fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
         anyhow::ensure!(
             cfg.worker_settings.compute_backend == ComputeBackend::Cpu,
             "phase_linking.write_covariance_operator requires the CPU f64 backend"
-        );
-        anyhow::ensure!(
-            cfg.phase_linking.shp_method == ShpMethod::Rect,
-            "phase_linking.write_covariance_operator requires shp_method = rect"
         );
         anyhow::ensure!(
             cfg.phase_linking.output_reference_idx.unwrap_or(0) == 0,
@@ -5401,6 +5496,7 @@ mod tests {
                 source_origin: (0, 0),
                 source_manifest_digest,
                 source_model_version_digest,
+                source_resolver: None,
                 sink: &mut blocks,
             }),
         )
@@ -5440,18 +5536,6 @@ mod tests {
     }
 
     #[test]
-    fn covariance_path_manifest_does_not_reread_cslc_bytes() {
-        let mut cfg = DisplacementWorkflow {
-            cslc_file_list: vec![PathBuf::from("/nonexistent/covariance-source-a.h5")],
-            ..DisplacementWorkflow::default()
-        };
-        let first = covariance_source_manifest_digest(&cfg).unwrap();
-        assert_eq!(covariance_source_manifest_digest(&cfg).unwrap(), first);
-        cfg.cslc_file_list[0] = PathBuf::from("/nonexistent/covariance-source-b.h5");
-        assert_ne!(covariance_source_manifest_digest(&cfg).unwrap(), first);
-    }
-
-    #[test]
     fn tiled_covariance_capture_accepts_all_masked_nonfinite_tiles() {
         let dims = (8, 16);
         let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (4, 4));
@@ -5483,6 +5567,7 @@ mod tests {
                 source_origin: (0, 0),
                 source_manifest_digest: [21; 32],
                 source_model_version_digest: [22; 32],
+                source_resolver: None,
                 sink: &mut blocks,
             }),
         )
@@ -6187,7 +6272,11 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.phase_linking.write_covariance_operator = true;
         cfg.phase_linking.shp_method = ShpMethod::Rect;
-        validate_config(&cfg).expect("the frozen CPU/Rect/AlwaysFirst/gauge-0 scope is supported");
+        for method in [ShpMethod::Rect, ShpMethod::Glrt, ShpMethod::Ks] {
+            cfg.phase_linking.shp_method = method;
+            validate_config(&cfg)
+                .expect("Rect, GLRT, and KS capture share the frozen source-factor identity");
+        }
 
         cfg.phase_linking.max_num_compressed = 0;
         assert!(validate_config(&cfg)

@@ -1,10 +1,13 @@
 //! Issue #52 unconditional workflow contract for `sequential_source_dag_v1`.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Mutex;
 
-use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
-use dolphin_core::Cf64;
+use dolphin_core::config::{
+    CompressedSlcPlan, ComputeBackend, EmpiricalSourceFactorOptions, InputType, ShpMethod,
+};
+use dolphin_core::{Cf32, Cf64};
 use dolphin_io::{
     read_covariance_operator_block_with_receipt, CovarianceOperatorBlock, CovarianceOperatorGrid,
     CovarianceOperatorMetadata, CovarianceOperatorStatus, CovarianceOperatorWriter,
@@ -19,14 +22,17 @@ use dolphin_phaselink::{
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_workflows::{
     admit_covariance_artifact_disk_with_identity_index, finalize_covariance_artifact,
-    run_sequential, run_sequential_with_covariance_capture, sequential_replay_kernel_digest,
+    run_sequential, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest, CovarianceArtifactReplayProvider,
-    CovarianceArtifactTransaction, DependencyConeQuery, GlobalBlockId, GlobalDateId, ReplayBackend,
-    ReplayExecutionScope, ReplayIdNamespace, ReplayStatus, ResolvedCompressionReplay,
-    ResolvedPhaseReplay, ResolvedPrimitiveSource, SequentialConfig,
+    CovarianceArtifactTransaction, CslcCovarianceManifest, DependencyConeQuery, GlobalBlockId,
+    GlobalDateId, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace, ReplayStatus,
+    ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource, SequentialConfig,
     SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
     SequentialSourceProviderIdentity, SequentialSourceReplayProvider, COVARIANCE_OPERATOR_FILENAME,
+    CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+    CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 use ndarray::{array, Array1, Array2, Array3, Axis};
 use sha2::{Digest, Sha256};
@@ -36,6 +42,26 @@ const SOURCE_PROVIDER_VERSION: &str = "1";
 const SOURCE_MODEL: &str = "proper-complex";
 const SOURCE_MODEL_VERSION: &str = "1";
 static HDF5_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_cslc_source_member(path: &Path, date: usize, changed: bool) {
+    let _ = std::fs::remove_file(path);
+    let values = Array2::from_shape_fn((5, 5), |(row, col)| {
+        let bump = if changed && row == 2 && col == 2 {
+            3.0
+        } else {
+            0.0
+        };
+        Cf32::new(
+            1.0 + date as f32 * 0.2 + row as f32 * 0.03 + bump,
+            0.5 + col as f32 * 0.04 - date as f32 * 0.01,
+        )
+    });
+    let file = hdf5::File::create(path).unwrap();
+    file.new_dataset_builder()
+        .with_data(&values)
+        .create("data")
+        .unwrap();
+}
 
 fn config() -> SequentialConfig {
     SequentialConfig {
@@ -74,6 +100,130 @@ fn source_model_identity_digest() -> [u8; 32] {
         SOURCE_MODEL,
         SOURCE_MODEL_VERSION,
     )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cslc_member_bytes_and_order_define_shared_tile_edge_factor_identity() {
+    let _hdf5 = HDF5_LOCK.lock().unwrap();
+    assert_eq!(
+        CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+        dolphin_phaselink::EMPIRICAL_PROPER_COMPLEX_VERSION.to_string()
+    );
+    let root = std::env::temp_dir().join(format!(
+        "dolphin_cslc_covariance_source_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(CslcCovarianceManifest::capture(
+        InputType::OperaCslc,
+        "/data",
+        &[root.join("missing.h5")],
+    )
+    .is_err());
+    let paths = (0..3)
+        .map(|date| root.join(format!("source_{date}.h5")))
+        .collect::<Vec<_>>();
+    for (date, path) in paths.iter().enumerate() {
+        write_cslc_source_member(path, date, false);
+    }
+    let manifest = CslcCovarianceManifest::capture(InputType::OperaCslc, "/data", &paths).unwrap();
+    let reversed = CslcCovarianceManifest::capture(
+        InputType::OperaCslc,
+        "/data",
+        &paths.iter().cloned().rev().collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_ne!(manifest.digest(), reversed.digest());
+
+    let model_version = sequential_source_model_identity_digest(
+        CSLC_COVARIANCE_SOURCE_PROVIDER,
+        CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+        CSLC_COVARIANCE_SOURCE_MODEL,
+        CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+    );
+    let block = SequentialReplayBlock {
+        id: GlobalBlockId::new(9),
+        generation: 0,
+        real_date_start: GlobalDateId::new(0),
+        num_real_dates: 3,
+        carried_parent_ids: Vec::new(),
+        phase_dimension: 2,
+    };
+    let options = EmpiricalSourceFactorOptions {
+        half_window: dolphin_core::HalfWindow { y: 1, x: 1 },
+        shrinkage_alpha: 0.2,
+        relative_diagonal_floor: 1e-8,
+    };
+    let mut left = manifest
+        .resolver(
+            &[0, 1, 2],
+            "burst",
+            (0, 0),
+            (5, 5),
+            CovarianceOperatorGrid {
+                row_start: 0,
+                col_start: 0,
+                rows: 4,
+                cols: 4,
+                stride_y: 1,
+                stride_x: 1,
+            },
+            &options,
+            model_version,
+            None,
+        )
+        .unwrap();
+    let mut right = manifest
+        .resolver(
+            &[0, 1, 2],
+            "burst",
+            (0, 0),
+            (5, 5),
+            CovarianceOperatorGrid {
+                row_start: 1,
+                col_start: 1,
+                rows: 4,
+                cols: 4,
+                stride_y: 1,
+                stride_x: 1,
+            },
+            &options,
+            model_version,
+            None,
+        )
+        .unwrap();
+    let from_left = left.resolve_source(&block, 10).unwrap();
+    let from_right = right.resolve_source(&block, 5).unwrap();
+    assert_eq!(from_left.id, from_right.id);
+    assert_eq!(from_left.content_digest, from_right.content_digest);
+    assert_eq!(
+        from_left.factor.numeric_receipt_digest(),
+        from_right.factor.numeric_receipt_digest()
+    );
+    assert!(from_left
+        .factor
+        .numeric_receipt_digest()
+        .iter()
+        .any(|byte| *byte != 0));
+    let mut invalid_dates = block.clone();
+    invalid_dates.real_date_start = GlobalDateId::new(2);
+    invalid_dates.num_real_dates = 2;
+    assert!(matches!(
+        left.resolve_source(&invalid_dates, 10),
+        Err(SequentialReplayError::Provider(
+            ReplayStatus::SourceIdentityMismatch,
+            _
+        ))
+    ));
+
+    write_cslc_source_member(&paths[1], 1, true);
+    let changed = CslcCovarianceManifest::capture(InputType::OperaCslc, "/data", &paths).unwrap();
+    assert_ne!(manifest.digest(), changed.digest());
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(root);
 }
 
 fn bind_test_factor_receipts(blocks: &mut [CovarianceOperatorBlock]) {
@@ -597,6 +747,7 @@ fn fixed_local_query_bound_does_not_scale_with_frame_area_before_ancestry_satura
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn production_sequential_path_streams_replay_blocks_without_changing_legacy_output() {
     let stack = Array3::from_shape_fn((6, 4, 4), |(date, row, col)| {
         let amplitude = 1.0 + 0.07 * date as f64 + 0.01 * (row + col) as f64;
@@ -670,6 +821,47 @@ fn production_sequential_path_streams_replay_blocks_without_changing_legacy_outp
     assert_eq!(blocks[1].support_bits_per_output, 9);
     assert_eq!(blocks[1].support_bits.len(), 8);
     assert_eq!(blocks[1].owned_output_grid, blocks[1].output_grid);
+
+    let mut resolver = CapturedProvider {
+        identity: SequentialSourceProviderIdentity {
+            source_manifest_digest: request.source_manifest_digest,
+            provider: SOURCE_PROVIDER.to_owned(),
+            provider_version: SOURCE_PROVIDER_VERSION.to_owned(),
+            model: SOURCE_MODEL.to_owned(),
+            model_version: SOURCE_MODEL_VERSION.to_owned(),
+            source_model_version_digest: request.source_model_version_digest,
+            source_model_hash: [9; 32],
+        },
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(|block| (GlobalBlockId::new(block.block_id), block))
+            .collect(),
+        stack: stack.clone(),
+        source_reads: 0,
+        fail_source_model: false,
+        dishonest_samples: false,
+    };
+    let mut factors = Vec::new();
+    run_sequential_with_covariance_capture_and_source_factors(
+        stack.view(),
+        &cfg,
+        &engine,
+        &request,
+        &mut resolver,
+        |block| {
+            factors.push(block);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(factors.iter().all(|block| {
+        block.source_factor_digests.len() == block.source_content_digests.len()
+            && block
+                .source_factor_digests
+                .chunks_exact(32)
+                .all(|digest| digest.iter().any(|byte| *byte != 0))
+    }));
 }
 
 #[test]
