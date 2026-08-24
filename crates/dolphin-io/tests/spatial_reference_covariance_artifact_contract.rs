@@ -29,6 +29,27 @@ fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_
         metadata()
     );
     std::fs::remove_file(path).unwrap();
+
+    let partial_path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_partial_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&partial_path);
+    let mut partial = block();
+    partial.target_grid = grid(0, 1);
+    partial.rank_by_target.truncate(1);
+    partial.status.truncate(1);
+    partial.source_burst_index_by_target.truncate(1);
+    partial.difference_factor.truncate(6);
+    partial.approximation_error_bound.truncate(1);
+    let mut writer = SpatialReferenceCovarianceWriter::create(&partial_path, &metadata()).unwrap();
+    writer.write_block(&partial).unwrap();
+    let mut overlap = partial.clone();
+    overlap.block_id += 1;
+    assert!(writer.write_block(&overlap).is_err());
+    assert!(writer.finish().is_err());
+    assert!(read_spatial_reference_covariance_header(&partial_path, 4096).is_err());
+    std::fs::remove_file(partial_path).unwrap();
 }
 
 fn grid(row_start: u64, rows: u32) -> CovarianceOperatorGrid {

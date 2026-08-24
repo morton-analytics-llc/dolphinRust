@@ -4428,6 +4428,7 @@ pub struct SpatialReferenceCovarianceWriter {
     path: PathBuf,
     metadata: SpatialReferenceCovarianceMetadata,
     block_ids: BTreeSet<u64>,
+    target_grids: Vec<CovarianceOperatorGrid>,
 }
 
 impl SpatialReferenceCovarianceWriter {
@@ -4448,6 +4449,7 @@ impl SpatialReferenceCovarianceWriter {
             path,
             metadata: metadata.clone(),
             block_ids: BTreeSet::new(),
+            target_grids: Vec::new(),
         })
     }
 
@@ -4462,13 +4464,21 @@ impl SpatialReferenceCovarianceWriter {
             self.block_ids.insert(block.block_id),
             "duplicate spatial reference block ID",
         )?;
+        ensure_valid(
+            self.target_grids
+                .iter()
+                .all(|grid| !grids_overlap(*grid, block.target_grid)),
+            "spatial reference target blocks overlap",
+        )?;
         let file = self
             .file
             .as_ref()
             .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
         let block_group = file.group("blocks")?;
         let group = block_group.create_group(&format!("{:020}", block.block_id))?;
-        write_spatial_reference_block(&group, &self.metadata, block)
+        write_spatial_reference_block(&group, &self.metadata, block)?;
+        self.target_grids.push(block.target_grid);
+        Ok(())
     }
 
     /// Mark the artifact complete, validate its exact schema, and return its digest.
@@ -4479,6 +4489,15 @@ impl SpatialReferenceCovarianceWriter {
         ensure_valid(
             !self.block_ids.is_empty(),
             "spatial reference artifact has no blocks",
+        )?;
+        let covered_targets = self.target_grids.iter().try_fold(0_usize, |total, grid| {
+            total
+                .checked_add(grid.area()?)
+                .ok_or_else(|| invalid("spatial reference covered area overflow"))
+        })?;
+        ensure_valid(
+            covered_targets == self.metadata.full_grid.area()?,
+            "spatial reference target blocks do not exactly cover the full grid",
         )?;
         let file = self
             .file
