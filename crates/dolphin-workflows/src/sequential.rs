@@ -836,13 +836,14 @@ fn link_and_compress_with_covariance_capture(
     let compressed_reference_idx = ms
         .resolved_compressed_reference_idx()
         .map_err(SequentialReplayError::Execution)?;
+    let neighbors = shp_neighbors(combined.slice(s![ms.num_compressed.., .., ..]), cfg);
     let compute = |input: ArrayView3<Cf64>| {
         let mut replay = engine
             .link_with_source_replay(
                 input,
                 cfg.half_window,
                 cfg.strides,
-                None,
+                neighbors.as_ref().map(Array4::view),
                 fused_params(ms, cfg, output_reference_idx),
                 fixed_validity,
                 branch_tolerance,

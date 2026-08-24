@@ -16,6 +16,7 @@ use dolphin_phaselink::{
     InfluenceNode, NodeId, ParentEdge, ProperComplexFactor, SourceDefinition, SourceEdge, SourceId,
     TemporalCoordinate,
 };
+use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_workflows::{
     admit_covariance_artifact_disk_with_identity_index, finalize_covariance_artifact,
     run_sequential, run_sequential_with_covariance_capture, sequential_replay_kernel_digest,
@@ -27,7 +28,7 @@ use dolphin_workflows::{
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
     SequentialSourceProviderIdentity, SequentialSourceReplayProvider, COVARIANCE_OPERATOR_FILENAME,
 };
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{array, Array1, Array2, Array3, Axis};
 use sha2::{Digest, Sha256};
 
 const SOURCE_PROVIDER: &str = "captured-provider";
@@ -183,6 +184,14 @@ impl SequentialSourceReplayProvider for CapturedProvider {
             ),
             selected_eigenvalue: stored.selected_eigenvalue[output_index],
             selected_eigengap: stored.eigen_gap[output_index],
+            realized_support: {
+                let bits = stored.support_bits_per_output as usize;
+                let bytes = bits.div_ceil(8);
+                let packed = &stored.support_bits[output_index * bytes..(output_index + 1) * bytes];
+                (0..bits)
+                    .map(|slot| packed[slot / 8] & (1 << (slot % 8)) != 0)
+                    .collect()
+            },
             status: stored.status[output_index],
             estimator_branch: stored.estimator_branch,
             branch_tolerance: stored.branch_tolerance,
@@ -661,6 +670,241 @@ fn production_sequential_path_streams_replay_blocks_without_changing_legacy_outp
     assert_eq!(blocks[1].support_bits_per_output, 9);
     assert_eq!(blocks[1].support_bits.len(), 8);
     assert_eq!(blocks[1].owned_output_grid, blocks[1].output_grid);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn adaptive_capture_matches_glrt_and_ks_production_and_persists_realized_support() {
+    let stack = Array3::from_shape_fn((6, 4, 4), |(date, row, col)| {
+        let amplitude = 1.0 + 0.04 * date as f64 + 0.002 * (row + col) as f64;
+        let phase = 0.13 * date as f64 + 0.021 * row as f64 - 0.016 * col as f64;
+        Cf64::from_polar(amplitude, phase)
+    });
+    let request = SequentialCovarianceCaptureRequest {
+        burst_id: "adaptive-burst".to_owned(),
+        source_manifest_digest: [43; 32],
+        source_model_version_digest: source_model_identity_digest(),
+        native_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 4,
+            cols: 4,
+            stride_y: 1,
+            stride_x: 1,
+        },
+        output_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 2,
+            cols: 2,
+            stride_y: 2,
+            stride_x: 2,
+        },
+        owned_output_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 2,
+            cols: 2,
+            stride_y: 2,
+            stride_x: 2,
+        },
+        branch_tolerance: 1e-10,
+    };
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    for method in [ShpMethod::Glrt, ShpMethod::Ks] {
+        let mut cfg = config();
+        cfg.shp_method = method;
+        let production = run_sequential(stack.view(), &cfg, &engine).unwrap();
+        let mut blocks = Vec::new();
+        let captured = run_sequential_with_covariance_capture(
+            stack.view(),
+            &cfg,
+            &engine,
+            &request,
+            |block| {
+                blocks.push(block);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(captured
+            .cpx_phase
+            .iter()
+            .zip(production.cpx_phase.iter())
+            .all(|(left, right)| left.re.to_bits() == right.re.to_bits()
+                && left.im.to_bits() == right.im.to_bits()));
+        assert!(captured
+            .compressed_slcs
+            .iter()
+            .flatten()
+            .zip(production.compressed_slcs.iter().flatten())
+            .all(|(left, right)| left.re.to_bits() == right.re.to_bits()
+                && left.im.to_bits() == right.im.to_bits()));
+        for block in &blocks {
+            let dates = block
+                .source_date_indices
+                .iter()
+                .map(|&date| date as usize)
+                .collect::<Vec<_>>();
+            let real = stack.select(Axis(0), &dates);
+            let amplitude = real.mapv(|value| value.norm());
+            let expected = match method {
+                ShpMethod::Glrt => estimate_neighbors_glrt(
+                    amplitude.mean_axis(Axis(0)).unwrap().view(),
+                    amplitude.var_axis(Axis(0), 0.0).view(),
+                    cfg.half_window,
+                    real.dim().0,
+                    cfg.strides,
+                    cfg.shp_alpha,
+                ),
+                ShpMethod::Ks => estimate_neighbors_ks(
+                    amplitude.view(),
+                    cfg.half_window,
+                    cfg.strides,
+                    cfg.shp_alpha,
+                    false,
+                ),
+                ShpMethod::Rect => unreachable!(),
+            };
+            assert_eq!(block.support_bits_per_output, 9);
+            for output in 0..4 {
+                let packed = &block.support_bits[output * 2..output * 2 + 2];
+                let output_row = output / 2;
+                let output_col = output % 2;
+                for slot in 0..9 {
+                    assert_eq!(
+                        packed[slot / 8] & (1 << (slot % 8)) != 0,
+                        expected[(output_row, output_col, slot / 3, slot % 3)],
+                    );
+                }
+                assert_eq!(packed[1] & !1, 0);
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn adaptive_replay_uses_persisted_support_and_rejects_a_changed_mask() {
+    let stack = Array3::from_shape_fn((3, 4, 4), |(date, row, col)| {
+        let amplitude = 0.8 + 0.12 * date as f64 + 0.03 * (row * 4 + col) as f64;
+        let phase = 0.17 * date as f64 + 0.09 * row as f64 - 0.07 * col as f64;
+        Cf64::from_polar(amplitude, phase)
+    });
+    let mut cfg = config();
+    cfg.shp_method = ShpMethod::Glrt;
+    let request = SequentialCovarianceCaptureRequest {
+        burst_id: "adaptive-replay-burst".to_owned(),
+        source_manifest_digest: [47; 32],
+        source_model_version_digest: source_model_identity_digest(),
+        native_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 4,
+            cols: 4,
+            stride_y: 1,
+            stride_x: 1,
+        },
+        output_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 2,
+            cols: 2,
+            stride_y: 2,
+            stride_x: 2,
+        },
+        owned_output_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 2,
+            cols: 2,
+            stride_y: 2,
+            stride_x: 2,
+        },
+        branch_tolerance: 1e-10,
+    };
+    let mut captured = Vec::new();
+    run_sequential_with_covariance_capture(
+        stack.view(),
+        &cfg,
+        &ComputeEngine::new(ComputeBackend::Cpu),
+        &request,
+        |block| {
+            captured.push(block);
+            Ok(())
+        },
+    )
+    .unwrap();
+    bind_test_factor_receipts(&mut captured);
+    let topology = SequentialReplayTopology::plan_identified(
+        3,
+        (4, 4),
+        (2, 2),
+        9,
+        Array2::from_elem((4, 4), true).view(),
+        &cfg,
+        scope(),
+        ReplayIdNamespace {
+            burst_id: request.burst_id.clone(),
+            source_manifest_digest: request.source_manifest_digest,
+            source_model_version_digest: request.source_model_version_digest,
+            native_origin: (0, 0),
+            output_origin: (0, 0),
+            owned_output_origin: (0, 0),
+            owned_output_shape: (2, 2),
+        },
+    )
+    .unwrap();
+    let identity = SequentialSourceProviderIdentity {
+        source_manifest_digest: request.source_manifest_digest,
+        provider: SOURCE_PROVIDER.to_owned(),
+        provider_version: SOURCE_PROVIDER_VERSION.to_owned(),
+        model: SOURCE_MODEL.to_owned(),
+        model_version: SOURCE_MODEL_VERSION.to_owned(),
+        source_model_version_digest: request.source_model_version_digest,
+        source_model_hash: [9; 32],
+    };
+    let provider_for = |blocks: Vec<CovarianceOperatorBlock>| CapturedProvider {
+        identity: identity.clone(),
+        blocks: blocks
+            .into_iter()
+            .map(|block| (GlobalBlockId::new(block.block_id), block))
+            .collect(),
+        stack: stack.clone(),
+        source_reads: 0,
+        fail_source_model: false,
+        dishonest_samples: false,
+    };
+    let selection = [(GlobalDateId::new(0), 0), (GlobalDateId::new(1), 0)];
+    let query = DependencyConeQuery {
+        source_rank: 6,
+        microbatch: 1,
+        byte_cap: u64::MAX,
+    };
+    let mut provider = provider_for(captured.clone());
+    let replay = topology
+        .replay_temporal_covariance_from_provider(
+            &selection,
+            query,
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    assert!(replay.covariance.iter().all(|value| value.is_finite()));
+
+    let mut changed = captured;
+    changed[0].support_bits[0] = 1;
+    changed[0].support_bits[1] = 0;
+    let mut provider = provider_for(changed);
+    let error = topology
+        .replay_temporal_covariance_from_provider(
+            &selection,
+            query,
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::ReplayStateMismatch);
 }
 
 #[test]
@@ -1806,15 +2050,6 @@ fn unsupported_scope_returns_stable_status_before_topology_allocation() {
             .unwrap_err()
             .status(),
         ReplayStatus::UnsupportedBackend,
-    );
-
-    let mut cfg = config();
-    cfg.shp_method = ShpMethod::Glrt;
-    assert_eq!(
-        SequentialReplayTopology::plan(6, (4, 4), (2, 2), 9, &cfg, scope())
-            .unwrap_err()
-            .status(),
-        ReplayStatus::UnsupportedShpMethod,
     );
 }
 
