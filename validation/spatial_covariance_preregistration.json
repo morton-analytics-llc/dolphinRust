@@ -1,121 +1,44 @@
 {
   "schema": "dolphinrust.spatial_covariance.preregistration",
-  "schema_version": 1,
+  "schema_version": 2,
   "validation_id": "F54-07-spatial-covariance-approximation",
   "status": "preregistered",
   "outcomes_present": false,
-  "design": "full-factorial-supported-cells-with-pairwise-and-worst-corner-receipts",
-  "seed_schedule": {
-    "attempted_seeds_per_cell": 5000,
-    "seed_derivation": "sha256(validation_seed||cell_id||seed_index)",
-    "validation_seed": "spatial-covariance-f54-07-v1",
-    "no_top_up": true
-  },
+  "design": "full-factorial-supported-cells-with-per-attempt-jsonl-receipts",
+  "seed_schedule": {"attempted_seeds_per_cell": 5000, "seed_derivation": "sha256(validation_seed||cell_id||seed_index)", "validation_seed": "spatial-covariance-f54-07-v2", "no_top_up": true},
   "dimensions": {
-    "half_window": [
-      {"id": "hw_1x1", "value": [1, 1]},
-      {"id": "hw_3x6", "value": [3, 6]},
-      {"id": "hw_7x14", "value": [7, 14]}
-    ],
-    "stride": [
-      {"id": "stride_1", "value": [1, 1]},
-      {"id": "stride_2", "value": [2, 2]},
-      {"id": "stride_4", "value": [4, 4]}
-    ],
-    "support": [
-      {"id": "rect", "mask": "rect"},
-      {"id": "glrt_frozen", "mask": "glrt_frozen"},
-      {"id": "ks_frozen", "mask": "ks_frozen"}
-    ],
-    "position": [
-      {"id": "interior", "boundary": "interior"},
-      {"id": "border_clamped", "boundary": "border_clamped"},
-      {"id": "tile_edge", "boundary": "tile_edge"},
-      {"id": "bounded_halo", "boundary": "bounded_halo"},
-      {"id": "masked", "boundary": "masked"}
-    ],
-    "pair_geometry": [
-      {"id": "coincident", "overlap_percent": 100, "distance": "coincident", "signed_influence": "zero"},
-      {"id": "shared_75_positive", "overlap_percent": 75, "distance": "shared", "signed_influence": "positive"},
-      {"id": "shared_75_negative", "overlap_percent": 75, "distance": "shared", "signed_influence": "negative"},
-      {"id": "shared_50_positive", "overlap_percent": 50, "distance": "shared", "signed_influence": "positive"},
-      {"id": "shared_50_negative", "overlap_percent": 50, "distance": "shared", "signed_influence": "negative"},
-      {"id": "shared_25_positive", "overlap_percent": 25, "distance": "shared", "signed_influence": "positive"},
-      {"id": "shared_25_negative", "overlap_percent": 25, "distance": "shared", "signed_influence": "negative"},
-      {"id": "disjoint_immediate", "overlap_percent": 0, "distance": "disjoint_immediate", "signed_influence": "none"},
-      {"id": "disjoint_after_depth_1", "overlap_percent": 0, "distance": "disjoint_after_depth_1", "signed_influence": "none"},
-      {"id": "disjoint_after_depth_2", "overlap_percent": 0, "distance": "disjoint_after_depth_2", "signed_influence": "none"},
-      {"id": "disjoint_after_depth_4", "overlap_percent": 0, "distance": "disjoint_after_depth_4", "signed_influence": "none"}
-    ],
-    "block_topology": [
-      {"id": "one_block", "blocks": 1, "edge_case": "none"},
-      {"id": "two_blocks", "blocks": 2, "edge_case": "none"},
-      {"id": "four_blocks", "blocks": 4, "edge_case": "none"},
-      {"id": "two_blocks_cap_eviction", "blocks": 2, "edge_case": "cap_eviction"},
-      {"id": "four_blocks_partial_final", "blocks": 4, "edge_case": "partial_final"}
-    ],
-    "estimator": [
-      {"id": "emi", "method": "EMI"},
-      {"id": "evd", "method": "EVD"}
-    ],
-    "eigen_stress": [
-      {"id": "well_separated", "condition": "well_separated"},
-      {"id": "tied_eigenvalue", "condition": "tied_eigenvalue"},
-      {"id": "near_tie", "condition": "near_tie"}
-    ],
-    "source_process": [
-      {"id": "independent_complex_looks", "correlation": "independent"},
-      {"id": "spatial_correlation_stress", "correlation": "spatial_correlation_stress"}
-    ]
+    "half_window": [{"id":"hw_1x1","value":[1,1]},{"id":"hw_3x6","value":[3,6]},{"id":"hw_7x14","value":[7,14]}],
+    "stride": [{"id":"stride_1","value":[1,1]},{"id":"stride_2","value":[2,2]},{"id":"stride_4","value":[4,4]}],
+    "support": [{"id":"rect","mask":"rect"},{"id":"glrt_frozen","mask":"glrt_frozen"},{"id":"ks_frozen","mask":"ks_frozen"}],
+    "position": [{"id":"interior","boundary":"interior"},{"id":"border_clamped","boundary":"border_clamped"},{"id":"tile_edge","boundary":"tile_edge"},{"id":"bounded_halo","boundary":"bounded_halo"},{"id":"masked","boundary":"masked"}],
+    "pair_geometry": [{"id":"coincident","overlap_percent":100,"distance":"coincident","signed_influence":"zero"},{"id":"shared_75_positive","overlap_percent":75,"distance":"shared","signed_influence":"positive"},{"id":"shared_75_negative","overlap_percent":75,"distance":"shared","signed_influence":"negative"},{"id":"shared_50_positive","overlap_percent":50,"distance":"shared","signed_influence":"positive"},{"id":"shared_50_negative","overlap_percent":50,"distance":"shared","signed_influence":"negative"},{"id":"shared_25_positive","overlap_percent":25,"distance":"shared","signed_influence":"positive"},{"id":"shared_25_negative","overlap_percent":25,"distance":"shared","signed_influence":"negative"},{"id":"disjoint_immediate","overlap_percent":0,"distance":"disjoint_immediate","signed_influence":"none"},{"id":"disjoint_after_depth_1","overlap_percent":0,"distance":"disjoint_after_depth_1","signed_influence":"none"},{"id":"disjoint_after_depth_2","overlap_percent":0,"distance":"disjoint_after_depth_2","signed_influence":"none"},{"id":"disjoint_after_depth_4","overlap_percent":0,"distance":"disjoint_after_depth_4","signed_influence":"none"}],
+    "block_topology": [{"id":"one_block","blocks":1,"edge_case":"none"},{"id":"two_blocks","blocks":2,"edge_case":"none"},{"id":"four_blocks","blocks":4,"edge_case":"none"},{"id":"two_blocks_cap_eviction","blocks":2,"edge_case":"cap_eviction"},{"id":"four_blocks_partial_final","blocks":4,"edge_case":"partial_final"}],
+    "estimator": [{"id":"emi","method":"EMI"},{"id":"evd","method":"EVD"}],
+    "eigen_stress": [{"id":"well_separated","condition":"well_separated"},{"id":"tied_eigenvalue","condition":"tied_eigenvalue"},{"id":"near_tie","condition":"near_tie"}],
+    "source_process": [{"id":"independent_complex_looks","correlation":"independent"},{"id":"spatial_correlation_stress","correlation":"spatial_correlation_stress"}]
   },
-  "cell_policy": {
-    "required_design": "cartesian_product_of_dimensions",
-    "allowed_not_evaluable": ["tied_eigenvalue"],
-    "correlated_source_requires_same_gates": true,
-    "aggregate_receipts_allowed": false,
-    "outcome_top_up_allowed": false
+  "cell_policy": {"required_design":"cartesian_product_of_dimensions","allowed_not_evaluable":["tied_eigenvalue"],"correlated_source_requires_same_gates":true,"aggregate_receipts_allowed":false,"outcome_top_up_allowed":false,"unsupported_conditions":["invalid_reference","empty_support","nonfinite_source","non_psd_truth","missing_attempt_record"]},
+  "thresholds": {"deterministic_operator_relative_error_max":1e-10,"stochastic_operator_relative_error_max":0.1,"contrast_variance_relative_error_max":0.1,"psd_min_eigenvalue_min":-1e-10,"coverage_probability":0.95,"coverage_absolute_error_max":0.02,"emission_rate_min":0.99,"weak_zero_variance_max":1e-14,"resource_rss_bytes_max":25769803776,"resource_growth":"area_or_dates_linear; no quadratic axis","resource_buffer_policy":"no_tile_area_times_s_b_times_d_b_squared_buffer"},
+  "hash_fields": {"algorithm":"sha256","receipt_required":["preregistration_sha256","code_sha256","fixture_sha256","operator_sha256","variance_sha256","resource_sha256","generator_protocol_sha256","config_sha256","source_model_sha256","result_sha256"],"cell_required":["operator_hash","variance_hash","psd_hash","coverage_hash","emission_hash","generator_hash","truth_hash"],"attempt_required":["seed_sha256","raw_input_sha256","truth_sha256","operator_hash","variance_hash","emission_hash","date_axis_sha256"],"resource_required":["resource_hash","config_hash","binary_hash"]},
+  "generator": {
+    "binary": {"package":"dolphin-workflows","target":"example:spatial_covariance_batch","release_invocation":["cargo","run","--release","-p","dolphin-workflows","--example","spatial_covariance_batch","--","--contract","validation/fixtures/spatial_covariance_batch.jsonl","--output-jsonl","validation/results/spatial_covariance/attempts.jsonl"],"input_schema":"dolphinrust.spatial-covariance.attempt/2","output_schema":"dolphinrust.spatial-covariance.attempt-receipt/2","one_input_one_output":true,"stdout":"diagnostics_only","stderr":"diagnostics_only","exit_code_zero_only":true},
+    "acquisition": {"date_origin":"2020-01-01","cadence_days":12,"date_axis_order":"ascending_iso8601","topologies":{
+      "one_block":{"acquisition_count":3,"date_axis":["2020-01-01","2020-01-13","2020-01-25"],"ministack_size":3,"partial_tail_count":0,"cap_eviction":false},
+      "two_blocks":{"acquisition_count":6,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01"],"ministack_size":3,"partial_tail_count":0,"cap_eviction":false},
+      "four_blocks":{"acquisition_count":12,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18","2020-04-30","2020-05-12"],"ministack_size":3,"partial_tail_count":0,"cap_eviction":false},
+      "two_blocks_cap_eviction":{"acquisition_count":6,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01"],"ministack_size":3,"partial_tail_count":0,"cap_eviction":true},
+      "four_blocks_partial_final":{"acquisition_count":10,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18"],"ministack_size":3,"partial_tail_count":1,"cap_eviction":false}}},
+    "raw_proper_complex": {"model":"proper_complex_gaussian_v1","dtype":"complex64","compute_dtype":"f64","mean":[0.0,0.0],"covariance_convention":"E[z z*]","pseudo_covariance":[0.0,0.0],"covariance":[[1.0,0.25],[0.25,1.5]],"signal_amplitude":1.0,"target_phase_rad":0.25,"reference_phase_rad":0.0,"target_slope_rad_per_day":0.001,"reference_slope_rad_per_day":0.0,"noise_scale":1.0},
+    "source_centered_empirical": {"model":"source_centered_empirical_proper_complex_v1","support_centering":"source_centered_inward_clamped","shrinkage_alpha":0.05,"amplitude_floor_relative_to_mean_diagonal":1e-12,"component_order":["real","imag"],"date_order":"acquisition_index_then_date","mean_subtraction":"per_source_per_component_over_dates","identity_hashes":["source_values_sha256","centered_values_sha256","covariance_sha256","support_mask_sha256"]},
+    "effective_looks": {"independent_fraction":1.0,"spatial_fraction":"n/(1^T R 1)","correlation_matrix":"R_ab=exp(-EuclideanDistance(a,b)/1.5 pixels)","distance_metric":"Euclidean","distance_scale_pixels":1.5,"diagonal":1.0},
+    "estimators": {"emi":{"beta":0.0,"zero_correlation_threshold":0.0,"branch":"emi"},"evd":{"branch":"evd","eigenvalue_sort":"descending","eigengap_min":1e-8,"tie_gap":1e-12,"tie_value":1.0}},
+    "neighbor_generation": {"glrt":{"alpha":0.05,"radius_pixels":1,"min_neighbors":3,"max_neighbors":64,"alternative":"two_sided"},"ks":{"alpha":0.05,"radius_pixels":1,"min_neighbors":3,"max_neighbors":64,"alternative":"two_sided"},"fixed_support_reuse":true,"selection_seed":"sha256(validation_seed||cell_id||seed_index)","mask_freeze":"same_support_for_target_reference_and_truth"},
+    "coordinates": {"coordinate_frame":"tile_row_col","rounding":"integer","target_by_position":{"interior":[128,128],"border_clamped":[2,2],"tile_edge":[128,254],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,1],"shared_75_negative":[0,1],"shared_50_positive":[0,2],"shared_50_negative":[0,2],"shared_25_positive":[0,3],"shared_25_negative":[0,3],"disjoint_immediate":[0,4],"disjoint_after_depth_1":[0,5],"disjoint_after_depth_2":[0,8],"disjoint_after_depth_4":[0,16]}},
+    "truth": {"operator":"direct_contrast_from_raw_covariance","variance":"target+reference-2*cross","interval":"estimate +/- 1.959963984540054*sqrt(estimated_variance)","z_95":1.959963984540054,"coverage_event":"truth_interval_contains_truth","attempt_aggregation":"all_attempts_in_cell","emission_aggregation":"sum_emitted_divided_by_5000"},
+    "supported": {"supported_if":["finite_raw_source","proper_complex_pseudocovariance_zero","psd_truth","nonempty_frozen_support","valid_reference"],"not_evaluable_if":["invalid_reference","empty_support","nonfinite_source","non_psd_truth","tied_eigenvalue","missing_attempt_record"]},
+    "identity": {"protocol_version":2,"release_only":true,"required_hashes":["binary_sha256","code_sha256","config_sha256","source_model_sha256","generator_protocol_sha256","result_sha256"]}
   },
-  "thresholds": {
-    "deterministic_operator_relative_error_max": 1e-10,
-    "stochastic_operator_relative_error_max": 0.1,
-    "contrast_variance_relative_error_max": 0.1,
-    "psd_min_eigenvalue_min": -1e-10,
-    "coverage_probability": 0.95,
-    "coverage_absolute_error_max": 0.02,
-    "emission_rate_min": 0.99,
-    "weak_zero_variance_max": 1e-14,
-    "resource_rss_bytes_max": 25769803776,
-    "resource_growth": "area_or_dates_linear; no quadratic axis",
-    "resource_buffer_policy": "no_tile_area_times_s_b_times_d_b_squared_buffer"
-  },
-  "hash_fields": {
-    "algorithm": "sha256",
-    "receipt_required": [
-      "preregistration_sha256",
-      "code_sha256",
-      "fixture_sha256",
-      "operator_sha256",
-      "variance_sha256",
-      "resource_sha256"
-    ],
-    "cell_required": ["operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash"],
-    "resource_required": ["resource_hash"]
-  },
-  "resource_matrix": [
-    {"id": "tile_256_dates_13", "tile_pixels": 65536, "dates": 13},
-    {"id": "tile_256_dates_26", "tile_pixels": 65536, "dates": 26},
-    {"id": "tile_256_dates_52", "tile_pixels": 65536, "dates": 52}
-  ],
-  "receipt_contract": {
-    "cell_statuses": ["pass", "fail", "not_evaluable"],
-    "required_cell_fields": [
-      "cell_id", "half_window", "stride", "support", "position", "pair_geometry",
-      "block_topology", "estimator", "eigen_stress", "source_process", "status",
-      "attempted_seeds", "emitted_seeds", "top_up_seeds", "operator_relative_error",
-      "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error",
-      "psd_min_eigenvalue", "coverage_95", "emission_rate",
-      "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash"
-    ],
-    "required_resource_fields": ["resource_id", "status", "rss_bytes", "growth_class", "resource_hash"]
-  }
+  "resource_matrix": [{"id":"tile_256_dates_13","tile_pixels":65536,"dates":13},{"id":"tile_256_dates_26","tile_pixels":65536,"dates":26},{"id":"tile_256_dates_52","tile_pixels":65536,"dates":52}],
+  "resource_sampling": {"hardware_class":"apple-m2-32gb","ram_bytes":34359738368,"rss_sampler":"/usr/bin/time -l","sampling_interval_ms":100,"tool_versions":["rustc -Vv","cargo -V","/usr/bin/time -l"],"growth_observations":["tile_pixels","date_count","peak_rss_bytes","wall_seconds"]},
+  "receipt_contract": {"cell_statuses":["pass","fail","not_evaluable"],"per_attempt_required":["seed_index","seed_sha256","status","emitted","raw_input_sha256","truth_sha256","operator_hash","variance_hash","emission_hash","date_axis_sha256","operator_relative_error","contrast_variance_relative_error","psd_min_eigenvalue","covered_95","interval_score","interval_width"],"aggregate_only_rejected":true,"incomplete_attempts_rejected":true,"result_hash_required":true}
 }
