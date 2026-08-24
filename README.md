@@ -111,6 +111,17 @@ global per-date uncertainty and must not be used as calibrated GroundPulse confi
 non-closure diagnostic. Both are validated against a forward dolphin v0.42.0 oracle; see
 [docs/usage.md](docs/usage.md) §5 and [VALIDATION.md](VALIDATION.md).
 
+`phase_linking.write_covariance_operator: true` separately captures the implicit
+`sequential_source_dag_v1` replay operator as `phase_covariance_operator.h5`, with
+`phase_covariance_provenance.json` written last as its commit marker. The supported capture path
+is full-batch CPU/f64, Rect support, `AlwaysFirst`, output reference 0, and no phase-bias
+correction. It stores source-keyed replay state, not a dense date-by-date covariance cube. The
+CLI artifact has no proper-complex source model and is therefore marked
+`source_model_unavailable`; low-level replay requires a verified caller-supplied source resolver
+and factor model whose exact per-source numeric receipts match the artifact. Every artifact remains
+`uncalibrated` and
+`blocked_pending_issue_54_and_53`; GroundPulse output and resumable updates reject the option.
+
 L2 inversion uses CRLB-derived observation precision by default. Set
 `timeseries_options.use_coherence_weights: false` for legacy unweighted parity. Posterior
 and velocity uncertainty rasters are opt-in; the field named `write_posterior_uncertainty`

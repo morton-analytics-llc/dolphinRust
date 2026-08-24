@@ -20,9 +20,14 @@ use ndarray::{Array1, Array2, Array3, ArrayView3, ArrayView4};
 use rayon::prelude::*;
 
 use crate::closure::triplet_closure;
-use crate::covariance::{normalize_numerator, pixel_coh, sliding_row_numerators};
+use crate::covariance::{
+    normalize_numerator, pixel_coh, sliding_row_numerators, sliding_row_numerators_with_validity,
+    validate_numerator_branch, CovarianceReplayError, RectReplayDescriptor,
+};
 use crate::crlb::crlb_pixel;
-use crate::estimator::process_coherence_matrix;
+use crate::estimator::{
+    phase_angle_jvp, process_coherence_matrix, EstimatorJvpError, FixedEstimatorBranch,
+};
 use crate::quality::temp_coh_single;
 
 /// Estimator + quality parameters for a fused pass (mirrors the separate-stage
@@ -82,6 +87,73 @@ pub struct FusedEstimate {
     pub average_coherence: Option<AverageCoherenceAggregate>,
 }
 
+/// Fixed estimator-branch status captured at one output pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedBranchStatus {
+    /// Requested EVD completed on its fixed branch.
+    Evd,
+    /// Requested EMI completed on its fixed branch.
+    Emi,
+    /// Requested EMI fell back to EVD and cannot be differentiated as EMI.
+    UnsupportedEmiFallback,
+    /// A magnitude or threshold branch is nondifferentiable within tolerance.
+    Nondifferentiable,
+    /// The selected estimator mode is tied within branch tolerance.
+    EigenvalueTie,
+    /// The fixed estimator state or derivative is non-finite.
+    NonFiniteState,
+    /// The selected eigenvector's output-reference component vanishes.
+    VanishingReference,
+    /// The fixed output-validity mask excludes this looked pixel.
+    Masked,
+    /// A covariance denominator is at the production amplitude-floor boundary.
+    AmplitudeFloorBoundary,
+    /// Estimator output did not identify a supported EVD or EMI branch.
+    InvalidEstimator,
+}
+
+/// Bounded per-output estimator receipt for source-influence replay.
+#[derive(Debug, Clone)]
+pub struct PhaseReplayGrid {
+    /// Selected fixed-branch eigenvalue per output pixel.
+    pub selected_eigenvalue: Array2<f64>,
+    /// Nearest selected-mode eigengap per output pixel.
+    pub selected_eigengap: Array2<f64>,
+    /// Actual fixed/fallback branch per output pixel.
+    pub branch_status: Array2<FixedBranchStatus>,
+}
+
+impl PhaseReplayGrid {
+    /// Apply a fixed looked-output validity mask to the status grid.
+    ///
+    /// # Errors
+    /// Returns an error when the validity and replay grids differ in shape.
+    pub fn apply_output_validity(
+        &mut self,
+        validity: ndarray::ArrayView2<bool>,
+    ) -> Result<(), &'static str> {
+        if validity.dim() != self.branch_status.dim() {
+            return Err("phase replay output validity shape mismatch");
+        }
+        for (index, status) in self.branch_status.indexed_iter_mut() {
+            if !validity[index] {
+                *status = FixedBranchStatus::Masked;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Legacy fused output plus the opt-in CPU/f64 source-replay receipt.
+pub struct SourceReplayEstimate {
+    /// Unchanged production linked-phase and quality output.
+    pub estimate: FusedEstimate,
+    /// Fixed estimator branch/eigen receipt.
+    pub phase: PhaseReplayGrid,
+    /// Recomputable Rect support and numerator geometry.
+    pub rect: RectReplayDescriptor,
+}
+
 /// One output pixel's fused products — the only thing retained per pixel.
 struct PixelFused {
     phase: Array1<Cf64>,
@@ -89,6 +161,8 @@ struct PixelFused {
     crlb: Option<Array1<f64>>,
     closure: Option<Vec<f64>>,
     average_coherence: Option<(f64, u32)>,
+    eigenvalue: f64,
+    eigengap: f64,
 }
 
 /// Run the fused covariance + estimator + quality pass over `stack`
@@ -96,7 +170,8 @@ struct PixelFused {
 /// `(out_rows, out_cols, win_h, win_w)`.
 ///
 /// # Errors
-/// Returns `Err` if the covariance window is larger than the stack.
+/// Returns `Err` if a stride is zero, the covariance window is larger than the
+/// stack, an acquisition is entirely non-finite, or aggregate bounds are invalid.
 pub fn link_fused(
     stack: ArrayView3<Cf64>,
     half: HalfWindow,
@@ -104,6 +179,9 @@ pub fn link_fused(
     neighbors: Option<ArrayView4<bool>>,
     params: FusedParams,
 ) -> Result<FusedEstimate, &'static str> {
+    if strides.y == 0 || strides.x == 0 {
+        return Err("phase-linking stride is zero");
+    }
     let (nslc, rows, cols) = stack.dim();
     if !all_non_finite_acquisition_indices(stack).is_empty() {
         return Err("slc stack contains an all non-finite acquisition");
@@ -128,6 +206,62 @@ pub fn link_fused(
         None => fused_pixels_sliding(stack, half, strides, params, (out_rows, out_cols)),
     };
     Ok(pack(pixels, (out_rows, out_cols, nslc), &params))
+}
+
+/// Run the CPU/f64 Rect fused path with an opt-in source-replay receipt.
+///
+/// The legacy [`FusedEstimate`] is produced by the same pixel kernels and pack
+/// function as [`link_fused`]. The extra receipt retains only bounded scalar
+/// estimator state and recomputable Rect geometry, never coherence cubes or
+/// eigensystems.
+///
+/// # Errors
+/// Returns an error for an empty stack, invalid geometry/validity, branch
+/// tolerance, or an invalid average-coherence date bound. Per-pixel numeric
+/// failures are reported in [`PhaseReplayGrid::branch_status`].
+pub fn link_fused_with_source_replay(
+    stack: ArrayView3<Cf64>,
+    half: HalfWindow,
+    strides: Strides,
+    params: FusedParams,
+    native_validity: ndarray::ArrayView2<bool>,
+    branch_tolerance: f64,
+) -> Result<SourceReplayEstimate, &'static str> {
+    let (nslc, rows, cols) = stack.dim();
+    if nslc == 0 {
+        return Err("source replay stack is empty");
+    }
+    if strides.y == 0 || strides.x == 0 {
+        return Err("phase-linking stride is zero");
+    }
+    if native_validity.dim() != (rows, cols) {
+        return Err("source replay native validity shape mismatch");
+    }
+    if params.compute_average_coherence && params.average_coherence_start_idx > nslc {
+        return Err("average coherence start exceeds stack depth");
+    }
+    if !branch_tolerance.is_finite() || branch_tolerance < 0.0 {
+        return Err("source replay branch tolerance is invalid");
+    }
+    let rect = RectReplayDescriptor::new((rows, cols), half, strides)
+        .map_err(|_| "invalid rectangular replay geometry")?;
+    let out_shape = rect.output_shape;
+    let replay_pixels = fused_pixels_sliding_with_replay(
+        stack,
+        params,
+        out_shape,
+        rect,
+        native_validity,
+        branch_tolerance,
+    );
+    let phase = phase_replay_grid(&replay_pixels, out_shape)?;
+    let pixels = replay_pixels.into_iter().map(|(pixel, _)| pixel).collect();
+    let estimate = pack(pixels, (out_shape.0, out_shape.1, nslc), &params);
+    Ok(SourceReplayEstimate {
+        estimate,
+        phase,
+        rect,
+    })
 }
 
 /// Return the zero-based ordinals of acquisitions containing no finite complex sample.
@@ -197,6 +331,121 @@ fn fused_pixels_sliding(
     rows_of_pixels.into_iter().flatten().collect()
 }
 
+fn fused_pixels_sliding_with_replay(
+    stack: ArrayView3<Cf64>,
+    params: FusedParams,
+    out_shape: (usize, usize),
+    rect: RectReplayDescriptor,
+    native_validity: ndarray::ArrayView2<bool>,
+    branch_tolerance: f64,
+) -> Vec<(PixelFused, FixedBranchStatus)> {
+    let (out_rows, _) = out_shape;
+    let rows_of_pixels: Vec<Vec<(PixelFused, FixedBranchStatus)>> = (0..out_rows)
+        .into_par_iter()
+        .map(|output_row| {
+            let production_numerators =
+                sliding_row_numerators(stack, output_row, rect.half_window, rect.strides);
+            let replay_numerators = sliding_row_numerators_with_validity(
+                stack,
+                output_row,
+                rect.half_window,
+                rect.strides,
+                Some(native_validity),
+            );
+            production_numerators
+                .into_iter()
+                .zip(replay_numerators)
+                .enumerate()
+                .map(|(output_column, (numerator, replay_numerator))| {
+                    let coherence = normalize_numerator(numerator.view());
+                    let replay_coherence = normalize_numerator(replay_numerator.view());
+                    let status = source_replay_status(
+                        stack,
+                        rect,
+                        (output_row, output_column),
+                        native_validity,
+                        replay_numerator.view(),
+                        replay_coherence.view(),
+                        params,
+                        branch_tolerance,
+                    );
+                    (fused_from_coh(coherence, params), status)
+                })
+                .collect()
+        })
+        .collect();
+    rows_of_pixels.into_iter().flatten().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_replay_status(
+    stack: ArrayView3<Cf64>,
+    rect: RectReplayDescriptor,
+    output: (usize, usize),
+    native_validity: ndarray::ArrayView2<bool>,
+    numerator: ndarray::ArrayView2<Cf64>,
+    coherence: ndarray::ArrayView2<Cf64>,
+    params: FusedParams,
+    branch_tolerance: f64,
+) -> FixedBranchStatus {
+    let Ok(sources) = rect.source_pixels(output, native_validity) else {
+        return FixedBranchStatus::InvalidEstimator;
+    };
+    if sources.is_empty() {
+        return FixedBranchStatus::Masked;
+    }
+    if sources.iter().any(|source| {
+        (0..stack.dim().0).any(|date| !stack[(date, source.row, source.column)].is_finite())
+    }) {
+        return FixedBranchStatus::NonFiniteState;
+    }
+    match validate_numerator_branch(numerator, branch_tolerance) {
+        Ok(()) => fixed_branch_status(coherence, params, branch_tolerance),
+        Err(CovarianceReplayError::AmplitudeFloorBoundary) => {
+            FixedBranchStatus::AmplitudeFloorBoundary
+        }
+        Err(CovarianceReplayError::NonFiniteState) => FixedBranchStatus::NonFiniteState,
+        Err(_) => FixedBranchStatus::InvalidEstimator,
+    }
+}
+
+fn fixed_branch_status(
+    coherence: ndarray::ArrayView2<Cf64>,
+    params: FusedParams,
+    branch_tolerance: f64,
+) -> FixedBranchStatus {
+    let branch = match params.use_evd {
+        true => FixedEstimatorBranch::Evd,
+        false => FixedEstimatorBranch::Emi {
+            beta: params.beta,
+            zero_correlation_threshold: params.zero_correlation_threshold,
+        },
+    };
+    let zero = Array2::zeros(coherence.dim());
+    match phase_angle_jvp(
+        coherence,
+        zero.view(),
+        branch,
+        params.reference_idx,
+        branch_tolerance,
+    ) {
+        Ok(_) if params.use_evd => FixedBranchStatus::Evd,
+        Ok(_) => FixedBranchStatus::Emi,
+        Err(EstimatorJvpError::EmiFallback) => FixedBranchStatus::UnsupportedEmiFallback,
+        Err(EstimatorJvpError::ZeroMagnitudeBranch | EstimatorJvpError::ThresholdBoundary) => {
+            FixedBranchStatus::Nondifferentiable
+        }
+        Err(EstimatorJvpError::EigenvalueTie) => FixedBranchStatus::EigenvalueTie,
+        Err(EstimatorJvpError::VanishingReference) => FixedBranchStatus::VanishingReference,
+        Err(EstimatorJvpError::NonFiniteState | EstimatorJvpError::NonFiniteDerivative) => {
+            FixedBranchStatus::NonFiniteState
+        }
+        Err(EstimatorJvpError::MatrixShapeMismatch | EstimatorJvpError::ReferenceOutOfBounds) => {
+            FixedBranchStatus::InvalidEstimator
+        }
+    }
+}
+
 /// Run every fused consumer against a precomputed coherence matrix, retaining
 /// only the per-pixel products. Shared by the masked and unmasked paths.
 fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
@@ -231,7 +480,33 @@ fn fused_from_coh(c: Array2<Cf64>, p: FusedParams) -> PixelFused {
         crlb,
         closure,
         average_coherence,
+        eigenvalue: est.eigenvalue,
+        eigengap: est.eigengap,
     }
+}
+
+fn phase_replay_grid(
+    pixels: &[(PixelFused, FixedBranchStatus)],
+    shape: (usize, usize),
+) -> Result<PhaseReplayGrid, &'static str> {
+    let selected_eigenvalue = Array2::from_shape_vec(
+        shape,
+        pixels.iter().map(|(pixel, _)| pixel.eigenvalue).collect(),
+    )
+    .map_err(|_| "phase replay eigenvalue shape mismatch")?;
+    let selected_eigengap = Array2::from_shape_vec(
+        shape,
+        pixels.iter().map(|(pixel, _)| pixel.eigengap).collect(),
+    )
+    .map_err(|_| "phase replay eigengap shape mismatch")?;
+    let branch_status =
+        Array2::from_shape_vec(shape, pixels.iter().map(|(_, status)| *status).collect())
+            .map_err(|_| "phase replay branch shape mismatch")?;
+    Ok(PhaseReplayGrid {
+        selected_eigenvalue,
+        selected_eigengap,
+        branch_status,
+    })
 }
 
 /// Unit-magnitude phasor `exp(j∠z)` (dolphin's `exp(1j*angle(cpx_phase))`).

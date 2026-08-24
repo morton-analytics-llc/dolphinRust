@@ -33,6 +33,18 @@ All notable changes to dolphinRust are documented here. The format follows
   its programmatic configs retain supported defaults.
 
 ### Added
+- **A bounded sequential source-covariance replay operator is available behind an opt-in flag**
+  (issue #52). `phase_linking.write_covariance_operator` streams fixed-branch phase-link and
+  compression replay blocks into `phase_covariance_operator.h5`; a SHA-256-bound JSON manifest is
+  committed last. Same-pixel temporal covariance is contracted from verified primitive-source
+  factors without allocating a date-by-date-by-area cube, and acquisition 0 remains an exact zero
+  gauge row and column. The initial scope is full-batch CPU/f64, Rect support, `AlwaysFirst`, and
+  output reference 0. The CLI capture has no source-factor model and records
+  `source_model_unavailable`; the low-level API requires a matching external resolver. Artifacts
+  bind exact raw-source and numeric-factor receipts, and replay preflight reserves sparse-tree,
+  support-vector, and padded estimator workspace before source I/O. Artifacts
+  remain `uncalibrated` and `blocked_pending_issue_54_and_53`, and GroundPulse, resumable, spatial-
+  reference, and velocity consumers remain disconnected.
 - **Per-pixel temporal-fit support and diagnostics.** Velocity output now retains valid-date
   count, regression rank/DOF, uncertainty status, cadence status, raw lag-1 residual
   correlation, pair count, diagnostic-only inflation, and diagnostic-only effective sample

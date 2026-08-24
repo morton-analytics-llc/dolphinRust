@@ -21,10 +21,20 @@
 
 use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_phaselink::{compress, AverageCoherenceAggregate, ComputeEngine, FusedParams};
+use dolphin_io::CovarianceOperatorBlock;
+use dolphin_phaselink::{
+    compress, compress_with_replay, AverageCoherenceAggregate, CompressionReplayGrid,
+    ComputeEngine, FusedParams, PhaseReplayGrid, ResolvedBackend,
+};
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView2, ArrayView3, Axis};
+
+pub use crate::sequential_covariance::SequentialCovarianceCaptureRequest;
+use crate::sequential_covariance::{
+    build_covariance_operator_block, ReplayBackend, ReplayExecutionScope, SequentialReplayError,
+    SequentialReplayTopology,
+};
 
 /// Configuration for a sequential phase-linking run.
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +180,77 @@ fn drive(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn drive_with_covariance_capture<F>(
+    plans: &[MiniStack],
+    real_stack: ArrayView3<Cf64>,
+    seed_compressed: &[Array2<Cf64>],
+    valid_mask: Option<ArrayView2<bool>>,
+    fixed_validity: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    topology: &SequentialReplayTopology,
+    request: &SequentialCovarianceCaptureRequest,
+    emit: &mut F,
+) -> Result<Drive, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
+    let mut out = Drive {
+        compressed: Vec::new(),
+        phases: Vec::new(),
+        temp_coh: Vec::new(),
+        average_coherence: Vec::new(),
+        crlb: Vec::new(),
+        closure: Vec::new(),
+    };
+    for &ministack in plans {
+        let combined = assemble(&carry, real_stack, ministack);
+        let captured = link_and_compress_with_covariance_capture(
+            combined.view(),
+            ministack,
+            valid_mask,
+            fixed_validity,
+            cfg,
+            engine,
+            request.branch_tolerance,
+        )?;
+        let block = build_covariance_operator_block(
+            topology,
+            request,
+            ministack,
+            combined.view(),
+            captured.result.cpx.view(),
+            &captured.phase,
+            &captured.compression,
+            cfg.use_evd,
+        )?;
+        emit(block).map_err(SequentialReplayError::Execution)?;
+
+        let result = captured.result;
+        out.phases.push(
+            result
+                .cpx
+                .slice(s![ministack.num_compressed.., .., ..])
+                .to_owned(),
+        );
+        carry.push(result.compressed.clone());
+        out.compressed.push(result.compressed);
+        out.temp_coh.push(result.temp_coh);
+        if let Some(average) = result.average_coherence {
+            out.average_coherence.push(average);
+        }
+        if let Some(sigma) = result.crlb_sigma {
+            out.crlb.push(sigma);
+        }
+        if let Some(closure) = result.closure_phase {
+            out.closure.push(closure);
+        }
+    }
+    Ok(out)
+}
+
 /// Assemble a [`SequentialOutput`] from the full per-ministack product lists
 /// (sealed prefix already chained in by the caller).
 fn build_output(
@@ -222,6 +303,166 @@ pub fn run_sequential_masked(
     Ok(run_sequential_resumable_masked(slc_stack, valid_mask, cfg, engine)?.0)
 }
 
+/// Run the fixed CPU/f64 Rect path and stream one replay operator block as
+/// each ministack completes.
+///
+/// Legacy sequential entry points do not invoke this path. The callback sees
+/// full local replay grids (including tile halo) with a distinct owned output
+/// rectangle in each block.
+///
+/// # Errors
+/// Returns a checked scope/identity/topology error, a production replay-capture
+/// failure, or a streaming sink failure.
+pub fn run_sequential_with_covariance_capture<F>(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    emit: F,
+) -> Result<SequentialOutput, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    run_sequential_with_covariance_capture_impl(slc_stack, None, cfg, engine, request, emit)
+}
+
+/// Run masked sequential phase linking with the same immutable validity mask
+/// captured by the replay operator.
+///
+/// # Errors
+/// Returns a checked scope/identity/topology error, a production replay-capture
+/// failure, or a streaming sink failure.
+pub fn run_sequential_masked_with_covariance_capture<F>(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    emit: F,
+) -> Result<SequentialOutput, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    run_sequential_with_covariance_capture_impl(
+        slc_stack,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        emit,
+    )
+}
+
+fn run_sequential_with_covariance_capture_impl<F>(
+    slc_stack: ArrayView3<Cf64>,
+    native_validity: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    mut emit: F,
+) -> Result<SequentialOutput, SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+{
+    let (_, rows, cols) = slc_stack.dim();
+    let fixed_validity = match native_validity {
+        Some(mask) if mask.dim() == (rows, cols) => mask.to_owned(),
+        Some(_) => {
+            return Err(SequentialReplayError::Invalid(
+                "layover/shadow mask grid differs from the SLC stack",
+            ))
+        }
+        None => Array2::from_elem((rows, cols), true),
+    };
+    let planner = planner_for(slc_stack.dim().0, cfg).map_err(SequentialReplayError::Execution)?;
+    let plans = planner
+        .plan(cfg.ministack_size)
+        .map_err(SequentialReplayError::Execution)?;
+    let output_shape = cfg.strides.out_shape((rows, cols));
+    let output_area =
+        output_shape
+            .0
+            .checked_mul(output_shape.1)
+            .ok_or(SequentialReplayError::Invalid(
+                "covariance capture output area overflows usize",
+            ))?;
+    let backend = match plans
+        .iter()
+        .any(|plan| engine.resolved(output_area, plan.size()) == ResolvedBackend::Gpu)
+    {
+        true => ReplayBackend::Gpu,
+        false => ReplayBackend::CpuF64,
+    };
+    let scope = ReplayExecutionScope {
+        enabled: true,
+        backend,
+        estimator_fallback: false,
+        phase_bias_correction: false,
+        strong_source_identity: true,
+        stitched_burst_count: 1,
+    };
+    let namespace = request.namespace_for((rows, cols), output_shape, cfg.strides)?;
+    let support_rows = cfg
+        .half_window
+        .y
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance capture support rows overflow usize",
+        ))?;
+    let support_cols = cfg
+        .half_window
+        .x
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance capture support columns overflow usize",
+        ))?;
+    let support_slots =
+        support_rows
+            .checked_mul(support_cols)
+            .ok_or(SequentialReplayError::Invalid(
+                "covariance capture support area overflows usize",
+            ))?;
+    let topology = SequentialReplayTopology::plan_identified(
+        slc_stack.dim().0,
+        (rows, cols),
+        output_shape,
+        support_slots,
+        fixed_validity.view(),
+        cfg,
+        scope,
+        namespace,
+    )?;
+    let valid_mask = native_validity
+        .map(|mask| nontrivial_mask(mask, (rows, cols)))
+        .transpose()
+        .map_err(SequentialReplayError::Execution)?
+        .flatten();
+    let d = drive_with_covariance_capture(
+        &plans,
+        slc_stack,
+        &[],
+        valid_mask,
+        fixed_validity.view(),
+        cfg,
+        engine,
+        &topology,
+        request,
+        &mut emit,
+    )?;
+    build_output(
+        &d.phases,
+        d.compressed,
+        &d.temp_coh,
+        &d.average_coherence,
+        d.crlb,
+        d.closure,
+        looked_validity(valid_mask, (rows, cols), cfg.strides),
+    )
+    .map_err(SequentialReplayError::Execution)
+}
+
 /// Run the sequential estimator and also return the [`SequentialState`] needed to
 /// fold in later acquisitions incrementally via [`update_sequential`]. The
 /// [`SequentialOutput`] is identical to [`run_sequential`]'s.
@@ -260,7 +501,7 @@ fn run_sequential_resumable_impl(
         Some(mask) => nontrivial_mask(mask, (slc_stack.dim().1, slc_stack.dim().2))?,
         None => None,
     };
-    let planner = planner_for(slc_stack.dim().0, cfg);
+    let planner = planner_for(slc_stack.dim().0, cfg)?;
     let plans = planner.plan(cfg.ministack_size)?;
     let d = drive(&plans, slc_stack, &[], valid_mask, cfg, engine)?;
     let output = build_output(
@@ -350,7 +591,7 @@ fn update_sequential_impl(
     });
     let num_sealed = state.sealed_compressed.len();
     let tail_plans =
-        planner_for(tail.dim().0, cfg).plan_with_offset(cfg.ministack_size, num_sealed)?;
+        planner_for(tail.dim().0, cfg)?.plan_with_offset(cfg.ministack_size, num_sealed)?;
     let d = drive(
         &tail_plans,
         tail.view(),
@@ -413,13 +654,14 @@ fn looked_validity(
 }
 
 /// The [`MiniStackPlanner`] for a stack of `num_slc` real SLCs under `cfg`.
-fn planner_for(num_slc: usize, cfg: &SequentialConfig) -> MiniStackPlanner {
-    MiniStackPlanner {
+fn planner_for(num_slc: usize, cfg: &SequentialConfig) -> Result<MiniStackPlanner, &'static str> {
+    Ok(MiniStackPlanner {
         num_slc,
         max_num_compressed: cfg.max_num_compressed,
-        output_reference_idx: cfg.output_reference_idx as isize,
+        output_reference_idx: isize::try_from(cfg.output_reference_idx)
+            .map_err(|_| "output reference index exceeds isize")?,
         compressed_slc_plan: cfg.compressed_slc_plan,
-    }
+    })
 }
 
 /// Partition `drive` products into the sealed (full) ministacks vs the open
@@ -572,6 +814,85 @@ struct MinistackResult {
     closure_phase: Option<Array3<f64>>,
 }
 
+struct CapturedMinistackResult {
+    result: MinistackResult,
+    phase: PhaseReplayGrid,
+    compression: CompressionReplayGrid,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn link_and_compress_with_covariance_capture(
+    combined: ArrayView3<Cf64>,
+    ms: MiniStack,
+    valid_mask: Option<ArrayView2<bool>>,
+    fixed_validity: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    branch_tolerance: f64,
+) -> Result<CapturedMinistackResult, SequentialReplayError> {
+    let output_reference_idx = ms
+        .resolved_output_reference_idx()
+        .map_err(SequentialReplayError::Execution)?;
+    let compressed_reference_idx = ms
+        .resolved_compressed_reference_idx()
+        .map_err(SequentialReplayError::Execution)?;
+    let compute = |input: ArrayView3<Cf64>| {
+        let mut replay = engine
+            .link_with_source_replay(
+                input,
+                cfg.half_window,
+                cfg.strides,
+                None,
+                fused_params(ms, cfg, output_reference_idx),
+                fixed_validity,
+                branch_tolerance,
+            )
+            .map_err(SequentialReplayError::Execution)?;
+        let compression = compress_with_replay(
+            input,
+            replay.estimate.cpx_phase.view(),
+            ms.num_compressed,
+            Some(compressed_reference_idx),
+            fixed_validity,
+            branch_tolerance,
+        )
+        .map_err(|_| SequentialReplayError::Execution("compression replay capture failed"))?;
+        if valid_mask.is_some() {
+            let output_validity =
+                looked_validity(Some(fixed_validity), fixed_validity.dim(), cfg.strides);
+            replay
+                .phase
+                .apply_output_validity(output_validity.view())
+                .map_err(SequentialReplayError::Execution)?;
+        }
+        let fused = replay.estimate;
+        let mut result = MinistackResult {
+            cpx: fused.cpx_phase,
+            compressed: compression.compressed.clone(),
+            temp_coh: fused.temporal_coherence,
+            average_coherence: fused.average_coherence,
+            crlb_sigma: fused
+                .crlb_sigma
+                .map(|sigma| sigma.slice(s![ms.num_compressed.., .., ..]).to_owned()),
+            closure_phase: fused.closure_phase,
+        };
+        if let Some(mask) = valid_mask {
+            let output_validity = looked_validity(Some(mask), mask.dim(), cfg.strides);
+            apply_output_validity(&mut result, output_validity.view());
+            mask_native_complex(&mut result.compressed, mask);
+        }
+        Ok(CapturedMinistackResult {
+            result,
+            phase: replay.phase,
+            compression,
+        })
+    };
+    match valid_mask {
+        Some(mask) => compute(mask_stack(combined, mask).view()),
+        None => compute(combined),
+    }
+}
+
 /// Phase-link a combined ministack and compress it to one SLC, plus its
 /// temporal coherence and (optionally) the CRLB / closure-phase quality layers.
 fn link_and_compress(
@@ -581,6 +902,8 @@ fn link_and_compress(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<MinistackResult, &'static str> {
+    let output_reference_idx = ms.resolved_output_reference_idx()?;
+    let compressed_reference_idx = ms.resolved_compressed_reference_idx()?;
     // SHP neighbors are selected from the real acquisitions only; the carried
     // compressed SLCs are projections, not observations, so their amplitude
     // statistics would not describe the scatterer.
@@ -591,13 +914,13 @@ fn link_and_compress(
             cfg.half_window,
             cfg.strides,
             neighbors.as_ref().map(Array4::view),
-            fused_params(ms, cfg),
+            fused_params(ms, cfg, output_reference_idx),
         )?;
         let compressed = compress(
             input,
             fused.cpx_phase.view(),
             ms.num_compressed,
-            Some(ms.compressed_reference_idx as usize),
+            Some(compressed_reference_idx),
         );
         Ok::<_, &'static str>((fused, compressed))
     };
@@ -699,12 +1022,12 @@ fn shp_neighbors(real: ArrayView3<Cf64>, cfg: &SequentialConfig) -> Option<Array
 /// `sqrt(half_y · half_x)`; the CRLB reference is the last compressed date
 /// (dolphin's `max(first_real_slc_idx − 1, 0)`), which may differ from the
 /// output reference.
-fn fused_params(ms: MiniStack, cfg: &SequentialConfig) -> FusedParams {
+fn fused_params(ms: MiniStack, cfg: &SequentialConfig, output_reference_idx: usize) -> FusedParams {
     FusedParams {
         use_evd: cfg.use_evd,
         beta: cfg.beta,
         zero_correlation_threshold: cfg.zero_correlation_threshold,
-        reference_idx: ms.output_reference_idx as usize,
+        reference_idx: output_reference_idx,
         compute_crlb: cfg.compute_crlb,
         crlb_reference_idx: ms.num_compressed.saturating_sub(1),
         num_looks: (cfg.half_window.y as f64 * cfg.half_window.x as f64).sqrt(),

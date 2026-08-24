@@ -32,6 +32,7 @@ rayon.workspace = true
 ndarray.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+libc = "0.2"
 gdal = "0.19"
 gdal-sys = "0.12"
 # Optional heap profiler (enabled only via the `dhat-heap` feature for profiling).
@@ -51,9 +52,7 @@ ndarray-npy = { version = "0.9", default-features = false, features = ["num-comp
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.
 dolphin-io = { workspace = true, features = ["nisar-fixture"] }
-# Per-stage CPU·s + max-RSS sampling (getrusage) and tracing capture for the
-# end-to-end profiling harness (`examples/profile_e2e.rs`).
-libc = "0.2"
+# Tracing capture for the end-to-end profiling harness (`examples/profile_e2e.rs`).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]

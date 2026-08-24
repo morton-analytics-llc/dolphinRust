@@ -73,6 +73,11 @@ pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
         evidence: "dolphin-workflows::displacement workflow-to-sequential mapping and phase_bias_correction_runs_end_to_end contracts",
     },
     ConfigBehaviorContract {
+        id: "CFG-COVARIANCE-OPERATOR",
+        reader: "dolphin-workflows::displacement::{sequential_config, run_displacement_with_output_policy}",
+        evidence: "dolphin-workflows global covariance operator opt-in and output-policy contracts",
+    },
+    ConfigBehaviorContract {
         id: "CFG-SHP-WIRING",
         reader: "dolphin-workflows::{displacement::sequential_config, sequential::{shp_neighbors, link_and_compress}}",
         evidence: "dolphin-workflows::displacement workflow-to-sequential mapping contract and shp_wiring_contract",
@@ -231,6 +236,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "sequential phase linking does not implement StBAS lag filtering"
     ),
     consumed!("phase_linking.compressed_slc_plan", "CFG-PHASE-LINK"),
+    conditional!(
+        "phase_linking.write_covariance_operator",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
     conditional!(
         "phase_linking.write_crlb",
         "CFG-PHASE-LINK",
@@ -656,6 +666,9 @@ pub struct PhaseLinkingOptions {
     pub baseline_lag: Option<i64>,
     /// Plan for which date each ministack's compressed SLC references.
     pub compressed_slc_plan: CompressedSlcPlan,
+    /// Persist the source-keyed sequential covariance replay operator. Off by
+    /// default and disconnected from downstream inference.
+    pub write_covariance_operator: bool,
     /// Write the Cramer-Rao lower bound raster.
     pub write_crlb: bool,
     /// Write the closure-phase raster.
@@ -685,6 +698,7 @@ impl Default for PhaseLinkingOptions {
             mask_input_ps: false,
             baseline_lag: None,
             compressed_slc_plan: CompressedSlcPlan::default(),
+            write_covariance_operator: false,
             write_crlb: true,
             write_closure_phase: false,
             calc_average_coh: false,

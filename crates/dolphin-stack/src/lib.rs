@@ -13,6 +13,8 @@ use dolphin_core::config::CompressedSlcPlan;
 /// One planned ministack: prepended compressed SLCs followed by real SLCs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiniStack {
+    /// Global zero-based block identifier, including any resumed prefix.
+    pub block_id: usize,
     /// Number of prior compressed SLCs prepended to this ministack.
     pub num_compressed: usize,
     /// Index (into the real SLC list) of this ministack's first real SLC.
@@ -31,6 +33,54 @@ impl MiniStack {
     pub fn size(&self) -> usize {
         self.num_compressed + self.num_real
     }
+
+    /// Global block IDs whose compressed SLCs are carried into this block.
+    ///
+    /// The range is oldest to newest and already reflects
+    /// [`MiniStackPlanner::max_num_compressed`] eviction.
+    pub fn carried_parent_ids(&self) -> std::ops::Range<usize> {
+        self.block_id - self.num_compressed..self.block_id
+    }
+
+    /// Resolve and validate the phase-link output reference for this block.
+    ///
+    /// # Errors
+    /// Returns `Err` when the reference is less than `-1` or outside the
+    /// combined compressed-plus-real stack.
+    pub fn resolved_output_reference_idx(&self) -> Result<usize, &'static str> {
+        resolve_reference_index(self.output_reference_idx, self.size())
+    }
+
+    /// Resolve and validate the compression reference for this block.
+    ///
+    /// # Errors
+    /// Returns `Err` when the reference is less than `-1` or outside the
+    /// combined compressed-plus-real stack.
+    pub fn resolved_compressed_reference_idx(&self) -> Result<usize, &'static str> {
+        resolve_reference_index(self.compressed_reference_idx, self.size())
+    }
+}
+
+/// Resolve a dolphin-style reference index against `len`.
+///
+/// `-1` selects the last element. Other negative values, an empty input, and
+/// non-negative indices outside the input fail before a consumer can index.
+///
+/// # Errors
+/// Returns `Err` when `reference_idx` cannot identify an element of `len`.
+pub fn resolve_reference_index(reference_idx: isize, len: usize) -> Result<usize, &'static str> {
+    if len == 0 {
+        return Err("cannot resolve a reference in an empty ministack");
+    }
+    if reference_idx == -1 {
+        return Ok(len - 1);
+    }
+    let resolved =
+        usize::try_from(reference_idx).map_err(|_| "reference index must be -1 or non-negative")?;
+    if resolved >= len {
+        return Err("reference index is outside the ministack");
+    }
+    Ok(resolved)
 }
 
 /// Plans the sequence of ministacks for a stack of real SLCs.
@@ -81,7 +131,11 @@ impl MiniStackPlanner {
             .step_by(ministack_size)
             .enumerate()
             .map(|(batch, start)| self.batch(batch + batch_offset, start, ministack_size))
-            .collect();
+            .collect::<Vec<_>>();
+        for ministack in &ministacks {
+            ministack.resolved_output_reference_idx()?;
+            ministack.resolved_compressed_reference_idx()?;
+        }
         Ok(ministacks)
     }
 
@@ -92,6 +146,7 @@ impl MiniStackPlanner {
         let num_compressed = batch.min(self.max_num_compressed);
         let (output_reference_idx, compressed_reference_idx) = self.references(num_compressed);
         MiniStack {
+            block_id: batch,
             num_compressed,
             real_start: start,
             num_real,

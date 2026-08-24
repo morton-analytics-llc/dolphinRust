@@ -9,14 +9,25 @@
 
 pub mod burst;
 pub mod corrections;
+pub mod covariance_artifact;
 pub mod crop;
 pub mod dates;
 pub mod displacement;
 pub mod provenance;
 pub mod sequential;
+pub mod sequential_covariance;
 pub mod tiling;
 pub mod unwrap_backend;
 
+pub use covariance_artifact::{
+    admit_covariance_artifact_disk, admit_covariance_artifact_disk_with_identity_index,
+    covariance_artifact_disk_bytes, covariance_artifact_disk_bytes_with_identity_index,
+    finalize_covariance_artifact, preflight_covariance_artifact_disk,
+    preflight_covariance_artifact_disk_with_identity_index, read_covariance_artifact_manifest,
+    read_covariance_artifact_manifest_with_byte_cap, CovarianceArtifactDiskAdmission,
+    CovarianceArtifactManifest, CovarianceArtifactTransaction, COVARIANCE_OPERATOR_FILENAME,
+    COVARIANCE_OPERATOR_MANIFEST_FILENAME,
+};
 pub use crop::{BoundsError, ProcessingBoundsProvenance};
 pub use displacement::{
     run_displacement, run_displacement_resumable, run_displacement_with_output_policy,
@@ -30,8 +41,20 @@ pub use provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
-    run_sequential, run_sequential_masked, run_sequential_resumable,
-    run_sequential_resumable_masked, update_sequential, update_sequential_masked, SequentialConfig,
-    SequentialOutput, SequentialState,
+    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    run_sequential_resumable, run_sequential_resumable_masked,
+    run_sequential_with_covariance_capture, update_sequential, update_sequential_masked,
+    SequentialConfig, SequentialOutput, SequentialState,
+};
+pub use sequential_covariance::{
+    sequential_replay_config_digest, sequential_replay_kernel_digest,
+    sequential_source_model_identity_digest, CovarianceArtifactReplayMetrics,
+    CovarianceArtifactReplayProvider, DependencyConeEstimate, DependencyConeQuery, GlobalBlockId,
+    GlobalDateId, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace, ReplayStatus,
+    ResolvedCompressionReplay, ResolvedPhaseReplay, ResolvedPrimitiveSource,
+    SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
+    SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
+    SequentialSourceProviderIdentity, SequentialSourceReplayProvider, TemporalCovarianceReplay,
+    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};

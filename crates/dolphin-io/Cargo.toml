@@ -20,6 +20,7 @@ nisar-fixture = []
 dolphin-core.workspace = true
 ndarray.workspace = true
 num-complex.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 # System-lib bindings (Phase 8). gdal 0.19 builds against system GDAL 3.12;
 # hdf5-metno (maintained fork) builds against HDF5 2.x where the old `hdf5`
