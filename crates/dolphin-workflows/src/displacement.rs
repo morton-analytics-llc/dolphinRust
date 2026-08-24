@@ -124,7 +124,7 @@ pub enum VelocityEstimator {
 }
 
 impl VelocityEstimator {
-    const fn metadata_value(self) -> &'static str {
+    pub(crate) const fn metadata_value(self) -> &'static str {
         match self {
             Self::LinearFullSeriesUnitPrecision => "linear_full_series_unit_precision",
             Self::LinearFullSeriesStitchedCrlbWithUnitFallback => {
@@ -1076,7 +1076,21 @@ fn emit_displacement(
                 crate::provenance::write_geometry_provenance(
                     &cfg.work_directory,
                     &geometry_provenance,
-                )
+                )?;
+                if let Some(geometry) = spatial.corrections.los_geometry.as_ref() {
+                    crate::fixed_cube::write_fixed_cube_bundle(
+                        cfg,
+                        &days,
+                        spatial.velocity_estimator,
+                        scaled.velocity_sigma.is_some(),
+                        spatial.validity_mask.view(),
+                        geometry,
+                        spatial.reference_point,
+                        epsg,
+                        spatial.geotransform,
+                    )?;
+                }
+                Ok(())
             }
             DisplacementOutputPolicy::GroundPulse => {
                 std::fs::create_dir_all(&cfg.work_directory)?;

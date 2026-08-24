@@ -13,6 +13,7 @@ pub mod covariance_artifact;
 pub mod crop;
 pub mod dates;
 pub mod displacement;
+pub mod fixed_cube;
 pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
@@ -34,6 +35,7 @@ pub use displacement::{
     update_displacement, DisplacementOutput, DisplacementOutputPolicy, DisplacementState,
     VelocityEstimator,
 };
+pub use fixed_cube::{write_fixed_cube_bundle, FixedCubeReceipt};
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
     assemble_geometry_provenance_with_coverage, write_geometry_provenance, BurstCoverageProvenance,
