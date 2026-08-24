@@ -22,6 +22,12 @@ pub struct FixedCubeReceipt {
     pub velocity_estimator: String,
     /// Unit recorded by the velocity raster metadata.
     pub velocity_unit: &'static str,
+    /// Inferential serving status; corrected temporal covariance is not present yet.
+    pub inference_status: &'static str,
+    /// Corrected velocity raster, absent until issue #53 promotion gates pass.
+    pub corrected_velocity_raster: Option<&'static str>,
+    /// Corrected sigma raster, absent until issue #53 promotion gates pass.
+    pub corrected_sigma_raster: Option<&'static str>,
     /// Fixed-cube validity mask filename.
     pub validity_mask_raster: &'static str,
     /// Velocity raster filename.
@@ -113,6 +119,9 @@ pub fn write_fixed_cube_bundle(
         acquisition_days_sha256: days_sha256,
         velocity_estimator: velocity_estimator.metadata_value().to_owned(),
         velocity_unit: "see velocity.tif UNITTYPE metadata",
+        inference_status: "conditional_only",
+        corrected_velocity_raster: None,
+        corrected_sigma_raster: None,
         validity_mask_raster: "velocity_validity_mask.tif",
         velocity_raster: "velocity.tif",
         velocity_sigma_raster: velocity_sigma_present.then_some("velocity_sigma.tif"),
