@@ -1,4 +1,7 @@
 //! Empirical proper-complex primitive source factors.
+//!
+//! The primitive speckle process is zero mean, so the source covariance is
+//! the uncentered second moment `Z Z^H / n` over fixed-valid native samples.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -10,10 +13,13 @@ use sha2::{Digest, Sha256};
 use crate::source_influence::{ProperComplexFactor, SourceId, SourceModelError};
 
 /// Stable empirical proper-complex source-model method name.
-pub const EMPIRICAL_PROPER_COMPLEX_METHOD: &str = "source_centered_empirical_proper_complex";
+pub const EMPIRICAL_PROPER_COMPLEX_METHOD: &str = "source_centered_empirical_proper_complex_v1";
 
 /// Stable empirical proper-complex source-model version.
-pub const EMPIRICAL_PROPER_COMPLEX_VERSION: &str = "1";
+pub const EMPIRICAL_PROPER_COMPLEX_VERSION: u32 = 1;
+
+const RELATIVE_DIAGONAL_FLOOR_RULE: &str = "mean_positive_covariance_diagonal_v1";
+const CHOLESKY_DIAGONAL_IMAGINARY_RELATIVE_TOLERANCE: f64 = 64.0 * f64::EPSILON;
 
 /// Fixed source-centered empirical covariance configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +27,7 @@ pub struct EmpiricalProperComplexConfig {
     half_window_rows: usize,
     half_window_columns: usize,
     shrinkage_alpha: f64,
-    amplitude_floor: f64,
+    relative_diagonal_floor: f64,
     model_identity: [u8; 32],
     config_digest: [u8; 32],
 }
@@ -31,12 +37,12 @@ impl EmpiricalProperComplexConfig {
     ///
     /// # Errors
     /// Returns an error for overflowing support, shrinkage outside `(0, 1]`,
-    /// a non-positive amplitude floor, or a missing model identity.
+    /// a relative diagonal floor outside `(0, 1]`, or a missing model identity.
     pub fn new(
         half_window_rows: usize,
         half_window_columns: usize,
         shrinkage_alpha: f64,
-        amplitude_floor: f64,
+        relative_diagonal_floor: f64,
         model_identity: [u8; 32],
     ) -> Result<Self, EmpiricalSourceModelError> {
         let support_rows = half_window_rows
@@ -50,8 +56,11 @@ impl EmpiricalProperComplexConfig {
         if !(shrinkage_alpha.is_finite() && 0.0 < shrinkage_alpha && shrinkage_alpha <= 1.0) {
             return Err(EmpiricalSourceModelError::InvalidShrinkage);
         }
-        if !amplitude_floor.is_finite() || amplitude_floor <= 0.0 {
-            return Err(EmpiricalSourceModelError::InvalidAmplitudeFloor);
+        if !(relative_diagonal_floor.is_finite()
+            && 0.0 < relative_diagonal_floor
+            && relative_diagonal_floor <= 1.0)
+        {
+            return Err(EmpiricalSourceModelError::InvalidRelativeDiagonalFloor);
         }
         if model_identity.iter().all(|byte| *byte == 0) {
             return Err(EmpiricalSourceModelError::MissingModelIdentity);
@@ -60,18 +69,24 @@ impl EmpiricalProperComplexConfig {
         let mut digest = Sha256::new();
         digest.update(b"dolphinrust:empirical_proper_complex_config:v1");
         digest.update(EMPIRICAL_PROPER_COMPLEX_METHOD.as_bytes());
-        digest.update(EMPIRICAL_PROPER_COMPLEX_VERSION.as_bytes());
+        digest.update(EMPIRICAL_PROPER_COMPLEX_VERSION.to_le_bytes());
         digest.update((support_rows as u64).to_le_bytes());
         digest.update((support_columns as u64).to_le_bytes());
         digest.update(shrinkage_alpha.to_bits().to_le_bytes());
-        digest.update(amplitude_floor.to_bits().to_le_bytes());
+        digest.update(RELATIVE_DIAGONAL_FLOOR_RULE.as_bytes());
+        digest.update(relative_diagonal_floor.to_bits().to_le_bytes());
+        digest.update(
+            CHOLESKY_DIAGONAL_IMAGINARY_RELATIVE_TOLERANCE
+                .to_bits()
+                .to_le_bytes(),
+        );
         digest.update(model_identity);
 
         Ok(Self {
             half_window_rows,
             half_window_columns,
             shrinkage_alpha,
-            amplitude_floor,
+            relative_diagonal_floor,
             model_identity,
             config_digest: digest.finalize().into(),
         })
@@ -92,10 +107,10 @@ impl EmpiricalProperComplexConfig {
         self.shrinkage_alpha
     }
 
-    /// Minimum centered component standard deviation.
+    /// Minimum component diagonal relative to the mean positive diagonal.
     #[must_use]
-    pub const fn amplitude_floor(&self) -> f64 {
-        self.amplitude_floor
+    pub const fn relative_diagonal_floor(&self) -> f64 {
+        self.relative_diagonal_floor
     }
 
     /// Caller-supplied source-model implementation or parameter identity.
@@ -104,7 +119,8 @@ impl EmpiricalProperComplexConfig {
         &self.model_identity
     }
 
-    /// Canonical digest of method, version, support, shrinkage, floor, and model identity.
+    /// Canonical digest of method, version, support, shrinkage, relative-floor rule/value,
+    /// Cholesky diagonal tolerance, and model identity.
     #[must_use]
     pub const fn config_digest(&self) -> &[u8; 32] {
         &self.config_digest
@@ -132,7 +148,7 @@ impl EmpiricalProperComplexReceipt {
 
     /// Stable method version.
     #[must_use]
-    pub const fn version(&self) -> &'static str {
+    pub const fn version(&self) -> u32 {
         EMPIRICAL_PROPER_COMPLEX_VERSION
     }
 
@@ -213,8 +229,8 @@ pub enum EmpiricalSourceModelError {
     InvalidSupport,
     /// Shrinkage was non-finite or outside `(0, 1]`.
     InvalidShrinkage,
-    /// The amplitude floor was non-finite or non-positive.
-    InvalidAmplitudeFloor,
+    /// The relative diagonal floor was non-finite or outside `(0, 1]`.
+    InvalidRelativeDiagonalFloor,
     /// The model identity was the all-zero missing value.
     MissingModelIdentity,
     /// The data identity was the all-zero missing value.
@@ -227,8 +243,10 @@ pub enum EmpiricalSourceModelError {
     MissingSupport,
     /// A fixed-valid sample contained NaN or infinity.
     NonFiniteSample,
-    /// A centered covariance diagonal was non-finite or below the declared floor.
-    NonPositiveDiagonal(usize),
+    /// The covariance contained no positive finite diagonal.
+    NoPositiveDiagonal,
+    /// A covariance component was below the declared relative diagonal floor.
+    DiagonalBelowRelativeFloor(usize),
     /// Deterministic complex Cholesky could not factor the shrunk covariance.
     CholeskyFailure,
     /// The generated factor violated the common proper-complex factor contract.
@@ -240,16 +258,21 @@ impl Display for EmpiricalSourceModelError {
         match self {
             Self::InvalidSupport => write!(f, "empirical source support is invalid"),
             Self::InvalidShrinkage => write!(f, "empirical source shrinkage is invalid"),
-            Self::InvalidAmplitudeFloor => write!(f, "empirical source amplitude floor is invalid"),
+            Self::InvalidRelativeDiagonalFloor => {
+                write!(f, "empirical source relative diagonal floor is invalid")
+            }
             Self::MissingModelIdentity => write!(f, "empirical source model identity is missing"),
             Self::MissingDataIdentity => write!(f, "empirical source data identity is missing"),
             Self::ShapeMismatch => write!(f, "empirical source stack dimensions do not agree"),
             Self::SourceOutsideGrid => write!(f, "empirical source pixel is outside the grid"),
             Self::MissingSupport => write!(f, "empirical source fixed support is unavailable"),
             Self::NonFiniteSample => write!(f, "empirical source sample is non-finite"),
-            Self::NonPositiveDiagonal(component) => write!(
+            Self::NoPositiveDiagonal => {
+                write!(f, "empirical source covariance has no positive diagonal")
+            }
+            Self::DiagonalBelowRelativeFloor(component) => write!(
                 f,
-                "empirical source component {component} has no positive finite variance"
+                "empirical source component {component} is below the relative diagonal floor"
             ),
             Self::CholeskyFailure => {
                 write!(f, "empirical source covariance is not positive definite")
@@ -275,7 +298,6 @@ struct ResolvedWindow {
 }
 
 struct SampleSummary {
-    means: Vec<Cf64>,
     sample_count: usize,
     content_digest: [u8; 32],
 }
@@ -343,7 +365,6 @@ fn summarize_samples(
     }
 
     let mut sample_count = 0usize;
-    let mut means = vec![Cf64::new(0.0, 0.0); component_ids.len()];
     for row in window.local_origin.0..window.local_origin.0 + window.shape.0 {
         for column in window.local_origin.1..window.local_origin.1 + window.shape.1 {
             let is_valid = valid[(row, column)];
@@ -357,7 +378,6 @@ fn summarize_samples(
                 if !value.is_finite() {
                     return Err(EmpiricalSourceModelError::NonFiniteSample);
                 }
-                means[date] += value;
                 content.update(value.re.to_bits().to_le_bytes());
                 content.update(value.im.to_bits().to_le_bytes());
             }
@@ -366,24 +386,20 @@ fn summarize_samples(
     if sample_count == 0 {
         return Err(EmpiricalSourceModelError::MissingSupport);
     }
-    for mean in &mut means {
-        *mean /= sample_count as f64;
-    }
     Ok(SampleSummary {
-        means,
         sample_count,
         content_digest: content.finalize().into(),
     })
 }
 
-fn centered_shrunk_covariance(
+fn shrunk_second_moment(
     values: ArrayView3<'_, Cf64>,
     valid: ArrayView2<'_, bool>,
     window: ResolvedWindow,
     summary: &SampleSummary,
     config: &EmpiricalProperComplexConfig,
 ) -> Result<Array2<Cf64>, EmpiricalSourceModelError> {
-    let date_count = summary.means.len();
+    let date_count = values.dim().0;
     let mut covariance = Array2::from_elem((date_count, date_count), Cf64::new(0.0, 0.0));
     for row in window.local_origin.0..window.local_origin.0 + window.shape.0 {
         for column in window.local_origin.1..window.local_origin.1 + window.shape.1 {
@@ -391,20 +407,34 @@ fn centered_shrunk_covariance(
                 continue;
             }
             for left in 0..date_count {
-                let centered_left = values[(left, row, column)] - summary.means[left];
                 for right in 0..date_count {
-                    covariance[(left, right)] += centered_left
-                        * (values[(right, row, column)] - summary.means[right]).conj();
+                    covariance[(left, right)] +=
+                        values[(left, row, column)] * values[(right, row, column)].conj();
                 }
             }
         }
     }
     covariance.mapv_inplace(|value| value / summary.sample_count as f64);
-    let variance_floor = config.amplitude_floor * config.amplitude_floor;
+    let mut positive_diagonal_sum = 0.0;
+    let mut positive_diagonal_count = 0usize;
     for component in 0..date_count {
         let diagonal = covariance[(component, component)].re;
-        if !diagonal.is_finite() || diagonal <= variance_floor {
-            return Err(EmpiricalSourceModelError::NonPositiveDiagonal(component));
+        if diagonal.is_finite() && diagonal > 0.0 {
+            positive_diagonal_sum += diagonal;
+            positive_diagonal_count += 1;
+        }
+    }
+    if positive_diagonal_count == 0 || !positive_diagonal_sum.is_finite() {
+        return Err(EmpiricalSourceModelError::NoPositiveDiagonal);
+    }
+    let relative_floor =
+        config.relative_diagonal_floor * (positive_diagonal_sum / positive_diagonal_count as f64);
+    for component in 0..date_count {
+        let diagonal = covariance[(component, component)].re;
+        if !diagonal.is_finite() || diagonal < relative_floor {
+            return Err(EmpiricalSourceModelError::DiagonalBelowRelativeFloor(
+                component,
+            ));
         }
         covariance[(component, component)] = Cf64::new(diagonal, 0.0);
     }
@@ -431,7 +461,14 @@ fn deterministic_complex_cholesky(
                 residual -= lower[(row, inner)] * lower[(column, inner)].conj();
             }
             if row == column {
-                if !residual.re.is_finite() || residual.re <= 0.0 || !residual.im.is_finite() {
+                let diagonal_scale = covariance[(row, row)].norm().max(residual.re.abs());
+                let imaginary_limit =
+                    CHOLESKY_DIAGONAL_IMAGINARY_RELATIVE_TOLERANCE * diagonal_scale;
+                if !residual.re.is_finite()
+                    || residual.re <= 0.0
+                    || !residual.im.is_finite()
+                    || residual.im.abs() > imaginary_limit
+                {
                     return Err(EmpiricalSourceModelError::CholeskyFailure);
                 }
                 lower[(row, column)] = Cf64::new(residual.re.sqrt(), 0.0);
@@ -455,7 +492,7 @@ fn deterministic_complex_cholesky(
 ///
 /// # Errors
 /// Returns a fail-closed error for missing identities or support, mismatched
-/// dimensions, non-finite fixed-valid samples, insufficient centered amplitude,
+/// dimensions, non-finite fixed-valid samples, insufficient relative diagonal,
 /// or a factorization/contract failure.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_empirical_proper_complex_factor(
@@ -480,7 +517,7 @@ pub fn estimate_empirical_proper_complex_factor(
     }
     let window = resolve_window((grid_rows, grid_columns), grid_origin, source_pixel, config)?;
     let summary = summarize_samples(component_ids, values, valid, window, data_identity)?;
-    let covariance = centered_shrunk_covariance(values, valid, window, &summary, config)?;
+    let covariance = shrunk_second_moment(values, valid, window, &summary, config)?;
     let lower = deterministic_complex_cholesky(&covariance)?;
     let mut receipt_digest = Sha256::new();
     receipt_digest.update(b"dolphinrust:empirical_proper_complex_receipt:v1");
@@ -499,4 +536,21 @@ pub fn estimate_empirical_proper_complex_factor(
         digest,
     };
     Ok(EmpiricalProperComplexEstimate { factor, receipt })
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::array;
+
+    use super::*;
+
+    #[test]
+    fn cholesky_rejects_materially_complex_diagonal() {
+        let covariance = array![[Cf64::new(1.0, 1.0e-8)]];
+
+        assert_eq!(
+            deterministic_complex_cholesky(&covariance).unwrap_err(),
+            EmpiricalSourceModelError::CholeskyFailure
+        );
+    }
 }

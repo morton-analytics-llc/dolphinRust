@@ -50,7 +50,7 @@ fn covariance_from_factor(lower: &Array2<Cf64>) -> Array2<Cf64> {
 }
 
 #[test]
-fn reconstructs_centered_shrunk_analytic_covariance() {
+fn reconstructs_zero_mean_shrunk_analytic_covariance() {
     let values = stack();
     let valid = Array2::from_elem((4, 5), true);
     let alpha = 0.25;
@@ -62,14 +62,10 @@ fn reconstructs_centered_shrunk_analytic_covariance() {
             samples.push([values[(0, row, column)], values[(1, row, column)]]);
         }
     }
-    let means = [
-        samples.iter().map(|sample| sample[0]).sum::<Cf64>() / samples.len() as f64,
-        samples.iter().map(|sample| sample[1]).sum::<Cf64>() / samples.len() as f64,
-    ];
     let empirical = Array2::from_shape_fn((2, 2), |(row, column)| {
         samples
             .iter()
-            .map(|sample| (sample[row] - means[row]) * (sample[column] - means[column]).conj())
+            .map(|sample| sample[row] * sample[column].conj())
             .sum::<Cf64>()
             / samples.len() as f64
     });
@@ -86,7 +82,12 @@ fn reconstructs_centered_shrunk_analytic_covariance() {
         assert!((*actual - *expected).norm() < 1.0e-10);
     }
     assert_eq!(estimate.factor().component_ids(), &[20240101, 20240113]);
+    assert_eq!(
+        estimate.receipt().method(),
+        "source_centered_empirical_proper_complex_v1"
+    );
     assert_eq!(estimate.receipt().method(), EMPIRICAL_PROPER_COMPLEX_METHOD);
+    assert_eq!(estimate.receipt().version(), 1);
     assert_eq!(
         estimate.receipt().version(),
         EMPIRICAL_PROPER_COMPLEX_VERSION
@@ -150,6 +151,10 @@ fn invalid_nonfinite_and_missing_support_fail_closed() {
         Err(EmpiricalSourceModelError::InvalidShrinkage)
     );
     assert_eq!(
+        EmpiricalProperComplexConfig::new(1, 1, 0.2, 0.0, [11; 32]),
+        Err(EmpiricalSourceModelError::InvalidRelativeDiagonalFloor)
+    );
+    assert_eq!(
         EmpiricalProperComplexConfig::new(1, 1, 0.2, 1.0e-12, [0; 32]),
         Err(EmpiricalSourceModelError::MissingModelIdentity)
     );
@@ -207,6 +212,31 @@ fn invalid_nonfinite_and_missing_support_fail_closed() {
 }
 
 #[test]
+fn relative_diagonal_floor_rejects_underpowered_component() {
+    let values = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| match date {
+        0 => Cf64::new(1.0, 0.0),
+        1 => Cf64::new(1.0e-7, 0.0),
+        _ => unreachable!(),
+    });
+    let valid = Array2::from_elem((3, 3), true);
+
+    assert_eq!(
+        estimate_empirical_proper_complex_factor(
+            SourceId::new(41),
+            &[1, 2],
+            values.view(),
+            valid.view(),
+            (0, 0),
+            (1, 1),
+            [17; 32],
+            &config(0.2),
+        )
+        .unwrap_err(),
+        EmpiricalSourceModelError::DiagonalBelowRelativeFloor(1)
+    );
+}
+
+#[test]
 fn receipt_digest_binds_content_config_and_date_order() {
     let values = stack();
     let valid = Array2::from_elem((4, 5), true);
@@ -222,6 +252,13 @@ fn receipt_digest_binds_content_config_and_date_order() {
         &config(0.2),
     );
     let changed_config = estimate(values.view(), valid.view(), (0, 0), (2, 2), &config(0.3));
+    let changed_floor = estimate(
+        values.view(),
+        valid.view(),
+        (0, 0),
+        (2, 2),
+        &EmpiricalProperComplexConfig::new(1, 1, 0.2, 1.0e-10, [11; 32]).unwrap(),
+    );
     let reversed = estimate_empirical_proper_complex_factor(
         SourceId::new(41),
         &[20240113, 20240101],
@@ -269,6 +306,10 @@ fn receipt_digest_binds_content_config_and_date_order() {
         changed_config.receipt().digest()
     );
     assert_ne!(baseline.receipt().digest(), reversed.receipt().digest());
+    assert_ne!(
+        baseline.receipt().digest(),
+        changed_floor.receipt().digest()
+    );
     assert_ne!(
         baseline.factor().model_hash(),
         content.factor().model_hash()
