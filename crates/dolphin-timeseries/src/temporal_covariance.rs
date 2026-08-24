@@ -6,7 +6,9 @@
 //! is exposed here.  The public result contains point estimates, diagnostics,
 //! and validation intervals, but no corrected inferential standard error.
 
+use faer::{Mat, Side};
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{ChiSquared, ContinuousCDF, Normal};
 
 const DAYS_PER_YEAR: f64 = 365.25;
 const SYMMETRY_TOLERANCE: f64 = 1e-10;
@@ -34,10 +36,24 @@ pub enum TemporalInferenceStatus {
     TotalCovarianceNotPositiveDefinite,
     /// The fitted correlation or process variance is at a configured boundary.
     CovarianceParameterAtBoundary,
+    /// The fitted correlation is at its lower bound.
+    RhoLowerBoundary,
+    /// The fitted correlation is at its upper bound.
+    RhoUpperBoundary,
+    /// The fitted process variance is at its lower bound.
+    ProcessVarianceLowerBoundary,
+    /// The fitted process variance is at its upper bound.
+    ProcessVarianceUpperBoundary,
     /// Too few complete-refit bootstrap replicates succeeded.
     BootstrapInsufficientSuccess,
     /// The requested cadence is outside the preregistered supported predicate.
     UnsupportedCadence,
+    /// The covariance optimizer did not converge within its frozen iterations.
+    OptimizerNonconverged,
+    /// The likelihood is too flat to identify covariance parameters.
+    WeakParameterIdentification,
+    /// Legacy intercept-plus-slope WLS is reported only as a non-comparable diagnostic.
+    LegacyNonComparable,
 }
 
 /// Continuous-time AR(1) and profile-fit options.
@@ -63,6 +79,24 @@ pub struct TemporalCovarianceOptions {
     pub bootstrap_minimum_successes: usize,
     /// Deterministic bootstrap seed.
     pub bootstrap_seed: u64,
+    /// Frozen maximum profile interval expansions.
+    pub profile_max_expansions: usize,
+    /// Frozen maximum profile endpoint iterations.
+    pub profile_max_iterations: usize,
+    /// Frozen maximum covariance optimizer coordinate iterations.
+    pub optimizer_max_iterations: usize,
+    /// Frozen objective convergence tolerance.
+    pub optimizer_tolerance: f64,
+    /// Frozen lower process-variance bound relative to the residual scale.
+    pub process_variance_min_ratio: f64,
+    /// Frozen upper process-variance bound relative to the residual scale.
+    pub process_variance_max_ratio: f64,
+    /// Minimum finite-difference profile curvature required for identification.
+    pub minimum_profile_curvature: f64,
+    /// Minimum supported adjacent acquisition gap in days.
+    pub minimum_gap_days: f64,
+    /// Maximum supported adjacent acquisition gap in days.
+    pub maximum_gap_days: f64,
 }
 
 impl Default for TemporalCovarianceOptions {
@@ -78,6 +112,15 @@ impl Default for TemporalCovarianceOptions {
             bootstrap_replicates: 200,
             bootstrap_minimum_successes: 180,
             bootstrap_seed: 0x53_2026,
+            profile_max_expansions: 12,
+            profile_max_iterations: 48,
+            optimizer_max_iterations: 12,
+            optimizer_tolerance: 1e-4,
+            process_variance_min_ratio: 1e-6,
+            process_variance_max_ratio: 1e6,
+            minimum_profile_curvature: 1e-6,
+            minimum_gap_days: 4.0,
+            maximum_gap_days: 36.0,
         }
     }
 }
@@ -148,7 +191,7 @@ pub struct TemporalCovarianceFit {
     pub plugin_gls_slope: Option<f64>,
     /// Adjusted/profile comparator slope. It is separate from the bootstrap interval.
     pub adjusted_profile_slope: Option<f64>,
-    /// Mean complete-refit bootstrap slope, when enough replicates succeeded.
+    /// Observed plug-in slope paired with complete-refit bootstrap intervals.
     pub bootstrap_slope: Option<f64>,
     /// Validation-only complete-refit interval.
     pub bootstrap_interval: Option<ValidationInterval>,
@@ -170,6 +213,10 @@ pub struct TemporalCovarianceFit {
     pub ols: ComparatorDiagnostics,
     /// Oracle GLS point/interval diagnostics.
     pub oracle_gls: ComparatorDiagnostics,
+    /// Diagonal conditional-WLS comparator diagnostics.
+    pub conditional_wls: ComparatorDiagnostics,
+    /// Scalar effective-N diagnostic comparator.
+    pub scalar_effective_n: ComparatorDiagnostics,
     /// Plug-in profiled GLS point/interval diagnostics.
     pub plugin_gls: ComparatorDiagnostics,
     /// Profile-likelihood comparator diagnostics.
@@ -180,6 +227,76 @@ pub struct TemporalCovarianceFit {
     pub bootstrap_attempts: usize,
     /// Number of successful bootstrap refits.
     pub bootstrap_successes: usize,
+}
+
+/// Validation-only F53-03 provenance sidecar fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemporalCovarianceProvenance {
+    /// Stable sidecar schema.
+    pub schema: String,
+    /// Estimator identity.
+    pub estimator: String,
+    /// Estimator implementation version.
+    pub estimator_version: String,
+    /// Retained post-gauge date count.
+    pub valid_date_count: usize,
+    /// Origin-anchored design rank.
+    pub rank: usize,
+    /// Residual degrees of freedom.
+    pub degrees_of_freedom: usize,
+    /// Minimum/median/maximum retained cadence in days.
+    pub cadence_days: [Option<f64>; 3],
+    /// Unclamped adjacent residual correlation.
+    pub raw_rho: Option<f64>,
+    /// Fitted continuous-time correlation.
+    pub fitted_rho: Option<f64>,
+    /// #52 replay/input receipt SHA-256.
+    pub issue52_receipt_sha256: String,
+    /// #54 direct difference-factor receipt SHA-256.
+    pub issue54_receipt_sha256: String,
+    /// Stable reference geometry identity.
+    pub reference_geometry: String,
+    /// Reference window identity.
+    pub reference_window: String,
+    /// Target/reference support overlap fraction.
+    pub overlap_fraction: f64,
+    /// Target/reference distance in pixels.
+    pub distance_pixels: f64,
+    /// Fitted total covariance condition number.
+    pub condition_number: Option<f64>,
+    /// Scope identity for the validation series.
+    pub scope: String,
+    /// Complete-refit bootstrap attempts.
+    pub bootstrap_attempts: usize,
+    /// Complete-refit bootstrap successes.
+    pub bootstrap_successes: usize,
+    /// Approximation identity, if any.
+    pub approximation: Option<String>,
+    /// Validation receipt SHA-256.
+    pub validation_receipt_sha256: String,
+}
+
+/// Inputs that bind an F53-03 provenance sidecar to #52/#54 and reference geometry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemporalCovarianceProvenanceInputs {
+    /// #52 replay/input receipt SHA-256.
+    pub issue52_receipt_sha256: String,
+    /// #54 direct difference-factor receipt SHA-256.
+    pub issue54_receipt_sha256: String,
+    /// Stable reference geometry identity.
+    pub reference_geometry: String,
+    /// Reference window identity.
+    pub reference_window: String,
+    /// Target/reference support overlap fraction.
+    pub overlap_fraction: f64,
+    /// Target/reference distance in pixels.
+    pub distance_pixels: f64,
+    /// Scope identity.
+    pub scope: String,
+    /// Approximation identity, if any.
+    pub approximation: Option<String>,
+    /// Validation receipt SHA-256.
+    pub validation_receipt_sha256: String,
 }
 
 /// Construct the preregistered continuous-time AR(1) correlation matrix.
@@ -310,6 +427,33 @@ pub fn total_difference_covariance(
         .collect())
 }
 
+/// Classify fitted covariance parameters against frozen lower and upper bounds.
+#[must_use]
+pub fn temporal_parameter_boundary_status(
+    rho: f64,
+    process_variance: f64,
+    rho_bounds: [f64; 2],
+    process_variance_bounds: [f64; 2],
+    tolerance_fraction: f64,
+) -> Option<TemporalInferenceStatus> {
+    let tolerance = tolerance_fraction.clamp(1e-8, 1e-4);
+    let rho_tolerance = tolerance * (rho_bounds[1] - rho_bounds[0]);
+    let log_min = process_variance_bounds[0].ln();
+    let log_max = process_variance_bounds[1].ln();
+    let log_tolerance = tolerance * (log_max - log_min);
+    if rho <= rho_bounds[0] + rho_tolerance {
+        Some(TemporalInferenceStatus::RhoLowerBoundary)
+    } else if rho >= rho_bounds[1] - rho_tolerance {
+        Some(TemporalInferenceStatus::RhoUpperBoundary)
+    } else if process_variance.ln() <= log_min + log_tolerance {
+        Some(TemporalInferenceStatus::ProcessVarianceLowerBoundary)
+    } else if process_variance.ln() >= log_max - log_tolerance {
+        Some(TemporalInferenceStatus::ProcessVarianceUpperBoundary)
+    } else {
+        None
+    }
+}
+
 /// Fit the OLS/oracle/plugin/profile/bootstrap comparator set.
 ///
 /// `observations[0]` is the exact acquisition-zero gauge and must be finite;
@@ -340,6 +484,8 @@ pub fn fit_temporal_covariance(
         covariance_condition_number: None,
         ols: empty_comparator(status),
         oracle_gls: empty_comparator(status),
+        conditional_wls: empty_comparator(status),
+        scalar_effective_n: empty_comparator(status),
         plugin_gls: empty_comparator(status),
         adjusted_profile: empty_comparator(status),
         complete_refit_bootstrap: empty_comparator(status),
@@ -362,6 +508,9 @@ pub fn fit_temporal_covariance(
         let mut result = empty(TemporalInferenceStatus::InsufficientDates);
         result.valid_date_count = n;
         return result;
+    }
+    if let Err(status) = validate_supported_cadence(&selected_days, options) {
+        return empty(status);
     }
     let rank = if selected_days.iter().map(|day| day * day).sum::<f64>() > 0.0 {
         1
@@ -399,6 +548,7 @@ pub fn fit_temporal_covariance(
         &selected_y,
         &oracle_v,
         options.condition_limit,
+        true,
     ) {
         Ok(value) => value,
         Err(status) => return empty(status),
@@ -435,11 +585,28 @@ pub fn fit_temporal_covariance(
         oracle_fit.information_variance.sqrt(),
         TemporalInferenceStatus::Evaluated,
     );
+    let conditional_wls = legacy_intercept_wls(&selected_days, &selected_y, &diagonal).map_or_else(
+        empty_comparator,
+        |slope| ComparatorDiagnostics {
+            point_estimate: Some(slope * DAYS_PER_YEAR),
+            status: TemporalInferenceStatus::LegacyNonComparable,
+            ..empty_comparator(TemporalInferenceStatus::LegacyNonComparable)
+        },
+    );
+    let ols_raw = raw_adjacent_correlation(&selected_days, &ols_residuals);
+    let lag_one_rho = ols_raw.rho.unwrap_or(0.0).clamp(-0.99, 0.99);
+    let effective_n = (n as f64 * (1.0 - lag_one_rho) / (1.0 + lag_one_rho)).clamp(1.0, n as f64);
+    let scalar_effective_n = normal_comparator(
+        ols.point_estimate.unwrap_or(f64::NAN) / DAYS_PER_YEAR,
+        (ols_scale / ols_information * n as f64 / effective_n).sqrt(),
+        TemporalInferenceStatus::Evaluated,
+    );
     let plugin_fit = gls_fit(
         &selected_days,
         &selected_y,
         &plugin.covariance,
         options.condition_limit,
+        true,
     );
     let plugin_comparator = plugin_fit.map_or_else(empty_comparator, |fit| {
         normal_comparator(
@@ -448,9 +615,14 @@ pub fn fit_temporal_covariance(
             TemporalInferenceStatus::Evaluated,
         )
     });
-    let adjusted_profile = profile_comparator(&plugin, degrees_of_freedom);
-    let bootstrap_comparator = bootstrap_comparator(&bootstrap);
-    let status = if bootstrap.successes < options.bootstrap_minimum_successes {
+    let adjusted_profile_result =
+        profile_comparator(&selected_days, &selected_y, &selected_c, &plugin, options);
+    let profile_status = adjusted_profile_result.as_ref().err().copied();
+    let adjusted_profile = adjusted_profile_result.unwrap_or_else(empty_comparator);
+    let bootstrap_comparator = bootstrap_comparator(&bootstrap, plugin.slope);
+    let status = if let Some(status) = profile_status {
+        status
+    } else if bootstrap.successes < options.bootstrap_minimum_successes {
         TemporalInferenceStatus::BootstrapInsufficientSuccess
     } else {
         TemporalInferenceStatus::Evaluated
@@ -472,11 +644,48 @@ pub fn fit_temporal_covariance(
         covariance_condition_number: Some(plugin.condition_number),
         ols,
         oracle_gls: oracle,
+        conditional_wls,
+        scalar_effective_n,
         plugin_gls: plugin_comparator,
         adjusted_profile,
         complete_refit_bootstrap: bootstrap_comparator,
         bootstrap_attempts: bootstrap.attempts,
         bootstrap_successes: bootstrap.successes,
+    }
+}
+
+/// Build validation-only F53-03 provenance without enabling any product writer.
+#[must_use]
+pub fn temporal_covariance_provenance(
+    fit: &TemporalCovarianceFit,
+    inputs: TemporalCovarianceProvenanceInputs,
+) -> TemporalCovarianceProvenance {
+    TemporalCovarianceProvenance {
+        schema: "dolphinrust-temporal-covariance-provenance/1".to_owned(),
+        estimator: "origin_anchored_temporal_covariance_slope".to_owned(),
+        estimator_version: env!("CARGO_PKG_VERSION").to_owned(),
+        valid_date_count: fit.valid_date_count,
+        rank: fit.rank,
+        degrees_of_freedom: fit.degrees_of_freedom,
+        cadence_days: [
+            fit.raw_correlation.minimum_gap_days,
+            fit.raw_correlation.median_gap_days,
+            fit.raw_correlation.maximum_gap_days,
+        ],
+        raw_rho: fit.raw_correlation.rho,
+        fitted_rho: fit.fitted_rho,
+        issue52_receipt_sha256: inputs.issue52_receipt_sha256,
+        issue54_receipt_sha256: inputs.issue54_receipt_sha256,
+        reference_geometry: inputs.reference_geometry,
+        reference_window: inputs.reference_window,
+        overlap_fraction: inputs.overlap_fraction,
+        distance_pixels: inputs.distance_pixels,
+        condition_number: fit.covariance_condition_number,
+        scope: inputs.scope,
+        bootstrap_attempts: fit.bootstrap_attempts,
+        bootstrap_successes: fit.bootstrap_successes,
+        approximation: inputs.approximation,
+        validation_receipt_sha256: inputs.validation_receipt_sha256,
     }
 }
 
@@ -547,7 +756,6 @@ fn empty_comparator(status: TemporalInferenceStatus) -> ComparatorDiagnostics {
 }
 
 struct BootstrapSummary {
-    mean: f64,
     interval_68: Option<ValidationInterval>,
     interval_90: Option<ValidationInterval>,
     interval_95: Option<ValidationInterval>,
@@ -562,50 +770,158 @@ fn normal_comparator(
     standard_error_per_day: f64,
     status: TemporalInferenceStatus,
 ) -> ComparatorDiagnostics {
+    let normal = Normal::new(0.0, 1.0).expect("standard normal parameters are valid");
+    let z_68 = normal.inverse_cdf(0.84);
+    let z_90 = normal.inverse_cdf(0.95);
+    let z_95 = normal.inverse_cdf(0.975);
     let point = slope_per_day * DAYS_PER_YEAR;
     let standard_error = standard_error_per_day * DAYS_PER_YEAR;
     ComparatorDiagnostics {
         point_estimate: point.is_finite().then_some(point),
         standard_error_diagnostic: standard_error.is_finite().then_some(standard_error),
-        interval_68: interval(point, standard_error, 0.9944579, 0, 0),
-        interval_90: interval(point, standard_error, 1.6448536, 0, 0),
-        interval_95: interval(point, standard_error, 1.959964, 0, 0),
-        width_68: Some(2.0 * 0.9944579 * standard_error),
-        width_90: Some(2.0 * 1.6448536 * standard_error),
-        width_95: Some(2.0 * 1.959964 * standard_error),
+        interval_68: interval(point, standard_error, z_68, 0, 0),
+        interval_90: interval(point, standard_error, z_90, 0, 0),
+        interval_95: interval(point, standard_error, z_95, 0, 0),
+        width_68: Some(2.0 * z_68 * standard_error),
+        width_90: Some(2.0 * z_90 * standard_error),
+        width_95: Some(2.0 * z_95 * standard_error),
         status,
         attempted_replicates: 0,
         successful_replicates: 0,
     }
 }
 
-fn profile_comparator(plugin: &PluginFit, degrees_of_freedom: usize) -> ComparatorDiagnostics {
-    let standard_error = plugin.information_variance.sqrt() * DAYS_PER_YEAR;
+fn profile_comparator(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    plugin: &PluginFit,
+    options: &TemporalCovarianceOptions,
+) -> Result<ComparatorDiagnostics, TemporalInferenceStatus> {
+    if options.profile_max_iterations == 0 || options.profile_max_expansions == 0 {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
     let point = plugin.slope * DAYS_PER_YEAR;
-    let (z68, z90, z95) = t_multipliers(degrees_of_freedom);
-    ComparatorDiagnostics {
+    let unrestricted_objective = profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        plugin.rho,
+        plugin.process_variance.ln(),
+        options,
+    )?
+    .0;
+    let levels = [0.68, 0.90, 0.95];
+    let mut intervals = Vec::with_capacity(levels.len());
+    for level in levels {
+        let chi_square = ChiSquared::new(1.0)
+            .map_err(|_| TemporalInferenceStatus::WeakParameterIdentification)?
+            .inverse_cdf(level);
+        let target = unrestricted_objective + chi_square;
+        let scale = plugin.information_variance.sqrt().max(1e-10);
+        let (lower, upper) = profile_endpoint_pair(
+            days,
+            observations,
+            difference_covariance,
+            plugin.slope,
+            scale,
+            target,
+            options,
+        )?;
+        intervals.push(ValidationInterval {
+            lower: lower * DAYS_PER_YEAR,
+            upper: upper * DAYS_PER_YEAR,
+            successful_replicates: 0,
+        });
+    }
+    let z_95 = Normal::new(0.0, 1.0)
+        .expect("standard normal parameters are valid")
+        .inverse_cdf(0.975);
+    let standard_error = intervals[2].upper - intervals[2].lower;
+    let standard_error = standard_error / (2.0 * z_95);
+    Ok(ComparatorDiagnostics {
         point_estimate: Some(point),
-        standard_error_diagnostic: Some(standard_error),
-        interval_68: interval(point, standard_error, z68, 0, 0),
-        interval_90: interval(point, standard_error, z90, 0, 0),
-        interval_95: interval(point, standard_error, z95, 0, 0),
-        width_68: Some(2.0 * z68 * standard_error),
-        width_90: Some(2.0 * z90 * standard_error),
-        width_95: Some(2.0 * z95 * standard_error),
+        standard_error_diagnostic: standard_error.is_finite().then_some(standard_error),
+        interval_68: Some(intervals[0]),
+        interval_90: Some(intervals[1]),
+        interval_95: Some(intervals[2]),
+        width_68: Some(intervals[0].upper - intervals[0].lower),
+        width_90: Some(intervals[1].upper - intervals[1].lower),
+        width_95: Some(intervals[2].upper - intervals[2].lower),
         status: TemporalInferenceStatus::Evaluated,
         attempted_replicates: 0,
         successful_replicates: 0,
-    }
+    })
 }
 
-fn bootstrap_comparator(summary: &BootstrapSummary) -> ComparatorDiagnostics {
+fn profile_endpoint_pair(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    point: f64,
+    initial_scale: f64,
+    target: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<(f64, f64), TemporalInferenceStatus> {
+    let objective = |slope: f64| {
+        profile_fixed_slope(days, observations, difference_covariance, slope, options)
+            .map(|(value, _)| value)
+    };
+    let mut lower = point - initial_scale;
+    let mut upper = point + initial_scale;
+    for _ in 0..options.profile_max_expansions {
+        if objective(lower)? > target && objective(upper)? > target {
+            break;
+        }
+        let span = (upper - lower) * 2.0;
+        lower = point - span;
+        upper = point + span;
+    }
+    if objective(lower)? <= target || objective(upper)? <= target {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
+    let lower = solve_profile_endpoint(&objective, point, lower, target, options)?;
+    let upper = solve_profile_endpoint(&objective, point, upper, target, options)?;
+    Ok((lower, upper))
+}
+
+fn solve_profile_endpoint<F: Fn(f64) -> Result<f64, TemporalInferenceStatus>>(
+    objective: &F,
+    point: f64,
+    boundary: f64,
+    target: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<f64, TemporalInferenceStatus> {
+    let mut inside = point;
+    let mut outside = boundary;
+    for _ in 0..options.profile_max_iterations {
+        let middle = (inside + outside) / 2.0;
+        if objective(middle)? <= target {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+        if (outside - inside).abs() <= options.optimizer_tolerance * (1.0 + middle.abs()) {
+            return Ok((inside + outside) / 2.0);
+        }
+    }
+    let endpoint = (inside + outside) / 2.0;
+    if (outside - inside).abs() > options.optimizer_tolerance * (1.0 + endpoint.abs()) {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
+    Ok(endpoint)
+}
+
+fn bootstrap_comparator(summary: &BootstrapSummary, observed_slope: f64) -> ComparatorDiagnostics {
     let se = if summary.successes > 1 {
         Some(summary.variance.sqrt() * DAYS_PER_YEAR)
     } else {
         None
     };
     ComparatorDiagnostics {
-        point_estimate: (summary.successes > 0).then_some(summary.mean * DAYS_PER_YEAR),
+        point_estimate: observed_slope
+            .is_finite()
+            .then_some(observed_slope * DAYS_PER_YEAR),
         standard_error_diagnostic: se,
         interval_68: scale_interval(summary.interval_68),
         interval_90: scale_interval(summary.interval_90),
@@ -651,14 +967,7 @@ fn interval(
     )
 }
 
-fn t_multipliers(degrees_of_freedom: usize) -> (f64, f64, f64) {
-    if degrees_of_freedom < 30 {
-        (1.0, 1.833, 2.262)
-    } else {
-        (0.9944579, 1.6448536, 1.959964)
-    }
-}
-
+#[allow(clippy::too_many_lines)]
 fn profile_plugin(
     days: &[f64],
     observations: &[f64],
@@ -675,10 +984,16 @@ fn profile_plugin(
         .map(|(y, x)| (y - initial * x).powi(2))
         .sum::<f64>()
         / observations.len() as f64;
-    let log_min = (scale * 1e-6).max(1e-12).ln();
-    let log_max = (scale * 1e6).max(1e-12).ln();
+    if !scale.is_finite() || scale <= 1e-12 {
+        return Err(TemporalInferenceStatus::WeakParameterIdentification);
+    }
+    if options.optimizer_max_iterations == 0 || options.optimizer_tolerance <= 0.0 {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
+    let (log_min, log_max) = process_log_bounds(scale, options)?;
     let rho_upper = (options.rho_max - 1e-8).max(options.rho_min + 1e-8);
     let mut best: Option<(f64, PluginFit)> = None;
+    let mut any_converged = false;
     for initial_rho in [
         options.rho_min,
         (options.rho_min + rho_upper) / 2.0,
@@ -686,7 +1001,8 @@ fn profile_plugin(
     ] {
         let mut rho = initial_rho;
         let mut log_variance = scale.max(1e-12).ln();
-        for _ in 0..3 {
+        let mut previous_score = f64::INFINITY;
+        for _ in 0..options.optimizer_max_iterations {
             rho = golden_section_minimum(options.rho_min, rho_upper, |candidate| {
                 profile_objective(
                     days,
@@ -709,6 +1025,23 @@ fn profile_plugin(
                 )
                 .map_or(f64::INFINITY, |(score, _)| score)
             });
+            let score = profile_objective(
+                days,
+                observations,
+                difference_covariance,
+                rho,
+                log_variance,
+                options,
+            )
+            .map_or(f64::INFINITY, |value| value.0);
+            if score.is_finite()
+                && (previous_score - score).abs()
+                    <= options.optimizer_tolerance * (1.0 + score.abs())
+            {
+                any_converged = true;
+                break;
+            }
+            previous_score = score;
         }
         if let Ok(candidate) = profile_objective(
             days,
@@ -723,10 +1056,32 @@ fn profile_plugin(
             }
         }
     }
-    let (_, fit) = best.ok_or(TemporalInferenceStatus::CovarianceParameterAtBoundary)?;
-    if fit.rho >= rho_upper - 1e-6 || fit.process_variance <= log_min.exp() * 1.000001 {
-        return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
+    if !any_converged {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
     }
+    let (_, candidate) = best.ok_or(TemporalInferenceStatus::CovarianceParameterAtBoundary)?;
+    let (_, mut fit) = profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        candidate.rho,
+        candidate.process_variance.ln(),
+        options,
+    )?;
+    fit.condition_number = condition_number(&fit.covariance);
+    if !fit.condition_number.is_finite() || fit.condition_number > options.condition_limit {
+        return Err(TemporalInferenceStatus::DesignIllConditioned);
+    }
+    if let Some(status) = temporal_parameter_boundary_status(
+        fit.rho,
+        fit.process_variance,
+        [options.rho_min, rho_upper],
+        [log_min.exp(), log_max.exp()],
+        options.optimizer_tolerance * 0.01,
+    ) {
+        return Err(status);
+    }
+    validate_profile_curvature(days, observations, difference_covariance, &fit, options)?;
     Ok(fit)
 }
 
@@ -746,8 +1101,14 @@ fn profile_objective(
         rho,
         options.reference_lag_days,
     )?;
-    let fit = gls_fit(days, observations, &covariance, options.condition_limit)?;
-    let objective = fit.log_determinant + fit.quadratic_form + fit.design_information.ln();
+    let fit = gls_fit(
+        days,
+        observations,
+        &covariance,
+        options.condition_limit,
+        false,
+    )?;
+    let objective = fit.log_determinant + fit.quadratic_form;
     Ok((
         objective,
         PluginFit {
@@ -759,6 +1120,99 @@ fn profile_objective(
             information_variance: fit.information_variance,
         },
     ))
+}
+
+fn process_log_bounds(
+    scale: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<(f64, f64), TemporalInferenceStatus> {
+    if !options.process_variance_min_ratio.is_finite()
+        || !options.process_variance_max_ratio.is_finite()
+        || options.process_variance_min_ratio <= 0.0
+        || options.process_variance_max_ratio <= options.process_variance_min_ratio
+    {
+        return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
+    }
+    Ok((
+        (scale * options.process_variance_min_ratio).max(1e-12).ln(),
+        (scale * options.process_variance_max_ratio).max(1e-12).ln(),
+    ))
+}
+
+fn validate_profile_curvature(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    fit: &PluginFit,
+    options: &TemporalCovarianceOptions,
+) -> Result<(), TemporalInferenceStatus> {
+    if !options.minimum_profile_curvature.is_finite()
+        || options.minimum_profile_curvature <= 0.0
+        || !fit.information_variance.is_finite()
+        || fit.information_variance <= 0.0
+    {
+        return Err(TemporalInferenceStatus::WeakParameterIdentification);
+    }
+    let base = profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        fit.rho,
+        fit.process_variance.ln(),
+        options,
+    )?
+    .0;
+    let rho_step = 1e-3_f64
+        .min((fit.rho - options.rho_min) / 2.0)
+        .min((options.rho_max - fit.rho) / 2.0);
+    let log_step = 1e-2;
+    if rho_step <= 0.0 {
+        return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
+    }
+    let rho_curvature = (profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        fit.rho + rho_step,
+        fit.process_variance.ln(),
+        options,
+    )?
+    .0 + profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        fit.rho - rho_step,
+        fit.process_variance.ln(),
+        options,
+    )?
+    .0 - 2.0 * base)
+        / rho_step.powi(2);
+    let variance_curvature = (profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        fit.rho,
+        fit.process_variance.ln() + log_step,
+        options,
+    )?
+    .0 + profile_objective(
+        days,
+        observations,
+        difference_covariance,
+        fit.rho,
+        fit.process_variance.ln() - log_step,
+        options,
+    )?
+    .0 - 2.0 * base)
+        / log_step.powi(2);
+    if !rho_curvature.is_finite()
+        || !variance_curvature.is_finite()
+        || rho_curvature <= options.minimum_profile_curvature
+        || variance_curvature <= options.minimum_profile_curvature
+    {
+        return Err(TemporalInferenceStatus::WeakParameterIdentification);
+    }
+    Ok(())
 }
 
 fn golden_section_minimum<F>(mut lower: f64, mut upper: f64, mut objective: F) -> f64
@@ -788,11 +1242,159 @@ where
     (lower + upper) / 2.0
 }
 
+fn profile_fixed_slope(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    slope: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<(f64, PluginFit), TemporalInferenceStatus> {
+    let residuals: Vec<f64> = observations
+        .iter()
+        .zip(days)
+        .map(|(value, day)| value - slope * day)
+        .collect();
+    let scale = dot(&residuals, &residuals) / residuals.len().max(1) as f64;
+    if !scale.is_finite() || scale <= 1e-12 {
+        return Err(TemporalInferenceStatus::WeakParameterIdentification);
+    }
+    if options.optimizer_max_iterations == 0 || options.optimizer_tolerance <= 0.0 {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
+    let (log_min, log_max) = process_log_bounds(scale, options)?;
+    let rho_upper = (options.rho_max - 1e-8).max(options.rho_min + 1e-8);
+    let mut best: Option<(f64, PluginFit)> = None;
+    let mut rho = (options.rho_min + rho_upper) / 2.0;
+    let mut log_variance = scale.max(1e-12).ln();
+    let mut converged = false;
+    let mut previous_score = f64::INFINITY;
+    for _ in 0..options.optimizer_max_iterations {
+        rho = golden_section_minimum(options.rho_min, rho_upper, |candidate| {
+            profile_fixed_objective(
+                days,
+                observations,
+                difference_covariance,
+                slope,
+                candidate,
+                log_variance,
+                options,
+            )
+            .map_or(f64::INFINITY, |(score, _)| score)
+        });
+        log_variance = golden_section_minimum(log_min, log_max, |candidate| {
+            profile_fixed_objective(
+                days,
+                observations,
+                difference_covariance,
+                slope,
+                rho,
+                candidate,
+                options,
+            )
+            .map_or(f64::INFINITY, |(score, _)| score)
+        });
+        let score = profile_fixed_objective(
+            days,
+            observations,
+            difference_covariance,
+            slope,
+            rho,
+            log_variance,
+            options,
+        )
+        .map_or(f64::INFINITY, |value| value.0);
+        if score.is_finite()
+            && (previous_score - score).abs() <= options.optimizer_tolerance * (1.0 + score.abs())
+        {
+            converged = true;
+            break;
+        }
+        previous_score = score;
+    }
+    if !converged {
+        return Err(TemporalInferenceStatus::OptimizerNonconverged);
+    }
+    if let Ok(candidate) = profile_fixed_objective(
+        days,
+        observations,
+        difference_covariance,
+        slope,
+        rho,
+        log_variance,
+        options,
+    ) {
+        best = Some(candidate);
+    }
+    let (_, candidate) = best.ok_or(TemporalInferenceStatus::OptimizerNonconverged)?;
+    let candidate = profile_fixed_objective(
+        days,
+        observations,
+        difference_covariance,
+        slope,
+        candidate.rho,
+        candidate.process_variance.ln(),
+        options,
+    )?;
+    if let Some(status) = temporal_parameter_boundary_status(
+        candidate.1.rho,
+        candidate.1.process_variance,
+        [options.rho_min, rho_upper],
+        [log_min.exp(), log_max.exp()],
+        options.optimizer_tolerance * 0.01,
+    ) {
+        return Err(status);
+    }
+    Ok(candidate)
+}
+
+fn profile_fixed_objective(
+    days: &[f64],
+    observations: &[f64],
+    difference_covariance: &[Vec<f64>],
+    slope: f64,
+    rho: f64,
+    log_process_variance: f64,
+    options: &TemporalCovarianceOptions,
+) -> Result<(f64, PluginFit), TemporalInferenceStatus> {
+    let process_variance = log_process_variance.exp();
+    let covariance = total_difference_covariance(
+        difference_covariance,
+        days,
+        process_variance,
+        rho,
+        options.reference_lag_days,
+    )?;
+    let fit = gls_fit(
+        days,
+        observations,
+        &covariance,
+        options.condition_limit,
+        false,
+    )?;
+    let residuals: Vec<f64> = observations
+        .iter()
+        .zip(days)
+        .map(|(value, day)| value - slope * day)
+        .collect();
+    let inverse = invert_positive_definite(&covariance, options.condition_limit, false)?;
+    let objective = fit.log_determinant + dot(&residuals, &mat_vec(&inverse, &residuals));
+    Ok((
+        objective,
+        PluginFit {
+            slope,
+            rho,
+            process_variance,
+            covariance,
+            condition_number: fit.condition_number,
+            information_variance: fit.information_variance,
+        },
+    ))
+}
+
 struct GlsFit {
     slope: f64,
     quadratic_form: f64,
     log_determinant: f64,
-    design_information: f64,
     information_variance: f64,
     condition_number: f64,
 }
@@ -802,10 +1404,11 @@ fn gls_fit(
     observations: &[f64],
     covariance: &[Vec<f64>],
     condition_limit: f64,
+    compute_condition_number: bool,
 ) -> Result<GlsFit, TemporalInferenceStatus> {
     let lower =
         cholesky(covariance).ok_or(TemporalInferenceStatus::TotalCovarianceNotPositiveDefinite)?;
-    let inverse = invert_positive_definite(covariance, condition_limit)?;
+    let inverse = invert_positive_definite(covariance, condition_limit, compute_condition_number)?;
     let transformed_x = mat_vec(&inverse, days);
     let transformed_y = mat_vec(&inverse, observations);
     let information = dot(days, &transformed_x);
@@ -829,9 +1432,12 @@ fn gls_fit(
         slope,
         quadratic_form,
         log_determinant,
-        design_information: information,
         information_variance: 1.0 / information,
-        condition_number: condition_number(covariance),
+        condition_number: if compute_condition_number {
+            condition_number(covariance)
+        } else {
+            f64::NAN
+        },
     })
 }
 
@@ -843,7 +1449,6 @@ fn bootstrap_refit(
 ) -> BootstrapSummary {
     if options.bootstrap_replicates == 0 {
         return BootstrapSummary {
-            mean: f64::NAN,
             interval_68: None,
             interval_90: None,
             interval_95: None,
@@ -855,7 +1460,6 @@ fn bootstrap_refit(
     }
     let Some(cholesky) = cholesky(&plugin.covariance) else {
         return BootstrapSummary {
-            mean: f64::NAN,
             interval_68: None,
             interval_90: None,
             interval_95: None,
@@ -865,9 +1469,9 @@ fn bootstrap_refit(
             minimum_successes: options.bootstrap_minimum_successes,
         };
     };
-    let mut state = options.bootstrap_seed;
     let mut slopes = Vec::with_capacity(options.bootstrap_replicates);
-    for _ in 0..options.bootstrap_replicates {
+    for replicate in 0..options.bootstrap_replicates {
+        let mut state = splitmix64(options.bootstrap_seed ^ replicate as u64);
         let normal = (0..days.len())
             .map(|_| standard_normal(&mut state))
             .collect::<Vec<_>>();
@@ -919,7 +1523,6 @@ fn bootstrap_refit(
         })
     };
     BootstrapSummary {
-        mean,
         interval_68: validation_interval(0.68),
         interval_90: validation_interval(0.90),
         interval_95: validation_interval(0.95),
@@ -937,6 +1540,30 @@ fn validate_dates(days: &[f64]) -> Result<(), TemporalInferenceStatus> {
             .any(|pair| !pair[0].is_finite() || !pair[1].is_finite() || pair[1] <= pair[0])
     {
         return Err(TemporalInferenceStatus::DatesNotStrictlyIncreasing);
+    }
+    Ok(())
+}
+
+fn validate_supported_cadence(
+    days: &[f64],
+    options: &TemporalCovarianceOptions,
+) -> Result<(), TemporalInferenceStatus> {
+    if days.len() < 2
+        || !options.minimum_gap_days.is_finite()
+        || !options.maximum_gap_days.is_finite()
+        || options.minimum_gap_days <= 0.0
+        || options.maximum_gap_days < options.minimum_gap_days
+    {
+        return Err(TemporalInferenceStatus::UnsupportedCadence);
+    }
+    let gaps: Vec<f64> = days.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    if days[0] < options.minimum_gap_days
+        || days[0] > options.maximum_gap_days
+        || gaps.iter().any(|gap| {
+            !gap.is_finite() || *gap < options.minimum_gap_days || *gap > options.maximum_gap_days
+        })
+    {
+        return Err(TemporalInferenceStatus::UnsupportedCadence);
     }
     Ok(())
 }
@@ -960,14 +1587,17 @@ fn validate_square_covariance(matrix: &[Vec<f64>]) -> Result<(), TemporalInferen
 fn invert_positive_definite(
     matrix: &[Vec<f64>],
     condition_limit: f64,
+    check_condition: bool,
 ) -> Result<Vec<Vec<f64>>, TemporalInferenceStatus> {
     validate_square_covariance(matrix)?;
     let Some(cholesky) = cholesky(matrix) else {
         return Err(TemporalInferenceStatus::TotalCovarianceNotPositiveDefinite);
     };
-    let condition = condition_number(matrix);
-    if !condition.is_finite() || condition > condition_limit {
-        return Err(TemporalInferenceStatus::DesignIllConditioned);
+    if check_condition {
+        let condition = condition_number(matrix);
+        if !condition.is_finite() || condition > condition_limit {
+            return Err(TemporalInferenceStatus::DesignIllConditioned);
+        }
     }
     let n = matrix.len();
     let mut inverse = vec![vec![0.0; n]; n];
@@ -1028,52 +1658,21 @@ fn solve_cholesky(lower: &[Vec<f64>], rhs: &[f64]) -> Vec<f64> {
 }
 
 fn condition_number(matrix: &[Vec<f64>]) -> f64 {
-    let eigenvalues = symmetric_eigenvalues(matrix);
+    let dimension = matrix.len();
+    let mut symmetric = Mat::<f64>::zeros(dimension, dimension);
+    for (row, values) in matrix.iter().enumerate() {
+        for (column, value) in values.iter().enumerate() {
+            symmetric.write(row, column, *value);
+        }
+    }
+    let eigenvalues = symmetric.selfadjoint_eigenvalues(Side::Lower);
     let largest = eigenvalues.iter().copied().fold(0.0, f64::max);
     let smallest = eigenvalues
         .iter()
         .copied()
-        .filter(|value| *value > 0.0)
+        .filter(|value| value.is_finite() && *value > 0.0)
         .fold(f64::INFINITY, f64::min);
     largest / smallest
-}
-
-#[allow(clippy::needless_range_loop)]
-fn symmetric_eigenvalues(matrix: &[Vec<f64>]) -> Vec<f64> {
-    let n = matrix.len();
-    let mut work = matrix.to_vec();
-    for _ in 0..(n * n * 5).max(20) {
-        let mut pivot = (0, 0);
-        let mut largest = 0.0;
-        for row in 0..n {
-            for column in (row + 1)..n {
-                if work[row][column].abs() > largest {
-                    largest = work[row][column].abs();
-                    pivot = (row, column);
-                }
-            }
-        }
-        if largest < 1e-14 {
-            break;
-        }
-        let (row, column) = pivot;
-        let angle = 0.5 * (2.0 * work[row][column]).atan2(work[row][row] - work[column][column]);
-        let cosine = angle.cos();
-        let sine = angle.sin();
-        for index in 0..n {
-            let left = work[index][row];
-            let right = work[index][column];
-            work[index][row] = cosine * left - sine * right;
-            work[index][column] = sine * left + cosine * right;
-        }
-        for index in 0..n {
-            let top = work[row][index];
-            let bottom = work[column][index];
-            work[row][index] = cosine * top - sine * bottom;
-            work[column][index] = sine * top + cosine * bottom;
-        }
-    }
-    (0..n).map(|index| work[index][index]).collect()
 }
 
 fn mat_vec(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
@@ -1112,6 +1711,39 @@ fn ols_slope(days: &[f64], observations: &[f64]) -> Result<f64, TemporalInferenc
     Ok(dot(days, observations) / denominator)
 }
 
+fn legacy_intercept_wls(
+    days: &[f64],
+    observations: &[f64],
+    variances: &[f64],
+) -> Result<f64, TemporalInferenceStatus> {
+    if days.len() != observations.len()
+        || days.len() != variances.len()
+        || variances
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(TemporalInferenceStatus::CovarianceNonfinite);
+    }
+    let (sw, swx, swxx, swy, swxy) = days.iter().zip(observations).zip(variances).fold(
+        (0.0, 0.0, 0.0, 0.0, 0.0),
+        |(sw, swx, swxx, swy, swxy), ((day, value), variance)| {
+            let weight = 1.0 / variance;
+            (
+                sw + weight,
+                swx + weight * day,
+                swxx + weight * day * day,
+                swy + weight * value,
+                swxy + weight * day * value,
+            )
+        },
+    );
+    let determinant = sw * swxx - swx * swx;
+    if !determinant.is_finite() || determinant <= 0.0 {
+        return Err(TemporalInferenceStatus::DesignRankDeficient);
+    }
+    Ok((sw * swxy - swx * swy) / determinant)
+}
+
 fn standard_normal(state: &mut u64) -> f64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -1122,4 +1754,11 @@ fn standard_normal(state: &mut u64) -> f64 {
     *state ^= *state << 17;
     let u2 = (*state >> 11) as f64 / (1u64 << 53) as f64;
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }

@@ -12,7 +12,6 @@ pub mod network;
 pub mod reference;
 pub mod spatial_covariance;
 pub mod temporal_covariance;
-pub mod temporal_validation;
 pub mod velocity_model;
 
 pub use inversion::{
@@ -37,11 +36,9 @@ pub use spatial_covariance::{
 pub use temporal_covariance::{
     continuous_time_ar1_correlation, fit_temporal_covariance, raw_adjacent_correlation,
     relative_standard_deviation_shape, subset_origin_anchored_covariance,
+    temporal_covariance_provenance, temporal_parameter_boundary_status,
     total_difference_covariance, RawCorrelationDiagnostics, TemporalCovarianceFit,
-    TemporalCovarianceOptions, TemporalInferenceStatus, ValidationInterval,
-};
-pub use temporal_validation::{
-    preregistered_grid, run_preregistered_validation, TemporalValidationReceipt, ValidationCell,
-    ValidationCellResult, ValidationCellStatus, TEMPORAL_VALIDATION_SCHEMA,
+    TemporalCovarianceOptions, TemporalCovarianceProvenance, TemporalCovarianceProvenanceInputs,
+    TemporalInferenceStatus, ValidationInterval,
 };
 pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};

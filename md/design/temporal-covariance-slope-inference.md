@@ -29,8 +29,9 @@ ill-conditioned design, or insufficient dates fails closed.
 ## Comparators
 
 The pure kernel evaluates origin-anchored OLS, oracle GLS using the generating
-parameters, constrained profile/REML-like plug-in GLS, an adjusted/profile
-comparator, and complete-refit parametric bootstrap. Every bootstrap replicate
+parameters, constrained maximum-likelihood plug-in GLS, a slope
+profile-likelihood comparator using the same unrestricted and fixed-slope ML
+objective, and complete-refit parametric bootstrap. Every bootstrap replicate
 resimulates from the fitted total covariance and refits mean and covariance
 parameters. The public Rust result contains point estimates and validation
 intervals but no corrected inferential standard-error field.
@@ -53,8 +54,17 @@ threshold. The first implementation runs only compact contract fixtures; the
 - Variance ratios: 1, 4, and 16, with alternating and contiguous arrangements.
 - Reference contribution: 0, 0.5, and 2, with only block-PSD target/reference
   joint factors.
-- Methods: OLS, oracle GLS, conditional WLS, scalar effective-N diagnostic,
-  plug-in GLS, adjusted/profile inference, and complete-refit bootstrap.
+- Methods: OLS, oracle GLS, legacy intercept-plus-slope WLS marked
+  non-comparable, lag-one scalar effective-N, plug-in GLS ML, slope-profile
+  likelihood inference, and complete-refit bootstrap.
+
+The release JSONL batch has two explicit paths. `fixed_factor` consumes the
+direct #54 covariance matrix. `production_path` consumes raw-complex target and
+reference series plus same-seed #52 target/reference factors and the #54 direct
+difference factor. A production-path record fails closed on missing inputs,
+factor shape, raw-complex validity, or any seed mismatch; it is not hardcoded
+unavailable. Both paths use the same origin-anchored estimator and never write a
+corrected product.
 
 The per-cell gates are absolute standardized slope bias <= 0.05 empirical SD,
 coverage error <= 0.03/0.02/0.015 at 68/90/95%, >=99% successful supported

@@ -17,6 +17,8 @@ ndarray.workspace = true
 faer.workspace = true
 rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+statrs.workspace = true
 
 [dev-dependencies]
 ndarray-npy = { version = "0.9", default-features = false }
