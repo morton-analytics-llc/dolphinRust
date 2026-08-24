@@ -120,6 +120,18 @@ impl SourceEdge {
             coefficient,
         }
     }
+
+    /// Primitive source identifier carried by this edge.
+    #[must_use]
+    pub const fn source(&self) -> SourceId {
+        self.source
+    }
+
+    /// Bound real source operator.
+    #[must_use]
+    pub const fn coefficient(&self) -> &Array2<f64> {
+        &self.coefficient
+    }
 }
 
 /// One derived node and its local influence operators.

@@ -44,8 +44,8 @@ pub use covariance::{
 };
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use cslc_metadata::{
-    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, CslcBurstMetadata,
-    CslcIdentification, CslcOrbit,
+    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, read_cslc_orbit_type,
+    CslcBurstMetadata, CslcIdentification, CslcOrbit,
 };
 pub use error::{IoError, Result};
 pub use geo::{read_geotransform, transform_bounds, GeoInfo};
