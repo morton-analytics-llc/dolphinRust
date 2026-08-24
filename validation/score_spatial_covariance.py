@@ -4,6 +4,7 @@
 import hashlib
 import itertools
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -13,7 +14,7 @@ NOT_EVALUABLE = "not_evaluable"
 STATUSES = {PASS, FAIL, NOT_EVALUABLE}
 HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 5000
-FROZEN_GENERATOR_SHA256 = "a471bb32f145d63f55962bc7354bc79d4ec05be77a284949491c1c41d5af117d"
+FROZEN_GENERATOR_SHA256 = "8332973bb64ff7fbb3211106fb447c373d5dd6000ed0122df57999cd7e1398fe"
 FROZEN_RESOURCE_IDS = ("tile_256_dates_13", "tile_256_dates_26", "tile_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -42,9 +43,9 @@ FROZEN_THRESHOLDS = {
 }
 RECEIPT_HASHES = {"code_sha256", "fixture_sha256", "operator_sha256", "variance_sha256", "resource_sha256", "generator_protocol_sha256", "config_sha256", "source_model_sha256", "result_sha256", "binary_sha256"}
 RECEIPT_KEYS = {"schema", "schema_version", "preregistration_sha256", "seed_schedule_sha256", "protocol", "binary", "hashes", "cells", "resources"}
-CELL_KEYS = {"cell_id", *DIMENSION_NAMES, "status", "not_evaluable_reason", "attempted_seeds", "emitted_seeds", "top_up_seeds", "target_coordinate", "reference_coordinate", "acquisition_count", "date_axis_sha256", "generator_hash", "truth_hash", "operator_relative_error", "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error", "psd_min_eigenvalue", "coverage_95", "emission_rate", "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash", "attempts"}
-ATTEMPT_KEYS = {"seed_index", "seed_sha256", "status", "emitted", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_coordinate", "reference_coordinate", "operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width"}
-RESOURCE_KEYS = {"resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "hardware_class", "rss_sampler", "sampling_interval_ms", "tool_versions", "growth_observation"}
+CELL_KEYS = {"cell_id", *DIMENSION_NAMES, "status", "not_evaluable_reason", "attempted_seeds", "emitted_seeds", "top_up_seeds", "target_coordinate", "reference_coordinate", "acquisition_count", "date_axis_sha256", "realized_overlap_percent", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "generator_hash", "truth_hash", "operator_relative_error", "contrast_variance_reference", "variance_evaluable", "contrast_variance_relative_error", "psd_min_eigenvalue", "coverage_95", "emission_rate", "operator_hash", "variance_hash", "psd_hash", "coverage_hash", "emission_hash", "attempts"}
+ATTEMPT_KEYS = {"seed_index", "seed_sha256", "status", "emitted", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_coordinate", "reference_coordinate", "realized_overlap_percent", "signed_cross_influence", "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width"}
+RESOURCE_KEYS = {"resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs", "measured_repetitions", "tool_versions", "growth_observation", "growth_regression", "acceptance"}
 
 
 class SchemaError(ValueError):
@@ -84,6 +85,76 @@ def _dimension_values(preregistration: Mapping[str, Any], name: str) -> Sequence
     return tuple(item.get("id") for item in values if isinstance(item, dict))
 
 
+def _planner_rows(num_slc: int, ministack_size: int, max_num_compressed: int) -> list[dict[str, int]]:
+    rows = []
+    for block_id, real_start in enumerate(range(0, num_slc, ministack_size)):
+        rows.append({"block_id": block_id, "num_compressed": min(block_id, max_num_compressed), "real_start": real_start, "num_real": min(ministack_size, num_slc - real_start)})
+    return rows
+
+
+def _validate_executable_generator(preregistration: Mapping[str, Any], errors: List[str]) -> None:
+    generator = preregistration.get("generator")
+    if not isinstance(generator, dict):
+        return
+    raw = generator.get("raw_proper_complex", {})
+    if raw.get("covariance_shape") != "N_by_N_per_topology" or "C_ab" not in raw.get("covariance_formula", "") or raw.get("sampler") != "Z=mu+L*(U+iV)/sqrt(2), U,V iid N(0,I), C=L L^H lower_hermitian_cholesky":
+        errors.append("raw generator must define an exact N-by-N proper-complex covariance and sampler")
+    source = generator.get("source_centered_empirical", {})
+    if source.get("covariance_definition") != "E[Z Z*]/n" or source.get("mean") != "zero; no sample-mean subtraction" or source.get("floor_application") != "after_zero_mean_covariance_and_shrinkage":
+        errors.append("source model must be zero-mean E[Z Z*]/n with post-shrinkage floor")
+    acquisition = generator.get("acquisition", {})
+    planner = acquisition.get("planner", {})
+    if planner != {"crate": "dolphin-stack", "planner": "MiniStackPlanner::plan", "ministack_size": 5, "max_num_compressed": 2, "output_reference_idx": 0, "compressed_slc_plan": "always_first", "partial_policy": "min(num_slc-start,ministack_size)"}:
+        errors.append("planner identity/parameters are not frozen to MiniStackPlanner")
+    for topology, spec in acquisition.get("topologies", {}).items():
+        expected = _planner_rows(spec.get("acquisition_count", 0), spec.get("ministack_size", 0), spec.get("max_num_compressed", 0))
+        if spec.get("expected_blocks") != expected or len(spec.get("date_axis", [])) != spec.get("acquisition_count", -1):
+            errors.append("topology %s does not reproduce the frozen MiniStackPlanner output" % topology)
+        dates = spec.get("date_axis", [])
+        if any(dates[index] >= dates[index + 1] for index in range(len(dates) - 1)):
+            errors.append("topology %s date axis is not strictly ascending" % topology)
+        try:
+            parsed_dates = [date.fromisoformat(value) for value in dates]
+            if parsed_dates and parsed_dates[0].isoformat() != acquisition.get("date_origin"):
+                errors.append("topology %s date axis has the wrong origin" % topology)
+            if any((parsed_dates[index + 1] - parsed_dates[index]).days != acquisition.get("cadence_days") for index in range(len(parsed_dates) - 1)):
+                errors.append("topology %s date axis does not use the frozen cadence" % topology)
+        except (TypeError, ValueError):
+            errors.append("topology %s date axis contains a non-ISO date" % topology)
+        if spec.get("partial_tail_count") != (expected[-1]["num_real"] if expected and expected[-1]["num_real"] < spec.get("ministack_size", 0) else 0):
+            errors.append("topology %s partial-tail count is not derived from the planner" % topology)
+    coordinates = generator.get("coordinates", {})
+    expected_window_stride = {"%s|%s" % (hw, stride) for hw in FROZEN_DIMENSION_IDS["half_window"] for stride in FROZEN_DIMENSION_IDS["stride"]}
+    if set(coordinates.get("window_stride", {})) != expected_window_stride:
+        errors.append("coordinates must provide every half-window/stride realization")
+    for key, spec in coordinates.get("window_stride", {}).items():
+        shape = spec.get("support_shape", [])
+        if shape != [2 * spec.get("half_window", [0, 0])[0] + 1, 2 * spec.get("half_window", [0, 0])[1] + 1]:
+            errors.append("coordinate %s support shape does not match production half-window" % key)
+        if set(spec.get("reference_delta_by_pair_geometry", {})) != set(PAIR_OVERLAP):
+            errors.append("coordinate %s is missing a pair-geometry realization" % key)
+    overlap_fixture = coordinates.get("overlap_fixture", {})
+    target_units = set(overlap_fixture.get("target_units", []))
+    if target_units != {0, 1, 2, 3}:
+        errors.append("overlap fixture target support is not the frozen four-unit support")
+    if set(overlap_fixture.get("reference_units_by_geometry", {})) != set(PAIR_OVERLAP):
+        errors.append("overlap fixture is missing a pair-geometry realization")
+    for geometry, units in overlap_fixture.get("reference_units_by_geometry", {}).items():
+        if round(100 * len(target_units.intersection(units)) / 4) != PAIR_OVERLAP.get(geometry, -1):
+            errors.append("overlap fixture does not realize declared percentage for %s" % geometry)
+    neighbors = generator.get("neighbor_generation", {})
+    if neighbors.get("full_half_window") is not True or neighbors.get("offset_order") != "neighbor_grid_row_major_from_clamped_start" or neighbors.get("glrt", {}).get("alpha") != 0.001 or neighbors.get("ks", {}).get("alpha") != 0.001 or neighbors.get("fixed_support_reuse") is not True:
+        errors.append("GLRT/KS support contract does not match production algorithms")
+    if generator.get("effective_looks", {}).get("application") != "source_factor_divided_by_sqrt_fraction" or generator.get("effective_looks", {}).get("recompute_per_cell") is not True:
+        errors.append("effective-look application or support-union recomputation is not frozen")
+    supported = generator.get("supported", {})
+    if supported.get("not_evaluable_if") != ["tied_eigenvalue"] or "missing_attempt_record" not in supported.get("receipt_failure_if", []):
+        errors.append("missing attempts must fail receipt validation; only tied eigenvalue is not-evaluable")
+    sampling = preregistration.get("resource_sampling", {})
+    if not all(key in sampling for key in ("os", "rss_field", "warmup_runs", "measured_repetitions", "growth_regression", "acceptance")):
+        errors.append("resource sampling must freeze OS, RSS source, repetitions, regression, and acceptance")
+
+
 def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
     errors: List[str] = []
     if preregistration.get("schema") != "dolphinrust.spatial_covariance.preregistration":
@@ -115,6 +186,7 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         errors.append("generator parameters/protocol differ from the frozen v2 generator")
     if not isinstance(preregistration.get("resource_sampling"), dict):
         errors.append("resource_sampling is required")
+    _validate_executable_generator(preregistration, errors)
     if errors:
         raise SchemaError("; ".join(errors))
 
@@ -136,13 +208,43 @@ def _require_hashes(value: Mapping[str, Any], fields: Iterable[str], prefix: str
 
 def _expected_coordinates(preregistration: Mapping[str, Any], cell: Mapping[str, Any]) -> tuple[list[int], list[int]]:
     coordinates = preregistration["generator"]["coordinates"]
-    target = coordinates["target_by_position"].get(cell.get("position"), [-1, -1])
-    delta = coordinates["reference_delta_by_pair_geometry"].get(cell.get("pair_geometry"), [0, 0])
+    key = "%s|%s" % (cell.get("half_window"), cell.get("stride"))
+    window_stride = coordinates["window_stride"].get(key, {})
+    target = window_stride.get("target_by_position", {}).get(cell.get("position"), [-1, -1])
+    delta = window_stride.get("reference_delta_by_pair_geometry", {}).get(cell.get("pair_geometry"), [0, 0])
     return target, [target[0] + delta[0], target[1] + delta[1]]
 
 
+PAIR_OVERLAP = {
+    "coincident": 100,
+    "shared_75_positive": 75,
+    "shared_75_negative": 75,
+    "shared_50_positive": 50,
+    "shared_50_negative": 50,
+    "shared_25_positive": 25,
+    "shared_25_negative": 25,
+    "disjoint_immediate": 0,
+    "disjoint_after_depth_1": 0,
+    "disjoint_after_depth_2": 0,
+    "disjoint_after_depth_4": 0,
+}
+PAIR_SIGN = {
+    "coincident": "zero",
+    "shared_75_positive": "positive",
+    "shared_75_negative": "negative",
+    "shared_50_positive": "positive",
+    "shared_50_negative": "negative",
+    "shared_25_positive": "positive",
+    "shared_25_negative": "negative",
+    "disjoint_immediate": "none",
+    "disjoint_after_depth_1": "none",
+    "disjoint_after_depth_2": "none",
+    "disjoint_after_depth_4": "none",
+}
+
+
 def _expected_date_axis(preregistration: Mapping[str, Any], topology: str) -> list[str]:
-    return preregistration["generator"]["acquisition"]["topologies"][topology]["date_axis"]
+    return preregistration["generator"]["acquisition"]["topologies"].get(topology, {}).get("date_axis", [])
 
 
 def _expected_seed_hash(preregistration: Mapping[str, Any], cell_id: str, index: int) -> str:
@@ -160,6 +262,8 @@ def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistratio
     expected_generator = sha256_json(preregistration["generator"])
     expected_config = sha256_json(preregistration["generator"])
     expected_source_model = sha256_json(preregistration["generator"]["source_centered_empirical"])
+    expected_overlap = PAIR_OVERLAP.get(cell.get("pair_geometry"), -1)
+    expected_sign = PAIR_SIGN.get(cell.get("pair_geometry"), "invalid")
     seen = set()
     emitted = 0
     for attempt in attempts:
@@ -188,7 +292,17 @@ def _validate_attempts(cell: Mapping[str, Any], expected_id: str, preregistratio
             errors.append("cell %s has a configuration/source-model identity mismatch" % expected_id)
         if attempt.get("target_coordinate") != expected_target or attempt.get("reference_coordinate") != expected_reference:
             errors.append("cell %s has a coordinate identity mismatch" % expected_id)
-        for metric in ("operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "interval_score", "interval_width"):
+        if attempt.get("realized_overlap_percent") != expected_overlap or attempt.get("signed_influence_sign") != expected_sign:
+            errors.append("cell %s has a realized overlap/sign mismatch" % expected_id)
+        if not _number(attempt.get("effective_looks_fraction")) or attempt["effective_looks_fraction"] <= 0 or attempt.get("effective_looks_application") != "source_factor_divided_by_sqrt_fraction":
+            errors.append("cell %s has an invalid effective-look realization" % expected_id)
+        if expected_sign in {"positive", "negative"} and (not _number(attempt.get("signed_cross_influence")) or (attempt["signed_cross_influence"] > 0) != (expected_sign == "positive")):
+            errors.append("cell %s has a signed cross-influence mismatch" % expected_id)
+        if expected_sign == "zero" and attempt.get("signed_cross_influence") != 0.0:
+            errors.append("cell %s coincident influence must be exactly zero" % expected_id)
+        if expected_sign == "none" and attempt.get("signed_cross_influence") != 0.0:
+            errors.append("cell %s disjoint influence must be exactly zero" % expected_id)
+        for metric in ("operator_relative_error", "contrast_variance_relative_error", "psd_min_eigenvalue", "interval_score", "interval_width", "signed_cross_influence"):
             if not _number(attempt.get(metric)):
                 errors.append("cell %s attempt %s is missing %s" % (expected_id, index, metric))
         if not isinstance(attempt.get("covered_95"), bool):
@@ -221,6 +335,10 @@ def _validate_cell(cell: Any, expected_id: str, preregistration: Mapping[str, An
     expected_target, expected_reference = _expected_coordinates(preregistration, cell)
     if cell.get("target_coordinate") != expected_target or cell.get("reference_coordinate") != expected_reference:
         errors.append("cell %s coordinates do not match frozen position/geometry mapping" % expected_id)
+    if cell.get("realized_overlap_percent") != PAIR_OVERLAP.get(cell.get("pair_geometry")) or cell.get("signed_influence_sign") != PAIR_SIGN.get(cell.get("pair_geometry")):
+        errors.append("cell %s realized overlap/sign does not match frozen geometry" % expected_id)
+    if not _number(cell.get("effective_looks_fraction")) or cell["effective_looks_fraction"] <= 0 or cell.get("effective_looks_application") != "source_factor_divided_by_sqrt_fraction":
+        errors.append("cell %s effective-look fraction/application is missing or invalid" % expected_id)
     topology = preregistration["generator"]["acquisition"]["topologies"].get(cell.get("block_topology"), {})
     if cell.get("acquisition_count") != topology.get("acquisition_count") or cell.get("date_axis_sha256") != sha256_json(topology.get("date_axis")):
         errors.append("cell %s acquisition/date-axis identity does not match topology" % expected_id)
@@ -276,7 +394,7 @@ def _validate_resources(receipt: Mapping[str, Any], preregistration: Mapping[str
             errors.append("resource %s has unknown or missing fields" % resource_id)
         if item.get("status") not in STATUSES or not _number(item.get("rss_bytes")) or item.get("rss_bytes", 0) > preregistration["thresholds"]["resource_rss_bytes_max"]:
             errors.append("resource %s has invalid RSS/status" % resource_id)
-        if item.get("growth_class") != "linear" or item.get("hardware_class") != sampling["hardware_class"] or item.get("rss_sampler") != sampling["rss_sampler"] or item.get("sampling_interval_ms") != sampling["sampling_interval_ms"] or item.get("tool_versions") != sampling["tool_versions"]:
+        if item.get("growth_class") != "linear" or any(item.get(field) != sampling[field] for field in ("os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs", "measured_repetitions", "tool_versions", "growth_regression", "acceptance")):
             errors.append("resource %s does not match frozen sampling provenance" % resource_id)
         _require_hashes(item, ("resource_hash", "config_hash", "binary_hash"), "resource %s" % resource_id, errors)
         hashes = receipt.get("hashes")

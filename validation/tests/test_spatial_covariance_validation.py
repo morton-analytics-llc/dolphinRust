@@ -36,6 +36,60 @@ class SpatialCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(self.preregistration["generator"]["binary"]["input_schema"], "dolphinrust.spatial-covariance.attempt/2")
         self.assertTrue(self.preregistration["generator"]["binary"]["one_input_one_output"])
 
+    def test_generator_is_dimensioned_and_mirrors_ministack_planner(self):
+        generator = self.preregistration["generator"]
+        raw = generator["raw_proper_complex"]
+        self.assertEqual(raw["covariance_shape"], "N_by_N_per_topology")
+        self.assertIn("C_ab", raw["covariance_formula"])
+        self.assertIn("lower_hermitian_cholesky", raw["sampler"])
+        self.assertEqual(raw["hermitian_rule"], "C_ba=conjugate(C_ab)")
+        self.assertEqual(raw["spatial_correlation"]["distance_scale_pixels"], 1.5)
+        self.assertEqual(generator["source_centered_empirical"]["mean"], "zero; no sample-mean subtraction")
+        planner = generator["acquisition"]["planner"]
+        for topology in generator["acquisition"]["topologies"].values():
+            starts = list(range(0, topology["acquisition_count"], planner["ministack_size"]))
+            expected = [
+                {"block_id": block, "num_compressed": min(block, topology["max_num_compressed"]), "real_start": start, "num_real": min(planner["ministack_size"], topology["acquisition_count"] - start)}
+                for block, start in enumerate(starts)
+            ]
+            self.assertEqual(topology["expected_blocks"], expected)
+            self.assertEqual(len(topology["date_axis"]), topology["acquisition_count"])
+
+    def test_every_window_stride_has_realized_coordinates_and_exact_overlap_contract(self):
+        coordinates = self.preregistration["generator"]["coordinates"]
+        # The labels, rather than a single fallback delta, identify every production support.
+        expected = {f"{item['id']}|{stride['id']}" for item in self.preregistration["dimensions"]["half_window"] for stride in self.preregistration["dimensions"]["stride"]}
+        self.assertEqual(set(coordinates["window_stride"]), expected)
+        self.assertEqual(coordinates["overlap_counts"], {"shared_75": 3, "shared_50": 2, "shared_25": 1})
+        self.assertEqual(set(coordinates["overlap_fixture"]["reference_units_by_geometry"]), {item["id"] for item in self.preregistration["dimensions"]["pair_geometry"]})
+        for spec in coordinates["window_stride"].values():
+            self.assertEqual(spec["support_shape"], [2 * spec["half_window"][0] + 1, 2 * spec["half_window"][1] + 1])
+            self.assertEqual(set(spec["reference_delta_by_pair_geometry"]), set(item["id"] for item in self.preregistration["dimensions"]["pair_geometry"]))
+
+    def test_production_support_and_status_rules_are_fail_closed(self):
+        generator = self.preregistration["generator"]
+        self.assertTrue(generator["neighbor_generation"]["full_half_window"])
+        self.assertEqual(generator["neighbor_generation"]["offset_order"], "neighbor_grid_row_major_from_clamped_start")
+        self.assertEqual(generator["neighbor_generation"]["glrt"]["alpha"], 0.001)
+        self.assertEqual(generator["neighbor_generation"]["ks"]["alpha"], 0.001)
+        self.assertEqual(generator["supported"]["not_evaluable_if"], ["tied_eigenvalue"])
+        self.assertIn("missing_attempt_record", generator["supported"]["receipt_failure_if"])
+        changed = copy.deepcopy(self.preregistration)
+        changed["generator"]["supported"]["not_evaluable_if"].append("missing_attempt_record")
+        with self.assertRaises(SchemaError):
+            validate_preregistration(changed)
+
+    def test_cell_overlap_and_sign_drift_is_rejected(self):
+        receipt = self._receipt_shell()
+        cell_id = expected_cell_ids(self.preregistration)[0]
+        labels = cell_id.split("|")
+        cell = dict(zip(("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process"), labels))
+        cell.update({"cell_id": cell_id, "status": NOT_EVALUABLE, "not_evaluable_reason": "test-only", "attempted_seeds": 5000, "emitted_seeds": 0, "top_up_seeds": 0, "realized_overlap_percent": 25, "signed_influence_sign": "negative", "attempts": []})
+        receipt["cells"] = [cell]
+        report = score_receipt(self.preregistration, receipt)
+        self.assertEqual(report["status"], FAIL)
+        self.assertTrue(any("realized overlap/sign" in error for error in report["errors"]))
+
     def test_frozen_threshold_and_generator_changes_are_rejected(self):
         changed = copy.deepcopy(self.preregistration)
         changed["thresholds"]["coverage_absolute_error_max"] = 0.03
