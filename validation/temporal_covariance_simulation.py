@@ -32,18 +32,24 @@ def cells(preregistration: dict) -> list[dict]:
                     for variance_ratio in preregistration["variance_ratios"]:
                         for arrangement in preregistration["variance_arrangements"]:
                             for reference_ratio in preregistration["reference_contribution_ratios"]:
-                                result.append({
-                                    "date_count": count,
-                                    "rho_at_12_days": rho,
-                                    "cadence": cadence["name"],
-                                    "missingness": missingness,
-                                    "variance_ratio": variance_ratio,
-                                    "variance_arrangement": arrangement,
-                                    "reference_contribution_ratio": reference_ratio,
-                                })
+                                for reference in preregistration["reference_contexts"]:
+                                    result.append({
+                                        "date_count": count,
+                                        "rho_at_12_days": rho,
+                                        "cadence": cadence["name"],
+                                        "missingness": missingness,
+                                        "variance_ratio": variance_ratio,
+                                        "variance_arrangement": arrangement,
+                                        "reference_contribution_ratio": reference_ratio,
+                                        "reference_context": reference["name"],
+                                        "overlap_fraction": reference["overlap_fraction"],
+                                        "distance_pixels": reference["distance_pixels"],
+                                        "sequential_depth": reference["sequential_depth"],
+                                        "approximation": reference["approximation"],
+                                    })
     for index, cell in enumerate(result):
         cell["cell_index"] = index
-        cell["cell_id"] = "c%04d-%02d-%s-%s-v%s-%s-r%s" % (
+        cell["cell_id"] = "c%05d-%02d-%s-%s-v%s-%s-r%s-%s" % (
             index,
             cell["date_count"],
             cell["cadence"].replace("_", "-"),
@@ -51,8 +57,15 @@ def cells(preregistration: dict) -> list[dict]:
             cell["variance_ratio"],
             cell["variance_arrangement"][:3],
             cell["reference_contribution_ratio"],
+            cell["reference_context"].replace("_", "-"),
         )
     return result
+
+
+def unsupported_cells(preregistration: dict) -> list[dict]:
+    """Frozen fail-closed cells excluded from promotion denominators."""
+    return [dict(cell, cell_index=index, cell_id=f"u{index:02d}-{cell['stratum']}")
+            for index, cell in enumerate(preregistration["unsupported_strata"])]
 
 
 def cell_hash(frozen_cells: list[dict]) -> str:
@@ -93,6 +106,18 @@ def normal_noise(state: int) -> tuple[int, float]:
     state = splitmix64(state)
     u2 = (state >> 11) / float(1 << 53)
     return state, math.sqrt(-2.0 * math.log(u1)) * math.cos(math.tau * u2)
+
+
+def stationary_ar_path(days: list[float], rho: float, state: int) -> tuple[int, list[float]]:
+    """Draw the exact stationary irregular continuous-time AR(1) truth."""
+    state, current = normal_noise(state)
+    values = [current]
+    for left, right in zip(days, days[1:]):
+        state, innovation = normal_noise(state)
+        phi = rho ** ((right - left) / 12.0)
+        current = phi * current + math.sqrt(max(0.0, 1.0 - phi * phi)) * innovation
+        values.append(current)
+    return state, values
 
 
 def missing_indices(cell: dict, seed: int, scheduled_count: int) -> set[int]:
@@ -139,17 +164,12 @@ def request_for(cell: dict, seed: int, preregistration: dict, execution_path: st
         diagonal.append(0.01 * (scale + cell["reference_contribution_ratio"]))
     geometric_mean = math.exp(sum(math.log(value) for value in diagonal[1:]) / (len(diagonal) - 1))
     process_variance = 0.04
-    ar_state = 0.0
     state = seed
+    state, ar_path = stationary_ar_path(days, cell["rho_at_12_days"], state)
     for index, day in enumerate(days):
-        state, innovation = normal_noise(state)
-        rho = cell["rho_at_12_days"]
-        gap = 12.0 if index == 0 else days[index] - days[index - 1]
-        phi = rho ** (gap / 12.0)
-        ar_state = phi * ar_state + math.sqrt(max(0.0, 1.0 - phi * phi)) * innovation
         state, measurement = normal_noise(state)
         shape = math.sqrt(diagonal[index] / geometric_mean)
-        value = 0.01 * day + math.sqrt(process_variance) * shape * ar_state
+        value = 0.01 * day + math.sqrt(process_variance) * shape * ar_path[index]
         value += math.sqrt(diagonal[index]) * measurement
         observations.append(0.0 if index == 0 else (None if index in missing else value))
     covariance = [[0.0 for _ in days] for _ in days]
@@ -173,8 +193,8 @@ def request_for(cell: dict, seed: int, preregistration: dict, execution_path: st
         "process_variance_min_ratio": preregistration["optimizer"]["process_variance_min_ratio"],
         "process_variance_max_ratio": preregistration["optimizer"]["process_variance_max_ratio"],
         "minimum_profile_curvature": preregistration["optimizer"]["minimum_profile_curvature"],
-        "minimum_gap_days": preregistration["supported_cell_predicate"]["minimum_gap_days"],
-        "maximum_gap_days": preregistration["supported_cell_predicate"]["maximum_gap_days"],
+        "minimum_gap_days": preregistration["supported_cell_predicate"]["scheduled_acquisition_minimum_gap_days"],
+        "maximum_gap_days": preregistration["supported_cell_predicate"]["scheduled_acquisition_maximum_gap_days"],
     }
     request = {"execution_path": execution_path, "cell_id": cell["cell_id"],
                "cell_index": cell["cell_index"], "seed": seed, "days": days,
@@ -184,41 +204,41 @@ def request_for(cell: dict, seed: int, preregistration: dict, execution_path: st
                                    "difference_covariance": covariance}
     else:
         values = [0.0 if value is None else value for value in observations]
-        factor = [[0.0 for _ in days] for _ in days]
-        issue52_factor = [[0.0 for _ in days] for _ in days]
+        overlap = cell["overlap_fraction"]
+        noise = [1e-12]
         for index in range(1, len(days)):
-            factor[index][index] = math.sqrt(diagonal[index])
-            issue52_factor[index][index] = math.sqrt(diagonal[index] / 2.0)
+            denominator = 2.0 * (1.0 - overlap * math.cos(values[index]))
+            noise.append(math.sqrt(diagonal[index] / denominator))
         request["production_path"] = {
             "raw_complex_seed": seed, "issue52_seed": seed, "issue54_seed": seed,
             "target_raw_complex": [[math.cos(value), math.sin(value)] for value in values],
             "reference_raw_complex": [[1.0, 0.0] for _ in values],
+            "complex_noise_standard_deviation": noise,
             "validity": [value is not None for value in observations],
-            "issue52_target_factor": issue52_factor,
-            "issue52_reference_factor": issue52_factor,
-            "issue54_difference_factor": factor,
-            "provenance": {
-                "issue52_receipt_sha256": "52" * 32,
-                "issue54_receipt_sha256": "54" * 32,
-                "reference_geometry": "synthetic_same_frame_reference",
-                "reference_window": "synthetic_window_0",
-                "overlap_fraction": 1.0,
-                "distance_pixels": 10.0,
-                "scope": "synthetic_validation",
-                "approximation": None,
-                "validation_receipt_sha256": "53" * 32,
+            "reference": {
+                "geometry_id": "synthetic_same_frame_reference",
+                "window_id": cell["reference_context"],
+                "overlap_fraction": overlap,
+                "distance_pixels": cell["distance_pixels"],
+                "sequential_depth": cell["sequential_depth"],
+                "approximation": cell["approximation"],
             },
+            "scope": "synthetic_validation",
+            "validation_receipt_sha256": "53" * 32,
+            "selected_method": "complete_refit_bootstrap",
         }
     return request
 
 
-def score_records(records: list[dict]) -> dict:
+def score_records(records: list[dict], preregistration: dict) -> dict:
     truth = 0.01 * 365.25
     method_fields = {
         "ols": "ols", "oracle_gls": "oracle_gls",
         "legacy_intercept_slope_wls_non_comparable": "conditional_wls",
         "lag_one_scalar_effective_n": "scalar_effective_n",
-        "plugin_gls_ml": "plugin_gls", "slope_profile_likelihood": "adjusted_profile",
+        "plugin_gls_reml": "plugin_gls",
+        "reml_covariance_parameter_adjusted_scalar": "adjusted_scalar",
+        "slope_profile_likelihood_ml": "adjusted_profile",
         "complete_refit_bootstrap": "complete_refit_bootstrap",
     }
     scores = {}
@@ -247,9 +267,65 @@ def score_records(records: list[dict]) -> dict:
                 row[f"width_{label}"] = upper - lower
                 row[f"interval_score_{label}"] = upper - lower + penalty
             rows.append(row)
-        scores[method] = {"attempted": len(records), "scored": len(rows), "rows": rows}
-    return {"schema": "coverage_bias_interval_score/1", "truth_slope_per_year": truth,
-            "methods": scores}
+        attempted = len(records)
+        biases = [row["bias"] for row in rows]
+        bias_mean = sum(biases) / len(biases) if biases else None
+        bias_sd = None
+        if len(biases) > 1:
+            bias_sd = math.sqrt(sum((value - bias_mean) ** 2 for value in biases)
+                                / (len(biases) - 1))
+        aggregate = {
+            "attempted": attempted,
+            "scored": len(rows),
+            "failed": attempted - len(rows),
+            "emission_fraction": len(rows) / attempted if attempted else 0.0,
+            "mean_bias": bias_mean,
+            "standardized_bias": (abs(bias_mean) / bias_sd
+                                  if bias_sd and bias_sd > 0.0 else None),
+        }
+        gates = {
+            "emission": aggregate["emission_fraction"]
+                        >= preregistration["thresholds"]["minimum_successful_emission_fraction"],
+            "standardized_bias": aggregate["standardized_bias"] is not None
+                and aggregate["standardized_bias"]
+                <= preregistration["thresholds"]["standardized_bias"],
+        }
+        for label in ("68", "90", "95"):
+            covered = [row[f"coverage_{label}"] for row in rows
+                       if row[f"coverage_{label}"] is not None]
+            widths = [row[f"width_{label}"] for row in rows
+                      if row[f"width_{label}"] is not None]
+            interval_scores = [row[f"interval_score_{label}"] for row in rows
+                               if row[f"interval_score_{label}"] is not None]
+            coverage = sum(covered) / len(covered) if covered else None
+            aggregate[f"coverage_{label}"] = coverage
+            aggregate[f"mean_width_{label}"] = (sum(widths) / len(widths)
+                                                   if widths else None)
+            aggregate[f"mean_interval_score_{label}"] = (
+                sum(interval_scores) / len(interval_scores) if interval_scores else None)
+            nominal = {"68": 0.68, "90": 0.90, "95": 0.95}[label]
+            gates[f"coverage_{label}"] = coverage is not None and abs(coverage - nominal) <= (
+                preregistration["thresholds"]["coverage"][f"0.{label}"])
+        scores[method] = {"attempted": attempted, "scored": len(rows), "rows": rows,
+                          "aggregate": aggregate, "gates": gates,
+                          "passes_all_gates": all(gates.values())}
+    oracle = scores["oracle_gls"]["aggregate"]
+    oracle_score = oracle["mean_interval_score_95"]
+    oracle_width = oracle["mean_width_95"]
+    for result in scores.values():
+        aggregate = result["aggregate"]
+        score = aggregate["mean_interval_score_95"]
+        width = aggregate["mean_width_95"]
+        result["gates"]["proper_score"] = (score is not None and oracle_score is not None
+            and score <= oracle_score * (1.0 + preregistration["thresholds"]["proper_score"]))
+        result["gates"]["interval_width"] = (width is not None and oracle_width is not None
+            and width <= oracle_width * preregistration["thresholds"]["maximum_interval_width_ratio"])
+        result["passes_all_gates"] = all(result["gates"].values())
+    promotion_methods = preregistration["promotion_methods"]
+    return {"schema": "coverage_bias_interval_score/2", "truth_slope_per_year": truth,
+            "methods": scores, "promotion_methods": promotion_methods,
+            "all_methods_pass": all(scores[name]["passes_all_gates"]
+                                     for name in promotion_methods)}
 
 
 def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
@@ -278,8 +354,25 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         with input_path.open() as input_handle, output_path.open("w") as output_handle:
             subprocess.run(command, cwd=Path(__file__).parents[1], stdin=input_handle, stdout=output_handle, check=True)
         records = [json.loads(line) for line in output_path.read_text().splitlines() if line]
+    scores = score_records(records, preregistration)
+    complete_execution = limit is None and len(records) == len(requests)
+    result_payload = json.dumps({"records": records, "scores": scores},
+                                separators=(",", ":"), sort_keys=True).encode()
+    total_wall = sum(record["resource"]["wall_micros"] for record in records)
+    peak_rss = max((max(record["resource"]["resident_set_bytes_before"],
+                        record["resource"]["resident_set_bytes_after"])
+                    for record in records), default=0)
+    projected_full_minutes = ((total_wall / len(records)) * len(requests) / 60_000_000
+                              if records else float("inf"))
+    resource_gates = {
+        "rss": peak_rss <= preregistration["resource_limits"]["rss_limit_bytes"],
+        "artifact_size": len(result_payload)
+            <= preregistration["resource_limits"]["artifact_size_limit_bytes"],
+        "projected_wall": projected_full_minutes
+            <= preregistration["resource_limits"]["projected_full_scene_minutes"],
+    }
     return {
-        "schema": "dolphinrust-temporal-covariance-simulation/3",
+        "schema": "dolphinrust-temporal-covariance-simulation/4",
         "preregistration_schema": preregistration["schema"],
         "pre_outcome_status": preregistration["status"],
         "supported_cell_sha256": preregistration["supported_cell_sha256"],
@@ -287,12 +380,26 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         "emitted_cells": sum(record["emitted"] for record in records),
         "failed_cells": sum(record["failed"] for record in records),
         "skipped_contract_cells": len(requests) - len(records), "seed_count": seed_count,
+        "unsupported_cell_count": len(unsupported_cells(preregistration)),
+        "unsupported_cell_sha256": preregistration["unsupported_cell_sha256"],
+        "unsupported_cells": unsupported_cells(preregistration),
         "methods": preregistration["methods"], "records": records,
-        "scores": score_records(records),
+        "scores": scores,
         "execution_paths": preregistration["execution_paths"],
         "corrected_inferential_sigma_emission": False,
-        "promotion_status": "blocked_pending_synthetic_field_review_and_manifest",
-        "resource_fields": preregistration["resource_limits"],
+        "execution_complete": complete_execution,
+        "result_records_sha256": hashlib.sha256(result_payload).hexdigest(),
+        "result_records_bytes": len(result_payload),
+        "promotion_eligible": complete_execution and scores["all_methods_pass"]
+                              and all(resource_gates.values()),
+        "promotion_status": ("eligible_for_external_field_review" if complete_execution
+                             and scores["all_methods_pass"] and all(resource_gates.values()) else
+                             "blocked_pending_complete_passing_synthetic_execution"),
+        "resource": {"total_wall_micros": total_wall, "peak_resident_set_bytes": peak_rss,
+                     "result_artifact_bytes": len(result_payload),
+                     "projected_full_minutes": projected_full_minutes},
+        "resource_gates": resource_gates,
+        "resource_limits": preregistration["resource_limits"],
     }
 
 

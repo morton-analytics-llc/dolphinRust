@@ -37,8 +37,9 @@ pub use temporal_covariance::{
     continuous_time_ar1_correlation, fit_temporal_covariance, raw_adjacent_correlation,
     relative_standard_deviation_shape, subset_origin_anchored_covariance,
     temporal_covariance_provenance, temporal_parameter_boundary_status,
-    total_difference_covariance, RawCorrelationDiagnostics, TemporalCovarianceFit,
-    TemporalCovarianceOptions, TemporalCovarianceProvenance, TemporalCovarianceProvenanceInputs,
-    TemporalInferenceStatus, ValidationInterval,
+    total_difference_covariance, RawCorrelationDiagnostics, Sha256Digest,
+    TemporalCovarianceApproximation, TemporalCovarianceFit, TemporalCovarianceOptions,
+    TemporalCovarianceProvenance, TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
+    TemporalReferenceProvenance, TemporalValidationScope, ValidationInterval,
 };
 pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};

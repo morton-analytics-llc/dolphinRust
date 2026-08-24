@@ -3,8 +3,9 @@
 use dolphin_timeseries::{
     continuous_time_ar1_correlation, fit_temporal_covariance, relative_standard_deviation_shape,
     subset_origin_anchored_covariance, temporal_covariance_provenance,
-    temporal_parameter_boundary_status, total_difference_covariance, TemporalCovarianceOptions,
-    TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
+    temporal_parameter_boundary_status, total_difference_covariance, Sha256Digest,
+    TemporalCovarianceApproximation, TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs,
+    TemporalInferenceStatus, TemporalReferenceProvenance, TemporalValidationScope,
 };
 use statrs::function::erf::erf;
 
@@ -62,6 +63,24 @@ fn missing_dates_subset_rows_columns_but_keeps_origin_gauge_out() {
     assert_eq!(days, vec![6.0, 24.0]);
     assert_eq!(values, vec![1.0, 4.0]);
     assert_eq!(selected, vec![vec![1.0, 0.1], vec![0.1, 3.0]]);
+}
+
+#[test]
+fn acquisition_zero_gauge_must_be_exactly_zero() {
+    let covariance = vec![vec![0.0, 0.0], vec![0.0, 1.0]];
+    assert_eq!(
+        subset_origin_anchored_covariance(&[0.0, 12.0], &[f64::EPSILON, 1.0], &covariance),
+        Err(TemporalInferenceStatus::GaugeNotZero)
+    );
+}
+
+#[test]
+fn even_length_gap_median_averages_the_two_center_gaps() {
+    let diagnostics = dolphin_timeseries::raw_adjacent_correlation(
+        &[0.0, 6.0, 18.0, 36.0, 60.0],
+        &[0.0, 1.0, 0.5, 1.5, 1.0],
+    );
+    assert_eq!(diagnostics.median_gap_days, Some(15.0));
 }
 
 #[test]
@@ -178,6 +197,14 @@ fn invalid_dates_and_missing_gauge_fail_closed() {
 #[test]
 fn default_minimum_dates_and_ml_profile_are_explicit() {
     assert_eq!(TemporalCovarianceOptions::default().minimum_dates, 12);
+    assert_eq!(
+        TemporalCovarianceOptions::default().bootstrap_replicates,
+        200
+    );
+    assert_eq!(
+        TemporalCovarianceOptions::default().bootstrap_minimum_successes,
+        198
+    );
     let (days, observations, covariance) = twelve_date_fixture();
     let options = TemporalCovarianceOptions {
         oracle_rho: 0.6,
@@ -228,6 +255,11 @@ fn bootstrap_emits_all_validation_levels_with_attempt_accounting() {
     assert!(fit.ols.standard_error_diagnostic.is_some());
     assert!(fit.oracle_gls.standard_error_diagnostic.is_some());
     assert!(fit.plugin_gls.standard_error_diagnostic.is_some());
+    assert!(fit.adjusted_scalar.standard_error_diagnostic.is_some());
+    assert!(
+        fit.adjusted_scalar.standard_error_diagnostic.unwrap()
+            >= fit.plugin_gls.standard_error_diagnostic.unwrap()
+    );
     assert!(fit.ols.width_68.unwrap() < fit.ols.width_95.unwrap());
     assert!(fit.oracle_gls.width_68.unwrap() < fit.oracle_gls.width_95.unwrap());
     assert!(fit.plugin_gls.width_68.unwrap() < fit.plugin_gls.width_95.unwrap());
@@ -369,22 +401,61 @@ fn provenance_contract_binds_issue_52_issue_54_reference_and_receipt() {
     let provenance = temporal_covariance_provenance(
         &fit,
         TemporalCovarianceProvenanceInputs {
-            issue52_receipt_sha256: "52".repeat(32),
-            issue54_receipt_sha256: "54".repeat(32),
-            reference_geometry: "burst/reference-window".to_owned(),
-            reference_window: "window-0".to_owned(),
-            overlap_fraction: 0.95,
-            distance_pixels: 12.0,
-            scope: "synthetic-validation".to_owned(),
-            approximation: None,
-            validation_receipt_sha256: "53".repeat(32),
+            issue52_receipt_sha256: Sha256Digest::new("52".repeat(32)).unwrap(),
+            issue54_receipt_sha256: Sha256Digest::new("54".repeat(32)).unwrap(),
+            reference: TemporalReferenceProvenance {
+                geometry_id: "burst/reference-window".to_owned(),
+                window_id: "window-0".to_owned(),
+                overlap_fraction: 0.95,
+                distance_pixels: 12.0,
+                sequential_depth: 2,
+                approximation: TemporalCovarianceApproximation::Exact,
+            },
+            scope: TemporalValidationScope::SyntheticValidation,
+            validation_receipt_sha256: Sha256Digest::new("53".repeat(32)).unwrap(),
+            estimator_input_sha256: Sha256Digest::new("51".repeat(32)).unwrap(),
+            selected_method: "complete_refit_bootstrap".to_owned(),
         },
-    );
+    )
+    .unwrap();
     assert_eq!(provenance.valid_date_count, 12);
     assert_eq!(provenance.rank, 1);
-    assert_eq!(provenance.issue52_receipt_sha256.len(), 64);
-    assert_eq!(provenance.issue54_receipt_sha256.len(), 64);
-    assert_eq!(provenance.reference_geometry, "burst/reference-window");
+    assert_eq!(provenance.issue52_receipt_sha256.as_str().len(), 64);
+    assert_eq!(provenance.issue54_receipt_sha256.as_str().len(), 64);
+    assert_eq!(provenance.reference.geometry_id, "burst/reference-window");
     assert_eq!(provenance.bootstrap_attempts, 0);
-    assert_eq!(provenance.validation_receipt_sha256, "53".repeat(32));
+    assert_eq!(
+        provenance.validation_receipt_sha256.as_str(),
+        "53".repeat(32)
+    );
+}
+
+#[test]
+fn failed_fit_never_emits_promotion_provenance() {
+    let options = TemporalCovarianceOptions::default();
+    let fit = fit_temporal_covariance(
+        &[0.0, 12.0],
+        &[1.0, 2.0],
+        &[vec![0.0, 0.0], vec![0.0, 1.0]],
+        &options,
+    );
+    assert_eq!(fit.status, TemporalInferenceStatus::GaugeNotZero);
+    let digest = Sha256Digest::new("00".repeat(32)).unwrap();
+    let inputs = TemporalCovarianceProvenanceInputs {
+        issue52_receipt_sha256: digest.clone(),
+        issue54_receipt_sha256: digest.clone(),
+        reference: TemporalReferenceProvenance {
+            geometry_id: "reference".to_owned(),
+            window_id: "window".to_owned(),
+            overlap_fraction: 1.0,
+            distance_pixels: 0.0,
+            sequential_depth: 1,
+            approximation: TemporalCovarianceApproximation::Exact,
+        },
+        scope: TemporalValidationScope::SyntheticValidation,
+        validation_receipt_sha256: digest.clone(),
+        estimator_input_sha256: digest,
+        selected_method: "complete_refit_bootstrap".to_owned(),
+    };
+    assert!(temporal_covariance_provenance(&fit, inputs).is_none());
 }

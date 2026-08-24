@@ -29,6 +29,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         ])
         self.assertEqual(self.prereg["variance_ratios"], [1, 4, 16])
         self.assertEqual(self.prereg["reference_contribution_ratios"], [0, 0.5, 2])
+        self.assertEqual(len(self.prereg["reference_contexts"]), 3)
         self.assertEqual(self.prereg["date_count_semantics"], "retained_post_gauge_dates_after_missingness")
         self.assertEqual(self.prereg["execution_paths"], ["fixed_factor", "production_path"])
 
@@ -42,13 +43,13 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertTrue(self.prereg["external_holdout_required"])
 
     def test_cell_count_and_seed_denominator_are_immutable(self):
-        self.assertEqual(self.prereg["cell_count_without_outer_seeds"], 4032)
+        self.assertEqual(self.prereg["cell_count_without_outer_seeds"], 12096)
         self.assertEqual(self.prereg["cell_count_by_execution_path"], {
-            "fixed_factor": 4032, "production_path": 4032
+            "fixed_factor": 12096, "production_path": 12096
         })
         self.assertEqual(
             self.prereg["supported_cell_sha256"],
-            "99d37d61fe76033f1caeaf0ae858a7ac6f3de1ea918c00e50267fbc3ab4db3fe",
+            "567fc7a4fb26539195cdeb47a3a655c2e7123a04d6892915130f9bb7b1f5876b",
         )
         self.assertEqual(self.prereg["global_seed"], 5447718)
         self.assertEqual(
@@ -57,7 +58,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         )
         self.assertEqual(self.prereg["bootstrap"]["interval_levels"], [0.68, 0.9, 0.95])
         self.assertEqual(self.prereg["bootstrap"]["count"], 200)
-        self.assertEqual(self.prereg["bootstrap"]["minimum_successes"], 180)
+        self.assertEqual(self.prereg["bootstrap"]["minimum_successes"], 198)
 
     def test_supported_cell_identities_match_frozen_hash(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"
@@ -65,8 +66,11 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         frozen = module.cells(self.prereg)
-        self.assertEqual(len(frozen), 4032)
+        self.assertEqual(len(frozen), 12096)
         self.assertEqual(module.cell_hash(frozen), self.prereg["supported_cell_sha256"])
+        unsupported = module.unsupported_cells(self.prereg)
+        self.assertEqual(len(unsupported), 10)
+        self.assertEqual(module.cell_hash(unsupported), self.prereg["unsupported_cell_sha256"])
 
     def test_compact_simulation_driver_is_deterministic_and_nonpromoting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,18 +89,18 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             ]
             subprocess.run(command, check=True)
             receipt = json.loads(output.read_text())
-            self.assertEqual(receipt["attempted_cells"], 8064)
+            self.assertEqual(receipt["attempted_cells"], 24192)
             self.assertEqual(receipt["batch_attempted_cells"], 2)
-            self.assertEqual(receipt["emitted_cells"], 2)
-            self.assertEqual(receipt["failed_cells"], 0)
-            self.assertEqual(receipt["skipped_contract_cells"], 8062)
+            self.assertEqual(receipt["emitted_cells"], 0)
+            self.assertEqual(receipt["failed_cells"], 2)
+            self.assertEqual(receipt["skipped_contract_cells"], 24190)
             self.assertFalse(receipt["corrected_inferential_sigma_emission"])
             self.assertEqual(receipt["pre_outcome_status"], "pre_outcome_frozen")
             fixed, production = receipt["records"]
             self.assertEqual(fixed["execution_path"], "fixed_factor")
-            self.assertEqual(fixed["fixed_factor_status"], "Evaluated")
+            self.assertEqual(fixed["fixed_factor_status"], "OptimizerNonconverged")
             self.assertEqual(production["execution_path"], "production_path")
-            self.assertEqual(production["production_path_status"], "evaluated")
+            self.assertEqual(production["production_path_status"], "estimator_failed")
             self.assertEqual(fixed["fit"]["valid_date_count"], 12)
             self.assertEqual(production["fit"]["valid_date_count"], 12)
             self.assertAlmostEqual(
@@ -104,14 +108,14 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 production["fit"]["plugin_gls_slope"],
                 places=12,
             )
-            self.assertEqual(len(fixed["comparator_methods"]), 7)
-            self.assertEqual(
-                production["provenance"]["schema"],
-                "dolphinrust-temporal-covariance-provenance/1",
-            )
-            self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/1")
+            self.assertEqual(len(fixed["comparator_methods"]), 8)
+            self.assertIsNone(production["provenance"])
+            self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/2")
             self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 2)
             self.assertIn("resource", fixed)
+            self.assertFalse(receipt["execution_complete"])
+            self.assertFalse(receipt["promotion_eligible"])
+            self.assertGreater(receipt["resource"]["peak_resident_set_bytes"], 0)
 
     def test_generator_uses_normal_draws_and_seed_varying_mcar(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"
@@ -137,6 +141,29 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         request = module.request_for(cell, 1, self.prereg, "fixed_factor")
         retained = sum(value is not None for value in request["fixed_factor"]["observations"]) - 1
         self.assertEqual(retained, cell["date_count"])
+        production = module.request_for(cell, 1, self.prereg, "production_path")["production_path"]
+        self.assertNotIn("issue52_target_factor", production)
+        self.assertNotIn("issue54_difference_factor", production)
+        self.assertIn("complex_noise_standard_deviation", production)
+
+    def test_stationary_irregular_ar_generator_matches_oracle_covariance(self):
+        path = ROOT / "validation/temporal_covariance_simulation.py"
+        spec = importlib.util.spec_from_file_location("temporal_covariance_simulation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        pairs = []
+        for seed in range(5000):
+            _, values = module.stationary_ar_path([0.0, 18.0], 0.6, seed)
+            pairs.append(values)
+        left_mean = sum(pair[0] for pair in pairs) / len(pairs)
+        right_mean = sum(pair[1] for pair in pairs) / len(pairs)
+        left_variance = sum((pair[0] - left_mean) ** 2 for pair in pairs) / (len(pairs) - 1)
+        right_variance = sum((pair[1] - right_mean) ** 2 for pair in pairs) / (len(pairs) - 1)
+        covariance = sum((pair[0] - left_mean) * (pair[1] - right_mean)
+                         for pair in pairs) / (len(pairs) - 1)
+        self.assertLess(abs(left_variance - 1.0), 0.05)
+        self.assertLess(abs(right_variance - 1.0), 0.05)
+        self.assertLess(abs(covariance - 0.6 ** 1.5), 0.05)
 
     def test_production_path_seed_mismatch_fails_closed(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"

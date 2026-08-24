@@ -29,9 +29,10 @@ ill-conditioned design, or insufficient dates fails closed.
 ## Comparators
 
 The pure kernel evaluates origin-anchored OLS, oracle GLS using the generating
-parameters, constrained maximum-likelihood plug-in GLS, a slope
-profile-likelihood comparator using the same unrestricted and fixed-slope ML
-objective, and complete-refit parametric bootstrap. Every bootstrap replicate
+parameters, constrained REML plug-in GLS, a covariance-parameter curvature
+adjusted scalar comparator, a slope profile-likelihood comparator whose
+unrestricted and fixed-slope ML objectives share one frozen nuisance parameter
+space, and complete-refit parametric bootstrap. Every bootstrap replicate
 resimulates from the fitted total covariance and refits mean and covariance
 parameters. The public Rust result contains point estimates and validation
 intervals but no corrected inferential standard-error field.
@@ -54,23 +55,33 @@ threshold. The first implementation runs only compact contract fixtures; the
 - Variance ratios: 1, 4, and 16, with alternating and contiguous arrangements.
 - Reference contribution: 0, 0.5, and 2, with only block-PSD target/reference
   joint factors.
+- Reference replay: overlap 0.75/0.5/0.1, distance 10/50/100 pixels, and
+  sequential depths 1/2/4. The supported production batch is exact; compressed
+  JVP is a frozen unsupported stratum until its provider-backed joint replay is
+  available.
 - Methods: OLS, oracle GLS, legacy intercept-plus-slope WLS marked
-  non-comparable, lag-one scalar effective-N, plug-in GLS ML, slope-profile
-  likelihood inference, and complete-refit bootstrap.
+  non-comparable, lag-one scalar effective-N, plug-in GLS REML, the REML
+  covariance-parameter adjusted scalar, ML slope-profile likelihood, and
+  complete-refit bootstrap.
 
 The release JSONL batch has two explicit paths. `fixed_factor` consumes the
 direct #54 covariance matrix. `production_path` consumes raw-complex target and
-reference series plus same-seed #52 target/reference factors and the #54 direct
-difference factor. A production-path record fails closed on missing inputs,
-factor shape, raw-complex validity, or any seed mismatch; it is not hardcoded
-unavailable. Both paths use the same origin-anchored estimator and never write a
-corrected product.
+reference series and a frozen proper-complex noise model. Rust constructs one
+same-seed source DAG, invokes the #52 temporal replay and the #54 joint
+target/reference replay, checks their target marginal identity, and passes only
+the resulting direct difference covariance to the estimator. A production-path
+record fails closed on missing inputs, raw-complex validity, replay failure, or
+any seed mismatch. Both paths use the same origin-anchored estimator and never
+write a corrected product.
 
 The per-cell gates are absolute standardized slope bias <= 0.05 empirical SD,
 coverage error <= 0.03/0.02/0.015 at 68/90/95%, >=99% successful supported
-emission, and no unsupported/boundary cell is promoted. Conditional and
+emission, at least 198 of 200 complete refits, and no unsupported/boundary cell
+is promoted. Conditional and
 unconditional coverage, proper interval score, width, failed fits, resources,
-and preregistration/code hashes are retained separately.
+and preregistration/code hashes are retained separately. Attempted failures are
+never topped up, and aggregate result hashes and measured wall/RSS receipts are
+created only after the batch exits.
 
 ## Promotion boundary
 
