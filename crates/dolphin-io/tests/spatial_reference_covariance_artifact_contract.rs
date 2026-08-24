@@ -3,9 +3,42 @@ use dolphin_io::{
     spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
     CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
     SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
+use std::sync::{Mutex, MutexGuard};
+
+static HDF5_LOCK: Mutex<()> = Mutex::new(());
+
+fn hdf5_guard() -> MutexGuard<'static, ()> {
+    HDF5_LOCK.lock().unwrap()
+}
+
+const DETAILED_STATUSES: &[SpatialReferenceCovarianceStatus] = &[
+    SpatialReferenceCovarianceStatus::Valid,
+    SpatialReferenceCovarianceStatus::InvalidReference,
+    SpatialReferenceCovarianceStatus::ReplayUnsupported,
+    SpatialReferenceCovarianceStatus::L2RankDeficient,
+    SpatialReferenceCovarianceStatus::ScopeMismatch,
+    SpatialReferenceCovarianceStatus::UnsupportedMultiburstReference,
+    SpatialReferenceCovarianceStatus::MaskedTarget,
+    SpatialReferenceCovarianceStatus::TemporalFactorInvalid,
+    SpatialReferenceCovarianceStatus::ReplayUnavailable,
+    SpatialReferenceCovarianceStatus::ReplayMismatch,
+    SpatialReferenceCovarianceStatus::InfluenceInvalid,
+    SpatialReferenceCovarianceStatus::NondifferentiableEstimator,
+    SpatialReferenceCovarianceStatus::UnstableAdaptiveSupport,
+    SpatialReferenceCovarianceStatus::UnsupportedL1,
+    SpatialReferenceCovarianceStatus::UnsupportedPhaseBias,
+    SpatialReferenceCovarianceStatus::UnsupportedCorrectionOrder,
+    SpatialReferenceCovarianceStatus::TiedEigenvalue,
+    SpatialReferenceCovarianceStatus::EmptySupport,
+    SpatialReferenceCovarianceStatus::NonfiniteSource,
+    SpatialReferenceCovarianceStatus::NonPsdTruth,
+    SpatialReferenceCovarianceStatus::MissingAttemptRecord,
+    SpatialReferenceCovarianceStatus::SupportIdentityMismatch,
+];
 
 fn digest(byte: u8) -> String {
     format!("sha256:{}", format!("{byte:02x}").repeat(32))
@@ -13,6 +46,7 @@ fn digest(byte: u8) -> String {
 
 #[test]
 fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_blocks() {
+    let _hdf5 = hdf5_guard();
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_streaming_{}.h5",
         std::process::id()
@@ -116,13 +150,14 @@ fn block() -> SpatialReferenceCovarianceBlock {
             0.0, 0.0, 0.0, 0.0, 1.0, 0.0, // target 0
             0.0, 0.0, 0.5, 0.0, 1.5, 0.0, // target 1
         ],
-        approximation_error_bound: vec![0.01, 0.02],
+        approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; 2],
         source_factor_digest: digest(0x77),
     }
 }
 
 #[test]
 fn chunked_reference_factor_round_trips_under_a_byte_cap() {
+    let _hdf5 = hdf5_guard();
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_factor_{}.h5",
         std::process::id()
@@ -136,7 +171,13 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
     let read_metadata = read_spatial_reference_covariance_header(&path, 4096).unwrap();
     assert_eq!(read_metadata, metadata());
     let read = read_spatial_reference_covariance_block(&path, 7, 4096).unwrap();
-    assert_eq!(read.block, block());
+    assert_eq!(read.block.status, block().status);
+    assert_eq!(read.block.difference_factor, block().difference_factor);
+    assert!(read
+        .block
+        .approximation_error_bound
+        .iter()
+        .all(|bound| bound.is_nan()));
     assert_eq!(
         read.logical_payload_bytes,
         12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8
@@ -148,7 +189,231 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
 }
 
 #[test]
+fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_statuses_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let target_count = DETAILED_STATUSES.len();
+    let mut metadata = metadata();
+    metadata.full_grid.rows = u32::try_from(target_count).unwrap();
+    metadata.reference_row = 0;
+    let mut status_block = SpatialReferenceCovarianceBlock {
+        block_id: 9,
+        target_grid: metadata.full_grid,
+        maximum_rank: 1,
+        rank_by_target: vec![0; target_count],
+        status: DETAILED_STATUSES.to_vec(),
+        source_burst_index_by_target: vec![
+            SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE;
+            target_count
+        ],
+        difference_factor: vec![0.0; target_count * metadata.ordered_date_indices.len()],
+        approximation_error_bound: vec![
+            SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE;
+            target_count
+        ],
+        source_factor_digest: digest(0x77),
+    };
+    status_block.rank_by_target[0] = 1;
+    status_block.source_burst_index_by_target[0] = 0;
+    status_block.difference_factor[1] = 1.0;
+
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY.len(),
+        target_count
+    );
+    assert_eq!(
+        SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec![
+            "valid",
+            "invalid_reference",
+            "replay_unsupported",
+            "l2_rank_deficient",
+            "scope_mismatch",
+            "unsupported_multiburst_reference",
+            "masked_target",
+            "temporal_factor_invalid",
+            "replay_unavailable",
+            "replay_mismatch",
+            "influence_invalid",
+            "nondifferentiable_estimator",
+            "unstable_adaptive_support",
+            "unsupported_l1",
+            "unsupported_phase_bias",
+            "unsupported_correction_order",
+            "tied_eigenvalue",
+            "empty_support",
+            "nonfinite_source",
+            "non_psd_truth",
+            "missing_attempt_record",
+            "support_identity_mismatch",
+        ]
+    );
+    write_spatial_reference_covariance(&path, &metadata, &[status_block.clone()]).unwrap();
+    let read = read_spatial_reference_covariance_block(&path, 9, 16_384).unwrap();
+    assert_eq!(read.block.status, status_block.status);
+
+    let file = hdf5::File::open_rw(&path).unwrap();
+    let dataset = file.dataset("blocks/00000000000000000009/status").unwrap();
+    let mut codes = dataset.read_raw::<u16>().unwrap();
+    codes[0] = u16::MAX;
+    dataset.write_raw(&codes).unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+    let error = read_spatial_reference_covariance_block(&path, 9, 16_384).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unknown spatial reference covariance status"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn coincident_valid_target_persists_exact_zero_rank() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_coincident_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut coincident = block();
+    coincident.rank_by_target[0] = 0;
+    coincident.difference_factor[..6].fill(0.0);
+    write_spatial_reference_covariance(&path, &metadata(), &[coincident]).unwrap();
+    let read = read_spatial_reference_covariance_block(&path, 7, 4096).unwrap();
+    assert_eq!(
+        read.block.status[0],
+        SpatialReferenceCovarianceStatus::Valid
+    );
+    assert_eq!(read.block.rank_by_target[0], 0);
+    assert!(read.block.difference_factor[..6]
+        .iter()
+        .all(|coefficient| *coefficient == 0.0));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
+    let _hdf5 = hdf5_guard();
+    let base = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_bounds_{}",
+        std::process::id()
+    ));
+    let mut false_uncalibrated_bound = block();
+    false_uncalibrated_bound
+        .approximation_error_bound
+        .fill(0.01);
+    assert!(write_spatial_reference_covariance(
+        base.with_extension("uncalibrated.h5"),
+        &metadata(),
+        &[false_uncalibrated_bound]
+    )
+    .is_err());
+
+    let mut calibrated_metadata = metadata();
+    calibrated_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
+    calibrated_metadata.review_receipt_digest = digest(0x81);
+    calibrated_metadata.method_manifest_digest = digest(0x82);
+    calibrated_metadata.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&calibrated_metadata);
+    assert!(write_spatial_reference_covariance(
+        base.with_extension("missing-bound.h5"),
+        &calibrated_metadata,
+        &[block()]
+    )
+    .is_err());
+
+    let mut calibrated_block = block();
+    calibrated_block.approximation_error_bound = vec![0.01, 0.02];
+    write_spatial_reference_covariance(
+        base.with_extension("calibrated.h5"),
+        &calibrated_metadata,
+        &[calibrated_block],
+    )
+    .unwrap();
+
+    let mut unsupported = block();
+    unsupported.rank_by_target[0] = 0;
+    unsupported.status[0] = SpatialReferenceCovarianceStatus::MaskedTarget;
+    unsupported.difference_factor[..6].fill(0.0);
+    unsupported.approximation_error_bound[0] = 0.01;
+    assert!(write_spatial_reference_covariance(
+        base.with_extension("unsupported-bound.h5"),
+        &calibrated_metadata,
+        &[unsupported]
+    )
+    .is_err());
+
+    let mut calibrated_masked = block();
+    calibrated_masked.rank_by_target[0] = 0;
+    calibrated_masked.status[0] = SpatialReferenceCovarianceStatus::MaskedTarget;
+    calibrated_masked.source_burst_index_by_target[0] = SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE;
+    calibrated_masked.difference_factor[..6].fill(0.0);
+    calibrated_masked.approximation_error_bound[1] = 0.02;
+    write_spatial_reference_covariance(
+        base.with_extension("calibrated-masked.h5"),
+        &calibrated_metadata,
+        &[calibrated_masked],
+    )
+    .unwrap();
+}
+
+#[test]
+fn calibrated_scope_requires_nonzero_exact_identity_receipts_and_rejects_tamper() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_scope_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut calibrated_metadata = metadata();
+    calibrated_metadata.calibration_scope = SpatialReferenceCalibrationScope::CalibratedScopeMatch;
+    calibrated_metadata.review_receipt_digest = digest(0x81);
+    calibrated_metadata.method_manifest_digest = digest(0x82);
+    calibrated_metadata.approximation_receipt_digest = digest(0x83);
+    calibrated_metadata.resource_receipt_digest = digest(0x84);
+    calibrated_metadata.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&calibrated_metadata);
+    let mut calibrated_block = block();
+    calibrated_block.approximation_error_bound = vec![0.01, 0.02];
+    write_spatial_reference_covariance(&path, &calibrated_metadata, &[calibrated_block]).unwrap();
+
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.group("metadata")
+        .unwrap()
+        .attr("reference_row")
+        .unwrap()
+        .write_scalar(&0_u64)
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+    assert!(read_spatial_reference_covariance_header(&path, 4096).is_err());
+
+    let mut zero_identity = calibrated_metadata;
+    zero_identity.source_replay_digest = digest(0x00);
+    zero_identity.calibration_scope_digest =
+        spatial_reference_calibration_scope_digest(&zero_identity);
+    assert!(write_spatial_reference_covariance(
+        path.with_extension("zero-source.h5"),
+        &zero_identity,
+        &[{
+            let mut value = block();
+            value.approximation_error_bound = vec![0.01, 0.02];
+            value
+        }]
+    )
+    .is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn malformed_scope_gauge_hash_and_factor_fail_before_commit() {
+    let _hdf5 = hdf5_guard();
     let base = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_invalid_{}",
         std::process::id()
@@ -187,10 +452,12 @@ fn malformed_scope_gauge_hash_and_factor_fail_before_commit() {
 
     invalid_metadata.calibration_scope_digest =
         spatial_reference_calibration_scope_digest(&invalid_metadata);
+    let mut calibrated_block = block();
+    calibrated_block.approximation_error_bound = vec![0.01, 0.02];
     write_spatial_reference_covariance(
         base.with_extension("calibrated.h5"),
         &invalid_metadata,
-        &[block()],
+        &[calibrated_block],
     )
     .unwrap();
 
