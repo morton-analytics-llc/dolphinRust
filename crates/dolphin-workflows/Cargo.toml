@@ -35,6 +35,7 @@ sha2.workspace = true
 libc = "0.2"
 gdal = "0.19"
 gdal-sys = "0.12"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Optional heap profiler (enabled only via the `dhat-heap` feature for profiling).
 dhat = { version = "0.3", optional = true }
 
@@ -49,7 +50,6 @@ dhat-heap = ["dep:dhat"]
 [dev-dependencies]
 num-complex.workspace = true
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
-hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
 # Enables the NISAR-layout fixture generator for the end-to-end NISAR stack test.
 dolphin-io = { workspace = true, features = ["nisar-fixture"] }
 # Tracing capture for the end-to-end profiling harness (`examples/profile_e2e.rs`).

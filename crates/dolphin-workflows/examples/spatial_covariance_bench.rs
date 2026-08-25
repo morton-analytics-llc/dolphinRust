@@ -35,6 +35,8 @@ struct BenchmarkReceipt {
     source_cache_peak_bytes: u64,
     admitted_block_targets: u64,
     tile_pixels: u64,
+    processed_tile_pixels: u64,
+    capture_native_shape: [u64; 2],
     date_count: u64,
     runtime_resource_receipt: Value,
 }
@@ -178,6 +180,8 @@ fn main() -> Result<()> {
         source_cache_peak_bytes: evidence.source_cache_peak_bytes,
         admitted_block_targets: evidence.admitted_block_targets,
         tile_pixels,
+        processed_tile_pixels: evidence.processed_tile_pixels,
+        capture_native_shape: evidence.capture_native_shape,
         date_count: dates,
         runtime_resource_receipt: serde_json::to_value(runtime)?,
     };

@@ -39,27 +39,27 @@ FROZEN_MAX_SHARD_MANIFEST_BYTES = 16384
 FROZEN_MAX_RUN_MANIFEST_BYTES = 16777216
 FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
-FROZEN_RETAINED_SIZE_BOUND_BYTES = 21831680
+FROZEN_RETAINED_SIZE_BOUND_BYTES = 23928832
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "b84b60dd769230e7f0f4f34d50ad1167c5064a5797e08d201634fe9299230a29"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "0f10a825c66f3b887f660aab9cf97e4ef08675b4a3e927c5ca27a61e65f14020"
-FROZEN_EXECUTION_SHA256 = "465b603c7202f4e9ba6ae0de6e4b8ade99020efef9802d7e41705f3ab34c7048"
+FROZEN_GENERATOR_SHA256 = "e52c0c428b6ec3c79fb136f343e18e2a162ba707c078cdb57a30ffeff0f2846f"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "521624623268b74ed38645dc5abf69a38df7119258a1aacef1dd3986bc2f504c"
+FROZEN_EXECUTION_SHA256 = "e8ea16af5fdf66d717677a69ce38e4f2d84b54ebe4397060d312fe1bbb1087a2"
 FROZEN_REDUCERS_SHA256 = "07c75209502a7ac67078e99960edc88d71616308d9d37b50d9bdc41389713007"
 FROZEN_MATRIX_SHA256 = "787f8e83bf8841b8cdfe5492e52b12a41dfb7da759e8425e554a3caefe10a528"
-FROZEN_RECEIPT_SHA256 = "747658ad422cef7fa97ee2df13c076f2ab931ac2dbc30e6d12c673b26b64bf9e"
+FROZEN_RECEIPT_SHA256 = "20066e75db08bc5a856cc3e896924edf7d6b286fd8502117197fa739ca283eec"
 FROZEN_HASH_FIELDS_SHA256 = "80eb7ab1c16f9908e39515d7988f2fe5e2fb6b50f81974f0544e6a1abec98d4c"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "cd88a410b60c927b9aebb783d1431cde3b6f3396d70b079db64993f17d93b508"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "602436d3f59dbce016a3a6489ded3d624a8aa5bf42bc6f782b9e787d50bb15d4"
 FROZEN_V3_PREREGISTRATION_SHA256 = "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184"
-FROZEN_DETERMINISM_SHA256 = "001a6ec1f4bad33313e5b1fe72c1e97d15b6c8bd001d471f9cc3b2cb8636acf0"
-FROZEN_NUMERIC_SHA256 = "89d5b32eadb562188798fe9231c2ea66933edcbcd85cad650473b08a1370e344"
+FROZEN_DETERMINISM_SHA256 = "9a00861e8296a0b37abafb5d50378b64424aca30356e37e401377a128e699a0b"
+FROZEN_NUMERIC_SHA256 = "2c1dccb498e66980cc0ab4b65cf48e4f7a8bcde25786e98722cf57b8c11842f6"
 FROZEN_NORMAL_QUANTILE_SHA256 = "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4"
-FROZEN_DGP_COEFFICIENT_SHA256 = "2c531b7366441ca255065098e4a3c35a4d9220596c2e9a3e7ad4ae1f8a71abb0"
-FROZEN_PORTABLE_DGP_TABLE_SHA256 = "2152045c9eaedaa5fe423178a0acee621deb43fae562dae34f9dd195f1afa299"
-FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_120_555
-FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d2ea499ad4915903a33c0f64ad0b43d09a78aa46b1fcf2659b69ec60c91c9b12"
-FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_007
+FROZEN_DGP_COEFFICIENT_SHA256 = "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69"
+FROZEN_PORTABLE_DGP_TABLE_SHA256 = "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff"
+FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_124_967
+FROZEN_PORTABLE_DGP_ASSET_SHA256 = "f2295c1448d93a061032699039e1096abbfb16d96e99b68a0fb07b340b269018"
+FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -491,7 +491,7 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
     if neighbors.get("full_half_window") is not True or neighbors.get("glrt", {}).get("alpha") != 0.001 or neighbors.get("ks", {}).get("alpha") != 0.001 or neighbors.get("fixed_support_reuse") is not True:
         errors.append("GLRT/KS support contract does not match the frozen production algorithms")
     supported = generator.get("supported", {})
-    if supported.get("stable_attempt_statuses") != ["valid", "masked_target", "empty_support", "singular_local_information", "nondifferentiable_node"] or supported.get("not_evaluable_if") != ["empty_support", "singular_local_information"] or supported.get("expected_abstention_if") != ["masked_target", "nondifferentiable_node"]:
+    if supported.get("stable_attempt_statuses") != ["valid", "masked_target", "empty_support", "singular_local_information", "nondifferentiable_node"] or supported.get("not_evaluable_if") != ["unexpected_empty_support", "unexpected_singular_local_information"] or supported.get("expected_abstention_if") != ["masked_target", "empty_support", "singular_local_information"]:
         errors.append("attempt status policy drifted")
 
 
@@ -547,8 +547,8 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         FROZEN_CELL_COUNT * execution.get("max_encoded_cell_summary_bytes", 0)
         + FROZEN_SHARD_COUNT * execution.get("max_encoded_shard_manifest_bytes", 0)
         + execution.get("max_encoded_run_manifest_bytes", 0)
-        + execution.get("max_production_hdf5_bytes", 0)
-        + execution.get("max_production_sidecar_bytes", 0)
+        + 2 * execution.get("max_production_hdf5_bytes", 0)
+        + 2 * execution.get("max_production_sidecar_bytes", 0)
     )
     if execution.get("retained_attempt_records") is not False or execution.get("request_files_retained") is not False or retained_bound > execution.get("retained_size_bound_bytes", -1) or execution.get("retained_size_bound_bytes") != FROZEN_RETAINED_SIZE_BOUND_BYTES:
         errors.append("v4 retained evidence does not satisfy the frozen compact bound")
@@ -1720,14 +1720,10 @@ class CellAccumulator:
             self._validate_masked(attempt)
         elif status == "masked_target":
             raise SchemaError(f"cell {self.cell_id} cannot use masked_target")
-        elif status == "empty_support" and not empty:
-            raise SchemaError(f"cell {self.cell_id} has an undeclared empty-support attempt")
         elif empty and status != "empty_support":
             raise SchemaError(f"cell {self.cell_id} must preserve the production empty-support status")
-        elif status == "singular_local_information" and labels["eigen_stress"] != "tied_eigenvalue":
-            raise SchemaError(f"cell {self.cell_id} has an undeclared not-evaluable attempt")
-        elif status == "nondifferentiable_node":
-            self._validate_nondifferentiable(attempt)
+        elif status in {"empty_support", "singular_local_information", "nondifferentiable_node"}:
+            self._validate_non_emitting(attempt)
         elif attempt.get("factor_emitted") != attempt.get("emitted"):
             raise SchemaError(f"cell {self.cell_id} has inconsistent factor/emission flags")
         return regenerated
@@ -1790,19 +1786,19 @@ class CellAccumulator:
         )):
             raise SchemaError(f"cell {self.cell_id} masked attempt must use null estimator digests")
 
-    def _validate_nondifferentiable(self, attempt: Mapping[str, Any]) -> None:
+    def _validate_non_emitting(self, attempt: Mapping[str, Any]) -> None:
         if attempt.get("emitted") is not False or attempt.get("factor_emitted") is not False:
-            raise SchemaError(f"cell {self.cell_id} nondifferentiable attempt must not emit")
+            raise SchemaError(f"cell {self.cell_id} non-emitting attempt must not emit")
         if any(attempt.get(name) is not None for name in (
             "target_estimate_history", "reference_estimate_history",
             "predicted_difference_covariance", "production_operator_matrix",
             "contrast_weights",
         )):
-            raise SchemaError(f"cell {self.cell_id} nondifferentiable attempt must omit estimator evidence")
+            raise SchemaError(f"cell {self.cell_id} non-emitting attempt must omit estimator evidence")
         if any(attempt.get(name) != "0" * 64 for name in (
             "estimate_sha256", "predicted_covariance_sha256", "operator_sha256",
         )):
-            raise SchemaError(f"cell {self.cell_id} nondifferentiable attempt must use null estimator digests")
+            raise SchemaError(f"cell {self.cell_id} non-emitting attempt must use null estimator digests")
 
     def _accumulate(self, attempt: Mapping[str, Any], regenerated: Mapping[str, Any]) -> None:
         labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
@@ -1930,18 +1926,24 @@ class CellAccumulator:
         elif labels["eigen_stress"] == "tied_eigenvalue":
             if self.statuses["singular_local_information"] != self.expected_seed_count:
                 raise SchemaError(f"cell {self.cell_id} tied-eigen cell is not completely not-evaluable")
-            status = NOT_EVALUABLE
+            status = PASS
         elif expected_empty_support(self.cell_id):
             if self.statuses["empty_support"] != self.expected_seed_count:
                 raise SchemaError(f"cell {self.cell_id} empty-support status count drifted")
-            status = NOT_EVALUABLE
+            status = PASS
         else:
+            unexpected_not_evaluable = (
+                self.statuses["empty_support"]
+                + self.statuses["singular_local_information"]
+            )
             if (
-                self.statuses["valid"] + self.statuses["nondifferentiable_node"]
+                self.statuses["valid"]
+                + self.statuses["nondifferentiable_node"]
+                + unexpected_not_evaluable
                 != self.expected_seed_count
             ):
                 raise SchemaError(f"cell {self.cell_id} has an unsupported attempt status")
-            status = self._numeric_status(labels)
+            status = NOT_EVALUABLE if unexpected_not_evaluable else self._numeric_status(labels)
         empirical = predicted = None
         calibration_error = bias_norm = empirical_trace = predicted_trace = None
         target_reference_error_covariance_trace = None
@@ -1996,11 +1998,19 @@ class CellAccumulator:
             "cell_id": self.cell_id, "cell_ordinal": self.cell_ordinal, "status": status,
             "attempted_seeds": self.expected_seed_count, "emitted_seeds": self.emitted,
             "status_histogram": dict(self.statuses),
-            "failure_histogram": (
-                {"nondifferentiable_node": self.statuses["nondifferentiable_node"]}
-                if self.statuses["nondifferentiable_node"]
-                else {}
-            ),
+            "failure_histogram": {
+                name: self.statuses[name]
+                for name in (
+                    "empty_support",
+                    "singular_local_information",
+                    "nondifferentiable_node",
+                )
+                if self.statuses[name]
+                and not (
+                    (name == "empty_support" and expected_empty_support(self.cell_id))
+                    or (name == "singular_local_information" and labels["eigen_stress"] == "tied_eigenvalue")
+                )
+            },
             "request_digest": self.request_digest.hexdigest(), "attempt_digest": self.attempt_digest.hexdigest(),
             "target_source_count_total": self.target_total, "reference_source_count_total": self.reference_total,
             "intersection_source_count_total": self.intersection_total, "union_source_count_total": self.union_total,
@@ -2319,29 +2329,40 @@ def validate_cell_summary(
     statuses = summary.get("status_histogram")
     if not isinstance(statuses, dict) or set(statuses) != ATTEMPT_STATUSES or any(not _integer(value) or value < 0 for value in statuses.values()) or sum(statuses.values()) != seed_count:
         raise SchemaError(f"cell {cell_id} compact status histogram is incomplete")
-    expected_failures = (
-        {"nondifferentiable_node": statuses["nondifferentiable_node"]}
-        if statuses["nondifferentiable_node"]
-        else {}
-    )
+    labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+    expected_failures = {
+        name: statuses[name]
+        for name in (
+            "empty_support",
+            "singular_local_information",
+            "nondifferentiable_node",
+        )
+        if statuses[name]
+        and not (
+            (name == "empty_support" and expected_empty_support(cell_id))
+            or (name == "singular_local_information" and labels["eigen_stress"] == "tied_eigenvalue")
+        )
+    }
     if summary.get("failure_histogram") != expected_failures:
         raise SchemaError(f"cell {cell_id} compact failure histogram is malformed")
-    labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
     expected_status = PASS
-    if (
-        labels["eigen_stress"] == "tied_eigenvalue"
-        and labels["position"] != "masked"
-    ) or expected_empty_support(cell_id):
-        expected_status = NOT_EVALUABLE
+    unexpected_not_evaluable = False
     if labels["position"] == "masked":
         valid_histogram = statuses["masked_target"] == seed_count and summary["emitted_seeds"] == 0
     elif expected_empty_support(cell_id):
         valid_histogram = statuses["empty_support"] == seed_count and summary["emitted_seeds"] == 0
-    elif expected_status == NOT_EVALUABLE:
+    elif labels["eigen_stress"] == "tied_eigenvalue":
         valid_histogram = statuses["singular_local_information"] == seed_count
     else:
+        unexpected_not_evaluable = bool(
+            statuses["empty_support"] + statuses["singular_local_information"]
+        )
         valid_histogram = (
-            statuses["valid"] + statuses["nondifferentiable_node"] == seed_count
+            statuses["valid"]
+            + statuses["nondifferentiable_node"]
+            + statuses["empty_support"]
+            + statuses["singular_local_information"]
+            == seed_count
             and summary["emitted_seeds"] == statuses["valid"]
         )
         deterministic = seed_count == FROZEN_DETERMINISTIC_SEED_COUNT
@@ -2403,7 +2424,9 @@ def validate_cell_summary(
             and (deterministic or coverage_passes)
             and summary["emitted_seeds"] / seed_count >= preregistration["thresholds"]["emission_rate_min"]
         )
-        expected_status = PASS if passes else FAIL
+        expected_status = (
+            NOT_EVALUABLE if unexpected_not_evaluable else PASS if passes else FAIL
+        )
     if not valid_histogram or summary.get("status") != expected_status:
         raise SchemaError(f"cell {cell_id} compact status contradicts its independently reduced evidence")
 
@@ -2599,6 +2622,9 @@ def validate_production_parity_fixture(
         "schema", "hdf5_path", "sidecar_path", "hdf5_sha256", "sidecar_sha256",
         "hdf5_schema_version", "manifest_schema_version", "coupling", "seed_index",
         "factor_digest", "persisted_factor_digest", "estimator_branch",
+        "bounded_hdf5_path", "bounded_sidecar_path", "bounded_hdf5_sha256",
+        "bounded_sidecar_sha256", "runtime_resource_receipt_digest",
+        "bounded_runtime_resource_receipt_digest",
     }
     if (
         not isinstance(binding, dict)
@@ -2612,43 +2638,60 @@ def validate_production_parity_fixture(
         or binding["seed_index"] < 0
         or binding.get("estimator_branch") not in {"emi", "evd"}
         or any(not _is_sha256(binding.get(name)) for name in (
-            "hdf5_sha256", "sidecar_sha256", "factor_digest", "persisted_factor_digest",
+            "hdf5_sha256", "sidecar_sha256", "bounded_hdf5_sha256",
+            "bounded_sidecar_sha256", "factor_digest", "persisted_factor_digest",
+        ))
+        or any(not prefixed_sha256(binding.get(name)) for name in (
+            "runtime_resource_receipt_digest", "bounded_runtime_resource_receipt_digest",
         ))
         or binding["factor_digest"] != binding["persisted_factor_digest"]
     ):
         raise SchemaError("production parity fixture identity is malformed")
-    hdf5_path = resolve_below_run_root(run_root, binding["hdf5_path"], "production parity HDF5")
-    sidecar_path = resolve_below_run_root(run_root, binding["sidecar_path"], "production parity sidecar")
-    hdf5_sha256, hdf5_bytes = _hash_bounded_file(
-        hdf5_path,
-        preregistration["execution_protocol"]["max_production_hdf5_bytes"],
-        "production parity HDF5",
-    )
-    sidecar_bytes = _read_bounded_bytes(
-        sidecar_path,
-        preregistration["execution_protocol"]["max_production_sidecar_bytes"],
-        "production parity sidecar",
-    )
-    sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
-    try:
-        sidecar = json.loads(sidecar_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SchemaError("production parity sidecar is malformed JSON") from exc
-    if (
-        hdf5_bytes <= 0
-        or not sidecar_bytes
-        or hdf5_sha256 != binding["hdf5_sha256"]
-        or sidecar_sha256 != binding["sidecar_sha256"]
-        or sidecar.get("schema_version") != binding["manifest_schema_version"]
-        or sidecar.get("hdf5_file") != Path(binding["hdf5_path"]).name
-        or sidecar.get("hdf5_sha256") != hdf5_sha256
-        or sidecar.get("method") != "reference_specific_influence_v1"
-        or sidecar.get("method_version") != 1
-        or not prefixed_sha256(sidecar.get("reference_signature_digest"))
-        or not prefixed_sha256(sidecar.get("l2_map_digest"))
-        or not prefixed_sha256(sidecar.get("unwrap_branch_digest"))
+    for prefix, expected_transform in (
+        ("", [100.0, 30.0, 0.0, 200.0, 0.0, -30.0]),
+        ("bounded_", [130.0, 30.0, 0.0, 170.0, 0.0, -30.0]),
     ):
-        raise SchemaError("production parity HDF5/sidecar binding mismatch")
+        hdf5_path = resolve_below_run_root(run_root, binding[f"{prefix}hdf5_path"], "production parity HDF5")
+        sidecar_path = resolve_below_run_root(run_root, binding[f"{prefix}sidecar_path"], "production parity sidecar")
+        hdf5_sha256, hdf5_bytes = _hash_bounded_file(
+            hdf5_path,
+            preregistration["execution_protocol"]["max_production_hdf5_bytes"],
+            "production parity HDF5",
+        )
+        sidecar_bytes = _read_bounded_bytes(
+            sidecar_path,
+            preregistration["execution_protocol"]["max_production_sidecar_bytes"],
+            "production parity sidecar",
+        )
+        sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
+        try:
+            sidecar = json.loads(sidecar_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SchemaError("production parity sidecar is malformed JSON") from exc
+        if (
+            hdf5_bytes <= 0
+            or not sidecar_bytes
+            or hdf5_sha256 != binding[f"{prefix}hdf5_sha256"]
+            or sidecar_sha256 != binding[f"{prefix}sidecar_sha256"]
+            or sidecar.get("schema_version") != binding["manifest_schema_version"]
+            or sidecar.get("hdf5_file") != Path(binding[f"{prefix}hdf5_path"]).name
+            or sidecar.get("hdf5_sha256") != hdf5_sha256
+            or sidecar.get("method") != "reference_specific_influence_v1"
+            or sidecar.get("method_version") != 1
+            or sidecar.get("crs") != "EPSG:32611"
+            or sidecar.get("units") != "radians"
+            or sidecar.get("geotransform") != expected_transform
+            or sidecar.get("acquisition_days") != [0.0, 12.0]
+            or sidecar.get("burst_id") != "spatial-covariance-validation"
+            or sidecar.get("runtime_resource_receipt_digest") != binding[f"{prefix}runtime_resource_receipt_digest"]
+            or sidecar.get("production_provider_open_count", 0) <= 0
+            or sidecar.get("operator_block_reads", 0) <= 0
+            or sidecar.get("source_resolutions", 0) <= 0
+            or not prefixed_sha256(sidecar.get("reference_signature_digest"))
+            or not prefixed_sha256(sidecar.get("l2_map_digest"))
+            or not prefixed_sha256(sidecar.get("unwrap_branch_digest"))
+        ):
+            raise SchemaError("production parity HDF5/sidecar binding mismatch")
 
 
 def _growth_exponent(points: list[tuple[int, int]]) -> float:
@@ -2728,12 +2771,14 @@ def _validate_benchmark_allocation_measurement(
         "dependency_cone_bytes", "replay_reservation_bytes", "source_influence_bytes",
         "source_correlation_workspace_bytes", "source_correlation_model",
         "source_cache_peak_bytes", "admitted_block_targets",
-        "tile_pixels", "date_count", "runtime_resource_receipt",
+        "tile_pixels", "processed_tile_pixels", "capture_native_shape", "date_count",
+        "runtime_resource_receipt",
     }
     if not isinstance(measurement, dict) or set(measurement) != keys:
         raise SchemaError(f"resource {resource_id} lacks benchmark-emitted allocation evidence")
     integer_names = keys - {
-        "allocation_components", "runtime_resource_receipt", "source_correlation_model"
+        "allocation_components", "runtime_resource_receipt", "source_correlation_model",
+        "capture_native_shape",
     }
     if any(type(measurement.get(name)) is not int or measurement[name] < 0 for name in integer_names):
         raise SchemaError(f"resource {resource_id} benchmark allocation evidence is non-numeric")
@@ -2750,6 +2795,11 @@ def _validate_benchmark_allocation_measurement(
         or measurement["maximum_dependency_depth"] != item["dependency_cone"]["maximum_dependency_depth"]
         or measurement["reference_cone_sources"] != item["dependency_cone"]["reference_cone_sources"]
         or measurement["tile_pixels"] != matrix["tile_pixels"]
+        or measurement["processed_tile_pixels"] != matrix["tile_pixels"]
+        or not isinstance(measurement["capture_native_shape"], list)
+        or len(measurement["capture_native_shape"]) != 2
+        or any(type(value) is not int or value < 3 for value in measurement["capture_native_shape"])
+        or math.prod(measurement["capture_native_shape"]) != matrix["tile_pixels"]
         or measurement["date_count"] != matrix["dates"]
         or measurement["dependency_cone_bytes"] <= 0
         or measurement["replay_reservation_bytes"] < measurement["dependency_cone_bytes"]

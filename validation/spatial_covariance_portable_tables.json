@@ -111874,6 +111874,170 @@
           "3fecdda5afd9aade",
           "3fdb9fa094767908"
         ]
+      ],
+      "269": [
+        [
+          "3fef01549f7deea1",
+          "3fcfaaeed4f31577"
+        ],
+        [
+          "3feeeb9ff360452c",
+          "3fd07bd547ef15fe"
+        ],
+        [
+          "3feed50c1d1e6de2",
+          "3fd121bc2d378cd7"
+        ],
+        [
+          "3feebd99bfabbd40",
+          "3fd1c7276cf1f88a"
+        ],
+        [
+          "3feea54984419a22",
+          "3fd26c125d39ca60"
+        ],
+        [
+          "3fee8c1c1a5ab862",
+          "3fd3107857c8846e"
+        ],
+        [
+          "3fee721237ae265d",
+          "3fd3b454ba174843"
+        ],
+        [
+          "3fee572c982a2d6b",
+          "3fd457a2e5804a88"
+        ],
+        [
+          "3fee3b6bfdef0589",
+          "3fd4fa5e3f602aa2"
+        ],
+        [
+          "3fee1ed131495c39",
+          "3fd59c8231372d63"
+        ],
+        [
+          "3fee015d00acaee8",
+          "3fd63e0a28ca59d8"
+        ],
+        [
+          "3fede31040ad78e0",
+          "3fd6def19844774e"
+        ],
+        [
+          "3fedc3ebcbfb3500",
+          "3fd77f33f656eb96"
+        ],
+        [
+          "3feda3f0835a336b",
+          "3fd81eccbe5a789b"
+        ],
+        [
+          "3fed831f4d9d4348",
+          "3fd8bdb7706fd873"
+        ],
+        [
+          "3fed6179179f30d6",
+          "3fd95bef91a036cf"
+        ],
+        [
+          "3fed3efed43c17ec",
+          "3fd9f970abfd8723"
+        ],
+        [
+          "3fed1bb17c4a8b2f",
+          "3fda96364ec2b658"
+        ],
+        [
+          "3fecf7920e94901a",
+          "3fdb323c0e73b75b"
+        ],
+        [
+          "3fecd2a18fd07012",
+          "3fdbcd7d84fd696f"
+        ]
+      ],
+      "270": [
+        [
+          "3fef01549f7deea1",
+          "3fcfaaeed4f31577"
+        ],
+        [
+          "3feeeb40eb004f17",
+          "3fd07e9e1589fe3c"
+        ],
+        [
+          "3feed446841d21ee",
+          "3fd12749ae38182f"
+        ],
+        [
+          "3feebc661647009e",
+          "3fd1cf754a023450"
+        ],
+        [
+          "3feea3a053a4d42a",
+          "3fd2771c0221a455"
+        ],
+        [
+          "3fee89f5f50ca3e0",
+          "3fd31e38f3af4240"
+        ],
+        [
+          "3fee6f67b9fe3232",
+          "3fd3c4c73fc7e5c6"
+        ],
+        [
+          "3fee53f6689d67e9",
+          "3fd46ac20bb0bbc5"
+        ],
+        [
+          "3fee37a2cdac8db9",
+          "3fd5102480fb7eb1"
+        ],
+        [
+          "3fee1a6dbc86547d",
+          "3fd5b4e9cdaa8eed"
+        ],
+        [
+          "3fedfc580f17ac3b",
+          "3fd6590d2454ea06"
+        ],
+        [
+          "3feddd62a5d96a21",
+          "3fd6fc89bc49ffbd"
+        ],
+        [
+          "3fedbd8e67c9bda5",
+          "3fd79f5ad1b563dc"
+        ],
+        [
+          "3fed9cdc42657503",
+          "3fd8417ba5c25bc9"
+        ],
+        [
+          "3fed7b4d29a11143",
+          "3fd8e2e77ebf46c5"
+        ],
+        [
+          "3fed58e217e1a9ff",
+          "3fd98399a840dfde"
+        ],
+        [
+          "3fed359c0df5a117",
+          "3fda238d73455888"
+        ],
+        [
+          "3fed117c130d2697",
+          "3fdac2be36574ac4"
+        ],
+        [
+          "3fecec8334b28cf7",
+          "3fdb61274db081ff"
+        ],
+        [
+          "3fecc6b286c26dff",
+          "3fdbfec41b5c9960"
+        ]
       ]
     },
     "latent_phase_bits": {
@@ -120610,14 +120774,58 @@
         "3fc67ad828f90ea9",
         "3fc7cd5d588f3cb3",
         "3fc91fe288256abd"
+      ],
+      "269": [
+        "0000000000000000",
+        "3f857e0490e502df",
+        "3f957e0490e502df",
+        "3fa01e836cabc227",
+        "3fa57e0490e502df",
+        "3faadd85b51e4397",
+        "3fb01e836cabc227",
+        "3fb2ce43fec86283",
+        "3fb57e0490e502df",
+        "3fb82dc52301a33b",
+        "3fbadd85b51e4397",
+        "3fbd8d46473ae3f3",
+        "3fc01e836cabc227",
+        "3fc17663b5ba1255",
+        "3fc2ce43fec86283",
+        "3fc4262447d6b2b1",
+        "3fc57e0490e502df",
+        "3fc6d5e4d9f3530d",
+        "3fc82dc52301a33b",
+        "3fc985a56c0ff369"
+      ],
+      "270": [
+        "0000000000000000",
+        "3f85da3b3960ea1f",
+        "3f95da3b3960ea1f",
+        "3fa063ac6b08af97",
+        "3fa5da3b3960ea1f",
+        "3fab50ca07b924a7",
+        "3fb063ac6b08af97",
+        "3fb31ef3d234ccdb",
+        "3fb5da3b3960ea1f",
+        "3fb89582a08d0763",
+        "3fbb50ca07b924a7",
+        "3fbe0c116ee541eb",
+        "3fc063ac6b08af97",
+        "3fc1c1501e9ebe39",
+        "3fc31ef3d234ccdb",
+        "3fc47c9785cadb7d",
+        "3fc5da3b3960ea1f",
+        "3fc737deecf6f8c1",
+        "3fc89582a08d0763",
+        "3fc9f32654231605"
       ]
     }
   },
-  "coefficient_sha256": "2c531b7366441ca255065098e4a3c35a4d9220596c2e9a3e7ad4ae1f8a71abb0",
+  "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
   "maximum_date_count": 20,
-  "coordinate_count": 29007,
+  "coordinate_count": 29243,
   "amplitude_arguments": 1106,
-  "slope_arguments": 397,
+  "slope_arguments": 399,
   "operation_order": [
     "weighted_local",
     "weighted_global",
@@ -120640,5 +120848,5 @@
   ],
   "fused_multiply_add": false,
   "raw_complex_hash_encoding": "domain UTF-8; uint64_le source count; int64_le row,column; uint64_le acquisition count; canonical finite IEEE754 binary32 little-endian real,imag",
-  "table_sha256": "2152045c9eaedaa5fe423178a0acee621deb43fae562dae34f9dd195f1afa299"
+  "table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff"
 }

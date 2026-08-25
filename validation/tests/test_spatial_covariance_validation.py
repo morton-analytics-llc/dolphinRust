@@ -101,7 +101,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         generator = self.preregistration["generator"]
         frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
         tied = labels["eigen_stress"] == "tied_eigenvalue" and labels["position"] != "masked"
-        emitted = not masked and not tied
+        empty = expected_empty_support(cell_id)
+        emitted = not masked and not tied and not empty
         sign = "zero"
         influence = 0.0
         if labels["pair_geometry"].endswith("_positive"):
@@ -121,7 +122,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "cell_ordinal": ordinal,
             "seed_index": seed_index,
             "seed_sha256": _expected_seed_hash(self.preregistration, cell_id, seed_index),
-            "status": "masked_target" if masked else "singular_local_information" if tied else "valid",
+            "status": "masked_target" if masked else "singular_local_information" if tied else "empty_support" if empty else "valid",
             "emitted": emitted,
             "factor_emitted": emitted,
             "raw_input_shape": frozen["raw_input_shape"],
@@ -151,7 +152,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 if frozen["union_source_count"]
                 else 0.0
             ),
-            "signed_cross_influence": None if masked or tied else influence,
+            "signed_cross_influence": None if masked or tied or empty else influence,
             "signed_influence_sign": sign,
             "effective_looks_fraction": frozen["effective_looks_fraction"],
             "effective_looks_application": "source_influence_joint_contraction_v1",
@@ -383,8 +384,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             FROZEN_CELL_COUNT * execution["max_encoded_cell_summary_bytes"]
             + FROZEN_SHARD_COUNT * execution["max_encoded_shard_manifest_bytes"]
             + execution["max_encoded_run_manifest_bytes"]
-            + execution["max_production_hdf5_bytes"]
-            + execution["max_production_sidecar_bytes"]
+            + 2 * execution["max_production_hdf5_bytes"]
+            + 2 * execution["max_production_sidecar_bytes"]
         )
         self.assertEqual(derived, FROZEN_RETAINED_SIZE_BOUND_BYTES)
         self.assertLess(derived, 32 << 30)
@@ -393,7 +394,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
 
     def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
         self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 2_891_776)
-        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 21_831_680)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 23_928_832)
         encoded = compact_json_line({"cell": 1})
         with tempfile.TemporaryDirectory() as directory:
             exact = _CellSummarySink(Path(directory) / "exact.jsonl")
@@ -467,9 +468,9 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
     def test_portable_tables_cover_every_frozen_coordinate_and_date(self):
         coverage = portable_table_coverage(self.preregistration)
         self.assertEqual(coverage["cell_count"], FROZEN_CELL_COUNT)
-        self.assertEqual(coverage["coordinate_count"], 29007)
+        self.assertEqual(coverage["coordinate_count"], 29243)
         self.assertEqual(coverage["amplitude_argument_count"], 1106)
-        self.assertEqual(coverage["slope_argument_count"], 397)
+        self.assertEqual(coverage["slope_argument_count"], 399)
         self.assertEqual(coverage["date_count"], 20)
 
     def test_portable_table_asset_is_relative_bounded_and_exact_byte_bound(self):
@@ -713,8 +714,44 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         accumulator = self._accumulator(tied)
         accumulator.add(attempt)
         summary = accumulator.finalize()
-        self.assertEqual(summary["status"], "not_evaluable")
+        self.assertEqual(summary["status"], "pass")
         self.assertEqual(summary["status_histogram"]["singular_local_information"], 1)
+
+    def test_expected_empty_support_is_a_verified_passing_abstention(self):
+        cell_id = next(
+            cell_id
+            for cell_id in expected_cell_ids(self.preregistration)
+            if expected_empty_support(cell_id)
+        )
+        attempt = self._attempt(cell_id, 0, 0)
+        accumulator = self._accumulator(cell_id)
+        accumulator.add(attempt)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["status"], "pass")
+        self.assertEqual(summary["status_histogram"]["empty_support"], 1)
+
+    def test_unexpected_production_abstention_forces_not_evaluable(self):
+        attempt = self._attempt(CELL, 0, 0)
+        attempt["status"] = "singular_local_information"
+        attempt["emitted"] = False
+        attempt["factor_emitted"] = False
+        attempt["signed_cross_influence"] = None
+        for name in (
+            "target_estimate_history",
+            "reference_estimate_history",
+            "predicted_difference_covariance",
+            "production_operator_matrix",
+            "contrast_weights",
+        ):
+            attempt[name] = None
+        for name in ("estimate_sha256", "predicted_covariance_sha256", "operator_sha256"):
+            attempt[name] = "0" * 64
+        accumulator = self._accumulator(CELL)
+        accumulator.add(attempt)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["status"], "not_evaluable")
+        self.assertEqual(summary["failure_histogram"], {"singular_local_information": 1})
+        validate_cell_summary(self.preregistration, summary, CELL, 0, CODE, BINARY)
 
     def test_negative_pair_dgp_has_negative_target_reference_error_loading(self):
         negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative").replace(
@@ -817,11 +854,58 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 "factor_digest": evidence["factor_digest"],
                 "persisted_factor_digest": evidence["persisted_factor_digest"],
                 "estimator_branch": evidence["estimator"],
+                "bounded_hdf5_path": evidence["bounded_hdf5_path"],
+                "bounded_sidecar_path": evidence["bounded_sidecar_path"],
+                "bounded_hdf5_sha256": evidence["bounded_hdf5_sha256"],
+                "bounded_sidecar_sha256": evidence["bounded_sidecar_sha256"],
+                "runtime_resource_receipt_digest": evidence["runtime_resource_receipt_digest"],
+                "bounded_runtime_resource_receipt_digest": evidence["bounded_runtime_resource_receipt_digest"],
             }
             validate_production_parity_fixture(
                 self.preregistration, Path(directory), binding, sha256_json(binding)
             )
             (Path(directory) / binding["hdf5_path"]).write_bytes(b"tamper")
+            with self.assertRaisesRegex(SchemaError, "production parity"):
+                validate_production_parity_fixture(
+                    self.preregistration, Path(directory), binding, sha256_json(binding)
+                )
+
+    def test_production_parity_rejects_bounded_sidecar_corruption(self):
+        request = {
+            "schema": "dolphinrust.spatial-covariance.attempt/4",
+            "cell_id": CELL,
+            "cell_ordinal": 0,
+            "seed_index": 0,
+            "seed_sha256": "0" * 64,
+            **dict(zip(self.preregistration["matrix_contract"]["dimension_order"], CELL.split("|"))),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                [
+                    "cargo", "run", "--quiet", "-p", "dolphin-workflows",
+                    "--no-default-features", "--features", "no-gpu", "--example",
+                    "spatial_covariance_batch", "--", "--parity-fixture",
+                    "--artifact-directory", directory,
+                ],
+                input=json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n",
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).parents[2],
+            )
+            evidence = json.loads(completed.stdout)
+            binding = {
+                "schema": "dolphinrust.spatial-covariance.production-parity-fixture/4",
+                **{name: evidence[name] for name in (
+                    "hdf5_path", "sidecar_path", "hdf5_sha256", "sidecar_sha256",
+                    "hdf5_schema_version", "manifest_schema_version", "coupling", "seed_index",
+                    "factor_digest", "persisted_factor_digest", "bounded_hdf5_path",
+                    "bounded_sidecar_path", "bounded_hdf5_sha256", "bounded_sidecar_sha256",
+                    "runtime_resource_receipt_digest", "bounded_runtime_resource_receipt_digest",
+                )},
+                "estimator_branch": evidence["estimator"],
+            }
+            (Path(directory) / binding["bounded_sidecar_path"]).write_text("{}")
             with self.assertRaisesRegex(SchemaError, "production parity"):
                 validate_production_parity_fixture(
                     self.preregistration, Path(directory), binding, sha256_json(binding)

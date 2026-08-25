@@ -73,12 +73,12 @@
     "max_encoded_cell_summary_bytes": 8192,
     "max_encoded_shard_manifest_bytes": 16384,
     "max_encoded_run_manifest_bytes": 16777216,
-    "retained_size_bound_bytes": 21831680,
+    "retained_size_bound_bytes": 23928832,
     "process_rss_bytes_max": 25769803776,
     "partial_suffix": ".partial",
-    "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one bounded production HDF5 parity fixture commits at run scope",
+    "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
     "resume_rule": "reuse requires Rust spatial_covariance_batch replay from seed zero and exact regenerated attempt digest plus byte-identical independently recomputed summary; without that executable the cell is not reusable",
-    "manifest_read": "read bounded bytes once with pre/open/post identity checks, then hash and parse those same bytes; the single run-scope production HDF5 is streamed once under its frozen cap",
+    "manifest_read": "read bounded bytes once with pre/open/post identity checks, then hash and parse those same bytes; each whole-frame and bounded run-scope production HDF5 is streamed once under its frozen per-artifact cap",
     "malformed_record_rule": "fail current cell without commit; previously committed cells remain reusable only after exact replay",
     "result_root": "sha256_domain_separated_ordered_shard_manifest_digests_v2",
     "performance_probe": {
@@ -114,14 +114,14 @@
   "determinism": {
     "text_encoding": "UTF-8",
     "dgp_generator_identity_sha256": "01e37bafdb852875b2c435597ee1c945dfc3d4fcd6824a7e39d8bf676a48bf18",
-    "dgp_generator_identity_definition": "canonical SHA-256 of the frozen v4 DGP-generating snapshot, including generator version, seed schedule, scientific axes, coordinate/topology tables, portable table identities, and numeric operation order; receipt, scorer, status, and resource metadata are excluded",
+    "dgp_generator_identity_definition": "frozen v4 counter-generator version identity; cell ordinal, seed, coordinate, date, and stream are separate counter-key fields, while exact portable-table bytes and coordinate coverage are bound by their own hashes without globally rekeying unchanged source histories; receipt, scorer, status, resource, and coverage-only table extensions are excluded",
     "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le matched_cohort_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
     "counter_domain": "dolphinrust:spatial-covariance-dgp:v1\\0",
     "matched_cell_ordinal": "negative signed geometries use the otherwise-identical positive geometry cell ordinal so matched marginals share draws",
     "normal_transform": "first uint64_le word of the counter digest; index=word>>(64-index_bits); exact IEEE754 binary64 value loaded from the frozen midpoint inverse-normal LUT; no runtime logarithm, square root, sine, or cosine",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
-    "coefficient_sha256": "2c531b7366441ca255065098e4a3c35a4d9220596c2e9a3e7ad4ae1f8a71abb0",
-    "portable_table_sha256": "2152045c9eaedaa5fe423178a0acee621deb43fae562dae34f9dd195f1afa299",
+    "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
+    "portable_table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff",
     "complex_normal": "four independent named local streams and four matched-cell global streams per source-factor halo coordinate/date; signed coupling conjugates only the negative-loading latent-frame stochastic base before the common frozen phasor",
     "complex_storage": "fixed scalar operation order, fused multiply-add prohibited, final real and imaginary components rounded to IEEE754 binary32; negative loading negates only latent-base imaginary binary64 before rotation",
     "matrix_order": "source coordinates row-major, acquisition ascending, component real then imag; estimate histories target then reference; covariance and online reductions row-major",
@@ -159,7 +159,7 @@
       "production_operator_matrix",
       "contrast_weights"
     ],
-    "production_artifact_validation": "one bounded production parity fixture per run is written by Rust, re-read through dolphin-io, stream-hashed with its actual JSON provenance sidecar, and bound separately from the ephemeral attempt stream",
+    "production_artifact_validation": "one whole-frame and one bounded production parity fixture per run are emitted through ProductionCovarianceState, re-read through dolphin-io, stream-hashed with their actual JSON provenance sidecars, and bound separately from the ephemeral attempt stream",
     "self_attested_metric_policy": "no Rust metric, stochastic oracle, realized noisy truth, nested allocation record, or unattached artifact digest is accepted; Python regenerates raw DGP and latent histories, derives deterministic 2N phase-joint oracles, and derives stochastic operator error from bounded online empirical estimator-error covariance",
     "canonical_hashes": "SHA-256 over frozen streaming raw encoding and numeric encodings with domain tags raw-input-v4, source-raw-input-v4, latent-phase-history-v4, estimate-history-v4, predicted-difference-covariance-v4, production-operator-v4, dense-oracle-v4, mean-predicted-covariance-v4, empirical-error-covariance-v4"
   },
@@ -989,24 +989,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              129,
+              129
             ],
             "border_clamped": [
-              2,
-              2
+              3,
+              3
             ],
             "tile_edge": [
-              128,
-              252
+              129,
+              253
             ],
             "bounded_halo": [
-              64,
-              64
+              65,
+              65
             ],
             "masked": [
-              128,
-              128
+              129,
+              129
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1071,24 +1071,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              130,
+              130
             ],
             "border_clamped": [
-              4,
-              4
+              6,
+              6
             ],
             "tile_edge": [
-              128,
-              248
+              130,
+              250
             ],
             "bounded_halo": [
-              64,
-              64
+              66,
+              66
             ],
             "masked": [
-              128,
-              128
+              130,
+              130
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1235,24 +1235,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              129,
+              129
             ],
             "border_clamped": [
-              6,
-              12
+              7,
+              13
             ],
             "tile_edge": [
-              128,
-              244
+              129,
+              245
             ],
             "bounded_halo": [
-              64,
-              64
+              65,
+              65
             ],
             "masked": [
-              128,
-              128
+              129,
+              129
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1317,24 +1317,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              130,
+              130
             ],
             "border_clamped": [
-              12,
-              24
+              14,
+              26
             ],
             "tile_edge": [
-              128,
-              232
+              130,
+              234
             ],
             "bounded_halo": [
-              64,
-              64
+              66,
+              66
             ],
             "masked": [
-              128,
-              128
+              130,
+              130
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1481,24 +1481,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              129,
+              129
             ],
             "border_clamped": [
-              14,
-              28
+              15,
+              29
             ],
             "tile_edge": [
-              128,
-              228
+              129,
+              229
             ],
             "bounded_halo": [
-              64,
-              64
+              65,
+              65
             ],
             "masked": [
-              128,
-              128
+              129,
+              129
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1563,24 +1563,24 @@
           ],
           "target_by_position": {
             "interior": [
-              128,
-              128
+              130,
+              130
             ],
             "border_clamped": [
-              28,
-              56
+              30,
+              58
             ],
             "tile_edge": [
-              128,
-              200
+              130,
+              202
             ],
             "bounded_halo": [
-              64,
-              64
+              66,
+              66
             ],
             "masked": [
-              128,
-              128
+              130,
+              130
             ]
           },
           "reference_delta_by_pair_geometry": {
@@ -1665,12 +1665,13 @@
         "nondifferentiable_node"
       ],
       "not_evaluable_if": [
-        "empty_support",
-        "singular_local_information"
+        "unexpected_empty_support",
+        "unexpected_singular_local_information"
       ],
       "expected_abstention_if": [
         "masked_target",
-        "nondifferentiable_node"
+        "empty_support",
+        "singular_local_information"
       ],
       "receipt_failure_if": [
         "invalid_reference",
@@ -2057,8 +2058,8 @@
       "reference provenance",
       "estimator branch"
     ],
-    "retention": "only cell summaries with bounded online sums/counts/per-date vectors/digests, shard manifests, run manifest, one bounded production parity HDF5 plus sidecar, performance probe, bounded captured stdout resource receipts, and resource aggregates; ephemeral attempt transport and preparation descriptors are durably deleted after verified commit",
-    "verification": "regenerate full raw DGP and latent histories for every attempt; use exact independent 2N phase-joint oracle only for deterministic fixtures and bounded online empirical estimator-error covariance for stochastic cells; independently derive E C E-prime, operator and contrast errors, signed cross covariance, PSD, intervals, and coverage; read and hash one actual production HDF5 v4 and manifest v3 sidecar via Rust and bind separate factor/reference/estimator provenance; reuse requires exact Rust replay",
+    "retention": "only cell summaries with bounded online sums/counts/per-date vectors/digests, shard manifests, run manifest, whole-frame and bounded production parity HDF5 artifacts plus sidecars, performance probe, bounded captured stdout resource receipts, and resource aggregates; ephemeral attempt transport, production operator inputs, source members, and preparation descriptors are durably deleted after verified commit",
+    "verification": "regenerate full raw DGP and latent histories for every attempt; use exact independent 2N phase-joint oracle only for deterministic fixtures and bounded online empirical estimator-error covariance for stochastic cells; independently derive E C E-prime, operator and contrast errors, signed cross covariance, PSD, intervals, and coverage; read and hash actual whole-frame and bounded production HDF5 v4 artifacts and manifest v3 sidecars via Rust and bind separate factor/reference/estimator provenance; reuse requires exact Rust replay",
     "manifest_read": "bounded bytes are read once with pre/open/post identity checks, then both hashed and parsed from those exact accepted bytes; HDF5 is stream-hashed once under its cap",
     "resource_hash": "sha256 canonical JSON of complete resource receipt excluding resource_hash; captured benchmark stdout bytes are hash checked and parsed, then every allocation model, dependency cone, microbatch, and component value and hash is independently recomputed",
     "aggregate_only_without_attempt_digest_rejected": true,
@@ -2068,10 +2069,10 @@
   "portable_dgp_asset": {
     "schema": "dolphinrust.spatial-covariance.portable-dgp-asset/1",
     "path": "spatial_covariance_portable_tables.json",
-    "byte_count": 3120555,
-    "sha256": "d2ea499ad4915903a33c0f64ad0b43d09a78aa46b1fcf2659b69ec60c91c9b12",
+    "byte_count": 3124967,
+    "sha256": "f2295c1448d93a061032699039e1096abbfb16d96e99b68a0fb07b340b269018",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
-    "coefficient_sha256": "2c531b7366441ca255065098e4a3c35a4d9220596c2e9a3e7ad4ae1f8a71abb0",
-    "table_sha256": "2152045c9eaedaa5fe423178a0acee621deb43fae562dae34f9dd195f1afa299"
+    "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
+    "table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff"
   }
 }
