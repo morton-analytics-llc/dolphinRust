@@ -686,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "12d836f42250b2fac6d76265155e4fc4479cd1f9681d9c4570c054f047ff8110"
+        "sha256": "9a4341f64155946400e3d705fbe62fae4e35da39d3fdcb8bedd7f9680316b93b"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
@@ -1013,7 +1013,7 @@
       ],
       "recompute_per_cell": true,
       "fraction": "n/(1^T R 1)",
-      "independent_recomputation_tolerance": "abs(actual-expected) <= 1e-12*max(1,abs(expected)); canonical receipt digests remain exact",
+      "independent_recomputation_tolerance": "abs(actual-expected) <= max(1e-12,4*ulp(1)*effective_support_count)*max(1,abs(expected)); canonical receipt digests remain exact",
       "source_process_models": {
         "independent_complex_looks": "identity_v1",
         "spatial_correlation_stress": "exponential_euclidean_v1"

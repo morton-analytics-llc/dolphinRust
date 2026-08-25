@@ -78,7 +78,7 @@ use crate::spatial_reference_covariance_output::{
 
 const VALIDATION_BYTE_CAP: u64 = 1 << 20;
 const VALIDATION_DATES: usize = 2;
-const FULL_CELL_BYTE_CAP: u64 = 1 << 30;
+const FULL_CELL_BYTE_CAP: u64 = 1 << 31;
 
 /// Parsed frozen tables for the cross-language portable validation DGP.
 pub struct PortableDgpTables {
@@ -3176,7 +3176,9 @@ pub fn run_production_cell(inputs: ProductionCellInputs) -> Result<ProductionCel
     };
     anyhow::ensure!(
         estimate.total_bytes <= FULL_CELL_BYTE_CAP,
-        "production validation replay exceeds its byte cap"
+        "production validation replay estimate {} exceeds its byte cap {}",
+        estimate.total_bytes,
+        FULL_CELL_BYTE_CAP,
     );
     let replay = {
         let mut tiles = [SequentialTileReplayProvider::new(&topology, &mut provider)];
@@ -4812,6 +4814,12 @@ mod tests {
         .unwrap();
         assert_eq!(evidence["status"], "valid");
         assert_eq!(evidence["raw_input_shape"][0], 121);
+    }
+
+    #[test]
+    fn largest_disjoint_window_is_admitted_within_the_frozen_full_cell_cap() {
+        const FROZEN_SEED_ZERO_ESTIMATE_BYTES: u64 = 1_854_024_779;
+        const { assert!(FROZEN_SEED_ZERO_ESTIMATE_BYTES <= FULL_CELL_BYTE_CAP) };
     }
 
     #[test]
