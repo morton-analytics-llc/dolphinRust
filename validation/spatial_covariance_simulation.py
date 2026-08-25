@@ -1137,6 +1137,37 @@ def _digest_update(digest: Any, value: Mapping[str, Any]) -> None:
     digest.update(encoded)
 
 
+def _matched_marginal_identity(regenerated: Mapping[str, Any]) -> dict[str, Any]:
+    fields = (
+        "target_support_sha256",
+        "reference_support_sha256",
+        "sequential_ancestry_sha256",
+        "latent_history_sha256",
+        "target_marginal_oracle_sha256",
+        "reference_marginal_oracle_sha256",
+        "source_correlation_receipt_sha256",
+        "target_coordinate",
+        "reference_coordinate",
+        "date_axis_sha256",
+        "raw_input_shape",
+        "raw_input_value_count",
+        "target_source_count",
+        "reference_source_count",
+        "intersection_source_count",
+        "union_source_count",
+        "effective_support_union_count",
+        "effective_looks_fraction",
+        "source_correlation_model",
+        "source_correlation_distance_scale_pixels",
+    )
+    if any(field not in regenerated for field in fields):
+        raise SchemaError("matched signed DGP omits a frozen marginal identity field")
+    return {
+        "schema": "dolphinrust.spatial-covariance.matched-marginal-identity/1",
+        **{field: regenerated[field] for field in fields},
+    }
+
+
 def generate_matched_pair_cohorts(
     preregistration: Mapping[str, Any],
     preregistration_path: Path,
@@ -1222,17 +1253,12 @@ def generate_matched_pair_cohorts(
                 regenerated.append(
                     regenerate_frozen_attempt_inputs(preregistration, cell_id, seed_index)
                 )
-            equality_fields = (
-                "target_support_sha256", "reference_support_sha256",
-                "latent_history_sha256", "raw_dgp_identity_sha256",
-                "target_marginal_oracle_sha256", "reference_marginal_oracle_sha256",
-                "target_coordinate", "reference_coordinate", "date_axis_sha256",
-                "target_source_count", "reference_source_count", "union_source_count",
-                "source_correlation_model", "source_correlation_distance_scale_pixels",
-            )
-            if any(regenerated[0][name] != regenerated[1][name] for name in equality_fields):
+            marginal_identities = [
+                _matched_marginal_identity(value) for value in regenerated
+            ]
+            if marginal_identities[0] != marginal_identities[1]:
                 raise SchemaError("matched signed Rust cohorts do not share exact marginals")
-            common = {name: regenerated[0][name] for name in equality_fields}
+            common = marginal_identities[0]
             common["seed_index"] = seed_index
             _digest_update(marginal_digest, common)
             _digest_update(target_support_digest, {

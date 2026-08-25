@@ -195,7 +195,7 @@
       "positive_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
       "negative_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
       "seed_count": 512,
-      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's marginal source/support/latent/orientation identity before reducing predicted and empirical traces; independent is derived only from the paired marginal target/reference traces"
+      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's canonical matched-marginal identity for support, ancestry, latent truth, marginal oracles, correlation receipt, coordinates, shape, counts, and source process before reducing predicted and empirical traces; signed joint raw DGP identities intentionally differ and remain bound by the positive/negative attempt digests; independent is derived only from the paired marginal target/reference traces"
     },
     "max_production_sidecar_bytes": 1048576
   },
@@ -627,7 +627,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "a4a6c68790dc7368031d8b5b63e6f6f5ba2fe1f8e46a9e177a2921c4ff2db94e"
+        "sha256": "204831714f38b5923009d25d589d537ab56a4cce11ae0480eb4ea764ab40b920"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
