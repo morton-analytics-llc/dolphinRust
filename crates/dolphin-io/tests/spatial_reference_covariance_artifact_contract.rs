@@ -1,9 +1,10 @@
 use dolphin_io::{
     read_spatial_reference_covariance_block, read_spatial_reference_covariance_header,
-    spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
-    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
-    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    spatial_reference_calibration_scope_digest, spatial_reference_runtime_resource_receipt_digest,
+    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
+    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
+    SpatialReferenceCovarianceStatus, SpatialReferenceCovarianceWriter,
+    SpatialReferenceRuntimeResourceReceipt, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
     SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
     SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
@@ -47,7 +48,7 @@ fn digest(byte: u8) -> String {
 #[test]
 fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_blocks() {
     let _hdf5 = hdf5_guard();
-    assert_eq!(SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, 3);
+    assert_eq!(SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, 4);
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_streaming_{}.h5",
         std::process::id()
@@ -103,6 +104,46 @@ fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_
     std::fs::remove_file(partial_path).unwrap();
 }
 
+#[test]
+fn runtime_resource_receipt_seals_observed_provider_peak_and_rejects_tamper() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_runtime_resource_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let initial = metadata();
+    let mut writer = SpatialReferenceCovarianceWriter::create(&path, &initial).unwrap();
+    writer.write_block(&block()).unwrap();
+    let observed = SpatialReferenceRuntimeResourceReceipt {
+        provider_peak_count: 1,
+        provider_peak_bytes: 256,
+        ..initial.runtime_resource_receipt.unwrap()
+    };
+    let sealed = writer.seal_runtime_resource_receipt(observed).unwrap();
+    assert_eq!(sealed.runtime_resource_receipt, Some(observed));
+    assert_eq!(
+        sealed.runtime_resource_receipt_digest,
+        spatial_reference_runtime_resource_receipt_digest(observed)
+    );
+    writer.finish().unwrap();
+    assert_eq!(
+        read_spatial_reference_covariance_header(&path, 4096)
+            .unwrap()
+            .runtime_resource_receipt,
+        Some(observed)
+    );
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.dataset("metadata/provider_peak_bytes")
+        .unwrap()
+        .write_raw(&[257_u64])
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+    assert!(read_spatial_reference_covariance_header(&path, 4096).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
 fn grid(row_start: u64, rows: u32) -> CovarianceOperatorGrid {
     CovarianceOperatorGrid {
         row_start,
@@ -115,6 +156,16 @@ fn grid(row_start: u64, rows: u32) -> CovarianceOperatorGrid {
 }
 
 fn metadata() -> SpatialReferenceCovarianceMetadata {
+    let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
+        aggregate_byte_cap: 4096,
+        factor_block_high_water_bytes: 512,
+        serialization_high_water_bytes: 512,
+        fixed_l2_workspace_bytes: 1024,
+        replay_reservation_high_water_bytes: 2048,
+        provider_peak_count: 2,
+        provider_peak_bytes: 1024,
+        aggregate_high_water_bytes: 4096,
+    };
     SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
         method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
@@ -137,6 +188,10 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_signature_digest: digest(0x44),
         approximation_receipt_digest: digest(0x55),
         resource_receipt_digest: digest(0x66),
+        runtime_resource_receipt_digest: spatial_reference_runtime_resource_receipt_digest(
+            runtime_resource_receipt,
+        ),
+        runtime_resource_receipt: Some(runtime_resource_receipt),
         review_receipt_digest: String::new(),
         method_manifest_digest: String::new(),
         calibration_scope_digest: String::new(),
@@ -502,7 +557,7 @@ fn calibrated_scope_requires_and_binds_an_exact_producer_code_identity() {
 }
 
 #[test]
-fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v3() {
+fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v4() {
     let _hdf5 = hdf5_guard();
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_legacy_v2_{}.h5",
@@ -522,6 +577,21 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v3()
     let metadata_group = file.group("metadata").unwrap();
     metadata_group.unlink("geotransform").unwrap();
     metadata_group.unlink("acquisition_days").unwrap();
+    metadata_group
+        .unlink("runtime_resource_receipt_digest")
+        .unwrap();
+    for name in [
+        "aggregate_byte_cap",
+        "factor_block_high_water_bytes",
+        "serialization_high_water_bytes",
+        "fixed_l2_workspace_bytes",
+        "replay_reservation_high_water_bytes",
+        "provider_peak_count",
+        "provider_peak_bytes",
+        "aggregate_high_water_bytes",
+    ] {
+        metadata_group.unlink(name).unwrap();
+    }
     let block_group = file.group("blocks/00000000000000000007").unwrap();
     for name in [
         "effective_looks_fraction",
@@ -538,6 +608,7 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v3()
     assert_eq!(legacy.schema_version, 2);
     assert_eq!(legacy.geotransform, None);
     assert_eq!(legacy.acquisition_days, None);
+    assert_eq!(legacy.runtime_resource_receipt, None);
     let legacy_block = read_spatial_reference_covariance_block(&path, 7, 4096)
         .unwrap()
         .block;
@@ -547,6 +618,68 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v3()
     assert_eq!(legacy_block.effective_looks_receipt, None);
     assert_eq!(legacy_block.resource_high_water_bytes, None);
     assert!(SpatialReferenceCovarianceWriter::create(&path, &legacy).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn previous_v3_layout_without_coordinates_or_runtime_receipts_remains_readable() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_previous_v3_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    write_spatial_reference_covariance(&path, &metadata(), &[block()]).unwrap();
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.attr("schema_version")
+        .unwrap()
+        .write_scalar(&3_u16)
+        .unwrap();
+    let metadata_group = file.group("metadata").unwrap();
+    for name in [
+        "geotransform",
+        "acquisition_days",
+        "runtime_resource_receipt_digest",
+        "aggregate_byte_cap",
+        "factor_block_high_water_bytes",
+        "serialization_high_water_bytes",
+        "fixed_l2_workspace_bytes",
+        "replay_reservation_high_water_bytes",
+        "provider_peak_count",
+        "provider_peak_bytes",
+        "aggregate_high_water_bytes",
+    ] {
+        metadata_group.unlink(name).unwrap();
+    }
+    let block_group = file.group("blocks/00000000000000000007").unwrap();
+    for name in [
+        "effective_looks_fraction",
+        "support_union_count",
+        "effective_looks_receipt",
+        "resource_high_water_bytes",
+    ] {
+        block_group.unlink(name).unwrap();
+    }
+    file.flush().unwrap();
+    file.close().unwrap();
+
+    let mut expected = metadata();
+    expected.schema_version = 3;
+    expected.geotransform = None;
+    expected.acquisition_days = None;
+    expected.runtime_resource_receipt_digest.clear();
+    expected.runtime_resource_receipt = None;
+    assert_eq!(
+        read_spatial_reference_covariance_header(&path, 4096).unwrap(),
+        expected
+    );
+    let previous = read_spatial_reference_covariance_block(&path, 7, 4096)
+        .unwrap()
+        .block;
+    assert_eq!(previous.effective_looks_fraction, None);
+    assert_eq!(previous.support_union_count, None);
+    assert_eq!(previous.effective_looks_receipt, None);
+    assert_eq!(previous.resource_high_water_bytes, None);
     std::fs::remove_file(path).unwrap();
 }
 

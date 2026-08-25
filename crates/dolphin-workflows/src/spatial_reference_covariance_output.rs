@@ -8,16 +8,18 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use dolphin_core::config::{CorrectionOptions, DisplacementWorkflow, ShpMethod, UnwrapMethod};
 use dolphin_io::{
-    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
+    spatial_reference_runtime_resource_receipt_digest, CovarianceOperatorGrid,
+    SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
     SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
-    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
-    SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+    SpatialReferenceCovarianceWriter, SpatialReferenceRuntimeResourceReceipt,
+    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
+    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
 use dolphin_timeseries::inversion::{fixed_l2_pixel_map, PixelL2MapError, PixelL2ObservationMap};
 use dolphin_timeseries::spatial_covariance::{
-    propagate_fixed_l2_difference_covariance, FixedL2DifferenceCovariance, SpatialL2Branch,
-    SpatialL2Error, SpatialL2Status,
+    fixed_l2_difference_workspace_composition, propagate_fixed_l2_difference_covariance,
+    FixedL2DifferenceCovariance, FixedL2WorkspaceComposition, SpatialL2Branch, SpatialL2Error,
+    SpatialL2Status,
 };
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use sha2::{Digest, Sha256};
@@ -30,6 +32,7 @@ use crate::cslc_covariance_source::{CslcCovarianceManifest, CslcCovarianceSource
 use crate::displacement::PreparedBurstMask;
 use crate::sequential::SequentialConfig;
 use crate::sequential_covariance::{
+    estimate_global_reference_difference_covariance_from_provider_bundle,
     replay_global_reference_difference_covariance_from_provider_bundle,
     sequential_replay_config_digest, sequential_replay_kernel_digest,
     CovarianceArtifactReplayProvider, EffectiveLooksReplay, GlobalDateId,
@@ -43,7 +46,7 @@ use crate::spatial_covariance_artifact::{
     SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
 };
 
-const PRODUCTION_REFERENCE_REPLAY_BYTE_CAP: u64 = 1_073_741_824;
+const PRODUCTION_REFERENCE_AGGREGATE_BYTE_CAP: u64 = 1_073_741_824;
 const EFFECTIVE_LOOKS_MODEL: &str = "source_factor_declared_v1";
 const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
 
@@ -66,6 +69,7 @@ pub(crate) struct ProductionCovarianceReplayContext {
     pub(crate) operator_block_byte_cap: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct TargetFactor {
     pub(crate) status: SpatialReferenceCovarianceStatus,
     pub(crate) source_burst_index: u32,
@@ -231,6 +235,7 @@ fn production_target_receipt(
     digest.finalize().into()
 }
 
+#[cfg(test)]
 pub(crate) fn build_factor_block(
     block_id: u64,
     target_grid: CovarianceOperatorGrid,
@@ -238,49 +243,97 @@ pub(crate) fn build_factor_block(
     phase_to_displacement: f64,
     outcomes: &[TargetFactor],
 ) -> Result<SpatialReferenceCovarianceBlock> {
-    let targets = usize::try_from(target_grid.rows)
-        .ok()
-        .and_then(|rows| {
-            usize::try_from(target_grid.cols)
-                .ok()
-                .and_then(|cols| rows.checked_mul(cols))
+    let mut builder = FactorBlockBuilder::new(block_id, target_grid, dates, phase_to_displacement)?;
+    for outcome in outcomes.iter().cloned() {
+        builder.push(outcome)?;
+    }
+    builder.finish()
+}
+
+struct FactorBlockBuilder {
+    block_id: u64,
+    target_grid: CovarianceOperatorGrid,
+    dates: usize,
+    phase_to_displacement: f64,
+    targets: usize,
+    difference_factor: Vec<f64>,
+    rank_by_target: Vec<u32>,
+    status: Vec<SpatialReferenceCovarianceStatus>,
+    source_burst_index_by_target: Vec<u32>,
+    effective_looks_fraction: Vec<f64>,
+    support_union_count: Vec<u64>,
+    effective_looks_receipt: Vec<u8>,
+    resource_high_water_bytes: Vec<u64>,
+    receipt: Sha256,
+}
+
+impl FactorBlockBuilder {
+    fn new(
+        block_id: u64,
+        target_grid: CovarianceOperatorGrid,
+        dates: usize,
+        phase_to_displacement: f64,
+    ) -> Result<Self> {
+        let targets = usize::try_from(target_grid.rows)
+            .ok()
+            .and_then(|rows| {
+                usize::try_from(target_grid.cols)
+                    .ok()
+                    .and_then(|cols| rows.checked_mul(cols))
+            })
+            .context("spatial covariance target grid area exceeds usize")?;
+        anyhow::ensure!(
+            dates > 0 && phase_to_displacement.is_finite(),
+            "spatial covariance block inputs disagree"
+        );
+        let factor_len = targets
+            .checked_mul(dates)
+            .and_then(|value| value.checked_mul(dates))
+            .context("spatial covariance factor block dimensions overflow")?;
+        let receipt_capacity = targets
+            .checked_mul(32)
+            .context("spatial covariance receipt block dimensions overflow")?;
+        let mut receipt = Sha256::new();
+        receipt.update(b"dolphinrust:production-source-factor-block:v1");
+        receipt.update(block_id.to_le_bytes());
+        hash_grid(&mut receipt, target_grid);
+        Ok(Self {
+            block_id,
+            target_grid,
+            dates,
+            phase_to_displacement,
+            targets,
+            difference_factor: vec![0.0; factor_len],
+            rank_by_target: Vec::with_capacity(targets),
+            status: Vec::with_capacity(targets),
+            source_burst_index_by_target: Vec::with_capacity(targets),
+            effective_looks_fraction: Vec::with_capacity(targets),
+            support_union_count: Vec::with_capacity(targets),
+            effective_looks_receipt: Vec::with_capacity(receipt_capacity),
+            resource_high_water_bytes: Vec::with_capacity(targets),
+            receipt,
         })
-        .context("spatial covariance target grid area exceeds usize")?;
-    anyhow::ensure!(
-        dates > 0 && targets == outcomes.len() && phase_to_displacement.is_finite(),
-        "spatial covariance block inputs disagree"
-    );
-    let maximum_rank = dates;
-    let factor_len = targets
-        .checked_mul(dates)
-        .and_then(|value| value.checked_mul(maximum_rank))
-        .context("spatial covariance factor block dimensions overflow")?;
-    let mut difference_factor = vec![0.0; factor_len];
-    let mut rank_by_target = Vec::with_capacity(targets);
-    let mut status = Vec::with_capacity(targets);
-    let mut source_burst_index_by_target = Vec::with_capacity(targets);
-    let mut effective_looks_fraction = Vec::with_capacity(targets);
-    let mut support_union_count = Vec::with_capacity(targets);
-    let mut effective_looks_receipt = Vec::with_capacity(targets * 32);
-    let mut resource_high_water_bytes = Vec::with_capacity(targets);
-    let mut receipt = Sha256::new();
-    receipt.update(b"dolphinrust:production-source-factor-block:v1");
-    receipt.update(block_id.to_le_bytes());
-    hash_grid(&mut receipt, target_grid);
-    for (target, outcome) in outcomes.iter().enumerate() {
-        let rank = match (&outcome.date_factor, outcome.status) {
+    }
+
+    fn push(&mut self, outcome: TargetFactor) -> Result<()> {
+        let target = self.status.len();
+        anyhow::ensure!(
+            target < self.targets,
+            "spatial covariance block is already full"
+        );
+        let rank = match (outcome.date_factor.as_ref(), outcome.status) {
             (Some(factor), SpatialReferenceCovarianceStatus::Valid) => {
                 anyhow::ensure!(
-                    factor.nrows() == dates
-                        && factor.ncols() <= maximum_rank
+                    factor.nrows() == self.dates
+                        && factor.ncols() <= self.dates
                         && factor.iter().all(|value| value.is_finite()),
                     "valid spatial covariance target factor is malformed"
                 );
-                for date in 0..dates {
-                    let start = (target * dates + date) * maximum_rank;
+                for date in 0..self.dates {
+                    let start = (target * self.dates + date) * self.dates;
                     for component in 0..factor.ncols() {
-                        difference_factor[start + component] =
-                            phase_to_displacement * factor[(date, component)];
+                        self.difference_factor[start + component] =
+                            self.phase_to_displacement * factor[(date, component)];
                     }
                 }
                 u32::try_from(factor.ncols()).context("target factor rank exceeds u32")?
@@ -298,34 +351,50 @@ pub(crate) fn build_factor_block(
                 || outcome.source_burst_index != SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
             "valid spatial covariance target is missing burst ownership"
         );
-        rank_by_target.push(rank);
-        status.push(outcome.status);
-        source_burst_index_by_target.push(outcome.source_burst_index);
-        effective_looks_fraction.push(outcome.effective_looks_fraction);
-        support_union_count.push(outcome.support_union_count);
-        effective_looks_receipt.extend_from_slice(&outcome.effective_looks_receipt);
-        resource_high_water_bytes.push(outcome.resource_high_water_bytes);
-        receipt.update((target as u64).to_le_bytes());
-        receipt.update((outcome.status as u16).to_le_bytes());
-        receipt.update(outcome.source_burst_index.to_le_bytes());
-        receipt.update(rank.to_le_bytes());
-        receipt.update(outcome.source_factor_receipt);
+        self.rank_by_target.push(rank);
+        self.status.push(outcome.status);
+        self.source_burst_index_by_target
+            .push(outcome.source_burst_index);
+        self.effective_looks_fraction
+            .push(outcome.effective_looks_fraction);
+        self.support_union_count.push(outcome.support_union_count);
+        self.effective_looks_receipt
+            .extend_from_slice(&outcome.effective_looks_receipt);
+        self.resource_high_water_bytes
+            .push(outcome.resource_high_water_bytes);
+        self.receipt.update((target as u64).to_le_bytes());
+        self.receipt.update((outcome.status as u16).to_le_bytes());
+        self.receipt
+            .update(outcome.source_burst_index.to_le_bytes());
+        self.receipt.update(rank.to_le_bytes());
+        self.receipt.update(outcome.source_factor_receipt);
+        Ok(())
     }
-    Ok(SpatialReferenceCovarianceBlock {
-        block_id,
-        target_grid,
-        maximum_rank: u32::try_from(maximum_rank).context("maximum factor rank exceeds u32")?,
-        rank_by_target,
-        status,
-        source_burst_index_by_target,
-        difference_factor,
-        approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; targets],
-        effective_looks_fraction: Some(effective_looks_fraction),
-        support_union_count: Some(support_union_count),
-        effective_looks_receipt: Some(effective_looks_receipt),
-        resource_high_water_bytes: Some(resource_high_water_bytes),
-        source_factor_digest: format!("sha256:{:x}", receipt.finalize()),
-    })
+
+    fn finish(self) -> Result<SpatialReferenceCovarianceBlock> {
+        anyhow::ensure!(
+            self.status.len() == self.targets,
+            "spatial covariance block is incomplete"
+        );
+        Ok(SpatialReferenceCovarianceBlock {
+            block_id: self.block_id,
+            target_grid: self.target_grid,
+            maximum_rank: u32::try_from(self.dates).context("maximum factor rank exceeds u32")?,
+            rank_by_target: self.rank_by_target,
+            status: self.status,
+            source_burst_index_by_target: self.source_burst_index_by_target,
+            difference_factor: self.difference_factor,
+            approximation_error_bound: vec![
+                SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE;
+                self.targets
+            ],
+            effective_looks_fraction: Some(self.effective_looks_fraction),
+            support_union_count: Some(self.support_union_count),
+            effective_looks_receipt: Some(self.effective_looks_receipt),
+            resource_high_water_bytes: Some(self.resource_high_water_bytes),
+            source_factor_digest: format!("sha256:{:x}", self.receipt.finalize()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,15 +570,6 @@ impl ProductionCovarianceState {
             branch_tolerance: replay_context.tiles[0].request.branch_tolerance,
         };
         let provider_residency = ProviderResidencyTracker::default();
-        for tile_index in 0..replay_context.tiles.len() {
-            drop(open_production_provider(
-                cfg,
-                replay_context,
-                &topologies,
-                build_identity,
-                tile_index,
-            )?);
-        }
         let dates = fixed_l2
             .pixel_map(reference)
             .map_err(anyhow::Error::new)?
@@ -535,6 +595,38 @@ impl ProductionCovarianceState {
         let source_rank = 2_usize
             .checked_mul(dates.min(sequential_cfg.ministack_size))
             .context("production source rank overflows usize")?;
+        let fixed_l2_workspace =
+            fixed_l2_difference_workspace_composition(dates).map_err(anyhow::Error::new)?;
+        let replay_reservation = preflight_production_replay_reservation(
+            reference_burst,
+            reference_output,
+            &ordered_dates,
+            source_rank,
+            build_identity.branch_tolerance,
+            cfg,
+            replay_context,
+            build_identity,
+            &provider_residency,
+            &topologies,
+        )?;
+        let block_shape = factor_block_shape(
+            validity.dim(),
+            dates,
+            PRODUCTION_REFERENCE_AGGREGATE_BYTE_CAP,
+            fixed_l2_workspace,
+            replay_reservation,
+        )?;
+        let planned_block_targets = block_shape
+            .0
+            .checked_mul(block_shape.1)
+            .context("planned factor block area overflows usize")?;
+        let preflight_resource_receipt = production_resource_admission(
+            planned_block_targets,
+            dates,
+            fixed_l2_workspace,
+            replay_reservation,
+            PRODUCTION_REFERENCE_AGGREGATE_BYTE_CAP,
+        )?;
         let full_grid = CovarianceOperatorGrid {
             row_start: u64::try_from(self.analysis_origin.0)?,
             col_start: u64::try_from(self.analysis_origin.1)?,
@@ -590,12 +682,12 @@ impl ProductionCovarianceState {
         let resource_receipt_digest = digest_string(
             b"dolphinrust:production-resource-admission:v1",
             &[
-                &PRODUCTION_REFERENCE_REPLAY_BYTE_CAP.to_le_bytes(),
+                &PRODUCTION_REFERENCE_AGGREGATE_BYTE_CAP.to_le_bytes(),
                 &replay_context.operator_block_byte_cap.to_le_bytes(),
                 &2_u64.to_le_bytes(),
             ],
         );
-        let metadata = SpatialReferenceCovarianceMetadata {
+        let mut metadata = SpatialReferenceCovarianceMetadata {
             schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
             method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
             method_version: 1,
@@ -620,6 +712,10 @@ impl ProductionCovarianceState {
             reference_signature_digest: sha256_string(reference_signature),
             approximation_receipt_digest,
             resource_receipt_digest,
+            runtime_resource_receipt_digest: spatial_reference_runtime_resource_receipt_digest(
+                preflight_resource_receipt,
+            ),
+            runtime_resource_receipt: Some(preflight_resource_receipt),
             review_receipt_digest: String::new(),
             method_manifest_digest: String::new(),
             calibration_scope_digest: String::new(),
@@ -633,7 +729,7 @@ impl ProductionCovarianceState {
             source_burst_ids: self.source_burst_ids.clone(),
             reference_source_burst_index: reference_owner,
             calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
-            maximum_block_bytes: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
+            maximum_block_bytes: PRODUCTION_REFERENCE_AGGREGATE_BYTE_CAP,
         };
         let transaction =
             SpatialReferenceCovarianceArtifactTransaction::acquire(&cfg.work_directory)?;
@@ -645,9 +741,7 @@ impl ProductionCovarianceState {
             .input_options
             .wavelength
             .map_or(1.0, |wavelength| -wavelength / (4.0 * std::f64::consts::PI));
-        let block_shape = factor_block_shape(validity.dim(), dates, metadata.maximum_block_bytes)?;
         let mut block_id = 0_u64;
-        let mut maximum_persisted_resource_bytes = 0_u64;
         for row_start in (0..validity.nrows()).step_by(block_shape.0) {
             let rows = block_shape.0.min(validity.nrows() - row_start);
             for col_start in (0..validity.ncols()).step_by(block_shape.1) {
@@ -660,11 +754,12 @@ impl ProductionCovarianceState {
                     stride_y: full_grid.stride_y,
                     stride_x: full_grid.stride_x,
                 };
-                let mut outcomes = Vec::with_capacity(rows * cols);
+                let mut builder =
+                    FactorBlockBuilder::new(block_id, target_grid, dates, phase_to_displacement)?;
                 for row in row_start..row_start + rows {
                     for column in col_start..col_start + cols {
                         let target = (row, column);
-                        outcomes.push(production_target_factor(
+                        builder.push(production_target_factor(
                             &self,
                             fixed_l2,
                             validity,
@@ -679,23 +774,11 @@ impl ProductionCovarianceState {
                             build_identity,
                             &provider_residency,
                             &topologies,
-                        )?);
+                            preflight_resource_receipt.replay_reservation_high_water_bytes,
+                        )?)?;
                     }
                 }
-                maximum_persisted_resource_bytes = maximum_persisted_resource_bytes.max(
-                    outcomes
-                        .iter()
-                        .map(|outcome| outcome.resource_high_water_bytes)
-                        .max()
-                        .unwrap_or(0),
-                );
-                writer.write_block(&build_factor_block(
-                    block_id,
-                    target_grid,
-                    dates,
-                    phase_to_displacement,
-                    &outcomes,
-                )?)?;
+                writer.write_block(&builder.finish()?)?;
                 block_id = block_id
                     .checked_add(1)
                     .context("factor block ID overflow")?;
@@ -706,9 +789,16 @@ impl ProductionCovarianceState {
             provider_receipt.current_count == 0
                 && provider_receipt.current_bytes == 0
                 && provider_receipt.peak_count <= 2
-                && provider_receipt.peak_bytes <= maximum_persisted_resource_bytes,
+                && provider_receipt.peak_bytes
+                    <= preflight_resource_receipt.replay_reservation_high_water_bytes,
             "production replay provider residency exceeded its two-provider bound"
         );
+        let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
+            provider_peak_count: u64::try_from(provider_receipt.peak_count)?,
+            provider_peak_bytes: provider_receipt.peak_bytes,
+            ..preflight_resource_receipt
+        };
+        metadata = writer.seal_runtime_resource_receipt(runtime_resource_receipt)?;
         let write_receipt = writer.finish()?;
         replay_context
             .source_manifest
@@ -964,6 +1054,134 @@ fn open_production_provider<'a>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn preflight_production_replay_reservation(
+    reference_burst: &str,
+    reference_output: (u64, u64),
+    ordered_dates: &[GlobalDateId],
+    source_rank: usize,
+    branch_tolerance: f64,
+    cfg: &DisplacementWorkflow,
+    replay_context: &ProductionCovarianceReplayContext,
+    build_identity: SequentialReplayBuildIdentity,
+    provider_residency: &ProviderResidencyTracker,
+    topologies: &[SequentialReplayTopology],
+) -> Result<u64> {
+    let mut maximum = 0_u64;
+    for tile_index in 0..replay_context.tiles.len() {
+        let provider =
+            open_production_provider(cfg, replay_context, topologies, build_identity, tile_index)?;
+        let reservation = provider.maximum_resident_bytes();
+        maximum = maximum.max(reservation);
+        drop(provider_residency.track(provider, reservation)?);
+    }
+    let reference_tile = owning_replay_tile(replay_context, reference_burst, reference_output)?;
+    for (target_tile, tile) in replay_context.tiles.iter().enumerate() {
+        if tile.request.burst_id != reference_burst {
+            continue;
+        }
+        let provider_plan = ActiveProviderPlan::new(target_tile, reference_tile);
+        if provider_plan.reference_tile.is_none() {
+            let provider = open_production_provider(
+                cfg,
+                replay_context,
+                topologies,
+                build_identity,
+                target_tile,
+            )?;
+            let reservation = provider.maximum_resident_bytes();
+            let mut provider = provider_residency.track(provider, reservation)?;
+            for row in 0..tile.request.owned_output_grid.rows {
+                for column in 0..tile.request.owned_output_grid.cols {
+                    let target = (
+                        tile.request.owned_output_grid.row_start + u64::from(row),
+                        tile.request.owned_output_grid.col_start + u64::from(column),
+                    );
+                    let query = GlobalReferenceCovarianceQuery {
+                        burst_id: reference_burst,
+                        target,
+                        reference: reference_output,
+                        ordered_dates,
+                        source_rank,
+                        byte_cap: u64::MAX,
+                        branch_tolerance,
+                    };
+                    let mut bundle = [SequentialTileReplayProvider::new(
+                        &topologies[target_tile],
+                        provider.provider_mut(),
+                    )];
+                    maximum = maximum.max(
+                        estimate_global_reference_difference_covariance_from_provider_bundle(
+                            &mut bundle,
+                            query,
+                        )?
+                        .total_bytes,
+                    );
+                }
+            }
+        } else {
+            let target_provider = open_production_provider(
+                cfg,
+                replay_context,
+                topologies,
+                build_identity,
+                target_tile,
+            )?;
+            let target_reservation = target_provider.maximum_resident_bytes();
+            let mut target_provider =
+                provider_residency.track(target_provider, target_reservation)?;
+            let reference_tile = provider_plan
+                .reference_tile
+                .context("two-provider replay plan lost its reference tile")?;
+            let reference_provider = open_production_provider(
+                cfg,
+                replay_context,
+                topologies,
+                build_identity,
+                reference_tile,
+            )?;
+            let reference_reservation = reference_provider.maximum_resident_bytes();
+            let mut reference_provider =
+                provider_residency.track(reference_provider, reference_reservation)?;
+            for row in 0..tile.request.owned_output_grid.rows {
+                for column in 0..tile.request.owned_output_grid.cols {
+                    let target = (
+                        tile.request.owned_output_grid.row_start + u64::from(row),
+                        tile.request.owned_output_grid.col_start + u64::from(column),
+                    );
+                    let query = GlobalReferenceCovarianceQuery {
+                        burst_id: reference_burst,
+                        target,
+                        reference: reference_output,
+                        ordered_dates,
+                        source_rank,
+                        byte_cap: u64::MAX,
+                        branch_tolerance,
+                    };
+                    let mut bundle = [
+                        SequentialTileReplayProvider::new(
+                            &topologies[target_tile],
+                            target_provider.provider_mut(),
+                        ),
+                        SequentialTileReplayProvider::new(
+                            &topologies[reference_tile],
+                            reference_provider.provider_mut(),
+                        ),
+                    ];
+                    maximum = maximum.max(
+                        estimate_global_reference_difference_covariance_from_provider_bundle(
+                            &mut bundle,
+                            query,
+                        )?
+                        .total_bytes,
+                    );
+                }
+            }
+        }
+    }
+    Ok(maximum)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn production_target_factor(
     state: &ProductionCovarianceState,
     fixed_l2: &FixedL2WorkflowInputs,
@@ -979,7 +1197,9 @@ fn production_target_factor(
     build_identity: SequentialReplayBuildIdentity,
     provider_residency: &ProviderResidencyTracker,
     topologies: &[SequentialReplayTopology],
+    query_byte_cap: u64,
 ) -> Result<TargetFactor> {
+    anyhow::ensure!(query_byte_cap > 0, "production replay byte cap is zero");
     if !validity[target] {
         return Ok(nonvalid_target(
             SpatialReferenceCovarianceStatus::MaskedTarget,
@@ -1009,10 +1229,10 @@ fn production_target_factor(
         reference: reference_output,
         ordered_dates,
         source_rank,
-        byte_cap: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
+        byte_cap: query_byte_cap,
         branch_tolerance,
     };
-    let (replay_result, active_provider_bytes) = if provider_plan.reference_tile.is_none() {
+    let (replay_result, _active_provider_bytes) = if provider_plan.reference_tile.is_none() {
         let provider = open_production_provider(
             cfg,
             replay_context,
@@ -1077,7 +1297,7 @@ fn production_target_factor(
         Err(error) => {
             return Ok(nonvalid_target_with_resource(
                 replay_status(error.status()),
-                active_provider_bytes,
+                query_byte_cap,
             ));
         }
     };
@@ -1096,7 +1316,7 @@ fn production_target_factor(
         Err(error) => {
             return Ok(nonvalid_target_with_resource(
                 fixed_l2_status(error.status),
-                replay.resource_high_water_bytes,
+                query_byte_cap,
             ));
         }
     };
@@ -1117,13 +1337,13 @@ fn production_target_factor(
             effective.support_union_count,
             effective.fraction,
             effective.receipt,
-            replay.resource_high_water_bytes,
+            query_byte_cap,
         ),
         effective_looks_fraction: effective.fraction,
         support_union_count: u64::try_from(effective.support_union_count)
             .context("effective-look support union exceeds u64")?,
         effective_looks_receipt: effective.receipt,
-        resource_high_water_bytes: replay.resource_high_water_bytes,
+        resource_high_water_bytes: query_byte_cap,
     })
 }
 
@@ -1173,19 +1393,61 @@ fn nonvalid_target_with_resource(
 fn factor_block_shape(
     shape: (usize, usize),
     dates: usize,
-    maximum_block_bytes: u64,
+    aggregate_byte_cap: u64,
+    fixed_l2_workspace: FixedL2WorkspaceComposition,
+    replay_reservation_bytes: u64,
 ) -> Result<(usize, usize)> {
-    let per_target = u64::try_from(dates)?
-        .checked_mul(u64::try_from(dates)?)
-        .and_then(|value| value.checked_mul(8))
-        .and_then(|value| value.checked_add(74))
-        .context("factor target payload bytes overflow u64")?;
-    let targets = usize::try_from(maximum_block_bytes / per_target)
+    let per_target = factor_target_payload_bytes(dates)?;
+    let available_for_blocks = aggregate_byte_cap
+        .checked_sub(fixed_l2_workspace.total_bytes)
+        .and_then(|bytes| bytes.checked_sub(replay_reservation_bytes))
+        .context("aggregate byte cap cannot hold fixed-L2 workspace and replay")?;
+    let targets = usize::try_from(available_for_blocks / per_target / 2)
         .context("factor target block capacity exceeds usize")?;
-    anyhow::ensure!(targets > 0, "factor byte cap cannot hold one target");
+    anyhow::ensure!(targets > 0, "aggregate byte cap cannot hold one target");
     let cols = shape.1.min(targets).max(1);
     let rows = shape.0.min(targets / cols).max(1);
     Ok((rows, cols))
+}
+
+fn factor_target_payload_bytes(dates: usize) -> Result<u64> {
+    u64::try_from(dates)?
+        .checked_mul(u64::try_from(dates)?)
+        .and_then(|value| value.checked_mul(8))
+        .and_then(|value| value.checked_add(74))
+        .context("factor target payload bytes overflow u64")
+}
+
+fn production_resource_admission(
+    targets: usize,
+    dates: usize,
+    fixed_l2_workspace: FixedL2WorkspaceComposition,
+    replay_reservation_high_water_bytes: u64,
+    aggregate_byte_cap: u64,
+) -> Result<SpatialReferenceRuntimeResourceReceipt> {
+    let factor_block_high_water_bytes = u64::try_from(targets)?
+        .checked_mul(factor_target_payload_bytes(dates)?)
+        .context("factor block payload bytes overflow u64")?;
+    let serialization_high_water_bytes = factor_block_high_water_bytes;
+    let aggregate_high_water_bytes = factor_block_high_water_bytes
+        .checked_add(serialization_high_water_bytes)
+        .and_then(|bytes| bytes.checked_add(fixed_l2_workspace.total_bytes))
+        .and_then(|bytes| bytes.checked_add(replay_reservation_high_water_bytes))
+        .context("aggregate resource admission overflows u64")?;
+    anyhow::ensure!(
+        aggregate_high_water_bytes <= aggregate_byte_cap,
+        "aggregate resource admission exceeds its byte cap"
+    );
+    Ok(SpatialReferenceRuntimeResourceReceipt {
+        aggregate_byte_cap,
+        factor_block_high_water_bytes,
+        serialization_high_water_bytes,
+        fixed_l2_workspace_bytes: fixed_l2_workspace.total_bytes,
+        replay_reservation_high_water_bytes,
+        provider_peak_count: 2,
+        provider_peak_bytes: replay_reservation_high_water_bytes,
+        aggregate_high_water_bytes,
+    })
 }
 
 fn support_method(method: ShpMethod) -> &'static str {
@@ -1860,15 +2122,32 @@ mod tests {
     fn factor_block_plan_is_rectangular_bounded_and_covers_narrow_caps() {
         let dates = 52;
         let per_target = (dates * dates * 8 + 74) as u64;
+        let workspace = fixed_l2_difference_workspace_composition(dates).unwrap();
+        let one_target_cap = workspace.total_bytes + 2 * per_target + 1;
         assert_eq!(
-            factor_block_shape((4, 7), dates, per_target).unwrap(),
+            factor_block_shape((4, 7), dates, one_target_cap, workspace, 1).unwrap(),
             (1, 1)
         );
+        let fourteen_target_cap = workspace.total_bytes + 2 * per_target * 14 + 1;
         assert_eq!(
-            factor_block_shape((4, 7), dates, per_target * 14).unwrap(),
+            factor_block_shape((4, 7), dates, fourteen_target_cap, workspace, 1).unwrap(),
             (2, 7)
         );
-        assert!(factor_block_shape((4, 7), dates, per_target - 1).is_err());
+        assert!(factor_block_shape((4, 7), dates, one_target_cap - 1, workspace, 1).is_err());
+        let admission =
+            production_resource_admission(14, dates, workspace, 1, fourteen_target_cap).unwrap();
+        assert_eq!(admission.factor_block_high_water_bytes, per_target * 14);
+        assert_eq!(
+            admission.aggregate_high_water_bytes,
+            admission.factor_block_high_water_bytes
+                + admission.serialization_high_water_bytes
+                + admission.fixed_l2_workspace_bytes
+                + admission.replay_reservation_high_water_bytes
+        );
+        assert!(
+            production_resource_admission(14, dates, workspace, 1, fourteen_target_cap - 1)
+                .is_err()
+        );
     }
 
     #[test]

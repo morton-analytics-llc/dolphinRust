@@ -248,6 +248,24 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
+    /// Exact runtime aggregate resource receipt identity.
+    pub runtime_resource_receipt_digest: String,
+    /// Single aggregate production resident-byte cap.
+    pub aggregate_byte_cap: u64,
+    /// Largest resident in-progress factor block.
+    pub factor_block_high_water_bytes: u64,
+    /// Largest HDF5 serialization reservation.
+    pub serialization_high_water_bytes: u64,
+    /// Dynamically projected fixed-L2 workspace.
+    pub fixed_l2_workspace_bytes: u64,
+    /// Largest admitted replay reservation.
+    pub replay_reservation_high_water_bytes: u64,
+    /// Observed maximum simultaneously live replay providers.
+    pub provider_peak_count: u64,
+    /// Observed maximum resident bytes held by live replay providers.
+    pub provider_peak_bytes: u64,
+    /// Exact aggregate admitted high-water bound.
+    pub aggregate_high_water_bytes: u64,
     /// Independent-review receipt identity.
     pub review_receipt_digest: String,
     /// Immutable reviewed method-manifest identity.
@@ -964,6 +982,9 @@ fn manifest(
     hdf5_sha256: String,
     hdf5_bytes: u64,
 ) -> SpatialReferenceCovarianceArtifactManifest {
+    let resource = metadata
+        .runtime_resource_receipt
+        .expect("current artifact metadata requires a runtime resource receipt");
     let calibration_scope = match metadata.calibration_scope {
         SpatialReferenceCalibrationScope::Uncalibrated => "uncalibrated",
         SpatialReferenceCalibrationScope::CalibratedScopeMatch => "calibrated_scope_match",
@@ -988,6 +1009,15 @@ fn manifest(
         l2_map_digest: metadata.l2_map_digest.clone(),
         approximation_receipt_digest: metadata.approximation_receipt_digest.clone(),
         resource_receipt_digest: metadata.resource_receipt_digest.clone(),
+        runtime_resource_receipt_digest: metadata.runtime_resource_receipt_digest.clone(),
+        aggregate_byte_cap: resource.aggregate_byte_cap,
+        factor_block_high_water_bytes: resource.factor_block_high_water_bytes,
+        serialization_high_water_bytes: resource.serialization_high_water_bytes,
+        fixed_l2_workspace_bytes: resource.fixed_l2_workspace_bytes,
+        replay_reservation_high_water_bytes: resource.replay_reservation_high_water_bytes,
+        provider_peak_count: resource.provider_peak_count,
+        provider_peak_bytes: resource.provider_peak_bytes,
+        aggregate_high_water_bytes: resource.aggregate_high_water_bytes,
         review_receipt_digest: metadata.review_receipt_digest.clone(),
         method_manifest_digest: metadata.method_manifest_digest.clone(),
         calibration_scope_digest: metadata.calibration_scope_digest.clone(),

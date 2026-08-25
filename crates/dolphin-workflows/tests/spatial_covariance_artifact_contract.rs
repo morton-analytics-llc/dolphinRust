@@ -1,7 +1,8 @@
 use dolphin_io::{
-    spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
-    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
-    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    spatial_reference_calibration_scope_digest, spatial_reference_runtime_resource_receipt_digest,
+    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
+    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
+    SpatialReferenceCovarianceStatus, SpatialReferenceRuntimeResourceReceipt,
     SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
     SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
@@ -32,6 +33,16 @@ fn digest(byte: u8) -> String {
 }
 
 fn metadata() -> SpatialReferenceCovarianceMetadata {
+    let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
+        aggregate_byte_cap: 1024,
+        factor_block_high_water_bytes: 128,
+        serialization_high_water_bytes: 128,
+        fixed_l2_workspace_bytes: 256,
+        replay_reservation_high_water_bytes: 512,
+        provider_peak_count: 2,
+        provider_peak_bytes: 256,
+        aggregate_high_water_bytes: 1024,
+    };
     SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
         method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
@@ -61,6 +72,10 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_signature_digest: digest(0x44),
         approximation_receipt_digest: digest(0x55),
         resource_receipt_digest: digest(0x66),
+        runtime_resource_receipt_digest: spatial_reference_runtime_resource_receipt_digest(
+            runtime_resource_receipt,
+        ),
+        runtime_resource_receipt: Some(runtime_resource_receipt),
         review_receipt_digest: String::new(),
         method_manifest_digest: String::new(),
         calibration_scope_digest: String::new(),
@@ -352,6 +367,22 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     assert_eq!(manifest.schema_version, 3);
     assert_eq!(manifest.geotransform, metadata().geotransform);
     assert_eq!(manifest.acquisition_days, metadata().acquisition_days);
+    let runtime = metadata().runtime_resource_receipt.unwrap();
+    assert_eq!(
+        manifest.runtime_resource_receipt_digest,
+        metadata().runtime_resource_receipt_digest
+    );
+    assert_eq!(manifest.aggregate_byte_cap, runtime.aggregate_byte_cap);
+    assert_eq!(
+        manifest.factor_block_high_water_bytes,
+        runtime.factor_block_high_water_bytes
+    );
+    assert_eq!(manifest.provider_peak_count, runtime.provider_peak_count);
+    assert_eq!(manifest.provider_peak_bytes, runtime.provider_peak_bytes);
+    assert_eq!(
+        manifest.aggregate_high_water_bytes,
+        runtime.aggregate_high_water_bytes
+    );
     assert_eq!(
         manifest.effective_looks_fraction_dataset,
         "blocks/{block_id:020}/effective_looks_fraction"

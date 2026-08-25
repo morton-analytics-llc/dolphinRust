@@ -3905,8 +3905,9 @@ fn write_chunked_2d<T: H5Type>(
 }
 
 /// HDF5 schema version for bounded reference-specific covariance factors.
-pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 3;
+pub const SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION: u16 = 4;
 const SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION: u16 = 2;
+const SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION: u16 = 3;
 /// Stable method identity for issue #54 reference-specific factors.
 pub const SPATIAL_REFERENCE_COVARIANCE_METHOD: &str = "reference_specific_influence_v1";
 /// Persisted sentinel for an approximation bound that is unavailable or has not
@@ -3951,7 +3952,8 @@ const SPATIAL_METADATA_MEMBERS_V2: &[&str] = &[
     "burst_ownership_digest",
     "source_burst_ids",
 ];
-const SPATIAL_METADATA_MEMBERS_V3: &[&str] = &[
+const SPATIAL_METADATA_MEMBERS_V3: &[&str] = SPATIAL_METADATA_MEMBERS_V2;
+const SPATIAL_METADATA_MEMBERS_V4: &[&str] = &[
     "method",
     "crate_version",
     "producer_commit",
@@ -3967,6 +3969,7 @@ const SPATIAL_METADATA_MEMBERS_V3: &[&str] = &[
     "reference_signature_digest",
     "approximation_receipt_digest",
     "resource_receipt_digest",
+    "runtime_resource_receipt_digest",
     "review_receipt_digest",
     "method_manifest_digest",
     "calibration_scope_digest",
@@ -3978,6 +3981,14 @@ const SPATIAL_METADATA_MEMBERS_V3: &[&str] = &[
     "unwrap_branch_digest",
     "burst_ownership_digest",
     "source_burst_ids",
+    "aggregate_byte_cap",
+    "factor_block_high_water_bytes",
+    "serialization_high_water_bytes",
+    "fixed_l2_workspace_bytes",
+    "replay_reservation_high_water_bytes",
+    "provider_peak_count",
+    "provider_peak_bytes",
+    "aggregate_high_water_bytes",
 ];
 const SPATIAL_BLOCK_MEMBERS_V2: &[&str] = &[
     "target_grid",
@@ -3988,7 +3999,8 @@ const SPATIAL_BLOCK_MEMBERS_V2: &[&str] = &[
     "approximation_error_bound",
     "source_factor_digest",
 ];
-const SPATIAL_BLOCK_MEMBERS_V3: &[&str] = &[
+const SPATIAL_BLOCK_MEMBERS_V3: &[&str] = SPATIAL_BLOCK_MEMBERS_V2;
+const SPATIAL_BLOCK_MEMBERS_V4: &[&str] = &[
     "target_grid",
     "rank_by_target",
     "status",
@@ -4002,6 +4014,16 @@ const SPATIAL_BLOCK_MEMBERS_V3: &[&str] = &[
     "source_factor_digest",
 ];
 const SPATIAL_BLOCK_ATTRIBUTES: &[&str] = &["block_id", "maximum_rank"];
+const SPATIAL_RUNTIME_RESOURCE_MEMBERS: &[&str] = &[
+    "aggregate_byte_cap",
+    "factor_block_high_water_bytes",
+    "serialization_high_water_bytes",
+    "fixed_l2_workspace_bytes",
+    "replay_reservation_high_water_bytes",
+    "provider_peak_count",
+    "provider_peak_bytes",
+    "aggregate_high_water_bytes",
+];
 
 /// Calibration scope bound to a persisted reference-specific factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4219,6 +4241,72 @@ pub const SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY: &[CovarianceRegistryEntr
 ];
 
 /// Artifact-level identity for bounded reference-specific covariance blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpatialReferenceRuntimeResourceReceipt {
+    /// Single aggregate production resident-byte cap.
+    pub aggregate_byte_cap: u64,
+    /// Largest resident in-progress factor block.
+    pub factor_block_high_water_bytes: u64,
+    /// Largest HDF5 serialization reservation for one factor block.
+    pub serialization_high_water_bytes: u64,
+    /// Dynamically projected fixed-L2 propagation workspace.
+    pub fixed_l2_workspace_bytes: u64,
+    /// Largest admitted replay reservation after all other components.
+    pub replay_reservation_high_water_bytes: u64,
+    /// Observed maximum simultaneously live replay providers.
+    pub provider_peak_count: u64,
+    /// Observed maximum resident bytes held by live replay providers.
+    pub provider_peak_bytes: u64,
+    /// Exact sum of the admitted component high-water bounds.
+    pub aggregate_high_water_bytes: u64,
+}
+
+impl SpatialReferenceRuntimeResourceReceipt {
+    fn validate(&self, maximum_block_bytes: u64) -> Result<()> {
+        let composed = self
+            .factor_block_high_water_bytes
+            .checked_add(self.serialization_high_water_bytes)
+            .and_then(|bytes| bytes.checked_add(self.fixed_l2_workspace_bytes))
+            .and_then(|bytes| bytes.checked_add(self.replay_reservation_high_water_bytes))
+            .ok_or_else(|| invalid("spatial reference resource receipt overflows u64"))?;
+        ensure_valid(
+            self.aggregate_byte_cap == maximum_block_bytes
+                && self.aggregate_byte_cap > 0
+                && self.factor_block_high_water_bytes > 0
+                && self.serialization_high_water_bytes > 0
+                && self.fixed_l2_workspace_bytes > 0
+                && self.provider_peak_count <= 2
+                && self.provider_peak_bytes <= self.replay_reservation_high_water_bytes
+                && self.aggregate_high_water_bytes == composed
+                && self.aggregate_high_water_bytes <= self.aggregate_byte_cap,
+            "spatial reference runtime resource receipt is inconsistent",
+        )
+    }
+}
+
+/// Digest the exact aggregate resource receipt committed by a production run.
+#[must_use]
+pub fn spatial_reference_runtime_resource_receipt_digest(
+    receipt: SpatialReferenceRuntimeResourceReceipt,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:production-runtime-resource-receipt:v1");
+    for value in [
+        receipt.aggregate_byte_cap,
+        receipt.factor_block_high_water_bytes,
+        receipt.serialization_high_water_bytes,
+        receipt.fixed_l2_workspace_bytes,
+        receipt.replay_reservation_high_water_bytes,
+        receipt.provider_peak_count,
+        receipt.provider_peak_bytes,
+        receipt.aggregate_high_water_bytes,
+    ] {
+        digest.update(value.to_le_bytes());
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+/// Artifact-level identity for bounded reference-specific covariance blocks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpatialReferenceCovarianceMetadata {
     /// HDF5 schema version.
@@ -4263,6 +4351,11 @@ pub struct SpatialReferenceCovarianceMetadata {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
+    /// Digest of the machine-readable runtime aggregate receipt.
+    pub runtime_resource_receipt_digest: String,
+    /// Machine-readable aggregate production resource receipt. Legacy schema
+    /// v2 and v3 artifacts explicitly lack this runtime evidence.
+    pub runtime_resource_receipt: Option<SpatialReferenceRuntimeResourceReceipt>,
     /// Independent-review receipt authorizing this exact scope, when calibrated.
     pub review_receipt_digest: String,
     /// Immutable method manifest binding code, configuration, and evidence.
@@ -4300,6 +4393,7 @@ impl SpatialReferenceCovarianceMetadata {
             matches!(
                 self.schema_version,
                 SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+                    | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION
                     | SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION
             ),
             "unsupported spatial reference covariance schema",
@@ -4346,8 +4440,11 @@ impl SpatialReferenceCovarianceMetadata {
             "spatial reference date map or gauge is invalid",
         )?;
         match self.schema_version {
-            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => ensure_valid(
-                self.geotransform.is_none() && self.acquisition_days.is_none(),
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => ensure_valid(
+                self.geotransform.is_none()
+                    && self.acquisition_days.is_none()
+                    && self.runtime_resource_receipt.is_none(),
                 "legacy spatial reference covariance cannot claim unavailable coordinates",
             )?,
             SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => {
@@ -4372,6 +4469,11 @@ impl SpatialReferenceCovarianceMetadata {
                         && determinant != 0.0,
                     "spatial reference affine geotransform is invalid",
                 )?;
+                self.runtime_resource_receipt
+                    .ok_or_else(|| {
+                        invalid("current spatial reference covariance requires a resource receipt")
+                    })?
+                    .validate(self.maximum_block_bytes)?;
             }
             _ => unreachable!("schema version was validated above"),
         }
@@ -4396,6 +4498,21 @@ impl SpatialReferenceCovarianceMetadata {
             ensure_valid(
                 is_sha256_digest(value),
                 "spatial reference identity is not a strong SHA-256 digest",
+            )?;
+        }
+        if self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+            ensure_valid(
+                self.runtime_resource_receipt_digest
+                    == spatial_reference_runtime_resource_receipt_digest(
+                        self.runtime_resource_receipt
+                            .expect("current schema receipt was validated above"),
+                    ),
+                "spatial reference runtime resource digest does not bind its receipt",
+            )?;
+        } else {
+            ensure_valid(
+                self.runtime_resource_receipt_digest.is_empty(),
+                "historical spatial reference schema cannot claim a runtime resource receipt",
             )?;
         }
         ensure_valid(
@@ -4455,7 +4572,7 @@ impl SpatialReferenceCovarianceMetadata {
                         "calibrated spatial reference scope requires strong promotion receipts",
                     )?;
                 }
-                if self.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+                if self.schema_version != SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
                     ensure_valid(
                         self.producer_commit
                             .as_deref()
@@ -4489,10 +4606,14 @@ pub fn spatial_reference_calibration_scope_digest(
 ) -> String {
     let mut digest = Sha256::new();
     let legacy = metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION;
-    digest.update(if legacy {
-        b"dolphinrust:spatial-reference-calibration-scope:v1".as_slice()
-    } else {
-        b"dolphinrust:spatial-reference-calibration-scope:v2".as_slice()
+    digest.update(match metadata.schema_version {
+        SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => {
+            b"dolphinrust:spatial-reference-calibration-scope:v1".as_slice()
+        }
+        SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => {
+            b"dolphinrust:spatial-reference-calibration-scope:v2".as_slice()
+        }
+        _ => b"dolphinrust:spatial-reference-calibration-scope:v3".as_slice(),
     });
     for value in [
         metadata.method.as_str(),
@@ -4522,6 +4643,10 @@ pub fn spatial_reference_calibration_scope_digest(
         digest.update((producer_identity.len() as u64).to_le_bytes());
         digest.update(producer_identity.as_bytes());
         digest.update(metadata.schema_version.to_le_bytes());
+    }
+    if metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+        digest.update((metadata.runtime_resource_receipt_digest.len() as u64).to_le_bytes());
+        digest.update(metadata.runtime_resource_receipt_digest.as_bytes());
     }
     digest.update(metadata.method_version.to_le_bytes());
     digest.update(metadata.full_grid.row_start.to_le_bytes());
@@ -4663,7 +4788,8 @@ impl SpatialReferenceCovarianceBlock {
             "spatial reference block shapes do not match",
         )?;
         let realization = match metadata.schema_version {
-            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => {
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => {
                 ensure_valid(
                     self.effective_looks_fraction.is_none()
                         && self.support_union_count.is_none()
@@ -4884,6 +5010,36 @@ impl SpatialReferenceCovarianceWriter {
         Ok(())
     }
 
+    /// Replace the preflight resource receipt with the exact observed runtime
+    /// receipt before sealing the artifact.
+    ///
+    /// # Errors
+    /// Returns an error for an inconsistent receipt or HDF5 update failure.
+    pub fn seal_runtime_resource_receipt(
+        &mut self,
+        receipt: SpatialReferenceRuntimeResourceReceipt,
+    ) -> Result<SpatialReferenceCovarianceMetadata> {
+        receipt.validate(self.metadata.maximum_block_bytes)?;
+        ensure_valid(
+            self.metadata.calibration_scope == SpatialReferenceCalibrationScope::Uncalibrated,
+            "calibrated spatial reference resource evidence is immutable",
+        )?;
+        let digest = spatial_reference_runtime_resource_receipt_digest(receipt);
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
+        let identity = file.group("metadata")?;
+        write_runtime_resource_receipt_datasets(&identity, receipt, true)?;
+        identity
+            .dataset("runtime_resource_receipt_digest")?
+            .write_raw(digest.as_bytes())?;
+        self.metadata.runtime_resource_receipt = Some(receipt);
+        self.metadata.runtime_resource_receipt_digest = digest;
+        self.metadata.validate()?;
+        Ok(self.metadata.clone())
+    }
+
     /// Mark the artifact complete, validate its exact schema, and return its digest.
     ///
     /// # Errors
@@ -4961,6 +5117,10 @@ fn write_spatial_reference_metadata(
             metadata.resource_receipt_digest.as_str(),
         ),
         (
+            "runtime_resource_receipt_digest",
+            metadata.runtime_resource_receipt_digest.as_str(),
+        ),
+        (
             "review_receipt_digest",
             metadata.review_receipt_digest.as_str(),
         ),
@@ -5023,9 +5183,53 @@ fn write_spatial_reference_metadata(
         "reference_source_burst_index",
         metadata.reference_source_burst_index,
     )?;
+    write_runtime_resource_receipt_datasets(
+        &identity,
+        metadata
+            .runtime_resource_receipt
+            .ok_or_else(|| invalid("current schema runtime resource receipt is missing"))?,
+        false,
+    )?;
     write_grid(file, "full_grid", metadata.full_grid)?;
     file.create_group("blocks")?;
     drop(identity);
+    Ok(())
+}
+
+fn write_runtime_resource_receipt_datasets(
+    group: &Group,
+    receipt: SpatialReferenceRuntimeResourceReceipt,
+    overwrite: bool,
+) -> Result<()> {
+    macro_rules! write_receipt_value {
+        ($name:literal, $value:expr) => {
+            if overwrite {
+                group.dataset($name)?.write_raw(&[$value])?;
+            } else {
+                write_chunked_1d(group, $name, &[$value])?;
+            }
+        };
+    }
+    write_receipt_value!("aggregate_byte_cap", receipt.aggregate_byte_cap);
+    write_receipt_value!(
+        "factor_block_high_water_bytes",
+        receipt.factor_block_high_water_bytes
+    );
+    write_receipt_value!(
+        "serialization_high_water_bytes",
+        receipt.serialization_high_water_bytes
+    );
+    write_receipt_value!("fixed_l2_workspace_bytes", receipt.fixed_l2_workspace_bytes);
+    write_receipt_value!(
+        "replay_reservation_high_water_bytes",
+        receipt.replay_reservation_high_water_bytes
+    );
+    write_receipt_value!("provider_peak_count", receipt.provider_peak_count);
+    write_receipt_value!("provider_peak_bytes", receipt.provider_peak_bytes);
+    write_receipt_value!(
+        "aggregate_high_water_bytes",
+        receipt.aggregate_high_water_bytes
+    );
     Ok(())
 }
 
@@ -5136,16 +5340,17 @@ pub fn read_spatial_reference_covariance_header(
     let schema_version: u16 = read_scalar_attr(&file, "schema_version")?;
     let mut budget = ReadBudget::new(byte_cap);
     let identity = file.group("metadata")?;
-    let metadata_members = if schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
-        SPATIAL_METADATA_MEMBERS_V2
-    } else {
-        SPATIAL_METADATA_MEMBERS_V3
+    let metadata_members = match schema_version {
+        SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V2,
+        SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V3,
+        SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V4,
+        _ => return Err(invalid("unsupported spatial reference covariance schema")),
     };
     for name in metadata_members.iter().copied().filter(|name| {
         !matches!(
             *name,
             "ordered_date_indices" | "acquisition_days" | "geotransform"
-        )
+        ) && !SPATIAL_RUNTIME_RESOURCE_MEMBERS.contains(name)
     }) {
         let (_, bytes) = inspect_dataset::<u8>(&identity, name, None)?;
         budget.charge(bytes)?;
@@ -5158,6 +5363,10 @@ pub fn read_spatial_reference_covariance_header(
         let (_, geotransform_bytes) =
             inspect_dataset::<f64>(&identity, "geotransform", Some(&[6]))?;
         budget.charge(geotransform_bytes)?;
+        for name in SPATIAL_RUNTIME_RESOURCE_MEMBERS {
+            let (_, bytes) = inspect_dataset::<u64>(&identity, name, Some(&[1]))?;
+            budget.charge(bytes)?;
+        }
     }
     read_spatial_metadata(&file)
 }
@@ -5180,12 +5389,12 @@ pub fn read_spatial_reference_covariance_block(
     let name = format!("{block_id:020}");
     validate_selected_block_link(&blocks, &name)?;
     let group = blocks.group(&name)?;
-    let block_members =
-        if metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
-            SPATIAL_BLOCK_MEMBERS_V2
-        } else {
-            SPATIAL_BLOCK_MEMBERS_V3
-        };
+    let block_members = match metadata.schema_version {
+        SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V2,
+        SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V3,
+        SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V4,
+        _ => return Err(invalid("unsupported spatial reference covariance schema")),
+    };
     validate_exact_schema(
         &group,
         Some(block_members),
@@ -5310,7 +5519,8 @@ fn read_current_block_dataset<T: hdf5::H5Type>(
     name: &str,
 ) -> Result<Option<Vec<T>>> {
     match schema_version {
-        SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => Ok(None),
+        SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+        | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => Ok(None),
         SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => Ok(Some(group.dataset(name)?.read_raw()?)),
         _ => Err(invalid("unsupported spatial reference covariance schema")),
     }
@@ -5330,7 +5540,8 @@ fn validate_spatial_root_schema(file: &hdf5::File) -> Result<()> {
     let schema_version: u16 = read_scalar_attr(file, "schema_version")?;
     let metadata_members = match schema_version {
         SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V2,
-        SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V3,
+        SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V3,
+        SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V4,
         _ => return Err(invalid("unsupported spatial reference covariance schema")),
     };
     let identity = file.group("metadata")?;
@@ -5351,6 +5562,7 @@ fn validate_spatial_root_schema(file: &hdf5::File) -> Result<()> {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovarianceMetadata> {
     let identity = file.group("metadata")?;
     let schema_version: u16 = read_scalar_attr(file, "schema_version")?;
@@ -5364,7 +5576,8 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         crs: read_string(&identity, "crs")?,
         units: read_string(&identity, "units")?,
         geotransform: match schema_version {
-            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => None,
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => None,
             SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => Some(
                 identity
                     .dataset("geotransform")?
@@ -5382,7 +5595,8 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         gauge_date_index: read_scalar_attr(file, "gauge_date_index")?,
         ordered_date_indices: identity.dataset("ordered_date_indices")?.read_raw()?,
         acquisition_days: match schema_version {
-            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => None,
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => None,
             SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => {
                 Some(identity.dataset("acquisition_days")?.read_raw()?)
             }
@@ -5394,6 +5608,55 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         reference_signature_digest: read_string(&identity, "reference_signature_digest")?,
         approximation_receipt_digest: read_string(&identity, "approximation_receipt_digest")?,
         resource_receipt_digest: read_string(&identity, "resource_receipt_digest")?,
+        runtime_resource_receipt_digest: match schema_version {
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => String::new(),
+            SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => {
+                read_string(&identity, "runtime_resource_receipt_digest")?
+            }
+            _ => return Err(invalid("unsupported spatial reference covariance schema")),
+        },
+        runtime_resource_receipt: match schema_version {
+            SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION
+            | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => None,
+            SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => {
+                Some(SpatialReferenceRuntimeResourceReceipt {
+                    aggregate_byte_cap: read_runtime_resource_value(
+                        &identity,
+                        "aggregate_byte_cap",
+                    )?,
+                    factor_block_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "factor_block_high_water_bytes",
+                    )?,
+                    serialization_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "serialization_high_water_bytes",
+                    )?,
+                    fixed_l2_workspace_bytes: read_runtime_resource_value(
+                        &identity,
+                        "fixed_l2_workspace_bytes",
+                    )?,
+                    replay_reservation_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "replay_reservation_high_water_bytes",
+                    )?,
+                    provider_peak_count: read_runtime_resource_value(
+                        &identity,
+                        "provider_peak_count",
+                    )?,
+                    provider_peak_bytes: read_runtime_resource_value(
+                        &identity,
+                        "provider_peak_bytes",
+                    )?,
+                    aggregate_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "aggregate_high_water_bytes",
+                    )?,
+                })
+            }
+            _ => return Err(invalid("unsupported spatial reference covariance schema")),
+        },
         review_receipt_digest: read_string(&identity, "review_receipt_digest")?,
         method_manifest_digest: read_string(&identity, "method_manifest_digest")?,
         calibration_scope_digest: read_string(&identity, "calibration_scope_digest")?,
@@ -5417,6 +5680,20 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
     };
     metadata.validate()?;
     Ok(metadata)
+}
+
+fn read_runtime_resource_value(group: &Group, name: &str) -> Result<u64> {
+    let (shape, _) = inspect_dataset::<u64>(group, name, Some(&[1]))?;
+    ensure_valid(
+        shape == [1],
+        "spatial reference runtime resource field is not scalar",
+    )?;
+    group
+        .dataset(name)?
+        .read_raw::<u64>()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("spatial reference runtime resource field is empty"))
 }
 
 fn bits_to_bytes(bits: u32) -> Result<usize> {
