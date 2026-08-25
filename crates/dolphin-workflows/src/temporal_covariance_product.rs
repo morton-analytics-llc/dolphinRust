@@ -3988,6 +3988,7 @@ fn transaction_marker_bytes_are_owned(
 struct VerifiedCleanupQuarantine {
     product_directory: File,
     outer: File,
+    inner: File,
     marker: CleanupQuarantineMarker,
 }
 
@@ -4046,6 +4047,7 @@ fn open_verified_cleanup_quarantine(
     Ok(VerifiedCleanupQuarantine {
         product_directory,
         outer,
+        inner,
         marker,
     })
 }
@@ -4102,10 +4104,54 @@ fn remove_verified_cleanup_quarantine(
     directory: &Path,
     cleanup_name: &str,
     expected_ownership_token: Option<&str>,
+    after_verification: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let verified =
         open_verified_cleanup_quarantine(directory, cleanup_name, expected_ownership_token)?;
-    remove_directory_contents_at(verified.outer.as_raw_fd())?;
+    after_verification()?;
+    remove_directory_contents_at(verified.inner.as_raw_fd())?;
+    verified.inner.sync_all()?;
+    let inner_name = CString::new("owned-stage")?;
+    let mut inner_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: arguments are valid and `inner_stat` points to writable storage.
+    let inner_status = unsafe {
+        libc::fstatat(
+            verified.outer.as_raw_fd(),
+            inner_name.as_ptr(),
+            inner_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    ensure!(
+        inner_status == 0,
+        "cleanup inner stage disappeared before removal"
+    );
+    // SAFETY: successful `fstatat` initialized `inner_stat`.
+    let inner_stat = unsafe { inner_stat.assume_init() };
+    ensure!(
+        verified.marker.inner_identity == stat_directory_identity(&inner_stat),
+        "cleanup inner stage identity changed before removal"
+    );
+    drop(verified.inner);
+    // SAFETY: removal is relative to the retained verified outer descriptor.
+    ensure!(
+        unsafe {
+            libc::unlinkat(
+                verified.outer.as_raw_fd(),
+                inner_name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } == 0,
+        "removing cleanup inner stage failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let marker_name = CString::new(TRANSACTION_ARTIFACT_MARKER_FILENAME)?;
+    // SAFETY: removal is relative to the retained verified outer descriptor.
+    ensure!(
+        unsafe { libc::unlinkat(verified.outer.as_raw_fd(), marker_name.as_ptr(), 0) } == 0,
+        "removing cleanup receipt failed: {}",
+        std::io::Error::last_os_error()
+    );
     verified.outer.sync_all()?;
     let cleanup_name_c = cstring_component(cleanup_name)?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -4215,7 +4261,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     for cleanup_name in owned_cleanup_quarantines {
-        remove_verified_cleanup_quarantine(directory, &cleanup_name, None)?;
+        remove_verified_cleanup_quarantine(directory, &cleanup_name, None, || Ok(()))?;
     }
     for (artifact, marker) in owned {
         if artifact.is_dir() {
@@ -4685,6 +4731,7 @@ fn remove_owned_stage_directory(
         directory,
         &private_name,
         Some(&cleanup_marker.ownership_token),
+        || Ok(()),
     )
 }
 
@@ -5161,6 +5208,54 @@ mod tests {
             std::fs::read(replacement.join("user-data")).unwrap(),
             b"preserve"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_retains_verified_inner_descriptor_across_final_swap_hook() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_descriptor_stage_swap_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let ownership_token = "descriptor-owner";
+        let stage = super::create_stage_directory(&directory, ownership_token).unwrap();
+        let mut cleanup = None;
+        super::remove_owned_stage_directory(
+            &directory,
+            &stage,
+            Some(ownership_token),
+            || Ok(()),
+            |inner| {
+                cleanup = inner.parent().map(std::path::Path::to_owned);
+                anyhow::bail!("retain durable cleanup quarantine")
+            },
+        )
+        .unwrap_err();
+        let cleanup = cleanup.unwrap();
+        let cleanup_name = cleanup.file_name().unwrap().to_str().unwrap().to_owned();
+        let inner = cleanup.join("owned-stage");
+        let error = super::remove_verified_cleanup_quarantine(
+            &directory,
+            &cleanup_name,
+            Some(ownership_token),
+            || {
+                let marker =
+                    std::fs::read(inner.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME))?;
+                std::fs::rename(&inner, cleanup.join("held-owned-stage"))?;
+                std::fs::create_dir(&inner)?;
+                std::fs::write(
+                    inner.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+                    marker,
+                )?;
+                std::fs::write(inner.join("user-data"), b"preserve")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(std::fs::read(inner.join("user-data")).unwrap(), b"preserve");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
