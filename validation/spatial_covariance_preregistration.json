@@ -585,7 +585,8 @@
       "config_hash",
       "source_model_hash",
       "target_support_sha256",
-      "reference_support_sha256"
+      "reference_support_sha256",
+      "source_correlation_receipt_sha256"
     ],
     "resource_required": [
       "resource_hash",
@@ -626,7 +627,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "da300fcd295306ac634c3d552cdf206ab15e1bf3a42d16acfb5b3bf0570fcb5b"
+        "sha256": "a4a6c68790dc7368031d8b5b63e6f6f5ba2fe1f8e46a9e177a2921c4ff2db94e"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
@@ -902,7 +903,9 @@
         "target_source_count",
         "reference_source_count",
         "intersection_source_count",
-        "union_source_count"
+        "union_source_count",
+        "effective_support_union_count",
+        "source_correlation_receipt_sha256"
       ],
       "support_generation": "run the frozen Rect, GLRT, or KS selector on the signed production stack separately for every expected ministack real-acquisition slice; hashes bind ordered block_id and row-major realized sources",
       "ancestry": "bind every expected ministack block, carried parent identity, complete date axis, acquisition-zero gauge, cap eviction, and partial tail",
@@ -942,7 +945,13 @@
       "distance_metric": "Euclidean",
       "distance_scale_pixels": 1.5,
       "diagonal": 1.0,
-      "support_union": "realized_target_support_union_reference_support",
+      "support_union": "nonzero_source_adjoint_coordinate union from realized target/reference phase supports and compressed native centers; for nonempty frozen validation cells this equals the complete target/reference candidate source union before adaptive phase selection",
+      "receipt_schema": "dolphinrust.spatial-covariance.source-correlation-receipt/1",
+      "receipt_fields": [
+        "source_correlation_model",
+        "source_correlation_distance_scale_pixels",
+        "effective_support"
+      ],
       "recompute_per_cell": true,
       "fraction": "n/(1^T R 1)",
       "independent_recomputation_tolerance": "abs(actual-expected) <= 1e-12*max(1,abs(expected)); canonical receipt digests remain exact",
@@ -2093,6 +2102,8 @@
       "signed_influence_sign",
       "effective_looks_fraction",
       "effective_looks_application",
+      "effective_support_union_count",
+      "source_correlation_receipt_sha256",
       "source_correlation_model",
       "source_correlation_distance_scale_pixels",
       "estimator_branch",

@@ -865,6 +865,18 @@ fn build_tied_probe_evidence(
     let support = (0..3_i64)
         .flat_map(|row| (0..3_i64).map(move |column| (row, column)))
         .collect::<Vec<_>>();
+    let effective_support = support.iter().copied().collect::<BTreeSet<_>>();
+    let source_correlation_model = if request.source_process == "independent_complex_looks" {
+        "identity_v1"
+    } else {
+        "exponential_euclidean_v1"
+    };
+    let source_correlation_distance_scale_pixels =
+        if request.source_process == "independent_complex_looks" {
+            0.0
+        } else {
+            1.5
+        };
     let mut raw_digest = Sha256::new();
     raw_digest.update(b"singular-local-information-probe-v1");
     raw_digest.update((support.len() as u64).to_le_bytes());
@@ -952,8 +964,14 @@ fn build_tied_probe_evidence(
         "signed_influence_sign": pair_sign(&request.pair_geometry)?,
         "effective_looks_fraction": 1.0,
         "effective_looks_application": "source_influence_joint_contraction_v1",
-        "source_correlation_model": if request.source_process == "independent_complex_looks" { "identity_v1" } else { "exponential_euclidean_v1" },
-        "source_correlation_distance_scale_pixels": if request.source_process == "independent_complex_looks" { 0.0 } else { 1.5 },
+        "effective_support_union_count": effective_support.len(),
+        "source_correlation_receipt_sha256": source_correlation_receipt_sha256(
+            source_correlation_model,
+            source_correlation_distance_scale_pixels,
+            &effective_support,
+        )?,
+        "source_correlation_model": source_correlation_model,
+        "source_correlation_distance_scale_pixels": source_correlation_distance_scale_pixels,
         "estimator_branch": "evd",
         "target_estimate_history": Value::Null,
         "reference_estimate_history": Value::Null,
@@ -1003,6 +1021,18 @@ fn build_empty_support_evidence(
         .keys()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
+    let effective_support = BTreeSet::new();
+    let source_correlation_model = if request.source_process == "independent_complex_looks" {
+        "identity_v1"
+    } else {
+        "exponential_euclidean_v1"
+    };
+    let source_correlation_distance_scale_pixels =
+        if request.source_process == "independent_complex_looks" {
+            0.0
+        } else {
+            1.5
+        };
     let empty = std::iter::empty::<(i64, i64)>();
     let raw_input_sha256 = raw_source_digest("raw-input-v4", raw_union.iter().copied(), raw)?;
     let target_raw_input_sha256 = raw_source_digest("source-raw-input-v4", empty, raw)?;
@@ -1088,8 +1118,14 @@ fn build_empty_support_evidence(
         "signed_influence_sign": pair_sign(&request.pair_geometry)?,
         "effective_looks_fraction": Value::Null,
         "effective_looks_application": "source_influence_joint_contraction_v1",
-        "source_correlation_model": if request.source_process == "independent_complex_looks" { "identity_v1" } else { "exponential_euclidean_v1" },
-        "source_correlation_distance_scale_pixels": if request.source_process == "independent_complex_looks" { 0.0 } else { 1.5 },
+        "effective_support_union_count": 0,
+        "source_correlation_receipt_sha256": source_correlation_receipt_sha256(
+            source_correlation_model,
+            source_correlation_distance_scale_pixels,
+            &effective_support,
+        )?,
+        "source_correlation_model": source_correlation_model,
+        "source_correlation_distance_scale_pixels": source_correlation_distance_scale_pixels,
         "estimator_branch": request.estimator,
         "target_estimate_history": Value::Null,
         "reference_estimate_history": Value::Null,
@@ -1176,10 +1212,20 @@ fn build_nondifferentiable_evidence(
         .union(&reference_phase)
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    for _ in 1..blocks.len() {
-        effective_support = factor_halo(effective_support.iter().copied(), geometry)?;
-    }
-    let effective_fraction = if request.source_process == "independent_complex_looks" {
+    effective_support.insert(geometry.target);
+    effective_support.insert(geometry.reference);
+    let source_correlation_model = if request.source_process == "independent_complex_looks" {
+        "identity_v1"
+    } else {
+        "exponential_euclidean_v1"
+    };
+    let source_correlation_distance_scale_pixels =
+        if request.source_process == "independent_complex_looks" {
+            0.0
+        } else {
+            1.5
+        };
+    let effective_fraction = if source_correlation_model == "identity_v1" {
         1.0
     } else {
         effective_looks_fraction(&effective_support)
@@ -1291,8 +1337,14 @@ fn build_nondifferentiable_evidence(
         "signed_influence_sign": sign,
         "effective_looks_fraction": effective_fraction,
         "effective_looks_application": "source_influence_joint_contraction_v1",
-        "source_correlation_model": if request.source_process == "independent_complex_looks" { "identity_v1" } else { "exponential_euclidean_v1" },
-        "source_correlation_distance_scale_pixels": if request.source_process == "independent_complex_looks" { 0.0 } else { 1.5 },
+        "effective_support_union_count": effective_support.len(),
+        "source_correlation_receipt_sha256": source_correlation_receipt_sha256(
+            source_correlation_model,
+            source_correlation_distance_scale_pixels,
+            &effective_support,
+        )?,
+        "source_correlation_model": source_correlation_model,
+        "source_correlation_distance_scale_pixels": source_correlation_distance_scale_pixels,
         "estimator_branch": request.estimator,
         "target_estimate_history": Value::Null,
         "reference_estimate_history": Value::Null,
@@ -1649,6 +1701,29 @@ pub fn run_frozen_attempt(
         object.insert("emitted".to_owned(), Value::Bool(false));
         object.insert("factor_emitted".to_owned(), Value::Bool(false));
         object.insert("effective_looks_fraction".to_owned(), Value::Null);
+        object.insert(
+            "effective_support_union_count".to_owned(),
+            Value::Number(0_u64.into()),
+        );
+        let source_correlation_model = if request.source_process == "independent_complex_looks" {
+            "identity_v1"
+        } else {
+            "exponential_euclidean_v1"
+        };
+        let source_correlation_distance_scale_pixels =
+            if request.source_process == "independent_complex_looks" {
+                0.0
+            } else {
+                1.5
+            };
+        object.insert(
+            "source_correlation_receipt_sha256".to_owned(),
+            Value::String(source_correlation_receipt_sha256(
+                source_correlation_model,
+                source_correlation_distance_scale_pixels,
+                &BTreeSet::new(),
+            )?),
+        );
         for name in [
             "signed_cross_influence",
             "target_estimate_history",
@@ -1880,6 +1955,12 @@ where
         "signed_influence_sign": sign,
         "effective_looks_fraction": production.effective_looks_fraction,
         "effective_looks_application": "source_influence_joint_contraction_v1",
+        "effective_support_union_count": effective_support.len(),
+        "source_correlation_receipt_sha256": source_correlation_receipt_sha256(
+            &production.source_correlation_model,
+            production.source_correlation_distance_scale_pixels,
+            &effective_support,
+        )?,
         "source_correlation_model": production.source_correlation_model,
         "source_correlation_distance_scale_pixels": production.source_correlation_distance_scale_pixels,
     })
@@ -1958,6 +2039,19 @@ fn effective_looks_fraction(support: &std::collections::BTreeSet<(i64, i64)>) ->
         })
         .sum::<f64>();
     support.len() as f64 / denominator
+}
+
+fn source_correlation_receipt_sha256(
+    model: &str,
+    distance_scale_pixels: f64,
+    support: &BTreeSet<(i64, i64)>,
+) -> Result<String> {
+    sha256_json_value(&serde_json::json!({
+        "schema": "dolphinrust.spatial-covariance.source-correlation-receipt/1",
+        "source_correlation_model": model,
+        "source_correlation_distance_scale_pixels": distance_scale_pixels,
+        "effective_support": support.iter().map(|&(row, column)| [row, column]).collect::<Vec<_>>(),
+    }))
 }
 
 fn sha256_json_value(value: &Value) -> Result<String> {
@@ -4299,6 +4393,88 @@ mod tests {
         assert_eq!(
             execute_tied_probe(&preregistration).unwrap(),
             dolphin_io::CovarianceOperatorStatus::SingularLocalInformation
+        );
+    }
+
+    #[test]
+    fn nondifferentiable_near_tie_uses_the_exact_dependency_cone_primitive_union() {
+        let preregistration: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_preregistration.json"
+        )))
+        .unwrap();
+        let asset: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_portable_tables.json"
+        )))
+        .unwrap();
+        let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
+        let request = FrozenAttemptRequest {
+            schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
+            cell_id: "nondifferentiable-near-tie-contract".to_owned(),
+            cell_ordinal: 0,
+            seed_index: 0,
+            seed_sha256: "0".repeat(64),
+            half_window: "hw_1x1".to_owned(),
+            stride: "stride_4".to_owned(),
+            support: "rect".to_owned(),
+            position: "interior".to_owned(),
+            pair_geometry: "shared_75_positive".to_owned(),
+            block_topology: "four_blocks".to_owned(),
+            estimator: "emi".to_owned(),
+            eigen_stress: "near_tie".to_owned(),
+            source_process: "spatial_correlation_stress".to_owned(),
+        };
+        let geometry = FrozenCellGeometry::parse(&preregistration, &request).unwrap();
+        let target_support = inward_clamped_support(
+            geometry.target,
+            geometry.half_window,
+            geometry.native_tile_shape,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let reference_support = inward_clamped_support(
+            geometry.reference,
+            geometry.half_window,
+            geometry.native_tile_shape,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let raw_support =
+            factor_halo(target_support.union(&reference_support).copied(), &geometry).unwrap();
+        let raw = raw_support
+            .into_iter()
+            .map(|coordinate| (coordinate, vec![Cf64::new(1.0, 0.0); geometry.dates]))
+            .collect::<BTreeMap<_, _>>();
+        let evidence = build_nondifferentiable_evidence(
+            &preregistration,
+            &tables,
+            &request,
+            0,
+            &geometry,
+            &raw,
+        )
+        .unwrap();
+        let mut exact_support = target_support
+            .union(&reference_support)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        exact_support.insert(geometry.target);
+        exact_support.insert(geometry.reference);
+        assert_eq!(exact_support.len(), 18);
+        assert_eq!(evidence["effective_support_union_count"], 18);
+        assert_eq!(
+            evidence["source_correlation_receipt_sha256"],
+            source_correlation_receipt_sha256("exponential_euclidean_v1", 1.5, &exact_support,)
+                .unwrap()
+        );
+        assert!(
+            (evidence["effective_looks_fraction"].as_f64().unwrap()
+                - effective_looks_fraction(&exact_support))
+            .abs()
+                <= 1e-15
         );
     }
 

@@ -42,13 +42,13 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21315584
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "e96c21800feb4e5873daa3bfcf181e7e857f903c6aaea7d2c00f6c555f3feaba"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "7697e728c554821ba4cc5bc7ffa4c28be06b2e6c177b644543e8876f7941eba5"
+FROZEN_GENERATOR_SHA256 = "f810da0ae0f10b3ff235a6ee664b2d740c51e382fb0e5c0301bb0f4c4a7926df"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "0454db5925bbb3076ec40d59f2fc861f5950b88c860cbf66ab68425f709425d5"
 FROZEN_EXECUTION_SHA256 = "44f1d6bcf80b681214bf7fddacaa8889afdd8e39f8d2a4bc48777a6305e0df0a"
 FROZEN_REDUCERS_SHA256 = "bdab964569b074caf0bc27ec758a2f7ca633a911368333610fd42c96bb6740dd"
 FROZEN_MATRIX_SHA256 = "7d56f01b6b759de9f722f476d7c2346e2c614580b3fdfc5ffecc00e030636244"
-FROZEN_RECEIPT_SHA256 = "aa34771674a8d92b8fed06ac08df9eb6414079adf646a515a203d14f64b0b38a"
-FROZEN_HASH_FIELDS_SHA256 = "80eb7ab1c16f9908e39515d7988f2fe5e2fb6b50f81974f0544e6a1abec98d4c"
+FROZEN_RECEIPT_SHA256 = "b25997a99ecd2c67f37949744687b8530cccf3e4d7515daec1d6fb87117cb957"
+FROZEN_HASH_FIELDS_SHA256 = "ce6b747b1b562225537ccf1148778517e60c1a54b42c02404011a467d4f2b7ed"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "0874fc530fda38d9f0e72b548549f47d749789e2c380c16c506bab03e0431559"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "393edffc872fa11fcb7c5c788205735ca622dc913ae818ce115714ffeeabec79"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "da300fcd295306ac634c3d552cdf206ab15e1bf3a42d16acfb5b3bf0570fcb5b"
+FROZEN_SOURCE_SET_SHA256 = "a4a6c68790dc7368031d8b5b63e6f6f5ba2fe1f8e46a9e177a2921c4ff2db94e"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -122,6 +122,7 @@ ATTEMPT_KEYS = {
     "target_support_sha256", "reference_support_sha256", "target_source_count", "reference_source_count",
     "intersection_source_count", "union_source_count", "realized_overlap_jaccard", "signed_cross_influence",
     "signed_influence_sign", "effective_looks_fraction", "effective_looks_application",
+    "effective_support_union_count", "source_correlation_receipt_sha256",
     "source_correlation_model", "source_correlation_distance_scale_pixels", "estimator_branch",
     "target_estimate_history", "reference_estimate_history", "predicted_difference_covariance",
     "production_operator_matrix", "contrast_weights", "operator_sha256",
@@ -134,6 +135,7 @@ ATTEMPT_HASH_FIELDS = (
     "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_support_sha256",
     "reference_support_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
     "sequential_ancestry_sha256", "raw_dgp_identity_sha256", "operator_sha256",
+    "source_correlation_receipt_sha256",
 )
 CELL_SUMMARY_KEYS = {
     "schema", "cell_id", "cell_ordinal", "status", "attempted_seeds", "emitted_seeds",
@@ -1498,6 +1500,10 @@ def _tied_probe_attempt_inputs(
         "intersection_source_count": 9,
         "union_source_count": 9,
         "effective_looks_fraction": 1.0,
+        "effective_support_union_count": 9,
+        "source_correlation_receipt_sha256": _source_correlation_receipt_sha256(
+            "identity_v1", 0.0, support
+        ),
         "source_correlation_model": "identity_v1",
         "source_correlation_distance_scale_pixels": 0.0,
         "target_global_loading_mean": 0.0,
@@ -1518,6 +1524,17 @@ def _effective_looks_fraction(support: Sequence[tuple[int, int]]) -> float:
         for second in support
     )
     return len(support) / denominator
+
+
+def _source_correlation_receipt_sha256(
+    model: str, distance_scale_pixels: float, support: Sequence[tuple[int, int]]
+) -> str:
+    return sha256_json({
+        "schema": "dolphinrust.spatial-covariance.source-correlation-receipt/1",
+        "source_correlation_model": model,
+        "source_correlation_distance_scale_pixels": distance_scale_pixels,
+        "effective_support": [list(coordinate) for coordinate in sorted(support)],
+    })
 
 
 def derive_dense_joint_oracle(
@@ -1659,13 +1676,11 @@ def regenerate_frozen_attempt_inputs(
         )
         for coordinate in raw_cube_support
     }
-    effective_support = set(union_support)
-    for _ in range(1, len(topology["expected_blocks"])):
-        effective_support = set(
-            _source_factor_support(
-                effective_support, window["half_window"], native_tile_shape
-            )
-        )
+    effective_support = (
+        set(candidate_union)
+        if union_support and labels["position"] != "masked"
+        else set()
+    )
     source_correlation_model = (
         "identity_v1"
         if labels["source_process"] == "independent_complex_looks"
@@ -1786,6 +1801,12 @@ def regenerate_frozen_attempt_inputs(
         "intersection_source_count": len(shared),
         "union_source_count": len(union_support),
         "effective_looks_fraction": effective_looks,
+        "effective_support_union_count": len(effective_support),
+        "source_correlation_receipt_sha256": _source_correlation_receipt_sha256(
+            source_correlation_model,
+            source_correlation_distance_scale_pixels,
+            sorted(effective_support),
+        ),
         "source_correlation_model": source_correlation_model,
         "source_correlation_distance_scale_pixels": source_correlation_distance_scale_pixels,
         "target_global_loading_mean": target_global_loading_mean,
@@ -1988,7 +2009,8 @@ class CellAccumulator:
             "target_support_sha256", "reference_support_sha256",
             "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
             "target_source_count", "reference_source_count", "intersection_source_count",
-            "union_source_count",
+            "union_source_count", "effective_support_union_count",
+            "source_correlation_receipt_sha256",
             "source_correlation_model", "source_correlation_distance_scale_pixels",
         )
         if any(attempt.get(field_name) != expected[field_name] for field_name in raw_fields):
