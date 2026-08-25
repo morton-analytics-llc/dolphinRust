@@ -88,6 +88,7 @@ FREEZE_HASH_FIELDS = {
     "preregistration_canonical_sha256",
     "metadata_cache_entry_set_sha256",
 }
+DISCOVERY_SOURCE_FILENAME = "discover_gnss_cohort.py"
 
 
 class CohortValidationError(ValueError):
@@ -120,6 +121,10 @@ def _lower(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _upper(value: Any) -> str:
+    return str(value).strip().upper()
+
+
 def _reject_outcomes(record: Mapping[str, Any]) -> None:
     if set(record) & OUTCOME_FIELDS:
         raise CohortValidationError("metadata discovery cannot inspect outcome fields")
@@ -148,11 +153,19 @@ def validate_candidate(record: Mapping[str, Any], preregistration: Mapping[str, 
         raise CohortValidationError("candidate site is protected from the outer holdout")
     if _lower(record["site_id"]) in PROTECTED_SITES:
         raise CohortValidationError("candidate site is Fresno or an equivalent protected site")
-    if set(stations) & set(preregistration["exclusions"]["station_ids"]):
+    canonical_stations = {_upper(station) for station in stations}
+    excluded_stations = {
+        _upper(station) for station in preregistration["exclusions"]["station_ids"]
+    }
+    if canonical_stations & excluded_stations:
         raise CohortValidationError("candidate station is in the exposed-data exclusion set")
-    if set(stations) & PROTECTED_STATIONS:
+    if canonical_stations & PROTECTED_STATIONS:
         raise CohortValidationError("candidate station is in the exposed-data station set")
-    if record["burst_id"] in preregistration["exclusions"]["burst_ids"] or record["burst_id"] in PROTECTED_BURSTS:
+    canonical_burst = _upper(record["burst_id"])
+    excluded_bursts = {
+        _upper(burst) for burst in preregistration["exclusions"]["burst_ids"]
+    }
+    if canonical_burst in excluded_bursts or canonical_burst in PROTECTED_BURSTS:
         raise CohortValidationError("candidate burst is in the exposed-data exclusion set")
     if _date(record["date_start"]) >= _date(record["date_end"]):
         raise CohortValidationError("candidate date range must be increasing")
@@ -345,6 +358,30 @@ def validate_freeze_receipt(
         raise CohortValidationError("freeze receipt preregistration canonical hash mismatch")
 
     validate_manifest(manifest, preregistration)
+    discovery_source = manifest_path.with_name(DISCOVERY_SOURCE_FILENAME)
+    try:
+        discovery_source_sha256 = _file_digest(discovery_source)
+    except OSError as error:
+        raise CohortValidationError(
+            "freeze receipt discovery_file_sha256 source is unreadable"
+        ) from error
+    if hashes["discovery_file_sha256"] != discovery_source_sha256:
+        raise CohortValidationError("freeze receipt discovery_file_sha256 mismatch")
+    admitted_cache_entries = [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "metadata_hashes": candidate["metadata_hashes"],
+        }
+        for candidate in sorted(
+            manifest["candidate_pool"], key=lambda item: item["candidate_id"]
+        )
+    ]
+    if hashes["metadata_cache_entry_set_sha256"] != canonical_digest(
+        admitted_cache_entries
+    ):
+        raise CohortValidationError(
+            "freeze receipt metadata_cache_entry_set_sha256 mismatch"
+        )
     if receipt.get("cohort_id") != preregistration["cohort_id"] or manifest.get("cohort_id") != receipt.get("cohort_id"):
         raise CohortValidationError("freeze receipt cohort identity mismatch")
     if manifest_binding.get("schema_version") != manifest["schema_version"] or manifest_binding.get("selection_algorithm") != manifest["selection_algorithm"]:

@@ -297,7 +297,9 @@ def load_exclusions(path: Path) -> Exclusions:
             isinstance(entry, str) and entry for entry in entries
         ):
             raise ValueError(f"held-out exclusions.{field} is invalid")
-        return frozenset(entries)
+        if field == "site_ids":
+            return frozenset(entry.strip().lower() for entry in entries)
+        return frozenset(entry.strip().upper() for entry in entries)
 
     return Exclusions(
         station_ids=identifiers("station_ids"),
@@ -309,10 +311,11 @@ def load_exclusions(path: Path) -> Exclusions:
 def exclude_stations(
     stations: Sequence[Station], exclusions: Exclusions
 ) -> list[Station]:
+    excluded = {station_id.strip().upper() for station_id in exclusions.station_ids}
     return [
         station
         for station in stations
-        if station.station_id not in exclusions.station_ids
+        if station.station_id.strip().upper() not in excluded
     ]
 
 
@@ -332,12 +335,18 @@ def select_shared_burst(
     second_station_id: str,
     exclusions: Exclusions,
 ) -> tuple[str, list[str]] | tuple[None, None]:
+    excluded_bursts = {
+        excluded.strip().upper() for excluded in exclusions.burst_ids
+    }
+    excluded_sites = {excluded.strip().lower() for excluded in exclusions.site_ids}
+    used = {used.strip().upper() for used in used_bursts}
     for burst, dates in shared:
         site_id = cohort_site_id(burst, first_station_id, second_station_id)
+        canonical_burst = burst.strip().upper()
         if (
-            burst not in used_bursts
-            and burst not in exclusions.burst_ids
-            and site_id not in exclusions.site_ids
+            canonical_burst not in used
+            and canonical_burst not in excluded_bursts
+            and site_id.strip().lower() not in excluded_sites
         ):
             return burst, dates
     return None, None

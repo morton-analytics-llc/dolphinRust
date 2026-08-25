@@ -382,12 +382,14 @@ class HeldoutCohortTests(unittest.TestCase):
             candidate(1, query_digest=self.preregistration["candidate_query"]["query_digest"], site_id="fresno"),
             candidate(2, query_digest=self.preregistration["candidate_query"]["query_digest"], station_ids=["A002", "MMX1"]),
             candidate(3, query_digest=self.preregistration["candidate_query"]["query_digest"], displacement=[1.0]),
+            candidate(4, query_digest=self.preregistration["candidate_query"]["query_digest"], station_ids=["A004", "mMx1"]),
+            candidate(5, query_digest=self.preregistration["candidate_query"]["query_digest"], burst_id="t005_008704_iW1"),
         ]
         discovered = discover_candidates(records, self.preregistration)
         self.assertTrue(discovered["metadata_only"])
         self.assertFalse(discovered["bulk_fetch_performed"])
         self.assertEqual([item["candidate_id"] for item in discovered["candidates"]], ["candidate-000"])
-        self.assertEqual(len(discovered["rejected"]), 3)
+        self.assertEqual(len(discovered["rejected"]), 5)
 
     def test_query_identity_is_a_real_sha256(self):
         self.assertEqual(
@@ -489,6 +491,20 @@ class HeldoutCohortTests(unittest.TestCase):
                 FROZEN_MANIFEST_PATH,
                 PREREGISTRATION_PATH,
             )
+
+        for field in (
+            "discovery_file_sha256",
+            "metadata_cache_entry_set_sha256",
+        ):
+            with self.subTest(field=field):
+                changed_hash = copy.deepcopy(receipt)
+                changed_hash["hashes"][field] = "0" * 64
+                with self.assertRaisesRegex(CohortValidationError, field):
+                    validate_freeze_receipt(
+                        changed_hash,
+                        FROZEN_MANIFEST_PATH,
+                        PREREGISTRATION_PATH,
+                    )
 
         with tempfile.TemporaryDirectory() as directory:
             changed_manifest = Path(directory) / FROZEN_MANIFEST_PATH.name

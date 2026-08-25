@@ -112,8 +112,8 @@ FFFF 35.3000 -120.0000 13 0 0 0 2020-01-01 2025-01-01 2025-01-02 700
     def test_preregistered_exclusions_are_applied_before_cohort_freeze(self) -> None:
         stations = discovery.parse_holdings(HOLDINGS)
         exclusions = discovery.Exclusions(
-            station_ids=frozenset({"AAAA"}),
-            burst_ids=frozenset({"T001_000001_IW1"}),
+            station_ids=frozenset({"aAaA"}),
+            burst_ids=frozenset({"t001_000001_iW1"}),
             site_ids=frozenset({"t002_000002_iw1_bbbb_cccc"}),
         )
         eligible = discovery.exclude_stations(stations, exclusions)
