@@ -1677,11 +1677,20 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             root = Path(directory)
             (root / "crates" / "producer" / "src").mkdir(parents=True)
             (root / "target" / "release" / "examples").mkdir(parents=True)
+            (root / "validation").mkdir()
             (root / "Cargo.toml").write_text("[workspace]\nmembers=[]\n")
             (root / "Cargo.lock").write_text("version = 3\n")
             source = root / "crates" / "producer" / "src" / "lib.rs"
             source.write_text("pub fn produce() {}\n")
             (root / "crates" / "producer" / "Cargo.toml").write_text("[package]\nname='producer'\nversion='0.1.0'\n")
+            scorer = root / "validation" / "score_spatial_covariance.py"
+            scorer.write_text(
+                'FROZEN_GENERATOR_SHA256 = "generated-a"\n'
+                'FROZEN_SOURCE_SET_SHA256 = "generated-b"\n'
+                "def score(): return 1\n"
+            )
+            simulation = root / "validation" / "spatial_covariance_simulation.py"
+            simulation.write_text("def generate(): return 1\n")
             batch = root / "target" / "release" / "examples" / "spatial_covariance_batch"
             benchmark = root / "target" / "release" / "examples" / "spatial_covariance_bench"
             batch.write_bytes(b"batch-v1")
@@ -1694,6 +1703,23 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             validate_producer_identities(
                 preregistration, code_sha256, binary_sha256, root, batch, benchmark
             )
+            scorer.write_text(
+                'FROZEN_GENERATOR_SHA256 = "changed-generated-a"\n'
+                'FROZEN_SOURCE_SET_SHA256 = "changed-generated-b"\n'
+                "def score(): return 1\n"
+            )
+            self.assertEqual(
+                producer_identities(root, batch, benchmark)[0], code_sha256
+            )
+            simulation.write_text("def generate(): return 2\n")
+            self.assertNotEqual(
+                producer_identities(root, batch, benchmark)[0], code_sha256
+            )
+            with self.assertRaisesRegex(SchemaError, "source set"):
+                validate_producer_identities(
+                    preregistration, code_sha256, binary_sha256, root, batch, benchmark
+                )
+            simulation.write_text("def generate(): return 1\n")
             source.write_text("pub fn produce() { panic!() }\n")
             with self.assertRaisesRegex(SchemaError, "source set"):
                 validate_producer_identities(

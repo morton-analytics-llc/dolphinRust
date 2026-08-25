@@ -42,7 +42,7 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21315584
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "2d0615066f36e2c1ad40fe811f9e5055a1811bf75a490064a7427d97c3b1dda2"
+FROZEN_GENERATOR_SHA256 = "e96c21800feb4e5873daa3bfcf181e7e857f903c6aaea7d2c00f6c555f3feaba"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "7697e728c554821ba4cc5bc7ffa4c28be06b2e6c177b644543e8876f7941eba5"
 FROZEN_EXECUTION_SHA256 = "44f1d6bcf80b681214bf7fddacaa8889afdd8e39f8d2a4bc48777a6305e0df0a"
 FROZEN_REDUCERS_SHA256 = "bdab964569b074caf0bc27ec758a2f7ca633a911368333610fd42c96bb6740dd"
@@ -61,9 +61,18 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "7c2bb91c4b5f2d1a7782122d1dbc160c4626b667e33097d0241bbb391e900a99"
+FROZEN_SOURCE_SET_SHA256 = "da300fcd295306ac634c3d552cdf206ab15e1bf3a42d16acfb5b3bf0570fcb5b"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
-FROZEN_SOURCE_SET_FILES = ("Cargo.lock", "Cargo.toml")
+FROZEN_SOURCE_SET_FILES = (
+    "Cargo.lock",
+    "Cargo.toml",
+    "validation/score_spatial_covariance.py",
+    "validation/spatial_covariance_simulation.py",
+)
+FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS = (
+    "FROZEN_GENERATOR_SHA256",
+    "FROZEN_SOURCE_SET_SHA256",
+)
 FROZEN_MATCHED_POSITIVE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
 FROZEN_MATCHED_NEGATIVE_CELL = FROZEN_MATCHED_POSITIVE_CELL.replace("shared_75_positive", "shared_75_negative")
 FROZEN_MATCHED_SEED_COUNT = 512
@@ -260,6 +269,56 @@ def sha256_file(path: Path, byte_limit: int | None = None) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _producer_source_bytes(path: Path, relative_path: str) -> bytes:
+    before = path.stat()
+    raw = path.read_bytes()
+    after = path.stat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity or len(raw) != before.st_size:
+        raise SchemaError(f"{path} changed while it was being read")
+    if relative_path != "validation/score_spatial_covariance.py":
+        return raw
+    try:
+        lines = raw.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise SchemaError("producer scorer source is not UTF-8") from exc
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for line in lines:
+        name = next(
+            (
+                candidate
+                for candidate in FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS
+                if line.startswith(f'{candidate} = "')
+            ),
+            None,
+        )
+        if name is None:
+            normalized.append(line)
+            continue
+        if name in seen or not line.rstrip("\r\n").endswith('"'):
+            raise SchemaError("producer scorer identity assignment is malformed")
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        normalized.append(f'{name} = "<producer-source-set-v2>"{ending}')
+        seen.add(name)
+    if seen != set(FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS):
+        raise SchemaError("producer scorer identity assignments are missing")
+    return "".join(normalized).encode("utf-8")
+
+
 def _canonical_source_entries(source_root: Path) -> list[dict[str, Any]]:
     source_root = Path(source_root).resolve(strict=True)
     paths = [source_root / name for name in FROZEN_SOURCE_SET_FILES]
@@ -270,11 +329,12 @@ def _canonical_source_entries(source_root: Path) -> list[dict[str, Any]]:
     for path in sorted(set(paths), key=lambda value: value.relative_to(source_root).as_posix()):
         if path.is_symlink() or not path.is_file():
             raise SchemaError("source identity contains a missing, non-regular, or symlinked file")
-        digest, byte_count = sha256_file(path)
+        relative_path = path.relative_to(source_root).as_posix()
+        normalized = _producer_source_bytes(path, relative_path)
         entries.append({
-            "path": path.relative_to(source_root).as_posix(),
-            "byte_count": byte_count,
-            "sha256": digest,
+            "path": relative_path,
+            "byte_count": len(normalized),
+            "sha256": hashlib.sha256(normalized).hexdigest(),
         })
     if not entries:
         raise SchemaError("source identity set is empty")
@@ -283,9 +343,10 @@ def _canonical_source_entries(source_root: Path) -> list[dict[str, Any]]:
 
 def canonical_source_set_sha256(source_root: Path) -> str:
     return sha256_json({
-        "schema": "dolphinrust.canonical-rust-source-set/1",
+        "schema": "dolphinrust.canonical-producer-source-set/2",
         "roots": list(FROZEN_SOURCE_SET_ROOTS),
         "files": list(FROZEN_SOURCE_SET_FILES),
+        "normalized_assignments": list(FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS),
         "entries": _canonical_source_entries(source_root),
     })
 
@@ -560,9 +621,10 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
         binary.get("release_invocation_template", [None])[0]
         != "target/release/examples/spatial_covariance_batch"
         or binary.get("source_identity") != {
-            "schema": "dolphinrust.canonical-rust-source-set/1",
+            "schema": "dolphinrust.canonical-producer-source-set/2",
             "roots": list(FROZEN_SOURCE_SET_ROOTS),
             "files": list(FROZEN_SOURCE_SET_FILES),
+            "normalized_assignments": list(FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS),
             "sha256": FROZEN_SOURCE_SET_SHA256,
         }
         or binary.get("producer_binary_identity") != {

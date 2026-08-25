@@ -612,15 +612,21 @@
         "--ephemeral-evidence-stdout"
       ],
       "source_identity": {
-        "schema": "dolphinrust.canonical-rust-source-set/1",
+        "schema": "dolphinrust.canonical-producer-source-set/2",
         "roots": [
           "crates"
         ],
         "files": [
           "Cargo.lock",
-          "Cargo.toml"
+          "Cargo.toml",
+          "validation/score_spatial_covariance.py",
+          "validation/spatial_covariance_simulation.py"
         ],
-        "sha256": "7c2bb91c4b5f2d1a7782122d1dbc160c4626b667e33097d0241bbb391e900a99"
+        "normalized_assignments": [
+          "FROZEN_GENERATOR_SHA256",
+          "FROZEN_SOURCE_SET_SHA256"
+        ],
+        "sha256": "da300fcd295306ac634c3d552cdf206ab15e1bf3a42d16acfb5b3bf0570fcb5b"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
