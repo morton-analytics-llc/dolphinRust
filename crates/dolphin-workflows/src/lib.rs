@@ -19,6 +19,7 @@ pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
 pub mod spatial_covariance_artifact;
+mod spatial_reference_covariance_output;
 pub mod tiling;
 pub mod unwrap_backend;
 
