@@ -356,6 +356,30 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             with self.assertRaisesRegex(SchemaError, "scope/order/count"):
                 validate_shard_manifest(self.preregistration, changed, spec)
 
+    def test_integer_receipt_identities_reject_boolean_aliases(self):
+        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+        ordinal = CellAccumulator(self.preregistration, cell_id, 1, expected_seed_count=1)
+        ordinal_alias = self._attempt(cell_id, 1, 0)
+        ordinal_alias["cell_ordinal"] = True
+        with self.assertRaisesRegex(SchemaError, "cell identity"):
+            ordinal.add(ordinal_alias)
+
+        seed = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=2)
+        seed.add(self._attempt(cell_id, 0, 0))
+        seed_alias = self._attempt(cell_id, 0, 1)
+        seed_alias["seed_index"] = True
+        with self.assertRaisesRegex(SchemaError, "seed"):
+            seed.add(seed_alias)
+
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        manifest = self._manifest(
+            spec,
+            {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0},
+        )
+        manifest["shard_index"] = False
+        with self.assertRaisesRegex(SchemaError, "integer identity"):
+            validate_shard_manifest(self.preregistration, manifest, spec)
+
     def test_atomic_commit_and_resume_require_exact_immutable_shard(self):
         cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
         spec = ShardSpec(0, 0, 1, (cell_id,))
@@ -443,7 +467,7 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         self.assertTrue(probe["required_before_outcomes"])
         self.assertTrue(probe["derived_concurrency_receipt_required"])
         self.assertEqual(derive_concurrency_receipt(7200, 3600, 0.25), 3)
-        rate = 100000.0
+        rate = 1_000_000.0
         projected = FROZEN_ATTEMPT_COUNT / rate
         measurements = [
             {
@@ -475,6 +499,15 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             "config_sha256": sha256_json(self.preregistration["generator"]),
         }
         _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        expected_concurrency = receipt["derived_concurrency"]
+        receipt["derived_concurrency"] = True
+        with self.assertRaisesRegex(SchemaError, "concurrency"):
+            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        receipt["derived_concurrency"] = expected_concurrency
+        receipt["schema_version"] = True
+        with self.assertRaisesRegex(SchemaError, "outcome-discarding"):
+            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        receipt["schema_version"] = 1
         receipt["derived_concurrency"] += 1
         with self.assertRaisesRegex(SchemaError, "derived concurrency"):
             _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
@@ -482,6 +515,45 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         receipt["measurements"][0]["peak_rss_bytes"] = True
         with self.assertRaisesRegex(SchemaError, "invalid RSS"):
             _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+
+    def test_assemble_rejects_destination_outside_run_root_before_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            outside = Path(directory) / "outside"
+            manifests = root / "manifests"
+            root.mkdir()
+            outside.mkdir()
+            manifests.mkdir()
+            performance = root / "performance.json"
+            resources = root / "resources.json"
+            performance.write_text("{}", encoding="utf-8")
+            resources.write_text("[]", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATION / "spatial_covariance_simulation.py"),
+                    "assemble",
+                    "--run-root",
+                    str(root),
+                    "--shard-manifest-directory",
+                    str(manifests),
+                    "--performance-probe",
+                    str(performance),
+                    "--resources",
+                    str(resources),
+                    "--destination",
+                    str(outside / "run-manifest.json"),
+                    "--code-sha256",
+                    "a" * 64,
+                    "--binary-sha256",
+                    "b" * 64,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("destination parent must equal the run root", completed.stderr)
+            self.assertFalse((outside / "run-manifest.json").exists())
 
     def _resources(self, peaks=(1_000_000, 2_000_000, 4_000_000), growth_class="linear", status=PASS):
         sampling = self.preregistration["resource_sampling"]
@@ -525,6 +597,10 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         wrong_scope[1]["growth_observation"][0]["date_count"] = 13
         with self.assertRaisesRegex(SchemaError, "scope drifted"):
             _validate_resources(self.preregistration, wrong_scope, "b" * 64)
+        boolean_repetition = copy.deepcopy(resources)
+        boolean_repetition[0]["growth_observation"][0]["repetition"] = False
+        with self.assertRaisesRegex(SchemaError, "scope drifted"):
+            _validate_resources(self.preregistration, boolean_repetition, "b" * 64)
         superlinear_declared_linear = self._resources((1_000_000, 4_000_000, 16_000_000))
         with self.assertRaisesRegex(SchemaError, "contradicts measured evidence"):
             _validate_resources(self.preregistration, superlinear_declared_linear, "b" * 64)

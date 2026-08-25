@@ -182,6 +182,10 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _integer(value: Any) -> bool:
+    return type(value) is int
+
+
 def _dimension_values(preregistration: Mapping[str, Any], name: str) -> Sequence[str]:
     values = preregistration.get("dimensions", {}).get(name, [])
     return tuple(item.get("id") for item in values if isinstance(item, dict))
@@ -231,12 +235,12 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
 
 def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
     errors: List[str] = []
-    if preregistration.get("schema") != "dolphinrust.spatial_covariance.preregistration" or preregistration.get("schema_version") != 3:
+    if preregistration.get("schema") != "dolphinrust.spatial_covariance.preregistration" or not _integer(preregistration.get("schema_version")) or preregistration.get("schema_version") != 3:
         errors.append("preregistration must use the F54-07 v3 schema")
     if preregistration.get("status") != "preregistered" or preregistration.get("outcomes_present") is not False:
         errors.append("preregistration must remain outcome-free and preregistered")
     supersedes = preregistration.get("supersedes")
-    if supersedes != {"schema_version": 2, "canonical_preregistration_sha256": FROZEN_V2_PREREGISTRATION_SHA256, "outcomes_present": False, "reason": "v2 monolithic receipt cannot satisfy bounded streaming evidence; scientific design unchanged"}:
+    if not isinstance(supersedes, dict) or not _integer(supersedes.get("schema_version")) or supersedes != {"schema_version": 2, "canonical_preregistration_sha256": FROZEN_V2_PREREGISTRATION_SHA256, "outcomes_present": False, "reason": "v2 monolithic receipt cannot satisfy bounded streaming evidence; scientific design unchanged"}:
         errors.append("v3 must bind and outcome-free supersede the exact v2 preregistration")
     dimensions = preregistration.get("dimensions")
     if not isinstance(dimensions, dict) or tuple(dimensions) != DIMENSION_NAMES:
@@ -246,7 +250,7 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
             if _dimension_values(preregistration, name) != FROZEN_DIMENSION_IDS[name]:
                 errors.append(f"dimension {name} does not match the frozen matrix")
     schedule = preregistration.get("seed_schedule")
-    if not isinstance(schedule, dict) or schedule.get("attempted_seeds_per_cell") != FROZEN_SEED_COUNT or schedule.get("no_top_up") is not True:
+    if not isinstance(schedule, dict) or not _integer(schedule.get("attempted_seeds_per_cell")) or schedule.get("attempted_seeds_per_cell") != FROZEN_SEED_COUNT or schedule.get("no_top_up") is not True:
         errors.append("seed schedule must freeze 5000 attempts and prohibit top-up")
     if preregistration.get("thresholds") != FROZEN_THRESHOLDS:
         errors.append("thresholds differ from immutable F54-07 thresholds")
@@ -318,7 +322,7 @@ def _expected_coordinates(preregistration: Mapping[str, Any], cell_id: str) -> t
 
 def realized_overlap_jaccard(target_count: Any, reference_count: Any, intersection_count: Any, union_count: Any) -> float:
     counts = (target_count, reference_count, intersection_count, union_count)
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts):
+    if any(not _integer(value) or value < 0 for value in counts):
         raise SchemaError("source-key overlap counts must be non-negative integers")
     if intersection_count > min(target_count, reference_count) or union_count != target_count + reference_count - intersection_count or union_count == 0:
         raise SchemaError("source-key intersection/union arithmetic is invalid")
@@ -358,9 +362,9 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has malformed or unknown per-attempt evidence")
         if attempt.get("schema") != "dolphinrust.spatial-covariance.attempt-receipt/3":
             raise SchemaError(f"cell {self.cell_id} has the wrong attempt schema")
-        if attempt.get("cell_id") != self.cell_id or attempt.get("cell_ordinal") != self.cell_ordinal:
+        if attempt.get("cell_id") != self.cell_id or not _integer(attempt.get("cell_ordinal")) or attempt.get("cell_ordinal") != self.cell_ordinal:
             raise SchemaError(f"cell {self.cell_id} has an out-of-order cell identity")
-        if attempt.get("seed_index") != self.next_seed_index or self.next_seed_index >= self.expected_seed_count:
+        if not _integer(attempt.get("seed_index")) or attempt.get("seed_index") != self.next_seed_index or self.next_seed_index >= self.expected_seed_count:
             raise SchemaError(f"cell {self.cell_id} has a missing, duplicate, top-up, or out-of-order seed")
         if attempt.get("seed_sha256") != _expected_seed_hash(self.preregistration, self.cell_id, self.next_seed_index):
             raise SchemaError(f"cell {self.cell_id} has a seed derivation mismatch")
@@ -381,7 +385,12 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has a source-model identity mismatch")
         if attempt.get("date_axis_sha256") != sha256_json(topology["date_axis"]):
             raise SchemaError(f"cell {self.cell_id} has a date-axis identity mismatch")
-        if attempt.get("target_coordinate") != target or attempt.get("reference_coordinate") != reference:
+        if any(
+            not isinstance(attempt.get(field_name), list)
+            or len(attempt[field_name]) != 2
+            or any(not _integer(value) for value in attempt[field_name])
+            for field_name in ("target_coordinate", "reference_coordinate")
+        ) or attempt.get("target_coordinate") != target or attempt.get("reference_coordinate") != reference:
             raise SchemaError(f"cell {self.cell_id} has a coordinate identity mismatch")
         status = attempt.get("status")
         if status not in ATTEMPT_STATUSES or not isinstance(attempt.get("emitted"), bool) or not isinstance(attempt.get("factor_emitted"), bool):
@@ -539,6 +548,13 @@ def validate_shard_manifest(preregistration: Mapping[str, Any], manifest: Any, s
         "expected_attempts": spec.expected_attempts, "preregistration_sha256": preregistration_digest(preregistration),
         "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]), "committed": True,
     }
+    integer_fields = (
+        "schema_version", "shard_index", "cell_ordinal_start", "cell_ordinal_end_exclusive",
+        "expected_cells", "expected_attempts", "input_bytes", "output_bytes", "input_records",
+        "output_records", "peak_rss_bytes",
+    )
+    if any(not _integer(manifest.get(field_name)) for field_name in integer_fields) or manifest.get("committed") is not True:
+        raise SchemaError(f"shard {spec.index} manifest has an invalid integer identity")
     if any(manifest.get(key) != value for key, value in expected.items()):
         raise SchemaError(f"shard {spec.index} manifest scope/order/count drifted")
     for field_name in ("input_sha256", "output_sha256", "code_sha256", "binary_sha256", "generator_protocol_sha256"):
@@ -548,7 +564,7 @@ def validate_shard_manifest(preregistration: Mapping[str, Any], manifest: Any, s
         raise SchemaError(f"shard {spec.index} violates one-input-one-output")
     for field_name in ("input_bytes", "output_bytes"):
         value = manifest.get(field_name)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > FROZEN_MAX_SHARD_BYTES:
+        if not _integer(value) or value < 0 or value > FROZEN_MAX_SHARD_BYTES:
             raise SchemaError(f"shard {spec.index} exceeds the uncompressed byte cap")
     if not _number(manifest.get("elapsed_seconds")) or manifest["elapsed_seconds"] < 0:
         raise SchemaError(f"shard {spec.index} has invalid elapsed time")
@@ -584,7 +600,7 @@ def validate_input_shard(preregistration: Mapping[str, Any], input_path: Path, m
                     "seed_sha256": _expected_seed_hash(preregistration, cell_id, seed_index),
                     **dimensions,
                 }
-                if set(request) != INPUT_KEYS or request != expected:
+                if set(request) != INPUT_KEYS or not _integer(request.get("cell_ordinal")) or not _integer(request.get("seed_index")) or request != expected:
                     raise SchemaError(f"shard {spec.index} input has malformed, duplicate, missing, or out-of-order identity")
                 byte_count += len(raw)
                 if byte_count > FROZEN_MAX_SHARD_BYTES:
@@ -648,9 +664,9 @@ def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, 
     if not isinstance(probe, dict) or set(probe) != required:
         raise SchemaError("performance probe receipt has unknown or missing fields")
     frozen = preregistration["execution_protocol"]["performance_probe"]
-    if probe["schema"] != "dolphinrust.spatial-covariance.performance-probe" or probe["schema_version"] != 1 or probe["outcomes_persisted"] is not False:
+    if probe["schema"] != "dolphinrust.spatial-covariance.performance-probe" or not _integer(probe["schema_version"]) or probe["schema_version"] != 1 or probe["outcomes_persisted"] is not False:
         raise SchemaError("performance probe must be outcome-discarding")
-    if probe["seed_counts"] != frozen["seed_counts"] or probe["cell_classes"] != frozen["required_cell_classes"]:
+    if not isinstance(probe["seed_counts"], list) or any(not _integer(value) for value in probe["seed_counts"]) or probe["seed_counts"] != frozen["seed_counts"] or probe["cell_classes"] != frozen["required_cell_classes"]:
         raise SchemaError("performance probe does not cover the frozen classes/seeds")
     if probe["code_sha256"] != code_sha256 or probe["binary_sha256"] != binary_sha256 or probe["config_sha256"] != sha256_json(preregistration["generator"]):
         raise SchemaError("performance probe scope identity mismatch")
@@ -664,7 +680,7 @@ def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, 
     for measurement, (cell_class, seed_count) in zip(measurements, expected_pairs):
         if not isinstance(measurement, dict) or set(measurement) != PERFORMANCE_MEASUREMENT_KEYS:
             raise SchemaError("performance probe measurement has unknown or missing fields")
-        if measurement["cell_class"] != cell_class or measurement["seed_count"] != seed_count or measurement["attempt_count"] != seed_count:
+        if not _integer(measurement["seed_count"]) or not _integer(measurement["attempt_count"]) or measurement["cell_class"] != cell_class or measurement["seed_count"] != seed_count or measurement["attempt_count"] != seed_count:
             raise SchemaError("performance probe measurement order/count drifted")
         if measurement["outcomes_persisted"] is not False or not _number(measurement["elapsed_seconds"]) or measurement["elapsed_seconds"] <= 0:
             raise SchemaError("performance probe measurement is not outcome-free with positive timing")
@@ -683,7 +699,7 @@ def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, 
     projected = FROZEN_ATTEMPT_COUNT / probe["attempts_per_second"]
     if not math.isclose(probe["projected_serial_seconds"], projected, rel_tol=1e-12, abs_tol=1e-9):
         raise SchemaError("performance probe serial projection does not match frozen attempt count/rate")
-    if probe["reserve_fraction"] != frozen["reserve_fraction"] or not isinstance(probe.get("derived_concurrency"), int) or probe["derived_concurrency"] < 1:
+    if probe["reserve_fraction"] != frozen["reserve_fraction"] or not _integer(probe.get("derived_concurrency")) or probe["derived_concurrency"] < 1:
         raise SchemaError("performance probe concurrency receipt is invalid")
     expected = math.ceil(probe["projected_serial_seconds"] / (probe["target_wall_seconds"] * (1.0 - probe["reserve_fraction"])))
     if probe["derived_concurrency"] != expected:
@@ -710,6 +726,8 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
         if item["growth_class"] not in {"linear", "superlinear"} or item["binary_hash"] != binary_sha256 or item["config_hash"] != sha256_json(preregistration["generator"]):
             raise SchemaError(f"resource {resource_id} identity/growth mismatch")
         provenance = ("os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs", "measured_repetitions", "tool_versions", "growth_regression", "acceptance")
+        if any(not _integer(item[field_name]) for field_name in ("ram_bytes", "sampling_interval_ms", "warmup_runs", "measured_repetitions")):
+            raise SchemaError(f"resource {resource_id} has invalid integer sampling identity")
         if any(item[field_name] != sampling[field_name] for field_name in provenance):
             raise SchemaError(f"resource {resource_id} sampling provenance mismatch")
         observations = item["growth_observation"]
@@ -720,7 +738,7 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
         for repetition, observation in enumerate(observations):
             if not isinstance(observation, dict) or set(observation) != RESOURCE_OBSERVATION_KEYS:
                 raise SchemaError(f"resource {resource_id} has malformed growth observations")
-            if observation["repetition"] != repetition or observation["tile_pixels"] != matrix["tile_pixels"] or observation["date_count"] != matrix["dates"]:
+            if any(not _integer(observation[field_name]) for field_name in ("repetition", "tile_pixels", "date_count")) or observation["repetition"] != repetition or observation["tile_pixels"] != matrix["tile_pixels"] or observation["date_count"] != matrix["dates"]:
                 raise SchemaError(f"resource {resource_id} growth observation scope drifted")
             if type(observation["peak_rss_bytes"]) is not int or observation["peak_rss_bytes"] <= 0 or not _number(observation["wall_seconds"]) or observation["wall_seconds"] <= 0:
                 raise SchemaError(f"resource {resource_id} growth observation has invalid measurements")
@@ -804,7 +822,7 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
             run_manifest = json.load(handle)
         if not isinstance(run_manifest, dict) or set(run_manifest) != RUN_MANIFEST_KEYS:
             raise SchemaError("run manifest has unknown or missing fields")
-        if run_manifest["schema"] != "dolphinrust.spatial-covariance.run-manifest" or run_manifest["schema_version"] != 3:
+        if run_manifest["schema"] != "dolphinrust.spatial-covariance.run-manifest" or not _integer(run_manifest["schema_version"]) or run_manifest["schema_version"] != 3:
             raise SchemaError("run manifest must use schema v3")
         if run_manifest["preregistration_sha256"] != preregistration_digest(preregistration):
             raise SchemaError("run manifest preregistration identity mismatch")

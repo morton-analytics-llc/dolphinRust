@@ -171,10 +171,10 @@ def inspect_one_input_one_output(
                     "seed_sha256": _expected_seed_hash(preregistration, cell_id, seed_index),
                     **dimensions,
                 }
-                if not isinstance(request, dict) or set(request) != INPUT_KEYS or request != expected_request:
+                if not isinstance(request, dict) or set(request) != INPUT_KEYS or type(request.get("cell_ordinal")) is not int or type(request.get("seed_index")) is not int or request != expected_request:
                     raise SchemaError("batch input has malformed, duplicate, missing, or out-of-order identity")
                 identity = ("cell_id", "cell_ordinal", "seed_index", "seed_sha256")
-                if not isinstance(receipt, dict) or any(receipt.get(field_name) != request[field_name] for field_name in identity):
+                if not isinstance(receipt, dict) or type(receipt.get("cell_ordinal")) is not int or type(receipt.get("seed_index")) is not int or any(receipt.get(field_name) != request[field_name] for field_name in identity):
                     raise SchemaError("batch output order/identity does not match its input record")
                 accumulator.add(receipt)
                 byte_count += len(output_line)
@@ -346,6 +346,15 @@ def build_run_manifest(
         validate_shard_manifest(preregistration, shard_manifest, spec)
         if shard_manifest["code_sha256"] != code_sha256 or shard_manifest["binary_sha256"] != binary_sha256:
             raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
+        if not committed_shard_matches(
+            preregistration,
+            spec,
+            run_root,
+            resolved,
+            code_sha256,
+            binary_sha256,
+        ):
+            raise SchemaError(f"shard {spec.index} is not an exact committed shard")
         entries.append({"path": relative, "sha256": digest})
         digests.append(digest)
     return {
@@ -435,13 +444,16 @@ def main() -> None:
             preregistration, spec, args.run_root, args.manifest, args.code_sha256, args.binary_sha256,
         )}
     else:
+        run_root = args.run_root.resolve(strict=True)
+        if args.destination.parent.resolve() != run_root:
+            raise SchemaError("run-manifest destination parent must equal the run root")
         manifest_paths = [args.shard_manifest_directory / f"manifest-{index:05d}.jsonl" for index in range(FROZEN_SHARD_COUNT)]
         with args.performance_probe.open(encoding="utf-8") as handle:
             performance_probe = json.load(handle)
         with args.resources.open(encoding="utf-8") as handle:
             resources = json.load(handle)
         run_manifest = build_run_manifest(
-            preregistration, args.run_root, manifest_paths, args.code_sha256, args.binary_sha256,
+            preregistration, run_root, manifest_paths, args.code_sha256, args.binary_sha256,
             performance_probe, resources,
         )
         result = write_run_manifest_atomic(run_manifest, args.destination)
