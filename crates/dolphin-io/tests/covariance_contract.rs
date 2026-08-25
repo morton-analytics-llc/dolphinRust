@@ -1387,8 +1387,16 @@ fn sealed_generation_registry_survives_append_and_capped_copy() {
         &extended_registry,
     )
     .unwrap();
+    let exact_copy_cap = parent_reader
+        .read_block_with_receipt(blocks[0].block_id, u64::MAX)
+        .unwrap()
+        .read_allocation_bytes;
+    let error = writer
+        .copy_validated_sealed_block(&parent_reader, blocks[0].block_id, exact_copy_cap - 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds byte cap"), "{error}");
     let copied = writer
-        .copy_validated_sealed_block(&parent_reader, blocks[0].block_id, u64::MAX)
+        .copy_validated_sealed_block(&parent_reader, blocks[0].block_id, exact_copy_cap)
         .unwrap();
     assert!(copied.source_read_bytes > 0);
     assert_eq!(
