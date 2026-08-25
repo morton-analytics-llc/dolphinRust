@@ -1924,6 +1924,13 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 CODE, BINARY, 32,
             )
 
+    def test_matched_cohort_generator_admits_frozen_512_before_execution(self):
+        with self.assertRaises(FileNotFoundError):
+            generate_matched_pair_cohorts(
+                self.preregistration, PREREGISTRATION, Path("missing-batch"),
+                CODE, BINARY, 512,
+            )
+
     def test_cli_exposes_compact_lifecycle(self):
         completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
         for command in (
