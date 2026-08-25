@@ -10,6 +10,7 @@ import json
 import math
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -75,7 +76,19 @@ class CachedCatalogResult:
 
 class MetadataSearchCache:
     SCHEMA = "dolphinrust.asf_metadata_search_cache"
-    VERSION = 1
+    VERSION = 2
+    CATALOG_PROPERTIES = (
+        "operaBurstID",
+        "startTime",
+        "fileName",
+        "fileID",
+        "flightDirection",
+        "pathNumber",
+        "orbit",
+        "groupID",
+        "processingDate",
+        "productVersion",
+    )
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -84,12 +97,90 @@ class MetadataSearchCache:
         self.misses = 0
         if path is not None and path.exists():
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("schema") != self.SCHEMA or payload.get("schema_version") != self.VERSION:
+            if payload.get("schema") != self.SCHEMA:
                 raise ValueError("ASF metadata cache schema/version mismatch")
-            entries = payload.get("entries")
-            if not isinstance(entries, dict):
-                raise ValueError("ASF metadata cache entries are invalid")
-            self.entries = entries
+            version = payload.get("schema_version")
+            if version == 1:
+                self._migrate_legacy(payload)
+            elif version == self.VERSION:
+                self._load_entries()
+            else:
+                raise ValueError("ASF metadata cache schema/version mismatch")
+
+    @property
+    def entry_directory(self) -> Path | None:
+        if self.path is None:
+            return None
+        return self.path.with_name(self.path.name + ".entries")
+
+    def _normalize_feature(self, feature: dict[str, Any]) -> dict[str, Any]:
+        result = CachedCatalogResult(feature)
+        missing = [
+            field
+            for field in self.CATALOG_PROPERTIES
+            if result.properties.get(field) is None
+        ]
+        if missing:
+            raise ValueError(
+                "ASF result is missing cache metadata fields: " + ", ".join(missing)
+            )
+        return {
+            "type": "Feature",
+            "geometry": result.geojson()["geometry"],
+            "properties": {
+                field: result.properties[field] for field in self.CATALOG_PROPERTIES
+            },
+        }
+
+    def _entry(self, request: dict[str, Any], features: list[dict[str, Any]]) -> dict[str, Any]:
+        normalized = sorted(
+            (self._normalize_feature(feature) for feature in features),
+            key=lambda feature: (
+                feature["properties"]["startTime"],
+                feature["properties"]["fileName"],
+                canonical_digest(feature),
+            ),
+        )
+        return {
+            "request": request,
+            "results": normalized,
+            "results_sha256": canonical_digest(normalized),
+        }
+
+    def _validate_entry(self, key: str, entry: dict[str, Any]) -> None:
+        request = entry.get("request")
+        features = entry.get("results")
+        if not isinstance(request, dict) or canonical_digest(request) != key:
+            raise ValueError("ASF metadata cache request identity mismatch")
+        if not isinstance(features, list) or entry.get("results_sha256") != canonical_digest(features):
+            raise ValueError("ASF metadata cache result hash mismatch")
+        for feature in features:
+            self._normalize_feature(feature)
+
+    def _migrate_legacy(self, payload: dict[str, Any]) -> None:
+        legacy = payload.get("entries")
+        if not isinstance(legacy, dict):
+            raise ValueError("ASF metadata cache entries are invalid")
+        for key, value in legacy.items():
+            request = value.get("request") if isinstance(value, dict) else None
+            features = value.get("results") if isinstance(value, dict) else None
+            if not isinstance(request, dict) or not isinstance(features, list):
+                raise ValueError("ASF metadata cache legacy entry is invalid")
+            entry = self._entry(request, features)
+            self._validate_entry(key, entry)
+            self.entries[key] = entry
+            self._persist_entry(key)
+        self._persist_index()
+
+    def _load_entries(self) -> None:
+        directory = self.entry_directory
+        if directory is None or not directory.is_dir():
+            raise ValueError("ASF metadata cache entry directory is missing")
+        for entry_path in sorted(directory.glob("*.json")):
+            key = entry_path.stem
+            entry = json.loads(entry_path.read_text(encoding="utf-8"))
+            self._validate_entry(key, entry)
+            self.entries[key] = entry
 
     def _request(self, station: Station, start: str, end: str) -> dict[str, Any]:
         return {
@@ -117,41 +208,81 @@ class MetadataSearchCache:
             return [CachedCatalogResult(feature) for feature in features]
         self.misses += 1
         features = [result.geojson() for result in search_station(station, start, end)]
-        results = [CachedCatalogResult(feature) for feature in features]
-        self.entries[key] = {
-            "request": request,
-            "results": features,
-            "results_sha256": canonical_digest(features),
-        }
-        self.persist()
-        return results
+        self.entries[key] = self._entry(request, features)
+        self._persist_entry(key)
+        self._persist_index()
+        return [CachedCatalogResult(feature) for feature in self.entries[key]["results"]]
 
-    def persist(self) -> None:
-        if self.path is None:
+    def prefetch(
+        self,
+        stations: Sequence[Station],
+        start: str,
+        end: str,
+        workers: int,
+    ) -> None:
+        if workers <= 0 or workers > 8:
+            raise ValueError("metadata prefetch workers must be between 1 and 8")
+        requests_by_key: dict[str, tuple[Station, dict[str, Any]]] = {}
+        for station in stations:
+            request = self._request(station, start, end)
+            requests_by_key[canonical_digest(request)] = (station, request)
+        missing: dict[str, tuple[Station, dict[str, Any]]] = {}
+        for key, value in requests_by_key.items():
+            if key in self.entries:
+                self._validate_entry(key, self.entries[key])
+                self.hits += 1
+            else:
+                missing[key] = value
+        if not missing:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        def fetch(station: Station, request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            return request, [result.geojson() for result in search_station(station, start, end)]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(fetch, station, request): key
+                for key, (station, request) in missing.items()
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                request, features = future.result()
+                self.entries[key] = self._entry(request, features)
+                self.misses += 1
+                self._persist_entry(key)
+        self._persist_index()
+
+    def _atomic_write(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
         os.close(descriptor)
         temporary_path = Path(temporary)
         try:
             temporary_path.write_text(
-                json.dumps(
-                    {
-                        "schema": self.SCHEMA,
-                        "schema_version": self.VERSION,
-                        "entries": self.entries,
-                    },
-                    indent=2,
-                    allow_nan=False,
-                )
-                + "\n",
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
                 encoding="utf-8",
             )
-            os.replace(temporary_path, self.path)
+            os.replace(temporary_path, path)
         finally:
             temporary_path.unlink(missing_ok=True)
+
+    def _persist_entry(self, key: str) -> None:
+        directory = self.entry_directory
+        if directory is not None:
+            self._atomic_write(directory / f"{key}.json", self.entries[key])
+
+    def _persist_index(self) -> None:
+        if self.path is not None:
+            self._atomic_write(
+                self.path,
+                {
+                    "schema": self.SCHEMA,
+                    "schema_version": self.VERSION,
+                    "entry_directory": self.entry_directory.name,
+                },
+            )
 
 
 def load_exclusions(path: Path) -> Exclusions:
@@ -461,7 +592,19 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
     examined: list[dict[str, Any]] = []
     used_bursts: set[str] = set()
     search_cache = MetadataSearchCache(getattr(args, "metadata_cache", None))
-    for first, second, distance in pairs[: args.max_pairs]:
+    bounded_pairs = pairs[: args.max_pairs]
+    stations_by_id = {
+        station.station_id: station
+        for first, second, _ in bounded_pairs
+        for station in (first, second)
+    }
+    search_cache.prefetch(
+        [stations_by_id[key] for key in sorted(stations_by_id)],
+        args.start,
+        args.end,
+        workers=getattr(args, "metadata_workers", 8),
+    )
+    for first, second, distance in bounded_pairs:
         first_bursts = results_by_burst(search_cache.search(first, args.start, args.end))
         second_bursts = results_by_burst(search_cache.search(second, args.start, args.end))
         shared: list[tuple[str, list[str]]] = []
@@ -586,6 +729,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest-output", type=Path)
     parser.add_argument("--metadata-cache", type=Path)
+    parser.add_argument("--metadata-workers", type=int, default=8)
     return parser.parse_args()
 
 

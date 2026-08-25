@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -263,6 +265,47 @@ FFFF 35.3000 -120.0000 13 0 0 0 2020-01-01 2025-01-01 2025-01-02 700
                 second = discovery.discover(args)
             self.assertEqual(resumed_search.call_count, 0)
             self.assertEqual(first["examined_pairs"], second["examined_pairs"])
+
+    def test_metadata_prefetch_is_bounded_concurrent_and_deterministic(self) -> None:
+        stations = [
+            discovery.Station(
+                station_id=f"S{index:03d}",
+                latitude=35.0 + index / 100,
+                longitude=-120.0,
+                height_m=10.0,
+                first_date=discovery.dt.date(2020, 1, 1),
+                last_date=discovery.dt.date(2025, 1, 1),
+                solution_count=1000 - index,
+            )
+            for index in range(12)
+        ]
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def search(station, start, end):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep((int(station.station_id[1:]) % 4 + 1) / 100)
+            with lock:
+                active -= 1
+            return [CatalogResult("T001_000001_IW1", "2023-01-01")]
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            discovery, "search_station", side_effect=search
+        ):
+            first = discovery.MetadataSearchCache(Path(directory) / "first.json")
+            first.prefetch(stations, "2023-01-01", "2024-01-01", workers=8)
+            second = discovery.MetadataSearchCache(Path(directory) / "second.json")
+            second.prefetch(list(reversed(stations)), "2023-01-01", "2024-01-01", workers=8)
+        self.assertGreater(peak, 1)
+        self.assertLessEqual(peak, 8)
+        self.assertEqual(
+            discovery.canonical_digest(first.entries),
+            discovery.canonical_digest(second.entries),
+        )
 
     def test_freeze_is_exact_lexical_disjoint_reconstruction(self) -> None:
         query_digest = self.preregistration["candidate_query"]["query_digest"]
