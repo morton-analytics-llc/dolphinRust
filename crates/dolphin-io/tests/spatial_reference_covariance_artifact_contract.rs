@@ -1,13 +1,13 @@
 use dolphin_io::{
-    read_spatial_reference_covariance_block, read_spatial_reference_covariance_header,
-    spatial_reference_calibration_scope_digest, spatial_reference_effective_looks_digest,
-    spatial_reference_runtime_resource_receipt_digest, write_spatial_reference_covariance,
-    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
-    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SpatialReferenceCovarianceWriter, SpatialReferenceRuntimeResourceReceipt,
-    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY,
-    SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+    read_spatial_reference_covariance_block, read_spatial_reference_covariance_block_ids,
+    read_spatial_reference_covariance_header, spatial_reference_calibration_scope_digest,
+    spatial_reference_effective_looks_digest, spatial_reference_runtime_resource_receipt_digest,
+    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
+    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
+    SpatialReferenceCovarianceStatus, SpatialReferenceCovarianceWriter,
+    SpatialReferenceRuntimeResourceReceipt, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
 use std::sync::{Mutex, MutexGuard};
 
@@ -310,6 +310,60 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
     let error =
         read_spatial_reference_covariance_block(&path, 7, exact_combined_cap - 1).unwrap_err();
     assert!(error.to_string().contains("byte cap"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn sealed_reference_factor_enumerates_block_ids_under_a_byte_cap() {
+    let _hdf5 = hdf5_guard();
+    let path = std::env::temp_dir().join(format!(
+        "dolphin_spatial_reference_block_ids_{}.h5",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut metadata = metadata();
+    let mut first = block();
+    first.target_grid = grid(0, 1);
+    first.rank_by_target.truncate(1);
+    first.status.truncate(1);
+    first.source_burst_index_by_target.truncate(1);
+    first.difference_factor.truncate(6);
+    first.approximation_error_bound.truncate(1);
+    first.effective_looks_fraction.as_mut().unwrap().truncate(1);
+    first.support_union_count.as_mut().unwrap().truncate(1);
+    first.effective_looks_receipt.as_mut().unwrap().truncate(32);
+    first
+        .resource_high_water_bytes
+        .as_mut()
+        .unwrap()
+        .truncate(1);
+    first.condition_number.as_mut().unwrap().truncate(1);
+    let mut second = block();
+    second.block_id = 11;
+    second.target_grid = grid(1, 1);
+    second.rank_by_target = vec![second.rank_by_target[1]];
+    second.status = vec![second.status[1]];
+    second.source_burst_index_by_target = vec![second.source_burst_index_by_target[1]];
+    second.difference_factor = second.difference_factor[6..].to_vec();
+    second.approximation_error_bound = vec![second.approximation_error_bound[1]];
+    second.effective_looks_fraction = Some(vec![0.5]);
+    second.support_union_count = Some(vec![12]);
+    second.effective_looks_receipt = Some(vec![0x72; 32]);
+    second.resource_high_water_bytes = Some(vec![1536]);
+    second.condition_number = Some(vec![1.0]);
+    metadata.effective_looks_digest =
+        spatial_reference_effective_looks_digest(&[first.clone(), second.clone()]).unwrap();
+    write_spatial_reference_covariance(&path, &metadata, &[second, first]).unwrap();
+
+    let mut exact_cap = 0;
+    while read_spatial_reference_covariance_block_ids(&path, exact_cap).is_err() {
+        exact_cap += 1;
+    }
+    assert_eq!(
+        read_spatial_reference_covariance_block_ids(&path, exact_cap).unwrap(),
+        vec![7, 11]
+    );
+    assert!(read_spatial_reference_covariance_block_ids(&path, exact_cap - 1).is_err());
     std::fs::remove_file(path).unwrap();
 }
 
