@@ -44,6 +44,7 @@ from validation.score_spatial_covariance import (
     _read_hashed_json_record,
     _read_single_json_record,
     _source_correlation_receipt_sha256,
+    _validate_positive_overlap_execution_replay,
     _validate_performance_probe,
     _validate_resources,
     derive_dense_joint_oracle,
@@ -1528,6 +1529,24 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 sha256_json(self.preregistration["generator"]),
             )
 
+        replayed = copy.deepcopy(cohort)
+        replayed["predicted_covariance_trace"] = 0.75
+        with (
+            mock.patch(
+                "validation.score_spatial_covariance._replay_positive_overlap_cohort",
+                return_value=replayed,
+            ),
+            self.assertRaisesRegex(SchemaError, "exact Rust execution replay"),
+        ):
+            _validate_positive_overlap_execution_replay(
+                self.preregistration,
+                binding,
+                PREREGISTRATION,
+                Path("batch"),
+                CODE,
+                BINARY,
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             standalone = Path(directory) / "standalone"
             standalone.mkdir()
@@ -2143,7 +2162,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         os.environ.get("DOLPHIN_RUN_FULL_POSITIVE_OVERLAP") == "1",
         "full 512-seed positive-overlap stream is opt-in",
     )
-    def test_complete_frozen_positive_overlap_stream_validates_final_receipt(self):
+    def test_complete_frozen_positive_overlap_stream_and_exact_replay_are_byte_identical(self):
         source_root = Path(__file__).parents[2]
         batch = source_root / "target/release/examples/spatial_covariance_batch"
         benchmark = source_root / "target/release/examples/spatial_covariance_bench"
@@ -2172,6 +2191,14 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             code_sha256,
             binary_sha256,
             sha256_json(self.preregistration["generator"]),
+        )
+        _validate_positive_overlap_execution_replay(
+            self.preregistration,
+            {"positive_overlap_cohort": receipt},
+            PREREGISTRATION,
+            batch,
+            code_sha256,
+            binary_sha256,
         )
         self.assertEqual(receipt["attempted_seed_count"], 512)
         self.assertEqual(receipt["seed_start"], 512)

@@ -202,7 +202,7 @@
       "record_deadline_seconds": 30.0,
       "final_exit_deadline_seconds": 10.0,
       "emission_rate_min": 0.95,
-      "execution": "stream exactly 512 attempts for the frozen positive-overlap cell at scheduled/request ordinal 13 and preserved DGP ordinal 14 through the exact prebuilt spatial_covariance_batch under an explicit extended replay and accumulator context that does not widen the ordinary 128-seed outcome schedule; a bounded supervisor concurrently drains stdout and stderr, kills and waits on stderr above 16 KiB, bounds stdout to one capped record, and enforces the frozen per-record and final-exit deadlines so missing, partial, stalled, or top-up output fails closed; Python independently regenerates each seed's support, ancestry, latent truth, marginal oracle, correlation receipt, coordinates, shape, counts, and source process; all attempt identities are retained and exact emitted and abstained seed counts/digests are persisted; predicted and empirical numeric traces are reduced only over emitted attempts subject to the frozen minimum emission rate, with no top-ups or fabricated values; the positive-overlap difference trace must be below its own target-plus-reference marginal trace for both predicted and empirical evidence; negative coupling is not represented by this stochastic proper-complex production model and remains covered only by the exact ValidationCoupling::Negative production DAG/source-factor oracle"
+      "execution": "stream exactly 512 attempts for the frozen positive-overlap cell at scheduled/request ordinal 13 and preserved DGP ordinal 14 through the exact prebuilt spatial_covariance_batch under an explicit extended replay and accumulator context that does not widen the ordinary 128-seed outcome schedule; a bounded supervisor concurrently drains stdout and stderr, kills and waits on stderr above 16 KiB, bounds stdout to one capped record, and enforces the frozen per-record and final-exit deadlines so missing, partial, stalled, or top-up output fails closed; Python independently regenerates each seed's support, ancestry, latent truth, marginal oracle, correlation receipt, coordinates, shape, counts, and source process; all attempt identities are retained and exact emitted and abstained seed counts/digests are persisted; predicted and empirical numeric traces are reduced only over emitted attempts subject to the frozen minimum emission rate, with no top-ups or fabricated values; the final scorer must rerun all 512 attempts through the exact bound Rust producer and require byte-identical canonical cohort evidence before scoring any shard; the positive-overlap difference trace must be below its own target-plus-reference marginal trace for both predicted and empirical evidence; negative coupling is not represented by this stochastic proper-complex production model and remains covered only by the exact ValidationCoupling::Negative production DAG/source-factor oracle"
     },
     "max_production_sidecar_bytes": 1048576
   },
@@ -686,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "9f28e9b1e0e379516551bdad92f7185f71abaf818a086f0d3a11f2b11004ec75"
+        "sha256": "7dd2dd03fd95a51996761006254a641ab4d15d8ebdbfe75559b67192c0351b69"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
