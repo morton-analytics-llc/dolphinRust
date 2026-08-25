@@ -14,16 +14,22 @@ from typing import Any, Iterable, Iterator, Mapping
 try:
     from validation.score_spatial_covariance import (
         DIMENSION_NAMES,
+        INPUT_KEYS,
+        CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
         FROZEN_SEED_COUNT,
+        FROZEN_SHARD_COUNT,
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _validate_performance_probe,
+        _validate_resources,
         iter_shard_specs,
         load_preregistration,
         preregistration_digest,
+        resolve_below_run_root,
         result_root_sha256,
         sha256_file,
         sha256_json,
@@ -34,16 +40,22 @@ try:
 except ModuleNotFoundError:
     from score_spatial_covariance import (
         DIMENSION_NAMES,
+        INPUT_KEYS,
+        CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
         FROZEN_SEED_COUNT,
+        FROZEN_SHARD_COUNT,
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _validate_performance_probe,
+        _validate_resources,
         iter_shard_specs,
         load_preregistration,
         preregistration_digest,
+        resolve_below_run_root,
         result_root_sha256,
         sha256_file,
         sha256_json,
@@ -74,6 +86,8 @@ def iter_attempt_requests(preregistration: Mapping[str, Any], spec: ShardSpec) -
 
 def write_jsonl_atomic(records: Iterable[Mapping[str, Any]], destination: Path, byte_limit: int = FROZEN_MAX_SHARD_BYTES) -> dict[str, Any]:
     destination = Path(destination)
+    if destination.name.endswith(".partial"):
+        raise SchemaError("final JSONL destination must not use the .partial suffix")
     partial = destination.with_name(destination.name + ".partial")
     if destination.exists() or partial.exists():
         raise SchemaError(f"refusing to overwrite existing shard state at {destination}")
@@ -109,37 +123,68 @@ def prepare_input_shard(preregistration: Mapping[str, Any], spec: ShardSpec, des
     return receipt
 
 
-def inspect_one_input_one_output(input_path: Path, output_partial: Path, byte_limit: int = FROZEN_MAX_SHARD_BYTES, require_partial: bool = True) -> dict[str, Any]:
+def _has_exactly_one_partial_suffix(path: Path) -> bool:
+    suffix = ".partial"
+    return path.name.endswith(suffix) and not path.name.removesuffix(suffix).endswith(suffix)
+
+
+def inspect_one_input_one_output(
+    preregistration: Mapping[str, Any],
+    spec: ShardSpec,
+    input_path: Path,
+    output_partial: Path,
+    byte_limit: int = FROZEN_MAX_SHARD_BYTES,
+    require_partial: bool = True,
+) -> dict[str, Any]:
+    validate_preregistration(preregistration)
     input_path = Path(input_path)
     output_partial = Path(output_partial)
-    if require_partial and not output_partial.name.endswith(".partial"):
-        raise SchemaError("uncommitted batch output must use the .partial suffix")
+    if require_partial and not _has_exactly_one_partial_suffix(output_partial):
+        raise SchemaError("uncommitted batch output must use exactly one .partial suffix")
+    if not require_partial and output_partial.name.endswith(".partial"):
+        raise SchemaError("committed batch output must not use the .partial suffix")
     digest = hashlib.sha256()
     byte_count = 0
     record_count = 0
     with input_path.open("rb") as input_handle, output_partial.open("rb") as output_handle:
-        while True:
-            input_line = input_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
-            output_line = output_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
-            if not input_line and not output_line:
-                break
-            if not input_line or not output_line:
-                raise SchemaError("batch output violates exact one-input-one-output cardinality")
-            if len(output_line) > FROZEN_MAX_RECORD_BYTES or not output_line.endswith(b"\n"):
-                raise SchemaError("batch output exceeds the record cap or lacks newline framing")
-            try:
-                request = json.loads(input_line)
-                receipt = json.loads(output_line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise SchemaError("batch input/output contains malformed JSON") from exc
-            identity = ("cell_id", "cell_ordinal", "seed_index", "seed_sha256")
-            if any(receipt.get(field_name) != request.get(field_name) for field_name in identity):
-                raise SchemaError("batch output order/identity does not match its input record")
-            byte_count += len(output_line)
-            if byte_count > byte_limit:
-                raise SchemaError("batch output exceeds the frozen uncompressed byte cap")
-            digest.update(output_line)
-            record_count += 1
+        for cell_offset, cell_id in enumerate(spec.cell_ids):
+            cell_ordinal = spec.cell_ordinal_start + cell_offset
+            dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+            accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal)
+            for seed_index in range(FROZEN_SEED_COUNT):
+                input_line = input_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
+                output_line = output_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
+                if not input_line or not output_line:
+                    raise SchemaError("batch output violates exact one-input-one-output cardinality")
+                if len(input_line) > FROZEN_MAX_RECORD_BYTES or not input_line.endswith(b"\n") or len(output_line) > FROZEN_MAX_RECORD_BYTES or not output_line.endswith(b"\n"):
+                    raise SchemaError("batch input/output exceeds the record cap or lacks newline framing")
+                try:
+                    request = json.loads(input_line)
+                    receipt = json.loads(output_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise SchemaError("batch input/output contains malformed JSON") from exc
+                expected_request = {
+                    "schema": "dolphinrust.spatial-covariance.attempt/3",
+                    "cell_id": cell_id,
+                    "cell_ordinal": cell_ordinal,
+                    "seed_index": seed_index,
+                    "seed_sha256": _expected_seed_hash(preregistration, cell_id, seed_index),
+                    **dimensions,
+                }
+                if not isinstance(request, dict) or set(request) != INPUT_KEYS or request != expected_request:
+                    raise SchemaError("batch input has malformed, duplicate, missing, or out-of-order identity")
+                identity = ("cell_id", "cell_ordinal", "seed_index", "seed_sha256")
+                if not isinstance(receipt, dict) or any(receipt.get(field_name) != request[field_name] for field_name in identity):
+                    raise SchemaError("batch output order/identity does not match its input record")
+                accumulator.add(receipt)
+                byte_count += len(output_line)
+                if byte_count > byte_limit:
+                    raise SchemaError("batch output exceeds the frozen uncompressed byte cap")
+                digest.update(output_line)
+                record_count += 1
+            accumulator.finalize()
+        if input_handle.read(1) or output_handle.read(1):
+            raise SchemaError("batch output violates exact one-input-one-output cardinality or contains top-up records")
     return {"sha256": digest.hexdigest(), "bytes": byte_count, "records": record_count}
 
 
@@ -156,18 +201,25 @@ def commit_output_shard(
     peak_rss_bytes: int,
 ) -> dict[str, Any]:
     validate_preregistration(preregistration)
-    if peak_rss_bytes > FROZEN_PROCESS_RSS_BYTES:
+    if type(peak_rss_bytes) is not int or peak_rss_bytes < 0 or peak_rss_bytes > FROZEN_PROCESS_RSS_BYTES:
         raise SchemaError("batch process exceeds the frozen 24 GiB RSS cap")
+    lexical_output_partial = Path(output_partial)
+    if not _has_exactly_one_partial_suffix(lexical_output_partial):
+        raise SchemaError("uncommitted batch output must use exactly one .partial suffix")
+    if lexical_output_partial.is_symlink():
+        raise SchemaError("uncommitted batch output must not be a symlink")
+    if Path(input_path).name.endswith(".partial") or Path(manifest_path).name.endswith(".partial"):
+        raise SchemaError("input and manifest destinations must not use the .partial suffix")
     run_root = Path(run_root).resolve()
     input_path = Path(input_path).resolve()
     output_partial = Path(output_partial).resolve()
     manifest_path = Path(manifest_path).resolve()
     output_name = output_partial.name.removesuffix(".partial")
     output_path = output_partial.with_name(output_name)
-    if input_path.name.endswith(".partial") or output_path.exists() or manifest_path.exists():
+    if output_path.name.endswith(".partial") or output_path.exists() or manifest_path.exists():
         raise SchemaError("refusing to overwrite committed shard state")
     input_digest, input_bytes = sha256_file(input_path, FROZEN_MAX_SHARD_BYTES)
-    output = inspect_one_input_one_output(input_path, output_partial)
+    output = inspect_one_input_one_output(preregistration, spec, input_path, output_partial)
     if output["records"] != spec.expected_attempts:
         raise SchemaError(f"shard {spec.index} is incomplete; top-up is prohibited")
     try:
@@ -210,29 +262,45 @@ def commit_output_shard(
     return manifest
 
 
-def committed_shard_matches(preregistration: Mapping[str, Any], spec: ShardSpec, run_root: Path, manifest_path: Path) -> bool:
+def committed_shard_matches(
+    preregistration: Mapping[str, Any],
+    spec: ShardSpec,
+    run_root: Path,
+    manifest_path: Path,
+    expected_code_sha256: str,
+    expected_binary_sha256: str,
+) -> bool:
     try:
+        root = Path(run_root).resolve(strict=True)
+        manifest_path = Path(manifest_path)
+        if manifest_path.name.endswith(".partial"):
+            return False
+        resolved_manifest = manifest_path.resolve(strict=True)
+        resolved_manifest.relative_to(root)
         if Path(str(manifest_path) + ".partial").exists():
             return False
-        raw = Path(manifest_path).read_bytes().splitlines()
+        raw = resolved_manifest.read_bytes().splitlines()
         if len(raw) != 1:
             return False
         manifest = json.loads(raw[0])
         validate_shard_manifest(preregistration, manifest, spec)
-        root = Path(run_root)
+        if manifest["code_sha256"] != expected_code_sha256 or manifest["binary_sha256"] != expected_binary_sha256:
+            return False
         for path_field, hash_field, byte_field in (("input_path", "input_sha256", "input_bytes"), ("output_path", "output_sha256", "output_bytes")):
-            path = root / manifest[path_field]
+            path = resolve_below_run_root(root, manifest[path_field], f"shard {spec.index} {path_field}")
             if Path(str(path) + ".partial").exists():
                 return False
             digest, size = sha256_file(path, FROZEN_MAX_SHARD_BYTES)
             if digest != manifest[hash_field] or size != manifest[byte_field]:
                 return False
-        validate_input_shard(preregistration, root / manifest["input_path"], manifest, spec)
-        output = inspect_one_input_one_output(root / manifest["input_path"], root / manifest["output_path"], require_partial=False)
+        input_path = resolve_below_run_root(root, manifest["input_path"], f"shard {spec.index} input path")
+        output_path = resolve_below_run_root(root, manifest["output_path"], f"shard {spec.index} output path")
+        validate_input_shard(preregistration, input_path, manifest, spec)
+        output = inspect_one_input_one_output(preregistration, spec, input_path, output_path, require_partial=False)
         if output["sha256"] != manifest["output_sha256"] or output["bytes"] != manifest["output_bytes"] or output["records"] != manifest["output_records"]:
             return False
         return True
-    except (OSError, json.JSONDecodeError, SchemaError):
+    except (OSError, ValueError, json.JSONDecodeError, SchemaError):
         return False
 
 
@@ -257,15 +325,27 @@ def build_run_manifest(
     expected_shards = preregistration["execution_protocol"]["shard_count"]
     if len(shard_manifest_paths) != expected_shards:
         raise SchemaError(f"run manifest requires exactly {expected_shards} committed shards")
+    _validate_performance_probe(preregistration, performance_probe, code_sha256, binary_sha256)
+    _validate_resources(preregistration, resources, binary_sha256)
     entries = []
     digests = []
-    for path in shard_manifest_paths:
+    for spec, path in zip(iter_shard_specs(preregistration), shard_manifest_paths):
         resolved = Path(path).resolve()
         try:
             relative = resolved.relative_to(run_root).as_posix()
         except ValueError as exc:
             raise SchemaError("shard manifest path must remain below the run root") from exc
         digest, _ = sha256_file(resolved)
+        raw = resolved.read_bytes().splitlines()
+        if len(raw) != 1:
+            raise SchemaError(f"shard {spec.index} manifest is not one canonical record")
+        try:
+            shard_manifest = json.loads(raw[0])
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SchemaError(f"shard {spec.index} manifest is malformed") from exc
+        validate_shard_manifest(preregistration, shard_manifest, spec)
+        if shard_manifest["code_sha256"] != code_sha256 or shard_manifest["binary_sha256"] != binary_sha256:
+            raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
         entries.append({"path": relative, "sha256": digest})
         digests.append(digest)
     return {
@@ -284,6 +364,8 @@ def build_run_manifest(
 
 def write_run_manifest_atomic(run_manifest: Mapping[str, Any], destination: Path) -> dict[str, Any]:
     destination = Path(destination)
+    if destination.name.endswith(".partial"):
+        raise SchemaError("run-manifest destination must not use the .partial suffix")
     partial = destination.with_name(destination.name + ".partial")
     if destination.exists() or partial.exists():
         raise SchemaError("refusing to overwrite run-manifest state")
@@ -306,15 +388,64 @@ def write_run_manifest_atomic(run_manifest: Mapping[str, Any], destination: Path
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preregistration", type=Path, default=Path(__file__).with_name("spatial_covariance_preregistration.json"))
-    parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--prepare-input-shard", type=int, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare", help="write one deterministic input shard")
+    prepare.add_argument("--run-root", type=Path, required=True)
+    prepare.add_argument("--shard-index", type=int, required=True)
+    commit = commands.add_parser("commit", help="validate and atomically commit one completed output shard")
+    commit.add_argument("--run-root", type=Path, required=True)
+    commit.add_argument("--shard-index", type=int, required=True)
+    commit.add_argument("--input", type=Path, required=True)
+    commit.add_argument("--output-partial", type=Path, required=True)
+    commit.add_argument("--manifest", type=Path, required=True)
+    commit.add_argument("--code-sha256", required=True)
+    commit.add_argument("--binary-sha256", required=True)
+    commit.add_argument("--elapsed-seconds", type=float, required=True)
+    commit.add_argument("--peak-rss-bytes", type=int, required=True)
+    resume = commands.add_parser("resume", help="verify whether one committed shard is exactly reusable")
+    resume.add_argument("--run-root", type=Path, required=True)
+    resume.add_argument("--shard-index", type=int, required=True)
+    resume.add_argument("--manifest", type=Path, required=True)
+    resume.add_argument("--code-sha256", required=True)
+    resume.add_argument("--binary-sha256", required=True)
+    assemble = commands.add_parser("assemble", help="atomically assemble the final run manifest")
+    assemble.add_argument("--run-root", type=Path, required=True)
+    assemble.add_argument("--shard-manifest-directory", type=Path, required=True)
+    assemble.add_argument("--performance-probe", type=Path, required=True)
+    assemble.add_argument("--resources", type=Path, required=True)
+    assemble.add_argument("--destination", type=Path, required=True)
+    assemble.add_argument("--code-sha256", required=True)
+    assemble.add_argument("--binary-sha256", required=True)
     args = parser.parse_args()
     preregistration = load_preregistration(args.preregistration)
-    spec = next((item for item in iter_shard_specs(preregistration) if item.index == args.prepare_input_shard), None)
-    if spec is None:
-        raise SystemExit(f"shard index is outside 0..{preregistration['execution_protocol']['shard_count'] - 1}")
-    destination = args.run_root / "shards" / f"input-{spec.index:05d}.jsonl"
-    print(json.dumps(prepare_input_shard(preregistration, spec, destination), sort_keys=True))
+    if args.command in {"prepare", "commit", "resume"}:
+        spec = next((item for item in iter_shard_specs(preregistration) if item.index == args.shard_index), None)
+        if spec is None:
+            raise SystemExit(f"shard index is outside 0..{preregistration['execution_protocol']['shard_count'] - 1}")
+    if args.command == "prepare":
+        destination = args.run_root / "shards" / f"input-{spec.index:05d}.jsonl"
+        result = prepare_input_shard(preregistration, spec, destination)
+    elif args.command == "commit":
+        result = commit_output_shard(
+            preregistration, spec, args.run_root, args.input, args.output_partial, args.manifest,
+            args.code_sha256, args.binary_sha256, args.elapsed_seconds, args.peak_rss_bytes,
+        )
+    elif args.command == "resume":
+        result = {"reusable": committed_shard_matches(
+            preregistration, spec, args.run_root, args.manifest, args.code_sha256, args.binary_sha256,
+        )}
+    else:
+        manifest_paths = [args.shard_manifest_directory / f"manifest-{index:05d}.jsonl" for index in range(FROZEN_SHARD_COUNT)]
+        with args.performance_probe.open(encoding="utf-8") as handle:
+            performance_probe = json.load(handle)
+        with args.resources.open(encoding="utf-8") as handle:
+            resources = json.load(handle)
+        run_manifest = build_run_manifest(
+            preregistration, args.run_root, manifest_paths, args.code_sha256, args.binary_sha256,
+            performance_probe, resources,
+        )
+        result = write_run_manifest_atomic(run_manifest, args.destination)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

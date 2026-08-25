@@ -29,10 +29,10 @@ FROZEN_MAX_RECORD_BYTES = 2048
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
 FROZEN_GENERATOR_SHA256 = "f481b639f9f092064b668a1e0f6a6945c9f5257fe6a208372da5dd2b034c2ead"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "2328f908c9b45ea416e6202b028c73df37fb40b2c5f338a4ddce375e5206ef7c"
-FROZEN_EXECUTION_SHA256 = "58e2bd28e56955b1c0d8e8e3a5e72adb6d5987461b5e34936ca1f35ca8edd13b"
+FROZEN_EXECUTION_SHA256 = "9564e38fdfd0f681b6fb7c6ca9738371de139d3b7832b103d2c781fa09cb205a"
 FROZEN_REDUCERS_SHA256 = "65e45eb254d65a9efd04c379581296f2396ee9166fdae6dad1be4058dad7eb5c"
 FROZEN_MATRIX_SHA256 = "9133bbac234fe511df7cce8e154bdf9134a1d2af699b8127c34522135cb50939"
-FROZEN_RECEIPT_SHA256 = "f2e53c52b485af7bb425c4da84c4d711de74acb80e6fb19c84850d35bc866f38"
+FROZEN_RECEIPT_SHA256 = "868af7896ba08ac15a92b1f4592a8ac777d75eef31bed597fcb29b9c64df1ec6"
 FROZEN_HASH_FIELDS_SHA256 = "ac81a3c151c46a953aa3ad279618addadadc57e9cdec83ae12f2cabfe2f4b12a"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "76e75e7dd6fe32c3751c8f230f4aa7e53df44800190f6877a685189eb56bc7d7"
 FROZEN_RESOURCE_MATRIX_SHA256 = "acfe4ba22b2fcb39496d5688628246c1be9fb488da4d451d2e2c726cbbc0c4b3"
@@ -101,6 +101,12 @@ RESOURCE_KEYS = {
     "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs",
     "measured_repetitions", "tool_versions", "growth_observation", "growth_regression", "acceptance",
 }
+PERFORMANCE_MEASUREMENT_KEYS = {
+    "cell_class", "seed_count", "attempt_count", "elapsed_seconds", "peak_rss_bytes", "outcomes_persisted",
+}
+RESOURCE_OBSERVATION_KEYS = {
+    "repetition", "tile_pixels", "date_count", "peak_rss_bytes", "wall_seconds",
+}
 
 
 class SchemaError(ValueError):
@@ -145,6 +151,19 @@ def sha256_file(path: Path, byte_limit: int | None = None) -> tuple[str, int]:
                 raise SchemaError(f"{path} exceeds the frozen uncompressed byte cap")
             digest.update(chunk)
     return digest.hexdigest(), size
+
+
+def resolve_below_run_root(run_root: Path, relative_path: Any, label: str) -> Path:
+    root = Path(run_root).resolve(strict=True)
+    path = Path(relative_path) if isinstance(relative_path, (str, os.PathLike)) else Path()
+    if not isinstance(relative_path, (str, os.PathLike)) or path.is_absolute() or ".." in path.parts:
+        raise SchemaError(f"{label} escapes the run root")
+    resolved = (root / path).resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise SchemaError(f"{label} escapes the run root through a symlink") from exc
+    return resolved
 
 
 def preregistration_digest(preregistration: Mapping[str, Any]) -> str:
@@ -398,7 +417,7 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has a signed-influence mismatch")
         influence = attempt.get("signed_cross_influence")
         expected_sign = PAIR_SIGN[labels["pair_geometry"]]
-        if expected_sign in {"positive", "negative"} and (not _number(influence) or (influence > 0) != (expected_sign == "positive")):
+        if labels["position"] != "masked" and expected_sign in {"positive", "negative"} and (not _number(influence) or (influence > 0) != (expected_sign == "positive")):
             raise SchemaError(f"cell {self.cell_id} has a signed cross-influence mismatch")
         if expected_sign in {"zero", "none"} and labels["position"] != "masked" and influence != 0.0:
             raise SchemaError(f"cell {self.cell_id} zero/disjoint influence must be exactly zero")
@@ -533,9 +552,15 @@ def validate_shard_manifest(preregistration: Mapping[str, Any], manifest: Any, s
             raise SchemaError(f"shard {spec.index} exceeds the uncompressed byte cap")
     if not _number(manifest.get("elapsed_seconds")) or manifest["elapsed_seconds"] < 0:
         raise SchemaError(f"shard {spec.index} has invalid elapsed time")
-    if not isinstance(manifest.get("peak_rss_bytes"), int) or manifest["peak_rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
+    if type(manifest.get("peak_rss_bytes")) is not int or manifest["peak_rss_bytes"] < 0 or manifest["peak_rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
         raise SchemaError(f"shard {spec.index} exceeds the process RSS cap")
-    if any(Path(manifest[field_name]).is_absolute() or ".." in Path(manifest[field_name]).parts for field_name in ("input_path", "output_path")):
+    if any(
+        not isinstance(manifest[field_name], str)
+        or Path(manifest[field_name]).is_absolute()
+        or ".." in Path(manifest[field_name]).parts
+        or Path(manifest[field_name]).name.endswith(preregistration["execution_protocol"]["partial_suffix"])
+        for field_name in ("input_path", "output_path")
+    ):
         raise SchemaError(f"shard {spec.index} manifest path escapes the run root")
 
 
@@ -574,8 +599,9 @@ def validate_input_shard(preregistration: Mapping[str, Any], input_path: Path, m
 
 def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, manifest: Mapping[str, Any], spec: ShardSpec) -> list[dict[str, Any]]:
     validate_shard_manifest(preregistration, manifest, spec)
-    validate_input_shard(preregistration, Path(run_root) / manifest["input_path"], manifest, spec)
-    output_path = Path(run_root) / manifest["output_path"]
+    input_path = resolve_below_run_root(run_root, manifest["input_path"], f"shard {spec.index} input path")
+    output_path = resolve_below_run_root(run_root, manifest["output_path"], f"shard {spec.index} output path")
+    validate_input_shard(preregistration, input_path, manifest, spec)
     if output_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
         raise SchemaError(f"shard {spec.index} references a partial output")
     digest = hashlib.sha256()
@@ -618,7 +644,7 @@ def result_root_sha256(manifest_digests: Iterable[str]) -> str:
 
 
 def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, code_sha256: str, binary_sha256: str) -> None:
-    required = {"schema", "schema_version", "outcomes_persisted", "seed_counts", "cell_classes", "attempts_per_second", "peak_rss_bytes", "target_wall_seconds", "reserve_fraction", "projected_serial_seconds", "derived_concurrency", "code_sha256", "binary_sha256", "config_sha256"}
+    required = {"schema", "schema_version", "outcomes_persisted", "seed_counts", "cell_classes", "measurements", "attempts_per_second", "peak_rss_bytes", "target_wall_seconds", "reserve_fraction", "projected_serial_seconds", "derived_concurrency", "code_sha256", "binary_sha256", "config_sha256"}
     if not isinstance(probe, dict) or set(probe) != required:
         raise SchemaError("performance probe receipt has unknown or missing fields")
     frozen = preregistration["execution_protocol"]["performance_probe"]
@@ -628,6 +654,30 @@ def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, 
         raise SchemaError("performance probe does not cover the frozen classes/seeds")
     if probe["code_sha256"] != code_sha256 or probe["binary_sha256"] != binary_sha256 or probe["config_sha256"] != sha256_json(preregistration["generator"]):
         raise SchemaError("performance probe scope identity mismatch")
+    expected_pairs = [(cell_class, seed_count) for cell_class in frozen["required_cell_classes"] for seed_count in frozen["seed_counts"]]
+    measurements = probe["measurements"]
+    if not isinstance(measurements, list) or len(measurements) != len(expected_pairs):
+        raise SchemaError("performance probe measurements do not cover the frozen classes/seeds")
+    total_attempts = 0
+    total_elapsed = 0.0
+    measured_peak_rss = 0
+    for measurement, (cell_class, seed_count) in zip(measurements, expected_pairs):
+        if not isinstance(measurement, dict) or set(measurement) != PERFORMANCE_MEASUREMENT_KEYS:
+            raise SchemaError("performance probe measurement has unknown or missing fields")
+        if measurement["cell_class"] != cell_class or measurement["seed_count"] != seed_count or measurement["attempt_count"] != seed_count:
+            raise SchemaError("performance probe measurement order/count drifted")
+        if measurement["outcomes_persisted"] is not False or not _number(measurement["elapsed_seconds"]) or measurement["elapsed_seconds"] <= 0:
+            raise SchemaError("performance probe measurement is not outcome-free with positive timing")
+        if type(measurement["peak_rss_bytes"]) is not int or measurement["peak_rss_bytes"] <= 0 or measurement["peak_rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
+            raise SchemaError("performance probe measurement has invalid RSS")
+        total_attempts += measurement["attempt_count"]
+        total_elapsed += measurement["elapsed_seconds"]
+        measured_peak_rss = max(measured_peak_rss, measurement["peak_rss_bytes"])
+    measured_rate = total_attempts / total_elapsed
+    if not _number(probe.get("attempts_per_second")) or not math.isclose(probe["attempts_per_second"], measured_rate, rel_tol=1e-12, abs_tol=1e-12):
+        raise SchemaError("performance probe rate is not derived from its measurements")
+    if probe.get("peak_rss_bytes") != measured_peak_rss:
+        raise SchemaError("performance probe peak RSS is not derived from its measurements")
     if any(not _number(probe.get(field_name)) or probe[field_name] <= 0 for field_name in ("attempts_per_second", "target_wall_seconds", "projected_serial_seconds")):
         raise SchemaError("performance probe rates/timing must be finite and positive")
     projected = FROZEN_ATTEMPT_COUNT / probe["attempts_per_second"]
@@ -638,7 +688,7 @@ def _validate_performance_probe(preregistration: Mapping[str, Any], probe: Any, 
     expected = math.ceil(probe["projected_serial_seconds"] / (probe["target_wall_seconds"] * (1.0 - probe["reserve_fraction"])))
     if probe["derived_concurrency"] != expected:
         raise SchemaError("performance probe derived concurrency does not match the frozen formula")
-    if not isinstance(probe.get("peak_rss_bytes"), int) or probe["peak_rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
+    if type(probe.get("peak_rss_bytes")) is not int or probe["peak_rss_bytes"] < 0 or probe["peak_rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
         raise SchemaError("performance probe exceeds the process RSS cap")
 
 
@@ -648,22 +698,53 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
     by_id = {item.get("resource_id"): item for item in resources if isinstance(item, dict)}
     if set(by_id) != set(FROZEN_RESOURCE_IDS) or len(resources) != len(FROZEN_RESOURCE_IDS):
         raise SchemaError("resource receipts must contain exactly the three frozen resource cells")
-    statuses = []
     sampling = preregistration["resource_sampling"]
+    matrix_by_id = {item["id"]: item for item in preregistration["resource_matrix"]}
+    validated: list[tuple[dict[str, Any], int]] = []
     for resource_id in FROZEN_RESOURCE_IDS:
         item = by_id[resource_id]
         if set(item) != RESOURCE_KEYS:
             raise SchemaError(f"resource {resource_id} has unknown or missing fields")
-        statuses.append(item["status"])
-        if item["status"] not in STATUSES or not isinstance(item["rss_bytes"], int) or item["rss_bytes"] > FROZEN_PROCESS_RSS_BYTES:
+        if item["status"] not in {PASS, FAIL} or type(item["rss_bytes"]) is not int or item["rss_bytes"] < 0:
             raise SchemaError(f"resource {resource_id} has invalid status/RSS")
-        if item["growth_class"] != "linear" or item["binary_hash"] != binary_sha256 or item["config_hash"] != sha256_json(preregistration["generator"]):
+        if item["growth_class"] not in {"linear", "superlinear"} or item["binary_hash"] != binary_sha256 or item["config_hash"] != sha256_json(preregistration["generator"]):
             raise SchemaError(f"resource {resource_id} identity/growth mismatch")
         provenance = ("os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms", "warmup_runs", "measured_repetitions", "tool_versions", "growth_regression", "acceptance")
         if any(item[field_name] != sampling[field_name] for field_name in provenance):
             raise SchemaError(f"resource {resource_id} sampling provenance mismatch")
-        if not _is_sha256(item["resource_hash"]):
-            raise SchemaError(f"resource {resource_id} hash is invalid")
+        observations = item["growth_observation"]
+        matrix = matrix_by_id[resource_id]
+        if not isinstance(observations, list) or len(observations) != sampling["measured_repetitions"]:
+            raise SchemaError(f"resource {resource_id} lacks measured growth observations")
+        observed_rss = []
+        for repetition, observation in enumerate(observations):
+            if not isinstance(observation, dict) or set(observation) != RESOURCE_OBSERVATION_KEYS:
+                raise SchemaError(f"resource {resource_id} has malformed growth observations")
+            if observation["repetition"] != repetition or observation["tile_pixels"] != matrix["tile_pixels"] or observation["date_count"] != matrix["dates"]:
+                raise SchemaError(f"resource {resource_id} growth observation scope drifted")
+            if type(observation["peak_rss_bytes"]) is not int or observation["peak_rss_bytes"] <= 0 or not _number(observation["wall_seconds"]) or observation["wall_seconds"] <= 0:
+                raise SchemaError(f"resource {resource_id} growth observation has invalid measurements")
+            observed_rss.append(observation["peak_rss_bytes"])
+        peak_rss = max(observed_rss)
+        if item["rss_bytes"] != peak_rss:
+            raise SchemaError(f"resource {resource_id} RSS is not derived from its repetitions")
+        expected_hash = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
+        if item["resource_hash"] != expected_hash:
+            raise SchemaError(f"resource {resource_id} hash does not bind its receipt")
+        validated.append((item, peak_rss))
+    x = [math.log(matrix_by_id[resource_id]["tile_pixels"] * matrix_by_id[resource_id]["dates"]) for resource_id in FROZEN_RESOURCE_IDS]
+    y = [math.log(peak_rss) for _, peak_rss in validated]
+    x_mean = sum(x) / len(x)
+    y_mean = sum(y) / len(y)
+    denominator = sum((value - x_mean) ** 2 for value in x)
+    growth_exponent = sum((x_value - x_mean) * (y_value - y_mean) for x_value, y_value in zip(x, y)) / denominator
+    expected_growth_class = "linear" if growth_exponent <= 1.25 else "superlinear"
+    statuses = []
+    for item, peak_rss in validated:
+        expected_status = PASS if peak_rss <= FROZEN_PROCESS_RSS_BYTES and expected_growth_class == "linear" else FAIL
+        if item["growth_class"] != expected_growth_class or item["status"] != expected_status:
+            raise SchemaError(f"resource {item['resource_id']} status/growth declaration contradicts measured evidence")
+        statuses.append(item["status"])
     return statuses
 
 
@@ -716,9 +797,10 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
     sink = _CellSummarySink(cell_summary_path)
     try:
         validate_preregistration(preregistration)
-        if Path(manifest_path).name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
+        manifest_path = Path(manifest_path)
+        if manifest_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
             raise SchemaError("partial run manifests are not admissible")
-        with Path(manifest_path).open(encoding="utf-8") as handle:
+        with manifest_path.open(encoding="utf-8") as handle:
             run_manifest = json.load(handle)
         if not isinstance(run_manifest, dict) or set(run_manifest) != RUN_MANIFEST_KEYS:
             raise SchemaError("run manifest has unknown or missing fields")
@@ -737,7 +819,7 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
         entries = run_manifest["shard_manifests"]
         if not isinstance(entries, list) or len(entries) != FROZEN_SHARD_COUNT:
             raise SchemaError("run manifest must contain exactly 891 ordered shard manifests")
-        run_root = Path(manifest_path).parent
+        run_root = manifest_path.resolve(strict=True).parent
         manifest_digests = []
         cell_count = 0
         any_failed = FAIL in resource_statuses
@@ -745,13 +827,16 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
         for spec, entry in zip(iter_shard_specs(preregistration), entries):
             if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
                 raise SchemaError(f"shard {spec.index} run-manifest entry is malformed")
+            if not isinstance(entry["path"], str):
+                raise SchemaError(f"shard {spec.index} manifest path escapes the run root")
             entry_path = Path(entry["path"])
             if entry_path.is_absolute() or ".." in entry_path.parts or entry_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
                 raise SchemaError(f"shard {spec.index} manifest path escapes the run root")
-            digest, _ = sha256_file(run_root / entry_path)
+            resolved_entry = resolve_below_run_root(run_root, entry["path"], f"shard {spec.index} manifest path")
+            digest, _ = sha256_file(resolved_entry)
             if digest != entry["sha256"]:
                 raise SchemaError(f"shard {spec.index} manifest hash mismatch")
-            with (run_root / entry_path).open(encoding="utf-8") as handle:
+            with resolved_entry.open(encoding="utf-8") as handle:
                 shard_manifest = json.load(handle)
             if shard_manifest.get("code_sha256") != run_manifest["code_sha256"] or shard_manifest.get("binary_sha256") != run_manifest["binary_sha256"]:
                 raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")

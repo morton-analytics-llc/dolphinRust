@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import tracemalloc
 import unittest
@@ -10,6 +12,7 @@ from pathlib import Path
 from validation.score_spatial_covariance import (
     FAIL,
     NOT_EVALUABLE,
+    PAIR_SIGN,
     PASS,
     CellAccumulator,
     FROZEN_ATTEMPT_COUNT,
@@ -21,6 +24,7 @@ from validation.score_spatial_covariance import (
     ShardSpec,
     _expected_seed_hash,
     _validate_performance_probe,
+    _validate_resources,
     expected_cell_ids,
     iter_shard_specs,
     load_preregistration,
@@ -68,6 +72,16 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         self.assertLessEqual(execution["max_cells_per_shard"], 120)
         self.assertEqual(execution["shard_count"], 891)
         self.assertLessEqual(execution["max_cells_per_shard"] * FROZEN_SEED_COUNT * execution["max_encoded_output_record_bytes"], execution["max_uncompressed_output_bytes"])
+
+    def test_driver_exposes_prepare_commit_resume_and_assemble_entrypoints(self):
+        completed = subprocess.run(
+            [sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for command in ("prepare", "commit", "resume", "assemble"):
+            self.assertIn(command, completed.stdout)
 
     def test_44550_count_from_omitting_source_process_is_rejected(self):
         product_without_source_process = 3 * 3 * 3 * 5 * 11 * 5 * 2 * 3
@@ -134,26 +148,24 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             self.assertFalse(Path(str(destination) + ".partial").exists())
 
     def test_one_input_one_output_rejects_missing_out_of_order_and_malformed(self):
-        records = [
-            {"cell_id": "a", "cell_ordinal": 0, "seed_index": 0, "seed_sha256": "0" * 64},
-            {"cell_id": "a", "cell_ordinal": 0, "seed_index": 1, "seed_sha256": "1" * 64},
-        ]
+        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
+        spec = ShardSpec(0, 0, 1, (cell_id,))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_path = root / "input.jsonl"
-            write_jsonl_atomic(records, input_path)
-            for name, outputs, message in (
-                ("missing", records[:1], "cardinality"),
-                ("order", list(reversed(records)), "order/identity"),
-            ):
-                partial = root / f"{name}.jsonl.partial"
-                partial.write_bytes(b"".join(compact_json_line(record) for record in outputs))
-                with self.subTest(name=name), self.assertRaisesRegex(SchemaError, message):
-                    inspect_one_input_one_output(input_path, partial)
+            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
+            missing = root / "missing.jsonl.partial"
+            missing.write_bytes(b"".join(compact_json_line(self._attempt(cell_id, 0, seed, status="masked_target")) for seed in range(4999)))
+            with self.assertRaisesRegex(SchemaError, "cardinality"):
+                inspect_one_input_one_output(self.preregistration, spec, input_path, missing)
+            order = root / "order.jsonl.partial"
+            order.write_bytes(b"".join(compact_json_line(self._attempt(cell_id, 0, seed, status="masked_target")) for seed in (1, 0)))
+            with self.assertRaisesRegex(SchemaError, "order/identity"):
+                inspect_one_input_one_output(self.preregistration, spec, input_path, order)
             malformed = root / "malformed.jsonl.partial"
-            malformed.write_bytes(compact_json_line(records[0]) + b"{\n")
+            malformed.write_bytes(b"{\n")
             with self.assertRaisesRegex(SchemaError, "malformed"):
-                inspect_one_input_one_output(input_path, malformed)
+                inspect_one_input_one_output(self.preregistration, spec, input_path, malformed)
 
     def _attempt(self, cell_id, ordinal, seed_index, status="valid", covered=True):
         labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
@@ -191,7 +203,7 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             "union_source_count": 4,
             "realized_overlap_jaccard": 1.0,
             "signed_cross_influence": None if masked else 0.0,
-            "signed_influence_sign": "zero",
+            "signed_influence_sign": PAIR_SIGN[labels["pair_geometry"]],
             "effective_looks_fraction": 1.0,
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
             "operator_relative_error": None if masked else 0.0,
@@ -231,6 +243,18 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         for seed_index in range(3):
             tied.add(self._attempt(tied_id, 2, seed_index, status="tied_eigenvalue"))
         self.assertEqual(tied.finalize()["status"], NOT_EVALUABLE)
+
+    def test_masked_shared_geometry_requires_null_influence_without_signed_gate(self):
+        for geometry in ("shared_75_positive", "shared_50_negative", "shared_25_positive"):
+            cell_id = f"hw_1x1|stride_1|rect|masked|{geometry}|one_block|emi|well_separated|independent_complex_looks"
+            accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1)
+            attempt = self._attempt(cell_id, 0, 0, status="masked_target")
+            accumulator.add(attempt)
+            self.assertEqual(accumulator.finalize()["status"], PASS)
+            invalid = dict(attempt)
+            invalid["signed_cross_influence"] = 1.0
+            with self.subTest(geometry=geometry), self.assertRaisesRegex(SchemaError, "null numeric"):
+                CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1).add(invalid)
 
     def test_weak_zero_variance_is_the_only_null_relative_error_path(self):
         cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
@@ -326,14 +350,14 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             manifest = self._manifest(spec, output)
             path = root / "manifest.jsonl"
             path.write_bytes(compact_json_line(manifest))
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, path))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, path, "b" * 64, "c" * 64))
             changed = dict(manifest)
             changed["cell_ordinal_end_exclusive"] = 2
             with self.assertRaisesRegex(SchemaError, "scope/order/count"):
                 validate_shard_manifest(self.preregistration, changed, spec)
 
     def test_atomic_commit_and_resume_require_exact_immutable_shard(self):
-        cell_id = next(iter(expected_cell_ids(self.preregistration)))
+        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
         spec = ShardSpec(0, 0, 1, (cell_id,))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -342,6 +366,17 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
             output_partial = root / "output.jsonl.partial"
             shutil.copyfile(input_path, output_partial)
             manifest_path = root / "manifest.jsonl"
+            with self.assertRaisesRegex(SchemaError, "malformed or unknown"):
+                commit_output_shard(
+                    self.preregistration, spec, root, input_path, output_partial, manifest_path,
+                    "a" * 64, "b" * 64, 1.0, 1024,
+                )
+            output_partial.unlink()
+            write_jsonl_atomic(
+                (self._attempt(cell_id, 0, seed, status="masked_target") for seed in range(FROZEN_SEED_COUNT)),
+                root / "valid-output.jsonl",
+            )
+            (root / "valid-output.jsonl").rename(output_partial)
             commit_output_shard(
                 self.preregistration,
                 spec,
@@ -355,10 +390,43 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
                 1024,
             )
             self.assertFalse(output_partial.exists())
-            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest_path))
+            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest_path, "a" * 64, "b" * 64))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path, "d" * 64, "b" * 64))
             with (root / "output.jsonl").open("ab") as handle:
                 handle.write(b"{}\n")
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path, "a" * 64, "b" * 64))
+
+    def test_partial_suffix_and_symlink_escape_fail_closed(self):
+        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
+        spec = ShardSpec(0, 0, 1, (cell_id,))
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "run"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            input_path = root / "input.jsonl"
+            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
+            double_partial = root / "output.jsonl.partial.partial"
+            double_partial.write_bytes(b"")
+            with self.assertRaisesRegex(SchemaError, "exactly one"):
+                inspect_one_input_one_output(self.preregistration, spec, input_path, double_partial)
+            with self.assertRaisesRegex(SchemaError, "must not"):
+                inspect_one_input_one_output(self.preregistration, spec, input_path, root / "final.partial", require_partial=False)
+            partial_manifest = root / "manifest.jsonl.partial"
+            partial_manifest.write_bytes(b"{}\n")
+            self.assertFalse(committed_shard_matches(
+                self.preregistration, spec, root, partial_manifest, "a" * 64, "b" * 64,
+            ))
+            (outside / "input.jsonl").write_bytes(b"")
+            (outside / "output.jsonl").write_bytes(b"")
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+            output = {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0}
+            manifest = self._manifest(spec, output)
+            manifest["input_path"] = "escape/input.jsonl"
+            manifest["output_path"] = "escape/output.jsonl"
+            with self.assertRaisesRegex(SchemaError, "symlink"):
+                score_attempt_shard(self.preregistration, root, manifest, spec)
 
     def test_result_root_binds_manifest_order_and_content(self):
         first = "1" * 64
@@ -377,12 +445,25 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         self.assertEqual(derive_concurrency_receipt(7200, 3600, 0.25), 3)
         rate = 100000.0
         projected = FROZEN_ATTEMPT_COUNT / rate
+        measurements = [
+            {
+                "cell_class": cell_class,
+                "seed_count": seed_count,
+                "attempt_count": seed_count,
+                "elapsed_seconds": seed_count / rate,
+                "peak_rss_bytes": 1024,
+                "outcomes_persisted": False,
+            }
+            for cell_class in probe["required_cell_classes"]
+            for seed_count in probe["seed_counts"]
+        ]
         receipt = {
             "schema": "dolphinrust.spatial-covariance.performance-probe",
             "schema_version": 1,
             "outcomes_persisted": False,
             "seed_counts": probe["seed_counts"],
             "cell_classes": probe["required_cell_classes"],
+            "measurements": measurements,
             "attempts_per_second": rate,
             "peak_rss_bytes": 1024,
             "target_wall_seconds": 3600.0,
@@ -397,6 +478,56 @@ class SpatialCovarianceValidationV3Tests(unittest.TestCase):
         receipt["derived_concurrency"] += 1
         with self.assertRaisesRegex(SchemaError, "derived concurrency"):
             _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        receipt["derived_concurrency"] -= 1
+        receipt["measurements"][0]["peak_rss_bytes"] = True
+        with self.assertRaisesRegex(SchemaError, "invalid RSS"):
+            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+
+    def _resources(self, peaks=(1_000_000, 2_000_000, 4_000_000), growth_class="linear", status=PASS):
+        sampling = self.preregistration["resource_sampling"]
+        resources = []
+        for matrix, peak in zip(self.preregistration["resource_matrix"], peaks):
+            item = {
+                "resource_id": matrix["id"],
+                "status": status,
+                "rss_bytes": peak,
+                "growth_class": growth_class,
+                "resource_hash": "",
+                "config_hash": sha256_json(self.preregistration["generator"]),
+                "binary_hash": "b" * 64,
+                "growth_observation": [
+                    {
+                        "repetition": repetition,
+                        "tile_pixels": matrix["tile_pixels"],
+                        "date_count": matrix["dates"],
+                        "peak_rss_bytes": peak,
+                        "wall_seconds": float(repetition + 1),
+                    }
+                    for repetition in range(sampling["measured_repetitions"])
+                ],
+                **{key: sampling[key] for key in (
+                    "os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms",
+                    "warmup_runs", "measured_repetitions", "tool_versions", "growth_regression", "acceptance",
+                )},
+            }
+            item["resource_hash"] = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
+            resources.append(item)
+        return resources
+
+    def test_resource_receipts_derive_rss_and_growth_from_13_26_52_observations(self):
+        resources = self._resources()
+        self.assertEqual(_validate_resources(self.preregistration, resources, "b" * 64), [PASS, PASS, PASS])
+        invalid_rss = copy.deepcopy(resources)
+        invalid_rss[0]["rss_bytes"] = True
+        with self.assertRaisesRegex(SchemaError, "invalid status/RSS"):
+            _validate_resources(self.preregistration, invalid_rss, "b" * 64)
+        wrong_scope = copy.deepcopy(resources)
+        wrong_scope[1]["growth_observation"][0]["date_count"] = 13
+        with self.assertRaisesRegex(SchemaError, "scope drifted"):
+            _validate_resources(self.preregistration, wrong_scope, "b" * 64)
+        superlinear_declared_linear = self._resources((1_000_000, 4_000_000, 16_000_000))
+        with self.assertRaisesRegex(SchemaError, "contradicts measured evidence"):
+            _validate_resources(self.preregistration, superlinear_declared_linear, "b" * 64)
 
     def test_legacy_aggregate_receipt_is_rejected(self):
         with PR61_FIXTURE.open(encoding="utf-8") as handle:
