@@ -10,6 +10,7 @@ from validation.heldout_temporal_covariance.cohort import (
     build_manifest,
     canonical_digest,
     discover_candidates,
+    validate_freeze_receipt,
     validate_manifest,
 )
 from validation.heldout_temporal_covariance.scorer import (
@@ -23,6 +24,8 @@ from validation.score_temporal_covariance_holdout import bind_factor_files
 
 VALIDATION = Path(__file__).parents[1]
 PREREGISTRATION_PATH = VALIDATION / "temporal_covariance_heldout_preregistration.json"
+FROZEN_MANIFEST_PATH = VALIDATION / "temporal_covariance_heldout_cohort_manifest.json"
+FREEZE_RECEIPT_PATH = VALIDATION / "temporal_covariance_heldout_cohort_freeze_receipt.json"
 
 
 def candidate(index: int, query_digest="dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b", **overrides):
@@ -316,6 +319,33 @@ class HeldoutCohortTests(unittest.TestCase):
                 )
                 self.assertEqual(manifest["excluded_after_selection"], ["candidate-001"])
                 validate_manifest(manifest, self.preregistration)
+
+    def test_persisted_freeze_receipt_recomputes_local_hashes_and_rejects_mutation(self):
+        receipt = json.loads(FREEZE_RECEIPT_PATH.read_text(encoding="utf-8"))
+        validate_freeze_receipt(
+            receipt,
+            FROZEN_MANIFEST_PATH,
+            PREREGISTRATION_PATH,
+        )
+
+        changed_receipt = copy.deepcopy(receipt)
+        changed_receipt["outcomes_present"] = True
+        with self.assertRaisesRegex(CohortValidationError, "outcome-blind"):
+            validate_freeze_receipt(
+                changed_receipt,
+                FROZEN_MANIFEST_PATH,
+                PREREGISTRATION_PATH,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            changed_manifest = Path(directory) / FROZEN_MANIFEST_PATH.name
+            changed_manifest.write_bytes(FROZEN_MANIFEST_PATH.read_bytes() + b"\n")
+            with self.assertRaisesRegex(CohortValidationError, "manifest file hash"):
+                validate_freeze_receipt(
+                    receipt,
+                    changed_manifest,
+                    PREREGISTRATION_PATH,
+                )
 
     def test_exact_power_contract_is_frozen(self):
         expected = {"68": 96, "90": 72, "95": 62}

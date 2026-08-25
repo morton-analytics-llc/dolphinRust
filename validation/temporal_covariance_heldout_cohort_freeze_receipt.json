@@ -1,0 +1,76 @@
+{
+  "schema": "dolphinrust.temporal_covariance.heldout_cohort_freeze_receipt",
+  "schema_version": 1,
+  "cohort_id": "f53-06-outer-nonfresno-v1",
+  "outcomes_present": false,
+  "selection_outcome_blind": true,
+  "manifest": {
+    "path": "validation/temporal_covariance_heldout_cohort_manifest.json",
+    "schema_version": 2,
+    "selection_algorithm": "lexical_candidate_id_greedy_independent_burst_site_v2"
+  },
+  "preregistration_path": "validation/temporal_covariance_heldout_preregistration.json",
+  "runtime_query": {
+    "criteria": {
+      "target_sites": 25346,
+      "minimum_epochs": 24,
+      "minimum_span_days": 330,
+      "station_pair_distance_km": [
+        1.0,
+        30.0
+      ],
+      "date_window": [
+        "2023-01-01",
+        "2024-01-01"
+      ],
+      "geographic_bounds": [
+        -180.0,
+        -80.0,
+        180.0,
+        80.0
+      ],
+      "maximum_pairs_examined": 25346
+    },
+    "candidate_query_digest": "dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b"
+  },
+  "runtime_query_digest": "b19699a492f359f3a1b9958f0597437022322445f0b3c2b655914fd81fd20956",
+  "candidate_query_digest": "dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b",
+  "exclusions": {
+    "station_ids": [
+      "ICMX",
+      "MMX1",
+      "MXMX",
+      "MXTM",
+      "SSNX",
+      "TNGF",
+      "UJAL",
+      "UNVA",
+      "UTAC"
+    ],
+    "burst_ids": [
+      "T005_008704_IW1",
+      "T035_073270_IW1",
+      "T100_213486_IW2",
+      "T137_292316_IW3",
+      "T137_292329_IW1",
+      "T150_320250_IW3"
+    ],
+    "site_ids": [
+      "fresno"
+    ]
+  },
+  "counts": {
+    "candidate_pool": 1444,
+    "frozen_clusters": 96,
+    "surplus_clusters": 20,
+    "excluded_after_selection": 1328
+  },
+  "hashes": {
+    "discovery_file_sha256": "ec33913c50dca1d7f518ecdd317159c49fb8af54dd39b13a48ab13623f4c8c2e",
+    "manifest_file_sha256": "75ce4e149aa8ed49ddb22cfedcac8056201a18c75af73ebb4fa22e7f9290ab1d",
+    "manifest_canonical_sha256": "534b9c534255404a71d3e2f53cc55cccc41ef4ef372bc18bb16e3a842826ee7e",
+    "preregistration_file_sha256": "79931328f82524563b3bfcd5069abbf31416a19b7aa34032e59e6c44389187ae",
+    "preregistration_canonical_sha256": "44cada30a3160e6a194c2df0a5e0fb4828f12a2de088ecce3fb3cc52221dce10",
+    "metadata_cache_entry_set_sha256": "b36069265fd00c97986c706d3709728f53262dc4a287312869ee0f9c978e3d36"
+  }
+}

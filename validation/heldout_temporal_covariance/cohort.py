@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -63,6 +64,30 @@ MANIFEST_FIELDS = {
     "surplus_clusters",
     "excluded_after_selection",
 }
+FREEZE_RECEIPT_SCHEMA = "dolphinrust.temporal_covariance.heldout_cohort_freeze_receipt"
+FREEZE_RECEIPT_FIELDS = {
+    "schema",
+    "schema_version",
+    "cohort_id",
+    "outcomes_present",
+    "selection_outcome_blind",
+    "manifest",
+    "preregistration_path",
+    "runtime_query",
+    "runtime_query_digest",
+    "candidate_query_digest",
+    "exclusions",
+    "counts",
+    "hashes",
+}
+FREEZE_HASH_FIELDS = {
+    "discovery_file_sha256",
+    "manifest_file_sha256",
+    "manifest_canonical_sha256",
+    "preregistration_file_sha256",
+    "preregistration_canonical_sha256",
+    "metadata_cache_entry_set_sha256",
+}
 
 
 class CohortValidationError(ValueError):
@@ -72,6 +97,10 @@ class CohortValidationError(ValueError):
 def canonical_digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _is_hash(value: Any) -> bool:
@@ -270,3 +299,76 @@ def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str,
     )
     if any(manifest.get(field) != expected[field] for field in frozen_fields):
         raise CohortValidationError("manifest does not match the exact lexical disjoint freeze")
+
+
+def validate_freeze_receipt(
+    receipt: Mapping[str, Any],
+    manifest_path: Path,
+    preregistration_path: Path,
+) -> None:
+    if not isinstance(receipt, Mapping) or set(receipt) != FREEZE_RECEIPT_FIELDS:
+        raise CohortValidationError("freeze receipt fields do not match the schema")
+    if receipt.get("schema") != FREEZE_RECEIPT_SCHEMA or receipt.get("schema_version") != 1:
+        raise CohortValidationError("freeze receipt schema/version mismatch")
+    if receipt.get("outcomes_present") is not False or receipt.get("selection_outcome_blind") is not True:
+        raise CohortValidationError("freeze receipt must remain outcome-blind")
+
+    manifest_binding = receipt.get("manifest")
+    if not isinstance(manifest_binding, Mapping) or set(manifest_binding) != {
+        "path",
+        "schema_version",
+        "selection_algorithm",
+    }:
+        raise CohortValidationError("freeze receipt manifest binding is invalid")
+    if manifest_binding.get("path") != "validation/temporal_covariance_heldout_cohort_manifest.json":
+        raise CohortValidationError("freeze receipt manifest path is invalid")
+    if receipt.get("preregistration_path") != "validation/temporal_covariance_heldout_preregistration.json":
+        raise CohortValidationError("freeze receipt preregistration path is invalid")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        preregistration = json.loads(preregistration_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CohortValidationError("freeze receipt local artifacts are unreadable") from error
+    hashes = receipt.get("hashes")
+    if not isinstance(hashes, Mapping) or set(hashes) != FREEZE_HASH_FIELDS:
+        raise CohortValidationError("freeze receipt hashes are incomplete")
+    if any(not _is_hash(hashes[field]) for field in FREEZE_HASH_FIELDS):
+        raise CohortValidationError("freeze receipt hashes must be SHA-256 values")
+    if hashes["manifest_file_sha256"] != _file_digest(manifest_path):
+        raise CohortValidationError("freeze receipt manifest file hash mismatch")
+    if hashes["manifest_canonical_sha256"] != canonical_digest(manifest):
+        raise CohortValidationError("freeze receipt manifest canonical hash mismatch")
+    if hashes["preregistration_file_sha256"] != _file_digest(preregistration_path):
+        raise CohortValidationError("freeze receipt preregistration file hash mismatch")
+    if hashes["preregistration_canonical_sha256"] != canonical_digest(preregistration):
+        raise CohortValidationError("freeze receipt preregistration canonical hash mismatch")
+
+    validate_manifest(manifest, preregistration)
+    if receipt.get("cohort_id") != preregistration["cohort_id"] or manifest.get("cohort_id") != receipt.get("cohort_id"):
+        raise CohortValidationError("freeze receipt cohort identity mismatch")
+    if manifest_binding.get("schema_version") != manifest["schema_version"] or manifest_binding.get("selection_algorithm") != manifest["selection_algorithm"]:
+        raise CohortValidationError("freeze receipt manifest contract mismatch")
+    candidate_query_digest = preregistration["candidate_query"]["query_digest"]
+    if receipt.get("candidate_query_digest") != candidate_query_digest or manifest["candidate_query_digest"] != candidate_query_digest:
+        raise CohortValidationError("freeze receipt candidate query mismatch")
+    runtime_query = receipt.get("runtime_query")
+    if not isinstance(runtime_query, Mapping) or runtime_query.get("candidate_query_digest") != candidate_query_digest:
+        raise CohortValidationError("freeze receipt runtime query is invalid")
+    if receipt.get("runtime_query_digest") != canonical_digest(runtime_query):
+        raise CohortValidationError("freeze receipt runtime query digest mismatch")
+
+    expected_exclusions = {
+        field: sorted(preregistration["exclusions"][field])
+        for field in ("station_ids", "burst_ids", "site_ids")
+    }
+    if receipt.get("exclusions") != expected_exclusions:
+        raise CohortValidationError("freeze receipt exclusions mismatch")
+    expected_counts = {
+        "candidate_pool": len(manifest["candidate_pool"]),
+        "frozen_clusters": len(manifest["frozen_clusters"]),
+        "surplus_clusters": len(manifest["surplus_clusters"]),
+        "excluded_after_selection": len(manifest["excluded_after_selection"]),
+    }
+    if receipt.get("counts") != expected_counts:
+        raise CohortValidationError("freeze receipt counts mismatch")
