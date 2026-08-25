@@ -1,10 +1,12 @@
 //! Calibrated, fail-closed temporal-GLS raster products for issue #53.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -71,6 +73,8 @@ const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
 const TRANSACTION_ARTIFACT_MARKER_SCHEMA: &str = "dolphinrust-temporal-transaction-artifact/1";
 const TRANSACTION_ARTIFACT_MARKER_FILENAME: &str = ".temporal-transaction-owner.json";
 const TRANSACTION_STAGE_CLEANUP_PREFIX: &str = ".temporal-inference-stage-cleanup-";
+#[cfg(unix)]
+const CLEANUP_QUARANTINE_MARKER_SCHEMA: &str = "dolphinrust-temporal-cleanup-quarantine/1";
 const HELDOUT_COHORT_ID: &str = "f53-06-outer-nonfresno-v1";
 const HELDOUT_PREREGISTRATION_FILE_SHA256: &str =
     "5fa4bb8935a6edda9c1005e7a041d659d2ff9bf2b1e5cde21ecbd20ef1b00981";
@@ -165,6 +169,19 @@ struct TransactionArtifactMarker {
     artifact_name: String,
 }
 
+#[cfg(unix)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupQuarantineMarker {
+    schema: String,
+    ownership_token: String,
+    product_directory_sha256: String,
+    artifact_name: String,
+    inner_artifact_name: String,
+    outer_identity: DirectoryIdentity,
+    inner_identity: DirectoryIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct OwnedArtifactReceipt {
     name: String,
@@ -208,7 +225,7 @@ struct ProductRollbackJournal {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
@@ -1875,7 +1892,6 @@ fn write_product_transaction_with_validator(
             output_directory,
             &stage,
             Some(&transaction.ownership_token),
-            None,
             || Ok(()),
             |_| Ok(()),
         )
@@ -3779,105 +3795,350 @@ fn transaction_marker_is_owned(
 }
 
 #[cfg(unix)]
-fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = std::fs::symlink_metadata(path)?;
+fn cstring_component(name: &str) -> Result<CString> {
     ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "temporal cleanup target is not a directory: {}",
-        path.display()
+        Path::new(name)
+            .file_name()
+            .is_some_and(|component| component == name),
+        "temporal cleanup name is not one path component"
     );
-    Ok(DirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-fn directory_identity(_path: &Path) -> Result<DirectoryIdentity> {
-    anyhow::bail!("temporal covariance product cleanup is unsupported on this platform")
+    Ok(CString::new(name.as_bytes())?)
 }
 
 #[cfg(unix)]
-fn cleanup_quarantine_identities(
-    directory: &Path,
-    quarantine: &Path,
-    cleanup_name: &str,
-    expected_ownership_token: Option<&str>,
-) -> Result<Option<(DirectoryIdentity, DirectoryIdentity)>> {
-    let parent_marker_path = quarantine.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-    if !transaction_marker_is_owned(
-        &parent_marker_path,
-        directory,
-        cleanup_name,
-        expected_ownership_token,
-    )? {
-        return Ok(None);
-    }
-    let parent_marker: TransactionArtifactMarker =
-        match serde_json::from_slice(&read_bounded(&parent_marker_path, 64 * 1024)?) {
-            Ok(marker) => marker,
-            Err(_) => return Ok(None),
-        };
-    let mut entries = match std::fs::read_dir(quarantine) {
-        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-        Err(_) => return Ok(None),
-    };
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    if entries.len() != 2
-        || !entries.iter().any(|entry| {
-            entry.file_name() == TRANSACTION_ARTIFACT_MARKER_FILENAME
-                && entry.file_type().is_ok_and(|file_type| file_type.is_file())
-        })
-        || !entries.iter().any(|entry| {
-            entry.file_name() == "owned-stage"
-                && entry.file_type().is_ok_and(|file_type| file_type.is_dir())
-        })
-    {
-        return Ok(None);
-    }
-    let inner = quarantine.join("owned-stage");
-    let inner_marker_path = inner.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-    let inner_marker: TransactionArtifactMarker = match read_bounded(&inner_marker_path, 64 * 1024)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    {
-        Some(marker) => marker,
-        None => return Ok(None),
-    };
-    if !inner_marker
-        .artifact_name
-        .starts_with(".temporal-inference-stage-")
-        || inner_marker
-            .artifact_name
-            .starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX)
-        || Path::new(&inner_marker.artifact_name)
-            .file_name()
-            .is_none_or(|name| name != inner_marker.artifact_name.as_str())
-        || !transaction_marker_is_owned(
-            &inner_marker_path,
-            directory,
-            &inner_marker.artifact_name,
-            Some(&parent_marker.ownership_token),
-        )?
-    {
-        return Ok(None);
-    }
-    Ok(Some((
-        directory_identity(quarantine)?,
-        directory_identity(&inner)?,
-    )))
+fn open_directory_path(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?)
 }
 
-#[cfg(not(unix))]
-fn cleanup_quarantine_identities(
-    _directory: &Path,
-    _quarantine: &Path,
-    _cleanup_name: &str,
-    _expected_ownership_token: Option<&str>,
-) -> Result<Option<(DirectoryIdentity, DirectoryIdentity)>> {
-    Ok(None)
+#[cfg(unix)]
+fn open_directory_at(parent: RawFd, name: &CStr) -> Result<File> {
+    // SAFETY: `parent` is a live directory descriptor and `name` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "opening cleanup directory failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `fd` was returned as a new owned descriptor by `openat`.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn stat_directory_identity(stat: &libc::stat) -> DirectoryIdentity {
+    DirectoryIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_identity(file: &File) -> Result<DirectoryIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` points to writable storage and `file` owns a live descriptor.
+    let result = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
+    ensure!(
+        result == 0,
+        "reading cleanup directory identity failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful `fstat` initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        "cleanup descriptor is not a directory"
+    );
+    Ok(stat_directory_identity(&stat))
+}
+
+#[cfg(unix)]
+fn read_bounded_at(parent: RawFd, name: &CStr, cap: u64) -> Result<Vec<u8>> {
+    // SAFETY: `parent` is live and `name` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "opening cleanup receipt failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `fd` is newly owned.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let before = file.metadata()?;
+    ensure!(
+        before.is_file() && before.len() <= cap,
+        "cleanup receipt exceeds byte cap"
+    );
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
+    file.by_ref()
+        .take(cap.checked_add(1).context("cleanup receipt cap overflow")?)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    ensure!(
+        bytes.len() as u64 <= cap
+            && before.len() == after.len()
+            && before.modified()? == after.modified()?,
+        "cleanup receipt changed while read"
+    );
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn write_new_at(parent: RawFd, name: &CStr, bytes: &[u8]) -> Result<()> {
+    // SAFETY: `parent` is live and `name` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "creating cleanup receipt failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `fd` is newly owned.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn directory_entry_names(directory: RawFd) -> Result<Vec<CString>> {
+    let current = CString::new(".")?;
+    // SAFETY: `directory` is live; `openat` creates an independent file description.
+    let duplicated = unsafe {
+        libc::openat(
+            directory,
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(
+        duplicated >= 0,
+        "duplicating cleanup descriptor failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `duplicated` is a directory descriptor owned by `fdopendir` on success.
+    let stream = unsafe { libc::fdopendir(duplicated) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed and did not take ownership.
+        unsafe { libc::close(duplicated) };
+        anyhow::bail!(
+            "opening cleanup directory stream failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` remains valid until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: POSIX guarantees a NUL-terminated `d_name` in a live dirent.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(CString::new(name.to_bytes())?);
+        }
+    }
+    // SAFETY: `stream` is live and owns `duplicated`.
+    ensure!(
+        unsafe { libc::closedir(stream) } == 0,
+        "closing cleanup directory stream failed"
+    );
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn transaction_marker_bytes_are_owned(
+    bytes: &[u8],
+    directory_sha256: &str,
+    artifact_name: &str,
+    ownership_token: &str,
+) -> bool {
+    serde_json::from_slice::<TransactionArtifactMarker>(bytes).is_ok_and(|marker| {
+        marker.schema == TRANSACTION_ARTIFACT_MARKER_SCHEMA
+            && marker.ownership_token == ownership_token
+            && marker.product_directory_sha256 == directory_sha256
+            && marker.artifact_name == artifact_name
+    })
+}
+
+#[cfg(unix)]
+struct VerifiedCleanupQuarantine {
+    product_directory: File,
+    outer: File,
+    marker: CleanupQuarantineMarker,
+}
+
+#[cfg(unix)]
+fn open_verified_cleanup_quarantine(
+    directory: &Path,
+    cleanup_name: &str,
+    expected_ownership_token: Option<&str>,
+) -> Result<VerifiedCleanupQuarantine> {
+    let product_directory = open_directory_path(directory)?;
+    let cleanup_name_c = cstring_component(cleanup_name)?;
+    let outer = open_directory_at(product_directory.as_raw_fd(), &cleanup_name_c)?;
+    let marker_name = CString::new(TRANSACTION_ARTIFACT_MARKER_FILENAME)?;
+    let marker: CleanupQuarantineMarker = serde_json::from_slice(&read_bounded_at(
+        outer.as_raw_fd(),
+        &marker_name,
+        64 * 1024,
+    )?)?;
+    ensure!(
+        marker.schema == CLEANUP_QUARANTINE_MARKER_SCHEMA
+            && marker.artifact_name == cleanup_name
+            && marker.product_directory_sha256 == product_directory_sha256(directory)?
+            && !marker.ownership_token.is_empty()
+            && marker.ownership_token.len() <= 256
+            && expected_ownership_token.is_none_or(|expected| marker.ownership_token == expected)
+            && marker.outer_identity == descriptor_identity(&outer)?,
+        "cleanup quarantine outer identity differs from its durable receipt"
+    );
+    let names = directory_entry_names(outer.as_raw_fd())?;
+    ensure!(
+        names.len() == 2
+            && names.iter().any(|name| name.as_bytes() == b"owned-stage")
+            && names
+                .iter()
+                .any(|name| name.as_bytes() == TRANSACTION_ARTIFACT_MARKER_FILENAME.as_bytes()),
+        "cleanup quarantine has an unexpected inventory"
+    );
+    let inner_name = CString::new("owned-stage")?;
+    let inner = open_directory_at(outer.as_raw_fd(), &inner_name)?;
+    ensure!(
+        marker.inner_identity == descriptor_identity(&inner)?
+            && marker
+                .inner_artifact_name
+                .starts_with(".temporal-inference-stage-")
+            && !marker
+                .inner_artifact_name
+                .starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX)
+            && transaction_marker_bytes_are_owned(
+                &read_bounded_at(inner.as_raw_fd(), &marker_name, 64 * 1024)?,
+                &marker.product_directory_sha256,
+                &marker.inner_artifact_name,
+                &marker.ownership_token,
+            ),
+        "cleanup quarantine inner identity differs from its durable receipt"
+    );
+    Ok(VerifiedCleanupQuarantine {
+        product_directory,
+        outer,
+        marker,
+    })
+}
+
+#[cfg(unix)]
+fn remove_directory_contents_at(directory: RawFd) -> Result<()> {
+    for name in directory_entry_names(directory)? {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: arguments are valid and `stat` points to writable storage.
+        let status = unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        ensure!(
+            status == 0,
+            "reading cleanup entry identity failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful `fstatat` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = open_directory_at(directory, &name)?;
+            ensure!(
+                descriptor_identity(&child)? == stat_directory_identity(&stat),
+                "cleanup child identity changed before traversal"
+            );
+            remove_directory_contents_at(child.as_raw_fd())?;
+            child.sync_all()?;
+            drop(child);
+            // SAFETY: deletion is relative to the verified parent descriptor.
+            ensure!(
+                unsafe { libc::unlinkat(directory, name.as_ptr(), libc::AT_REMOVEDIR) } == 0,
+                "removing cleanup directory failed: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            // SAFETY: deletion is relative to the verified parent and never follows links.
+            ensure!(
+                unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } == 0,
+                "removing cleanup entry failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_verified_cleanup_quarantine(
+    directory: &Path,
+    cleanup_name: &str,
+    expected_ownership_token: Option<&str>,
+) -> Result<()> {
+    let verified =
+        open_verified_cleanup_quarantine(directory, cleanup_name, expected_ownership_token)?;
+    remove_directory_contents_at(verified.outer.as_raw_fd())?;
+    verified.outer.sync_all()?;
+    let cleanup_name_c = cstring_component(cleanup_name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: arguments are valid and `stat` points to writable storage.
+    let status = unsafe {
+        libc::fstatat(
+            verified.product_directory.as_raw_fd(),
+            cleanup_name_c.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    ensure!(status == 0, "cleanup quarantine disappeared before removal");
+    // SAFETY: successful `fstatat` initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    ensure!(
+        verified.marker.outer_identity == stat_directory_identity(&stat),
+        "cleanup quarantine root identity changed before removal"
+    );
+    // SAFETY: removal is relative to the opened product directory.
+    ensure!(
+        unsafe {
+            libc::unlinkat(
+                verified.product_directory.as_raw_fd(),
+                cleanup_name_c.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } == 0,
+        "removing cleanup quarantine failed: {}",
+        std::io::Error::last_os_error()
+    );
+    verified.product_directory.sync_all()?;
+    Ok(())
 }
 
 fn is_reserved_transaction_artifact(name: &str) -> bool {
@@ -3892,6 +4153,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
     let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     let mut owned = Vec::new();
+    let mut owned_cleanup_quarantines = Vec::new();
     let mut collisions = Vec::new();
     for entry in &entries {
         let name = entry.file_name();
@@ -3899,6 +4161,17 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
             continue;
         };
         if !is_reserved_transaction_artifact(name) || name.ends_with(".owner.json") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() && name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX) {
+            #[cfg(unix)]
+            if open_verified_cleanup_quarantine(directory, name, None).is_ok() {
+                owned_cleanup_quarantines.push(name.to_owned());
+            } else {
+                collisions.push(name.to_owned());
+            }
+            #[cfg(not(unix))]
+            collisions.push(name.to_owned());
             continue;
         }
         let marker =
@@ -3910,23 +4183,8 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
                 collisions.push(name.to_owned());
                 continue;
             };
-        let expected_directory_identities = if entry.file_type()?.is_dir() {
-            if name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX) {
-                cleanup_quarantine_identities(directory, &entry.path(), name, None)?
-                    .map(|(outer, inner)| (outer, Some(inner)))
-            } else {
-                Some((directory_identity(&entry.path())?, None))
-            }
-        } else {
-            None
-        };
-        let cleanup_quarantine_is_owned = !name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX)
-            || expected_directory_identities.is_some();
-        if marker.exists()
-            && transaction_marker_is_owned(&marker, directory, name, None)?
-            && cleanup_quarantine_is_owned
-        {
-            owned.push((entry.path(), marker, expected_directory_identities));
+        if marker.exists() && transaction_marker_is_owned(&marker, directory, name, None)? {
+            owned.push((entry.path(), marker));
         } else {
             collisions.push(name.to_owned());
         }
@@ -3945,7 +4203,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
             continue;
         }
         if transaction_marker_is_owned(&entry.path(), directory, artifact_name, None)? {
-            owned.push((directory.join(artifact_name), entry.path(), None));
+            owned.push((directory.join(artifact_name), entry.path()));
         } else {
             collisions.push(name.to_owned());
         }
@@ -3955,7 +4213,11 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
         collisions.dedup();
         return Err(TemporalTransactionCollision { paths: collisions }.into());
     }
-    for (artifact, marker, expected_directory_identities) in owned {
+    #[cfg(unix)]
+    for cleanup_name in owned_cleanup_quarantines {
+        remove_verified_cleanup_quarantine(directory, &cleanup_name, None)?;
+    }
+    for (artifact, marker) in owned {
         if artifact.is_dir() {
             let name = artifact
                 .file_name()
@@ -3966,14 +4228,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
                     && transaction_marker_is_owned(&marker, directory, &name, None)?,
                 "temporal stage ownership changed before orphan cleanup"
             );
-            remove_owned_stage_directory(
-                directory,
-                &artifact,
-                None,
-                expected_directory_identities,
-                || Ok(()),
-                |_| Ok(()),
-            )?;
+            remove_owned_stage_directory(directory, &artifact, None, || Ok(()), |_| Ok(()))?;
         } else if artifact.exists() {
             let name = artifact
                 .file_name()
@@ -4045,7 +4300,6 @@ fn rollback_incomplete_product_with_journal(
             directory,
             &stage,
             Some(&journal.ownership_token),
-            None,
             || Ok(()),
             |_| Ok(()),
         )
@@ -4332,7 +4586,6 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
                 directory,
                 &stage,
                 Some(ownership_token),
-                None,
                 || Ok(()),
                 |_| Ok(()),
             )?;
@@ -4341,32 +4594,11 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
     initialize
 }
 
-fn disarm_private_cleanup_parent(
-    directory: &Path,
-    private_parent: &Path,
-    private_name: &str,
-    ownership_token: &str,
-) -> Result<()> {
-    let private_marker = private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-    if transaction_marker_is_owned(
-        &private_marker,
-        directory,
-        private_name,
-        Some(ownership_token),
-    )? {
-        std::fs::remove_file(private_marker)?;
-        File::open(private_parent)?.sync_all()?;
-        File::open(directory)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
+#[cfg(unix)]
 fn remove_owned_stage_directory(
     directory: &Path,
     stage: &Path,
     ownership_token: Option<&str>,
-    expected_directory_identities: Option<(DirectoryIdentity, Option<DirectoryIdentity>)>,
     before_isolate: impl FnOnce() -> Result<()>,
     after_quarantine: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
@@ -4374,39 +4606,28 @@ fn remove_owned_stage_directory(
     let stage_name = stage
         .file_name()
         .context("temporal product stage has no filename")?
-        .to_string_lossy();
-    let stage_marker = stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+        .to_str()
+        .context("temporal product stage filename is not UTF-8")?
+        .to_owned();
     ensure!(
         stage.parent() == Some(directory)
-            && stage.is_dir()
-            && transaction_marker_is_owned(&stage_marker, directory, &stage_name, ownership_token,)?,
+            && !stage_name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX),
+        "temporal stage path is outside the product directory"
+    );
+    let initial_stage = open_directory_path(stage)?;
+    let initial_stage_identity = descriptor_identity(&initial_stage)?;
+    let marker_name = CString::new(TRANSACTION_ARTIFACT_MARKER_FILENAME)?;
+    let directory_sha256 = product_directory_sha256(directory)?;
+    let marker_bytes = read_bounded_at(initial_stage.as_raw_fd(), &marker_name, 64 * 1024)?;
+    let marker: TransactionArtifactMarker = serde_json::from_slice(&marker_bytes)?;
+    ensure!(
+        transaction_marker_bytes_are_owned(
+            &marker_bytes,
+            &directory_sha256,
+            &stage_name,
+            &marker.ownership_token,
+        ) && ownership_token.is_none_or(|expected| marker.ownership_token == expected),
         "temporal stage ownership changed before deletion"
-    );
-    let marker: TransactionArtifactMarker =
-        serde_json::from_slice(&read_bounded(&stage_marker, 64 * 1024)?)?;
-    let initial_cleanup_identities = if stage_name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX) {
-        cleanup_quarantine_identities(directory, stage, &stage_name, Some(&marker.ownership_token))?
-    } else {
-        None
-    };
-    ensure!(
-        !stage_name.starts_with(TRANSACTION_STAGE_CLEANUP_PREFIX)
-            || initial_cleanup_identities.is_some(),
-        "temporal cleanup quarantine contains an unowned inner stage"
-    );
-    let initial_stage_identity = directory_identity(stage)?;
-    ensure!(
-        expected_directory_identities
-            .as_ref()
-            .is_none_or(|(expected_stage, expected_inner)| {
-                *expected_stage == initial_stage_identity
-                    && expected_inner.as_ref().is_none_or(|expected_inner| {
-                        initial_cleanup_identities
-                            .as_ref()
-                            .is_some_and(|(_, actual_inner)| actual_inner == expected_inner)
-                    })
-            }),
-        "temporal stage identity changed before orphan cleanup"
     );
     before_isolate()?;
     let private_name = format!(
@@ -4422,99 +4643,60 @@ fn remove_owned_stage_directory(
         private_builder.mode(0o700);
     }
     private_builder.create(&private_parent)?;
-    write_transaction_marker(
-        &private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
-        directory,
-        &private_name,
-        &marker.ownership_token,
-    )?;
-    File::open(&private_parent)?.sync_all()?;
-    File::open(directory)?.sync_all()?;
-    let private_parent_identity = directory_identity(&private_parent)?;
     let quarantined = private_parent.join("owned-stage");
     std::fs::rename(stage, &quarantined)?;
-    File::open(directory)?.sync_all()?;
-    let quarantined_identity = directory_identity(&quarantined)?;
-    let quarantined_marker = quarantined.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-    if !transaction_marker_is_owned(&quarantined_marker, directory, &stage_name, ownership_token)? {
-        if !stage.exists() {
-            std::fs::rename(&quarantined, stage)?;
-            std::fs::remove_file(private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME))?;
-            std::fs::remove_dir(&private_parent)?;
-            File::open(directory)?.sync_all()?;
-        } else {
-            disarm_private_cleanup_parent(
-                directory,
-                &private_parent,
-                &private_name,
-                &marker.ownership_token,
-            )?;
-        }
-        anyhow::bail!("temporal stage ownership changed while isolating for deletion");
-    }
-    let moved_stage_is_owned = quarantined_identity == initial_stage_identity
-        && initial_cleanup_identities.as_ref().is_none_or(|expected| {
-            cleanup_quarantine_identities(
-                directory,
-                &quarantined,
+    let product_directory = open_directory_path(directory)?;
+    let private_name_c = cstring_component(&private_name)?;
+    let outer = open_directory_at(product_directory.as_raw_fd(), &private_name_c)?;
+    let inner_name = CString::new("owned-stage")?;
+    let inner = open_directory_at(outer.as_raw_fd(), &inner_name)?;
+    let inner_identity = descriptor_identity(&inner)?;
+    ensure!(
+        inner_identity == initial_stage_identity
+            && transaction_marker_bytes_are_owned(
+                &read_bounded_at(inner.as_raw_fd(), &marker_name, 64 * 1024)?,
+                &directory_sha256,
                 &stage_name,
-                Some(&marker.ownership_token),
-            )
-            .is_ok_and(|actual| actual.as_ref() == Some(expected))
-        });
-    if !moved_stage_is_owned {
-        if !stage.exists() {
-            std::fs::rename(&quarantined, stage)?;
-            std::fs::remove_file(private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME))?;
-            std::fs::remove_dir(&private_parent)?;
-            File::open(directory)?.sync_all()?;
-        } else {
-            disarm_private_cleanup_parent(
-                directory,
-                &private_parent,
-                &private_name,
                 &marker.ownership_token,
-            )?;
-        }
-        anyhow::bail!("temporal cleanup quarantine inner stage changed while isolating");
-    }
-    if let Err(error) = after_quarantine(&quarantined) {
-        disarm_private_cleanup_parent(
-            directory,
-            &private_parent,
-            &private_name,
-            &marker.ownership_token,
-        )?;
-        return Err(error);
-    }
-    let cleanup_identity_is_unchanged =
-        initial_cleanup_identities.as_ref().is_none_or(|expected| {
-            cleanup_quarantine_identities(
-                directory,
-                &quarantined,
-                &stage_name,
-                Some(&marker.ownership_token),
-            )
-            .is_ok_and(|actual| actual.as_ref() == Some(expected))
-        });
-    let deletion_identity_is_unchanged =
-        transaction_marker_is_owned(&quarantined_marker, directory, &stage_name, ownership_token)?
-            && directory_identity(&private_parent)
-                .is_ok_and(|actual| actual == private_parent_identity)
-            && directory_identity(&quarantined).is_ok_and(|actual| actual == quarantined_identity)
-            && cleanup_identity_is_unchanged;
-    if !deletion_identity_is_unchanged {
-        disarm_private_cleanup_parent(
-            directory,
-            &private_parent,
-            &private_name,
-            &marker.ownership_token,
-        )?;
-        anyhow::bail!("temporal stage identity changed after quarantine");
-    }
-    std::fs::remove_dir_all(&private_parent)?;
-    File::open(directory)?.sync_all()?;
-    Ok(())
+            ),
+        "temporal stage identity changed while quarantining for deletion"
+    );
+    let cleanup_marker = CleanupQuarantineMarker {
+        schema: CLEANUP_QUARANTINE_MARKER_SCHEMA.to_owned(),
+        ownership_token: marker.ownership_token.clone(),
+        product_directory_sha256: directory_sha256,
+        artifact_name: private_name.clone(),
+        inner_artifact_name: stage_name,
+        outer_identity: descriptor_identity(&outer)?,
+        inner_identity,
+    };
+    write_new_at(
+        outer.as_raw_fd(),
+        &marker_name,
+        &serde_json::to_vec(&cleanup_marker)?,
+    )?;
+    outer.sync_all()?;
+    product_directory.sync_all()?;
+    drop(inner);
+    drop(outer);
+    drop(product_directory);
+    after_quarantine(&quarantined)?;
+    remove_verified_cleanup_quarantine(
+        directory,
+        &private_name,
+        Some(&cleanup_marker.ownership_token),
+    )
+}
+
+#[cfg(not(unix))]
+fn remove_owned_stage_directory(
+    _directory: &Path,
+    _stage: &Path,
+    _ownership_token: Option<&str>,
+    _before_isolate: impl FnOnce() -> Result<()>,
+    _after_quarantine: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    anyhow::bail!("temporal covariance product cleanup is unsupported on this platform")
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -4920,7 +5102,6 @@ mod tests {
             &directory,
             &stage,
             Some(ownership_token),
-            None,
             || {
                 std::fs::remove_dir_all(&stage)?;
                 std::fs::create_dir(&stage)?;
@@ -4930,8 +5111,14 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("ownership changed"));
-        assert_eq!(std::fs::read(stage.join("user-data")).unwrap(), b"preserve");
+        let error_text = error.to_string();
+        assert!(error_text.contains("identity"), "{error_text}");
+        let preserved = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("owned-stage/user-data"))
+            .find(|path| path.exists())
+            .unwrap();
+        assert_eq!(std::fs::read(preserved).unwrap(), b"preserve");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4951,7 +5138,6 @@ mod tests {
             &directory,
             &stage,
             Some(ownership_token),
-            None,
             || Ok(()),
             |quarantined| {
                 let marker =
@@ -4968,7 +5154,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("identity changed"));
+        let error_text = error.to_string();
+        assert!(error_text.contains("identity"), "{error_text}");
         let replacement = replacement.unwrap();
         assert_eq!(
             std::fs::read(replacement.join("user-data")).unwrap(),
@@ -4988,33 +5175,63 @@ mod tests {
         let ownership_token = "quarantine-recovery-owner";
 
         let owned_stage = super::create_stage_directory(&directory, ownership_token).unwrap();
-        let owned_cleanup_name = ".temporal-inference-stage-cleanup-owned-crash";
-        let owned_cleanup = directory.join(owned_cleanup_name);
-        std::fs::create_dir(&owned_cleanup).unwrap();
-        super::write_transaction_marker(
-            &owned_cleanup.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+        let mut owned_cleanup = None;
+        let crash = super::remove_owned_stage_directory(
             &directory,
-            owned_cleanup_name,
-            ownership_token,
+            &owned_stage,
+            Some(ownership_token),
+            || Ok(()),
+            |inner| {
+                owned_cleanup = inner.parent().map(std::path::Path::to_owned);
+                anyhow::bail!("simulated crash after durable cleanup receipt")
+            },
         )
-        .unwrap();
-        std::fs::rename(&owned_stage, owned_cleanup.join("owned-stage")).unwrap();
+        .unwrap_err();
+        assert!(crash.to_string().contains("simulated crash"));
+        let owned_cleanup = owned_cleanup.unwrap();
         let transaction = TemporalProductTransaction::acquire(&directory).unwrap();
         assert!(!owned_cleanup.exists());
         drop(transaction);
 
-        let swapped_cleanup_name = ".temporal-inference-stage-cleanup-swapped-crash";
-        let swapped_cleanup = directory.join(swapped_cleanup_name);
-        std::fs::create_dir(&swapped_cleanup).unwrap();
-        super::write_transaction_marker(
-            &swapped_cleanup.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+        let swapped_stage = super::create_stage_directory(&directory, ownership_token).unwrap();
+        let mut swapped_cleanup = None;
+        super::remove_owned_stage_directory(
             &directory,
-            swapped_cleanup_name,
-            ownership_token,
+            &swapped_stage,
+            Some(ownership_token),
+            || Ok(()),
+            |inner| {
+                swapped_cleanup = inner.parent().map(std::path::Path::to_owned);
+                anyhow::bail!("simulated crash before restart substitution")
+            },
+        )
+        .unwrap_err();
+        let swapped_cleanup = swapped_cleanup.unwrap();
+        let swapped_cleanup_name = swapped_cleanup
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let swapped_inner = swapped_cleanup.join("owned-stage");
+        let outer_marker =
+            std::fs::read(swapped_cleanup.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME))
+                .unwrap();
+        let inner_marker =
+            std::fs::read(swapped_inner.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME)).unwrap();
+        std::fs::remove_dir_all(&swapped_cleanup).unwrap();
+        std::fs::create_dir(&swapped_cleanup).unwrap();
+        std::fs::write(
+            swapped_cleanup.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+            outer_marker,
         )
         .unwrap();
-        let swapped_inner = swapped_cleanup.join("owned-stage");
         std::fs::create_dir(&swapped_inner).unwrap();
+        std::fs::write(
+            swapped_inner.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+            inner_marker,
+        )
+        .unwrap();
         std::fs::write(swapped_inner.join("user-data"), b"preserve").unwrap();
 
         let error = TemporalProductTransaction::acquire(&directory).unwrap_err();
