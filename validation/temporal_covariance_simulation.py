@@ -9,8 +9,19 @@ import itertools
 import json
 import math
 import subprocess
-import tempfile
 from pathlib import Path
+
+
+PAIRWISE_DIMENSIONS = (
+    "date_count",
+    "rho_at_12_days",
+    "cadence",
+    "missingness",
+    "variance_ratio",
+    "variance_arrangement",
+    "reference_contribution_ratio",
+    "reference_context",
+)
 
 
 def splitmix64(value: int) -> int:
@@ -20,8 +31,18 @@ def splitmix64(value: int) -> int:
     return value ^ (value >> 31)
 
 
-def cells(preregistration: dict) -> list[dict]:
-    result = []
+def seed_identity(preregistration: dict, cell_index: int, outer_seed_index: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    digest.update(b"dolphinrust:temporal-covariance:outer-seed:v1\0")
+    digest.update(int(preregistration["global_seed"]).to_bytes(8, "big"))
+    digest.update(int(cell_index).to_bytes(8, "big"))
+    digest.update(int(outer_seed_index).to_bytes(8, "big"))
+    raw = digest.digest()
+    return int.from_bytes(raw[:8], "big"), raw.hex()
+
+
+def all_supported_cells(preregistration: dict) -> list[dict]:
+    result: list[dict] = []
     supported_rho_counts = set(preregistration["rho_085_supported_date_counts"])
     for count in preregistration["date_counts"]:
         for rho in preregistration["rho_at_12_days"]:
@@ -47,7 +68,45 @@ def cells(preregistration: dict) -> list[dict]:
                                         "sequential_depth": reference["sequential_depth"],
                                         "approximation": reference["approximation"],
                                     })
-    for index, cell in enumerate(result):
+    return result
+
+
+def _pair_tokens(cell: dict) -> frozenset[tuple[str, str, str, str]]:
+    tokens = set()
+    for left_index, left in enumerate(PAIRWISE_DIMENSIONS):
+        for right in PAIRWISE_DIMENSIONS[left_index + 1:]:
+            tokens.add((left, repr(cell[left]), right, repr(cell[right])))
+    return frozenset(tokens)
+
+
+def _cell_order(cell: dict) -> tuple:
+    return tuple(repr(cell[dimension]) for dimension in PAIRWISE_DIMENSIONS)
+
+
+def cells(preregistration: dict) -> list[dict]:
+    """Return the deterministic greedy pairwise covering array.
+
+    The candidate universe retains every supported level and the rho/date
+    constraint. Selection covers every feasible dimension pair at least once;
+    lexical tie-breaking makes the frozen list independent of hash iteration.
+    """
+    candidates = all_supported_cells(preregistration)
+    tokens = [_pair_tokens(cell) for cell in candidates]
+    uncovered = set().union(*tokens)
+    selected: list[dict] = []
+    remaining = set(range(len(candidates)))
+    while uncovered:
+        best = min(
+            remaining,
+            key=lambda index: (-len(tokens[index] & uncovered), _cell_order(candidates[index])),
+        )
+        covered = tokens[best] & uncovered
+        if not covered:
+            raise RuntimeError("pairwise design cannot cover every feasible pair")
+        selected.append(dict(candidates[best]))
+        uncovered.difference_update(covered)
+        remaining.remove(best)
+    for index, cell in enumerate(selected):
         cell["cell_index"] = index
         cell["cell_id"] = "c%05d-%02d-%s-%s-v%s-%s-r%s-%s" % (
             index,
@@ -59,7 +118,12 @@ def cells(preregistration: dict) -> list[dict]:
             cell["reference_contribution_ratio"],
             cell["reference_context"].replace("_", "-"),
         )
-    return result
+    return selected
+
+
+def production_cells(preregistration: dict, frozen_cells: list[dict] | None = None) -> list[dict]:
+    """Return every pairwise cell for the actual production path."""
+    return list(cells(preregistration) if frozen_cells is None else frozen_cells)
 
 
 def unsupported_cells(preregistration: dict) -> list[dict]:
@@ -151,7 +215,8 @@ def missing_indices(cell: dict, seed: int, scheduled_count: int) -> set[int]:
     return set(selected)
 
 
-def request_for(cell: dict, seed: int, preregistration: dict, execution_path: str) -> dict:
+def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execution_path: str) -> dict:
+    seed, seed_sha256 = seed_identity(preregistration, cell["cell_index"], outer_seed_index)
     days = days_for(cell)
     missing = missing_indices(cell, seed, len(days) - 1)
     observations = []
@@ -197,7 +262,8 @@ def request_for(cell: dict, seed: int, preregistration: dict, execution_path: st
         "maximum_gap_days": preregistration["supported_cell_predicate"]["scheduled_acquisition_maximum_gap_days"],
     }
     request = {"execution_path": execution_path, "cell_id": cell["cell_id"],
-               "cell_index": cell["cell_index"], "seed": seed, "days": days,
+               "cell_index": cell["cell_index"], "outer_seed_index": outer_seed_index,
+               "seed_sha256": seed_sha256, "seed": seed, "days": days,
                "options": options, "fixed_factor": None, "production_path": None}
     if execution_path == "fixed_factor":
         request["fixed_factor"] = {"observations": observations,
@@ -230,9 +296,7 @@ def request_for(cell: dict, seed: int, preregistration: dict, execution_path: st
     return request
 
 
-def score_records(records: list[dict], preregistration: dict) -> dict:
-    truth = 0.01 * 365.25
-    method_fields = {
+METHOD_FIELDS = {
         "ols": "ols", "oracle_gls": "oracle_gls",
         "legacy_intercept_slope_wls_non_comparable": "conditional_wls",
         "lag_one_scalar_effective_n": "scalar_effective_n",
@@ -240,130 +304,252 @@ def score_records(records: list[dict], preregistration: dict) -> dict:
         "reml_covariance_parameter_adjusted_scalar": "adjusted_scalar",
         "slope_profile_likelihood_ml": "adjusted_profile",
         "complete_refit_bootstrap": "complete_refit_bootstrap",
-    }
-    scores = {}
-    for method, field in method_fields.items():
-        rows = []
-        for record in records:
-            comparator = record.get("fit", {}).get(field) if record.get("fit") else None
-            if not comparator or comparator["point_estimate"] is None:
+}
+
+
+class MethodReducer:
+    def __init__(self) -> None:
+        self.attempted = 0
+        self.scored = 0
+        self.bias_mean = 0.0
+        self.bias_m2 = 0.0
+        self.interval_counts = {label: 0 for label in ("68", "90", "95")}
+        self.covered = {label: 0 for label in ("68", "90", "95")}
+        self.width_sums = {label: 0.0 for label in ("68", "90", "95")}
+        self.score_sums = {label: 0.0 for label in ("68", "90", "95")}
+
+    def update(self, comparator: dict | None, truth: float) -> None:
+        self.attempted += 1
+        if not comparator or comparator.get("point_estimate") is None:
+            return
+        bias = comparator["point_estimate"] - truth
+        self.scored += 1
+        delta = bias - self.bias_mean
+        self.bias_mean += delta / self.scored
+        self.bias_m2 += delta * (bias - self.bias_mean)
+        for label, level in (("68", 0.68), ("90", 0.90), ("95", 0.95)):
+            interval = comparator.get(f"interval_{label}")
+            if interval is None:
                 continue
-            row = {"cell_id": record["cell_id"], "seed": record["seed"],
-                   "execution_path": record["execution_path"],
-                   "bias": comparator["point_estimate"] - truth,
-                   "status": comparator["status"]}
-            for label, level in (("68", 0.68), ("90", 0.90), ("95", 0.95)):
-                interval = comparator[f"interval_{label}"]
-                if interval is None:
-                    row[f"coverage_{label}"] = None
-                    row[f"width_{label}"] = None
-                    row[f"interval_score_{label}"] = None
-                    continue
-                lower, upper = interval["lower"], interval["upper"]
-                alpha = 1.0 - level
-                penalty = (2.0 / alpha) * max(lower - truth, 0.0)
-                penalty += (2.0 / alpha) * max(truth - upper, 0.0)
-                row[f"coverage_{label}"] = lower <= truth <= upper
-                row[f"width_{label}"] = upper - lower
-                row[f"interval_score_{label}"] = upper - lower + penalty
-            rows.append(row)
-        attempted = len(records)
-        biases = [row["bias"] for row in rows]
-        bias_mean = sum(biases) / len(biases) if biases else None
-        bias_sd = None
-        if len(biases) > 1:
-            bias_sd = math.sqrt(sum((value - bias_mean) ** 2 for value in biases)
-                                / (len(biases) - 1))
+            lower, upper = interval["lower"], interval["upper"]
+            if not all(math.isfinite(value) for value in (lower, upper)) or upper < lower:
+                continue
+            alpha = 1.0 - level
+            penalty = (2.0 / alpha) * max(lower - truth, 0.0)
+            penalty += (2.0 / alpha) * max(truth - upper, 0.0)
+            self.interval_counts[label] += 1
+            self.covered[label] += lower <= truth <= upper
+            self.width_sums[label] += upper - lower
+            self.score_sums[label] += upper - lower + penalty
+
+    def finalize(self, preregistration: dict) -> dict:
+        bias_sd = math.sqrt(self.bias_m2 / (self.scored - 1)) if self.scored > 1 else None
+        standardized = abs(self.bias_mean) / bias_sd if bias_sd and bias_sd > 0.0 else None
         aggregate = {
-            "attempted": attempted,
-            "scored": len(rows),
-            "failed": attempted - len(rows),
-            "emission_fraction": len(rows) / attempted if attempted else 0.0,
-            "mean_bias": bias_mean,
-            "standardized_bias": (abs(bias_mean) / bias_sd
-                                  if bias_sd and bias_sd > 0.0 else None),
+            "attempted": self.attempted,
+            "scored": self.scored,
+            "failed": self.attempted - self.scored,
+            "emission_fraction": self.scored / self.attempted if self.attempted else 0.0,
+            "mean_bias": self.bias_mean if self.scored else None,
+            "standardized_bias": standardized,
         }
         gates = {
             "emission": aggregate["emission_fraction"]
-                        >= preregistration["thresholds"]["minimum_successful_emission_fraction"],
-            "standardized_bias": aggregate["standardized_bias"] is not None
-                and aggregate["standardized_bias"]
-                <= preregistration["thresholds"]["standardized_bias"],
+                >= preregistration["thresholds"]["minimum_successful_emission_fraction"],
+            "standardized_bias": standardized is not None
+                and standardized <= preregistration["thresholds"]["standardized_bias"],
         }
-        for label in ("68", "90", "95"):
-            covered = [row[f"coverage_{label}"] for row in rows
-                       if row[f"coverage_{label}"] is not None]
-            widths = [row[f"width_{label}"] for row in rows
-                      if row[f"width_{label}"] is not None]
-            interval_scores = [row[f"interval_score_{label}"] for row in rows
-                               if row[f"interval_score_{label}"] is not None]
-            coverage = sum(covered) / len(covered) if covered else None
+        for label, nominal in (("68", 0.68), ("90", 0.90), ("95", 0.95)):
+            count = self.interval_counts[label]
+            coverage = self.covered[label] / count if count else None
             aggregate[f"coverage_{label}"] = coverage
-            aggregate[f"mean_width_{label}"] = (sum(widths) / len(widths)
-                                                   if widths else None)
-            aggregate[f"mean_interval_score_{label}"] = (
-                sum(interval_scores) / len(interval_scores) if interval_scores else None)
-            nominal = {"68": 0.68, "90": 0.90, "95": 0.95}[label]
+            aggregate[f"mean_width_{label}"] = self.width_sums[label] / count if count else None
+            aggregate[f"mean_interval_score_{label}"] = self.score_sums[label] / count if count else None
             gates[f"coverage_{label}"] = coverage is not None and abs(coverage - nominal) <= (
                 preregistration["thresholds"]["coverage"][f"0.{label}"])
-        scores[method] = {"attempted": attempted, "scored": len(rows), "rows": rows,
-                          "aggregate": aggregate, "gates": gates,
-                          "passes_all_gates": all(gates.values())}
-    oracle = scores["oracle_gls"]["aggregate"]
-    oracle_score = oracle["mean_interval_score_95"]
-    oracle_width = oracle["mean_width_95"]
-    for result in scores.values():
-        aggregate = result["aggregate"]
-        score = aggregate["mean_interval_score_95"]
-        width = aggregate["mean_width_95"]
-        result["gates"]["proper_score"] = (score is not None and oracle_score is not None
-            and score <= oracle_score * (1.0 + preregistration["thresholds"]["proper_score"]))
-        result["gates"]["interval_width"] = (width is not None and oracle_width is not None
-            and width <= oracle_width * preregistration["thresholds"]["maximum_interval_width_ratio"])
-        result["passes_all_gates"] = all(result["gates"].values())
-    promotion_methods = preregistration["promotion_methods"]
-    return {"schema": "coverage_bias_interval_score/2", "truth_slope_per_year": truth,
-            "methods": scores, "promotion_methods": promotion_methods,
-            "all_methods_pass": all(scores[name]["passes_all_gates"]
-                                     for name in promotion_methods)}
+        return {"aggregate": aggregate, "gates": gates}
+
+
+class StreamingScores:
+    def __init__(self, preregistration: dict) -> None:
+        self.preregistration = preregistration
+        self.truth = 0.01 * 365.25
+        frozen = cells(preregistration)
+        self.cells_by_id = {cell["cell_id"]: cell for cell in frozen}
+        self.reducers = {
+            (cell["cell_id"], path, method): MethodReducer()
+            for cell in frozen
+            for path in preregistration["execution_paths"]
+            for method in METHOD_FIELDS
+        }
+        self.next_seed = {
+            (cell["cell_id"], path): 0
+            for cell in frozen
+            for path in preregistration["execution_paths"]
+        }
+
+    def update(self, record: dict) -> None:
+        key = (record.get("cell_id"), record.get("execution_path"))
+        if key not in self.next_seed:
+            raise RuntimeError("batch returned an unknown cell or execution path")
+        expected_index = self.next_seed[key]
+        if record.get("outer_seed_index") != expected_index:
+            raise RuntimeError("batch returned a duplicate, missing, or reordered outer seed")
+        cell = self.cells_by_id[key[0]]
+        expected_seed, expected_digest = seed_identity(
+            self.preregistration, cell["cell_index"], expected_index)
+        if record.get("seed") != expected_seed or record.get("seed_sha256") != expected_digest:
+            raise RuntimeError("batch returned a stale or mismatched seed identity")
+        self.next_seed[key] += 1
+        fit = record.get("fit")
+        for method, field in METHOD_FIELDS.items():
+            comparator = fit.get(field) if fit else None
+            self.reducers[(key[0], key[1], method)].update(comparator, self.truth)
+
+    def finalize(self, require_complete: bool) -> dict:
+        expected = self.preregistration["outer_seeds_per_supported_cell"]
+        if require_complete and any(count != expected for count in self.next_seed.values()):
+            raise RuntimeError("batch did not return the exact frozen seed denominator for every cell")
+        summaries = []
+        global_methods = {
+            method: {"attempted": 0, "scored": 0, "failed": 0}
+            for method in METHOD_FIELDS
+        }
+        all_selected_pass = True
+        for cell in sorted(self.cells_by_id.values(), key=lambda value: value["cell_index"]):
+            for path in self.preregistration["execution_paths"]:
+                methods = {
+                    method: self.reducers[(cell["cell_id"], path, method)].finalize(self.preregistration)
+                    for method in METHOD_FIELDS
+                }
+                oracle = methods["oracle_gls"]["aggregate"]
+                for method, result in methods.items():
+                    aggregate = result["aggregate"]
+                    score = aggregate["mean_interval_score_95"]
+                    width = aggregate["mean_width_95"]
+                    oracle_score = oracle["mean_interval_score_95"]
+                    oracle_width = oracle["mean_width_95"]
+                    result["gates"]["proper_score"] = (
+                        score is not None and oracle_score is not None
+                        and score <= oracle_score * (1.0 + self.preregistration["thresholds"]["proper_score"])
+                    )
+                    result["gates"]["interval_width"] = (
+                        width is not None and oracle_width is not None
+                        and width <= oracle_width * self.preregistration["thresholds"]["maximum_interval_width_ratio"]
+                    )
+                    result["passes_all_gates"] = all(result["gates"].values())
+                    for field in ("attempted", "scored", "failed"):
+                        global_methods[method][field] += aggregate[field]
+                all_selected_pass = all_selected_pass and all(
+                    methods[method]["passes_all_gates"]
+                    for method in self.preregistration["promotion_methods"]
+                )
+                summaries.append({
+                    "cell_id": cell["cell_id"],
+                    "cell_index": cell["cell_index"],
+                    "execution_path": path,
+                    "attempted": self.next_seed[(cell["cell_id"], path)],
+                    "methods": methods,
+                })
+        return {
+            "schema": "coverage_bias_interval_score/3",
+            "truth_slope_per_year": self.truth,
+            "methods": global_methods,
+            "cell_summaries": summaries,
+            "promotion_methods": self.preregistration["promotion_methods"],
+            "all_methods_pass": all_selected_pass,
+        }
+
+
+def score_records(records: list[dict], preregistration: dict) -> dict:
+    scorer = StreamingScores(preregistration)
+    for record in records:
+        scorer.update(record)
+    return scorer.finalize(require_complete=False)
+
+
+def iter_requests(preregistration: dict, seed_count: int):
+    for cell in cells(preregistration):
+        for outer_seed_index in range(seed_count):
+            for execution_path in preregistration["execution_paths"]:
+                yield request_for(
+                    cell,
+                    outer_seed_index,
+                    preregistration,
+                    execution_path,
+                )
 
 
 def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
     frozen_cells = cells(preregistration)
     if cell_hash(frozen_cells) != preregistration["supported_cell_sha256"]:
         raise RuntimeError("supported cell construction does not match preregistration hash")
-    requests = [
-        request_for(
-            cell,
-            splitmix64(splitmix64(preregistration["global_seed"] ^ seed) ^ cell["cell_index"]),
-            preregistration,
-            execution_path,
-        )
-        for cell in frozen_cells
-        for seed in range(seed_count)
-        for execution_path in preregistration["execution_paths"]
-    ]
-    selected = requests if limit is None else requests[:limit]
-    with tempfile.TemporaryDirectory(prefix="dolphinrust-temporal-", dir="/var/tmp") as directory:
-        input_path = Path(directory) / "requests.jsonl"
-        output_path = Path(directory) / "responses.jsonl"
-        with input_path.open("w") as handle:
-            for request in selected:
-                handle.write(json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n")
-        command = ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example", "temporal_covariance_batch"]
-        with input_path.open() as input_handle, output_path.open("w") as output_handle:
-            subprocess.run(command, cwd=Path(__file__).parents[1], stdin=input_handle, stdout=output_handle, check=True)
-        records = [json.loads(line) for line in output_path.read_text().splitlines() if line]
-    scores = score_records(records, preregistration)
-    complete_execution = limit is None and len(records) == len(requests)
-    result_payload = json.dumps({"records": records, "scores": scores},
-                                separators=(",", ":"), sort_keys=True).encode()
-    total_wall = sum(record["resource"]["wall_micros"] for record in records)
-    peak_rss = max((max(record["resource"]["resident_set_bytes_before"],
-                        record["resource"]["resident_set_bytes_after"])
-                    for record in records), default=0)
-    projected_full_minutes = ((total_wall / len(records)) * len(requests) / 60_000_000
-                              if records else float("inf"))
+    expected_attempts = len(frozen_cells) * seed_count * len(preregistration["execution_paths"])
+    selected = iter_requests(preregistration, seed_count)
+    if limit is not None:
+        selected = itertools.islice(selected, limit)
+    root = Path(__file__).parents[1]
+    subprocess.run(
+        ["cargo", "build", "--release", "-p", "dolphin-timeseries", "--example", "temporal_covariance_batch"],
+        cwd=root,
+        check=True,
+    )
+    process = subprocess.Popen(
+        [root / "target/release/examples/temporal_covariance_batch"],
+        cwd=root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RuntimeError("temporal covariance batch pipes are unavailable")
+    scorer = StreamingScores(preregistration)
+    records: list[dict] = []
+    processed = 0
+    emitted = 0
+    failed = 0
+    total_wall = 0
+    peak_rss = 0
+    try:
+        for request in selected:
+            process.stdin.write(json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+            line = process.stdout.readline()
+            if not line:
+                raise RuntimeError("temporal covariance batch ended before returning every request")
+            record = json.loads(line)
+            scorer.update(record)
+            processed += 1
+            emitted += bool(record["emitted"])
+            failed += bool(record["failed"])
+            total_wall += record["resource"]["wall_micros"]
+            peak_rss = max(
+                peak_rss,
+                record["resource"]["resident_set_bytes_before"],
+                record["resource"]["resident_set_bytes_after"],
+            )
+            if limit is not None and limit <= 1024:
+                records.append(record)
+        process.stdin.close()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"temporal covariance batch exited with status {return_code}")
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    exact_denominator = (
+        limit is None
+        and seed_count == preregistration["outer_seeds_per_supported_cell"]
+        and processed == expected_attempts
+    )
+    scores = scorer.finalize(require_complete=exact_denominator)
+    complete_execution = limit is None and processed == expected_attempts
+    result_payload = json.dumps({"scores": scores}, separators=(",", ":"), sort_keys=True).encode()
+    projected_full_minutes = ((total_wall / processed) * expected_attempts / 60_000_000
+                              if processed else float("inf"))
     resource_gates = {
         "rss": peak_rss <= preregistration["resource_limits"]["rss_limit_bytes"],
         "artifact_size": len(result_payload)
@@ -376,10 +562,10 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         "preregistration_schema": preregistration["schema"],
         "pre_outcome_status": preregistration["status"],
         "supported_cell_sha256": preregistration["supported_cell_sha256"],
-        "attempted_cells": len(requests), "batch_attempted_cells": len(records),
-        "emitted_cells": sum(record["emitted"] for record in records),
-        "failed_cells": sum(record["failed"] for record in records),
-        "skipped_contract_cells": len(requests) - len(records), "seed_count": seed_count,
+        "attempted_cells": expected_attempts, "batch_attempted_cells": processed,
+        "emitted_cells": emitted,
+        "failed_cells": failed,
+        "skipped_contract_cells": expected_attempts - processed, "seed_count": seed_count,
         "unsupported_cell_count": len(unsupported_cells(preregistration)),
         "unsupported_cell_sha256": preregistration["unsupported_cell_sha256"],
         "unsupported_cells": unsupported_cells(preregistration),
@@ -388,11 +574,12 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         "execution_paths": preregistration["execution_paths"],
         "corrected_inferential_sigma_emission": False,
         "execution_complete": complete_execution,
+        "exact_seed_denominator_complete": exact_denominator,
         "result_records_sha256": hashlib.sha256(result_payload).hexdigest(),
         "result_records_bytes": len(result_payload),
-        "promotion_eligible": complete_execution and scores["all_methods_pass"]
+        "promotion_eligible": exact_denominator and scores["all_methods_pass"]
                               and all(resource_gates.values()),
-        "promotion_status": ("eligible_for_external_field_review" if complete_execution
+        "promotion_status": ("eligible_for_external_field_review" if exact_denominator
                              and scores["all_methods_pass"] and all(resource_gates.values()) else
                              "blocked_pending_complete_passing_synthetic_execution"),
         "resource": {"total_wall_micros": total_wall, "peak_resident_set_bytes": peak_rss,

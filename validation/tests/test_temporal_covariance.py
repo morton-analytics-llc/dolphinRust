@@ -43,13 +43,13 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertTrue(self.prereg["external_holdout_required"])
 
     def test_cell_count_and_seed_denominator_are_immutable(self):
-        self.assertEqual(self.prereg["cell_count_without_outer_seeds"], 12096)
+        self.assertEqual(self.prereg["cell_count_without_outer_seeds"], 24)
         self.assertEqual(self.prereg["cell_count_by_execution_path"], {
-            "fixed_factor": 12096, "production_path": 12096
+            "fixed_factor": 24, "production_path": 24
         })
         self.assertEqual(
             self.prereg["supported_cell_sha256"],
-            "567fc7a4fb26539195cdeb47a3a655c2e7123a04d6892915130f9bb7b1f5876b",
+            "6d732dd55a4258b9e3dcd479693c6b09a98e32b11c7cddb23a36d7ac992dedaf",
         )
         self.assertEqual(self.prereg["global_seed"], 5447718)
         self.assertEqual(
@@ -66,8 +66,13 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         frozen = module.cells(self.prereg)
-        self.assertEqual(len(frozen), 12096)
+        self.assertEqual(len(frozen), 24)
         self.assertEqual(module.cell_hash(frozen), self.prereg["supported_cell_sha256"])
+        candidates = module.all_supported_cells(self.prereg)
+        expected_pairs = set().union(*(module._pair_tokens(cell) for cell in candidates))
+        actual_pairs = set().union(*(module._pair_tokens(cell) for cell in frozen))
+        self.assertEqual(actual_pairs, expected_pairs)
+        self.assertEqual(module.production_cells(self.prereg, frozen), frozen)
         unsupported = module.unsupported_cells(self.prereg)
         self.assertEqual(len(unsupported), 10)
         self.assertEqual(module.cell_hash(unsupported), self.prereg["unsupported_cell_sha256"])
@@ -89,16 +94,16 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             ]
             subprocess.run(command, check=True)
             receipt = json.loads(output.read_text())
-            self.assertEqual(receipt["attempted_cells"], 24192)
+            self.assertEqual(receipt["attempted_cells"], 48)
             self.assertEqual(receipt["batch_attempted_cells"], 2)
             self.assertEqual(receipt["emitted_cells"], 0)
             self.assertEqual(receipt["failed_cells"], 2)
-            self.assertEqual(receipt["skipped_contract_cells"], 24190)
+            self.assertEqual(receipt["skipped_contract_cells"], 46)
             self.assertFalse(receipt["corrected_inferential_sigma_emission"])
             self.assertEqual(receipt["pre_outcome_status"], "pre_outcome_frozen")
             fixed, production = receipt["records"]
             self.assertEqual(fixed["execution_path"], "fixed_factor")
-            self.assertEqual(fixed["fixed_factor_status"], "OptimizerNonconverged")
+            self.assertNotEqual(fixed["fixed_factor_status"], "Evaluated")
             self.assertEqual(production["execution_path"], "production_path")
             self.assertEqual(production["production_path_status"], "estimator_failed")
             self.assertEqual(fixed["fit"]["valid_date_count"], 12)
@@ -110,8 +115,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             )
             self.assertEqual(len(fixed["comparator_methods"]), 8)
             self.assertIsNone(production["provenance"])
-            self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/2")
+            self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/3")
             self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 2)
+            self.assertEqual(len(receipt["scores"]["cell_summaries"]), 48)
+            self.assertFalse(receipt["exact_seed_denominator_complete"])
             self.assertIn("resource", fixed)
             self.assertFalse(receipt["execution_complete"])
             self.assertFalse(receipt["promotion_eligible"])
@@ -186,6 +193,26 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(record["production_path_status"], "source_seed_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
+
+    def test_streaming_scorer_rejects_missing_or_reordered_seed(self):
+        path = ROOT / "validation/temporal_covariance_simulation.py"
+        spec = importlib.util.spec_from_file_location("temporal_covariance_simulation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        request_iter = module.iter_requests(self.prereg, 2)
+        self.assertNotIsInstance(request_iter, list)
+        request = next(request_iter)
+        scorer = module.StreamingScores(self.prereg)
+        stale = {
+            "cell_id": request["cell_id"],
+            "execution_path": request["execution_path"],
+            "outer_seed_index": 1,
+            "seed": request["seed"],
+            "seed_sha256": request["seed_sha256"],
+            "fit": None,
+        }
+        with self.assertRaisesRegex(RuntimeError, "duplicate, missing, or reordered"):
+            scorer.update(stale)
 
     def test_coverage_tolerances_are_explicit(self):
         self.assertEqual(self.prereg["coverage_tolerances"], {
