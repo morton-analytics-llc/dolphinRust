@@ -1219,7 +1219,12 @@ fn nuisance_bounds(
     observations: &[f64],
     options: &TemporalCovarianceOptions,
 ) -> Result<NuisanceBounds, TemporalInferenceStatus> {
-    if !(0.0..1.0).contains(&options.rho_max) || options.rho_min < 0.0 {
+    if !options.rho_min.is_finite()
+        || !options.rho_max.is_finite()
+        || options.rho_min < 0.0
+        || options.rho_min >= options.rho_max
+        || options.rho_max >= 1.0
+    {
         return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
     }
     let initial = ols_slope(days, observations)?;
@@ -1236,7 +1241,10 @@ fn nuisance_bounds(
         return Err(TemporalInferenceStatus::OptimizerNonconverged);
     }
     let (log_min, log_max) = process_log_bounds(scale, options)?;
-    let rho_upper = (options.rho_max - 1e-8).max(options.rho_min + 1e-8);
+    let rho_upper = options.rho_max - 1e-8;
+    if rho_upper <= options.rho_min {
+        return Err(TemporalInferenceStatus::CovarianceParameterAtBoundary);
+    }
     Ok(NuisanceBounds {
         rho_lower: options.rho_min,
         rho_upper,
@@ -1515,6 +1523,10 @@ fn golden_section_minimum<F>(mut lower: f64, mut upper: f64, mut objective: F) -
 where
     F: FnMut(f64) -> f64,
 {
+    let lower_boundary = lower;
+    let upper_boundary = upper;
+    let lower_boundary_value = objective(lower_boundary);
+    let upper_boundary_value = objective(upper_boundary);
     let ratio = 0.618_033_988_749_894_9;
     let mut left = upper - ratio * (upper - lower);
     let mut right = lower + ratio * (upper - lower);
@@ -1535,7 +1547,16 @@ where
             right_value = objective(right);
         }
     }
-    (lower + upper) / 2.0
+    let interior = (lower + upper) / 2.0;
+    let interior_value = objective(interior);
+    [
+        (lower_boundary, lower_boundary_value),
+        (interior, interior_value),
+        (upper_boundary, upper_boundary_value),
+    ]
+    .into_iter()
+    .min_by(|left, right| left.1.total_cmp(&right.1))
+    .map_or(interior, |(parameter, _)| parameter)
 }
 
 fn profile_fixed_slope(

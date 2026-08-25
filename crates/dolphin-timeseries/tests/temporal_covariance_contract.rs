@@ -10,24 +10,41 @@ use dolphin_timeseries::{
 use statrs::function::erf::erf;
 
 fn twelve_date_fixture() -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
+    direct_factor_fixture(1.0)
+}
+
+fn direct_factor_fixture(diagonal: f64) -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
     let days: Vec<f64> = (0..13).map(|index| index as f64 * 12.0).collect();
-    let observations: Vec<f64> = days
+    let mut observations: Vec<f64> = days
         .iter()
         .enumerate()
-        .map(|(index, day)| 0.01 * day + (index as f64 * 0.07).sin() * 0.2)
+        .map(|(index, day)| 0.01 * day + (index as f64 * 0.7).sin() * 2.0)
         .collect();
-    let covariance: Vec<Vec<f64>> = (0..13).map(|_| (0..13).map(|_| 0.0).collect()).collect();
-    let covariance = covariance
-        .into_iter()
-        .enumerate()
-        .map(|(row, mut values)| {
-            if row > 0 {
-                values[row] = 1e-8;
-            }
-            values
-        })
-        .collect();
+    observations[0] = 0.0;
+    let mut covariance = vec![vec![0.0; days.len()]; days.len()];
+    for (index, row) in covariance.iter_mut().enumerate().skip(1) {
+        row[index] = diagonal;
+    }
     (days, observations, covariance)
+}
+
+fn issue54_difference_variance(name: &str) -> f64 {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../dolphin-workflows/tests/fixtures/spatial_reference_covariance_cases.json"
+    ))
+    .unwrap();
+    let case = fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap();
+    let target = case["expected_target_variance"].as_f64().unwrap();
+    let reference = case["expected_reference_variance"].as_f64().unwrap();
+    let cross = case["expected_cross_covariance"].as_f64().unwrap();
+    let difference = case["expected_difference_variance"].as_f64().unwrap();
+    assert_eq!(difference, target + reference - 2.0 * cross);
+    difference
 }
 
 #[test]
@@ -93,7 +110,78 @@ fn direct_difference_factor_is_used_without_two_marginal_reconstruction() {
 }
 
 #[test]
-fn short_irregular_covariance_fails_weak_identification() {
+fn direct_issue54_cross_covariance_controls_oracle_slope_standard_error() {
+    let options = TemporalCovarianceOptions {
+        oracle_rho: 0.3,
+        oracle_process_variance: 1.0,
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let standard_error = |difference_diagonal| {
+        let (days, observations, covariance) = direct_factor_fixture(difference_diagonal);
+        let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
+        assert_eq!(fit.status, TemporalInferenceStatus::Evaluated);
+        fit.oracle_gls.standard_error_diagnostic.unwrap()
+    };
+
+    let positive_cross = standard_error(issue54_difference_variance("positive"));
+    let independent = standard_error(issue54_difference_variance("independent"));
+    let negative_cross = standard_error(issue54_difference_variance("negative"));
+    assert!(positive_cross < independent);
+    assert!(independent < negative_cross);
+}
+
+#[test]
+fn coincident_and_invalid_direct_issue54_factors_abstain() {
+    let options = TemporalCovarianceOptions {
+        minimum_dates: 2,
+        oracle_process_variance: 0.0,
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let days = [0.0, 12.0, 24.0];
+    let observations = [0.0, 1.0, 2.0];
+    let coincident = vec![vec![issue54_difference_variance("coincident"); 3]; 3];
+    assert_eq!(
+        fit_temporal_covariance(&days, &observations, &coincident, &options).status,
+        TemporalInferenceStatus::CovarianceNonfinite
+    );
+
+    let asymmetric = vec![
+        vec![0.0, 0.0, 0.0],
+        vec![0.0, 1.0, 0.5],
+        vec![0.0, 0.25, 1.0],
+    ];
+    assert_eq!(
+        fit_temporal_covariance(&days, &observations, &asymmetric, &options).status,
+        TemporalInferenceStatus::CovarianceNonfinite
+    );
+
+    let nonfinite = vec![
+        vec![0.0, 0.0, 0.0],
+        vec![0.0, 1.0, f64::NAN],
+        vec![0.0, f64::NAN, 1.0],
+    ];
+    assert_eq!(
+        fit_temporal_covariance(&days, &observations, &nonfinite, &options).status,
+        TemporalInferenceStatus::CovarianceNonfinite
+    );
+
+    let indefinite = vec![
+        vec![0.0, 0.0, 0.0],
+        vec![0.0, 1.0, 2.0],
+        vec![0.0, 2.0, 1.0],
+    ];
+    assert_eq!(
+        fit_temporal_covariance(&days, &observations, &indefinite, &options).status,
+        TemporalInferenceStatus::TotalCovarianceNotPositiveDefinite
+    );
+}
+
+#[test]
+fn short_irregular_covariance_fails_at_the_fitted_boundary() {
     let days = [6.0, 12.0, 30.0, 48.0];
     let observations = [0.1, 0.8, 1.4, 2.6];
     let difference = [
@@ -131,10 +219,7 @@ fn short_irregular_covariance_fails_weak_identification() {
         },
         &options,
     );
-    assert_eq!(
-        fit.status,
-        TemporalInferenceStatus::WeakParameterIdentification
-    );
+    assert_eq!(fit.status, TemporalInferenceStatus::RhoLowerBoundary);
     assert!(fit.adjusted_profile.interval_95.is_none());
 }
 
@@ -314,6 +399,24 @@ fn invalid_profile_boundary_and_condition_fail_closed() {
 }
 
 #[test]
+fn crossed_or_nonfinite_rho_bounds_fail_before_optimization() {
+    let (days, observations, covariance) = twelve_date_fixture();
+    for (rho_min, rho_max) in [(0.5, 0.5), (0.8, 0.2), (f64::NAN, 0.98)] {
+        let options = TemporalCovarianceOptions {
+            rho_min,
+            rho_max,
+            bootstrap_replicates: 0,
+            bootstrap_minimum_successes: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            fit_temporal_covariance(&days, &observations, &covariance, &options).status,
+            TemporalInferenceStatus::CovarianceParameterAtBoundary
+        );
+    }
+}
+
+#[test]
 fn optimizer_and_weak_identification_statuses_are_distinct() {
     let (days, observations, covariance) = twelve_date_fixture();
     let nonconverged = TemporalCovarianceOptions {
@@ -356,6 +459,52 @@ fn fitted_parameter_boundaries_have_distinct_statuses() {
         temporal_parameter_boundary_status(0.5, 10.0, [0.0, 0.98], [0.1, 10.0], 1e-6),
         Some(TemporalInferenceStatus::ProcessVarianceUpperBoundary)
     );
+}
+
+#[test]
+fn fitted_rho_endpoint_returns_lower_boundary_status() {
+    let (days, _, covariance) = direct_factor_fixture(0.01);
+    let observations = days
+        .iter()
+        .enumerate()
+        .map(|(index, day)| {
+            if index == 0 {
+                0.0
+            } else {
+                0.01 * day + if index % 2 == 0 { -0.5 } else { 0.5 }
+            }
+        })
+        .collect::<Vec<_>>();
+    let options = TemporalCovarianceOptions {
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
+    assert_eq!(fit.status, TemporalInferenceStatus::RhoLowerBoundary);
+    assert!(fit.plugin_gls_slope.is_none());
+}
+
+#[test]
+fn fitted_rho_endpoint_returns_upper_boundary_status() {
+    let days: Vec<f64> = (0..13).map(|index| index as f64 * 12.0).collect();
+    let observations = days
+        .iter()
+        .enumerate()
+        .map(|(index, day)| 0.01 * day + (index as f64 * 0.07).sin() * 0.2)
+        .collect::<Vec<_>>();
+    let mut covariance = vec![vec![0.0; days.len()]; days.len()];
+    for (index, row) in covariance.iter_mut().enumerate().skip(1) {
+        row[index] = 1e-8;
+    }
+    let options = TemporalCovarianceOptions {
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
+    assert_eq!(fit.status, TemporalInferenceStatus::RhoUpperBoundary);
+    assert!(fit.adjusted_profile.interval_95.is_none());
 }
 
 #[test]
