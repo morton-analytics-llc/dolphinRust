@@ -152,6 +152,79 @@ fn dropping_incomplete_bounded_writer_never_creates_destination() {
 }
 
 #[test]
+fn incomplete_bounded_writer_cannot_finalize() {
+    let root = std::env::temp_dir().join(format!("dolphinrust_gapped_cog_{}", std::process::id()));
+    let scratch = root.with_extension("scratch.tif");
+    let destination = root.with_extension("tif");
+    let _ = std::fs::remove_file(&scratch);
+    let _ = std::fs::remove_file(&destination);
+    let mut writer =
+        BoundedCogWriter::<u8>::create(&scratch, (4, 4), GT, Some(32611), Some(255.0), &[])
+            .unwrap();
+    writer
+        .write_window(
+            BlockIndices {
+                row_start: 0,
+                row_stop: 3,
+                col_start: 0,
+                col_stop: 4,
+            },
+            Array2::from_elem((3, 4), 1_u8).view(),
+        )
+        .unwrap();
+    assert!(writer.finalize(&destination).is_err());
+    assert!(!destination.exists());
+    assert!(scratch.exists());
+    let _ = std::fs::remove_file(&scratch);
+}
+
+#[test]
+fn bounded_writer_rejects_overlapping_and_duplicate_windows() {
+    let scratch = std::env::temp_dir().join(format!(
+        "dolphinrust_overlapping_window_{}.tif",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&scratch);
+    let mut writer =
+        BoundedCogWriter::<f32>::create(&scratch, (6, 6), GT, Some(32611), None, &[]).unwrap();
+    let first = BlockIndices {
+        row_start: 0,
+        row_stop: 3,
+        col_start: 0,
+        col_stop: 3,
+    };
+    writer
+        .write_window(first, Array2::zeros((3, 3)).view())
+        .unwrap();
+    assert!(writer
+        .write_window(first, Array2::ones((3, 3)).view())
+        .is_err());
+    assert!(writer
+        .write_window(
+            BlockIndices {
+                row_start: 2,
+                row_stop: 5,
+                col_start: 2,
+                col_stop: 5,
+            },
+            Array2::ones((3, 3)).view(),
+        )
+        .is_err());
+    writer
+        .write_window(
+            BlockIndices {
+                row_start: 3,
+                row_stop: 6,
+                col_start: 0,
+                col_stop: 3,
+            },
+            Array2::ones((3, 3)).view(),
+        )
+        .unwrap();
+    let _ = std::fs::remove_file(&scratch);
+}
+
+#[test]
 fn bounded_writer_rejects_window_shape_and_bounds_mismatches() {
     let scratch =
         std::env::temp_dir().join(format!("dolphinrust_bad_window_{}.tif", std::process::id()));
