@@ -9,9 +9,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA = "dolphinrust.temporal_covariance.heldout_cohort"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HASH_FIELDS = ("catalog_sha256", "burst_metadata_sha256", "gnss_station_metadata_sha256")
-CLUSTER_KEYS = ("burst_id", "orbit_id", "footprint_id", "site_id")
+INDEPENDENCE_KEYS = ("burst_id", "footprint_id", "site_id")
 PROTECTED_SITES = {"fresno"}
 PROTECTED_STATIONS = {"MMX1", "ICMX", "MXMX", "MXTM", "SSNX", "TNGF", "UJAL", "UNVA", "UTAC"}
 PROTECTED_BURSTS = {
@@ -160,7 +160,9 @@ def discover_candidates(records: Iterable[Mapping[str, Any]], preregistration: M
 
 
 def _disjoint(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    if any(left[key] == right[key] for key in CLUSTER_KEYS):
+    # Relative orbit is provenance within the composite cluster identity, not a
+    # global exclusion across otherwise independent burst/site clusters.
+    if any(left[key] == right[key] for key in INDEPENDENCE_KEYS):
         return False
     return not set(left["station_ids"]) & set(right["station_ids"])
 
@@ -201,7 +203,7 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
         "outcomes_present": False,
         "preregistration_sha256": canonical_digest(preregistration),
         "candidate_query_digest": discovery["query_digest"],
-        "selection_algorithm": "lexical_candidate_id_greedy_disjoint_v1",
+        "selection_algorithm": "lexical_candidate_id_greedy_independent_burst_site_v2",
         "selection_outcome_blind": True,
         "candidate_pool": [dict(candidate) for candidate in ordered_candidates],
         "frozen_clusters": [dict(candidate) for candidate in selected],

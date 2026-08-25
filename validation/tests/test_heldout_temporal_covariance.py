@@ -276,6 +276,47 @@ class HeldoutCohortTests(unittest.TestCase):
         with self.assertRaisesRegex(CohortValidationError, "schema"):
             validate_manifest(exposed, self.preregistration)
 
+    def test_relative_orbit_is_composite_provenance_not_a_global_exclusion(self):
+        records = [
+            candidate(
+                index,
+                query_digest=self.preregistration["candidate_query"]["query_digest"],
+                orbit_id="ascending-r001",
+            )
+            for index in range(116)
+        ]
+        manifest = build_manifest(
+            discover_candidates(records, self.preregistration), self.preregistration
+        )
+        self.assertEqual(manifest["status"], "frozen_metadata_only")
+        self.assertEqual(
+            manifest["selection_algorithm"],
+            "lexical_candidate_id_greedy_independent_burst_site_v2",
+        )
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(len(manifest["frozen_clusters"]), 96)
+        self.assertEqual(len(manifest["surplus_clusters"]), 20)
+        validate_manifest(manifest, self.preregistration)
+
+        old_v1 = copy.deepcopy(manifest)
+        old_v1["schema_version"] = 1
+        old_v1["selection_algorithm"] = "lexical_candidate_id_greedy_disjoint_v1"
+        with self.assertRaisesRegex(CohortValidationError, "schema/version mismatch"):
+            validate_manifest(old_v1, self.preregistration)
+
+    def test_burst_footprint_site_and_station_overlap_remain_excluded(self):
+        query_digest = self.preregistration["candidate_query"]["query_digest"]
+        for field in ("burst_id", "footprint_id", "site_id", "station_ids"):
+            with self.subTest(field=field):
+                records = [candidate(index, query_digest=query_digest) for index in range(117)]
+                records[1][field] = records[0][field]
+                manifest = build_manifest(
+                    discover_candidates(records, self.preregistration),
+                    self.preregistration,
+                )
+                self.assertEqual(manifest["excluded_after_selection"], ["candidate-001"])
+                validate_manifest(manifest, self.preregistration)
+
     def test_exact_power_contract_is_frozen(self):
         expected = {"68": 96, "90": 72, "95": 62}
         self.assertEqual(self.preregistration["power"]["required_evaluable_clusters"], expected)
