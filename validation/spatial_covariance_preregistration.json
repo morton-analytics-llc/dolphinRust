@@ -195,7 +195,7 @@
       "positive_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
       "negative_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
       "seed_count": 512,
-      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's canonical matched-marginal identity for support, ancestry, latent truth, marginal oracles, correlation receipt, coordinates, shape, counts, and source process before reducing predicted and empirical traces; signed joint raw DGP identities intentionally differ and remain bound by the positive/negative attempt digests; independent is derived only from the paired marginal target/reference traces"
+      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells under an explicit matched-cohort replay and accumulator context that admits exactly seed indices 0 through 511 only for these two cells without widening their ordinary 0 through 127 outcome schedule; Python regenerates and equality-checks each seed's canonical matched-marginal identity for support, ancestry, latent truth, marginal oracles, correlation receipt, coordinates, shape, counts, and source process before reducing predicted and empirical traces; signed joint raw DGP identities intentionally differ and remain bound by the positive/negative attempt digests; independent is derived only from the paired marginal target/reference traces"
     },
     "max_production_sidecar_bytes": 1048576
   },
@@ -627,7 +627,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "204831714f38b5923009d25d589d537ab56a4cce11ae0480eb4ea764ab40b920"
+        "sha256": "ac1ad658931af8e0c59c59f527159b5889cc030d901d19017a327e4e54ec0182"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",

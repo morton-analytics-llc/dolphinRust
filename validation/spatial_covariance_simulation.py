@@ -1208,6 +1208,7 @@ def generate_matched_pair_cohorts(
         CellAccumulator(
             preregistration, cell_id, cell_ids.index(cell_id), seed_count,
             code_sha256, binary_sha256,
+            matched_cohort_replay=True,
         )
         for cell_id in (MATCHED_POSITIVE_CELL, MATCHED_NEGATIVE_CELL)
     ]
@@ -1251,7 +1252,12 @@ def generate_matched_pair_cohorts(
                 attempt_digests[index].update(raw)
                 attempts.append(attempt)
                 regenerated.append(
-                    regenerate_frozen_attempt_inputs(preregistration, cell_id, seed_index)
+                    regenerate_frozen_attempt_inputs(
+                        preregistration,
+                        cell_id,
+                        seed_index,
+                        matched_cohort_replay=True,
+                    )
                 )
             marginal_identities = [
                 _matched_marginal_identity(value) for value in regenerated
