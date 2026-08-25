@@ -1198,6 +1198,26 @@ fn emit_displacement(
                         spatial.geotransform,
                     )?;
                 }
+                if cfg.timeseries_options.temporal_uncertainty.method
+                    == dolphin_core::config::TemporalUncertaintyMethod::CompleteRefitBootstrap
+                {
+                    anyhow::ensure!(
+                        spatial.corrections.los_geometry.is_some(),
+                        "corrected temporal inference requires a completed fixed-cube receipt"
+                    );
+                    let displacement_rasters = (0..days.len())
+                        .map(|date| {
+                            cfg.work_directory
+                                .join(format!("displacement_{date:02}.tif"))
+                        })
+                        .collect::<Vec<_>>();
+                    crate::temporal_covariance_product::write_temporal_covariance_products(
+                        &cfg.work_directory,
+                        &displacement_rasters,
+                        &days,
+                        &cfg.timeseries_options.temporal_uncertainty,
+                    )?;
+                }
                 Ok(())
             }
             DisplacementOutputPolicy::GroundPulse => {
