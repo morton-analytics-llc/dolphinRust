@@ -48,9 +48,10 @@ pub fn temporal_covariance_workspace_composition(
     let vector = f64_vector_bytes(acquisition_count)?;
     let input_bytes = checked_sum(&[matrix, vector])?;
 
-    // Selected covariance/days/observations/diagonal, oracle covariance, and
-    // the retained plug-in covariance coexist through the bootstrap.
-    let retained_fit_bytes = checked_sum(&[matrix, matrix, matrix, vector, vector, vector])?;
+    // Selected covariance/days/observations/diagonal/relative shape, oracle
+    // covariance, and the retained plug-in covariance coexist through bootstrap.
+    let retained_fit_bytes =
+        checked_sum(&[matrix, matrix, matrix, vector, vector, vector, vector])?;
 
     // A retained best candidate coexists with an active candidate. During GLS,
     // the active candidate owns the outer Cholesky plus the inverse routine's

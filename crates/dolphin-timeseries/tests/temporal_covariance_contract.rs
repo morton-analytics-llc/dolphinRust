@@ -3,14 +3,31 @@
 use dolphin_timeseries::{
     complete_refit_bootstrap_estimate, continuous_time_ar1_correlation, fit_temporal_covariance,
     relative_standard_deviation_shape, subset_origin_anchored_covariance,
-    temporal_covariance_provenance, temporal_parameter_boundary_status,
-    total_difference_covariance, CompleteRefitBootstrapCadenceStatus,
-    CompleteRefitBootstrapEstimateStatus, Sha256Digest, TemporalCovarianceApproximation,
-    TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
-    TemporalReferenceProvenance, TemporalValidationScope, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
-    COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
+    temporal_covariance_provenance, temporal_covariance_workspace_composition,
+    temporal_parameter_boundary_status, total_difference_covariance,
+    CompleteRefitBootstrapCadenceStatus, CompleteRefitBootstrapEstimateStatus, Sha256Digest,
+    TemporalCovarianceApproximation, TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs,
+    TemporalInferenceStatus, TemporalReferenceProvenance, TemporalValidationScope,
+    COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS, COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
 };
 use statrs::function::erf::erf;
+
+#[test]
+fn temporal_workspace_retains_relative_shape_through_bootstrap() {
+    let acquisition_count = 13;
+    let matrix_bytes = (acquisition_count * acquisition_count * std::mem::size_of::<f64>()
+        + acquisition_count * std::mem::size_of::<Vec<f64>>()) as u64;
+    let vector_bytes = (acquisition_count * std::mem::size_of::<f64>()) as u64;
+    let composition = temporal_covariance_workspace_composition(
+        acquisition_count,
+        COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
+    )
+    .unwrap();
+    assert_eq!(
+        composition.retained_fit_bytes,
+        3 * matrix_bytes + 4 * vector_bytes
+    );
+}
 
 fn twelve_date_fixture() -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
     direct_factor_fixture(1.0)

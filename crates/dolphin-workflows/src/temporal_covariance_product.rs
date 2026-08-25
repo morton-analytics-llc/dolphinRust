@@ -57,6 +57,8 @@ const COMBINED_WORKING_SET_CAP_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
 const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.json";
 const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
+const TRANSACTION_ARTIFACT_MARKER_SCHEMA: &str = "dolphinrust-temporal-transaction-artifact/1";
+const TRANSACTION_ARTIFACT_MARKER_FILENAME: &str = ".temporal-transaction-owner.json";
 static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -101,10 +103,39 @@ pub struct TemporalCovarianceProductReceipt {
     pub promotion_manifest_sha256: String,
 }
 
+#[derive(Debug)]
 struct TemporalProductTransaction {
     directory: PathBuf,
     ownership_token: String,
     _lock: File,
+}
+
+/// An unowned path collides with a reserved temporal-transaction prefix.
+#[derive(Debug)]
+pub struct TemporalTransactionCollision {
+    /// Preserved collision paths, relative to the product directory.
+    pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for TemporalTransactionCollision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unowned temporal transaction artifacts use reserved names: {}",
+            self.paths.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for TemporalTransactionCollision {}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransactionArtifactMarker {
+    schema: String,
+    ownership_token: String,
+    product_directory_sha256: String,
+    artifact_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,7 +633,7 @@ fn write_product_transaction_with_validator(
         config,
         factor_directory,
     )?;
-    let stage = create_stage_directory(output_directory)?;
+    let stage = create_stage_directory(output_directory, &transaction.ownership_token)?;
     let transaction = (|| {
         let admission = admit_combined_working_set(config, acquisition_days.len())?;
         let gdal_cache = ScopedGdalCacheLimit::acquire(admission.gdal_cache_budget_bytes)?;
@@ -2084,16 +2115,29 @@ fn persist_rollback_journal(
         std::process::id(),
         NEXT_TRANSACTION_FILE_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&scratch, serde_json::to_vec(&journal)?)?;
-    File::open(&scratch)?.sync_all()?;
-    let path = directory.join(ROLLBACK_JOURNAL_FILENAME);
-    if create {
-        install_no_replace(&scratch, &path)
-    } else {
-        std::fs::rename(&scratch, &path)?;
+    let scratch_name = scratch
+        .file_name()
+        .context("temporal journal scratch has no filename")?
+        .to_string_lossy();
+    let marker =
+        write_transaction_artifact_marker(directory, &scratch_name, &journal.ownership_token)?;
+    let persist = (|| {
+        std::fs::write(&scratch, serde_json::to_vec(&journal)?)?;
+        File::open(&scratch)?.sync_all()?;
+        let path = directory.join(ROLLBACK_JOURNAL_FILENAME);
+        if create {
+            install_no_replace(&scratch, &path)
+        } else {
+            std::fs::rename(&scratch, &path)?;
+            File::open(directory)?.sync_all()?;
+            Ok(())
+        }
+    })();
+    if persist.is_ok() {
+        std::fs::remove_file(marker)?;
         File::open(directory)?.sync_all()?;
-        Ok(())
     }
+    persist
 }
 
 fn read_rollback_journal(directory: &Path) -> Result<ProductRollbackJournal> {
@@ -2142,21 +2186,140 @@ fn recover_incomplete_product(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+fn product_directory_sha256(directory: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(directory)?;
+    Ok(sha256(canonical.to_string_lossy().as_bytes()))
+}
+
+fn scratch_marker_path(directory: &Path, artifact_name: &str) -> PathBuf {
+    directory.join(format!("{artifact_name}.owner.json"))
+}
+
+fn write_transaction_artifact_marker(
+    directory: &Path,
+    artifact_name: &str,
+    ownership_token: &str,
+) -> Result<PathBuf> {
+    let path = scratch_marker_path(directory, artifact_name);
+    write_transaction_marker(&path, directory, artifact_name, ownership_token)?;
+    File::open(directory)?.sync_all()?;
+    Ok(path)
+}
+
+fn write_transaction_marker(
+    path: &Path,
+    directory: &Path,
+    artifact_name: &str,
+    ownership_token: &str,
+) -> Result<()> {
+    ensure!(
+        !ownership_token.is_empty()
+            && ownership_token.len() <= 256
+            && Path::new(artifact_name)
+                .file_name()
+                .is_some_and(|name| name == artifact_name),
+        "temporal transaction ownership identity is invalid"
+    );
+    let marker = TransactionArtifactMarker {
+        schema: TRANSACTION_ARTIFACT_MARKER_SCHEMA.to_owned(),
+        ownership_token: ownership_token.to_owned(),
+        product_directory_sha256: product_directory_sha256(directory)?,
+        artifact_name: artifact_name.to_owned(),
+    };
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    std::io::Write::write_all(&mut file, &serde_json::to_vec(&marker)?)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn transaction_marker_is_owned(
+    path: &Path,
+    directory: &Path,
+    artifact_name: &str,
+    expected_ownership_token: Option<&str>,
+) -> Result<bool> {
+    let bytes = match read_bounded(path, 64 * 1024) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    let marker: TransactionArtifactMarker = match serde_json::from_slice(&bytes) {
+        Ok(marker) => marker,
+        Err(_) => return Ok(false),
+    };
+    Ok(marker.schema == TRANSACTION_ARTIFACT_MARKER_SCHEMA
+        && !marker.ownership_token.is_empty()
+        && marker.ownership_token.len() <= 256
+        && expected_ownership_token.is_none_or(|token| marker.ownership_token == token)
+        && marker.product_directory_sha256 == product_directory_sha256(directory)?
+        && marker.artifact_name == artifact_name)
+}
+
+fn is_reserved_transaction_artifact(name: &str) -> bool {
+    name.starts_with(".temporal-inference-stage-")
+        || name.starts_with(".temporal-product-journal-")
+        || name.starts_with(".fixed-cube-receipt-rollback-")
+}
+
 fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
+    let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut owned = Vec::new();
+    let mut collisions = Vec::new();
+    for entry in &entries {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() && name.starts_with(".temporal-inference-stage-") {
-            std::fs::remove_dir_all(entry.path())?;
-        } else if file_type.is_file()
-            && (name.starts_with(".temporal-product-journal-")
-                || name.starts_with(".fixed-cube-receipt-rollback-"))
+        if !is_reserved_transaction_artifact(name) || name.ends_with(".owner.json") {
+            continue;
+        }
+        let marker =
+            if entry.file_type()?.is_dir() && name.starts_with(".temporal-inference-stage-") {
+                entry.path().join(TRANSACTION_ARTIFACT_MARKER_FILENAME)
+            } else if entry.file_type()?.is_file() {
+                scratch_marker_path(directory, name)
+            } else {
+                collisions.push(name.to_owned());
+                continue;
+            };
+        if marker.exists() && transaction_marker_is_owned(&marker, directory, name, None)? {
+            owned.push((entry.path(), marker));
+        } else {
+            collisions.push(name.to_owned());
+        }
+    }
+    for entry in &entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(artifact_name) = name.strip_suffix(".owner.json") else {
+            continue;
+        };
+        if !is_reserved_transaction_artifact(artifact_name)
+            || directory.join(artifact_name).exists()
         {
-            std::fs::remove_file(entry.path())?;
+            continue;
+        }
+        if transaction_marker_is_owned(&entry.path(), directory, artifact_name, None)? {
+            owned.push((directory.join(artifact_name), entry.path()));
+        } else {
+            collisions.push(name.to_owned());
+        }
+    }
+    if !collisions.is_empty() {
+        collisions.sort();
+        collisions.dedup();
+        return Err(TemporalTransactionCollision { paths: collisions }.into());
+    }
+    for (artifact, marker) in owned {
+        if artifact.is_dir() {
+            std::fs::remove_dir_all(&artifact)?;
+        } else if artifact.exists() {
+            std::fs::remove_file(&artifact)?;
+        }
+        if marker.exists() {
+            std::fs::remove_file(marker)?;
         }
     }
     File::open(directory)?.sync_all()?;
@@ -2187,10 +2350,26 @@ fn rollback_incomplete_product_with_journal(
             }
         }
     }
-    restore_fixed_cube_receipt(directory, &journal.original_fixed_cube_receipt)?;
+    restore_fixed_cube_receipt(
+        directory,
+        &journal.original_fixed_cube_receipt,
+        &journal.ownership_token,
+    )?;
     let stage = directory.join(&journal.stage_directory);
     if stage.is_dir() {
-        std::fs::remove_dir_all(stage)?;
+        let marker = stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+        if marker.exists()
+            && transaction_marker_is_owned(
+                &marker,
+                directory,
+                &journal.stage_directory,
+                Some(&journal.ownership_token),
+            )?
+        {
+            std::fs::remove_dir_all(stage)?;
+        } else {
+            collisions.push(journal.stage_directory.clone());
+        }
     }
     File::open(directory)?.sync_all()?;
     if !collisions.is_empty() {
@@ -2382,13 +2561,22 @@ fn validate_no_existing_products(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn restore_fixed_cube_receipt(directory: &Path, receipt: &[u8]) -> Result<()> {
+fn restore_fixed_cube_receipt(
+    directory: &Path,
+    receipt: &[u8],
+    ownership_token: &str,
+) -> Result<()> {
     static NEXT_ROLLBACK_ID: AtomicU64 = AtomicU64::new(0);
     let scratch = directory.join(format!(
         ".fixed-cube-receipt-rollback-{}-{}",
         std::process::id(),
         NEXT_ROLLBACK_ID.fetch_add(1, Ordering::Relaxed)
     ));
+    let scratch_name = scratch
+        .file_name()
+        .context("fixed-cube rollback scratch has no filename")?
+        .to_string_lossy();
+    let marker = write_transaction_artifact_marker(directory, &scratch_name, ownership_token)?;
     let restore = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2403,10 +2591,14 @@ fn restore_fixed_cube_receipt(directory: &Path, receipt: &[u8]) -> Result<()> {
     if restore.is_err() {
         let _ = std::fs::remove_file(&scratch);
     }
+    if restore.is_ok() {
+        std::fs::remove_file(marker)?;
+        File::open(directory)?.sync_all()?;
+    }
     restore
 }
 
-fn create_stage_directory(directory: &Path) -> Result<PathBuf> {
+fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<PathBuf> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let stage = directory.join(format!(
         ".temporal-inference-stage-{}-{}",
@@ -2414,7 +2606,25 @@ fn create_stage_directory(directory: &Path) -> Result<PathBuf> {
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&stage)?;
-    Ok(stage)
+    let initialize = (|| {
+        let stage_name = stage
+            .file_name()
+            .context("temporal product stage has no filename")?
+            .to_string_lossy();
+        write_transaction_marker(
+            &stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
+            directory,
+            &stage_name,
+            ownership_token,
+        )?;
+        File::open(&stage)?.sync_all()?;
+        File::open(directory)?.sync_all()?;
+        Ok(stage.clone())
+    })();
+    if initialize.is_err() {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    initialize
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -2617,22 +2827,111 @@ mod tests {
     }
 
     #[test]
-    fn startup_removes_prejournal_orphan_stages() {
+    fn startup_preserves_unowned_prefix_collisions_and_cleans_owned_stages() {
         let directory = std::env::temp_dir().join(format!(
             "dolphin_temporal_orphan_stage_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir(&directory).unwrap();
-        let orphan = directory.join(".temporal-inference-stage-orphan");
-        std::fs::create_dir(&orphan).unwrap();
-        std::fs::write(orphan.join("partial.tif"), b"partial").unwrap();
-        let scratch = directory.join(".temporal-product-journal-orphan");
-        std::fs::write(&scratch, b"partial journal").unwrap();
+        let collision = directory.join(".temporal-inference-stage-foreign");
+        std::fs::create_dir(&collision).unwrap();
+        std::fs::write(collision.join("user-data"), b"preserve").unwrap();
+        let scratch_collision = directory.join(".temporal-product-journal-foreign");
+        std::fs::write(&scratch_collision, b"preserve scratch").unwrap();
+        let error = TemporalProductTransaction::acquire(&directory).unwrap_err();
+        let collision_error = error
+            .downcast_ref::<super::TemporalTransactionCollision>()
+            .unwrap();
+        assert_eq!(
+            collision_error.paths,
+            vec![
+                ".temporal-inference-stage-foreign",
+                ".temporal-product-journal-foreign"
+            ]
+        );
+        assert_eq!(
+            std::fs::read(collision.join("user-data")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(
+            std::fs::read(&scratch_collision).unwrap(),
+            b"preserve scratch"
+        );
+
+        std::fs::remove_dir_all(&collision).unwrap();
+        std::fs::remove_file(&scratch_collision).unwrap();
+        let owned = super::create_stage_directory(&directory, &"53".repeat(32)).unwrap();
+        std::fs::write(owned.join("partial.tif"), b"partial").unwrap();
+        let owned_scratch_name = ".temporal-product-journal-owned";
+        let owned_scratch = directory.join(owned_scratch_name);
+        super::write_transaction_artifact_marker(&directory, owned_scratch_name, &"54".repeat(32))
+            .unwrap();
+        std::fs::write(&owned_scratch, b"partial journal").unwrap();
         let transaction = TemporalProductTransaction::acquire(&directory).unwrap();
-        assert!(!orphan.exists());
-        assert!(!scratch.exists());
+        assert!(!owned.exists());
+        assert!(!owned_scratch.exists());
+        assert!(!super::scratch_marker_path(&directory, owned_scratch_name).exists());
         drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_preserves_a_replaced_unowned_stage() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_replaced_stage_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("fixed_cube_receipt.json"), b"changed").unwrap();
+        let stage_name = ".temporal-inference-stage-replaced";
+        let stage = directory.join(stage_name);
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("user-data"), b"preserve").unwrap();
+        let journal = super::ProductRollbackJournal {
+            schema: super::ROLLBACK_JOURNAL_SCHEMA.to_owned(),
+            ownership_token: "owner-token".to_owned(),
+            original_fixed_cube_receipt: b"original".to_vec(),
+            legacy_velocity_sha256: String::new(),
+            legacy_sigma_sha256: None,
+            promotion_manifest_sha256: String::new(),
+            semantic_validation: crate::fixed_cube::FixedCubeSemanticValidation {
+                observed_valid_pixels: 0,
+                maximum_los_norm_error: 0.0,
+                minimum_los_up: 1.0,
+                los_sign_convention: String::new(),
+                geometry_source: String::new(),
+                geometry_provenance_status: String::new(),
+            },
+            product_grid: super::ProductGridReceipt {
+                rows: 1,
+                cols: 1,
+                geotransform: [0.0; 6],
+                epsg: None,
+            },
+            expected_products: PRODUCT_LAYERS
+                .iter()
+                .map(|(name, _)| super::OwnedArtifactReceipt {
+                    name: (*name).to_owned(),
+                    sha256: "00".repeat(32),
+                })
+                .collect(),
+            installed_artifacts: Vec::new(),
+            stage_directory: stage_name.to_owned(),
+            expected_provenance_sha256: None,
+            expected_fixed_receipt_sha256: None,
+            rollback_state: super::ProductRollbackState::Active,
+            collision_artifacts: Vec::new(),
+        };
+        assert!(super::rollback_incomplete_product_with_journal(&directory, &journal).is_err());
+        assert_eq!(std::fs::read(stage.join("user-data")).unwrap(), b"preserve");
+        assert_eq!(
+            super::read_rollback_journal(&directory)
+                .unwrap()
+                .collision_artifacts,
+            vec![stage_name]
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2755,7 +3054,15 @@ mod tests {
             )
             .unwrap();
             let stage_name = format!(".temporal-inference-stage-prefix-{prefix}");
-            std::fs::create_dir(directory.join(&stage_name)).unwrap();
+            let stage = directory.join(&stage_name);
+            std::fs::create_dir(&stage).unwrap();
+            super::write_transaction_marker(
+                &stage.join(super::TRANSACTION_ARTIFACT_MARKER_FILENAME),
+                &directory,
+                &stage_name,
+                token,
+            )
+            .unwrap();
             let cog_count = prefix.min(PRODUCT_LAYERS.len());
             for artifact in expected.iter().take(cog_count) {
                 std::fs::copy(source.join(&artifact.name), directory.join(&artifact.name)).unwrap();
