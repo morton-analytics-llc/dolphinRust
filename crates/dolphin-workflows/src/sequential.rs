@@ -19,9 +19,19 @@
 //! phase-linking-stage half of NRT; the non-causal downstream (ifg network →
 //! unwrap → timeseries → velocity) recomputes from the updated phase history.
 
+use std::collections::BTreeMap;
+
 use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_io::CovarianceOperatorBlock;
+use dolphin_io::covariance::{
+    covariance_operator_block_sha256, CovarianceGenerationBlockIdentity,
+    CovarianceGenerationIdentity, CovarianceGenerationRegistry,
+    COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+};
+use dolphin_io::{
+    CovarianceOperatorBlock, CovarianceOperatorBlockReader, CovarianceOperatorPlan,
+    CovarianceOperatorWriter,
+};
 use dolphin_phaselink::{
     compress, compress_with_replay, AverageCoherenceAggregate, CompressionReplayGrid,
     ComputeEngine, FusedParams, PhaseReplayGrid, ResolvedBackend,
@@ -29,11 +39,12 @@ use dolphin_phaselink::{
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView2, ArrayView3, Axis};
+use sha2::{Digest, Sha256};
 
 pub use crate::sequential_covariance::SequentialCovarianceCaptureRequest;
 use crate::sequential_covariance::{
-    build_covariance_operator_block, ReplayBackend, ReplayExecutionScope, SequentialReplayError,
-    SequentialReplayTopology,
+    build_covariance_operator_block, sequential_replay_kernel_digest, ReplayBackend,
+    ReplayExecutionScope, SequentialReplayError, SequentialReplayTopology,
 };
 
 /// Configuration for a sequential phase-linking run.
@@ -129,6 +140,105 @@ pub struct SequentialState {
     open_real_slcs: Array3<Cf64>,
 }
 
+/// Immutable source revision supplied to one resumable covariance capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequentialCovarianceRevision {
+    /// Complete ordered source-manifest digest for the artifact revision.
+    pub full_source_manifest_digest: [u8; 32],
+    /// Prior complete revision digest; absent only for initial capture.
+    pub prior_full_source_manifest_digest: Option<[u8; 32]>,
+    /// Exact ordered member digest for each generation in the complete plan.
+    pub generation_source_manifest_digests: Vec<[u8; 32]>,
+    /// Exact numeric source-model/configuration receipt.
+    pub source_model_receipt_digest: [u8; 32],
+}
+
+/// Header-only NRT operator plan used to create a streaming writer before capture.
+#[derive(Debug, Clone)]
+pub struct SequentialCovarianceCapturePlan {
+    operator_plan: CovarianceOperatorPlan,
+    generation_registry: CovarianceGenerationRegistry,
+}
+
+impl SequentialCovarianceCapturePlan {
+    /// Complete operator plan for writer creation.
+    #[must_use]
+    pub const fn operator_plan(&self) -> &CovarianceOperatorPlan {
+        &self.operator_plan
+    }
+
+    /// Provisional all-open registry; the writer records block hashes during capture.
+    #[must_use]
+    pub const fn generation_registry(&self) -> &CovarianceGenerationRegistry {
+        &self.generation_registry
+    }
+}
+
+/// Resumable sequential output plus exact covariance-generation continuity.
+#[derive(Clone)]
+pub struct SequentialCovarianceState {
+    sequential: SequentialState,
+    normalized_config_digest: [u8; 32],
+    kernel_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    source_model_receipt_digest: [u8; 32],
+    mask_digest: [u8; 32],
+    full_source_manifest_digest: [u8; 32],
+    operator_plan: CovarianceOperatorPlan,
+    generation_registry: CovarianceGenerationRegistry,
+}
+
+impl SequentialCovarianceState {
+    /// Complete writer plan for this artifact revision.
+    #[must_use]
+    pub const fn operator_plan(&self) -> &CovarianceOperatorPlan {
+        &self.operator_plan
+    }
+
+    /// Sealed-prefix/open-tail generation identities for this revision.
+    #[must_use]
+    pub const fn generation_registry(&self) -> &CovarianceGenerationRegistry {
+        &self.generation_registry
+    }
+
+    /// Complete immutable source revision digest.
+    #[must_use]
+    pub const fn full_source_manifest_digest(&self) -> [u8; 32] {
+        self.full_source_manifest_digest
+    }
+
+    /// Raw real acquisitions retained for recapturing the open tail.
+    #[must_use]
+    pub fn open_real_slcs(&self) -> ArrayView3<'_, Cf64> {
+        self.sequential.open_real_slcs.view()
+    }
+
+    /// Seal complete generations in a writer after every planned block was streamed.
+    ///
+    /// # Errors
+    /// Returns when a planned generation is missing/incomplete or the writer's
+    /// recorded registry differs from this completed state.
+    pub fn seal_writer_generations(
+        &self,
+        writer: &mut CovarianceOperatorWriter,
+    ) -> Result<(), SequentialReplayError> {
+        for identity in self
+            .generation_registry
+            .generations
+            .iter()
+            .filter(|identity| identity.sealed)
+        {
+            writer.seal_generation(&identity.burst_id, identity.generation)?;
+        }
+        if writer.generation_registry() != Some(&self.generation_registry) {
+            return Err(SequentialReplayError::Invalid(
+                "completed covariance state differs from the streaming writer",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Per-ministack products accumulated by [`drive`] over a (sub)sequence.
 struct Drive {
     compressed: Vec<Array2<Cf64>>,
@@ -197,7 +307,7 @@ fn drive_with_covariance_capture<F>(
     emit: &mut F,
 ) -> Result<Drive, SequentialReplayError>
 where
-    F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
 {
     let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
     let mut out = Drive {
@@ -244,7 +354,7 @@ where
                 None,
             ),
         }?;
-        emit(block).map_err(SequentialReplayError::Execution)?;
+        emit(block)?;
 
         let result = captured.result;
         out.phases.push(
@@ -508,6 +618,7 @@ where
         .transpose()
         .map_err(SequentialReplayError::Execution)?
         .flatten();
+    let mut adapted_emit = |block| emit(block).map_err(SequentialReplayError::Execution);
     let d = drive_with_covariance_capture(
         &plans,
         slc_stack,
@@ -519,7 +630,7 @@ where
         &topology,
         request,
         source_resolver,
-        &mut emit,
+        &mut adapted_emit,
     )?;
     build_output(
         &d.phases,
@@ -531,6 +642,973 @@ where
         looked_validity(valid_mask, (rows, cols), cfg.strides),
     )
     .map_err(SequentialReplayError::Execution)
+}
+
+/// Plan an unmasked generation-namespaced writer before numeric capture.
+///
+/// # Errors
+/// Returns for invalid scope, revision identity, grids, or generation receipts.
+pub fn plan_sequential_covariance_capture(
+    num_real_dates: usize,
+    native_shape: (usize, usize),
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
+    let validity = Array2::from_elem(native_shape, true);
+    plan_sequential_covariance_capture_impl(
+        num_real_dates,
+        validity.view(),
+        cfg,
+        engine,
+        request,
+        revision,
+        false,
+    )
+}
+
+/// Plan a masked generation-namespaced writer before numeric capture.
+///
+/// # Errors
+/// Returns for invalid scope, revision identity, grids, mask, or generation receipts.
+pub fn plan_sequential_masked_covariance_capture(
+    num_real_dates: usize,
+    native_validity: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
+    plan_sequential_covariance_capture_impl(
+        num_real_dates,
+        native_validity,
+        cfg,
+        engine,
+        request,
+        revision,
+        true,
+    )
+}
+
+/// Plan the identity-checked destination writer for one NRT covariance update.
+///
+/// Sealed parent generations retain their exact block digests. The prior open
+/// tail and new acquisitions remain provisional until the update writes them.
+///
+/// # Errors
+/// Returns before writer creation for identity drift, an empty extension, or
+/// invalid complete-plan generation receipts.
+pub fn plan_sequential_covariance_update(
+    state: &SequentialCovarianceState,
+    new_real_dates: usize,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
+    if new_real_dates == 0
+        || revision.prior_full_source_manifest_digest != Some(state.full_source_manifest_digest)
+        || state.normalized_config_digest
+            != crate::sequential_covariance::sequential_replay_config_digest(cfg)
+        || state.kernel_digest != sequential_replay_kernel_digest()
+        || state.source_model_version_digest != request.source_model_version_digest
+        || state.source_model_receipt_digest != revision.source_model_receipt_digest
+    {
+        return Err(SequentialReplayError::Invalid(
+            "covariance update plan differs from the prior state",
+        ));
+    }
+    let (_, rows, cols) = state.sequential.open_real_slcs.dim();
+    let validity = state
+        .sequential
+        .native_validity
+        .clone()
+        .unwrap_or_else(|| Array2::from_elem((rows, cols), true));
+    if state.mask_digest
+        != sequential_covariance_mask_digest(
+            state
+                .sequential
+                .native_validity
+                .as_ref()
+                .map(|mask| mask.view()),
+            validity.view(),
+        )
+    {
+        return Err(SequentialReplayError::Invalid(
+            "covariance update plan mask differs from the prior state",
+        ));
+    }
+    let total_dates = state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+        .map(|identity| identity.source_date_indices.len())
+        .sum::<usize>()
+        .checked_add(state.sequential.open_real_slcs.dim().0)
+        .and_then(|count| count.checked_add(new_real_dates))
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance update date count overflows usize",
+        ))?;
+    let mut plan = plan_sequential_covariance_capture_impl(
+        total_dates,
+        validity.view(),
+        cfg,
+        engine,
+        request,
+        revision,
+        state.sequential.native_validity.is_some(),
+    )?;
+    for sealed in state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+    {
+        let planned = plan
+            .generation_registry
+            .generations
+            .get_mut(sealed.generation as usize)
+            .ok_or(SequentialReplayError::Invalid(
+                "covariance update plan omits a sealed generation",
+            ))?;
+        let mut expected = planned.clone();
+        expected.blocks = sealed.blocks.clone();
+        expected.sealed = true;
+        if expected != *sealed {
+            return Err(SequentialReplayError::Invalid(
+                "covariance update plan changes a sealed generation",
+            ));
+        }
+        *planned = sealed.clone();
+    }
+    Ok(plan)
+}
+
+fn plan_sequential_covariance_capture_impl(
+    num_real_dates: usize,
+    native_validity: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    configured_mask: bool,
+) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
+    if revision.full_source_manifest_digest != request.source_manifest_digest
+        || revision
+            .source_model_receipt_digest
+            .iter()
+            .all(|byte| *byte == 0)
+    {
+        return Err(SequentialReplayError::Invalid(
+            "covariance revision identity is invalid",
+        ));
+    }
+    let native_shape = native_validity.dim();
+    let plans = planner_for(num_real_dates, cfg)
+        .and_then(|planner| planner.plan(cfg.ministack_size))
+        .map_err(SequentialReplayError::Execution)?;
+    if plans.len() != revision.generation_source_manifest_digests.len() {
+        return Err(SequentialReplayError::Invalid(
+            "covariance generation receipts differ from the complete plan",
+        ));
+    }
+    let output_shape = cfg.strides.out_shape(native_shape);
+    let output_area = checked_output_area(output_shape)?;
+    let backend = match plans
+        .iter()
+        .any(|plan| engine.resolved(output_area, plan.size()) == ResolvedBackend::Gpu)
+    {
+        true => ReplayBackend::Gpu,
+        false => ReplayBackend::CpuF64,
+    };
+    let topology = SequentialReplayTopology::plan_identified_generations(
+        num_real_dates,
+        native_shape,
+        output_shape,
+        support_slot_count(cfg)?,
+        native_validity,
+        cfg,
+        ReplayExecutionScope {
+            enabled: true,
+            backend,
+            estimator_fallback: false,
+            phase_bias_correction: false,
+            strong_source_identity: true,
+            stitched_burst_count: 1,
+        },
+        request.namespace_for(native_shape, output_shape, cfg.strides)?,
+        revision.generation_source_manifest_digests.clone(),
+    )?;
+    Ok(SequentialCovarianceCapturePlan {
+        operator_plan: topology.covariance_operator_plan(&request.burst_id)?,
+        generation_registry: provisional_covariance_generation_registry(
+            &topology,
+            request,
+            revision,
+            sequential_covariance_mask_digest(
+                configured_mask.then_some(native_validity),
+                native_validity,
+            ),
+        )?,
+    })
+}
+
+/// Run an initial unmasked sequential capture and retain exact NRT covariance state.
+///
+/// # Errors
+/// Returns before emission when the revision, generation receipts, or replay
+/// identity do not match the complete ministack plan.
+pub fn run_sequential_resumable_with_covariance_capture<F>(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack, None, cfg, engine, request, revision, None, emit,
+    )
+}
+
+/// Run an initial unmasked resumable capture with exact primitive source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sequential_resumable_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack,
+        None,
+        cfg,
+        engine,
+        request,
+        revision,
+        Some(source_resolver),
+        emit,
+    )
+}
+
+/// Run an initial masked sequential capture and retain exact NRT covariance state.
+///
+/// # Errors
+/// Returns before emission when the mask, revision, generation receipts, or
+/// replay identity do not match the complete ministack plan.
+pub fn run_sequential_resumable_masked_with_covariance_capture<F>(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        None,
+        emit,
+    )
+}
+
+/// Run an initial masked resumable capture with exact primitive source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sequential_resumable_masked_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        Some(source_resolver),
+        emit,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_sequential_resumable_with_covariance_capture_impl<F>(
+    slc_stack: ArrayView3<Cf64>,
+    native_validity: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
+    mut emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    if revision.prior_full_source_manifest_digest.is_some()
+        || revision.full_source_manifest_digest != request.source_manifest_digest
+        || revision
+            .source_model_receipt_digest
+            .iter()
+            .all(|byte| *byte == 0)
+    {
+        return Err(SequentialReplayError::Invalid(
+            "initial covariance revision identity is invalid",
+        ));
+    }
+    let (_, rows, cols) = slc_stack.dim();
+    let fixed_validity = match native_validity {
+        Some(mask) if mask.dim() == (rows, cols) => mask.to_owned(),
+        Some(_) => {
+            return Err(SequentialReplayError::Invalid(
+                "layover/shadow mask grid differs from the SLC stack",
+            ))
+        }
+        None => Array2::from_elem((rows, cols), true),
+    };
+    let planner = planner_for(slc_stack.dim().0, cfg).map_err(SequentialReplayError::Execution)?;
+    let plans = planner
+        .plan(cfg.ministack_size)
+        .map_err(SequentialReplayError::Execution)?;
+    if revision.generation_source_manifest_digests.len() != plans.len() {
+        return Err(SequentialReplayError::Invalid(
+            "covariance generation receipts differ from the complete plan",
+        ));
+    }
+    let output_shape = cfg.strides.out_shape((rows, cols));
+    let output_area = checked_output_area(output_shape)?;
+    let backend = match plans
+        .iter()
+        .any(|plan| engine.resolved(output_area, plan.size()) == ResolvedBackend::Gpu)
+    {
+        true => ReplayBackend::Gpu,
+        false => ReplayBackend::CpuF64,
+    };
+    let scope = ReplayExecutionScope {
+        enabled: true,
+        backend,
+        estimator_fallback: false,
+        phase_bias_correction: false,
+        strong_source_identity: true,
+        stitched_burst_count: 1,
+    };
+    let namespace = request.namespace_for((rows, cols), output_shape, cfg.strides)?;
+    let topology = SequentialReplayTopology::plan_identified_generations(
+        slc_stack.dim().0,
+        (rows, cols),
+        output_shape,
+        support_slot_count(cfg)?,
+        fixed_validity.view(),
+        cfg,
+        scope,
+        namespace,
+        revision.generation_source_manifest_digests.clone(),
+    )?;
+    let valid_mask = native_validity
+        .map(|mask| nontrivial_mask(mask, (rows, cols)))
+        .transpose()
+        .map_err(SequentialReplayError::Execution)?
+        .flatten();
+    let mut block_digests = BTreeMap::new();
+    let mut capture = |block: CovarianceOperatorBlock| {
+        block_digests.insert(block.block_id, covariance_operator_block_sha256(&block));
+        emit(block)
+    };
+    let drive = drive_with_covariance_capture(
+        &plans,
+        slc_stack,
+        &[],
+        valid_mask,
+        fixed_validity.view(),
+        cfg,
+        engine,
+        &topology,
+        request,
+        source_resolver,
+        &mut capture,
+    )?;
+    let output = build_output(
+        &drive.phases,
+        drive.compressed.clone(),
+        &drive.temp_coh,
+        &drive.average_coherence,
+        drive.crlb.clone(),
+        drive.closure.clone(),
+        looked_validity(valid_mask, (rows, cols), cfg.strides),
+    )
+    .map_err(SequentialReplayError::Execution)?;
+    let mask_digest = sequential_covariance_mask_digest(native_validity, fixed_validity.view());
+    let generation_registry = build_covariance_generation_registry(
+        &topology,
+        cfg,
+        request,
+        revision,
+        mask_digest,
+        &block_digests,
+    )?;
+    let operator_plan = topology.covariance_operator_plan(&request.burst_id)?;
+    let sequential = seal_state(
+        &plans,
+        slc_stack,
+        cfg.ministack_size,
+        native_validity,
+        drive,
+    );
+    Ok((
+        output,
+        SequentialCovarianceState {
+            sequential,
+            normalized_config_digest: topology.normalized_config_digest(),
+            kernel_digest: sequential_replay_kernel_digest(),
+            source_model_version_digest: request.source_model_version_digest,
+            source_model_receipt_digest: revision.source_model_receipt_digest,
+            mask_digest,
+            full_source_manifest_digest: revision.full_source_manifest_digest,
+            operator_plan,
+            generation_registry,
+        },
+    ))
+}
+
+/// Extend unmasked covariance state into an identity-checked destination artifact.
+///
+/// Parent validation completes under `sealed_block_byte_cap` before any sealed
+/// block is copied or the open tail is recaptured.
+///
+/// # Errors
+/// Returns on any revision/config/kernel/model/mask/parent drift, insufficient
+/// cap, invalid extension, capture failure, or destination-writer failure.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_with_covariance_capture(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    destination: &mut CovarianceOperatorWriter,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        None,
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        None,
+        destination,
+    )
+}
+
+/// Extend unmasked covariance state with exact source factors for the recaptured tail.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_with_covariance_capture_and_source_factors(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    destination: &mut CovarianceOperatorWriter,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        None,
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        Some(source_resolver),
+        destination,
+    )
+}
+
+/// Extend masked covariance state with the exact prior native validity.
+///
+/// # Errors
+/// Returns on any revision/config/kernel/model/mask/parent drift, insufficient
+/// cap, invalid extension, capture failure, or destination-writer failure.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_masked_with_covariance_capture(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    destination: &mut CovarianceOperatorWriter,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        None,
+        destination,
+    )
+}
+
+/// Extend masked covariance state with exact source factors for the recaptured tail.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_masked_with_covariance_capture_and_source_factors(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    destination: &mut CovarianceOperatorWriter,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        Some(source_resolver),
+        destination,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn update_sequential_with_covariance_capture_impl(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    native_validity: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
+    destination: &mut CovarianceOperatorWriter,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    let (n_open, rows, cols) = state.sequential.open_real_slcs.dim();
+    let (n_new, nrows, ncols) = new_slcs.dim();
+    if n_new == 0 || (nrows, ncols) != (rows, cols) {
+        return Err(SequentialReplayError::Invalid(
+            "covariance update requires new acquisitions on the prior grid",
+        ));
+    }
+    let fixed_validity = match (&state.sequential.native_validity, native_validity) {
+        (None, None) => Array2::from_elem((rows, cols), true),
+        (Some(expected), Some(actual))
+            if actual.dim() == (rows, cols) && expected.view() == actual =>
+        {
+            expected.clone()
+        }
+        _ => {
+            return Err(SequentialReplayError::Invalid(
+                "covariance update native validity differs from the prior state",
+            ))
+        }
+    };
+    let mask_digest = sequential_covariance_mask_digest(native_validity, fixed_validity.view());
+    if state.normalized_config_digest
+        != crate::sequential_covariance::sequential_replay_config_digest(cfg)
+        || state.kernel_digest != sequential_replay_kernel_digest()
+        || state.source_model_version_digest != request.source_model_version_digest
+        || state.source_model_receipt_digest != revision.source_model_receipt_digest
+        || state.mask_digest != mask_digest
+        || revision.prior_full_source_manifest_digest != Some(state.full_source_manifest_digest)
+        || revision.full_source_manifest_digest != request.source_manifest_digest
+        || parent.generation_registry() != Some(&state.generation_registry)
+    {
+        return Err(SequentialReplayError::Invalid(
+            "covariance update identity differs from the prior state",
+        ));
+    }
+    let destination_plan =
+        plan_sequential_covariance_update(state, n_new, cfg, engine, request, revision)?;
+    destination.validate_empty_nrt_destination(
+        destination_plan.operator_plan(),
+        destination_plan.generation_registry(),
+    )?;
+    let num_sealed = state.sequential.sealed_compressed.len();
+    let tail_plans = planner_for(n_open + n_new, cfg)
+        .and_then(|planner| planner.plan_with_offset(cfg.ministack_size, num_sealed))
+        .map_err(SequentialReplayError::Execution)?;
+    let total_dates = state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+        .map(|identity| identity.source_date_indices.len())
+        .sum::<usize>()
+        .checked_add(n_open + n_new)
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance update date count overflows usize",
+        ))?;
+    let full_plans = planner_for(total_dates, cfg)
+        .and_then(|planner| planner.plan(cfg.ministack_size))
+        .map_err(SequentialReplayError::Execution)?;
+    if revision.generation_source_manifest_digests.len() != full_plans.len() {
+        return Err(SequentialReplayError::Invalid(
+            "covariance generation receipts differ from the extended plan",
+        ));
+    }
+    if state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+        .count()
+        != num_sealed
+    {
+        return Err(SequentialReplayError::Invalid(
+            "covariance sealed registry differs from sequential state",
+        ));
+    }
+    for identity in state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+    {
+        if revision
+            .generation_source_manifest_digests
+            .get(identity.generation as usize)
+            != Some(&identity.source_member_manifest_digest)
+        {
+            return Err(SequentialReplayError::Invalid(
+                "covariance extension changes a sealed generation",
+            ));
+        }
+    }
+
+    parent.validate_sealed_blocks(sealed_block_byte_cap)?;
+    for identity in state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+    {
+        for block in &identity.blocks {
+            destination.copy_validated_sealed_block(
+                parent,
+                block.block_id,
+                sealed_block_byte_cap,
+            )?;
+        }
+    }
+
+    let tail = Array3::from_shape_fn((n_open + n_new, rows, cols), |(date, row, col)| {
+        match date < n_open {
+            true => state.sequential.open_real_slcs[(date, row, col)],
+            false => new_slcs[(date - n_open, row, col)],
+        }
+    });
+    let output_shape = cfg.strides.out_shape((rows, cols));
+    let output_area = checked_output_area(output_shape)?;
+    let backend = match tail_plans
+        .iter()
+        .any(|plan| engine.resolved(output_area, plan.size()) == ResolvedBackend::Gpu)
+    {
+        true => ReplayBackend::Gpu,
+        false => ReplayBackend::CpuF64,
+    };
+    let scope = ReplayExecutionScope {
+        enabled: true,
+        backend,
+        estimator_fallback: false,
+        phase_bias_correction: false,
+        strong_source_identity: true,
+        stitched_burst_count: 1,
+    };
+    let namespace = request.namespace_for((rows, cols), output_shape, cfg.strides)?;
+    let topology = SequentialReplayTopology::plan_identified_generations(
+        total_dates,
+        (rows, cols),
+        output_shape,
+        support_slot_count(cfg)?,
+        fixed_validity.view(),
+        cfg,
+        scope,
+        namespace,
+        revision.generation_source_manifest_digests.clone(),
+    )?;
+    let valid_mask = native_validity
+        .map(|mask| nontrivial_mask(mask, (rows, cols)))
+        .transpose()
+        .map_err(SequentialReplayError::Execution)?
+        .flatten();
+    let mut block_digests = state
+        .generation_registry
+        .generations
+        .iter()
+        .filter(|identity| identity.sealed)
+        .flat_map(|identity| {
+            identity
+                .blocks
+                .iter()
+                .map(|block| (block.block_id, block.block_sha256))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut capture = |block: CovarianceOperatorBlock| {
+        block_digests.insert(block.block_id, covariance_operator_block_sha256(&block));
+        destination
+            .write_block(&block)
+            .map_err(SequentialReplayError::Io)
+    };
+    let drive = drive_with_covariance_capture(
+        &tail_plans,
+        tail.view(),
+        &state.sequential.sealed_compressed,
+        valid_mask,
+        fixed_validity.view(),
+        cfg,
+        engine,
+        &topology,
+        request,
+        source_resolver,
+        &mut capture,
+    )?;
+    let phases = chain(&state.sequential.sealed_phases, &drive.phases);
+    let temp_coh = chain(&state.sequential.sealed_temp_coh, &drive.temp_coh);
+    let average_coherence = chain(
+        &state.sequential.sealed_average_coherence,
+        &drive.average_coherence,
+    );
+    let compressed = chain(&state.sequential.sealed_compressed, &drive.compressed);
+    let crlb = chain(&state.sequential.sealed_crlb, &drive.crlb);
+    let closure = chain(&state.sequential.sealed_closure, &drive.closure);
+    let output = build_output(
+        &phases,
+        compressed,
+        &temp_coh,
+        &average_coherence,
+        crlb,
+        closure,
+        looked_validity(valid_mask, (rows, cols), cfg.strides),
+    )
+    .map_err(SequentialReplayError::Execution)?;
+    let generation_registry = build_covariance_generation_registry(
+        &topology,
+        cfg,
+        request,
+        revision,
+        mask_digest,
+        &block_digests,
+    )?;
+    let operator_plan = topology.covariance_operator_plan(&request.burst_id)?;
+    let sequential = seal_state(
+        &tail_plans,
+        tail.view(),
+        cfg.ministack_size,
+        native_validity,
+        drive,
+    )
+    .with_sealed_prefix(&state.sequential);
+    let state = SequentialCovarianceState {
+        sequential,
+        normalized_config_digest: topology.normalized_config_digest(),
+        kernel_digest: sequential_replay_kernel_digest(),
+        source_model_version_digest: request.source_model_version_digest,
+        source_model_receipt_digest: revision.source_model_receipt_digest,
+        mask_digest,
+        full_source_manifest_digest: revision.full_source_manifest_digest,
+        operator_plan,
+        generation_registry,
+    };
+    state.seal_writer_generations(destination)?;
+    Ok((output, state))
+}
+
+fn checked_output_area(shape: (usize, usize)) -> Result<usize, SequentialReplayError> {
+    shape
+        .0
+        .checked_mul(shape.1)
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance capture output area overflows usize",
+        ))
+}
+
+fn support_slot_count(cfg: &SequentialConfig) -> Result<usize, SequentialReplayError> {
+    cfg.half_window
+        .y
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|rows| {
+            cfg.half_window
+                .x
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|cols| rows.checked_mul(cols))
+        })
+        .ok_or(SequentialReplayError::Invalid(
+            "covariance capture support area overflows usize",
+        ))
+}
+
+fn sequential_covariance_mask_digest(
+    configured: Option<ArrayView2<bool>>,
+    fixed: ArrayView2<bool>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:sequential_covariance_mask:v1");
+    digest.update([u8::from(configured.is_some())]);
+    digest.update((fixed.dim().0 as u64).to_le_bytes());
+    digest.update((fixed.dim().1 as u64).to_le_bytes());
+    for value in fixed {
+        digest.update([u8::from(*value)]);
+    }
+    digest.finalize().into()
+}
+
+fn provisional_covariance_generation_registry(
+    topology: &SequentialReplayTopology,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    mask_digest: [u8; 32],
+) -> Result<CovarianceGenerationRegistry, SequentialReplayError> {
+    let generations = topology
+        .blocks()
+        .iter()
+        .map(|block| {
+            let source_date_indices = (0..block.num_real_dates)
+                .map(|offset| {
+                    u32::try_from(offset)
+                        .ok()
+                        .and_then(|value| block.real_date_start.get().checked_add(value))
+                        .ok_or(SequentialReplayError::Invalid(
+                            "covariance generation date overflows u32",
+                        ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CovarianceGenerationIdentity {
+                burst_id: request.burst_id.clone(),
+                generation: block.generation,
+                source_date_indices,
+                source_member_manifest_digest: topology
+                    .generation_source_manifest_digest(block.id)?,
+                source_model_version_digest: request.source_model_version_digest,
+                source_model_receipt_digest: revision.source_model_receipt_digest,
+                normalized_config_digest: topology.normalized_config_digest(),
+                kernel_digest: sequential_replay_kernel_digest(),
+                mask_digest,
+                blocks: vec![CovarianceGenerationBlockIdentity {
+                    block_id: block.id.get(),
+                    block_sha256: [0; 32],
+                }],
+                sealed: false,
+            })
+        })
+        .collect::<Result<Vec<_>, SequentialReplayError>>()?;
+    Ok(CovarianceGenerationRegistry {
+        schema_version: COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+        full_source_manifest_digest: revision.full_source_manifest_digest,
+        generations,
+    })
+}
+
+fn build_covariance_generation_registry(
+    topology: &SequentialReplayTopology,
+    cfg: &SequentialConfig,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    mask_digest: [u8; 32],
+    block_digests: &BTreeMap<u64, [u8; 32]>,
+) -> Result<CovarianceGenerationRegistry, SequentialReplayError> {
+    let generations = topology
+        .blocks()
+        .iter()
+        .map(|block| {
+            let source_date_indices = (0..block.num_real_dates)
+                .map(|offset| {
+                    u32::try_from(offset)
+                        .ok()
+                        .and_then(|value| block.real_date_start.get().checked_add(value))
+                        .ok_or(SequentialReplayError::Invalid(
+                            "covariance generation date overflows u32",
+                        ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let block_sha256 = block_digests.get(&block.id.get()).copied().ok_or(
+                SequentialReplayError::Invalid("covariance generation block was not captured"),
+            )?;
+            Ok(CovarianceGenerationIdentity {
+                burst_id: request.burst_id.clone(),
+                generation: block.generation,
+                source_date_indices,
+                source_member_manifest_digest: topology
+                    .generation_source_manifest_digest(block.id)?,
+                source_model_version_digest: request.source_model_version_digest,
+                source_model_receipt_digest: revision.source_model_receipt_digest,
+                normalized_config_digest: topology.normalized_config_digest(),
+                kernel_digest: sequential_replay_kernel_digest(),
+                mask_digest,
+                blocks: vec![CovarianceGenerationBlockIdentity {
+                    block_id: block.id.get(),
+                    block_sha256,
+                }],
+                sealed: block.num_real_dates == cfg.ministack_size,
+            })
+        })
+        .collect::<Result<Vec<_>, SequentialReplayError>>()?;
+    Ok(CovarianceGenerationRegistry {
+        schema_version: COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+        full_source_manifest_digest: revision.full_source_manifest_digest,
+        generations,
+    })
 }
 
 /// Run the sequential estimator and also return the [`SequentialState`] needed to

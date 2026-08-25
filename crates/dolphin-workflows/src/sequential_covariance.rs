@@ -399,6 +399,17 @@ pub trait SequentialPrimitiveSourceResolver {
     /// Verified source manifest and proper-complex model identity.
     fn identity(&self) -> &SequentialSourceProviderIdentity;
 
+    /// Generation-specific identity for one replay block.
+    ///
+    /// Batch resolvers use their artifact-wide identity. NRT resolver bundles
+    /// override this with the exact sealed/open generation member receipt.
+    fn identity_for_block(
+        &self,
+        _block: &SequentialReplayBlock,
+    ) -> Result<&SequentialSourceProviderIdentity, SequentialReplayError> {
+        Ok(self.identity())
+    }
+
     /// Maximum resolver-internal resident bytes beyond the returned source.
     fn maximum_resident_bytes(&self) -> u64;
 
@@ -602,6 +613,22 @@ where
             ));
         }
         topology.validate_provider_identity(&identity)?;
+        for block in topology.blocks() {
+            let block_identity = source_resolver.identity_for_block(block)?;
+            topology.validate_provider_identity_for_block(block, block_identity)?;
+            if block_identity.provider != identity.provider
+                || block_identity.provider_version != identity.provider_version
+                || block_identity.model != identity.model
+                || block_identity.model_version != identity.model_version
+                || block_identity.source_model_version_digest
+                    != identity.source_model_version_digest
+                || block_identity.source_model_hash != identity.source_model_hash
+            {
+                return Err(identity_mismatch(
+                    "artifact generation provider/model identity differs from the complete revision resolver",
+                ));
+            }
+        }
         Ok(Self {
             _artifact_read_lock: artifact_read_lock,
             operator_reader,
@@ -687,11 +714,12 @@ where
                         )
                     })?;
                 let stored = &receipt.block.source_factor_digests[start..start + 32];
+                let block_identity = self.source_resolver.identity_for_block(block)?;
                 let expected = masked_source_factor_receipt_digest(
                     block,
                     receipt.block.source_ids[native_index],
                     content,
-                    &self.identity,
+                    block_identity,
                 );
                 if stored != expected {
                     return Err(SequentialReplayError::Provider(
@@ -775,6 +803,10 @@ where
                 "source resolver identity changed after artifact admission",
             ));
         }
+        self.topology.validate_provider_identity_for_block(
+            block,
+            self.source_resolver.identity_for_block(block)?,
+        )?;
         let stored = self.read_block(block)?;
         let stored_source_id = stored.source_ids.get(native_index).copied();
         let digest_start = native_index
@@ -808,7 +840,7 @@ where
                     "artifact masked source ID is missing",
                 ))?,
                 stored_content_digest,
-                &self.identity,
+                self.source_resolver.identity_for_block(block)?,
             );
             if stored_factor_digest != expected {
                 return Err(SequentialReplayError::Provider(
@@ -1594,6 +1626,8 @@ pub enum SequentialReplayError {
     Execution(&'static str),
     /// External source/model resolution or captured-state verification failed.
     Provider(ReplayStatus, &'static str),
+    /// Persisted operator I/O or schema validation failed.
+    Io(dolphin_io::IoError),
 }
 
 impl SequentialReplayError {
@@ -1607,6 +1641,7 @@ impl SequentialReplayError {
             Self::Influence(_) => ReplayStatus::InvalidReplayGraph,
             Self::Execution(_) => ReplayStatus::InvalidReplayGraph,
             Self::Provider(status, _) => *status,
+            Self::Io(_) => ReplayStatus::InvalidReplayGraph,
         }
     }
 
@@ -1631,6 +1666,7 @@ impl Display for SequentialReplayError {
             Self::Influence(error) => Display::fmt(error, f),
             Self::Execution(message) => f.write_str(message),
             Self::Provider(_, message) => f.write_str(message),
+            Self::Io(error) => Display::fmt(error, f),
         }
     }
 }
@@ -1640,6 +1676,12 @@ impl Error for SequentialReplayError {}
 impl From<InfluenceError> for SequentialReplayError {
     fn from(value: InfluenceError) -> Self {
         Self::Influence(value)
+    }
+}
+
+impl From<dolphin_io::IoError> for SequentialReplayError {
+    fn from(value: dolphin_io::IoError) -> Self {
+        Self::Io(value)
     }
 }
 
@@ -1656,6 +1698,7 @@ pub struct SequentialReplayTopology {
     strides: Strides,
     native_validity: Vec<bool>,
     id_namespace: Option<ReplayIdNamespace>,
+    generation_source_manifest_digests: Option<Vec<[u8; 32]>>,
     estimator_branch: FixedEstimatorBranch,
     normalized_config_digest: [u8; 32],
 }
@@ -1687,6 +1730,7 @@ impl SequentialReplayTopology {
             cfg,
             scope,
             None,
+            None,
         )
     }
 
@@ -1712,6 +1756,7 @@ impl SequentialReplayTopology {
             native_validity,
             cfg,
             scope,
+            None,
             None,
         )
     }
@@ -1746,6 +1791,41 @@ impl SequentialReplayTopology {
             cfg,
             scope,
             Some(id_namespace),
+            None,
+        )
+    }
+
+    /// Plan a strongly identified graph whose generations use exact member receipts.
+    ///
+    /// The complete revision digest remains in `id_namespace`; block, source,
+    /// phase, date, and compressed IDs use the corresponding generation digest.
+    ///
+    /// # Errors
+    /// Returns an error when the digest list is missing, weak, or does not match
+    /// the complete ministack plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_identified_generations(
+        num_real_dates: usize,
+        native_shape: (usize, usize),
+        output_shape: (usize, usize),
+        support_slots_per_output: usize,
+        native_validity: ArrayView2<bool>,
+        cfg: &SequentialConfig,
+        scope: ReplayExecutionScope,
+        id_namespace: ReplayIdNamespace,
+        generation_source_manifest_digests: Vec<[u8; 32]>,
+    ) -> Result<Self, SequentialReplayError> {
+        id_namespace.validate()?;
+        Self::plan_impl(
+            num_real_dates,
+            native_shape,
+            output_shape,
+            support_slots_per_output,
+            native_validity,
+            cfg,
+            scope,
+            Some(id_namespace),
+            Some(generation_source_manifest_digests),
         )
     }
 
@@ -1759,6 +1839,7 @@ impl SequentialReplayTopology {
         cfg: &SequentialConfig,
         scope: ReplayExecutionScope,
         id_namespace: Option<ReplayIdNamespace>,
+        generation_source_manifest_digests: Option<Vec<[u8; 32]>>,
     ) -> Result<Self, SequentialReplayError> {
         assess_support(cfg, scope)?;
         if num_real_dates == 0 {
@@ -1862,6 +1943,19 @@ impl SequentialReplayTopology {
                 "identified replay exceeds the 16-bit block generation range",
             ));
         }
+        if generation_source_manifest_digests
+            .as_ref()
+            .is_some_and(|digests| {
+                digests.len() != planned.len()
+                    || digests
+                        .iter()
+                        .any(|digest| digest.iter().all(|byte| *byte == 0))
+            })
+        {
+            return Err(SequentialReplayError::Unsupported(
+                ReplayStatus::UnsupportedSourceIdentity,
+            ));
+        }
         let mut blocks: Vec<SequentialReplayBlock> = Vec::with_capacity(planned.len());
         for block in &planned {
             let generation = u32::try_from(block.block_id).map_err(|_| {
@@ -1870,6 +1964,11 @@ impl SequentialReplayTopology {
             let id = match id_namespace.as_ref() {
                 Some(namespace) => GlobalBlockId::new(record_block_id(
                     namespace,
+                    generation_source_manifest_digests
+                        .as_ref()
+                        .map_or(namespace.source_manifest_digest, |digests| {
+                            digests[block.block_id]
+                        }),
                     generation,
                     native_shape,
                     output_shape,
@@ -1904,6 +2003,7 @@ impl SequentialReplayTopology {
             strides: cfg.strides,
             native_validity: native_validity.iter().copied().collect(),
             id_namespace,
+            generation_source_manifest_digests,
             estimator_branch: match cfg.use_evd {
                 true => FixedEstimatorBranch::Evd,
                 false => FixedEstimatorBranch::Emi {
@@ -2009,6 +2109,28 @@ impl SequentialReplayTopology {
         self.normalized_config_digest
     }
 
+    /// Exact source-member receipt used by one generation namespace.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown block.
+    pub fn generation_source_manifest_digest(
+        &self,
+        block: GlobalBlockId,
+    ) -> Result<[u8; 32], SequentialReplayError> {
+        let definition = self.block(block)?;
+        Ok(self
+            .generation_source_manifest_digests
+            .as_ref()
+            .map_or_else(
+                || {
+                    self.id_namespace
+                        .as_ref()
+                        .map_or([0; 32], |namespace| namespace.source_manifest_digest)
+                },
+                |digests| digests[definition.generation as usize],
+            ))
+    }
+
     /// Deterministic source-locator ID before raw-content binding.
     ///
     /// # Errors
@@ -2023,6 +2145,7 @@ impl SequentialReplayTopology {
         let value = match &self.id_namespace {
             Some(_) => self.identified_id(
                 b"source",
+                self.generation_source_manifest_digest(block)?,
                 u64::from(definition.generation),
                 (u64::from(definition.real_date_start.get()) << 32)
                     | definition.num_real_dates as u64,
@@ -2067,8 +2190,16 @@ impl SequentialReplayTopology {
         output_index: usize,
     ) -> Result<NodeId, SequentialReplayError> {
         self.validate_block_local(block, output_index, self.output_area)?;
+        let source_manifest_digest = self.generation_source_manifest_digest(block)?;
         Ok(NodeId::new(match &self.id_namespace {
-            Some(_) => self.identified_id(b"phase", block.get(), 0, output_index, false),
+            Some(_) => self.identified_id(
+                b"phase",
+                source_manifest_digest,
+                block.get(),
+                0,
+                output_index,
+                false,
+            ),
             None => pack_node_id(0, block.get() as u32, output_index as u32).get(),
         }))
     }
@@ -2083,8 +2214,16 @@ impl SequentialReplayTopology {
         native_index: usize,
     ) -> Result<NodeId, SequentialReplayError> {
         self.validate_block_local(block, native_index, self.native_area)?;
+        let source_manifest_digest = self.generation_source_manifest_digest(block)?;
         Ok(NodeId::new(match &self.id_namespace {
-            Some(_) => self.identified_id(b"compressed", block.get(), 0, native_index, true),
+            Some(_) => self.identified_id(
+                b"compressed",
+                source_manifest_digest,
+                block.get(),
+                0,
+                native_index,
+                true,
+            ),
             None => pack_node_id(1, block.get() as u32, native_index as u32).get(),
         }))
     }
@@ -2111,6 +2250,7 @@ impl SequentialReplayTopology {
         Ok(NodeId::new(match &self.id_namespace {
             Some(_) => self.identified_id(
                 b"date",
+                self.generation_source_manifest_digest(block.id)?,
                 block.id.get(),
                 u64::from(date.get()),
                 output_index,
@@ -3876,6 +4016,30 @@ impl SequentialReplayTopology {
         Ok(())
     }
 
+    fn validate_provider_identity_for_block(
+        &self,
+        block: &SequentialReplayBlock,
+        identity: &SequentialSourceProviderIdentity,
+    ) -> Result<(), SequentialReplayError> {
+        if identity.source_model_hash.iter().all(|byte| *byte == 0) {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceModelUnavailable,
+                "generation source provider has no proper-complex model digest",
+            ));
+        }
+        if identity.source_manifest_digest != self.generation_source_manifest_digest(block.id)?
+            || self.id_namespace.as_ref().is_none_or(|namespace| {
+                identity.source_model_version_digest != namespace.source_model_version_digest
+            })
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceIdentityMismatch,
+                "source provider generation identity does not match the replay block namespace",
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate_operator_block_contract(
         &self,
@@ -4623,6 +4787,7 @@ impl SequentialReplayTopology {
     fn identified_id(
         &self,
         kind: &[u8],
+        source_manifest_digest: [u8; 32],
         major: u64,
         secondary: u64,
         local: usize,
@@ -4643,7 +4808,7 @@ impl SequentialReplayTopology {
         covariance_identified_id(
             kind,
             &namespace.burst_id,
-            namespace.source_manifest_digest,
+            source_manifest_digest,
             namespace.source_model_version_digest,
             major,
             secondary,
@@ -4917,6 +5082,7 @@ pub(crate) fn build_covariance_operator_block(
         .ok_or(SequentialReplayError::Invalid(
             "captured ministack has no replay topology block",
         ))?;
+    let generation_source_manifest_digest = topology.generation_source_manifest_digest(block.id)?;
     if block.generation as usize != ministack.block_id
         || combined_source.dim().0 != ministack.size()
         || combined_source.dim().1 * combined_source.dim().2 != topology.native_area
@@ -4930,14 +5096,16 @@ pub(crate) fn build_covariance_operator_block(
         ));
     }
 
-    let source_date_indices: Vec<u32> = (ministack.real_start
-        ..ministack.real_start + ministack.num_real)
-        .map(|date| {
-            u32::try_from(date).map_err(|_| {
-                SequentialReplayError::Invalid("captured source date index exceeds u32")
-            })
+    let source_date_indices = (0..ministack.num_real)
+        .map(|offset| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|value| block.real_date_start.get().checked_add(value))
+                .ok_or(SequentialReplayError::Invalid(
+                    "captured source date index exceeds u32",
+                ))
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     let mut phase_components = block
         .carried_parent_ids
         .iter()
@@ -4994,8 +5162,8 @@ pub(crate) fn build_covariance_operator_block(
         .collect::<Result<Vec<_>, _>>()?;
     let mut source_factor_digests = Vec::with_capacity(source_digest_bytes);
     if let Some(resolver) = source_resolver.as_mut() {
-        let identity = resolver.identity().clone();
-        if identity.source_manifest_digest != request.source_manifest_digest
+        let identity = resolver.identity_for_block(block)?.clone();
+        if identity.source_manifest_digest != generation_source_manifest_digest
             || resolver.identity().source_model_version_digest
                 != request.source_model_version_digest
             || identity.source_model_hash.iter().all(|byte| *byte == 0)
@@ -5145,7 +5313,7 @@ pub(crate) fn build_covariance_operator_block(
         .map_err(|_| SequentialReplayError::Invalid("captured Rect support count exceeds u32"))?;
     Ok(CovarianceOperatorBlock {
         burst_id: request.burst_id.clone(),
-        source_manifest_digest: request.source_manifest_digest,
+        source_manifest_digest: generation_source_manifest_digest,
         source_model_version_digest: request.source_model_version_digest,
         block_id: block.id.get(),
         generation: block.generation,
@@ -5472,6 +5640,7 @@ fn pack_node_id(kind: u64, major: u32, local: u32) -> NodeId {
 
 fn record_block_id(
     namespace: &ReplayIdNamespace,
+    source_manifest_digest: [u8; 32],
     generation: u32,
     native_shape: (usize, usize),
     output_shape: (usize, usize),
@@ -5492,7 +5661,7 @@ fn record_block_id(
     );
     covariance_record_block_id(
         &namespace.burst_id,
-        namespace.source_manifest_digest,
+        source_manifest_digest,
         namespace.source_model_version_digest,
         generation,
         grid(namespace.native_origin, native_shape, (1, 1)),
