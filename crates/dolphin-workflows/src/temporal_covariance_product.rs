@@ -1864,6 +1864,7 @@ fn write_product_transaction_with_validator(
             &stage,
             Some(&transaction.ownership_token),
             || Ok(()),
+            |_| Ok(()),
         )
     } else {
         Ok(())
@@ -2091,6 +2092,7 @@ fn compose_working_set_admission(
     );
     let writer_block_capacity = maximum_block_ids
         .checked_next_power_of_two()
+        .map(|capacity| capacity.max(4))
         .context("COG writer block capacity overflow")?;
     let writer_bookkeeping_bytes = writer_block_capacity
         .checked_mul(LAYER_COUNT as u64)
@@ -2288,6 +2290,24 @@ fn publish_product_receipt(
         &fixed_scratch_name,
         &transaction.ownership_token,
     )?;
+    let expected_fixed_receipt = promoted_fixed_cube_receipt_bytes(
+        &journal.original_fixed_cube_receipt,
+        &scope.fixed_cube_semantics,
+        &corrected_velocity_sha256,
+        &corrected_sigma_sha256,
+        &provenance_sha256,
+        &promotion.manifest_sha256,
+    )?;
+    journal.expected_provenance_sha256 = Some(provenance_sha256.clone());
+    journal.installed_artifacts.push(OwnedArtifactReceipt {
+        name: TEMPORAL_INFERENCE_PROVENANCE_FILENAME.to_owned(),
+        sha256: provenance_sha256.clone(),
+    });
+    journal_expected_fixed_receipt_before_replace(
+        output_directory,
+        &mut journal,
+        &expected_fixed_receipt,
+    )?;
     let promote = promote_fixed_cube_receipt(
         output_directory,
         &provenance_scratch,
@@ -2314,15 +2334,13 @@ fn publish_product_receipt(
     std::fs::remove_file(&fixed_scratch_marker)?;
     File::open(output_directory)?.sync_all()?;
     promote?;
-    journal.expected_provenance_sha256 = Some(provenance_sha256.clone());
-    journal.expected_fixed_receipt_sha256 = Some(sha256_file(
-        &output_directory.join("fixed_cube_receipt.json"),
-    )?);
-    journal.installed_artifacts.push(OwnedArtifactReceipt {
-        name: TEMPORAL_INFERENCE_PROVENANCE_FILENAME.to_owned(),
-        sha256: provenance_sha256.clone(),
-    });
-    persist_rollback_journal(output_directory, &journal, false)?;
+    let promoted_fixed_receipt_sha256 =
+        sha256_file(&output_directory.join("fixed_cube_receipt.json"))?;
+    ensure!(
+        journal.expected_fixed_receipt_sha256.as_deref()
+            == Some(promoted_fixed_receipt_sha256.as_str()),
+        "promoted fixed-cube receipt differs from its durable rollback identity"
+    );
     verify_final_cogs(
         output_directory,
         &staged_products,
@@ -3594,6 +3612,45 @@ fn persist_rollback_journal(
     persist
 }
 
+fn journal_expected_fixed_receipt_before_replace(
+    directory: &Path,
+    journal: &mut ProductRollbackJournal,
+    expected_receipt_bytes: &[u8],
+) -> Result<()> {
+    journal.expected_fixed_receipt_sha256 = Some(sha256(expected_receipt_bytes));
+    persist_rollback_journal(directory, journal, false)
+}
+
+fn promoted_fixed_cube_receipt_bytes(
+    original_receipt_bytes: &[u8],
+    semantic_validation: &crate::fixed_cube::FixedCubeSemanticValidation,
+    corrected_velocity_sha256: &str,
+    corrected_sigma_sha256: &str,
+    provenance_sha256: &str,
+    promotion_manifest_sha256: &str,
+) -> Result<Vec<u8>> {
+    let mut receipt: crate::fixed_cube::FixedCubeReceipt =
+        serde_json::from_slice(original_receipt_bytes)?;
+    ensure!(
+        receipt.contract_version == "fixed-cube-v1"
+            && receipt.inference_status == "conditional_only"
+            && receipt.corrected_velocity_raster.is_none()
+            && receipt.corrected_sigma_raster.is_none()
+            && receipt.semantic_validation.is_none(),
+        "fixed-cube receipt is not eligible for temporal-inference promotion"
+    );
+    receipt.inference_status = "calibrated_scope_match".to_owned();
+    receipt.corrected_velocity_raster = Some("velocity_temporal_gls.tif".to_owned());
+    receipt.corrected_sigma_raster = Some("velocity_sigma_corrected.tif".to_owned());
+    receipt.corrected_velocity_sha256 = Some(corrected_velocity_sha256.to_owned());
+    receipt.corrected_sigma_sha256 = Some(corrected_sigma_sha256.to_owned());
+    receipt.inference_provenance = Some(TEMPORAL_INFERENCE_PROVENANCE_FILENAME.to_owned());
+    receipt.inference_provenance_sha256 = Some(provenance_sha256.to_owned());
+    receipt.temporal_promotion_manifest_sha256 = Some(promotion_manifest_sha256.to_owned());
+    receipt.semantic_validation = Some(semantic_validation.clone());
+    Ok(serde_json::to_vec_pretty(&receipt)?)
+}
+
 fn read_rollback_journal(directory: &Path) -> Result<ProductRollbackJournal> {
     let journal: ProductRollbackJournal = serde_json::from_slice(&read_bounded(
         &directory.join(ROLLBACK_JOURNAL_FILENAME),
@@ -3778,7 +3835,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
                     && transaction_marker_is_owned(&marker, directory, &name, None)?,
                 "temporal stage ownership changed before orphan cleanup"
             );
-            remove_owned_stage_directory(directory, &artifact, None, || Ok(()))?;
+            remove_owned_stage_directory(directory, &artifact, None, || Ok(()), |_| Ok(()))?;
         } else if artifact.exists() {
             let name = artifact
                 .file_name()
@@ -3851,6 +3908,7 @@ fn rollback_incomplete_product_with_journal(
             &stage,
             Some(&journal.ownership_token),
             || Ok(()),
+            |_| Ok(()),
         )
         .is_err()
     {
@@ -4131,7 +4189,13 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
         if marker.exists()
             && transaction_marker_is_owned(&marker, directory, &stage_name, Some(ownership_token))?
         {
-            remove_owned_stage_directory(directory, &stage, Some(ownership_token), || Ok(()))?;
+            remove_owned_stage_directory(
+                directory,
+                &stage,
+                Some(ownership_token),
+                || Ok(()),
+                |_| Ok(()),
+            )?;
         }
     }
     initialize
@@ -4142,39 +4206,88 @@ fn remove_owned_stage_directory(
     stage: &Path,
     ownership_token: Option<&str>,
     before_isolate: impl FnOnce() -> Result<()>,
+    after_quarantine: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     static NEXT_CLEANUP_ID: AtomicU64 = AtomicU64::new(0);
     let stage_name = stage
         .file_name()
         .context("temporal product stage has no filename")?
         .to_string_lossy();
+    let stage_marker = stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
     ensure!(
         stage.parent() == Some(directory)
             && stage.is_dir()
-            && transaction_marker_is_owned(
-                &stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
-                directory,
-                &stage_name,
-                ownership_token,
-            )?,
+            && transaction_marker_is_owned(&stage_marker, directory, &stage_name, ownership_token,)?,
         "temporal stage ownership changed before deletion"
     );
+    let marker: TransactionArtifactMarker =
+        serde_json::from_slice(&read_bounded(&stage_marker, 64 * 1024)?)?;
     before_isolate()?;
-    let isolated = directory.join(format!(
+    let private_name = format!(
         ".temporal-inference-stage-cleanup-{}-{}",
         std::process::id(),
         NEXT_CLEANUP_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::rename(stage, &isolated)?;
-    let isolated_marker = isolated.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-    if !transaction_marker_is_owned(&isolated_marker, directory, &stage_name, ownership_token)? {
+    );
+    let private_parent = directory.join(&private_name);
+    let mut private_builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        private_builder.mode(0o700);
+    }
+    private_builder.create(&private_parent)?;
+    write_transaction_marker(
+        &private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
+        directory,
+        &private_name,
+        &marker.ownership_token,
+    )?;
+    File::open(&private_parent)?.sync_all()?;
+    File::open(directory)?.sync_all()?;
+    let quarantined = private_parent.join("owned-stage");
+    std::fs::rename(stage, &quarantined)?;
+    File::open(directory)?.sync_all()?;
+    let quarantined_marker = quarantined.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+    if !transaction_marker_is_owned(&quarantined_marker, directory, &stage_name, ownership_token)? {
         if !stage.exists() {
-            std::fs::rename(&isolated, stage)?;
+            std::fs::rename(&quarantined, stage)?;
+            std::fs::remove_file(private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME))?;
+            std::fs::remove_dir(&private_parent)?;
             File::open(directory)?.sync_all()?;
+        } else {
+            let private_marker = private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+            if transaction_marker_is_owned(
+                &private_marker,
+                directory,
+                &private_name,
+                ownership_token,
+            )? {
+                std::fs::remove_file(private_marker)?;
+                File::open(&private_parent)?.sync_all()?;
+                File::open(directory)?.sync_all()?;
+            }
         }
         anyhow::bail!("temporal stage ownership changed while isolating for deletion");
     }
-    std::fs::remove_dir_all(&isolated)?;
+    if let Err(error) = after_quarantine(&quarantined) {
+        let private_marker = private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+        if transaction_marker_is_owned(&private_marker, directory, &private_name, ownership_token)?
+        {
+            std::fs::remove_file(private_marker)?;
+            File::open(&private_parent)?.sync_all()?;
+        }
+        return Err(error);
+    }
+    if !transaction_marker_is_owned(&quarantined_marker, directory, &stage_name, ownership_token)? {
+        let private_marker = private_parent.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+        if transaction_marker_is_owned(&private_marker, directory, &private_name, ownership_token)?
+        {
+            std::fs::remove_file(private_marker)?;
+            File::open(&private_parent)?.sync_all()?;
+        }
+        anyhow::bail!("temporal stage ownership changed after quarantine");
+    }
+    std::fs::remove_dir_all(&private_parent)?;
     File::open(directory)?.sync_all()?;
     Ok(())
 }
@@ -4360,6 +4473,17 @@ mod tests {
             admit_combined_working_set(&non_power_of_two_block_cap, days.len()).is_err(),
             "writer Vec capacity growth must be admitted before block reads"
         );
+        for block_ids in [1_u64, 2] {
+            let mut small_block_cap = config.clone();
+            small_block_cap.block_id_read_cap_bytes = block_ids * std::mem::size_of::<u64>() as u64;
+            let admission = compose_working_set_admission(&small_block_cap, days.len()).unwrap();
+            assert_eq!(
+                admission.writer_bookkeeping_bytes,
+                4 * super::LAYER_COUNT as u64
+                    * std::mem::size_of::<dolphin_core::BlockIndices>() as u64,
+                "Vec must reserve its minimum nonzero capacity for {block_ids} block IDs"
+            );
+        }
         let boundary = compose_working_set_admission(&config, days.len()).unwrap();
         assert!(
             validate_working_set_high_water(&boundary, boundary.gdal_cache_budget_bytes).is_ok()
@@ -4502,6 +4626,62 @@ mod tests {
     }
 
     #[test]
+    fn rollback_recognizes_a_fixed_receipt_replaced_after_durable_identity() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_fixed_receipt_crash_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let original = b"original fixed receipt".to_vec();
+        let promoted = b"owned promoted fixed receipt".to_vec();
+        std::fs::write(directory.join("fixed_cube_receipt.json"), &original).unwrap();
+        let mut journal = super::ProductRollbackJournal {
+            schema: super::ROLLBACK_JOURNAL_SCHEMA.to_owned(),
+            ownership_token: "fixed-receipt-owner".to_owned(),
+            original_fixed_cube_receipt: original.clone(),
+            legacy_velocity_sha256: String::new(),
+            legacy_sigma_sha256: None,
+            promotion_manifest_sha256: String::new(),
+            semantic_validation: crate::fixed_cube::FixedCubeSemanticValidation {
+                observed_valid_pixels: 0,
+                maximum_los_norm_error: 0.0,
+                minimum_los_up: 1.0,
+                los_sign_convention: String::new(),
+                geometry_source: String::new(),
+                geometry_provenance_status: String::new(),
+            },
+            product_grid: super::ProductGridReceipt {
+                rows: 1,
+                cols: 1,
+                geotransform: [0.0; 6],
+                epsg: None,
+                velocity_unit: "rad/yr".to_owned(),
+                process_variance_unit: "rad^2".to_owned(),
+            },
+            expected_products: Vec::new(),
+            installed_artifacts: Vec::new(),
+            stage_directory: ".temporal-inference-stage-fixed-receipt".to_owned(),
+            expected_provenance_sha256: None,
+            expected_fixed_receipt_sha256: None,
+            rollback_state: super::ProductRollbackState::Active,
+            collision_artifacts: Vec::new(),
+        };
+        super::persist_rollback_journal(&directory, &journal, true).unwrap();
+        super::journal_expected_fixed_receipt_before_replace(&directory, &mut journal, &promoted)
+            .unwrap();
+        std::fs::write(directory.join("fixed_cube_receipt.json"), &promoted).unwrap();
+
+        super::rollback_incomplete_product_with_journal(&directory, &journal).unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
+            original
+        );
+        assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn normal_cleanup_preserves_a_stage_replaced_after_ownership_check() {
         let directory = std::env::temp_dir().join(format!(
             "dolphin_temporal_cleanup_stage_swap_{}",
@@ -4511,16 +4691,56 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let ownership_token = "cleanup-owner";
         let stage = super::create_stage_directory(&directory, ownership_token).unwrap();
-        let error =
-            super::remove_owned_stage_directory(&directory, &stage, Some(ownership_token), || {
+        let error = super::remove_owned_stage_directory(
+            &directory,
+            &stage,
+            Some(ownership_token),
+            || {
                 std::fs::remove_dir_all(&stage)?;
                 std::fs::create_dir(&stage)?;
                 std::fs::write(stage.join("user-data"), b"preserve")?;
                 Ok(())
-            })
-            .unwrap_err();
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("ownership changed"));
         assert_eq!(std::fs::read(stage.join("user-data")).unwrap(), b"preserve");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_a_quarantined_stage_replaced_after_isolation() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_quarantine_stage_swap_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let ownership_token = "quarantine-owner";
+        let stage = super::create_stage_directory(&directory, ownership_token).unwrap();
+        std::fs::write(stage.join("owned-data"), b"owned").unwrap();
+        let mut replacement = None;
+        let error = super::remove_owned_stage_directory(
+            &directory,
+            &stage,
+            Some(ownership_token),
+            || Ok(()),
+            |quarantined| {
+                std::fs::remove_dir_all(quarantined)?;
+                std::fs::create_dir(quarantined)?;
+                std::fs::write(quarantined.join("user-data"), b"preserve")?;
+                replacement = Some(quarantined.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ownership changed"));
+        let replacement = replacement.unwrap();
+        assert_eq!(
+            std::fs::read(replacement.join("user-data")).unwrap(),
+            b"preserve"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
