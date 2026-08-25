@@ -38,7 +38,7 @@ use crate::sequential_covariance::{
     CovarianceArtifactReplayProvider, EffectiveLooksReplay, GlobalDateId,
     GlobalReferenceCovarianceQuery, ReplayBackend, ReplayExecutionScope, ReplayStatus,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialSourceReplayProvider, SequentialTileReplayProvider,
+    SequentialSourceReplayProvider, SequentialTileReplayProvider, SourceCorrelationModel,
 };
 use crate::spatial_covariance_artifact::{
     finalize_spatial_reference_covariance_artifact, SpatialReferenceCovarianceArtifactTransaction,
@@ -46,8 +46,8 @@ use crate::spatial_covariance_artifact::{
     SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
 };
 
-const PRODUCTION_REFERENCE_COVARIANCE_WORKING_SET_BYTE_CAP: u64 = 1_073_741_824;
-const EFFECTIVE_LOOKS_MODEL: &str = "source_factor_declared_v1";
+pub(crate) const PRODUCTION_REFERENCE_COVARIANCE_WORKING_SET_BYTE_CAP: u64 = 1_073_741_824;
+const EFFECTIVE_LOOKS_MODEL: &str = "exponential_euclidean_v1";
 const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
 
 pub(crate) const NO_BURST_OWNER: u32 = u32::MAX;
@@ -236,7 +236,6 @@ fn production_target_receipt(
     digest.finalize().into()
 }
 
-#[cfg(test)]
 pub(crate) fn build_factor_block(
     block_id: u64,
     target_grid: CovarianceOperatorGrid,
@@ -1312,6 +1311,9 @@ fn preflight_production_replay_reservation(
                         reference: reference_output,
                         ordered_dates,
                         source_rank,
+                        source_correlation: SourceCorrelationModel::ExponentialEuclidean {
+                            distance_scale_pixels: EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+                        },
                         byte_cap: u64::MAX,
                         branch_tolerance,
                     };
@@ -1364,6 +1366,9 @@ fn preflight_production_replay_reservation(
                         reference: reference_output,
                         ordered_dates,
                         source_rank,
+                        source_correlation: SourceCorrelationModel::ExponentialEuclidean {
+                            distance_scale_pixels: EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+                        },
                         byte_cap: u64::MAX,
                         branch_tolerance,
                     };
@@ -1534,6 +1539,9 @@ fn production_target_factor(
         reference: reference_output,
         ordered_dates,
         source_rank,
+        source_correlation: SourceCorrelationModel::ExponentialEuclidean {
+            distance_scale_pixels: EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+        },
         byte_cap: query_byte_cap,
         branch_tolerance,
     };
@@ -1628,7 +1636,7 @@ fn validate_effective_looks(effective: &EffectiveLooksReplay) -> Result<()> {
             && effective.fraction > 0.0
             && effective.fraction <= 1.0
             && effective.receipt.iter().any(|byte| *byte != 0),
-        "production replay effective-look receipt differs from source_factor_declared_v1"
+        "production replay source-correlation receipt differs from exponential_euclidean_v1"
     );
     Ok(())
 }
@@ -1654,7 +1662,7 @@ fn nonvalid_target_with_resource(
     }
 }
 
-fn factor_block_shape(
+pub(crate) fn factor_block_shape(
     shape: (usize, usize),
     dates: usize,
     working_set_byte_cap: u64,
@@ -1685,7 +1693,7 @@ fn factor_target_payload_bytes(dates: usize) -> Result<u64> {
         .context("factor target payload bytes overflow u64")
 }
 
-fn production_resource_admission(
+pub(crate) fn production_resource_admission(
     targets: usize,
     dates: usize,
     fixed_l2_workspace: FixedL2WorkspaceComposition,
@@ -2072,7 +2080,7 @@ mod tests {
             [1; 32],
             [2; 32],
             [3; 32],
-            "source_factor_declared_v1",
+            "exponential_euclidean_v1",
             1.5,
             17,
             0.25,
@@ -2085,7 +2093,7 @@ mod tests {
                 [1; 32],
                 [2; 32],
                 [3; 32],
-                "source_factor_declared_v1",
+                "exponential_euclidean_v1",
                 1.5,
                 18,
                 0.25,
@@ -2099,7 +2107,7 @@ mod tests {
                 [1; 32],
                 [2; 32],
                 [3; 32],
-                "source_factor_declared_v1",
+                "exponential_euclidean_v1",
                 1.5,
                 17,
                 0.25,
