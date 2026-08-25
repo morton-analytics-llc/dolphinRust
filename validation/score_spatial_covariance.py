@@ -8,6 +8,7 @@ import itertools
 import json
 import math
 import os
+import stat
 import struct
 from dataclasses import dataclass, field
 from datetime import date
@@ -30,21 +31,24 @@ FROZEN_SHARD_COUNT = 891
 FROZEN_MAX_SHARD_BYTES = 100 * 8192
 FROZEN_MAX_RECORD_BYTES = 262144
 FROZEN_MAX_CELL_SUMMARY_BYTES = 8192
+FROZEN_MAX_SHARD_MANIFEST_BYTES = 16384
+FROZEN_MAX_RUN_MANIFEST_BYTES = 16777216
+FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 761282560
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "7a68140978d6ce46d9af35d209db8b76074d18cff6848f14db0841efe0715e63"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "2328f908c9b45ea416e6202b028c73df37fb40b2c5f338a4ddce375e5206ef7c"
-FROZEN_EXECUTION_SHA256 = "d54c7461552b29f8fee009ec825f76d1e76ff3285b4d887735e2d874f72f65b2"
+FROZEN_GENERATOR_SHA256 = "222355a893286969429707c4429124e8c344bb4832b66abdebd58859c34abea8"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "eaa2c6e33159e00e47aa52ab27eaaf00c45b8dcae429d9b2d04d5d4336a59133"
+FROZEN_EXECUTION_SHA256 = "0f66072a4926e96a21f2e97c47226a6890cfaf4ae1e5724b386287ba38f09fd8"
 FROZEN_REDUCERS_SHA256 = "65e45eb254d65a9efd04c379581296f2396ee9166fdae6dad1be4058dad7eb5c"
 FROZEN_MATRIX_SHA256 = "9133bbac234fe511df7cce8e154bdf9134a1d2af699b8127c34522135cb50939"
-FROZEN_RECEIPT_SHA256 = "73251e72007c4236695e5a3d159c748797c91cc5f07bfa5c9dbd08099342cfd8"
+FROZEN_RECEIPT_SHA256 = "57699344b794b6148abc76817d5674b635d3f21ea321e5dfa6dc8a1a60ae25d3"
 FROZEN_HASH_FIELDS_SHA256 = "bc4a53c9803ad5c4def667280417e3210d1dac0b6bc02d4a6402ba7ac437f6c8"
-FROZEN_RESOURCE_SAMPLING_SHA256 = "c3484b3ff811792e65a7ac3abc94975ca53e3c2eeaae87c922d1a0df09056e76"
+FROZEN_RESOURCE_SAMPLING_SHA256 = "75309d564a3ad7f4fb8765b89af7696a9b995dd2a6a4c65bf8f792ee8ec9847c"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "f3e8f63462ae82c5dc43cebeecd49f0236b4e0804460ada79cf24c12e8096c90"
 FROZEN_V3_PREREGISTRATION_SHA256 = "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184"
 FROZEN_DETERMINISM_SHA256 = "ad6904d88f04c5d91a7e7168351c10a06a41e4253ae1324e2391eab7ef1443bd"
-FROZEN_NUMERIC_SHA256 = "edc00a8e79011c628c42afd16e255bd33d21f774f42352356b6cc88e21861e08"
+FROZEN_NUMERIC_SHA256 = "01dc8b496a40b385fb3eef548df053b32f75f2239d484ddb615769d8b5b02d52"
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -87,6 +91,7 @@ ATTEMPT_KEYS = {
     "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error",
     "contrast_variance_reference", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width",
     "operator_matrix", "truth_matrix", "contrast_weights", "estimate_value", "truth_value",
+    "raw_input_values",
 }
 INPUT_KEYS = {"schema", "cell_id", "cell_ordinal", "seed_index", "seed_sha256", *DIMENSION_NAMES}
 ATTEMPT_HASH_FIELDS = (
@@ -122,7 +127,11 @@ PERFORMANCE_MEASUREMENT_KEYS = {
     "cell_class", "seed_count", "attempt_count", "elapsed_seconds", "peak_rss_bytes", "outcomes_persisted",
 }
 RESOURCE_OBSERVATION_KEYS = {
-    "repetition", "tile_pixels", "date_count", "peak_rss_bytes", "wall_seconds", "raw_measurement_sha256",
+    "repetition", "tile_pixels", "date_count", "peak_rss_bytes", "wall_seconds", "raw_measurement", "raw_measurement_sha256",
+}
+RESOURCE_RAW_MEASUREMENT_KEYS = {
+    "command", "exit_status", "wall_seconds", "max_rss_bytes", "rss_sampler", "rss_field", "os",
+    "hardware_class", "ram_bytes", "tool_versions",
 }
 
 
@@ -143,7 +152,10 @@ class ShardSpec:
 
 
 def load_preregistration(path: Path) -> Dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as handle:
+    path = Path(path)
+    if path.stat().st_size > 4 * 1024 * 1024:
+        raise SchemaError("preregistration exceeds its frozen byte cap before read")
+    with path.open(encoding="utf-8") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
         raise SchemaError("preregistration root must be an object")
@@ -159,15 +171,47 @@ def sha256_json(value: Any) -> str:
 
 
 def sha256_file(path: Path, byte_limit: int | None = None) -> tuple[str, int]:
+    path = Path(path)
+    admitted_size = path.stat().st_size
+    if byte_limit is not None and admitted_size > byte_limit:
+        raise SchemaError(f"{path} exceeds the frozen uncompressed byte cap before read")
     digest = hashlib.sha256()
     size = 0
-    with Path(path).open("rb") as handle:
+    with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             size += len(chunk)
             if byte_limit is not None and size > byte_limit:
                 raise SchemaError(f"{path} exceeds the frozen uncompressed byte cap")
             digest.update(chunk)
+    if size != admitted_size:
+        raise SchemaError(f"{path} changed while it was being read")
     return digest.hexdigest(), size
+
+
+def _read_single_json_record(path: Path, byte_limit: int, label: str) -> tuple[dict[str, Any], bytes]:
+    path = Path(path)
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SchemaError(f"{label} is not a regular file")
+    if metadata.st_size > byte_limit:
+        raise SchemaError(f"{label} exceeds its frozen byte cap before read")
+    with path.open("rb") as handle:
+        raw = handle.readline(byte_limit + 1)
+        if not raw:
+            raise SchemaError(f"{label} is empty")
+        if len(raw) > byte_limit or not raw.endswith(b"\n"):
+            raise SchemaError(f"{label} exceeds its frozen byte cap or lacks newline framing")
+        if handle.read(1):
+            raise SchemaError(f"{label} must contain exactly one JSON record")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError(f"{label} is malformed JSON") from exc
+    if not isinstance(value, dict):
+        raise SchemaError(f"{label} is not an object")
+    if len(raw) != metadata.st_size:
+        raise SchemaError(f"{label} changed while it was being read")
+    return value, raw
 
 
 def resolve_below_run_root(run_root: Path, relative_path: Any, label: str) -> Path:
@@ -492,6 +536,62 @@ def _expected_coordinates(preregistration: Mapping[str, Any], cell_id: str) -> t
     return target, [target[0] + delta[0], target[1] + delta[1]]
 
 
+def regenerate_frozen_attempt_inputs(
+    preregistration: Mapping[str, Any], cell_id: str, seed_index: int
+) -> dict[str, Any]:
+    if not _integer(seed_index) or seed_index < 0 or seed_index >= FROZEN_SEED_COUNT:
+        raise SchemaError("frozen DGP seed index is outside the preregistered schedule")
+    labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+    if set(labels) != set(DIMENSION_NAMES):
+        raise SchemaError("frozen DGP cell identity is malformed")
+    target, _ = _expected_coordinates(preregistration, cell_id)
+    seed_preimage = (
+        f"{preregistration['seed_schedule']['validation_seed']}||{cell_id}||{seed_index}||"
+        f"{target[0]},{target[1]}"
+    )
+    raw_values = deterministic_normals(hashlib.sha256(seed_preimage.encode("utf-8")).hexdigest(), 8)
+    dgp = preregistration["generator"]["scorer_replay_dgp"]
+    target_energy = (
+        ((raw_values[0] * raw_values[0] + raw_values[1] * raw_values[1])
+         + (raw_values[2] * raw_values[2] + raw_values[3] * raw_values[3]))
+        * 0.25
+        + dgp["noise_variance"]
+    )
+    reference_energy = (
+        ((raw_values[4] * raw_values[4] + raw_values[5] * raw_values[5])
+         + (raw_values[6] * raw_values[6] + raw_values[7] * raw_values[7]))
+        * 0.25
+        + dgp["noise_variance"]
+    )
+    stress = labels["eigen_stress"]
+    if stress == "well_separated":
+        correlation = dgp["pair_correlation"][labels["pair_geometry"]]
+        cross = correlation * math.sqrt(target_energy * reference_energy)
+        truth_matrix = [
+            [target_energy + dgp["well_separated_diagonal"][0], cross],
+            [cross, reference_energy + dgp["well_separated_diagonal"][1]],
+        ]
+    else:
+        leading = 1.0
+        trailing = 1.0 if stress == "tied_eigenvalue" else 1.0 - 2.0**-24
+        cosine = dgp["fixed_rotation"]["cosine"]
+        sine = dgp["fixed_rotation"]["sine"]
+        truth_matrix = [
+            [cosine * cosine * leading + sine * sine * trailing, cosine * sine * (leading - trailing)],
+            [cosine * sine * (leading - trailing), sine * sine * leading + cosine * cosine * trailing],
+        ]
+    weights = [1.0, -1.0]
+    truth_value = raw_values[0] / math.sqrt(2.0)
+    return {
+        "raw_input_values": raw_values,
+        "raw_input_sha256": numeric_digest("raw-input-v4", raw_values),
+        "truth_matrix": truth_matrix,
+        "truth_sha256": numeric_digest("truth-v4", itertools.chain.from_iterable(truth_matrix)),
+        "contrast_weights": weights,
+        "truth_value": truth_value,
+    }
+
+
 def realized_overlap_jaccard(target_count: Any, reference_count: Any, intersection_count: Any, union_count: Any) -> float:
     counts = (target_count, reference_count, intersection_count, union_count)
     if any(not _integer(value) or value < 0 for value in counts):
@@ -580,6 +680,7 @@ class CellAccumulator:
             for field_name in ("target_coordinate", "reference_coordinate")
         ) or attempt.get("target_coordinate") != target or attempt.get("reference_coordinate") != reference:
             raise SchemaError(f"cell {self.cell_id} has a coordinate identity mismatch")
+        self._validate_regenerated_inputs(attempt)
         status = attempt.get("status")
         if status not in ATTEMPT_STATUSES or not isinstance(attempt.get("emitted"), bool) or not isinstance(attempt.get("factor_emitted"), bool):
             raise SchemaError(f"cell {self.cell_id} has invalid status/emission flags")
@@ -593,6 +694,35 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has an undeclared not-evaluable attempt")
         elif attempt.get("factor_emitted") != attempt.get("emitted"):
             raise SchemaError(f"cell {self.cell_id} has inconsistent factor/emission flags")
+
+    def _validate_regenerated_inputs(self, attempt: Mapping[str, Any]) -> None:
+        expected = regenerate_frozen_attempt_inputs(
+            self.preregistration, self.cell_id, self.next_seed_index
+        )
+        raw_values = attempt.get("raw_input_values")
+        if (
+            not isinstance(raw_values, list)
+            or len(raw_values) != len(expected["raw_input_values"])
+            or any(not _number(value) for value in raw_values)
+            or raw_values != expected["raw_input_values"]
+            or attempt.get("raw_input_sha256") != expected["raw_input_sha256"]
+        ):
+            raise SchemaError(f"cell {self.cell_id} raw DGP does not match deterministic regeneration")
+        if attempt.get("truth_sha256") != expected["truth_sha256"]:
+            raise SchemaError(f"cell {self.cell_id} frozen truth digest does not match regeneration")
+        if attempt.get("status") == "masked_target":
+            return
+        try:
+            supplied_truth = _matrix(attempt.get("truth_matrix"), "truth matrix")
+        except SchemaError as exc:
+            raise SchemaError(f"cell {self.cell_id} frozen truth matrix is invalid") from exc
+        expected_truth = np.asarray(expected["truth_matrix"], dtype=np.float64)
+        if (
+            not np.array_equal(supplied_truth, expected_truth)
+            or attempt.get("contrast_weights") != expected["contrast_weights"]
+            or attempt.get("truth_value") != expected["truth_value"]
+        ):
+            raise SchemaError(f"cell {self.cell_id} frozen truth sufficient values were replaced")
 
     def _validate_masked(self, attempt: Mapping[str, Any]) -> None:
         if attempt.get("status") != "masked_target" or attempt.get("emitted") is not False or attempt.get("factor_emitted") is not False:
@@ -958,6 +1088,8 @@ def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, mani
         path = directory / f"cell-{spec.cell_ordinal_start + offset:05d}.jsonl"
         if path.is_symlink():
             raise SchemaError(f"shard {spec.index} cell summary must not be a symlink")
+        if path.stat().st_size > FROZEN_MAX_CELL_SUMMARY_BYTES:
+            raise SchemaError(f"shard {spec.index} cell summary exceeds its cap before read")
         with path.open("rb") as handle:
             summary, raw = _read_json_line(handle, path, 1)
             if summary is None:
@@ -1135,7 +1267,29 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
             expected = matrix[resource_id]
             if observation["repetition"] != repetition or observation["tile_pixels"] != expected["tile_pixels"] or observation["date_count"] != expected["dates"]:
                 raise SchemaError(f"resource {resource_id} observation scope drifted")
-            if type(observation["peak_rss_bytes"]) is not int or observation["peak_rss_bytes"] <= 0 or not _number(observation["wall_seconds"]) or observation["wall_seconds"] <= 0 or not _is_sha256(observation["raw_measurement_sha256"]):
+            raw_measurement = observation.get("raw_measurement")
+            expected_command = [
+                "cargo", "run", "--release", "-p", "dolphin-workflows", "--example",
+                "spatial_covariance_bench", "--", "--tile-pixels", str(expected["tile_pixels"]),
+                "--dates", str(expected["dates"]),
+            ]
+            if (
+                not isinstance(raw_measurement, dict)
+                or set(raw_measurement) != RESOURCE_RAW_MEASUREMENT_KEYS
+                or raw_measurement.get("command") != expected_command
+                or type(raw_measurement.get("exit_status")) is not int
+                or raw_measurement["exit_status"] != 0
+                or raw_measurement.get("wall_seconds") != observation.get("wall_seconds")
+                or raw_measurement.get("max_rss_bytes") != observation.get("peak_rss_bytes")
+                or any(raw_measurement.get(name) != sampling[name] for name in ("rss_sampler", "rss_field", "os", "hardware_class", "ram_bytes"))
+                or not isinstance(raw_measurement.get("tool_versions"), dict)
+                or set(raw_measurement["tool_versions"]) != {"rustc", "cargo", "uname"}
+                or any(not isinstance(value, str) or not value for value in raw_measurement["tool_versions"].values())
+                or len(_canonical_bytes(raw_measurement)) > sampling["max_encoded_raw_measurement_bytes"]
+                or observation.get("raw_measurement_sha256") != sha256_json(raw_measurement)
+            ):
+                raise SchemaError(f"resource {resource_id} raw resource measurement is invalid")
+            if type(observation["peak_rss_bytes"]) is not int or observation["peak_rss_bytes"] <= 0 or not _number(observation["wall_seconds"]) or observation["wall_seconds"] <= 0:
                 raise SchemaError(f"resource {resource_id} observation is not bound to raw measurements")
             observed.append(observation["peak_rss_bytes"])
         peaks[resource_id] = max(observed)
@@ -1157,13 +1311,18 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
 
 
 class _CellSummarySink:
-    def __init__(self, destination: Path | None):
+    def __init__(
+        self,
+        destination: Path | None,
+        byte_limit: int = FROZEN_CELL_SUMMARY_COMPONENT_BYTES,
+    ):
         self.destination = Path(destination) if destination is not None else None
         self.partial = self.destination.with_name(self.destination.name + ".partial") if self.destination is not None else None
         self.handle = None
         self.digest = hashlib.sha256()
         self.byte_count = 0
         self.record_count = 0
+        self.byte_limit = byte_limit
 
     def open(self) -> None:
         if self.destination is None:
@@ -1177,8 +1336,8 @@ class _CellSummarySink:
         if self.handle is None:
             return
         encoded = _canonical_bytes(summary) + b"\n"
-        if self.byte_count + len(encoded) > FROZEN_MAX_SHARD_BYTES:
-            raise SchemaError("cell-summary JSONL exceeds the frozen compact shard cap")
+        if self.byte_count + len(encoded) > self.byte_limit:
+            raise SchemaError("cell-summary JSONL exceeds the frozen full retained cell-summary cap")
         self.handle.write(encoded)
         self.digest.update(encoded)
         self.byte_count += len(encoded)
@@ -1208,8 +1367,11 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
         manifest_path = Path(manifest_path)
         if manifest_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
             raise SchemaError("partial run manifests are not admissible")
-        with manifest_path.open(encoding="utf-8") as handle:
-            run_manifest = json.load(handle)
+        run_manifest, _ = _read_single_json_record(
+            manifest_path,
+            preregistration["execution_protocol"]["max_encoded_run_manifest_bytes"],
+            "run manifest",
+        )
         if not isinstance(run_manifest, dict) or set(run_manifest) != RUN_MANIFEST_KEYS:
             raise SchemaError("run manifest has unknown or missing fields")
         if run_manifest["schema"] != "dolphinrust.spatial-covariance.run-manifest/4" or not _integer(run_manifest["schema_version"]) or run_manifest["schema_version"] != 4:
@@ -1241,11 +1403,17 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
             if entry_path.is_absolute() or ".." in entry_path.parts or entry_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
                 raise SchemaError(f"shard {spec.index} manifest path escapes the run root")
             resolved_entry = resolve_below_run_root(run_root, entry["path"], f"shard {spec.index} manifest path")
-            digest, _ = sha256_file(resolved_entry)
+            digest, _ = sha256_file(
+                resolved_entry,
+                preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
+            )
             if digest != entry["sha256"]:
                 raise SchemaError(f"shard {spec.index} manifest hash mismatch")
-            with resolved_entry.open(encoding="utf-8") as handle:
-                shard_manifest = json.load(handle)
+            shard_manifest, _ = _read_single_json_record(
+                resolved_entry,
+                preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
+                f"shard {spec.index} manifest",
+            )
             if shard_manifest.get("code_sha256") != run_manifest["code_sha256"] or shard_manifest.get("binary_sha256") != run_manifest["binary_sha256"]:
                 raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
             for summary in score_attempt_shard(preregistration, run_root, shard_manifest, spec):

@@ -9,7 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 try:
     from validation.score_spatial_covariance import (
@@ -17,6 +17,7 @@ try:
         INPUT_KEYS,
         CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
+        FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
         FROZEN_SEED_COUNT,
@@ -24,6 +25,7 @@ try:
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
@@ -45,6 +47,7 @@ except ModuleNotFoundError:
         INPUT_KEYS,
         CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
+        FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
         FROZEN_SEED_COUNT,
@@ -52,6 +55,7 @@ except ModuleNotFoundError:
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
@@ -71,6 +75,14 @@ except ModuleNotFoundError:
 
 def compact_json_line(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8") + b"\n"
+
+
+def _load_bounded_json(path: Path, byte_limit: int, label: str) -> Any:
+    path = Path(path)
+    if path.stat().st_size > byte_limit:
+        raise SchemaError(f"{label} exceeds its byte cap before read")
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def iter_attempt_requests(preregistration: Mapping[str, Any], spec: ShardSpec) -> Iterator[dict[str, Any]]:
@@ -283,10 +295,9 @@ def committed_shard_matches(
         resolved_manifest.relative_to(root)
         if Path(str(manifest_path) + ".partial").exists():
             return False
-        raw = resolved_manifest.read_bytes().splitlines()
-        if len(raw) != 1:
-            return False
-        manifest = json.loads(raw[0])
+        manifest, _ = _read_single_json_record(
+            resolved_manifest, FROZEN_MAX_RECORD_BYTES, f"shard {spec.index} manifest"
+        )
         validate_shard_manifest(preregistration, manifest, spec)
         if manifest["code_sha256"] != expected_code_sha256 or manifest["binary_sha256"] != expected_binary_sha256:
             return False
@@ -339,14 +350,10 @@ def build_run_manifest(
             relative = resolved.relative_to(run_root).as_posix()
         except ValueError as exc:
             raise SchemaError("shard manifest path must remain below the run root") from exc
-        digest, _ = sha256_file(resolved)
-        raw = resolved.read_bytes().splitlines()
-        if len(raw) != 1:
-            raise SchemaError(f"shard {spec.index} manifest is not one canonical record")
-        try:
-            shard_manifest = json.loads(raw[0])
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SchemaError(f"shard {spec.index} manifest is malformed") from exc
+        digest, _ = sha256_file(resolved, FROZEN_MAX_RECORD_BYTES)
+        shard_manifest, _ = _read_single_json_record(
+            resolved, FROZEN_MAX_RECORD_BYTES, f"shard {spec.index} manifest"
+        )
         validate_shard_manifest(preregistration, shard_manifest, spec)
         if shard_manifest["code_sha256"] != code_sha256 or shard_manifest["binary_sha256"] != binary_sha256:
             raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
@@ -383,7 +390,7 @@ def write_run_manifest_atomic(run_manifest: Mapping[str, Any], destination: Path
     if destination.exists() or partial.exists():
         raise SchemaError("refusing to overwrite run-manifest state")
     encoded = compact_json_line(run_manifest)
-    if len(encoded) > FROZEN_MAX_SHARD_BYTES:
+    if len(encoded) > FROZEN_MAX_RUN_MANIFEST_BYTES:
         raise SchemaError("run manifest exceeds the frozen uncompressed byte cap")
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -459,16 +466,37 @@ def _is_digest(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= set("0123456789abcdef")
 
 
-def _summary_root(preregistration: Mapping[str, Any], directory: Path, spec: ShardSpec, code_sha256: str, binary_sha256: str) -> tuple[str, int]:
+AttemptRegenerator = Callable[[str, int], Iterable[Mapping[str, Any]]]
+
+
+def _summary_root(
+    preregistration: Mapping[str, Any],
+    directory: Path,
+    spec: ShardSpec,
+    code_sha256: str,
+    binary_sha256: str,
+    attempt_regenerator: AttemptRegenerator | None = None,
+) -> tuple[str, int]:
     digest = hashlib.sha256(b"dolphinrust:spatial-covariance:cell-summary-root:v4\0")
     total_bytes = 0
     for offset, cell_id in enumerate(spec.cell_ids):
         path = directory / f"cell-{spec.cell_ordinal_start + offset:05d}.jsonl"
-        raw = path.read_bytes()
-        if len(raw.splitlines()) != 1 or len(raw) > FROZEN_MAX_RECORD_BYTES:
-            raise SchemaError(f"cell {cell_id} compact summary is malformed")
-        summary = json.loads(raw)
-        validate_cell_summary(preregistration, summary, cell_id, spec.cell_ordinal_start + offset, code_sha256, binary_sha256)
+        summary, raw = _read_single_json_record(
+            path,
+            preregistration["execution_protocol"]["max_encoded_cell_summary_bytes"],
+            f"cell {cell_id} compact summary",
+        )
+        cell_ordinal = spec.cell_ordinal_start + offset
+        validate_cell_summary(preregistration, summary, cell_id, cell_ordinal, code_sha256, binary_sha256)
+        if attempt_regenerator is not None:
+            accumulator = CellAccumulator(
+                preregistration, cell_id, cell_ordinal, FROZEN_SEED_COUNT, code_sha256, binary_sha256
+            )
+            for attempt in attempt_regenerator(cell_id, cell_ordinal):
+                accumulator.add(attempt)
+            regenerated = accumulator.finalize()
+            if compact_json_line(regenerated) != raw:
+                raise SchemaError(f"cell {cell_id} compact summary does not match deterministic replay")
         digest.update(offset.to_bytes(8, "big"))
         digest.update(hashlib.sha256(raw).digest())
         total_bytes += len(raw)
@@ -512,24 +540,55 @@ def commit_output_shard(
     return write_jsonl_atomic((manifest,), manifest_path, byte_limit=preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"])
 
 
-def committed_shard_matches(preregistration: Mapping[str, Any], spec: ShardSpec, run_root: Path, manifest_path: Path, expected_code_sha256: str, expected_binary_sha256: str) -> bool:
+def committed_shard_matches(
+    preregistration: Mapping[str, Any],
+    spec: ShardSpec,
+    run_root: Path,
+    manifest_path: Path,
+    expected_code_sha256: str,
+    expected_binary_sha256: str,
+    attempt_regenerator: AttemptRegenerator | None = None,
+) -> bool:
     try:
-        raw = Path(manifest_path).read_bytes().splitlines()
-        if len(raw) != 1:
+        if attempt_regenerator is None:
             return False
-        manifest = json.loads(raw[0])
+        manifest, _ = _read_single_json_record(
+            Path(manifest_path),
+            preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
+            f"shard {spec.index} manifest",
+        )
         validate_shard_manifest(preregistration, manifest, spec)
         if manifest["code_sha256"] != expected_code_sha256 or manifest["binary_sha256"] != expected_binary_sha256:
             return False
         directory = resolve_below_run_root(Path(run_root), manifest["summary_path"], "compact summary directory")
-        digest, size = _summary_root(preregistration, directory, spec, expected_code_sha256, expected_binary_sha256)
+        digest, size = _summary_root(
+            preregistration,
+            directory,
+            spec,
+            expected_code_sha256,
+            expected_binary_sha256,
+            attempt_regenerator,
+        )
         return digest == manifest["summary_sha256"] and size == manifest["summary_bytes"]
     except (OSError, ValueError, json.JSONDecodeError, SchemaError):
         return False
 
 
-def build_run_manifest(preregistration: Mapping[str, Any], run_root: Path, shard_manifest_paths: Iterable[Path], code_sha256: str, binary_sha256: str, performance_probe: Mapping[str, Any], resources: list[Mapping[str, Any]]) -> dict[str, Any]:
+def build_run_manifest(
+    preregistration: Mapping[str, Any],
+    run_root: Path,
+    shard_manifest_paths: Iterable[Path],
+    code_sha256: str,
+    binary_sha256: str,
+    performance_probe: Mapping[str, Any],
+    resources: list[Mapping[str, Any]],
+    attempt_regenerator: AttemptRegenerator | None = None,
+) -> dict[str, Any]:
     validate_preregistration(preregistration)
+    if attempt_regenerator is None:
+        raise SchemaError(
+            "exact shard assembly requires the Rust spatial_covariance_batch replay executable"
+        )
     paths = tuple(shard_manifest_paths)
     if len(paths) != FROZEN_SHARD_COUNT:
         raise SchemaError("run manifest requires exactly 891 compact shards")
@@ -541,8 +600,18 @@ def build_run_manifest(preregistration: Mapping[str, Any], run_root: Path, shard
     for spec, path in zip(iter_shard_specs(preregistration), paths):
         resolved = Path(path).resolve(strict=True)
         relative = resolved.relative_to(root).as_posix()
-        digest, _ = sha256_file(resolved)
-        if not committed_shard_matches(preregistration, spec, root, resolved, code_sha256, binary_sha256):
+        digest, _ = sha256_file(
+            resolved, preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"]
+        )
+        if not committed_shard_matches(
+            preregistration,
+            spec,
+            root,
+            resolved,
+            code_sha256,
+            binary_sha256,
+            attempt_regenerator,
+        ):
             raise SchemaError(f"shard {spec.index} is not exact compact committed evidence")
         entries.append({"path": relative, "sha256": digest})
         digests.append(digest)
@@ -620,10 +689,8 @@ def main() -> None:
         if args.destination.parent.resolve() != run_root:
             raise SchemaError("run-manifest destination parent must equal the run root")
         manifest_paths = [args.shard_manifest_directory / f"manifest-{index:05d}.jsonl" for index in range(FROZEN_SHARD_COUNT)]
-        with args.performance_probe.open(encoding="utf-8") as handle:
-            performance_probe = json.load(handle)
-        with args.resources.open(encoding="utf-8") as handle:
-            resources = json.load(handle)
+        performance_probe = _load_bounded_json(args.performance_probe, 1 << 20, "performance probe")
+        resources = _load_bounded_json(args.resources, 1 << 20, "resource receipts")
         run_manifest = build_run_manifest(
             preregistration, run_root, manifest_paths, args.code_sha256, args.binary_sha256,
             performance_probe, resources,

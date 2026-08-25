@@ -10,6 +10,8 @@ from validation.score_spatial_covariance import (
     ATTEMPT_KEYS,
     FROZEN_ATTEMPT_COUNT,
     FROZEN_CELL_COUNT,
+    FROZEN_CELL_SUMMARY_COMPONENT_BYTES,
+    FROZEN_MAX_SHARD_BYTES,
     FROZEN_RETAINED_SIZE_BOUND_BYTES,
     FROZEN_SEED_COUNT,
     FROZEN_SHARD_COUNT,
@@ -17,19 +19,23 @@ from validation.score_spatial_covariance import (
     CellAccumulator,
     SchemaError,
     ShardSpec,
+    _CellSummarySink,
     _expected_seed_hash,
     _growth_exponent,
+    _read_single_json_record,
     _validate_resources,
     deterministic_normals,
     expected_cell_ids,
     independently_recompute_metrics,
     load_preregistration,
     numeric_digest,
+    regenerate_frozen_attempt_inputs,
     sha256_json,
     validate_cell_summary,
     validate_preregistration,
 )
 from validation.spatial_covariance_simulation import (
+    build_run_manifest,
     commit_cell_transport,
     commit_output_shard,
     committed_shard_matches,
@@ -58,6 +64,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         window = generator["coordinates"]["window_stride"][f"{labels['half_window']}|{labels['stride']}"]
         target = window["target_by_position"][labels["position"]]
         delta = window["reference_delta_by_pair_geometry"][labels["pair_geometry"]]
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
         attempt = {
             "schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
             "cell_id": cell_id,
@@ -67,8 +74,9 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "status": "masked_target" if masked else "valid",
             "emitted": not masked,
             "factor_emitted": not masked,
-            "raw_input_sha256": "1" * 64,
-            "truth_sha256": "2" * 64,
+            "raw_input_values": frozen["raw_input_values"],
+            "raw_input_sha256": frozen["raw_input_sha256"],
+            "truth_sha256": frozen["truth_sha256"],
             "operator_hash": "3" * 64,
             "variance_hash": "4" * 64,
             "emission_hash": "5" * 64,
@@ -89,11 +97,11 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "signed_influence_sign": "zero",
             "effective_looks_fraction": 1.0,
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
-            "operator_matrix": None if masked else [[1.0, 0.25], [0.25, 2.0]],
-            "truth_matrix": None if masked else [[1.0, 0.25], [0.25, 2.0]],
-            "contrast_weights": None if masked else [1.0, -1.0],
+            "operator_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
+            "truth_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
+            "contrast_weights": None if masked else frozen["contrast_weights"],
             "estimate_value": None if masked else 0.0,
-            "truth_value": None if masked else 0.0,
+            "truth_value": None if masked else frozen["truth_value"],
             "operator_relative_error": None,
             "contrast_variance_reference": None,
             "contrast_variance_relative_error": None,
@@ -117,7 +125,21 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         sampling = self.preregistration["resource_sampling"]
         result = []
         for name in matrix:
-            observations = [{"repetition": repetition, "tile_pixels": matrix[name]["tile_pixels"], "date_count": matrix[name]["dates"], "peak_rss_bytes": peaks[name] - 2 + repetition, "wall_seconds": 1.0, "raw_measurement_sha256": f"{repetition + 1:064x}"} for repetition in range(3)]
+            observations = []
+            for repetition in range(3):
+                raw_measurement = {
+                    "command": ["cargo", "run", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_bench", "--", "--tile-pixels", str(matrix[name]["tile_pixels"]), "--dates", str(matrix[name]["dates"])],
+                    "exit_status": 0,
+                    "wall_seconds": 1.0,
+                    "max_rss_bytes": peaks[name] - 2 + repetition,
+                    "rss_sampler": sampling["rss_sampler"],
+                    "rss_field": sampling["rss_field"],
+                    "os": sampling["os"],
+                    "hardware_class": sampling["hardware_class"],
+                    "ram_bytes": sampling["ram_bytes"],
+                    "tool_versions": {"rustc": "rustc test", "cargo": "cargo test", "uname": "Darwin test"},
+                }
+                observations.append({"repetition": repetition, "tile_pixels": matrix[name]["tile_pixels"], "date_count": matrix[name]["dates"], "peak_rss_bytes": peaks[name] - 2 + repetition, "wall_seconds": 1.0, "raw_measurement": raw_measurement, "raw_measurement_sha256": sha256_json(raw_measurement)})
             item = {"resource_id": name, "status": PASS, "rss_bytes": peaks[name], "growth_class": "linear", "resource_hash": "", "config_hash": sha256_json(self.preregistration["generator"]), "binary_hash": BINARY, "os": sampling["os"], "hardware_class": sampling["hardware_class"], "ram_bytes": sampling["ram_bytes"], "rss_sampler": sampling["rss_sampler"], "rss_field": sampling["rss_field"], "warmup_runs": sampling["warmup_runs"], "measured_repetitions": sampling["measured_repetitions"], "tool_versions": sampling["tool_versions"], "growth_observation": observations, "area_growth_exponent": area, "date_growth_exponent": dates, "acceptance": sampling["acceptance"]}
             item["resource_hash"] = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
             result.append(item)
@@ -139,6 +161,26 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertLess(derived, 32 << 30)
         self.assertFalse(execution["retained_attempt_records"])
         self.assertFalse(execution["request_files_retained"])
+
+    def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
+        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 729_907_200)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 761_282_560)
+        encoded = compact_json_line({"cell": 1})
+        with tempfile.TemporaryDirectory() as directory:
+            exact = _CellSummarySink(Path(directory) / "exact.jsonl")
+            self.assertEqual(exact.byte_limit, FROZEN_CELL_SUMMARY_COMPONENT_BYTES)
+            exact.open()
+            exact.byte_count = FROZEN_CELL_SUMMARY_COMPONENT_BYTES - len(encoded)
+            exact.add({"cell": 1})
+            self.assertEqual(exact.byte_count, FROZEN_CELL_SUMMARY_COMPONENT_BYTES)
+            exact.abort()
+            over = _CellSummarySink(Path(directory) / "over.jsonl")
+            over.open()
+            over.byte_count = FROZEN_CELL_SUMMARY_COMPONENT_BYTES - len(encoded) + 1
+            with self.assertRaisesRegex(SchemaError, "full retained cell-summary cap"):
+                over.add({"cell": 1})
+            over.abort()
+        self.assertEqual(FROZEN_MAX_SHARD_BYTES, 819_200)
 
     def test_exact_request_regeneration_is_ordered_and_stable(self):
         spec = ShardSpec(0, 0, 1, (CELL,))
@@ -163,7 +205,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
     def test_python_independently_recomputes_all_numeric_claims(self):
         computed = independently_recompute_metrics(self._attempt(CELL, 0, 0))
         self.assertEqual(computed["operator_relative_error"], 0.0)
-        self.assertEqual(computed["contrast_variance_reference"], 2.5)
+        self.assertGreater(computed["contrast_variance_reference"], 0.0)
         self.assertTrue(computed["covered_95"])
         self.assertGreater(computed["interval_score"], 0.0)
 
@@ -174,6 +216,19 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
         with self.assertRaisesRegex(SchemaError, "fabricated|digest mismatch"):
             accumulator.add(attempt)
+
+    def test_producer_replaced_raw_input_or_truth_fails_regeneration(self):
+        raw = self._attempt(CELL, 0, 0)
+        raw["raw_input_values"][0] += 1.0
+        raw["raw_input_sha256"] = numeric_digest("raw-input-v4", raw["raw_input_values"])
+        with self.assertRaisesRegex(SchemaError, "raw DGP"):
+            CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(raw)
+        truth = self._attempt(CELL, 0, 0)
+        truth["truth_matrix"][0][0] += 0.5
+        truth["operator_matrix"] = copy.deepcopy(truth["truth_matrix"])
+        truth.update(independently_recompute_metrics(truth))
+        with self.assertRaisesRegex(SchemaError, "frozen truth"):
+            CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(truth)
 
     def test_cell_summary_binds_attempt_digest_and_scope(self):
         accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
@@ -216,8 +271,28 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             spec = ShardSpec(0, 0, 1, (MASKED_CELL,))
             manifest = root / "manifest.jsonl"
             commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
-            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY))
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(FROZEN_SEED_COUNT))
+            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             cells.joinpath("cell-00000.jsonl").write_text("{}\n")
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+
+    def test_resume_rejects_self_consistent_replaced_summary_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(FROZEN_SEED_COUNT)))
+            cell_path = cells / "cell-00000.jsonl"
+            commit_cell_transport(self.preregistration, MASKED_CELL, 0, transport, cell_path, CODE, BINARY)
+            summary = json.loads(cell_path.read_text())
+            summary["effective_looks_fraction"] = 0.5
+            cell_path.write_bytes(compact_json_line(summary))
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,))
+            manifest = root / "manifest.jsonl"
+            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(FROZEN_SEED_COUNT))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY))
 
     def test_prepare_retains_one_descriptor_not_attempt_lines(self):
@@ -239,6 +314,21 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         resources[0]["growth_observation"][0]["raw_measurement_sha256"] = "bad"
         with self.assertRaises(SchemaError):
             _validate_resources(self.preregistration, resources, BINARY)
+        resources = self._resource_receipts()
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        raw["command"][-1] = "999"
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_untrusted_single_record_is_sized_before_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oversized.jsonl"
+            with path.open("wb") as handle:
+                handle.truncate(129)
+            with self.assertRaisesRegex(SchemaError, "before read"):
+                _read_single_json_record(path, 128, "test manifest")
 
     def test_preregistration_drift_fails_closed(self):
         for section, field, value in (("thresholds", "coverage_absolute_error_max", 0.03), ("determinism", "prng", "unspecified"), ("numeric_contract", "operator_relative_error", "trust Rust"), ("execution_protocol", "retained_attempt_records", True)):
@@ -251,6 +341,12 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
         for command in ("prepare", "reduce-cell", "commit", "resume", "assemble"):
             self.assertIn(command, completed.stdout)
+
+    def test_assembly_fails_closed_until_rust_replay_executable_is_available(self):
+        with self.assertRaisesRegex(SchemaError, "Rust spatial_covariance_batch replay executable"):
+            build_run_manifest(
+                self.preregistration, Path.cwd(), (), CODE, BINARY, {}, self._resource_receipts()
+            )
 
 
 if __name__ == "__main__":
