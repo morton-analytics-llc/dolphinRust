@@ -1,616 +1,991 @@
 import copy
 import hashlib
 import json
-import shutil
+import math
+import os
 import subprocess
 import sys
 import tempfile
-import tracemalloc
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from validation.score_spatial_covariance import (
-    FAIL,
-    NOT_EVALUABLE,
-    PAIR_SIGN,
-    PASS,
-    CellAccumulator,
+    ATTEMPT_KEYS,
     FROZEN_ATTEMPT_COUNT,
     FROZEN_CELL_COUNT,
+    FROZEN_CELL_SUMMARY_COMPONENT_BYTES,
+    FROZEN_MAX_SHARD_BYTES,
+    FROZEN_MAX_RUN_MANIFEST_BYTES,
     FROZEN_MAX_RECORD_BYTES,
+    FROZEN_MAX_SHARD_MANIFEST_BYTES,
+    FROZEN_RETAINED_SIZE_BOUND_BYTES,
     FROZEN_SEED_COUNT,
     FROZEN_SHARD_COUNT,
+    PASS,
+    CellAccumulator,
     SchemaError,
     ShardSpec,
+    _CellSummarySink,
     _expected_seed_hash,
-    _validate_performance_probe,
+    _growth_exponent,
+    _read_hashed_json_record,
+    _read_single_json_record,
     _validate_resources,
+    deterministic_normals,
+    derive_dense_joint_oracle,
     expected_cell_ids,
-    iter_shard_specs,
+    expected_seed_count,
+    expected_production_artifact_provenance,
+    independently_recompute_metrics,
     load_preregistration,
-    preregistration_digest,
-    result_root_sha256,
-    score_attempt_shard,
-    score_receipt,
+    numeric_digest,
+    regenerate_frozen_attempt_inputs,
     sha256_json,
+    validate_cell_summary,
+    validate_direct_pair_variance_order,
     validate_preregistration,
-    validate_shard_manifest,
 )
 from validation.spatial_covariance_simulation import (
-    committed_shard_matches,
-    commit_output_shard,
+    _load_bounded_json,
     build_run_manifest,
+    commit_cell_transport,
+    commit_output_shard,
+    committed_shard_matches,
     compact_json_line,
-    derive_concurrency_receipt,
-    inspect_one_input_one_output,
+    capture_benchmark_stdout,
     iter_attempt_requests,
-    write_jsonl_atomic,
+    prepare_input_shard,
 )
 
 
 VALIDATION = Path(__file__).parents[1]
 PREREGISTRATION = VALIDATION / "spatial_covariance_preregistration.json"
-PR61_FIXTURE = VALIDATION / "fixtures" / "spatial_covariance_validation" / "pr61_bookkeeping_receipt.json"
+CODE = "a" * 64
+BINARY = "b" * 64
+CELL = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+SUPPORTED_CELL = "hw_1x1|stride_1|rect|interior|shared_75_positive|one_block|emi|well_separated|independent_complex_looks"
+RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|near_tie|spatial_correlation_stress"
+MASKED_CELL = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
 
 
-class SpatialCovarianceValidationV3Tests(unittest.TestCase):
+class SpatialCovarianceValidationV4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.preregistration = load_preregistration(PREREGISTRATION)
+        cls.artifact_directory = tempfile.TemporaryDirectory()
+        cls.artifact_root = Path(cls.artifact_directory.name)
+        cls.addClassCleanup(cls.artifact_directory.cleanup)
 
-    def test_v3_freezes_full_matrix_attempt_count_and_outcome_free_state(self):
-        validate_preregistration(self.preregistration)
-        self.assertEqual(self.preregistration["schema_version"], 3)
-        self.assertFalse(self.preregistration["outcomes_present"])
-        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 2)
-        self.assertFalse(self.preregistration["supersedes"]["outcomes_present"])
-        self.assertEqual(self.preregistration["matrix_contract"]["expected_cell_count"], FROZEN_CELL_COUNT)
-        self.assertEqual(self.preregistration["matrix_contract"]["expected_attempt_count"], FROZEN_ATTEMPT_COUNT)
-        self.assertEqual(len(expected_cell_ids(self.preregistration)), 89100)
-        self.assertTrue(self.preregistration["matrix_contract"]["source_process_axis_required"])
-        execution = self.preregistration["execution_protocol"]
-        self.assertLessEqual(execution["max_cells_per_shard"], 120)
-        self.assertEqual(execution["shard_count"], 891)
-        self.assertLessEqual(execution["max_cells_per_shard"] * FROZEN_SEED_COUNT * execution["max_encoded_output_record_bytes"], execution["max_uncompressed_output_bytes"])
+    def _write_artifact_sidecar(self, attempt, provenance, artifact_root=None):
+        artifact_root = self.artifact_root if artifact_root is None else Path(artifact_root)
+        artifact = attempt["production_artifact"]
+        sidecar = {
+            "schema": "dolphinrust.spatial-reference-covariance-artifact/4",
+            "schema_version": 4,
+            "hdf5_path": artifact["hdf5_path"],
+            "hdf5_sha256": artifact["hdf5_sha256"],
+            "factor_sha256": attempt["operator_sha256"],
+            "reference_provenance": provenance,
+            "reference_provenance_sha256": sha256_json(provenance),
+        }
+        raw = json.dumps(sidecar, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        (artifact_root / artifact["sidecar_path"]).write_bytes(raw)
+        artifact["sidecar_sha256"] = hashlib.sha256(raw).hexdigest()
+        attempt["production_artifact_sha256"] = sha256_json(artifact)
 
-    def test_driver_exposes_prepare_commit_resume_and_assemble_entrypoints(self):
-        completed = subprocess.run(
-            [sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"],
-            check=True,
-            capture_output=True,
-            text=True,
+    def _sync_artifact(self, attempt):
+        sidecar = json.loads(
+            (self.artifact_root / attempt["production_artifact"]["sidecar_path"]).read_text()
         )
-        for command in ("prepare", "commit", "resume", "assemble"):
-            self.assertIn(command, completed.stdout)
+        self._write_artifact_sidecar(attempt, sidecar["reference_provenance"])
 
-    def test_44550_count_from_omitting_source_process_is_rejected(self):
-        product_without_source_process = 3 * 3 * 3 * 5 * 11 * 5 * 2 * 3
-        self.assertEqual(product_without_source_process, 44550)
-        changed = copy.deepcopy(self.preregistration)
-        changed["matrix_contract"]["expected_cell_count"] = product_without_source_process
-        changed["matrix_contract"]["expected_attempt_count"] = product_without_source_process * FROZEN_SEED_COUNT
-        changed["matrix_contract"]["source_process_axis_required"] = False
-        with self.assertRaisesRegex(SchemaError, "89100"):
-            validate_preregistration(changed)
-
-    def test_scientific_axes_seeds_thresholds_and_generator_are_immutable(self):
-        mutations = (
-            ("thresholds", "coverage_absolute_error_max", 0.03),
-            ("seed_schedule", "attempted_seeds_per_cell", 4999),
-            ("generator", "source_centered_empirical", {"model": "drift"}),
-            ("execution_protocol", "max_cells_per_shard", 121),
-            ("cell_reducers", "coverage_95", "wrong denominator"),
+    def _accumulator(self, cell_id, ordinal=0, seeds=1):
+        return CellAccumulator(
+            self.preregistration, cell_id, ordinal, seeds, CODE, BINARY,
+            artifact_root=self.artifact_root,
         )
-        for section, field, value in mutations:
-            changed = copy.deepcopy(self.preregistration)
-            changed[section][field] = value
-            with self.subTest(section=section, field=field), self.assertRaises(SchemaError):
-                validate_preregistration(changed)
 
-    def test_all_shards_are_contiguous_complete_and_at_most_120_cells(self):
-        expected_start = 0
-        count = 0
-        last = None
-        for spec in iter_shard_specs(self.preregistration):
-            self.assertEqual(spec.index, count)
-            self.assertEqual(spec.cell_ordinal_start, expected_start)
-            self.assertEqual(spec.cell_ordinal_end_exclusive - spec.cell_ordinal_start, len(spec.cell_ids))
-            self.assertLessEqual(len(spec.cell_ids), 120)
-            expected_start = spec.cell_ordinal_end_exclusive
-            count += 1
-            last = spec
-        self.assertEqual(count, FROZEN_SHARD_COUNT)
-        self.assertEqual(expected_start, FROZEN_CELL_COUNT)
-        self.assertEqual(len(last.cell_ids), 100)
-
-    def test_request_stream_is_exact_ordered_seed_schedule_without_top_up(self):
-        cell_id = next(iter(expected_cell_ids(self.preregistration)))
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        count = 0
-        first = None
-        last = None
-        for request in iter_attempt_requests(self.preregistration, spec):
-            first = request if first is None else first
-            last = request
-            self.assertEqual(request["seed_index"], count)
-            count += 1
-        self.assertEqual(count, 5000)
-        self.assertEqual(first["seed_index"], 0)
-        self.assertEqual(last["seed_index"], 4999)
-        self.assertEqual(last["seed_sha256"], _expected_seed_hash(self.preregistration, cell_id, 4999))
-
-    def test_byte_cap_fails_without_final_or_partial_artifact(self):
-        with tempfile.TemporaryDirectory() as directory:
-            destination = Path(directory) / "attempts.jsonl"
-            with self.assertRaisesRegex(SchemaError, "byte cap"):
-                write_jsonl_atomic(({"value": "x" * 64},), destination, byte_limit=16)
-            self.assertFalse(destination.exists())
-            self.assertFalse(Path(str(destination) + ".partial").exists())
-
-    def test_one_input_one_output_rejects_missing_out_of_order_and_malformed(self):
-        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            input_path = root / "input.jsonl"
-            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
-            missing = root / "missing.jsonl.partial"
-            missing.write_bytes(b"".join(compact_json_line(self._attempt(cell_id, 0, seed, status="masked_target")) for seed in range(4999)))
-            with self.assertRaisesRegex(SchemaError, "cardinality"):
-                inspect_one_input_one_output(self.preregistration, spec, input_path, missing)
-            order = root / "order.jsonl.partial"
-            order.write_bytes(b"".join(compact_json_line(self._attempt(cell_id, 0, seed, status="masked_target")) for seed in (1, 0)))
-            with self.assertRaisesRegex(SchemaError, "order/identity"):
-                inspect_one_input_one_output(self.preregistration, spec, input_path, order)
-            malformed = root / "malformed.jsonl.partial"
-            malformed.write_bytes(b"{\n")
-            with self.assertRaisesRegex(SchemaError, "malformed"):
-                inspect_one_input_one_output(self.preregistration, spec, input_path, malformed)
-
-    def _attempt(self, cell_id, ordinal, seed_index, status="valid", covered=True):
+    def _attempt(self, cell_id, ordinal, seed_index, masked=False, artifact_root=None):
+        artifact_root = self.artifact_root if artifact_root is None else Path(artifact_root)
         labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
         generator = self.preregistration["generator"]
         window = generator["coordinates"]["window_stride"][f"{labels['half_window']}|{labels['stride']}"]
         target = window["target_by_position"][labels["position"]]
         delta = window["reference_delta_by_pair_geometry"][labels["pair_geometry"]]
-        reference = [target[0] + delta[0], target[1] + delta[1]]
-        masked = status == "masked_target"
-        return {
-            "schema": "dolphinrust.spatial-covariance.attempt-receipt/3",
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
+        sign = "zero"
+        influence = 0.0
+        if labels["pair_geometry"].endswith("_positive"):
+            sign = "positive"
+        elif labels["pair_geometry"].endswith("_negative"):
+            sign = "negative"
+        elif labels["pair_geometry"].startswith("disjoint_"):
+            sign = "none"
+        if sign in {"positive", "negative"}:
+            influence = (
+                frozen["target_global_loading_mean"]
+                * frozen["reference_global_loading_mean"]
+            )
+        attempt = {
+            "schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
             "cell_id": cell_id,
             "cell_ordinal": ordinal,
             "seed_index": seed_index,
             "seed_sha256": _expected_seed_hash(self.preregistration, cell_id, seed_index),
-            "status": status,
+            "status": "masked_target" if masked else "valid",
             "emitted": not masked,
             "factor_emitted": not masked,
-            "raw_input_sha256": "1" * 64,
-            "truth_sha256": "2" * 64,
-            "operator_hash": "3" * 64,
-            "variance_hash": "4" * 64,
-            "emission_hash": "5" * 64,
+            "raw_input_shape": frozen["raw_input_shape"],
+            "raw_input_value_count": frozen["raw_input_value_count"],
+            "raw_input_sha256": frozen["raw_input_sha256"],
+            "target_raw_input_sha256": frozen["target_raw_input_sha256"],
+            "reference_raw_input_sha256": frozen["reference_raw_input_sha256"],
+            "sequential_ancestry_sha256": frozen["sequential_ancestry_sha256"],
+            "raw_dgp_identity_sha256": frozen["raw_dgp_identity_sha256"],
+            "latent_history_sha256": frozen["latent_history_sha256"],
+            "estimate_sha256": "0" * 64,
+            "predicted_covariance_sha256": "0" * 64,
             "date_axis_sha256": sha256_json(generator["acquisition"]["topologies"][labels["block_topology"]]["date_axis"]),
             "generator_hash": sha256_json(generator),
             "config_hash": sha256_json(generator),
             "source_model_hash": sha256_json(generator["source_centered_empirical"]),
             "target_coordinate": target,
-            "reference_coordinate": reference,
-            "target_support_sha256": "6" * 64,
-            "reference_support_sha256": "6" * 64,
-            "target_source_count": 4,
-            "reference_source_count": 4,
-            "intersection_source_count": 4,
-            "union_source_count": 4,
-            "realized_overlap_jaccard": 1.0,
-            "signed_cross_influence": None if masked else 0.0,
-            "signed_influence_sign": PAIR_SIGN[labels["pair_geometry"]],
-            "effective_looks_fraction": 1.0,
+            "reference_coordinate": [target[0] + delta[0], target[1] + delta[1]],
+            "target_support_sha256": frozen["target_support_sha256"],
+            "reference_support_sha256": frozen["reference_support_sha256"],
+            "target_source_count": frozen["target_source_count"],
+            "reference_source_count": frozen["reference_source_count"],
+            "intersection_source_count": frozen["intersection_source_count"],
+            "union_source_count": frozen["union_source_count"],
+            "realized_overlap_jaccard": frozen["intersection_source_count"] / frozen["union_source_count"],
+            "signed_cross_influence": None if masked else influence,
+            "signed_influence_sign": sign,
+            "effective_looks_fraction": frozen["effective_looks_fraction"],
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
-            "operator_relative_error": None if masked else 0.0,
-            "contrast_variance_reference": None if masked else 1.0,
-            "contrast_variance_relative_error": None if masked else 0.0,
-            "psd_min_eigenvalue": None if masked else 0.0,
-            "covered_95": None if masked else covered,
-            "interval_score": None if masked else 1.0,
-            "interval_width": None if masked else 1.0,
+            "estimator_branch": labels["estimator"],
+            "target_estimate_history": None if masked else copy.deepcopy(frozen["latent_target_history"]),
+            "reference_estimate_history": None if masked else copy.deepcopy(frozen["latent_reference_history"]),
+            "predicted_difference_covariance": None,
+            "production_operator_matrix": None,
+            "contrast_weights": None,
+            "operator_sha256": "0" * 64,
         }
+        provenance = expected_production_artifact_provenance(
+            self.preregistration, cell_id, seed_index
+        )
+        artifact_stem = hashlib.sha256(f"{cell_id}|{ordinal}|{seed_index}".encode()).hexdigest()
+        hdf5_path = f"artifacts/{artifact_stem}.h5"
+        sidecar_path = f"artifacts/{artifact_stem}.json"
+        (artifact_root / "artifacts").mkdir(exist_ok=True)
+        hdf5_bytes = b"dolphinrust-hdf5-v4\0" + artifact_stem.encode()
+        (artifact_root / hdf5_path).write_bytes(hdf5_bytes)
+        artifact = {
+            "schema": "dolphinrust.spatial-covariance.production-artifact-binding/4",
+            "hdf5_path": hdf5_path,
+            "sidecar_path": sidecar_path,
+            "hdf5_sha256": hashlib.sha256(hdf5_bytes).hexdigest(),
+            "sidecar_sha256": "0" * 64,
+        }
+        attempt["production_artifact"] = artifact
+        if not masked:
+            dates = len(frozen["latent_target_history"])
+            covariance = copy.deepcopy(frozen["oracle_difference_covariance"])
+            attempt["predicted_difference_covariance"] = covariance
+            joint = copy.deepcopy(frozen["dense_joint_oracle"])
+            attempt["production_operator_matrix"] = copy.deepcopy(joint)
+            attempt["contrast_weights"] = [0.0] * (2 * dates)
+            attempt["contrast_weights"][dates - 1] = 1.0
+            attempt["contrast_weights"][-1] = -1.0
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
+            attempt["predicted_covariance_sha256"] = numeric_digest(
+                "predicted-difference-covariance-v4",
+                [value for row in covariance for value in row],
+            )
+            attempt["operator_sha256"] = numeric_digest(
+                "production-operator-v4", [value for row in joint for value in row]
+            )
+        self._write_artifact_sidecar(attempt, provenance, artifact_root)
+        self.assertEqual(set(attempt), ATTEMPT_KEYS)
+        return attempt
 
-    def test_cell_reducers_use_frozen_max_min_and_denominators(self):
-        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
-        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=20)
-        for seed_index in range(20):
-            attempt = self._attempt(cell_id, 0, seed_index, covered=seed_index < 19)
-            attempt["operator_relative_error"] = seed_index * 1e-13
-            attempt["contrast_variance_relative_error"] = seed_index * 1e-3
-            attempt["psd_min_eigenvalue"] = seed_index * -1e-12
+    def _set_operator_and_difference(self, attempt, difference):
+        dates = len(difference)
+        joint = [[0.0] * (2 * dates) for _ in range(2 * dates)]
+        for row in range(dates):
+            for column in range(dates):
+                joint[row][column] = difference[row][column]
+        attempt["production_operator_matrix"] = joint
+        attempt["predicted_difference_covariance"] = copy.deepcopy(difference)
+        attempt["predicted_covariance_sha256"] = numeric_digest(
+            "predicted-difference-covariance-v4", [value for row in difference for value in row]
+        )
+        attempt["operator_sha256"] = numeric_digest(
+            "production-operator-v4", [value for row in joint for value in row]
+        )
+        self._sync_artifact(attempt)
+
+    def _sync_difference_from_operator(self, attempt):
+        joint = attempt["production_operator_matrix"]
+        dates = len(joint) // 2
+        raw_difference = [
+            [
+                joint[row][column] + joint[dates + row][dates + column]
+                - joint[row][dates + column] - joint[dates + row][column]
+                for column in range(dates)
+            ]
+            for row in range(dates)
+        ]
+        difference = [
+            [0.0 if row == 0 or column == 0 else 0.5 * (raw_difference[row][column] + raw_difference[column][row])
+             for column in range(dates)]
+            for row in range(dates)
+        ]
+        attempt["predicted_difference_covariance"] = difference
+        attempt["predicted_covariance_sha256"] = numeric_digest(
+            "predicted-difference-covariance-v4", [value for row in difference for value in row]
+        )
+
+    def _resource_receipts(self):
+        matrix = {item["id"]: item for item in self.preregistration["resource_matrix"]}
+        peaks = {name: 100_000_000 + matrix[name]["tile_pixels"] * 100 + matrix[name]["dates"] * 10_000 for name in matrix}
+        area_names = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26")
+        date_names = ("area_256_dates_13", "area_256_dates_26", "area_256_dates_52")
+        area = _growth_exponent([(matrix[name]["tile_pixels"], peaks[name]) for name in area_names])
+        dates = _growth_exponent([(matrix[name]["dates"], peaks[name]) for name in date_names])
+        sampling = self.preregistration["resource_sampling"]
+        result = []
+        for name in matrix:
+            tile_pixels = matrix[name]["tile_pixels"]
+            date_count = matrix[name]["dates"]
+            microbatch_pixels = min(tile_pixels, 4096)
+            allocation_model = {"model": "named-allocation-components-v1", "area_axis": "tile_pixels", "date_axis": "date_count", "forbid_multiple_area_scaled_axes": True}
+            block_count = max(1, math.ceil(date_count / 7))
+            dependency_cone = {
+                "model": "spatial-query-cone-v1", "tile_pixels": tile_pixels,
+                "date_count": date_count, "maximum_sources": tile_pixels,
+                "block_count": block_count, "maximum_dependency_depth": block_count - 1,
+                "reference_cone_sources": tile_pixels,
+            }
+            microbatch = {"model": "bounded-microbatch-v1", "microbatch_pixels": microbatch_pixels, "batch_count": (tile_pixels + microbatch_pixels - 1) // microbatch_pixels}
+            component_specs = (
+                ("source_cache", 16, [("tile_pixels", tile_pixels, True), ("date_count", date_count, False)]),
+                ("reverse_adjoint", 8, [("tile_pixels", tile_pixels, True), ("date_count", date_count, False)]),
+                ("joint_covariance", 8, [("date_count", date_count, False), ("date_count", date_count, False)]),
+                ("difference_covariance", 8, [("date_count", date_count, False), ("date_count", date_count, False)]),
+                ("microbatch_workspace", 16, [("microbatch_pixels", microbatch_pixels, True), ("date_count", date_count, False)]),
+            )
+            components = []
+            for component_name, coefficient, axes in component_specs:
+                component = {
+                    "name": component_name,
+                    "coefficient_bytes": coefficient,
+                    "axis_factors": [
+                        {"axis": axis, "extent": extent, "area_scaled": area_scaled}
+                        for axis, extent, area_scaled in axes
+                    ],
+                    "bytes": coefficient * math.prod(extent for _, extent, _ in axes),
+                    "component_sha256": "",
+                }
+                component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+                components.append(component)
+            observations = []
+            for repetition in range(3):
+                allocation_measurement = {
+                    "block_count": dependency_cone["block_count"],
+                    "maximum_sources_per_block": matrix[name]["tile_pixels"],
+                    "maximum_dependency_depth": dependency_cone["maximum_dependency_depth"],
+                    "reference_cone_sources": matrix[name]["tile_pixels"],
+                    "persisted_block_bytes": 16 * matrix[name]["tile_pixels"] * matrix[name]["dates"],
+                    "scratch_bytes": 16 * matrix[name]["tile_pixels"] * matrix[name]["dates"],
+                    "final_bytes": 8 * matrix[name]["dates"] * matrix[name]["dates"],
+                    "allocation_components": copy.deepcopy(components),
+                    "maximum_simultaneously_retained_bytes": 0,
+                }
+                allocation_measurement["maximum_simultaneously_retained_bytes"] = (
+                    allocation_measurement["persisted_block_bytes"]
+                    + allocation_measurement["scratch_bytes"]
+                    + allocation_measurement["final_bytes"]
+                    + sum(component["bytes"] for component in components)
+                )
+                stdout_json = json.dumps(
+                    allocation_measurement, sort_keys=True, separators=(",", ":")
+                ) + "\n"
+                raw_measurement = {
+                    "command": ["cargo", "run", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_bench", "--", "--tile-pixels", str(matrix[name]["tile_pixels"]), "--dates", str(matrix[name]["dates"])],
+                    "exit_status": 0,
+                    "wall_seconds": 1.0,
+                    "max_rss_bytes": peaks[name] - 2 + repetition,
+                    "rss_sampler": sampling["rss_sampler"],
+                    "rss_field": sampling["rss_field"],
+                    "os": sampling["os"],
+                    "hardware_class": sampling["hardware_class"],
+                    "ram_bytes": sampling["ram_bytes"],
+                    "tool_versions": {"rustc": "rustc test", "cargo": "cargo test", "uname": "Darwin test"},
+                    "stdout_bytes": len(stdout_json.encode()),
+                    "stdout_sha256": hashlib.sha256(stdout_json.encode()).hexdigest(),
+                    "stdout_json": stdout_json,
+                }
+                observations.append({"repetition": repetition, "tile_pixels": matrix[name]["tile_pixels"], "date_count": matrix[name]["dates"], "peak_rss_bytes": peaks[name] - 2 + repetition, "wall_seconds": 1.0, "raw_measurement": raw_measurement, "raw_measurement_sha256": sha256_json(raw_measurement)})
+            item = {"resource_id": name, "status": PASS, "rss_bytes": peaks[name], "growth_class": "linear", "resource_hash": "", "config_hash": sha256_json(self.preregistration["generator"]), "binary_hash": BINARY, "os": sampling["os"], "hardware_class": sampling["hardware_class"], "ram_bytes": sampling["ram_bytes"], "rss_sampler": sampling["rss_sampler"], "rss_field": sampling["rss_field"], "warmup_runs": sampling["warmup_runs"], "measured_repetitions": sampling["measured_repetitions"], "tool_versions": sampling["tool_versions"], "growth_observation": observations, "area_growth_exponent": area, "date_growth_exponent": dates, "acceptance": sampling["acceptance"], "allocation_model": allocation_model, "allocation_model_sha256": sha256_json(allocation_model), "dependency_cone": dependency_cone, "dependency_cone_sha256": sha256_json(dependency_cone), "microbatch": microbatch, "microbatch_sha256": sha256_json(microbatch), "allocation_components": components}
+            item["resource_hash"] = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
+            result.append(item)
+        return result
+
+    def test_v4_supersedes_v3_outcome_free_without_changing_matrix(self):
+        validate_preregistration(self.preregistration)
+        self.assertEqual(self.preregistration["schema_version"], 4)
+        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 3)
+        self.assertFalse(self.preregistration["outcomes_present"])
+        self.assertEqual(len(expected_cell_ids(self.preregistration)), FROZEN_CELL_COUNT)
+        self.assertEqual(FROZEN_ATTEMPT_COUNT, 725_208)
+        counts = [expected_seed_count(cell_id) for cell_id in expected_cell_ids(self.preregistration)]
+        self.assertEqual(counts.count(FROZEN_SEED_COUNT), 145)
+        self.assertEqual(counts.count(1), 208)
+        self.assertEqual(FROZEN_SHARD_COUNT, 4)
+
+    def test_compact_design_covers_every_pairwise_level_combination(self):
+        cells = [cell_id.split("|") for cell_id in expected_cell_ids(self.preregistration)]
+        dimensions = self.preregistration["matrix_contract"]["dimension_order"]
+        values = [[item["id"] for item in self.preregistration["dimensions"][name]] for name in dimensions]
+        for first in range(len(dimensions)):
+            for second in range(first + 1, len(dimensions)):
+                observed = {(cell[first], cell[second]) for cell in cells}
+                expected = {(left, right) for left in values[first] for right in values[second]}
+                self.assertTrue(expected <= observed, (dimensions[first], dimensions[second]))
+        self.assertEqual(sum(expected_seed_count("|".join(cell)) for cell in cells), FROZEN_ATTEMPT_COUNT)
+
+    def test_all_supported_interior_disjoint_cells_retain_5000_seed_coverage(self):
+        for cell_id in expected_cell_ids(self.preregistration):
+            labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
+            if (
+                labels["position"] == "interior"
+                and labels["eigen_stress"] != "tied_eigenvalue"
+                and labels["pair_geometry"].startswith("disjoint_")
+            ):
+                self.assertEqual(expected_seed_count(cell_id), FROZEN_SEED_COUNT)
+
+    def test_ephemeral_evidence_is_estimator_history_not_realized_truth(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        self.assertEqual(attempt["estimator_branch"], "emi")
+        self.assertIn("target_estimate_history", attempt)
+        self.assertIn("reference_estimate_history", attempt)
+        self.assertIn("predicted_difference_covariance", attempt)
+        self.assertIn("latent_history_sha256", attempt)
+        self.assertNotIn("truth_matrix", ATTEMPT_KEYS)
+        self.assertNotIn("truth_value", ATTEMPT_KEYS)
+
+    def test_estimator_branch_and_latent_history_drift_fail_closed(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["estimator_branch"] = "evd"
+        with self.assertRaisesRegex(SchemaError, "estimator"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["latent_history_sha256"] = "f" * 64
+        with self.assertRaisesRegex(SchemaError, "latent"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        sidecar_path = self.artifact_root / attempt["production_artifact"]["sidecar_path"]
+        sidecar = json.loads(sidecar_path.read_text())
+        sidecar["reference_provenance"]["estimator_branch"] = "evd"
+        self._write_artifact_sidecar(attempt, sidecar["reference_provenance"])
+        with self.assertRaisesRegex(SchemaError, "production HDF5"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+
+    def test_operator_and_contrast_variance_errors_are_independently_gated(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["production_operator_matrix"][-1][-1] = 2.0
+        self._sync_difference_from_operator(attempt)
+        attempt["operator_sha256"] = numeric_digest(
+            "production-operator-v4",
+            [value for row in attempt["production_operator_matrix"] for value in row],
+        )
+        self._sync_artifact(attempt)
+        accumulator = self._accumulator(SUPPORTED_CELL)
+        accumulator.add(attempt)
+        self.assertEqual(accumulator.finalize()["status"], "fail")
+
+    def test_emi_and_evd_estimator_histories_are_both_exercised_and_bound(self):
+        for cell_id, branch in ((SUPPORTED_CELL, "emi"), (RISK_CELL, "evd")):
+            attempt = self._attempt(cell_id, 0, 0)
+            self.assertEqual(attempt["estimator_branch"], branch)
+            accumulator = self._accumulator(cell_id)
+            accumulator.add(attempt)
+            self.assertEqual(accumulator.finalize()["emitted_seeds"], 1)
+
+    def test_retained_bound_is_derived_and_below_32_gib(self):
+        execution = self.preregistration["execution_protocol"]
+        derived = FROZEN_CELL_COUNT * execution["max_encoded_cell_summary_bytes"] + FROZEN_SHARD_COUNT * execution["max_encoded_shard_manifest_bytes"] + execution["max_encoded_run_manifest_bytes"]
+        self.assertEqual(derived, FROZEN_RETAINED_SIZE_BOUND_BYTES)
+        self.assertLess(derived, 32 << 30)
+        self.assertFalse(execution["retained_attempt_records"])
+        self.assertFalse(execution["request_files_retained"])
+
+    def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
+        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 2_891_776)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 19_734_528)
+        encoded = compact_json_line({"cell": 1})
+        with tempfile.TemporaryDirectory() as directory:
+            exact = _CellSummarySink(Path(directory) / "exact.jsonl")
+            self.assertEqual(exact.byte_limit, FROZEN_CELL_SUMMARY_COMPONENT_BYTES)
+            exact.open()
+            exact.byte_count = FROZEN_CELL_SUMMARY_COMPONENT_BYTES - len(encoded)
+            exact.add({"cell": 1})
+            self.assertEqual(exact.byte_count, FROZEN_CELL_SUMMARY_COMPONENT_BYTES)
+            exact.abort()
+            over = _CellSummarySink(Path(directory) / "over.jsonl")
+            over.open()
+            over.byte_count = FROZEN_CELL_SUMMARY_COMPONENT_BYTES - len(encoded) + 1
+            with self.assertRaisesRegex(SchemaError, "full retained cell-summary cap"):
+                over.add({"cell": 1})
+            over.abort()
+        self.assertEqual(FROZEN_MAX_SHARD_BYTES, 819_200)
+
+    def test_exact_request_regeneration_is_ordered_and_stable(self):
+        spec = ShardSpec(0, 0, 1, (SUPPORTED_CELL,), (expected_seed_count(SUPPORTED_CELL),))
+        generator = iter_attempt_requests(self.preregistration, spec)
+        first = [next(generator), next(generator)]
+        repeated_generator = iter_attempt_requests(self.preregistration, spec)
+        repeated = [next(repeated_generator), next(repeated_generator)]
+        self.assertEqual(first, repeated)
+        self.assertEqual([item["seed_index"] for item in first], [0, 1])
+        self.assertEqual(first[0]["schema"], "dolphinrust.spatial-covariance.attempt/4")
+
+    def test_sha256_ctr_box_muller_has_frozen_golden_values(self):
+        values = deterministic_normals("00" * 32, 4)
+        self.assertEqual([value.hex() for value in values], ["-0x1.24d403dd03f46p+0", "0x1.7c127730e66f0p+0", "0x1.d80472ced3428p-2", "0x1.ab0b83421b7ecp-2"])
+        self.assertNotEqual(values, deterministic_normals("01" * 32, 4))
+
+    def test_numeric_encoding_canonicalizes_negative_zero(self):
+        self.assertEqual(numeric_digest("truth-v4", [0.0, 1.0]), numeric_digest("truth-v4", [-0.0, 1.0]))
+        with self.assertRaises(SchemaError):
+            numeric_digest("truth-v4", [float("nan")])
+
+    def test_python_independently_recomputes_all_numeric_claims(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
+        computed = independently_recompute_metrics(
+            attempt, frozen["latent_target_history"], frozen["latent_reference_history"],
+            derive_dense_joint_oracle(self.preregistration, SUPPORTED_CELL, frozen),
+        )
+        self.assertTrue(all(value == 0.0 for value in computed["error"]))
+        self.assertEqual(int(computed["covered"].sum()), len(frozen["latent_target_history"]) - 1)
+        self.assertGreater(float(computed["interval_score"].sum()), 0.0)
+
+    def test_fabricated_zero_and_self_attested_hashes_are_rejected(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["target_estimate_history"][-1] += 0.5
+        accumulator = self._accumulator(SUPPORTED_CELL)
+        with self.assertRaisesRegex(SchemaError, "digest mismatch"):
+            accumulator.add(attempt)
+
+    def test_producer_replaced_raw_input_or_latent_history_fails_regeneration(self):
+        raw = self._attempt(CELL, 0, 0)
+        raw["raw_input_sha256"] = "f" * 64
+        with self.assertRaisesRegex(SchemaError, "raw DGP"):
+            self._accumulator(CELL).add(raw)
+        latent = self._attempt(CELL, 0, 0)
+        latent["latent_history_sha256"] = "e" * 64
+        with self.assertRaisesRegex(SchemaError, "latent history"):
+            self._accumulator(CELL).add(latent)
+
+    def test_full_production_shaped_dgp_binds_support_ancestry_and_raw_content(self):
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, RISK_CELL, 0)
+        dates = len(self.preregistration["generator"]["acquisition"]["topologies"]["four_blocks"]["date_axis"])
+        self.assertEqual(frozen["raw_input_shape"], [frozen["union_source_count"], dates, 2])
+        self.assertEqual(frozen["raw_input_value_count"], 2 * dates * frozen["union_source_count"])
+        self.assertGreater(frozen["raw_input_value_count"], 10_000)
+        self.assertEqual(len(frozen["latent_target_history"]), dates)
+        self.assertEqual(len(frozen["latent_reference_history"]), dates)
+        self.assertLessEqual(len(compact_json_line(self._attempt(RISK_CELL, 0, 0))), FROZEN_MAX_RECORD_BYTES)
+        for name in (
+            "raw_input_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
+            "target_support_sha256", "reference_support_sha256", "sequential_ancestry_sha256",
+            "raw_dgp_identity_sha256",
+        ):
+            self.assertEqual(len(frozen[name]), 64)
+
+        attempt = self._attempt(CELL, 0, 0)
+        attempt["sequential_ancestry_sha256"] = "f" * 64
+        attempt["raw_dgp_identity_sha256"] = "e" * 64
+        attempt["target_support_sha256"] = "d" * 64
+        attempt["reference_support_sha256"] = "d" * 64
+        with self.assertRaisesRegex(SchemaError, "raw DGP|support|ancestry"):
+            self._accumulator(CELL).add(attempt)
+
+    def test_coincident_pair_is_the_same_source_and_exact_zero_contrast(self):
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
+        self.assertEqual(frozen["target_support_sha256"], frozen["reference_support_sha256"])
+        self.assertEqual(frozen["target_raw_input_sha256"], frozen["reference_raw_input_sha256"])
+        self.assertEqual(frozen["latent_target_history"], frozen["latent_reference_history"])
+        attempt = self._attempt(CELL, 0, 0)
+        self.assertEqual(attempt["target_estimate_history"], attempt["reference_estimate_history"])
+        self.assertTrue(all(value == 0.0 for row in attempt["predicted_difference_covariance"] for value in row))
+
+    def test_online_reducer_uses_latent_estimator_errors_without_retaining_attempts(self):
+        accumulator = self._accumulator(SUPPORTED_CELL, seeds=2)
+        first = self._attempt(SUPPORTED_CELL, 0, 0)
+        second = self._attempt(SUPPORTED_CELL, 0, 1)
+        first["target_estimate_history"][-1] += 1.0
+        second["target_estimate_history"][-1] -= 1.0
+        for attempt in (first, second):
+            dates = len(attempt["target_estimate_history"])
+            difference = [[0.0] * dates for _ in range(dates)]
+            difference[-1][-1] = 1.0
+            self._set_operator_and_difference(attempt, difference)
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
             accumulator.add(attempt)
         summary = accumulator.finalize()
-        self.assertEqual(summary["status"], PASS)
-        self.assertEqual(summary["coverage_95"], 0.95)
-        self.assertEqual(summary["emission_rate"], 1.0)
-        self.assertEqual(summary["operator_relative_error"], 19e-13)
-        self.assertEqual(summary["contrast_variance_relative_error"], 0.019)
-        self.assertEqual(summary["psd_min_eigenvalue"], -19e-12)
+        self.assertEqual(summary["error_bias_norm"], 0.0)
+        self.assertEqual(summary["covariance_calibration_relative_error"], 0.0)
+        self.assertGreater(summary["empirical_error_covariance_trace"], 0.0)
+        self.assertIn("empirical_error_covariance_digest", summary)
+        self.assertFalse(hasattr(accumulator, "attempts"))
 
-    def test_masked_and_tied_cells_are_complete_not_pruned(self):
-        masked_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        masked = CellAccumulator(self.preregistration, masked_id, 1, expected_seed_count=3)
-        for seed_index in range(3):
-            masked.add(self._attempt(masked_id, 1, seed_index, status="masked_target"))
-        self.assertEqual(masked.finalize()["status"], PASS)
-        tied_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|tied_eigenvalue|independent_complex_looks"
-        tied = CellAccumulator(self.preregistration, tied_id, 2, expected_seed_count=3)
-        for seed_index in range(3):
-            tied.add(self._attempt(tied_id, 2, seed_index, status="tied_eigenvalue"))
-        self.assertEqual(tied.finalize()["status"], NOT_EVALUABLE)
-
-    def test_masked_shared_geometry_requires_null_influence_without_signed_gate(self):
-        for geometry in ("shared_75_positive", "shared_50_negative", "shared_25_positive"):
-            cell_id = f"hw_1x1|stride_1|rect|masked|{geometry}|one_block|emi|well_separated|independent_complex_looks"
-            accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1)
-            attempt = self._attempt(cell_id, 0, 0, status="masked_target")
+    def test_coverage_is_gated_per_date_and_names_final_date(self):
+        accumulator = self._accumulator(SUPPORTED_CELL, seeds=2)
+        for seed_index in range(2):
+            attempt = self._attempt(SUPPORTED_CELL, 0, seed_index)
+            difference = [
+                [0.0] * len(attempt["target_estimate_history"])
+                for _ in attempt["target_estimate_history"]
+            ]
+            self._set_operator_and_difference(attempt, difference)
+            if seed_index == 0:
+                attempt["target_estimate_history"][1] += 1.0
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
             accumulator.add(attempt)
-            self.assertEqual(accumulator.finalize()["status"], PASS)
-            invalid = dict(attempt)
-            invalid["signed_cross_influence"] = 1.0
-            with self.subTest(geometry=geometry), self.assertRaisesRegex(SchemaError, "null numeric"):
-                CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1).add(invalid)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["coverage_95_by_date"][1], 0.5)
+        self.assertEqual(summary["final_date_coverage_95"], 1.0)
+        self.assertEqual(summary["status"], "fail")
 
-    def test_weak_zero_variance_is_the_only_null_relative_error_path(self):
-        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
-        weak = self._attempt(cell_id, 0, 0)
-        weak["contrast_variance_reference"] = 0.0
-        weak["contrast_variance_relative_error"] = None
-        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1)
-        accumulator.add(weak)
-        self.assertFalse(accumulator.finalize()["variance_evaluable"])
-        invalid = dict(weak)
-        invalid["contrast_variance_relative_error"] = 0.0
-        with self.assertRaisesRegex(SchemaError, "weak-zero"):
-            CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=1).add(invalid)
+    def test_deterministic_signed_and_invalid_contracts_are_separate_from_coverage(self):
+        for geometry, expected_sign in (
+            ("shared_75_positive", "positive"),
+            ("shared_75_negative", "negative"),
+            ("disjoint_immediate", "none"),
+            ("coincident", "zero"),
+        ):
+            cell_id = CELL.replace("coincident", geometry)
+            attempt = self._attempt(cell_id, 0, 0)
+            self.assertEqual(attempt["signed_influence_sign"], expected_sign)
+            accumulator = self._accumulator(cell_id)
+            accumulator.add(attempt)
+            summary = accumulator.finalize()
+            self.assertEqual(summary["attempted_seeds"], 1)
+        masked = self._attempt(MASKED_CELL, 0, 0, masked=True)
+        accumulator = self._accumulator(MASKED_CELL)
+        accumulator.add(masked)
+        self.assertIsNone(accumulator.finalize()["coverage_95_by_date"])
 
-    def test_accumulator_rejects_duplicate_missing_out_of_order_top_up_and_tamper(self):
-        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
-        accumulator = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=2)
-        with self.assertRaisesRegex(SchemaError, "out-of-order seed"):
-            accumulator.add(self._attempt(cell_id, 0, 1))
-        accumulator.add(self._attempt(cell_id, 0, 0))
-        with self.assertRaisesRegex(SchemaError, "out-of-order seed"):
-            accumulator.add(self._attempt(cell_id, 0, 0))
-        with self.assertRaisesRegex(SchemaError, "missing"):
-            accumulator.finalize()
-        tampered = self._attempt(cell_id, 0, 1)
-        tampered["truth_sha256"] = "bad"
-        with self.assertRaisesRegex(SchemaError, "identity hash"):
-            accumulator.add(tampered)
-        unknown = self._attempt(cell_id, 0, 1)
-        unknown["unexpected"] = True
-        with self.assertRaisesRegex(SchemaError, "unknown"):
-            accumulator.add(unknown)
-
-    def test_streaming_scorer_has_bounded_memory_and_rejects_hash_tamper(self):
-        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            input_path = root / "input.jsonl"
-            input_receipt = write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
-            output_path = root / "output.jsonl"
-            output = write_jsonl_atomic((self._attempt(cell_id, 0, seed, status="masked_target") for seed in range(5000)), output_path)
-            self.assertLessEqual(max(len(line) for line in output_path.read_bytes().splitlines(keepends=True)), FROZEN_MAX_RECORD_BYTES)
-            manifest = self._manifest(spec, output, input_receipt)
-            tracemalloc.start()
-            summaries = score_attempt_shard(self.preregistration, root, manifest, spec)
-            _, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-            self.assertEqual(summaries[0]["status"], PASS)
-            self.assertLess(peak, 5 * 1024 * 1024)
-            tampered = dict(manifest)
-            tampered["output_sha256"] = "f" * 64
-            with self.assertRaisesRegex(SchemaError, "hash/byte"):
-                score_attempt_shard(self.preregistration, root, tampered, spec)
-            with input_path.open("ab") as handle:
-                handle.write(b"{}\n")
-            with self.assertRaisesRegex(SchemaError, "top-up"):
-                score_attempt_shard(self.preregistration, root, manifest, spec)
-
-    def _manifest(self, spec, output, input_receipt=None):
-        input_receipt = input_receipt or {"sha256": "a" * 64, "bytes": 1}
-        return {
-            "schema": "dolphinrust.spatial-covariance.shard-manifest",
-            "schema_version": 3,
-            "shard_index": spec.index,
-            "cell_ordinal_start": spec.cell_ordinal_start,
-            "cell_ordinal_end_exclusive": spec.cell_ordinal_end_exclusive,
-            "expected_cells": len(spec.cell_ids),
-            "expected_attempts": spec.expected_attempts,
-            "input_path": "input.jsonl",
-            "output_path": "output.jsonl",
-            "input_sha256": input_receipt["sha256"],
-            "output_sha256": output["sha256"],
-            "input_bytes": input_receipt["bytes"],
-            "output_bytes": output["bytes"],
-            "input_records": spec.expected_attempts,
-            "output_records": spec.expected_attempts,
-            "preregistration_sha256": preregistration_digest(self.preregistration),
-            "code_sha256": "b" * 64,
-            "binary_sha256": "c" * 64,
-            "generator_protocol_sha256": sha256_json(self.preregistration["execution_protocol"]),
-            "elapsed_seconds": 1.0,
-            "peak_rss_bytes": 1024,
-            "committed": True,
-        }
-
-    def test_partial_resume_and_manifest_scope_fail_closed(self):
-        cell_id = next(iter(expected_cell_ids(self.preregistration)))
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0}
-            manifest = self._manifest(spec, output)
-            path = root / "manifest.jsonl"
-            path.write_bytes(compact_json_line(manifest))
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, path, "b" * 64, "c" * 64))
-            changed = dict(manifest)
-            changed["cell_ordinal_end_exclusive"] = 2
-            with self.assertRaisesRegex(SchemaError, "scope/order/count"):
-                validate_shard_manifest(self.preregistration, changed, spec)
-
-    def test_integer_receipt_identities_reject_boolean_aliases(self):
-        cell_id = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
-        ordinal = CellAccumulator(self.preregistration, cell_id, 1, expected_seed_count=1)
-        ordinal_alias = self._attempt(cell_id, 1, 0)
-        ordinal_alias["cell_ordinal"] = True
-        with self.assertRaisesRegex(SchemaError, "cell identity"):
-            ordinal.add(ordinal_alias)
-
-        seed = CellAccumulator(self.preregistration, cell_id, 0, expected_seed_count=2)
-        seed.add(self._attempt(cell_id, 0, 0))
-        seed_alias = self._attempt(cell_id, 0, 1)
-        seed_alias["seed_index"] = True
-        with self.assertRaisesRegex(SchemaError, "seed"):
-            seed.add(seed_alias)
-
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        manifest = self._manifest(
-            spec,
-            {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0},
+    def test_negative_pair_dgp_has_negative_target_reference_error_loading(self):
+        negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative").replace(
+            "independent_complex_looks", "spatial_correlation_stress"
         )
-        manifest["shard_index"] = False
-        with self.assertRaisesRegex(SchemaError, "integer identity"):
-            validate_shard_manifest(self.preregistration, manifest, spec)
+        positive = negative.replace("shared_75_negative", "shared_75_positive")
+        negative_dgp = regenerate_frozen_attempt_inputs(self.preregistration, negative, 0)
+        positive_dgp = regenerate_frozen_attempt_inputs(self.preregistration, positive, 0)
+        self.assertLess(
+            negative_dgp["target_global_loading_mean"]
+            * negative_dgp["reference_global_loading_mean"],
+            0.0,
+        )
+        self.assertGreater(
+            positive_dgp["target_global_loading_mean"]
+            * positive_dgp["reference_global_loading_mean"],
+            0.0,
+        )
 
-    def test_atomic_commit_and_resume_require_exact_immutable_shard(self):
-        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        spec = ShardSpec(0, 0, 1, (cell_id,))
+    def test_attempt_contract_restores_operator_error_and_production_artifact_bindings(self):
+        for field in (
+            "production_operator_matrix", "contrast_weights",
+            "operator_sha256", "production_artifact",
+            "production_artifact_sha256",
+        ):
+            self.assertIn(field, ATTEMPT_KEYS)
+        self.assertNotIn("dense_oracle_matrix", ATTEMPT_KEYS)
+        self.assertNotIn("oracle_sha256", ATTEMPT_KEYS)
+        for threshold in (
+            "deterministic_operator_relative_error_max",
+            "stochastic_operator_relative_error_max",
+            "contrast_variance_relative_error_max",
+        ):
+            self.assertIn(threshold, self.preregistration["thresholds"])
+
+    def test_production_artifact_paths_hash_actual_hdf5_and_sidecar_bytes(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        artifact = attempt["production_artifact"]
+        self.assertFalse(Path(artifact["hdf5_path"]).is_absolute())
+        self.assertFalse(Path(artifact["sidecar_path"]).is_absolute())
+        self._accumulator(SUPPORTED_CELL).add(attempt)
+        hdf5_path = self.artifact_root / artifact["hdf5_path"]
+        hdf5_path.write_bytes(hdf5_path.read_bytes() + b"tamper")
+        with self.assertRaisesRegex(SchemaError, "production HDF5 artifact"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        sidecar_path = self.artifact_root / attempt["production_artifact"]["sidecar_path"]
+        sidecar_path.write_bytes(sidecar_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(SchemaError, "production HDF5"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["production_artifact"]["hdf5_path"] = "../escape.h5"
+        attempt["production_artifact_sha256"] = sha256_json(attempt["production_artifact"])
+        with self.assertRaisesRegex(SchemaError, "escapes the run root"):
+            self._accumulator(SUPPORTED_CELL).add(attempt)
+
+    def test_direct_pair_contract_requires_positive_independent_negative_order(self):
+        identities = {
+            "target_support_digest": "a" * 64,
+            "reference_support_digest": "b" * 64,
+            "latent_history_digest": "c" * 64,
+        }
+        margins = {
+            "target_predicted_covariance_trace": 1.0,
+            "reference_predicted_covariance_trace": 1.0,
+            "target_empirical_error_covariance_trace": 1.05,
+            "reference_empirical_error_covariance_trace": 1.05,
+        }
+        positive = {**identities, **margins, "predicted_covariance_trace": 1.0, "empirical_error_covariance_trace": 1.1}
+        negative = {**identities, **margins, "predicted_covariance_trace": 3.0, "empirical_error_covariance_trace": 3.1}
+        validate_direct_pair_variance_order(positive, negative)
+        with self.assertRaisesRegex(SchemaError, "positive < independent < negative"):
+            validate_direct_pair_variance_order(negative, positive)
+
+    def test_python_derives_joint_oracle_from_regenerated_dgp(self):
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
+        oracle = derive_dense_joint_oracle(self.preregistration, SUPPORTED_CELL, frozen)
+        dates = len(frozen["latent_target_history"])
+        self.assertEqual(oracle.shape, (2 * dates, 2 * dates))
+        self.assertEqual(
+            numeric_digest("dense-oracle-v4", oracle.flat),
+            frozen["dense_oracle_sha256"],
+        )
+
+    def test_matched_signed_pair_differs_only_by_coupling(self):
+        positive = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
+        negative = regenerate_frozen_attempt_inputs(
+            self.preregistration,
+            SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative"),
+            0,
+        )
+        for field in (
+            "target_support_sha256", "reference_support_sha256",
+            "latent_target_history", "latent_reference_history",
+            "target_marginal_oracle_sha256", "reference_marginal_oracle_sha256",
+        ):
+            self.assertEqual(positive[field], negative[field])
+        self.assertLess(
+            positive["oracle_difference_covariance_trace"],
+            positive["oracle_independent_covariance_trace"],
+        )
+        self.assertLess(
+            positive["oracle_independent_covariance_trace"],
+            negative["oracle_difference_covariance_trace"],
+        )
+
+    def test_cell_summary_binds_attempt_digest_and_scope(self):
+        accumulator = self._accumulator(CELL)
+        accumulator.add(self._attempt(CELL, 0, 0))
+        summary = accumulator.finalize()
+        self.assertEqual(summary["attempted_seeds"], 1)
+        self.assertNotEqual(summary["request_digest"], summary["attempt_digest"])
+
+    def test_cell_boundary_commit_deletes_transport_only_after_success(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            input_path = root / "input.jsonl"
-            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
-            output_partial = root / "output.jsonl.partial"
-            shutil.copyfile(input_path, output_partial)
-            manifest_path = root / "manifest.jsonl"
-            with self.assertRaisesRegex(SchemaError, "malformed or unknown"):
-                commit_output_shard(
-                    self.preregistration, spec, root, input_path, output_partial, manifest_path,
-                    "a" * 64, "b" * 64, 1.0, 1024,
-                )
-            output_partial.unlink()
-            write_jsonl_atomic(
-                (self._attempt(cell_id, 0, seed, status="masked_target") for seed in range(FROZEN_SEED_COUNT)),
-                root / "valid-output.jsonl",
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True, artifact_root=root)) for seed in range(expected_seed_count(MASKED_CELL))))
+            destination = root / "cell-00000.jsonl"
+            commit_cell_transport(
+                self.preregistration, MASKED_CELL, 0, transport, destination, CODE, BINARY,
+                artifact_root=root,
             )
-            (root / "valid-output.jsonl").rename(output_partial)
+            self.assertFalse(transport.exists())
+            validate_cell_summary(self.preregistration, json.loads(destination.read_text()), MASKED_CELL, 0, CODE, BINARY)
+
+    def test_crash_preserves_prior_boundary_and_malformed_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prior = root / "cell-00000.jsonl"
+            prior.write_text("committed\n")
+            transport = root / "broken.jsonl"
+            transport.write_text("{\n")
+            with self.assertRaises(SchemaError):
+                commit_cell_transport(self.preregistration, CELL, 1, transport, root / "cell-00001.jsonl", CODE, BINARY)
+            self.assertEqual(prior.read_text(), "committed\n")
+            self.assertTrue(transport.exists())
+            self.assertFalse((root / "cell-00001.jsonl").exists())
+
+    def test_compact_shard_commit_resume_and_tamper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True, artifact_root=root)) for seed in range(expected_seed_count(MASKED_CELL))))
+            commit_cell_transport(
+                self.preregistration, MASKED_CELL, 0, transport, cells / "cell-00000.jsonl", CODE, BINARY,
+                artifact_root=root,
+            )
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
+            manifest = root / "manifest.jsonl"
+            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True, artifact_root=root) for seed in range(expected_seed_count(cell_id)))
+            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+            cells.joinpath("cell-00000.jsonl").write_text("{}\n")
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+
+    def test_resume_rejects_self_consistent_replaced_summary_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True, artifact_root=root)) for seed in range(expected_seed_count(MASKED_CELL))))
+            cell_path = cells / "cell-00000.jsonl"
+            commit_cell_transport(
+                self.preregistration, MASKED_CELL, 0, transport, cell_path, CODE, BINARY,
+                artifact_root=root,
+            )
+            summary = json.loads(cell_path.read_text())
+            summary["effective_looks_fraction"] = 0.5
+            cell_path.write_bytes(compact_json_line(summary))
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
+            manifest = root / "manifest.jsonl"
+            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True, artifact_root=root) for seed in range(expected_seed_count(cell_id)))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY))
+
+    def test_prepare_retains_one_descriptor_not_attempt_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = ShardSpec(0, 0, 1, (CELL,), (expected_seed_count(CELL),))
+            destination = Path(directory) / "descriptor.jsonl"
+            receipt = prepare_input_shard(self.preregistration, spec, destination)
+            self.assertEqual(receipt["records"], 1)
+            descriptor = json.loads(destination.read_text())
+            self.assertFalse(descriptor["retained"])
+            self.assertEqual(descriptor["expected_attempts"], expected_seed_count(CELL))
+            self.assertEqual(descriptor["seed_counts"], [expected_seed_count(CELL)])
+
+    def test_committing_shard_deletes_preparation_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
+            descriptor = root / "requests" / "shard-00000.jsonl"
+            prepare_input_shard(self.preregistration, spec, descriptor)
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(compact_json_line(self._attempt(MASKED_CELL, 0, 0, masked=True, artifact_root=root)))
+            commit_cell_transport(
+                self.preregistration, MASKED_CELL, 0, transport,
+                cells / "cell-00000.jsonl", CODE, BINARY,
+                artifact_root=root,
+            )
             commit_output_shard(
-                self.preregistration,
-                spec,
-                root,
-                input_path,
-                output_partial,
-                manifest_path,
-                "a" * 64,
-                "b" * 64,
-                1.0,
-                1024,
+                self.preregistration, spec, root, cells, root / "manifest.jsonl",
+                CODE, BINARY, 1.0, 1_000_000,
             )
-            self.assertFalse(output_partial.exists())
-            self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest_path, "a" * 64, "b" * 64))
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path, "d" * 64, "b" * 64))
-            with (root / "output.jsonl").open("ab") as handle:
-                handle.write(b"{}\n")
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest_path, "a" * 64, "b" * 64))
+            self.assertFalse(descriptor.exists())
 
-    def test_partial_suffix_and_symlink_escape_fail_closed(self):
-        cell_id = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
-        spec = ShardSpec(0, 0, 1, (cell_id,))
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            root = base / "run"
-            outside = base / "outside"
-            root.mkdir()
-            outside.mkdir()
-            input_path = root / "input.jsonl"
-            write_jsonl_atomic(iter_attempt_requests(self.preregistration, spec), input_path)
-            double_partial = root / "output.jsonl.partial.partial"
-            double_partial.write_bytes(b"")
-            with self.assertRaisesRegex(SchemaError, "exactly one"):
-                inspect_one_input_one_output(self.preregistration, spec, input_path, double_partial)
-            with self.assertRaisesRegex(SchemaError, "must not"):
-                inspect_one_input_one_output(self.preregistration, spec, input_path, root / "final.partial", require_partial=False)
-            partial_manifest = root / "manifest.jsonl.partial"
-            partial_manifest.write_bytes(b"{}\n")
-            self.assertFalse(committed_shard_matches(
-                self.preregistration, spec, root, partial_manifest, "a" * 64, "b" * 64,
-            ))
-            (outside / "input.jsonl").write_bytes(b"")
-            (outside / "output.jsonl").write_bytes(b"")
-            (root / "escape").symlink_to(outside, target_is_directory=True)
-            output = {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0}
-            manifest = self._manifest(spec, output)
-            manifest["input_path"] = "escape/input.jsonl"
-            manifest["output_path"] = "escape/output.jsonl"
-            with self.assertRaisesRegex(SchemaError, "symlink"):
-                score_attempt_shard(self.preregistration, root, manifest, spec)
+    def test_area_and_date_sweeps_are_independently_identifiable(self):
+        matrix = self.preregistration["resource_matrix"]
+        self.assertEqual(len({item["tile_pixels"] for item in matrix if item["dates"] == 26}), 3)
+        self.assertEqual(len({item["dates"] for item in matrix if item["tile_pixels"] == 65536}), 3)
+        resources = self._resource_receipts()
+        self.assertEqual(_validate_resources(self.preregistration, resources, BINARY), [PASS] * 5)
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = "bad"
+        with self.assertRaises(SchemaError):
+            _validate_resources(self.preregistration, resources, BINARY)
+        resources = self._resource_receipts()
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        raw["command"][-1] = "999"
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
+            _validate_resources(self.preregistration, resources, BINARY)
 
-    def test_result_root_binds_manifest_order_and_content(self):
-        first = "1" * 64
-        second = "2" * 64
-        root = result_root_sha256((first, second))
-        self.assertNotEqual(root, result_root_sha256((second, first)))
-        self.assertNotEqual(root, result_root_sha256((first, "3" * 64)))
-        with self.assertRaisesRegex(SchemaError, "exactly 891"):
-            build_run_manifest(self.preregistration, Path("."), (), "a" * 64, "b" * 64, {}, [])
+    def test_resource_receipt_rejects_two_area_scaled_axes(self):
+        resources = self._resource_receipts()
+        component = resources[0]["allocation_components"][0]
+        component["axis_factors"][1]["area_scaled"] = True
+        component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "two area-scaled axes"):
+            _validate_resources(self.preregistration, resources, BINARY)
 
-    def test_performance_concurrency_is_derived_without_frozen_total_time(self):
-        probe = self.preregistration["execution_protocol"]["performance_probe"]
-        self.assertIsNone(probe["total_wall_seconds_max"])
-        self.assertTrue(probe["required_before_outcomes"])
-        self.assertTrue(probe["derived_concurrency_receipt_required"])
-        self.assertEqual(derive_concurrency_receipt(7200, 3600, 0.25), 3)
-        rate = 1_000_000.0
-        projected = FROZEN_ATTEMPT_COUNT / rate
-        measurements = [
-            {
-                "cell_class": cell_class,
-                "seed_count": seed_count,
-                "attempt_count": seed_count,
-                "elapsed_seconds": seed_count / rate,
-                "peak_rss_bytes": 1024,
-                "outcomes_persisted": False,
-            }
-            for cell_class in probe["required_cell_classes"]
-            for seed_count in probe["seed_counts"]
+    def test_resource_receipt_binds_dependency_microbatch_and_named_formulas(self):
+        for field, digest_field in (
+            ("dependency_cone", "dependency_cone_sha256"),
+            ("microbatch", "microbatch_sha256"),
+        ):
+            resources = self._resource_receipts()
+            resources[0][field][next(name for name in resources[0][field] if name.endswith("count") or name.endswith("sources"))] += 1
+            resources[0][digest_field] = sha256_json(resources[0][field])
+            resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+            with self.assertRaisesRegex(SchemaError, "identity mismatch"):
+                _validate_resources(self.preregistration, resources, BINARY)
+        resources = self._resource_receipts()
+        component = resources[0]["allocation_components"][0]
+        component["coefficient_bytes"] += 1
+        component["bytes"] = component["coefficient_bytes"] * math.prod(factor["extent"] for factor in component["axis_factors"])
+        component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "named allocation formula"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_allocation_receipt_is_benchmark_emitted_and_hash_bound(self):
+        resources = self._resource_receipts()
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        self.assertNotIn("allocation_measurement", raw)
+        allocation = json.loads(raw["stdout_json"])
+        allocation["maximum_simultaneously_retained_bytes"] += 1
+        raw["stdout_json"] = json.dumps(allocation, sort_keys=True, separators=(",", ":")) + "\n"
+        raw["stdout_bytes"] = len(raw["stdout_json"].encode())
+        raw["stdout_sha256"] = hashlib.sha256(raw["stdout_json"].encode()).hexdigest()
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json(
+            {key: value for key, value in resources[0].items() if key != "resource_hash"}
+        )
+        with self.assertRaisesRegex(SchemaError, "allocation arithmetic"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_benchmark_driver_captures_stdout_and_nested_fabrication_is_rejected(self):
+        allocation = json.loads(
+            self._resource_receipts()[0]["growth_observation"][0]["raw_measurement"]["stdout_json"]
+        )
+        command = [
+            sys.executable, "-c",
+            "import json,sys;sys.stdout.write(json.dumps(" + repr(allocation) + ",sort_keys=True,separators=(',',':'))+'\\n')",
         ]
-        receipt = {
-            "schema": "dolphinrust.spatial-covariance.performance-probe",
-            "schema_version": 1,
-            "outcomes_persisted": False,
-            "seed_counts": probe["seed_counts"],
-            "cell_classes": probe["required_cell_classes"],
-            "measurements": measurements,
-            "attempts_per_second": rate,
-            "peak_rss_bytes": 1024,
-            "target_wall_seconds": 3600.0,
-            "reserve_fraction": 0.25,
-            "projected_serial_seconds": projected,
-            "derived_concurrency": derive_concurrency_receipt(projected, 3600.0),
-            "code_sha256": "a" * 64,
-            "binary_sha256": "b" * 64,
-            "config_sha256": sha256_json(self.preregistration["generator"]),
-        }
-        _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
-        expected_concurrency = receipt["derived_concurrency"]
-        receipt["derived_concurrency"] = True
-        with self.assertRaisesRegex(SchemaError, "concurrency"):
-            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
-        receipt["derived_concurrency"] = expected_concurrency
-        receipt["schema_version"] = True
-        with self.assertRaisesRegex(SchemaError, "outcome-discarding"):
-            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
-        receipt["schema_version"] = 1
-        receipt["derived_concurrency"] += 1
-        with self.assertRaisesRegex(SchemaError, "derived concurrency"):
-            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
-        receipt["derived_concurrency"] -= 1
-        receipt["measurements"][0]["peak_rss_bytes"] = True
-        with self.assertRaisesRegex(SchemaError, "invalid RSS"):
-            _validate_performance_probe(self.preregistration, receipt, "a" * 64, "b" * 64)
+        captured = capture_benchmark_stdout(command)
+        self.assertEqual(captured["stdout_sha256"], hashlib.sha256(captured["stdout_json"].encode()).hexdigest())
+        self.assertNotIn("allocation_measurement", captured)
 
-    def test_assemble_rejects_destination_outside_run_root_before_publication(self):
+        resources = self._resource_receipts()
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        raw["allocation_measurement"] = allocation
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json(
+            {key: value for key, value in resources[0].items() if key != "resource_hash"}
+        )
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_manifest_hash_and_parse_use_one_identical_bounded_read(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "run"
-            outside = Path(directory) / "outside"
-            manifests = root / "manifests"
-            root.mkdir()
-            outside.mkdir()
-            manifests.mkdir()
-            performance = root / "performance.json"
-            resources = root / "resources.json"
-            performance.write_text("{}", encoding="utf-8")
-            resources.write_text("[]", encoding="utf-8")
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(VALIDATION / "spatial_covariance_simulation.py"),
-                    "assemble",
-                    "--run-root",
-                    str(root),
-                    "--shard-manifest-directory",
-                    str(manifests),
-                    "--performance-probe",
-                    str(performance),
-                    "--resources",
-                    str(resources),
-                    "--destination",
-                    str(outside / "run-manifest.json"),
-                    "--code-sha256",
-                    "a" * 64,
-                    "--binary-sha256",
-                    "b" * 64,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("destination parent must equal the run root", completed.stderr)
-            self.assertFalse((outside / "run-manifest.json").exists())
+            path = Path(directory) / "manifest.jsonl"
+            raw = b'{"schema":"test"}\n'
+            path.write_bytes(raw)
+            original_open = Path.open
+            opens = 0
 
-    def _resources(self, peaks=(1_000_000, 2_000_000, 4_000_000), growth_class="linear", status=PASS):
+            def count_open(open_path, *args, **kwargs):
+                nonlocal opens
+                if open_path == path:
+                    opens += 1
+                return original_open(open_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", count_open):
+                value, accepted, digest = _read_hashed_json_record(path, len(raw), "manifest")
+            self.assertEqual(opens, 1)
+            self.assertEqual(value, {"schema": "test"})
+            self.assertEqual(accepted, raw)
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+
+    def test_raw_resource_measurement_accepts_exact_bound_and_rejects_one_byte_over(self):
+        resources = self._resource_receipts()
         sampling = self.preregistration["resource_sampling"]
-        resources = []
-        for matrix, peak in zip(self.preregistration["resource_matrix"], peaks):
-            item = {
-                "resource_id": matrix["id"],
-                "status": status,
-                "rss_bytes": peak,
-                "growth_class": growth_class,
-                "resource_hash": "",
-                "config_hash": sha256_json(self.preregistration["generator"]),
-                "binary_hash": "b" * 64,
-                "growth_observation": [
-                    {
-                        "repetition": repetition,
-                        "tile_pixels": matrix["tile_pixels"],
-                        "date_count": matrix["dates"],
-                        "peak_rss_bytes": peak,
-                        "wall_seconds": float(repetition + 1),
-                    }
-                    for repetition in range(sampling["measured_repetitions"])
-                ],
-                **{key: sampling[key] for key in (
-                    "os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "sampling_interval_ms",
-                    "warmup_runs", "measured_repetitions", "tool_versions", "growth_regression", "acceptance",
-                )},
-            }
-            item["resource_hash"] = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
-            resources.append(item)
-        return resources
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        raw["tool_versions"]["uname"] += "x" * (sampling["max_encoded_raw_measurement_bytes"] - len(encoded(raw)))
+        observation = resources[0]["growth_observation"][0]
+        observation["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        self.assertEqual(len(encoded(raw)), sampling["max_encoded_raw_measurement_bytes"])
+        self.assertEqual(_validate_resources(self.preregistration, resources, BINARY), [PASS] * 5)
+        raw["tool_versions"]["uname"] += "x"
+        observation["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
+            _validate_resources(self.preregistration, resources, BINARY)
 
-    def test_resource_receipts_derive_rss_and_growth_from_13_26_52_observations(self):
-        resources = self._resources()
-        self.assertEqual(_validate_resources(self.preregistration, resources, "b" * 64), [PASS, PASS, PASS])
-        invalid_rss = copy.deepcopy(resources)
-        invalid_rss[0]["rss_bytes"] = True
-        with self.assertRaisesRegex(SchemaError, "invalid status/RSS"):
-            _validate_resources(self.preregistration, invalid_rss, "b" * 64)
-        wrong_scope = copy.deepcopy(resources)
-        wrong_scope[1]["growth_observation"][0]["date_count"] = 13
-        with self.assertRaisesRegex(SchemaError, "scope drifted"):
-            _validate_resources(self.preregistration, wrong_scope, "b" * 64)
-        boolean_repetition = copy.deepcopy(resources)
-        boolean_repetition[0]["growth_observation"][0]["repetition"] = False
-        with self.assertRaisesRegex(SchemaError, "scope drifted"):
-            _validate_resources(self.preregistration, boolean_repetition, "b" * 64)
-        superlinear_declared_linear = self._resources((1_000_000, 4_000_000, 16_000_000))
-        with self.assertRaisesRegex(SchemaError, "contradicts measured evidence"):
-            _validate_resources(self.preregistration, superlinear_declared_linear, "b" * 64)
+    def test_untrusted_single_record_is_sized_before_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oversized.jsonl"
+            with path.open("wb") as handle:
+                handle.truncate(129)
+            with self.assertRaisesRegex(SchemaError, "before read"):
+                _read_single_json_record(path, 128, "test manifest")
 
-    def test_legacy_aggregate_receipt_is_rejected(self):
-        with PR61_FIXTURE.open(encoding="utf-8") as handle:
-            receipt = json.load(handle)
-        report = score_receipt(self.preregistration, receipt)
-        self.assertEqual(report["status"], FAIL)
-        self.assertIn("aggregate receipts are rejected", report["errors"][0])
+    def test_bounded_json_readers_accept_exact_bound_and_reject_one_byte_over(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            label = "raw resource"
+            limit = self.preregistration["resource_sampling"]["max_encoded_raw_measurement_bytes"]
+            exact = root / "raw-resource-exact.json"
+            exact.write_bytes(b'{"value":1}' + b" " * (limit - len(b'{"value":1}')))
+            self.assertEqual(_load_bounded_json(exact, limit, label), {"value": 1})
+            over = root / "raw-resource-over.json"
+            over.write_bytes(exact.read_bytes() + b" ")
+            with self.assertRaisesRegex(SchemaError, "byte cap"):
+                _load_bounded_json(over, limit, label)
+            for label, limit in (("shard manifest", FROZEN_MAX_SHARD_MANIFEST_BYTES), ("run manifest", FROZEN_MAX_RUN_MANIFEST_BYTES)):
+                exact = root / f"{label.replace(' ', '-')}-exact.json"
+                exact.write_bytes(b'{"value":1}' + b" " * (limit - len(b'{"value":1}') - 1) + b"\n")
+                self.assertEqual(_read_single_json_record(exact, limit, label)[0], {"value": 1})
+                over = root / f"{label.replace(' ', '-')}-over.json"
+                over.write_bytes(exact.read_bytes() + b"\n")
+                with self.assertRaisesRegex(SchemaError, "byte cap"):
+                    _read_single_json_record(over, limit, label)
+
+    def test_bounded_json_rejects_path_replacement_between_stat_and_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            replacement = Path(directory) / "replacement.json"
+            path.write_text('{"value":1}')
+            replacement.write_text('{"value":2}')
+            original_open = Path.open
+
+            def replace_then_open(open_path, *args, **kwargs):
+                if open_path == path:
+                    os.replace(replacement, path)
+                return original_open(open_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", replace_then_open), self.assertRaisesRegex(SchemaError, "changed before"):
+                _load_bounded_json(path, 128, "receipt")
+
+    def test_preregistration_drift_fails_closed(self):
+        for section, field, value in (("thresholds", "coverage_absolute_error_max", 0.03), ("determinism", "prng", "unspecified"), ("numeric_contract", "operator_relative_error", "trust Rust"), ("execution_protocol", "retained_attempt_records", True)):
+            changed = copy.deepcopy(self.preregistration)
+            changed[section][field] = value
+            with self.subTest(section=section), self.assertRaises(SchemaError):
+                validate_preregistration(changed)
+
+    def test_cli_exposes_compact_lifecycle(self):
+        completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
+        for command in ("capture-resource", "prepare", "reduce-cell", "commit", "resume", "assemble"):
+            self.assertIn(command, completed.stdout)
+
+    def test_assembly_fails_closed_until_rust_replay_executable_is_available(self):
+        with self.assertRaisesRegex(SchemaError, "Rust spatial_covariance_batch replay executable"):
+            build_run_manifest(
+                self.preregistration, Path.cwd(), (), CODE, BINARY, {}, self._resource_receipts()
+            )
 
 
 if __name__ == "__main__":
