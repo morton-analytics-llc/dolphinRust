@@ -1,7 +1,7 @@
 //! Calibrated, fail-closed temporal-GLS raster products for issue #53.
 
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -397,6 +397,10 @@ pub fn write_temporal_covariance_products(
         .exists()
         .then(|| sha256_file(&legacy_sigma_path))
         .transpose()?;
+    let fixed_cube_receipt_before = read_bounded(
+        &output_directory.join("fixed_cube_receipt.json"),
+        1024 * 1024,
+    )?;
     let result = write_product_transaction(
         output_directory,
         displacement_rasters,
@@ -405,19 +409,51 @@ pub fn write_temporal_covariance_products(
         factor_directory,
         &promotion,
     );
-    if result.is_err() {
-        remove_published_products(output_directory);
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            remove_published_products(output_directory)?;
+            return Err(error);
+        }
+    };
+    complete_publication_after_legacy_check(
+        output_directory,
+        receipt,
+        &legacy_velocity_before,
+        legacy_sigma_before.as_deref(),
+        &fixed_cube_receipt_before,
+    )
+}
+
+fn complete_publication_after_legacy_check(
+    output_directory: &Path,
+    receipt: TemporalCovarianceProductReceipt,
+    legacy_velocity_before: &str,
+    legacy_sigma_before: Option<&str>,
+    fixed_cube_receipt_before: &[u8],
+) -> Result<TemporalCovarianceProductReceipt> {
+    let legacy_check = (|| {
+        let velocity_path = output_directory.join("velocity.tif");
+        let sigma_path = output_directory.join("velocity_sigma.tif");
+        ensure!(
+            sha256_file(&velocity_path)? == legacy_velocity_before
+                && sigma_path
+                    .exists()
+                    .then(|| sha256_file(&sigma_path))
+                    .transpose()?
+                    .as_deref()
+                    == legacy_sigma_before,
+            "legacy velocity products changed during corrected inference"
+        );
+        Ok(())
+    })();
+    if let Err(error) = legacy_check {
+        let removal = remove_published_products(output_directory);
+        let restoration = restore_fixed_cube_receipt(output_directory, fixed_cube_receipt_before);
+        removal.context("removing corrected products after legacy-product mutation")?;
+        restoration.context("restoring fixed-cube receipt after legacy-product mutation")?;
+        return Err(error);
     }
-    let receipt = result?;
-    ensure!(
-        sha256_file(&velocity_path)? == legacy_velocity_before
-            && legacy_sigma_path
-                .exists()
-                .then(|| sha256_file(&legacy_sigma_path))
-                .transpose()?
-                == legacy_sigma_before,
-        "legacy velocity products changed during corrected inference"
-    );
     Ok(receipt)
 }
 
@@ -483,6 +519,7 @@ fn write_product_transaction_with_validator(
             scope.factor_metadata.full_grid,
             &mut layers,
         )?;
+        finalize_layers(&stage, &mut layers)?;
         ensure!(
             input_raster_receipts(displacement_rasters)? == scope.input_receipts,
             "displacement rasters changed during temporal inference"
@@ -495,7 +532,6 @@ fn write_product_transaction_with_validator(
             input_raster_receipts(&scope.fixed_cube_paths)? == scope.fixed_cube_inputs,
             "fixed-cube inputs changed during temporal inference"
         );
-        finalize_layers(&stage, &mut layers)?;
         publish_product_receipt(output_directory, &stage, acquisition_days, scope, promotion)
     })();
     let _ = std::fs::remove_dir_all(&stage);
@@ -1222,11 +1258,42 @@ fn validate_no_existing_products(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_published_products(directory: &Path) {
+fn remove_published_products(directory: &Path) -> Result<()> {
     for (name, _) in PRODUCT_LAYERS {
-        let _ = std::fs::remove_file(directory.join(name));
+        let path = directory.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
     }
-    let _ = std::fs::remove_file(directory.join(TEMPORAL_INFERENCE_PROVENANCE_FILENAME));
+    let provenance = directory.join(TEMPORAL_INFERENCE_PROVENANCE_FILENAME);
+    if provenance.exists() {
+        std::fs::remove_file(&provenance)?;
+    }
+    validate_no_existing_products(directory)
+}
+
+fn restore_fixed_cube_receipt(directory: &Path, receipt: &[u8]) -> Result<()> {
+    static NEXT_ROLLBACK_ID: AtomicU64 = AtomicU64::new(0);
+    let scratch = directory.join(format!(
+        ".fixed-cube-receipt-rollback-{}-{}",
+        std::process::id(),
+        NEXT_ROLLBACK_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let restore = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&scratch)?;
+        std::io::Write::write_all(&mut file, receipt)?;
+        file.sync_all()?;
+        std::fs::rename(&scratch, directory.join("fixed_cube_receipt.json"))?;
+        File::open(directory)?.sync_all()?;
+        Ok(())
+    })();
+    if restore.is_err() {
+        let _ = std::fs::remove_file(&scratch);
+    }
+    restore
 }
 
 fn create_stage_directory(directory: &Path) -> Result<PathBuf> {
@@ -1288,11 +1355,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ensure_same_run_factor_directory, output_window, reconstruct_covariance,
-        validate_heldout_result, validate_manifest, validate_review, validate_synthetic_result,
-        write_product_transaction_with_validator, EvidenceDigests, HeldoutLevel, HeldoutResult,
-        SyntheticResult, SyntheticScores, TemporalCovariancePromotion, TemporalPromotionManifest,
-        TemporalReviewReceipt, PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA, SYNTHETIC_SCHEMA,
+        complete_publication_after_legacy_check, ensure_same_run_factor_directory, output_window,
+        reconstruct_covariance, validate_heldout_result, validate_manifest, validate_review,
+        validate_synthetic_result, write_product_transaction_with_validator, EvidenceDigests,
+        HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
+        TemporalPromotionManifest, TemporalReviewReceipt, PRODUCT_LAYERS, PROMOTION_SCHEMA,
+        REVIEW_SCHEMA, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -1529,6 +1597,11 @@ mod tests {
             br#"{"schema":"test_geometry_provenance"}"#,
         )
         .unwrap();
+        let fixed_cube_receipt_before =
+            std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap();
+        let legacy_velocity_sha256 = super::sha256_file(&directory.join("velocity.tif")).unwrap();
+        let legacy_sigma_sha256 =
+            super::sha256_file(&directory.join("velocity_sigma.tif")).unwrap();
         let promotion = TemporalCovariancePromotion {
             manifest_sha256: "11".repeat(32),
             review_sha256: "22".repeat(32),
@@ -1577,7 +1650,22 @@ mod tests {
             &config,
             &directory,
             &promotion,
-            || Ok(changed_promotion),
+            || {
+                let finalized_stage_exists = std::fs::read_dir(&directory)?.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(".temporal-inference-stage-"))
+                            && entry.path().join("velocity_temporal_gls.tif").exists()
+                    })
+                });
+                anyhow::ensure!(
+                    finalized_stage_exists,
+                    "promotion revalidation ran before COG finalization"
+                );
+                Ok(changed_promotion)
+            },
         )
         .is_err());
         assert!(!directory
@@ -1611,6 +1699,36 @@ mod tests {
             .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
             .exists());
         std::fs::write(&geometry_path, geometry_before).unwrap();
+        let published_before_legacy_mutation = write_product_transaction_with_validator(
+            &directory,
+            &displacement_rasters,
+            &days,
+            &config,
+            &directory,
+            &promotion,
+            || Ok(promotion.clone()),
+        )
+        .unwrap();
+        std::fs::write(directory.join("velocity.tif"), b"mutated legacy velocity").unwrap();
+        assert!(complete_publication_after_legacy_check(
+            &directory,
+            published_before_legacy_mutation,
+            &legacy_velocity_sha256,
+            Some(&legacy_sigma_sha256),
+            &fixed_cube_receipt_before,
+        )
+        .is_err());
+        assert!(PRODUCT_LAYERS
+            .iter()
+            .all(|(name, _)| !directory.join(name).exists()));
+        assert!(!directory
+            .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
+            .exists());
+        assert_eq!(
+            std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
+            fixed_cube_receipt_before
+        );
+        std::fs::write(directory.join("velocity.tif"), &legacy_before).unwrap();
         let receipt = write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
