@@ -32,7 +32,9 @@ use dolphin_phaselink::{
     ComputeEngine, InfluenceDag, InfluenceNode, NodeId, SourceDefinition, SourceEdge, SourceId,
 };
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
-use dolphin_timeseries::spatial_covariance::fixed_l2_difference_workspace_composition;
+use dolphin_timeseries::spatial_covariance::{
+    fixed_l2_difference_workspace_composition, SpatialL2Error, SpatialL2Status,
+};
 use ndarray::{array, s, Array1, Array2, Array3, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1342,14 +1344,19 @@ fn reconstruct_nondifferentiable_supports(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn build_nondifferentiable_evidence(
+fn build_replay_abstention_evidence(
     preregistration: &Value,
     tables: &PortableDgpTables,
     request: &FrozenAttemptRequest,
     dgp_ordinal: u64,
     geometry: &FrozenCellGeometry,
     raw: &BTreeMap<(i64, i64), Vec<Cf64>>,
+    status: &str,
 ) -> Result<Value> {
+    anyhow::ensure!(
+        matches!(status, "nondifferentiable_node" | "ill_conditioned"),
+        "unsupported replay abstention status"
+    );
     let blocks = geometry
         .topology
         .get("expected_blocks")
@@ -1514,7 +1521,7 @@ fn build_nondifferentiable_evidence(
         "cell_ordinal": request.cell_ordinal,
         "seed_index": request.seed_index,
         "seed_sha256": request.seed_sha256,
-        "status": "nondifferentiable_node",
+        "status": status,
         "emitted": false,
         "factor_emitted": false,
         "raw_input_shape": raw_shape,
@@ -1860,13 +1867,28 @@ pub fn run_frozen_attempt(
                 .downcast_ref::<SequentialReplayError>()
                 .is_some_and(|replay| replay.status() == ReplayStatus::NondifferentiableNode)
             {
-                return build_nondifferentiable_evidence(
+                return build_replay_abstention_evidence(
                     preregistration,
                     tables,
                     request,
                     dgp_ordinal,
                     &geometry,
                     &raw,
+                    "nondifferentiable_node",
+                );
+            }
+            if error
+                .downcast_ref::<SpatialL2Error>()
+                .is_some_and(|failure| failure.status == SpatialL2Status::IllConditioned)
+            {
+                return build_replay_abstention_evidence(
+                    preregistration,
+                    tables,
+                    request,
+                    dgp_ordinal,
+                    &geometry,
+                    &raw,
+                    "ill_conditioned",
                 );
             }
             return Err(
@@ -4660,13 +4682,14 @@ mod tests {
             .into_iter()
             .map(|coordinate| (coordinate, vec![Cf64::new(1.0, 0.0); geometry.dates]))
             .collect::<BTreeMap<_, _>>();
-        let evidence = build_nondifferentiable_evidence(
+        let evidence = build_replay_abstention_evidence(
             &preregistration,
             &tables,
             &request,
             0,
             &geometry,
             &raw,
+            "nondifferentiable_node",
         )
         .unwrap();
         let mut exact_support = target_support
@@ -4789,6 +4812,53 @@ mod tests {
         .unwrap();
         assert_eq!(evidence["status"], "valid");
         assert_eq!(evidence["raw_input_shape"][0], 121);
+    }
+
+    #[test]
+    fn ill_conditioned_attempt_emits_a_fail_closed_receipt() {
+        let preregistration: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_preregistration.json"
+        )))
+        .unwrap();
+        let asset: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_portable_tables.json"
+        )))
+        .unwrap();
+        let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
+        let cell_id = "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress";
+        let evidence = run_frozen_attempt(
+            &preregistration,
+            &tables,
+            &FrozenAttemptRequest {
+                schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
+                cell_id: cell_id.to_owned(),
+                cell_ordinal: 23,
+                seed_index: 127,
+                seed_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(format!("spatial-covariance-f54-07-v2||{cell_id}||127"))
+                ),
+                half_window: "hw_3x6".to_owned(),
+                stride: "stride_4".to_owned(),
+                support: "glrt_frozen".to_owned(),
+                position: "interior".to_owned(),
+                pair_geometry: "coincident".to_owned(),
+                block_topology: "four_blocks".to_owned(),
+                estimator: "emi".to_owned(),
+                eigen_stress: "well_separated".to_owned(),
+                source_process: "spatial_correlation_stress".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence["status"], "ill_conditioned");
+        assert_eq!(evidence["emitted"], false);
+        assert_eq!(evidence["factor_emitted"], false);
+        assert_eq!(evidence["target_estimate_history"], Value::Null);
+        assert_eq!(evidence["predicted_difference_covariance"], Value::Null);
+        assert!(evidence["target_source_count"].as_u64().unwrap() > 0);
+        assert!(evidence["effective_support_union_count"].as_u64().unwrap() > 0);
     }
 
     #[test]

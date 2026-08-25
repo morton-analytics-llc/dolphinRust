@@ -254,9 +254,11 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertEqual(set(attempt), ATTEMPT_KEYS)
         return attempt
 
-    def _nondifferentiable_attempt(self, cell_id, ordinal, seed_index):
+    def _nondifferentiable_attempt(
+        self, cell_id, ordinal, seed_index, status="nondifferentiable_node"
+    ):
         attempt = self._attempt(cell_id, ordinal, seed_index)
-        attempt["status"] = "nondifferentiable_node"
+        attempt["status"] = status
         attempt["emitted"] = False
         attempt["factor_emitted"] = False
         for name in (
@@ -742,6 +744,18 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         summary = accumulator.finalize()
         self.assertEqual(summary["status_histogram"]["nondifferentiable_node"], 1)
         self.assertEqual(summary["failure_histogram"], {"nondifferentiable_node": 1})
+        self.assertEqual(summary["emitted_seeds"], 1)
+        self.assertEqual(summary["status"], "fail")
+
+    def test_ill_conditioned_attempt_is_retained_and_counts_against_emission_gate(self):
+        accumulator = self._accumulator(CELL, seeds=2)
+        accumulator.add(
+            self._nondifferentiable_attempt(CELL, 0, 0, status="ill_conditioned")
+        )
+        accumulator.add(self._attempt(CELL, 0, 1))
+        summary = accumulator.finalize()
+        self.assertEqual(summary["status_histogram"]["ill_conditioned"], 1)
+        self.assertEqual(summary["failure_histogram"], {"ill_conditioned": 1})
         self.assertEqual(summary["emitted_seeds"], 1)
         self.assertEqual(summary["status"], "fail")
 
