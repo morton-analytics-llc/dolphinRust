@@ -6755,6 +6755,48 @@ pub fn read_spatial_reference_covariance_header(
     read_spatial_metadata(&file)
 }
 
+/// Enumerate the stable IDs of every sealed reference-factor block under an
+/// allocation cap.
+///
+/// # Errors
+/// Returns an error for malformed/incomplete schema, a non-canonical block
+/// name, or metadata plus ID storage above `byte_cap`.
+pub fn read_spatial_reference_covariance_block_ids(
+    path: impl AsRef<Path>,
+    byte_cap: u64,
+) -> Result<Vec<u64>> {
+    let file = hdf5::File::open(path)?;
+    validate_spatial_root_schema(&file)?;
+    let schema_version: u16 = read_scalar_attr(&file, "schema_version")?;
+    let metadata_bytes = spatial_reference_metadata_logical_bytes(&file, schema_version)?;
+    let blocks = file.group("blocks")?;
+    let names = blocks.member_names()?;
+    let id_bytes = u64::try_from(names.len())
+        .ok()
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
+        .ok_or_else(|| invalid("spatial reference block ID bytes overflow"))?;
+    let mut budget = ReadBudget::new(byte_cap);
+    budget.charge(metadata_bytes)?;
+    budget.charge(id_bytes)?;
+    let mut ids = names
+        .into_iter()
+        .map(|name| {
+            ensure_valid(
+                name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit()),
+                "spatial reference block name is not canonical",
+            )?;
+            name.parse::<u64>()
+                .map_err(|_| invalid("spatial reference block ID exceeds u64"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ids.sort_unstable();
+    ensure_valid(
+        ids.windows(2).all(|pair| pair[0] != pair[1]),
+        "spatial reference block IDs are duplicated",
+    )?;
+    Ok(ids)
+}
+
 fn spatial_reference_metadata_logical_bytes(file: &hdf5::File, schema_version: u16) -> Result<u64> {
     let identity = file.group("metadata")?;
     let metadata_members = match schema_version {

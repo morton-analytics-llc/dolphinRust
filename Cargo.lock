@@ -619,11 +619,17 @@ name = "dolphin-timeseries"
 version = "1.6.0"
 dependencies = [
  "dolphin-core",
+ "dolphin-io",
+ "dolphin-phaselink",
+ "dolphin-workflows",
  "faer",
  "ndarray",
  "ndarray-npy",
  "rayon",
  "serde",
+ "serde_json",
+ "sha2",
+ "statrs",
 ]
 
 [[package]]

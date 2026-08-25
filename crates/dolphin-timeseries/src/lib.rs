@@ -11,7 +11,7 @@ pub mod loop_closure;
 pub mod network;
 pub mod reference;
 pub mod spatial_covariance;
-pub mod temporal_validation;
+pub mod temporal_covariance;
 pub mod velocity_model;
 
 pub use inversion::{
@@ -33,8 +33,17 @@ pub use spatial_covariance::{
     SpatialL2Covariance, SpatialL2Error, SpatialL2FactorCovariance, SpatialL2Status,
     FIXED_L2_SPATIAL_COVARIANCE_METHOD,
 };
-pub use temporal_validation::{
-    preregistered_grid, run_preregistered_validation, TemporalValidationReceipt, ValidationCell,
-    ValidationCellResult, ValidationCellStatus, TEMPORAL_VALIDATION_SCHEMA,
+pub use temporal_covariance::{
+    complete_refit_bootstrap_estimate, continuous_time_ar1_correlation, fit_temporal_covariance,
+    raw_adjacent_correlation, relative_standard_deviation_shape, subset_origin_anchored_covariance,
+    temporal_covariance_provenance, temporal_parameter_boundary_status,
+    total_difference_covariance, CompleteRefitBootstrapCadenceStatus,
+    CompleteRefitBootstrapEstimate, CompleteRefitBootstrapEstimateStatus,
+    RawCorrelationDiagnostics, Sha256Digest, TemporalCovarianceApproximation,
+    TemporalCovarianceFit, TemporalCovarianceOptions, TemporalCovarianceProvenance,
+    TemporalCovarianceProvenanceInputs, TemporalInferenceStatus, TemporalReferenceProvenance,
+    TemporalValidationScope, ValidationInterval, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
+    COMPLETE_REFIT_BOOTSTRAP_METHOD, COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+    COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
 };
 pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};
