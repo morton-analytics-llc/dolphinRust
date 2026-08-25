@@ -180,7 +180,7 @@ SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS = 1.5
 OUTER_COVERAGE_DGP = "physical_raw_space_v1"
 CONDITIONAL_COVARIANCE_ORACLE = "fixed_capture_common_factor_monte_carlo_v1"
 FROZEN_SOURCE_SET_SCHEMA = "dolphinrust.canonical-producer-source-set/2"
-FROZEN_SOURCE_SET_SHA256 = "398c73491231c4417503b5d8bdc908ecded95deb1426c63fac86dc0b7625348d"
+FROZEN_SOURCE_SET_SHA256 = "d4358eaf1e3ca6d65da78c61df7058835e2978390edf1e55f2faf8b25c842b55"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -1027,6 +1027,9 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
             and interval["successful_replicates"] >= 0
         )
 
+    def close(left, right):
+        return abs(left - right) <= 1e-12 * max(1.0, abs(left), abs(right))
+
     fit = record["fit"]
     if fit is not None:
         fit_keys = {
@@ -1097,13 +1100,79 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
                     or comparator["successful_replicates"]
                     > comparator["attempted_replicates"]):
                 raise RuntimeError("batch returned malformed comparator diagnostics")
+            present_intervals = [comparator[name] is not None for name in (
+                "interval_68", "interval_90", "interval_95"
+            )]
+            present_widths = [comparator[name] is not None for name in (
+                "width_68", "width_90", "width_95"
+            )]
+            if present_intervals != present_widths:
+                raise RuntimeError("batch returned inconsistent comparator intervals")
+            for level in ("68", "90", "95"):
+                interval = comparator[f"interval_{level}"]
+                width = comparator[f"width_{level}"]
+                if interval is not None and (
+                        interval["successful_replicates"]
+                        != comparator["successful_replicates"]
+                        or not close(width, interval["upper"] - interval["lower"])):
+                    raise RuntimeError("batch returned inconsistent comparator interval width")
+            if comparator["standard_error_diagnostic"] is not None \
+                    and comparator["point_estimate"] is None:
+                raise RuntimeError("batch returned a comparator error without an estimate")
+            if any(present_intervals) and (
+                    comparator["point_estimate"] is None
+                    or comparator["standard_error_diagnostic"] is None):
+                raise RuntimeError("batch returned intervals without complete comparator values")
+            if comparator["status"] == "Evaluated" and (
+                    comparator["point_estimate"] is None
+                    or comparator["standard_error_diagnostic"] is None
+                    or not all(present_intervals)):
+                raise RuntimeError("batch returned incomplete evaluated comparator values")
+            if field != "complete_refit_bootstrap" and (
+                    comparator["attempted_replicates"] != 0
+                    or comparator["successful_replicates"] != 0):
+                raise RuntimeError("batch returned resamples for a non-bootstrap comparator")
+        scalar_couplings = (
+            ("ols_slope", "ols"),
+            ("oracle_gls_slope", "oracle_gls"),
+            ("adjusted_profile_slope", "adjusted_profile"),
+            ("bootstrap_slope", "complete_refit_bootstrap"),
+        )
+        if any(fit[scalar] != fit[comparator]["point_estimate"]
+               for scalar, comparator in scalar_couplings):
+            raise RuntimeError("batch returned inconsistent fit and comparator estimates")
+        plugin_point = fit["plugin_gls"]["point_estimate"]
+        if plugin_point is not None and fit["plugin_gls_slope"] != plugin_point:
+            raise RuntimeError("batch returned inconsistent plugin GLS estimates")
+        if (
+                fit["bootstrap_interval"]
+                != fit["complete_refit_bootstrap"]["interval_95"]
+                or fit["bootstrap_attempts"]
+                != fit["complete_refit_bootstrap"]["attempted_replicates"]
+                or fit["bootstrap_successes"]
+                != fit["complete_refit_bootstrap"]["successful_replicates"]):
+            raise RuntimeError("batch returned inconsistent bootstrap evidence")
+        gap_values = [raw[field] for field in (
+            "minimum_gap_days", "median_gap_days", "maximum_gap_days"
+        )]
+        if any(value is None for value in gap_values) != all(
+                value is None for value in gap_values):
+            raise RuntimeError("batch returned incomplete cadence diagnostics")
+        if all(value is not None for value in gap_values) and not (
+                0.0 < gap_values[0] <= gap_values[1] <= gap_values[2]):
+            raise RuntimeError("batch returned inconsistent cadence diagnostics")
         if fit["status"] == "Evaluated" and (
                 any(fit[field] is None for field in (
-                    "ols_slope", "oracle_gls_slope", "plugin_gls_slope", "bootstrap_slope",
+                    "ols_slope", "oracle_gls_slope", "plugin_gls_slope",
+                    "adjusted_profile_slope", "bootstrap_slope", "bootstrap_interval",
                     "fitted_rho", "fitted_process_variance", "covariance_condition_number"
                 ))
                 or fit["valid_date_count"] == 0
-                or fit["rank"] == 0):
+                or fit["rank"] == 0
+                or any(fit[field]["status"] != "Evaluated" for field in (
+                    "ols", "oracle_gls", "scalar_effective_n", "plugin_gls",
+                    "adjusted_profile", "complete_refit_bootstrap",
+                ))):
             raise RuntimeError("batch returned an incomplete evaluated fit")
 
     evaluated = fit is not None and fit["status"] == "Evaluated"
@@ -1163,7 +1232,9 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
         if not isinstance(receipts, dict) or set(receipts) != receipt_keys:
             raise RuntimeError("batch returned a malformed production receipt schema")
         if (
-            receipts.get("source_correlation_model") != SOURCE_CORRELATION_MODEL
+            receipts.get("capture_scope_sha256")
+            != request["production_path"]["capture_scope_sha256"]
+            or receipts.get("source_correlation_model") != SOURCE_CORRELATION_MODEL
             or receipts.get("source_correlation_distance_scale_pixels")
             != SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
             or type(receipts.get("source_correlation_support_union_count")) is not int
@@ -1255,6 +1326,62 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
                 raise RuntimeError("batch returned malformed production provenance identity")
 
 
+def _response_semantic_bytes(record: dict) -> bytes:
+    semantic = {key: value for key, value in record.items() if key != "resource"}
+    return canonical_json_bytes(semantic) + b"\n"
+
+
+def _require_binary_identity(binary: Path, identity: dict) -> None:
+    digest, byte_count = sha256_file(binary, 1024 * 1024 * 1024)
+    if digest != identity["binary_sha256"] or (
+            "binary_bytes" in identity and byte_count != identity["binary_bytes"]):
+        raise RuntimeError("temporal covariance batch binary identity is stale")
+
+
+def _replay_response_semantic_sha256(
+        preregistration: dict, cell: dict, execution_path: str, seed_count: int,
+        binary: Path, identity: dict) -> str:
+    _require_binary_identity(binary, identity)
+    process = subprocess.Popen(
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RuntimeError("temporal covariance batch pipes are unavailable")
+    semantic_digest = hashlib.sha256()
+    try:
+        for seed_index in range(seed_count):
+            request = request_for(
+                cell, seed_index, preregistration, execution_path,
+                retain_dense_evidence=False,
+            )
+            encoded = canonical_json_bytes(request) + b"\n"
+            if len(encoded) > MAX_REQUEST_LINE_BYTES:
+                raise RuntimeError("temporal covariance request exceeds its line cap")
+            process.stdin.write(encoded)
+            process.stdin.flush()
+            line = _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES)
+            if not line:
+                raise RuntimeError("temporal covariance batch ended before semantic replay")
+            record = json.loads(line)
+            _validate_compact_record(record, request, identity["batch_schema"])
+            semantic_digest.update(_response_semantic_bytes(record))
+        process.stdin.close()
+        if _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES):
+            raise RuntimeError("temporal covariance batch returned a top-up semantic record")
+        if process.wait() != 0:
+            raise RuntimeError("temporal covariance batch semantic replay exited unsuccessfully")
+    except BaseException:
+        process.kill()
+        process.wait()
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
+        raise
+    process.stdout.close()
+    return semantic_digest.hexdigest()
+
+
 def _cleanup_uncommitted(paths: dict[str, Path]) -> None:
     if paths["commit"].exists() or paths["commit"].is_symlink():
         return
@@ -1265,10 +1392,12 @@ def _cleanup_uncommitted(paths: dict[str, Path]) -> None:
 
 def _validate_manifest(
         manifest: dict, identity: dict, cell: dict, execution_path: str,
-        seed_count: int, records_sha256: str, records_bytes: int) -> None:
+        seed_count: int, records_sha256: str, records_bytes: int,
+        response_semantic_sha256: str) -> None:
     expected_keys = {
         "schema", "cell_id", "cell_index", "execution_path", "seed_count",
         "records_sha256", "records_bytes", "request_schedule_sha256",
+        "response_semantic_sha256",
         "producer_identity", "attempted", "emitted", "failed",
         "producer_source_set_sha256", "producer_binary_sha256",
         "total_wall_micros", "peak_resident_set_bytes",
@@ -1283,6 +1412,7 @@ def _validate_manifest(
         "seed_count": seed_count,
         "records_sha256": records_sha256,
         "records_bytes": records_bytes,
+        "response_semantic_sha256": response_semantic_sha256,
         "producer_identity": identity,
         "producer_source_set_sha256": identity["source_set_sha256"],
         "producer_binary_sha256": identity["binary_sha256"],
@@ -1302,7 +1432,8 @@ def _validate_manifest(
 
 def _read_committed_shard(
         preregistration: dict, cell: dict, execution_path: str, seed_count: int,
-        paths: dict[str, Path], identity: dict, scorer: StreamingScores | None) -> dict:
+        paths: dict[str, Path], identity: dict, scorer: StreamingScores | None,
+        binary: Path | None = None) -> dict:
     try:
         commit_bytes = _read_bounded_regular(paths["commit"], MAX_COMMIT_BYTES)
         manifest_bytes = _read_bounded_regular(paths["manifest"], MAX_MANIFEST_BYTES)
@@ -1311,6 +1442,7 @@ def _read_committed_shard(
     commit = json.loads(commit_bytes)
     if not isinstance(commit, dict) or set(commit) != {
         "schema", "manifest_sha256", "records_sha256",
+        "response_semantic_sha256",
         "producer_source_set_sha256", "producer_binary_sha256",
     } or commit.get("schema") != SHARD_COMMIT_SCHEMA:
         raise RuntimeError("shard commit schema is malformed")
@@ -1336,11 +1468,8 @@ def _read_committed_shard(
         records_sha256 = records_digest.hexdigest()
         if records_sha256 != commit.get("records_sha256"):
             raise RuntimeError("shard record hash is stale or tampered")
-        _validate_manifest(
-            manifest, identity, cell, execution_path, seed_count,
-            records_sha256, records_bytes,
-        )
         records.seek(0)
+        semantic_digest = hashlib.sha256()
         while line := _read_bounded_line(records, MAX_RESPONSE_LINE_BYTES):
             if not line.strip():
                 raise RuntimeError("shard contains an empty record")
@@ -1352,13 +1481,25 @@ def _read_committed_shard(
             schedule.update(encoded_request)
             record = json.loads(line)
             _validate_compact_record(record, request, identity["batch_schema"])
+            semantic_digest.update(_response_semantic_bytes(record))
             if scorer is not None:
                 scorer.update(record)
             count += 1
             if count > seed_count:
                 raise RuntimeError("shard contains a top-up attempt")
+    response_semantic_sha256 = semantic_digest.hexdigest()
+    _validate_manifest(
+        manifest, identity, cell, execution_path, seed_count,
+        records_sha256, records_bytes, response_semantic_sha256,
+    )
     if count != seed_count or schedule.hexdigest() != manifest["request_schedule_sha256"]:
         raise RuntimeError("shard seed schedule is missing, duplicated, or reordered")
+    if commit["response_semantic_sha256"] != response_semantic_sha256:
+        raise RuntimeError("shard response semantic receipt is stale or tampered")
+    if binary is not None and _replay_response_semantic_sha256(
+            preregistration, cell, execution_path, seed_count, binary, identity
+    ) != response_semantic_sha256:
+        raise RuntimeError("batch returned response semantics inconsistent with the commit")
     return manifest
 
 
@@ -1369,12 +1510,14 @@ def execute_or_resume_shard(
     if paths["commit"].exists() or paths["commit"].is_symlink():
         return (
             _read_committed_shard(
-                preregistration, cell, execution_path, seed_count, paths, identity, None
+                preregistration, cell, execution_path, seed_count, paths, identity, None,
+                binary,
             ),
             True,
         )
     _cleanup_uncommitted(paths)
     partial_records = paths["records"].with_name(paths["records"].name + ".partial")
+    _require_binary_identity(binary, identity)
     process = subprocess.Popen(
         [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
     )
@@ -1383,6 +1526,7 @@ def execute_or_resume_shard(
         raise RuntimeError("temporal covariance batch pipes are unavailable")
     records_digest = hashlib.sha256()
     schedule_digest = hashlib.sha256()
+    semantic_digest = hashlib.sha256()
     attempted = emitted = failed = total_wall = peak_rss = records_bytes = 0
     try:
         with partial_records.open("xb") as retained:
@@ -1402,6 +1546,7 @@ def execute_or_resume_shard(
                     raise RuntimeError("temporal covariance batch ended before its shard")
                 record = json.loads(line)
                 _validate_compact_record(record, request, identity["batch_schema"])
+                semantic_digest.update(_response_semantic_bytes(record))
                 records_bytes += len(line)
                 if records_bytes > MAX_SHARD_RECORD_BYTES:
                     raise RuntimeError("temporal covariance shard exceeds its byte cap")
@@ -1441,6 +1586,7 @@ def execute_or_resume_shard(
         "records_sha256": records_digest.hexdigest(),
         "records_bytes": records_bytes,
         "request_schedule_sha256": schedule_digest.hexdigest(),
+        "response_semantic_sha256": semantic_digest.hexdigest(),
         "producer_identity": identity,
         "producer_source_set_sha256": identity["source_set_sha256"],
         "producer_binary_sha256": identity["binary_sha256"],
@@ -1457,6 +1603,7 @@ def execute_or_resume_shard(
         "schema": SHARD_COMMIT_SCHEMA,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "records_sha256": records_digest.hexdigest(),
+        "response_semantic_sha256": semantic_digest.hexdigest(),
         "producer_source_set_sha256": identity["source_set_sha256"],
         "producer_binary_sha256": identity["binary_sha256"],
     }

@@ -767,7 +767,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             )
             self.assertTrue(reused)
             self.assertEqual(resumed, manifest)
-            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "1")
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "2")
 
     def test_resumable_shard_rejects_tamper_missing_duplicate_and_reorder(self):
         module = load_generator()
@@ -792,16 +792,21 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
 
         def rebind(paths, lines):
             payload = b"".join(line.rstrip(b"\n") + b"\n" for line in lines)
+            semantic = hashlib.sha256()
+            for line in lines:
+                semantic.update(module._response_semantic_bytes(json.loads(line)))
             paths["records"].write_bytes(payload)
             manifest = json.loads(paths["manifest"].read_bytes())
             manifest["records_sha256"] = hashlib.sha256(payload).hexdigest()
             manifest["records_bytes"] = len(payload)
+            manifest["response_semantic_sha256"] = semantic.hexdigest()
             manifest_bytes = module.canonical_json_bytes(manifest) + b"\n"
             paths["manifest"].write_bytes(manifest_bytes)
             commit = {
                 "schema": module.SHARD_COMMIT_SCHEMA,
                 "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                 "records_sha256": hashlib.sha256(payload).hexdigest(),
+                "response_semantic_sha256": semantic.hexdigest(),
                 "producer_source_set_sha256": manifest[
                     "producer_source_set_sha256"
                 ],
@@ -854,15 +859,18 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
 
         def rebind(paths, record):
             payload = module.canonical_json_bytes(record) + b"\n"
+            semantic = hashlib.sha256(module._response_semantic_bytes(record)).hexdigest()
             paths["records"].write_bytes(payload)
             manifest = json.loads(paths["manifest"].read_bytes())
             manifest["records_sha256"] = hashlib.sha256(payload).hexdigest()
             manifest["records_bytes"] = len(payload)
+            manifest["response_semantic_sha256"] = semantic
             manifest_bytes = module.canonical_json_bytes(manifest) + b"\n"
             paths["manifest"].write_bytes(manifest_bytes)
             commit = json.loads(paths["commit"].read_bytes())
             commit["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
             commit["records_sha256"] = hashlib.sha256(payload).hexdigest()
+            commit["response_semantic_sha256"] = semantic
             paths["commit"].write_bytes(module.canonical_json_bytes(commit) + b"\n")
 
         cases = {
@@ -870,29 +878,45 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 record.update({"fixed_factor_status": "Evaluated", "emitted": True,
                                "failed": False}),
                 record["fit"].update({"status": "Evaluated"}),
-            )),
+            ), "batch returned"),
             "nonfinite comparator": ("fixed_factor", lambda record:
-                record["fit"]["ols"].update({"point_estimate": "nan"})),
+                record["fit"]["ols"].update({"point_estimate": "nan"}), "batch returned"),
             "omitted production receipts": ("production_path", lambda record:
-                record.update({"production_receipts": None})),
+                record.update({"production_receipts": None}), "batch returned"),
             "invalid production provenance": ("production_path", lambda record:
-                record.update({"provenance": {"schema": "forged"}})),
+                record.update({"provenance": {"schema": "forged"}}), "batch returned"),
             "unknown production status": ("production_path", lambda record:
-                record.update({"production_path_status": "fabricated_fail_closed"})),
+                record.update({"production_path_status": "fabricated_fail_closed"}),
+                "batch returned"),
+            "capture receipt mismatch": ("production_path", lambda record:
+                record["production_receipts"].update({"capture_scope_sha256": "ff" * 32}),
+                "batch returned"),
+            "finite coupled slope forgery": ("fixed_factor", lambda record: (
+                record["fit"].update({
+                    "ols_slope": record["fit"]["ols_slope"] + 1000.0,
+                }),
+                record["fit"]["ols"].update({
+                    "point_estimate": record["fit"]["ols"]["point_estimate"] + 1000.0,
+                }),
+            ), "response semantics inconsistent"),
+            "finite coupled interval forgery": ("fixed_factor", lambda record: (
+                record["fit"]["ols"]["interval_95"].update({
+                    "upper": record["fit"]["ols"]["interval_95"]["upper"] + 1000.0,
+                }),
+                record["fit"]["ols"].update({
+                    "width_95": record["fit"]["ols"]["width_95"] + 1000.0,
+                }),
+            ), "response semantics inconsistent"),
         }
-        for label, (execution_path, mutate) in cases.items():
+        for label, (execution_path, mutate, pattern) in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
-                binary = (
-                    write_fake_batch(root, self.prereg["schemas"]["batch"])
-                    if execution_path == "fixed_factor"
-                    else ROOT / "target/release/examples/temporal_covariance_batch"
-                )
+                binary = ROOT / "target/release/examples/temporal_covariance_batch"
                 identity, shards, paths = committed(root, execution_path, binary)
                 record = json.loads(paths["records"].read_bytes())
                 mutate(record)
                 rebind(paths, record)
-                with self.assertRaisesRegex(RuntimeError, "batch returned"):
+                with self.assertRaisesRegex(RuntimeError, pattern):
                     module.execute_or_resume_shard(
                         self.prereg, cell, execution_path, 1,
                         shards, binary, identity,
@@ -973,7 +997,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                     preregistration, 1, None, run_root=run_root, binary=binary
                 )
             self.assertEqual(second, first)
-            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "48")
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "96")
 
     def test_retained_bound_matches_exact_48_shard_composition(self):
         module = load_generator()
