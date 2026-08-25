@@ -132,8 +132,8 @@ struct SpatialCovarianceResultScope {
     burst_id: String,
     crs: String,
     units: String,
-    geotransform: [f64; 6],
-    acquisition_days: Vec<f64>,
+    geotransform: Option<[f64; 6]>,
+    acquisition_days: Option<Vec<f64>>,
     grid_row_start: u64,
     grid_col_start: u64,
     grid_rows: u32,
@@ -233,9 +233,9 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     /// Factor units.
     pub units: String,
     /// Exact GDAL affine geotransform of the factor grid.
-    pub geotransform: [f64; 6],
+    pub geotransform: Option<[f64; 6]>,
     /// Exact acquisition day coordinates relative to the gauge acquisition.
-    pub acquisition_days: Vec<f64>,
+    pub acquisition_days: Option<Vec<f64>>,
     /// Selected reference/grid signature.
     pub reference_signature_digest: String,
     /// Native/output mask identity.

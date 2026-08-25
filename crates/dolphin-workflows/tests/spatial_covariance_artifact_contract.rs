@@ -41,7 +41,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         burst_id: "T078-165482-IW1".to_owned(),
         crs: "EPSG:32611".to_owned(),
         units: "radians".to_owned(),
-        geotransform: [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0],
+        geotransform: Some([500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0]),
         full_grid: CovarianceOperatorGrid {
             row_start: 0,
             col_start: 0,
@@ -54,7 +54,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_col: 0,
         gauge_date_index: 0,
         ordered_date_indices: vec![0, 1],
-        acquisition_days: vec![0.0, 12.0],
+        acquisition_days: Some(vec![0.0, 12.0]),
         mask_digest: digest(0x11),
         source_replay_digest: digest(0x22),
         l2_map_digest: digest(0x33),
@@ -88,10 +88,10 @@ fn block() -> SpatialReferenceCovarianceBlock {
         source_burst_index_by_target: vec![0],
         difference_factor: vec![0.0, 1.0],
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE],
-        effective_looks_fraction: vec![0.75],
-        support_union_count: vec![9],
-        effective_looks_receipt: vec![0x71; 32],
-        resource_high_water_bytes: vec![2048],
+        effective_looks_fraction: Some(vec![0.75]),
+        support_union_count: Some(vec![9]),
+        effective_looks_receipt: Some(vec![0x71; 32]),
+        resource_high_water_bytes: Some(vec![2048]),
         source_factor_digest: digest(0x77),
     }
 }
