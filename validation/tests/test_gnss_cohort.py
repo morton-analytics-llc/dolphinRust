@@ -217,6 +217,53 @@ FFFF 35.3000 -120.0000 13 0 0 0 2020-01-01 2025-01-01 2025-01-02 700
         self.assertEqual(len(payload["candidates"]), 1)
         validate_candidate(payload["candidates"][0], self.preregistration)
 
+    def test_discovery_queries_each_station_once_and_resumes_metadata_cache(self) -> None:
+        stations = discovery.parse_holdings(HOLDINGS)[:3]
+        pairs = [
+            (stations[0], stations[1], 10.0),
+            (stations[0], stations[2], 20.0),
+            (stations[1], stations[2], 15.0),
+        ]
+        response = SimpleNamespace(
+            text=HOLDINGS,
+            content=HOLDINGS.encode(),
+            raise_for_status=lambda: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "asf-metadata-cache.json"
+            args = SimpleNamespace(
+                preregistration=self.preregistration_path,
+                start="2023-01-01",
+                end="2024-01-01",
+                min_distance_km=1.0,
+                max_distance_km=30.0,
+                west=-170.0,
+                south=5.0,
+                east=-50.0,
+                north=75.0,
+                max_pairs=3,
+                min_epochs=12,
+                min_span_days=300,
+                target_sites=5,
+                metadata_cache=cache,
+            )
+            with patch.object(discovery.requests, "get", return_value=response), patch.object(
+                discovery, "candidate_pairs", return_value=pairs
+            ), patch.object(discovery, "search_station", return_value=[]) as search:
+                first = discovery.discover(args)
+            self.assertEqual(search.call_count, 3)
+            self.assertTrue(cache.is_file())
+            with patch.object(discovery.requests, "get", return_value=response), patch.object(
+                discovery, "candidate_pairs", return_value=pairs
+            ), patch.object(
+                discovery,
+                "search_station",
+                side_effect=AssertionError("persisted cache was not reused"),
+            ) as resumed_search:
+                second = discovery.discover(args)
+            self.assertEqual(resumed_search.call_count, 0)
+            self.assertEqual(first["examined_pairs"], second["examined_pairs"])
+
     def test_freeze_is_exact_lexical_disjoint_reconstruction(self) -> None:
         query_digest = self.preregistration["candidate_query"]["query_digest"]
         records = []

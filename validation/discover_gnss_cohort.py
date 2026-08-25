@@ -8,6 +8,8 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -56,6 +58,100 @@ class Exclusions:
     station_ids: frozenset[str]
     burst_ids: frozenset[str]
     site_ids: frozenset[str]
+
+
+class CachedCatalogResult:
+    def __init__(self, feature: dict[str, Any]) -> None:
+        properties = feature.get("properties")
+        geometry = feature.get("geometry")
+        if not isinstance(properties, dict) or not isinstance(geometry, dict):
+            raise ValueError("cached ASF result is not a GeoJSON feature")
+        self._feature = feature
+        self.properties = properties
+
+    def geojson(self) -> dict[str, Any]:
+        return self._feature
+
+
+class MetadataSearchCache:
+    SCHEMA = "dolphinrust.asf_metadata_search_cache"
+    VERSION = 1
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+        if path is not None and path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema") != self.SCHEMA or payload.get("schema_version") != self.VERSION:
+                raise ValueError("ASF metadata cache schema/version mismatch")
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                raise ValueError("ASF metadata cache entries are invalid")
+            self.entries = entries
+
+    def _request(self, station: Station, start: str, end: str) -> dict[str, Any]:
+        return {
+            "dataset": "OPERA-S1",
+            "processing_level": "CSLC",
+            "station_id": station.station_id,
+            "latitude": station.latitude,
+            "longitude": station.longitude,
+            "start": start,
+            "end": end,
+            "maximum_results": 500,
+        }
+
+    def search(self, station: Station, start: str, end: str) -> list[Any]:
+        request = self._request(station, start, end)
+        key = canonical_digest(request)
+        if key in self.entries:
+            self.hits += 1
+            entry = self.entries[key]
+            if entry.get("request") != request:
+                raise ValueError("ASF metadata cache request identity mismatch")
+            features = entry.get("results")
+            if not isinstance(features, list) or entry.get("results_sha256") != canonical_digest(features):
+                raise ValueError("ASF metadata cache result hash mismatch")
+            return [CachedCatalogResult(feature) for feature in features]
+        self.misses += 1
+        features = [result.geojson() for result in search_station(station, start, end)]
+        results = [CachedCatalogResult(feature) for feature in features]
+        self.entries[key] = {
+            "request": request,
+            "results": features,
+            "results_sha256": canonical_digest(features),
+        }
+        self.persist()
+        return results
+
+    def persist(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
+        try:
+            temporary_path.write_text(
+                json.dumps(
+                    {
+                        "schema": self.SCHEMA,
+                        "schema_version": self.VERSION,
+                        "entries": self.entries,
+                    },
+                    indent=2,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self.path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def load_exclusions(path: Path) -> Exclusions:
@@ -364,9 +460,10 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
     selected: list[dict[str, Any]] = []
     examined: list[dict[str, Any]] = []
     used_bursts: set[str] = set()
+    search_cache = MetadataSearchCache(getattr(args, "metadata_cache", None))
     for first, second, distance in pairs[: args.max_pairs]:
-        first_bursts = results_by_burst(search_station(first, args.start, args.end))
-        second_bursts = results_by_burst(search_station(second, args.start, args.end))
+        first_bursts = results_by_burst(search_cache.search(first, args.start, args.end))
+        second_bursts = results_by_burst(search_cache.search(second, args.start, args.end))
         shared: list[tuple[str, list[str]]] = []
         for burst in sorted(set(first_bursts) & set(second_bursts)):
             dates = sorted(set(first_bursts[burst]) & set(second_bursts[burst]))
@@ -456,6 +553,12 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         "candidates": selected,
         "rejected": [],
         "examined_pairs": examined,
+        "metadata_cache": {
+            "persisted": search_cache.path is not None,
+            "entry_count": len(search_cache.entries),
+            "hits": search_cache.hits,
+            "misses": search_cache.misses,
+        },
     }
 
 
@@ -482,6 +585,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest-output", type=Path)
+    parser.add_argument("--metadata-cache", type=Path)
     return parser.parse_args()
 
 
