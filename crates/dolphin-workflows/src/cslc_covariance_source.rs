@@ -1,11 +1,15 @@
 //! Immutable CSLC-member identity and empirical primitive-source resolution.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{EmpiricalSourceFactorOptions, InputType};
 use dolphin_core::{BlockIndices, Cf64};
+use dolphin_io::covariance::{
+    CovarianceGenerationRegistry, COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+};
 use dolphin_io::{
     covariance_content_bound_source_id, covariance_identified_id, read_cslc_shape,
     read_cslc_window, read_nisar_window, CovarianceOperatorGrid,
@@ -68,6 +72,58 @@ pub struct CslcCovarianceResolverMetrics {
     pub source_resolutions: u64,
     /// Peak resident decoded tile-cache bytes.
     pub peak_cached_bytes: u64,
+}
+
+/// Generation-routed CSLC resolver for one complete NRT artifact revision.
+///
+/// Only the active generation may retain a decoded source tile. Switching
+/// generations drops the prior cache before reading the next generation.
+pub struct CslcCovarianceGenerationResolverBundle<'a> {
+    identity: SequentialSourceProviderIdentity,
+    resolvers: BTreeMap<u32, CslcCovarianceSourceResolver<'a>>,
+    active_generation: Option<u32>,
+}
+
+impl CslcCovarianceGenerationResolverBundle<'_> {
+    /// Generation whose decoded source tile may currently be resident.
+    #[must_use]
+    pub const fn active_generation(&self) -> Option<u32> {
+        self.active_generation
+    }
+
+    /// Aggregate reads/resolutions and maximum one-generation cache residency.
+    #[must_use]
+    pub fn metrics(&self) -> CslcCovarianceResolverMetrics {
+        self.resolvers.values().fold(
+            CslcCovarianceResolverMetrics::default(),
+            |mut total, resolver| {
+                let current = resolver.metrics();
+                total.member_window_reads = total
+                    .member_window_reads
+                    .saturating_add(current.member_window_reads);
+                total.tile_cache_loads = total
+                    .tile_cache_loads
+                    .saturating_add(current.tile_cache_loads);
+                total.source_resolutions = total
+                    .source_resolutions
+                    .saturating_add(current.source_resolutions);
+                total.peak_cached_bytes = total.peak_cached_bytes.max(current.peak_cached_bytes);
+                total
+            },
+        )
+    }
+
+    fn resolver_for_block(
+        &self,
+        block: &SequentialReplayBlock,
+    ) -> Result<&CslcCovarianceSourceResolver<'_>, SequentialReplayError> {
+        self.resolvers.get(&block.generation).ok_or_else(|| {
+            CslcCovarianceSourceResolver::provider_error(
+                ReplayStatus::SourceIdentityMismatch,
+                "replay block generation is absent from the CSLC resolver bundle",
+            )
+        })
+    }
 }
 
 /// Ordered immutable identity of every configured CSLC member.
@@ -197,6 +253,108 @@ impl CslcCovarianceManifest {
         Ok(())
     }
 
+    /// Verify that this manifest is the exact ordered prefix of `paths`, rehash
+    /// every prior decoded member, then capture only the appended members.
+    ///
+    /// Prior members are verified both before and after extension capture so a
+    /// concurrent mutation cannot be admitted into the returned revision.
+    ///
+    /// # Errors
+    /// Returns an error before reading any appended member when the path prefix
+    /// differs or a prior member's metadata, shape, or decoded values changed.
+    pub fn verify_prefix_and_extend(&self, paths: &[PathBuf]) -> Result<Self> {
+        anyhow::ensure!(
+            paths.len() > self.members.len()
+                && paths[..self.members.len()]
+                    .iter()
+                    .zip(&self.members)
+                    .all(|(path, member)| *path == member.path),
+            "CSLC extension does not preserve the exact ordered prefix"
+        );
+        self.verify_unchanged()?;
+        let mut members = self.members.clone();
+        for path in &paths[self.members.len()..] {
+            let shape = read_cslc_shape(path, &self.subdataset)
+                .with_context(|| format!("reading CSLC extension shape from {}", path.display()))?;
+            let fingerprint = file_fingerprint(path)?;
+            let content_digest =
+                member_content_digest(self.input_type, path, &self.subdataset, shape)
+                    .with_context(|| format!("hashing CSLC extension member {}", path.display()))?;
+            anyhow::ensure!(
+                content_digest.iter().any(|byte| *byte != 0),
+                "CSLC extension member digest is missing"
+            );
+            anyhow::ensure!(
+                file_fingerprint(path)? == fingerprint,
+                "CSLC extension member changed during manifest capture"
+            );
+            members.push(CslcMemberIdentity {
+                path: path.clone(),
+                shape,
+                content_digest,
+                file_fingerprint: fingerprint,
+            });
+        }
+        self.verify_unchanged()?;
+        let digest = manifest_digest(self.input_type, &self.subdataset, &members);
+        let resource_estimate = manifest_resource_estimate(&members)?;
+        let extended = Self {
+            input_type: self.input_type,
+            subdataset: self.subdataset.clone(),
+            members,
+            digest,
+            resource_estimate,
+        };
+        extended.verify_unchanged()?;
+        Ok(extended)
+    }
+
+    /// Exact ordered member receipt for one burst-local sequential generation.
+    ///
+    /// # Errors
+    /// Returns an error for an empty burst, empty generation, repeated/out-of-order
+    /// member indices, or an index outside this revision.
+    pub fn generation_member_manifest_digest(
+        &self,
+        member_indices: &[usize],
+        burst_id: &str,
+        generation: u32,
+    ) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            !burst_id.is_empty(),
+            "CSLC generation burst identity is empty"
+        );
+        anyhow::ensure!(
+            !member_indices.is_empty()
+                && member_indices
+                    .windows(2)
+                    .all(|pair| pair[0].checked_add(1) == Some(pair[1])),
+            "CSLC generation member indices must be nonempty and consecutive"
+        );
+        let mut digest = Sha256::new();
+        digest.update(b"dolphinrust:cslc_generation_member_manifest:v1");
+        digest.update(input_type_tag(self.input_type));
+        digest.update((self.subdataset.len() as u64).to_le_bytes());
+        digest.update(self.subdataset.as_bytes());
+        digest.update((burst_id.len() as u64).to_le_bytes());
+        digest.update(burst_id.as_bytes());
+        digest.update(generation.to_le_bytes());
+        digest.update((member_indices.len() as u64).to_le_bytes());
+        for &index in member_indices {
+            let member = self.members.get(index).with_context(|| {
+                format!("CSLC generation member index {index} is outside the manifest")
+            })?;
+            let path = member.path.as_os_str().as_encoded_bytes();
+            digest.update((index as u64).to_le_bytes());
+            digest.update((path.len() as u64).to_le_bytes());
+            digest.update(path);
+            digest.update((member.shape.0 as u64).to_le_bytes());
+            digest.update((member.shape.1 as u64).to_le_bytes());
+            digest.update(member.content_digest);
+        }
+        Ok(digest.finalize().into())
+    }
+
     /// Build a resolver for one burst and one captured native tile.
     ///
     /// `member_indices` are burst-local date order into this immutable manifest.
@@ -208,6 +366,231 @@ impl CslcCovarianceManifest {
         &self,
         member_indices: &[usize],
         burst_id: impl Into<String>,
+        processed_origin: (usize, usize),
+        processed_shape: (usize, usize),
+        tile_grid: CovarianceOperatorGrid,
+        options: &EmpiricalSourceFactorOptions,
+        source_model_version_digest: [u8; 32],
+        validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
+    ) -> Result<CslcCovarianceSourceResolver<'a>> {
+        self.resolver_with_manifest_digest(
+            member_indices,
+            burst_id.into(),
+            self.digest,
+            None,
+            processed_origin,
+            processed_shape,
+            tile_grid,
+            options,
+            source_model_version_digest,
+            validity_reader,
+        )
+    }
+
+    /// Build a resolver over one exact generation while retaining the complete
+    /// revision identity separately from the generation replay namespace.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid generation receipt, member, grid, or
+    /// factor configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolver_for_generation<'a>(
+        &self,
+        member_indices: &[usize],
+        generation_member_indices: &[usize],
+        burst_id: impl Into<String>,
+        generation: u32,
+        processed_origin: (usize, usize),
+        processed_shape: (usize, usize),
+        tile_grid: CovarianceOperatorGrid,
+        options: &EmpiricalSourceFactorOptions,
+        source_model_version_digest: [u8; 32],
+        validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
+    ) -> Result<CslcCovarianceSourceResolver<'a>> {
+        let burst_id = burst_id.into();
+        let generation_digest = self.generation_member_manifest_digest(
+            generation_member_indices,
+            &burst_id,
+            generation,
+        )?;
+        let generation_member_positions = generation_member_indices
+            .iter()
+            .map(|generation_member| {
+                let positions = member_indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, member)| {
+                        (member == generation_member).then_some(position)
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    positions.len() == 1,
+                    "generation member {generation_member} must occur exactly once in the resolver member list"
+                );
+                Ok(positions[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            generation_member_positions
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1),
+            "generation members must be one contiguous date range in the resolver member list"
+        );
+        let generation_date_start = *generation_member_positions
+            .first()
+            .context("generation member list is empty")?;
+        self.resolver_with_manifest_digest(
+            generation_member_indices,
+            burst_id,
+            generation_digest,
+            Some((generation, generation_date_start)),
+            processed_origin,
+            processed_shape,
+            tile_grid,
+            options,
+            source_model_version_digest,
+            validity_reader,
+        )
+    }
+
+    /// Build a generation-routed resolver for one complete NRT artifact revision.
+    ///
+    /// Every registry generation for `burst_id` is rebound to this manifest's
+    /// exact member bytes and empirical factor configuration before the bundle
+    /// is returned. The complete revision digest remains the provider identity;
+    /// each replay block uses its generation member digest.
+    ///
+    /// # Errors
+    /// Returns before source-window reads when the registry is stale, mixed,
+    /// incomplete, or bound to a different empirical model receipt.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn resolver_bundle<'a>(
+        &self,
+        member_indices: &[usize],
+        registry: &CovarianceGenerationRegistry,
+        burst_id: impl Into<String>,
+        processed_origin: (usize, usize),
+        processed_shape: (usize, usize),
+        tile_grid: CovarianceOperatorGrid,
+        options: &EmpiricalSourceFactorOptions,
+        source_model_version_digest: [u8; 32],
+        validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
+    ) -> Result<CslcCovarianceGenerationResolverBundle<'a>> {
+        let burst_id = burst_id.into();
+        anyhow::ensure!(
+            registry.schema_version == COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+            "unsupported covariance generation registry schema version"
+        );
+        anyhow::ensure!(
+            registry.full_source_manifest_digest == self.digest,
+            "covariance generation registry full source manifest differs from CSLC revision"
+        );
+        let factor_config = empirical_factor_config(options)?;
+        let source_model_receipt_digest = *factor_config.config_digest();
+        let generations = registry
+            .generations
+            .iter()
+            .filter(|identity| identity.burst_id == burst_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !generations.is_empty(),
+            "covariance generation registry has no requested burst"
+        );
+        let mut resolvers = BTreeMap::new();
+        let mut next_date = 0_u32;
+        for identity in generations {
+            anyhow::ensure!(
+                identity.generation == resolvers.len() as u32
+                    && identity.source_date_indices.first().copied() == Some(next_date)
+                    && identity
+                        .source_date_indices
+                        .windows(2)
+                        .all(|pair| pair[0].checked_add(1) == Some(pair[1])),
+                "covariance generation registry is not a contiguous generation/date sequence"
+            );
+            anyhow::ensure!(
+                identity.source_model_version_digest == source_model_version_digest,
+                "covariance generation source-model version differs from the resolver"
+            );
+            anyhow::ensure!(
+                identity.source_model_receipt_digest == source_model_receipt_digest,
+                "covariance generation source-model receipt differs from the empirical factor configuration"
+            );
+            let generation_member_indices = identity
+                .source_date_indices
+                .iter()
+                .map(|date| {
+                    member_indices
+                        .get(*date as usize)
+                        .copied()
+                        .with_context(|| {
+                            format!(
+                                "covariance generation source date {date} is outside the resolver member list"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expected_digest = self.generation_member_manifest_digest(
+                &generation_member_indices,
+                &burst_id,
+                identity.generation,
+            )?;
+            anyhow::ensure!(
+                identity.source_member_manifest_digest == expected_digest,
+                "covariance generation source manifest differs from immutable CSLC members"
+            );
+            let resolver = self.resolver_for_generation(
+                member_indices,
+                &generation_member_indices,
+                burst_id.clone(),
+                identity.generation,
+                processed_origin,
+                processed_shape,
+                tile_grid,
+                options,
+                source_model_version_digest,
+                validity_reader,
+            )?;
+            anyhow::ensure!(
+                resolver.source_identity().source_model_hash == source_model_receipt_digest,
+                "CSLC resolver empirical source-model receipt is inconsistent"
+            );
+            next_date = identity
+                .source_date_indices
+                .last()
+                .and_then(|date| date.checked_add(1))
+                .context("covariance generation source date overflows u32")?;
+            anyhow::ensure!(
+                resolvers.insert(identity.generation, resolver).is_none(),
+                "covariance generation registry repeats a generation"
+            );
+        }
+        anyhow::ensure!(
+            next_date as usize == member_indices.len(),
+            "covariance generation registry does not cover the resolver member list"
+        );
+        Ok(CslcCovarianceGenerationResolverBundle {
+            identity: SequentialSourceProviderIdentity {
+                source_manifest_digest: self.digest,
+                provider: CSLC_COVARIANCE_SOURCE_PROVIDER.to_owned(),
+                provider_version: CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned(),
+                model: CSLC_COVARIANCE_SOURCE_MODEL.to_owned(),
+                model_version: CSLC_COVARIANCE_SOURCE_MODEL_VERSION.to_owned(),
+                source_model_version_digest,
+                source_model_hash: source_model_receipt_digest,
+            },
+            resolvers,
+            active_generation: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolver_with_manifest_digest<'a>(
+        &self,
+        member_indices: &[usize],
+        burst_id: String,
+        source_manifest_digest: [u8; 32],
+        generation_scope: Option<(u32, usize)>,
         processed_origin: (usize, usize),
         processed_shape: (usize, usize),
         tile_grid: CovarianceOperatorGrid,
@@ -248,7 +631,7 @@ impl CslcCovarianceManifest {
         let factor_config = empirical_factor_config(options)?;
         let source_model_hash = *factor_config.config_digest();
         let identity = SequentialSourceProviderIdentity {
-            source_manifest_digest: self.digest,
+            source_manifest_digest,
             provider: CSLC_COVARIANCE_SOURCE_PROVIDER.to_owned(),
             provider_version: CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned(),
             model: CSLC_COVARIANCE_SOURCE_MODEL.to_owned(),
@@ -260,12 +643,14 @@ impl CslcCovarianceManifest {
             input_type: self.input_type,
             subdataset: self.subdataset.clone(),
             members,
-            burst_id: burst_id.into(),
+            burst_id,
             native_origin: (0, 0),
             native_shape,
             tile_grid,
             factor_config,
             identity,
+            full_revision_manifest_digest: self.digest,
+            generation_scope,
             validity_reader,
             tile_cache: None,
             metrics: CslcCovarianceResolverMetrics::default(),
@@ -306,6 +691,8 @@ pub struct CslcCovarianceSourceResolver<'a> {
     tile_grid: CovarianceOperatorGrid,
     factor_config: EmpiricalProperComplexConfig,
     identity: SequentialSourceProviderIdentity,
+    full_revision_manifest_digest: [u8; 32],
+    generation_scope: Option<(u32, usize)>,
     validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
     tile_cache: Option<CslcSourceTileCache>,
     metrics: CslcCovarianceResolverMetrics,
@@ -319,10 +706,26 @@ impl CslcCovarianceSourceResolver<'_> {
         &self.identity
     }
 
+    /// Generation-member manifest digest used by replay IDs.
+    #[must_use]
+    pub const fn generation_manifest_digest(&self) -> [u8; 32] {
+        self.identity.source_manifest_digest
+    }
+
+    /// Full ordered manifest digest for the complete artifact revision.
+    #[must_use]
+    pub const fn full_revision_manifest_digest(&self) -> [u8; 32] {
+        self.full_revision_manifest_digest
+    }
+
     /// Physical-read and cache high-water evidence.
     #[must_use]
     pub const fn metrics(&self) -> CslcCovarianceResolverMetrics {
         self.metrics
+    }
+
+    fn clear_tile_cache(&mut self) {
+        self.tile_cache = None;
     }
 
     pub(crate) fn set_tile_grid(&mut self, tile_grid: CovarianceOperatorGrid) {
@@ -580,14 +983,27 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
         block: &SequentialReplayBlock,
         native_index: usize,
     ) -> Result<ResolvedPrimitiveSource, SequentialReplayError> {
-        let start = usize::try_from(block.real_date_start.get())
+        let global_start = usize::try_from(block.real_date_start.get())
             .map_err(|_| SequentialReplayError::Invalid("source date exceeds usize"))?;
-        let stop =
-            start
-                .checked_add(block.num_real_dates)
-                .ok_or(SequentialReplayError::Invalid(
-                    "source date range overflows usize",
-                ))?;
+        let global_stop = global_start.checked_add(block.num_real_dates).ok_or(
+            SequentialReplayError::Invalid("source date range overflows usize"),
+        )?;
+        let (start, stop) = match self.generation_scope {
+            Some((generation, generation_date_start))
+                if block.generation == generation
+                    && global_start == generation_date_start
+                    && block.num_real_dates == self.members.len() =>
+            {
+                (0, self.members.len())
+            }
+            Some(_) => {
+                return Err(Self::provider_error(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "replay block generation or dates differ from the generation source receipt",
+                ));
+            }
+            None => (global_start, global_stop),
+        };
         if stop > self.members.len() {
             return Err(Self::provider_error(
                 ReplayStatus::SourceIdentityMismatch,
@@ -645,7 +1061,7 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
             covariance_content_bound_source_id(locator, &content_digest)
                 .map_err(|_| SequentialReplayError::Invalid("binding source content failed"))?,
         );
-        let component_ids = (start..stop)
+        let component_ids = (global_start..global_stop)
             .map(|index| {
                 u64::try_from(index)
                     .map_err(|_| SequentialReplayError::Invalid("component index exceeds u64"))
@@ -655,7 +1071,7 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
         data_identity.update(b"dolphinrust:cslc_source_block_identity:v1");
         data_identity.update(self.identity.source_manifest_digest);
         data_identity.update((members.len() as u64).to_le_bytes());
-        for (index, member) in (start..stop).zip(members) {
+        for (index, member) in (global_start..global_stop).zip(members) {
             data_identity.update((index as u64).to_le_bytes());
             data_identity.update(member.content_digest);
         }
@@ -695,6 +1111,66 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
             factor,
             content_digest,
         })
+    }
+}
+
+impl SequentialPrimitiveSourceResolver for CslcCovarianceGenerationResolverBundle<'_> {
+    fn identity(&self) -> &SequentialSourceProviderIdentity {
+        &self.identity
+    }
+
+    fn identity_for_block(
+        &self,
+        block: &SequentialReplayBlock,
+    ) -> Result<&SequentialSourceProviderIdentity, SequentialReplayError> {
+        Ok(self.resolver_for_block(block)?.source_identity())
+    }
+
+    fn maximum_resident_bytes(&self) -> u64 {
+        self.resolvers
+            .values()
+            .map(SequentialPrimitiveSourceResolver::maximum_resident_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn factor_receipt_digest(
+        &self,
+        source: &ResolvedPrimitiveSource,
+    ) -> Result<[u8; 32], SequentialReplayError> {
+        self.active_generation
+            .and_then(|generation| self.resolvers.get(&generation))
+            .ok_or_else(|| {
+                CslcCovarianceSourceResolver::provider_error(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "empirical factor receipt has no active generation resolver",
+                )
+            })?
+            .factor_receipt_digest(source)
+    }
+
+    fn resolve_source(
+        &mut self,
+        block: &SequentialReplayBlock,
+        native_index: usize,
+    ) -> Result<ResolvedPrimitiveSource, SequentialReplayError> {
+        if self.active_generation != Some(block.generation) {
+            if let Some(active) = self.active_generation {
+                if let Some(resolver) = self.resolvers.get_mut(&active) {
+                    resolver.clear_tile_cache();
+                }
+            }
+            self.active_generation = Some(block.generation);
+        }
+        self.resolvers
+            .get_mut(&block.generation)
+            .ok_or_else(|| {
+                CslcCovarianceSourceResolver::provider_error(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "replay block generation is absent from the CSLC resolver bundle",
+                )
+            })?
+            .resolve_source(block, native_index)
     }
 }
 
