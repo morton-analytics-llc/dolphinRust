@@ -38,9 +38,10 @@ use dolphin_workflows::{
     ResolvedPrimitiveSource, SequentialConfig, SequentialCovarianceCaptureRequest,
     SequentialPrimitiveSourceResolver, SequentialReplayBlock, SequentialReplayBuildIdentity,
     SequentialReplayError, SequentialReplayTopology, SequentialSourceProviderIdentity,
-    SequentialSourceReplayProvider, SequentialTileReplayProvider, COVARIANCE_OPERATOR_FILENAME,
-    CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
-    CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+    SequentialSourceReplayProvider, SequentialTileReplayProvider, SourceCorrelationModel,
+    COVARIANCE_OPERATOR_FILENAME, CSLC_COVARIANCE_SOURCE_MODEL,
+    CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
+    CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 use ndarray::{array, Array1, Array2, Array3, Axis};
 use sha2::{Digest, Sha256};
@@ -1079,13 +1080,14 @@ fn dependency_cone_preflight_rejects_one_byte_below_the_exact_bound() {
     assert_eq!(
         (
             estimate.frontier_bytes,
+            estimate.source_influence_bytes,
             estimate.source_window_bytes,
             estimate.operator_bytes,
             estimate.support_bytes,
             estimate.covariance_bytes,
             estimate.provider_bytes,
         ),
-        (1_944, 47_608, 47_960, 6, 72, 0)
+        (744, 1_200, 47_608, 47_960, 6, 72, 0)
     );
     let estimator_workspace =
         phase_angle_jvp_workspace_bytes(4, FixedEstimatorBranch::Evd).unwrap();
@@ -1093,6 +1095,7 @@ fn dependency_cone_preflight_rejects_one_byte_below_the_exact_bound() {
     assert_eq!(
         estimate.total_bytes,
         estimate.frontier_bytes
+            + estimate.source_influence_bytes
             + estimate.source_window_bytes
             + estimate.operator_bytes
             + estimate.baseline_bytes
@@ -2097,7 +2100,7 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         (GlobalDateId::new(6), 3),
     ];
     let disjoint = disjoint_topology
-        .replay_reference_difference_covariance_from_provider(
+        .replay_reference_difference_covariance_from_provider_with_source_correlation(
             &joint_selection,
             &disjoint_reference,
             DependencyConeQuery {
@@ -2105,6 +2108,7 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
                 microbatch: 1,
                 byte_cap: u64::MAX,
             },
+            SourceCorrelationModel::Identity,
             request.branch_tolerance,
             &mut disjoint_provider,
         )
@@ -2184,17 +2188,35 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
             &mut provider,
         )
         .unwrap();
-    let effective_fraction = shared.effective_looks.as_ref().unwrap().fraction;
+    let independent_pair = topology
+        .replay_reference_difference_covariance_from_provider_with_source_correlation(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            SourceCorrelationModel::Identity,
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    assert_eq!(
+        independent_pair.effective_looks.as_ref().unwrap().fraction,
+        1.0
+    );
     for row in 0..4 {
         for column in 0..4 {
             assert!(
-                (shared.target_covariance[(row, column)]
-                    - target_marginal.covariance[(row, column)] / effective_fraction)
+                (independent_pair.target_covariance[(row, column)]
+                    - target_marginal.covariance[(row, column)])
                     .abs()
                     < 1.0e-10
             );
         }
     }
+    assert_ne!(shared.target_covariance, independent_pair.target_covariance);
 
     provider.dishonest_samples = true;
     let error = topology
@@ -3126,14 +3148,14 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         .sum::<f64>();
     let expected_fraction = expected_support.len() as f64 / expected_denominator;
     let effective_looks = replay.effective_looks.as_ref().unwrap();
-    assert_eq!(effective_looks.model, "source_factor_declared_v1");
+    assert_eq!(effective_looks.model, "exponential_euclidean_v1");
     assert_eq!(effective_looks.distance_scale_pixels, 1.5);
     assert_eq!(effective_looks.support_union_count, expected_support.len());
     assert!((effective_looks.fraction - expected_fraction).abs() < 1e-15);
     assert_ne!(effective_looks.receipt, [0; 32]);
     let mut expected_receipt = Sha256::new();
-    expected_receipt.update(b"dolphinrust:effective-looks-realization:v1");
-    expected_receipt.update(b"source_factor_declared_v1");
+    expected_receipt.update(b"dolphinrust:source-correlation-realization:v1");
+    expected_receipt.update(b"exponential_euclidean_v1");
     expected_receipt.update(1.5_f64.to_bits().to_le_bytes());
     expected_receipt.update((expected_support.len() as u64).to_le_bytes());
     for &(row, column) in &expected_support {
@@ -3144,7 +3166,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
     expected_receipt.update(replay.source_factor_receipt);
     expected_receipt.update(replay.support_receipt);
     assert_eq!(effective_looks.receipt, expected_receipt.finalize()[..]);
-    let config_only_receipt = Sha256::digest(b"source_factor_declared_v1:1.5");
+    let config_only_receipt = Sha256::digest(b"exponential_euclidean_v1:1.5");
     assert_ne!(effective_looks.receipt, config_only_receipt[..]);
 
     let epsilon = 1e-4;
@@ -3180,7 +3202,33 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             }
         }
     }
-    let oracle = jacobian.dot(&jacobian.t());
+    let mut oracle = Array2::<f64>::zeros((6, 6));
+    for left_row in 0_usize..4 {
+        for left_col in 0_usize..8 {
+            for right_row in 0_usize..4 {
+                for right_col in 0_usize..8 {
+                    let row_distance = left_row.abs_diff(right_row) as f64;
+                    let col_distance = left_col.abs_diff(right_col) as f64;
+                    let correlation = (-(row_distance.hypot(col_distance)) / 1.5).exp();
+                    for date in 0..3 {
+                        for imaginary in 0..2 {
+                            let left_column =
+                                (((date * 4 + left_row) * 8 + left_col) * 2) + imaginary;
+                            let right_column =
+                                (((date * 4 + right_row) * 8 + right_col) * 2) + imaginary;
+                            for output_row in 0..6 {
+                                for output_col in 0..6 {
+                                    oracle[(output_row, output_col)] += correlation
+                                        * jacobian[(output_row, left_column)]
+                                        * jacobian[(output_col, right_column)];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut actual = Array2::<f64>::zeros((6, 6));
     actual
         .slice_mut(ndarray::s![..3, ..3])
@@ -3194,11 +3242,10 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
     actual
         .slice_mut(ndarray::s![3.., ..3])
         .assign(&replay.target_reference_covariance.t());
-    for ((row, col), unscaled) in oracle.indexed_iter() {
-        let expected = unscaled / expected_fraction;
+    for ((row, col), expected) in oracle.indexed_iter() {
         let tolerance = 5e-9 + 5e-5 * expected.abs();
         assert!(
-            (actual[(row, col)] - expected).abs() <= tolerance,
+            (actual[(row, col)] - *expected).abs() <= tolerance,
             "joint covariance[{row},{col}] {} != dense oracle {expected}",
             actual[(row, col)]
         );
@@ -3224,6 +3271,9 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         SequentialTileReplayProvider::new(&left, &mut estimate_left),
         SequentialTileReplayProvider::new(&right, &mut estimate_right),
     ];
+    let source_correlation = SourceCorrelationModel::ExponentialEuclidean {
+        distance_scale_pixels: 1.5,
+    };
     let estimate = estimate_global_reference_difference_covariance_from_provider_bundle(
         &mut estimate_bundle,
         GlobalReferenceCovarianceQuery {
@@ -3232,6 +3282,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             reference: (0, 1),
             ordered_dates: &dates,
             source_rank: 6,
+            source_correlation,
             byte_cap: u64::MAX,
             branch_tolerance,
         },
@@ -3247,12 +3298,21 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             reference: (0, 1),
             ordered_dates: &dates,
             source_rank: 6,
+            source_correlation,
             byte_cap: u64::MAX,
             branch_tolerance,
         },
     )
     .unwrap();
     assert_eq!(estimate.total_bytes, global.resource_high_water_bytes);
+    assert!(global.replay.dependency_cone.source_influence_bytes > 0);
+    assert!(
+        global
+            .replay
+            .dependency_cone
+            .source_correlation_workspace_bytes
+            > 0
+    );
     assert_eq!(global.joint_phase_covariance, actual);
     assert_eq!(
         global.replay.difference_covariance,
@@ -3284,6 +3344,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             reference: (0, 1),
             ordered_dates: &dates,
             source_rank: 6,
+            source_correlation,
             byte_cap: u64::MAX,
             branch_tolerance,
         },
@@ -3324,6 +3385,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             reference: (0, 1),
             ordered_dates: &dates,
             source_rank: 6,
+            source_correlation,
             byte_cap: global.resource_high_water_bytes - 1,
             branch_tolerance,
         },
@@ -3347,6 +3409,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
             reference: (0, 1),
             ordered_dates: &dates,
             source_rank: 6,
+            source_correlation,
             byte_cap: u64::MAX,
             branch_tolerance,
         },
@@ -3366,6 +3429,38 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         coincident.target_reference_covariance
     );
 
+    let mut independent_left = provider_for(&left_provider);
+    let mut independent_right = provider_for(&right_provider);
+    let independent_overlap = left
+        .replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation(
+            &target,
+            &mut independent_left,
+            &right,
+            &reference,
+            &mut independent_right,
+            query,
+            SourceCorrelationModel::Identity,
+            branch_tolerance,
+        )
+        .unwrap();
+    assert!(independent_overlap.target_reference_covariance[(2, 2)].abs() > 1e-12);
+    assert_eq!(
+        independent_overlap.effective_looks.as_ref().unwrap().model,
+        "identity_v1"
+    );
+    assert_eq!(
+        independent_overlap
+            .effective_looks
+            .as_ref()
+            .unwrap()
+            .fraction,
+        1.0
+    );
+    assert_ne!(
+        independent_overlap.difference_covariance,
+        replay.difference_covariance
+    );
+
     let (far, mut far_provider, _) = capture_tile(&right_stack, 20, 10);
     let mut disjoint_left = provider_for(&left_provider);
     let disjoint = left
@@ -3380,6 +3475,24 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         )
         .unwrap();
     assert!(disjoint
+        .target_reference_covariance
+        .iter()
+        .any(|value| value.abs() > 1e-12));
+    let mut independent_disjoint_left = provider_for(&left_provider);
+    let mut independent_far = provider_for(&far_provider);
+    let independent_disjoint = left
+        .replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation(
+            &target,
+            &mut independent_disjoint_left,
+            &far,
+            &reference,
+            &mut independent_far,
+            query,
+            SourceCorrelationModel::Identity,
+            branch_tolerance,
+        )
+        .unwrap();
+    assert!(independent_disjoint
         .target_reference_covariance
         .iter()
         .all(|value| *value == 0.0));

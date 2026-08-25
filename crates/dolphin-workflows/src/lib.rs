@@ -19,6 +19,7 @@ pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
 pub mod spatial_covariance_artifact;
+pub mod spatial_covariance_validation;
 mod spatial_reference_covariance_output;
 pub mod temporal_covariance_product;
 pub mod tiling;
@@ -86,8 +87,8 @@ pub use sequential_covariance::{
     SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver, SequentialReplayBlock,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
     SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SequentialTileReplayProvider,
-    SpatialCovarianceStatus, TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID,
-    SEQUENTIAL_SOURCE_DAG_METHOD,
+    SourceCorrelationModel, SpatialCovarianceStatus, TemporalCovarianceReplay,
+    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use spatial_covariance_artifact::{
     finalize_spatial_reference_covariance_artifact,
