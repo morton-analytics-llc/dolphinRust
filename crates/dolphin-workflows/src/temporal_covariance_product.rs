@@ -39,6 +39,15 @@ use crate::spatial_covariance_artifact::{
 pub const TEMPORAL_SYNTHETIC_RESULT_FILENAME: &str = "temporal_covariance_synthetic_result.json";
 /// Externally supplied non-Fresno holdout result filename.
 pub const TEMPORAL_HELDOUT_RESULT_FILENAME: &str = "temporal_covariance_heldout_result.json";
+/// Exact one-shot 96+20 raw receipt consumed by the held-out scorer.
+pub const TEMPORAL_HELDOUT_RECEIPT_FILENAME: &str =
+    "temporal_covariance_heldout_result_receipt.json";
+/// Frozen outcome-blind cohort manifest supplied with the held-out receipt.
+pub const TEMPORAL_HELDOUT_MANIFEST_FILENAME: &str =
+    "temporal_covariance_heldout_cohort_manifest.json";
+/// Freeze receipt binding the manifest to the preregistration before unblinding.
+pub const TEMPORAL_HELDOUT_FREEZE_RECEIPT_FILENAME: &str =
+    "temporal_covariance_heldout_cohort_freeze_receipt.json";
 /// Independent scientific-review receipt filename.
 pub const TEMPORAL_REVIEW_RECEIPT_FILENAME: &str = "temporal_covariance_review_receipt.json";
 /// Immutable completion/promotion manifest filename.
@@ -52,6 +61,8 @@ const PRODUCT_SCHEMA: &str = "dolphinrust-temporal-inference-product/1";
 const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/1";
 const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
 const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/5";
+const HELDOUT_SCORE_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_score";
+const HELDOUT_RECEIPT_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_receipt";
 const LAYER_COUNT: usize = 14;
 const COMBINED_WORKING_SET_CAP_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
@@ -59,6 +70,7 @@ const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.j
 const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
 const TRANSACTION_ARTIFACT_MARKER_SCHEMA: &str = "dolphinrust-temporal-transaction-artifact/1";
 const TRANSACTION_ARTIFACT_MARKER_FILENAME: &str = ".temporal-transaction-owner.json";
+const HELDOUT_COHORT_ID: &str = "f53-06-outer-nonfresno-v1";
 static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -78,6 +90,11 @@ const BATCH_SOURCE_BYTES: &[u8] =
     include_bytes!("../../dolphin-timeseries/examples/temporal_covariance_batch.rs");
 const PRODUCT_SOURCE_BYTES: &[u8] = include_bytes!("temporal_covariance_product.rs");
 const FIXED_CUBE_SOURCE_BYTES: &[u8] = include_bytes!("fixed_cube.rs");
+const DISPLACEMENT_SOURCE_BYTES: &[u8] = include_bytes!("displacement.rs");
+const SPATIAL_ARTIFACT_SOURCE_BYTES: &[u8] = include_bytes!("spatial_covariance_artifact.rs");
+const GEOTIFF_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/geotiff.rs");
+const COVARIANCE_IO_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/covariance.rs");
+const CONFIG_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-core/src/config.rs");
 
 /// A promotion authorization that cannot be constructed outside this module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +167,8 @@ struct ProductGridReceipt {
     cols: usize,
     geotransform: [f64; 6],
     epsg: Option<u32>,
+    velocity_unit: String,
+    process_variance_unit: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,12 +269,80 @@ struct HeldoutLevel {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeldoutResult {
+    schema: String,
+    schema_version: u16,
+    cohort_id: String,
+    manifest_file_sha256: String,
+    manifest_sha256: String,
+    freeze_receipt_sha256: String,
+    factor_scope_sha256: String,
+    heldout_receipt_sha256: String,
+    primary_cluster_count: usize,
+    surplus_cluster_count: usize,
     status: String,
     errors: Vec<Value>,
     levels: BTreeMap<String, HeldoutLevel>,
     evaluated_clusters: usize,
     emission_rate: f64,
+    attrited_primary_ids: Vec<String>,
+    used_surplus_ids: Vec<String>,
+    unused_surplus_ids: Vec<String>,
+    reasons_by_cluster: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldoutAttrition {
+    attrited_primary_ids: Vec<String>,
+    used_surplus_ids: Vec<String>,
+    unused_surplus_ids: Vec<String>,
+    reasons_by_cluster: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldoutRunIdentity {
+    generation_id: String,
+    preregistration_sha256: String,
+    manifest_sha256: String,
+    freeze_receipt_sha256: String,
+    run_plan_sha256: String,
+    binary_sha256: String,
+    implementation_source_hashes: BTreeMap<String, String>,
+    product_identities_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldoutClusterCounts {
+    primary: usize,
+    surplus: usize,
+    executed: usize,
+    evaluable: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldoutReceipt {
+    schema: String,
+    schema_version: u16,
+    outcomes_present: bool,
+    one_shot_unblinding: bool,
+    cohort_id: String,
+    generation_id: String,
+    preregistration_sha256: String,
+    manifest_sha256: String,
+    scope_hash: String,
+    calibrated_scope_match: bool,
+    factor_binding: Value,
+    hashes: BTreeMap<String, String>,
+    cluster_counts: HeldoutClusterCounts,
+    attrition: HeldoutAttrition,
+    clusters: Vec<Value>,
+    run_identity: HeldoutRunIdentity,
+    run_identity_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +355,7 @@ struct TemporalReviewReceipt {
     unresolved_findings: u32,
     synthetic_result_sha256: String,
     heldout_result_sha256: String,
+    heldout_receipt_sha256: String,
     spatial_manifest_sha256: String,
     temporal_preregistration_sha256: String,
     heldout_preregistration_sha256: String,
@@ -285,6 +373,7 @@ struct TemporalPromotionManifest {
     selected_method_version: u16,
     synthetic_result_sha256: String,
     heldout_result_sha256: String,
+    heldout_receipt_sha256: String,
     review_receipt_sha256: String,
     spatial_factor_sha256: String,
     spatial_manifest_sha256: String,
@@ -321,7 +410,26 @@ pub fn validate_temporal_covariance_promotion(
         JSON_CAP,
     )?;
     let heldout: HeldoutResult = serde_json::from_slice(&heldout_bytes)?;
-    validate_heldout_result(&heldout)?;
+    let heldout_receipt_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_HELDOUT_RECEIPT_FILENAME),
+        JSON_CAP,
+    )?;
+    let heldout_receipt: HeldoutReceipt = serde_json::from_slice(&heldout_receipt_bytes)?;
+    let heldout_manifest_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_HELDOUT_MANIFEST_FILENAME),
+        JSON_CAP,
+    )?;
+    let heldout_freeze_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_HELDOUT_FREEZE_RECEIPT_FILENAME),
+        JSON_CAP,
+    )?;
+    let heldout_identity = validate_heldout_receipt(
+        &heldout_receipt,
+        &heldout_manifest_bytes,
+        &heldout_freeze_bytes,
+        sha256(&heldout_receipt_bytes),
+    )?;
+    validate_heldout_result(&heldout, &heldout_identity)?;
     let review_bytes = read_bounded(
         &evidence_directory.join(TEMPORAL_REVIEW_RECEIPT_FILENAME),
         JSON_CAP,
@@ -330,6 +438,7 @@ pub fn validate_temporal_covariance_promotion(
     let expected = EvidenceDigests::current(
         sha256(&synthetic_bytes),
         sha256(&heldout_bytes),
+        sha256(&heldout_receipt_bytes),
         spatial.hdf5_sha256,
         spatial_manifest_sha256.clone(),
     );
@@ -354,6 +463,7 @@ pub fn validate_temporal_covariance_promotion(
 struct EvidenceDigests {
     synthetic_result_sha256: String,
     heldout_result_sha256: String,
+    heldout_receipt_sha256: String,
     spatial_factor_sha256: String,
     spatial_manifest_sha256: String,
     temporal_preregistration_sha256: String,
@@ -366,29 +476,387 @@ impl EvidenceDigests {
     fn current(
         synthetic_result_sha256: String,
         heldout_result_sha256: String,
+        heldout_receipt_sha256: String,
         spatial_factor_sha256: String,
         spatial_manifest_sha256: String,
     ) -> Self {
-        let mut scorer = Sha256::new();
-        scorer.update(SYNTHETIC_SCORER_BYTES);
-        scorer.update(HELDOUT_SCORER_BYTES);
-        scorer.update(HELDOUT_LIBRARY_BYTES);
-        let mut source = Sha256::new();
-        source.update(ESTIMATOR_SOURCE_BYTES);
-        source.update(BATCH_SOURCE_BYTES);
-        source.update(PRODUCT_SOURCE_BYTES);
-        source.update(FIXED_CUBE_SOURCE_BYTES);
         Self {
             synthetic_result_sha256,
             heldout_result_sha256,
+            heldout_receipt_sha256,
             spatial_factor_sha256,
             spatial_manifest_sha256,
             temporal_preregistration_sha256: sha256(TEMPORAL_PREREGISTRATION_BYTES),
             heldout_preregistration_sha256: sha256(HELDOUT_PREREGISTRATION_BYTES),
-            scorer_sha256: format!("{:x}", scorer.finalize()),
-            source_sha256: format!("{:x}", source.finalize()),
+            scorer_sha256: canonical_named_sources_sha256(&[
+                ("temporal_covariance_simulation.py", SYNTHETIC_SCORER_BYTES),
+                ("score_temporal_covariance_holdout.py", HELDOUT_SCORER_BYTES),
+                (
+                    "heldout_temporal_covariance/scorer.py",
+                    HELDOUT_LIBRARY_BYTES,
+                ),
+            ]),
+            source_sha256: canonical_named_sources_sha256(&[
+                (
+                    "dolphin-timeseries/src/temporal_covariance.rs",
+                    ESTIMATOR_SOURCE_BYTES,
+                ),
+                (
+                    "dolphin-timeseries/examples/temporal_covariance_batch.rs",
+                    BATCH_SOURCE_BYTES,
+                ),
+                (
+                    "dolphin-workflows/src/temporal_covariance_product.rs",
+                    PRODUCT_SOURCE_BYTES,
+                ),
+                (
+                    "dolphin-workflows/src/fixed_cube.rs",
+                    FIXED_CUBE_SOURCE_BYTES,
+                ),
+                (
+                    "dolphin-workflows/src/displacement.rs",
+                    DISPLACEMENT_SOURCE_BYTES,
+                ),
+                (
+                    "dolphin-workflows/src/spatial_covariance_artifact.rs",
+                    SPATIAL_ARTIFACT_SOURCE_BYTES,
+                ),
+                ("dolphin-io/src/geotiff.rs", GEOTIFF_SOURCE_BYTES),
+                ("dolphin-io/src/covariance.rs", COVARIANCE_IO_SOURCE_BYTES),
+                ("dolphin-core/src/config.rs", CONFIG_SOURCE_BYTES),
+            ]),
         }
     }
+}
+
+fn canonical_named_sources_sha256(sources: &[(&str, &[u8])]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust-canonical-named-sources-v1\0");
+    for (name, bytes) in sources {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+struct HeldoutReceiptIdentity {
+    receipt_sha256: String,
+    manifest_file_sha256: String,
+    manifest_sha256: String,
+    freeze_receipt_sha256: String,
+    factor_scope_sha256: String,
+}
+
+fn canonical_json_sha256(bytes: &[u8]) -> Result<String> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    Ok(sha256(&serde_json::to_vec(&value)?))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_heldout_receipt(
+    receipt: &HeldoutReceipt,
+    manifest_bytes: &[u8],
+    freeze_bytes: &[u8],
+    receipt_sha256: String,
+) -> Result<HeldoutReceiptIdentity> {
+    let preregistration: Value = serde_json::from_slice(HELDOUT_PREREGISTRATION_BYTES)?;
+    let manifest: Value = serde_json::from_slice(manifest_bytes)?;
+    let freeze: Value = serde_json::from_slice(freeze_bytes)?;
+    let preregistration_sha256 = canonical_json_sha256(HELDOUT_PREREGISTRATION_BYTES)?;
+    let manifest_sha256 = canonical_json_sha256(manifest_bytes)?;
+    let manifest_file_sha256 = sha256(manifest_bytes);
+    let freeze_receipt_sha256 = sha256(freeze_bytes);
+    let factor_binding = preregistration["factor_binding"].clone();
+    let factor_scope_sha256 = sha256(&serde_json::to_vec(&factor_binding)?);
+    let scope_hash = sha256(&serde_json::to_vec(&preregistration["field_scope"])?);
+    ensure!(
+        manifest["schema"].as_str() == Some("dolphinrust.temporal_covariance.heldout_cohort")
+            && manifest["schema_version"].as_u64() == Some(2)
+            && manifest["cohort_id"].as_str() == Some(HELDOUT_COHORT_ID)
+            && manifest["status"].as_str() == Some("frozen_metadata_only")
+            && manifest["outcomes_present"].as_bool() == Some(false)
+            && manifest["frozen_clusters"].as_array().map(Vec::len) == Some(96)
+            && manifest["surplus_clusters"].as_array().map(Vec::len) == Some(20),
+        "held-out manifest is not the exact outcome-blind 96+20 schema"
+    );
+    ensure!(
+        freeze["schema"].as_str()
+            == Some("dolphinrust.temporal_covariance.heldout_cohort_freeze_receipt")
+            && freeze["schema_version"].as_u64() == Some(1)
+            && freeze["cohort_id"].as_str() == Some(HELDOUT_COHORT_ID)
+            && freeze["outcomes_present"].as_bool() == Some(false)
+            && freeze["selection_outcome_blind"].as_bool() == Some(true)
+            && freeze["counts"]["frozen_clusters"].as_u64() == Some(96)
+            && freeze["counts"]["surplus_clusters"].as_u64() == Some(20)
+            && freeze["hashes"]["manifest_file_sha256"].as_str()
+                == Some(manifest_file_sha256.as_str())
+            && freeze["hashes"]["manifest_canonical_sha256"].as_str()
+                == Some(manifest_sha256.as_str()),
+        "held-out freeze receipt does not bind the supplied 96+20 manifest"
+    );
+    ensure!(
+        receipt.schema == HELDOUT_RECEIPT_SCHEMA
+            && receipt.schema_version == 1
+            && receipt.outcomes_present
+            && receipt.one_shot_unblinding
+            && receipt.cohort_id == HELDOUT_COHORT_ID
+            && receipt.generation_id == "f53-06-v1"
+            && receipt.preregistration_sha256 == preregistration_sha256
+            && receipt.manifest_sha256 == manifest_sha256
+            && receipt.scope_hash == scope_hash
+            && receipt.calibrated_scope_match
+            && receipt.factor_binding == factor_binding,
+        "held-out raw receipt schema or frozen scope identity differs"
+    );
+    let expected_hash_fields = preregistration["receipt_hash_fields"]
+        .as_array()
+        .context("held-out preregistration lacks receipt hash fields")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("held-out receipt hash field is not a string")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(
+        expected_hash_fields.contains("binary_sha256")
+            && expected_hash_fields.contains("scorer_sha256")
+            && expected_hash_fields.contains("gnss_catalog_sha256")
+            && expected_hash_fields.contains("factor_scope_sha256")
+            && receipt
+                .hashes
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                == expected_hash_fields
+            && receipt.hashes.values().all(|value| is_sha256(value))
+            && receipt.hashes.get("preregistration_sha256") == Some(&preregistration_sha256)
+            && receipt.hashes.get("manifest_sha256") == Some(&manifest_sha256)
+            && receipt.hashes.get("factor_scope_sha256") == Some(&factor_scope_sha256),
+        "held-out raw receipt implementation/factor/GNSS hash inventory is incomplete"
+    );
+    ensure!(
+        receipt.run_identity.generation_id == receipt.generation_id
+            && receipt.run_identity.preregistration_sha256 == preregistration_sha256
+            && receipt.run_identity.manifest_sha256 == manifest_sha256
+            && receipt.run_identity.freeze_receipt_sha256 == freeze_receipt_sha256
+            && receipt.hashes.get("binary_sha256").map(String::as_str)
+                == Some(receipt.run_identity.binary_sha256.as_str())
+            && is_sha256(&receipt.run_identity.run_plan_sha256)
+            && receipt
+                .run_identity
+                .implementation_source_hashes
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                == std::collections::BTreeSet::from([
+                    "executor_sha256",
+                    "runner_sha256",
+                    "scorer_sha256",
+                    "runner_cli_sha256",
+                    "scorer_cli_sha256",
+                ])
+            && receipt
+                .run_identity
+                .implementation_source_hashes
+                .values()
+                .all(|value| is_sha256(value))
+            && is_sha256(&receipt.run_identity.product_identities_sha256)
+            && receipt.run_identity_sha256 == canonical_run_identity_sha256(&receipt.run_identity)?,
+        "held-out raw receipt run identity is stale or internally inconsistent"
+    );
+    validate_heldout_accounting(receipt, &manifest)?;
+    Ok(HeldoutReceiptIdentity {
+        receipt_sha256,
+        manifest_file_sha256,
+        manifest_sha256,
+        freeze_receipt_sha256,
+        factor_scope_sha256,
+    })
+}
+
+fn canonical_run_identity_sha256(identity: &HeldoutRunIdentity) -> Result<String> {
+    let fields = BTreeMap::from([
+        (
+            "binary_sha256",
+            Value::String(identity.binary_sha256.clone()),
+        ),
+        (
+            "freeze_receipt_sha256",
+            Value::String(identity.freeze_receipt_sha256.clone()),
+        ),
+        (
+            "generation_id",
+            Value::String(identity.generation_id.clone()),
+        ),
+        (
+            "implementation_source_hashes",
+            serde_json::to_value(&identity.implementation_source_hashes)?,
+        ),
+        (
+            "manifest_sha256",
+            Value::String(identity.manifest_sha256.clone()),
+        ),
+        (
+            "preregistration_sha256",
+            Value::String(identity.preregistration_sha256.clone()),
+        ),
+        (
+            "product_identities_sha256",
+            Value::String(identity.product_identities_sha256.clone()),
+        ),
+        (
+            "run_plan_sha256",
+            Value::String(identity.run_plan_sha256.clone()),
+        ),
+    ]);
+    Ok(sha256(&serde_json::to_vec(&fields)?))
+}
+
+fn manifest_cluster_ids(manifest: &Value, field: &str) -> Result<Vec<String>> {
+    manifest[field]
+        .as_array()
+        .context("held-out manifest cluster list is missing")?
+        .iter()
+        .map(|candidate| {
+            candidate["candidate_id"]
+                .as_str()
+                .map(str::to_owned)
+                .context("held-out manifest candidate lacks an identity")
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_heldout_accounting(receipt: &HeldoutReceipt, manifest: &Value) -> Result<()> {
+    let primary_ids = manifest_cluster_ids(manifest, "frozen_clusters")?;
+    let surplus_ids = manifest_cluster_ids(manifest, "surplus_clusters")?;
+    let primary = primary_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let surplus = surplus_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut statuses = BTreeMap::new();
+    let mut receipt_ids = Vec::with_capacity(receipt.clusters.len());
+    for cluster in &receipt.clusters {
+        let id = cluster["cluster_id"]
+            .as_str()
+            .context("held-out cluster lacks an identity")?;
+        let status = cluster["status"]
+            .as_str()
+            .context("held-out cluster lacks a status")?;
+        ensure!(
+            matches!(status, "pass" | "fail" | "not_evaluable" | "not_used")
+                && statuses.insert(id.to_owned(), status.to_owned()).is_none(),
+            "held-out cluster accounting has an invalid or duplicate entry"
+        );
+        receipt_ids.push(id.to_owned());
+    }
+    let attrition = &receipt.attrition;
+    let used = attrition
+        .used_surplus_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let unused = attrition
+        .unused_surplus_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let attrited = attrition
+        .attrited_primary_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_attrited = primary_ids
+        .iter()
+        .filter(|id| statuses.get(*id).map(String::as_str) == Some("not_evaluable"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_used = surplus_ids
+        .iter()
+        .filter(|id| matches!(statuses.get(*id).map(String::as_str), Some("pass" | "fail")))
+        .take(expected_attrited.len())
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_unused = surplus_ids
+        .iter()
+        .filter(|id| !expected_used.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_reasons = statuses
+        .iter()
+        .filter_map(|(id, status)| (status == "not_evaluable").then_some(id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let executed = statuses
+        .values()
+        .filter(|status| *status != "not_used")
+        .count();
+    let evaluable = statuses
+        .values()
+        .filter(|status| matches!(status.as_str(), "pass" | "fail"))
+        .count();
+    ensure!(
+        primary.len() == 96
+            && surplus.len() == 20
+            && receipt.cluster_counts.primary == primary.len()
+            && receipt.cluster_counts.surplus == surplus.len()
+            && receipt.cluster_counts.executed == executed
+            && receipt.cluster_counts.evaluable == evaluable
+            && primary.is_disjoint(&surplus)
+            && receipt_ids
+                == primary_ids
+                    .iter()
+                    .chain(&surplus_ids)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            && used.len() == attrition.used_surplus_ids.len()
+            && unused.len() == attrition.unused_surplus_ids.len()
+            && attrited.len() == attrition.attrited_primary_ids.len()
+            && used.is_disjoint(&unused)
+            && attrited.is_subset(&primary)
+            && used.is_subset(&surplus)
+            && unused.is_subset(&surplus)
+            && used.len() == attrited.len()
+            && used.len() + unused.len() == 20
+            && attrition.attrited_primary_ids == expected_attrited
+            && attrition.used_surplus_ids == expected_used
+            && attrition.unused_surplus_ids == expected_unused
+            && primary.iter().all(|id| matches!(
+                statuses.get(id).map(String::as_str),
+                Some("pass" | "fail" | "not_evaluable")
+            ))
+            && used
+                .iter()
+                .all(|id| matches!(statuses.get(id).map(String::as_str), Some("pass" | "fail")))
+            && unused.iter().all(|id| matches!(
+                statuses.get(id).map(String::as_str),
+                Some("not_used" | "not_evaluable")
+            ))
+            && attrition
+                .reasons_by_cluster
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+                == expected_reasons
+            && attrition.reasons_by_cluster.iter().all(|(id, reason)| {
+                !reason.is_empty() && statuses.get(id).map(String::as_str) == Some("not_evaluable")
+            }),
+        "held-out raw receipt does not exactly account for 96 primary and 20 surplus clusters"
+    );
+    Ok(())
 }
 
 fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
@@ -418,11 +886,57 @@ fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
     Ok(())
 }
 
-fn validate_heldout_result(result: &HeldoutResult) -> Result<()> {
+fn validate_heldout_result(
+    result: &HeldoutResult,
+    expected: &HeldoutReceiptIdentity,
+) -> Result<()> {
+    let unique = |values: &[String]| {
+        values
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == values.len()
+    };
+    let attrition_count = result.attrited_primary_ids.len();
+    ensure!(
+        result.schema == HELDOUT_SCORE_SCHEMA
+            && result.schema_version == 1
+            && result.cohort_id == HELDOUT_COHORT_ID
+            && result.manifest_file_sha256 == expected.manifest_file_sha256
+            && result.manifest_sha256 == expected.manifest_sha256
+            && result.freeze_receipt_sha256 == expected.freeze_receipt_sha256
+            && result.factor_scope_sha256 == expected.factor_scope_sha256
+            && result.heldout_receipt_sha256 == expected.receipt_sha256,
+        "held-out temporal-covariance result is not bound to the exact frozen cohort"
+    );
+    ensure!(
+        result.primary_cluster_count == 96
+            && result.surplus_cluster_count == 20
+            && result.evaluated_clusters == 96
+            && attrition_count <= result.surplus_cluster_count
+            && result.used_surplus_ids.len() == attrition_count
+            && result.unused_surplus_ids.len() + result.used_surplus_ids.len()
+                == result.surplus_cluster_count
+            && result.attrited_primary_ids.iter().all(|id| {
+                result.reasons_by_cluster.contains_key(id)
+                    && !result.used_surplus_ids.contains(id)
+                    && !result.unused_surplus_ids.contains(id)
+            })
+            && result
+                .used_surplus_ids
+                .iter()
+                .all(|id| !result.unused_surplus_ids.contains(id))
+            && result.reasons_by_cluster.keys().all(|id| {
+                result.attrited_primary_ids.contains(id) || result.unused_surplus_ids.contains(id)
+            })
+            && unique(&result.attrited_primary_ids)
+            && unique(&result.used_surplus_ids)
+            && unique(&result.unused_surplus_ids),
+        "held-out temporal-covariance result does not account for exact 96+20 frozen slots"
+    );
     ensure!(
         result.status == "pass"
             && result.errors.is_empty()
-            && result.evaluated_clusters >= 96
             && result.emission_rate.is_finite()
             && result.emission_rate >= 0.99,
         "held-out temporal-covariance result did not pass the frozen cohort"
@@ -452,6 +966,7 @@ fn validate_review(review: &TemporalReviewReceipt, expected: &EvidenceDigests) -
     ensure!(
         review.synthetic_result_sha256 == expected.synthetic_result_sha256
             && review.heldout_result_sha256 == expected.heldout_result_sha256
+            && review.heldout_receipt_sha256 == expected.heldout_receipt_sha256
             && review.spatial_manifest_sha256 == expected.spatial_manifest_sha256
             && review.temporal_preregistration_sha256 == expected.temporal_preregistration_sha256
             && review.heldout_preregistration_sha256 == expected.heldout_preregistration_sha256
@@ -478,6 +993,7 @@ fn validate_manifest(
     ensure!(
         manifest.synthetic_result_sha256 == expected.synthetic_result_sha256
             && manifest.heldout_result_sha256 == expected.heldout_result_sha256
+            && manifest.heldout_receipt_sha256 == expected.heldout_receipt_sha256
             && manifest.review_receipt_sha256 == review_sha256
             && manifest.spatial_factor_sha256 == expected.spatial_factor_sha256
             && manifest.spatial_manifest_sha256 == expected.spatial_manifest_sha256
@@ -634,16 +1150,21 @@ fn write_product_transaction_with_validator(
         factor_directory,
     )?;
     let stage = create_stage_directory(output_directory, &transaction.ownership_token)?;
-    let transaction = (|| {
+    let transaction_result = (|| {
         let admission = admit_combined_working_set(config, acquisition_days.len())?;
         let gdal_cache = ScopedGdalCacheLimit::acquire(admission.gdal_cache_budget_bytes)?;
         let mut working_set = WorkingSetMonitor::new(admission);
-        let mut layers =
-            create_layer_writers(&stage, &scope.velocity_header, &transaction.ownership_token)?;
+        let mut layers = create_layer_writers(
+            &stage,
+            &scope.velocity_header,
+            &scope.factor_metadata.units,
+            &transaction.ownership_token,
+        )?;
         working_set.observe_gdal_cache(&gdal_cache)?;
         process_factor_blocks(
             &scope.factor_path,
             displacement_rasters,
+            &scope.fixed_cube_mask_path,
             acquisition_days,
             config,
             scope.factor_metadata.full_grid,
@@ -677,11 +1198,16 @@ fn write_product_transaction_with_validator(
             &mut revalidate,
         )
     })();
-    let _ = std::fs::remove_dir_all(&stage);
-    if transaction.is_err() && output_directory.join(ROLLBACK_JOURNAL_FILENAME).exists() {
+    let stage_cleanup = if stage.exists() {
+        remove_owned_stage_directory(output_directory, &stage, &transaction.ownership_token)
+    } else {
+        Ok(())
+    };
+    if transaction_result.is_err() && output_directory.join(ROLLBACK_JOURNAL_FILENAME).exists() {
         rollback_incomplete_product(output_directory)?;
     }
-    transaction
+    stage_cleanup?;
+    transaction_result
 }
 
 struct ProductScope {
@@ -691,6 +1217,7 @@ struct ProductScope {
     velocity_unit: String,
     input_receipts: Vec<InputRasterReceipt>,
     fixed_cube_paths: Vec<PathBuf>,
+    fixed_cube_mask_path: PathBuf,
     fixed_cube_inputs: Vec<InputRasterReceipt>,
     fixed_cube_semantics: crate::fixed_cube::FixedCubeSemanticValidation,
 }
@@ -747,6 +1274,7 @@ fn prepare_product_scope(
         &factor_metadata,
     )?;
     let fixed_cube_paths = fixed_cube_input_paths(output_directory, &fixed_cube);
+    let fixed_cube_mask_path = output_directory.join(&fixed_cube.validity_mask_raster);
     let fixed_cube_inputs = input_raster_receipts(&fixed_cube_paths)?;
     Ok(ProductScope {
         factor_path,
@@ -755,6 +1283,7 @@ fn prepare_product_scope(
         velocity_unit,
         input_receipts: input_raster_receipts(displacement_rasters)?,
         fixed_cube_paths,
+        fixed_cube_mask_path,
         fixed_cube_inputs,
         fixed_cube_semantics,
     })
@@ -764,6 +1293,7 @@ fn prepare_product_scope(
 fn process_factor_blocks(
     factor_path: &Path,
     displacement_rasters: &[PathBuf],
+    fixed_cube_mask_path: &Path,
     acquisition_days: &[f64],
     config: &TemporalUncertaintyOptions,
     full_grid: dolphin_io::CovarianceOperatorGrid,
@@ -798,7 +1328,15 @@ fn process_factor_blocks(
             .iter()
             .map(|path| read_raster_window::<f32>(path, output_window))
             .collect::<dolphin_io::Result<Vec<_>>>()?;
-        let values = evaluate_block(&read.block, &observations, acquisition_days, &options)?;
+        let common_support = read_raster_window::<u8>(fixed_cube_mask_path, output_window)?;
+        let values = evaluate_block(
+            &read.block,
+            &observations,
+            common_support.view(),
+            acquisition_days,
+            &options,
+        )?;
+        validate_product_value_semantics(&values)?;
         for (layer, value) in layers.iter_mut().zip(values.iter()) {
             layer
                 .writer
@@ -1024,6 +1562,9 @@ fn publish_product_receipt(
             cols: scope.velocity_header.shape.1,
             geotransform: scope.velocity_header.geotransform,
             epsg: scope.velocity_header.epsg,
+            velocity_unit: scope.velocity_unit.clone(),
+            process_variance_unit: squared_displacement_unit(&scope.factor_metadata.units)?
+                .to_owned(),
         },
         expected_products,
         installed_artifacts: Vec::new(),
@@ -1043,6 +1584,7 @@ fn publish_product_receipt(
         output_directory,
         &staged_products,
         &scope.velocity_header,
+        &scope.factor_metadata.units,
         &transaction.ownership_token,
     )?;
     let corrected_velocity_sha256 =
@@ -1064,15 +1606,42 @@ fn publish_product_receipt(
     std::fs::write(&provenance_scratch, serde_json::to_vec_pretty(&provenance)?)?;
     File::open(&provenance_scratch)?.sync_all()?;
     let provenance_sha256 = sha256_file(&provenance_scratch)?;
-    promote_fixed_cube_receipt(
+    let fixed_scratch_name = format!(
+        ".fixed-cube-receipt-temporal-{}",
+        &transaction.ownership_token[..32]
+    );
+    let fixed_scratch = output_directory.join(&fixed_scratch_name);
+    let fixed_scratch_marker = write_transaction_artifact_marker(
+        output_directory,
+        &fixed_scratch_name,
+        &transaction.ownership_token,
+    )?;
+    let promote = promote_fixed_cube_receipt(
         output_directory,
         &provenance_scratch,
+        &fixed_scratch,
         scope.fixed_cube_semantics.clone(),
         corrected_velocity_sha256.clone(),
         corrected_sigma_sha256.clone(),
         provenance_sha256.clone(),
         promotion.manifest_sha256.clone(),
-    )?;
+    );
+    ensure!(
+        fixed_scratch_marker.exists()
+            && transaction_marker_is_owned(
+                &fixed_scratch_marker,
+                output_directory,
+                &fixed_scratch_name,
+                Some(&transaction.ownership_token),
+            )?,
+        "fixed-cube receipt scratch ownership changed before cleanup"
+    );
+    if promote.is_err() && fixed_scratch.exists() {
+        std::fs::remove_file(&fixed_scratch)?;
+    }
+    std::fs::remove_file(&fixed_scratch_marker)?;
+    File::open(output_directory)?.sync_all()?;
+    promote?;
     journal.expected_provenance_sha256 = Some(provenance_sha256.clone());
     journal.expected_fixed_receipt_sha256 = Some(sha256_file(
         &output_directory.join("fixed_cube_receipt.json"),
@@ -1086,6 +1655,7 @@ fn publish_product_receipt(
         output_directory,
         &staged_products,
         &scope.velocity_header,
+        &scope.factor_metadata.units,
         &transaction.ownership_token,
     )?;
     verify_promoted_fixed_cube_receipt(
@@ -1222,11 +1792,12 @@ fn validate_fixed_cube_semantics(
         let los_header = validate_fixed_cube_grid(path, velocity_header)?;
         validate_single_band_type(path, gdal::raster::GdalDataType::Float32)?;
         ensure!(
-            los_header
-                .metadata
-                .get("GEOMETRY_SOURCE")
-                .map(String::as_str)
-                == Some("CSLC-S1-STATIC")
+            los_header.nodata.is_some_and(f64::is_nan)
+                && los_header
+                    .metadata
+                    .get("GEOMETRY_SOURCE")
+                    .map(String::as_str)
+                    == Some("CSLC-S1-STATIC")
                 && los_header
                     .metadata
                     .get("LOS_SIGN_CONVENTION")
@@ -1326,24 +1897,35 @@ fn validate_fixed_cube_pixels(
                     (*mask == 1) == velocity.is_finite(),
                     "fixed-cube validity mask disagrees with finite velocity support"
                 );
-                let norm_error = (east.mul_add(*east, north.mul_add(*north, up * up)) - 1.0).abs();
-                ensure!(
-                    east.is_finite()
-                        && north.is_finite()
-                        && up.is_finite()
-                        && *up > 0.0
-                        && norm_error <= 5e-4,
-                    "fixed-cube LOS vector is nonfinite, non-unit, or sign-inconsistent"
-                );
-                maximum_los_norm_error = maximum_los_norm_error.max(norm_error);
-                minimum_los_up = minimum_los_up.min(*up);
+                if *mask == 1 {
+                    let norm_error =
+                        (east.mul_add(*east, north.mul_add(*north, up * up)) - 1.0).abs();
+                    ensure!(
+                        east.is_finite()
+                            && north.is_finite()
+                            && up.is_finite()
+                            && *up > 0.0
+                            && norm_error <= 5e-4,
+                        "valid fixed-cube LOS vector is nonfinite, non-unit, or sign-inconsistent"
+                    );
+                    maximum_los_norm_error = maximum_los_norm_error.max(norm_error);
+                    minimum_los_up = minimum_los_up.min(*up);
+                } else {
+                    ensure!(
+                        east.is_nan() && north.is_nan() && up.is_nan(),
+                        "invalid fixed-cube pixel retains unmasked LOS geometry"
+                    );
+                }
             }
         }
     }
     ensure!(
-        valid_pixels == expected_valid_pixels && minimum_los_up.is_finite(),
+        valid_pixels == expected_valid_pixels && (valid_pixels == 0 || minimum_los_up.is_finite()),
         "fixed-cube validity count differs from receipt"
     );
+    if valid_pixels == 0 {
+        minimum_los_up = 0.0;
+    }
     Ok(crate::fixed_cube::FixedCubeSemanticValidation {
         observed_valid_pixels: valid_pixels,
         maximum_los_norm_error,
@@ -1537,6 +2119,7 @@ const PRODUCT_LAYERS: [(&str, &str); LAYER_COUNT] = [
 fn create_layer_writers(
     stage: &Path,
     header: &dolphin_io::RasterHeader,
+    spatial_units: &str,
     ownership_token: &str,
 ) -> Result<Vec<ProductLayer>> {
     let velocity_unit = header
@@ -1548,11 +2131,7 @@ fn create_layer_writers(
         .enumerate()
         .map(|(index, (name, role))| {
             let scratch = stage.join(format!("{name}.scratch.tif"));
-            let unit = if index < 2 {
-                velocity_unit.as_str()
-            } else {
-                "1"
-            };
+            let unit = product_layer_unit(index, velocity_unit, spatial_units)?;
             let writer = BoundedCogWriter::create(
                 &scratch,
                 header.shape,
@@ -1574,6 +2153,29 @@ fn create_layer_writers(
             })
         })
         .collect()
+}
+
+fn squared_displacement_unit(spatial_units: &str) -> Result<&'static str> {
+    match spatial_units {
+        "radians" => Ok("rad^2"),
+        "meters" => Ok("m^2"),
+        "millimeters" => Ok("mm^2"),
+        _ => anyhow::bail!("unsupported spatial covariance unit"),
+    }
+}
+
+fn product_layer_unit<'a>(
+    index: usize,
+    velocity_unit: &'a str,
+    spatial_units: &str,
+) -> Result<&'a str> {
+    if index < 2 {
+        Ok(velocity_unit)
+    } else if index == 10 {
+        Ok(squared_displacement_unit(spatial_units)?)
+    } else {
+        Ok("1")
+    }
 }
 
 fn finalize_layers(
@@ -1632,6 +2234,7 @@ fn install_no_replace(source: &Path, destination: &Path) -> Result<()> {
 fn evaluate_block(
     block: &dolphin_io::SpatialReferenceCovarianceBlock,
     observations: &[Array2<f32>],
+    common_support: ndarray::ArrayView2<'_, u8>,
     acquisition_days: &[f64],
     options: &TemporalCovarianceOptions,
 ) -> Result<[Array2<f32>; LAYER_COUNT]> {
@@ -1645,12 +2248,23 @@ fn evaluate_block(
             .len()
             .checked_add(1)
             .is_some_and(|count| count == acquisition_days.len())
-            && observations.iter().all(|values| values.dim() == shape),
+            && observations.iter().all(|values| values.dim() == shape)
+            && common_support.dim() == shape,
         "displacement windows differ from factor block"
     );
     let mut output: [Array2<f32>; LAYER_COUNT] =
         std::array::from_fn(|_| Array2::from_elem(shape, f32::NAN));
     for target in 0..target_count {
+        let support = common_support
+            .as_slice()
+            .context("fixed-cube common-support mask is not contiguous")?[target];
+        ensure!(support <= 1, "fixed-cube common-support mask is not binary");
+        if support == 0 {
+            output[2]
+                .as_slice_mut()
+                .context("status layer is not contiguous")?[target] = 2_000.0;
+            continue;
+        }
         if block.status[target] != SpatialReferenceCovarianceStatus::Valid {
             output[2]
                 .as_slice_mut()
@@ -1669,6 +2283,12 @@ fn evaluate_block(
         )?;
         let row = target / shape.1;
         let col = target % shape.1;
+        ensure!(
+            observations
+                .iter()
+                .all(|values| values[(row, col)].is_finite()),
+            "fixed-cube common support contains a missing displacement epoch"
+        );
         let mut series = Vec::with_capacity(acquisition_days.len());
         series.push(0.0);
         series.extend(
@@ -1727,17 +2347,21 @@ fn write_target_diagnostics(
         Ok(())
     };
     if selected.status == CompleteRefitBootstrapEstimateStatus::Evaluated {
-        set(
+        set_checked(
             &mut layers[0],
+            target,
             selected
                 .slope_per_year
-                .context("evaluated slope is absent")? as f32,
+                .context("evaluated slope is absent")?,
+            "selected velocity",
         )?;
-        set(
+        set_checked(
             &mut layers[1],
+            target,
             selected
                 .standard_error_per_year
-                .context("evaluated standard error is absent")? as f32,
+                .context("evaluated standard error is absent")?,
+            "corrected standard error",
         )?;
     }
     set(&mut layers[2], estimate_status_code(selected.status) as f32)?;
@@ -1749,23 +2373,148 @@ fn write_target_diagnostics(
         &mut layers[4],
         cadence_status_code(selected.cadence_status) as f32,
     )?;
-    set(&mut layers[5], selected.valid_date_count as f32)?;
-    set(&mut layers[6], selected.rank as f32)?;
-    set(&mut layers[7], selected.degrees_of_freedom as f32)?;
-    set_optional(&mut layers[8], target, selected.raw_rho)?;
-    set_optional(&mut layers[9], target, selected.fitted_rho)?;
-    set_optional(&mut layers[10], target, selected.fitted_process_variance)?;
-    set_optional(&mut layers[11], target, selected.condition_number)?;
-    set(&mut layers[12], selected.bootstrap_attempts as f32)?;
-    set(&mut layers[13], selected.bootstrap_successes as f32)?;
+    set_checked(
+        &mut layers[5],
+        target,
+        selected.valid_date_count as f64,
+        "valid date count",
+    )?;
+    set_checked(&mut layers[6], target, selected.rank as f64, "design rank")?;
+    set_checked(
+        &mut layers[7],
+        target,
+        selected.degrees_of_freedom as f64,
+        "degrees of freedom",
+    )?;
+    set_optional(&mut layers[8], target, selected.raw_rho, "raw rho")?;
+    set_optional(&mut layers[9], target, selected.fitted_rho, "fitted rho")?;
+    set_optional(
+        &mut layers[10],
+        target,
+        selected.fitted_process_variance,
+        "fitted process variance",
+    )?;
+    set_optional(
+        &mut layers[11],
+        target,
+        selected.condition_number,
+        "condition number",
+    )?;
+    set_checked(
+        &mut layers[12],
+        target,
+        selected.bootstrap_attempts as f64,
+        "bootstrap attempts",
+    )?;
+    set_checked(
+        &mut layers[13],
+        target,
+        selected.bootstrap_successes as f64,
+        "bootstrap successes",
+    )?;
     Ok(())
 }
 
-fn set_optional(layer: &mut Array2<f32>, target: usize, value: Option<f64>) -> Result<()> {
+fn set_optional(
+    layer: &mut Array2<f32>,
+    target: usize,
+    value: Option<f64>,
+    field: &str,
+) -> Result<()> {
     if let Some(value) = value.filter(|value| value.is_finite()) {
         layer
             .as_slice_mut()
-            .context("temporal diagnostic layer is not contiguous")?[target] = value as f32;
+            .context("temporal diagnostic layer is not contiguous")?[target] =
+            checked_f32(value, field)?;
+    }
+    Ok(())
+}
+
+fn set_checked(layer: &mut Array2<f32>, target: usize, value: f64, field: &str) -> Result<()> {
+    layer
+        .as_slice_mut()
+        .context("temporal product layer is not contiguous")?[target] = checked_f32(value, field)?;
+    Ok(())
+}
+
+fn checked_f32(value: f64, field: &str) -> Result<f32> {
+    ensure!(
+        value.is_finite() && value >= f64::from(f32::MIN) && value <= f64::from(f32::MAX),
+        "{field} cannot be represented as finite f32"
+    );
+    Ok(value as f32)
+}
+
+fn validate_product_value_semantics(layers: &[Array2<f32>; LAYER_COUNT]) -> Result<()> {
+    let shape = layers[0].dim();
+    ensure!(
+        layers.iter().all(|layer| layer.dim() == shape),
+        "temporal product layers have different shapes"
+    );
+    let slices = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .as_slice()
+                .context("temporal product semantic layer is not contiguous")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for target in 0..shape
+        .0
+        .checked_mul(shape.1)
+        .context("product shape overflow")?
+    {
+        ensure!(
+            slices.iter().all(|layer| !layer[target].is_infinite()),
+            "temporal product contains an infinite f32 value"
+        );
+        let selection = slices[2][target];
+        ensure!(
+            selection.is_finite()
+                && selection.fract() == 0.0
+                && ((0.0..=6.0).contains(&selection)
+                    || (1_000.0..2_000.0).contains(&selection)
+                    || selection == 2_000.0),
+            "temporal selection status is invalid"
+        );
+        if selection == 0.0 {
+            ensure!(
+                slices[0][target].is_finite()
+                    && slices[1][target].is_finite()
+                    && slices[1][target] > 0.0,
+                "evaluated temporal pixel lacks finite velocity and positive standard error"
+            );
+        } else {
+            ensure!(
+                slices[0][target].is_nan() && slices[1][target].is_nan(),
+                "abstained temporal pixel retains an inferential value"
+            );
+        }
+        for &index in &[3_usize, 4, 5, 6, 7, 12, 13] {
+            let value = slices[index][target];
+            ensure!(
+                value.is_nan() || (value.is_finite() && value >= 0.0 && value.fract() == 0.0),
+                "temporal status/count diagnostic is not a nonnegative integer or nodata"
+            );
+        }
+        if selection < 1_000.0 {
+            ensure!(
+                slices[3][target].is_finite()
+                    && slices[4][target].is_finite()
+                    && slices[5][target].is_finite()
+                    && slices[6][target].is_finite()
+                    && slices[7][target].is_finite()
+                    && slices[12][target].is_finite()
+                    && slices[13][target].is_finite()
+                    && slices[13][target] <= slices[12][target],
+                "temporal estimator status/count diagnostics are incomplete"
+            );
+        } else {
+            ensure!(
+                (3..LAYER_COUNT).all(|index| slices[index][target].is_nan()),
+                "support/factor abstention retains estimator diagnostics"
+            );
+        }
     }
     Ok(())
 }
@@ -2025,13 +2774,19 @@ fn verify_final_cogs(
     directory: &Path,
     expected: &[InputRasterReceipt],
     grid: &dolphin_io::RasterHeader,
+    spatial_units: &str,
     ownership_token: &str,
 ) -> Result<()> {
     ensure!(
         expected.len() == PRODUCT_LAYERS.len(),
         "temporal product receipt count is incomplete"
     );
-    for ((name, role), expected_receipt) in PRODUCT_LAYERS.iter().zip(expected) {
+    let velocity_unit = grid
+        .metadata
+        .get("UNITTYPE")
+        .context("legacy velocity raster is missing UNITTYPE")?;
+    for (index, ((name, role), expected_receipt)) in PRODUCT_LAYERS.iter().zip(expected).enumerate()
+    {
         let path = directory.join(name);
         ensure!(
             sha256_file(&path)? == expected_receipt.sha256,
@@ -2044,6 +2799,8 @@ fn verify_final_cogs(
                 && header.epsg == grid.epsg
                 && header.nodata.is_some_and(f64::is_nan)
                 && header.metadata.get("PRODUCT_ROLE").map(String::as_str) == Some(*role)
+                && header.metadata.get("UNITTYPE").map(String::as_str)
+                    == Some(product_layer_unit(index, velocity_unit, spatial_units)?)
                 && header
                     .metadata
                     .get("TEMPORAL_ESTIMATOR")
@@ -2056,6 +2813,30 @@ fn verify_final_cogs(
                     == Some(ownership_token),
             "published temporal product header changed: {name}"
         );
+    }
+    verify_persisted_product_value_semantics(directory, grid.shape)?;
+    Ok(())
+}
+
+fn verify_persisted_product_value_semantics(directory: &Path, shape: (usize, usize)) -> Result<()> {
+    for row_start in (0..shape.0).step_by(256) {
+        for col_start in (0..shape.1).step_by(256) {
+            let window = BlockIndices {
+                row_start,
+                row_stop: (row_start + 256).min(shape.0),
+                col_start,
+                col_stop: (col_start + 256).min(shape.1),
+            };
+            let layers = PRODUCT_LAYERS
+                .each_ref()
+                .map(|(name, _)| read_raster_window::<f32>(&directory.join(name), window))
+                .into_iter()
+                .collect::<dolphin_io::Result<Vec<_>>>()?;
+            let layers: [Array2<f32>; LAYER_COUNT] = layers
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("temporal product layer count changed"))?;
+            validate_product_value_semantics(&layers)?;
+        }
     }
     Ok(())
 }
@@ -2258,6 +3039,7 @@ fn is_reserved_transaction_artifact(name: &str) -> bool {
     name.starts_with(".temporal-inference-stage-")
         || name.starts_with(".temporal-product-journal-")
         || name.starts_with(".fixed-cube-receipt-rollback-")
+        || name.starts_with(".fixed-cube-receipt-temporal-")
 }
 
 fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
@@ -2314,8 +3096,25 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
     }
     for (artifact, marker) in owned {
         if artifact.is_dir() {
+            let name = artifact
+                .file_name()
+                .context("owned temporal stage has no filename")?
+                .to_string_lossy();
+            ensure!(
+                marker == artifact.join(TRANSACTION_ARTIFACT_MARKER_FILENAME)
+                    && transaction_marker_is_owned(&marker, directory, &name, None)?,
+                "temporal stage ownership changed before orphan cleanup"
+            );
             std::fs::remove_dir_all(&artifact)?;
         } else if artifact.exists() {
+            let name = artifact
+                .file_name()
+                .context("owned temporal scratch has no filename")?
+                .to_string_lossy();
+            ensure!(
+                transaction_marker_is_owned(&marker, directory, &name, None)?,
+                "temporal scratch ownership changed before orphan cleanup"
+            );
             std::fs::remove_file(&artifact)?;
         }
         if marker.exists() {
@@ -2428,7 +3227,11 @@ fn validate_completed_bundle(directory: &Path, journal: &ProductRollbackJournal)
                 .is_some_and(|receipt| receipt.name == TEMPORAL_INFERENCE_PROVENANCE_FILENAME),
         "completed temporal journal has an invalid artifact inventory"
     );
-    for ((name, role), expected) in PRODUCT_LAYERS.iter().zip(&journal.expected_products) {
+    for (index, ((name, role), expected)) in PRODUCT_LAYERS
+        .iter()
+        .zip(&journal.expected_products)
+        .enumerate()
+    {
         let path = directory.join(name);
         ensure!(
             expected.name == *name && sha256_file(&path)? == expected.sha256,
@@ -2441,6 +3244,14 @@ fn validate_completed_bundle(directory: &Path, journal: &ProductRollbackJournal)
                 && header.epsg == journal.product_grid.epsg
                 && header.nodata.is_some_and(f64::is_nan)
                 && header.metadata.get("PRODUCT_ROLE").map(String::as_str) == Some(*role)
+                && header.metadata.get("UNITTYPE").map(String::as_str)
+                    == Some(if index < 2 {
+                        journal.product_grid.velocity_unit.as_str()
+                    } else if index == 10 {
+                        journal.product_grid.process_variance_unit.as_str()
+                    } else {
+                        "1"
+                    })
                 && header
                     .metadata
                     .get("TEMPORAL_ESTIMATOR")
@@ -2454,6 +3265,10 @@ fn validate_completed_bundle(directory: &Path, journal: &ProductRollbackJournal)
             "completed temporal product header differs: {name}"
         );
     }
+    verify_persisted_product_value_semantics(
+        directory,
+        (journal.product_grid.rows, journal.product_grid.cols),
+    )?;
     ensure!(
         sha256_file(&directory.join("velocity.tif"))? == journal.legacy_velocity_sha256
             && directory
@@ -2621,10 +3436,44 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
         File::open(directory)?.sync_all()?;
         Ok(stage.clone())
     })();
-    if initialize.is_err() {
-        let _ = std::fs::remove_dir_all(&stage);
+    if initialize.is_err() && stage.exists() {
+        let stage_name = stage
+            .file_name()
+            .context("temporal product stage has no filename")?
+            .to_string_lossy();
+        let marker = stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+        if marker.exists()
+            && transaction_marker_is_owned(&marker, directory, &stage_name, Some(ownership_token))?
+        {
+            std::fs::remove_dir_all(&stage)?;
+        }
     }
     initialize
+}
+
+fn remove_owned_stage_directory(
+    directory: &Path,
+    stage: &Path,
+    ownership_token: &str,
+) -> Result<()> {
+    let stage_name = stage
+        .file_name()
+        .context("temporal product stage has no filename")?
+        .to_string_lossy();
+    ensure!(
+        stage.parent() == Some(directory)
+            && stage.is_dir()
+            && transaction_marker_is_owned(
+                &stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
+                directory,
+                &stage_name,
+                Some(ownership_token),
+            )?,
+        "temporal stage ownership changed before deletion"
+    );
+    std::fs::remove_dir_all(stage)?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -2678,12 +3527,13 @@ mod tests {
         admit_combined_working_set, complete_publication_after_legacy_check,
         compose_working_set_admission, ensure_same_run_factor_directory, install_no_replace,
         output_window, reconstruct_covariance, validate_heldout_result, validate_input_coverage,
-        validate_manifest, validate_review, validate_synthetic_result,
-        validate_working_set_high_water, write_product_transaction_with_validator, EvidenceDigests,
-        HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
-        TemporalProductTransaction, TemporalPromotionManifest, TemporalReviewReceipt,
-        PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME,
-        SYNTHETIC_SCHEMA,
+        validate_manifest, validate_product_value_semantics, validate_review,
+        validate_synthetic_result, validate_working_set_high_water,
+        write_product_transaction_with_validator, EvidenceDigests, HeldoutLevel,
+        HeldoutReceiptIdentity, HeldoutResult, SyntheticResult, SyntheticScores,
+        TemporalCovariancePromotion, TemporalProductTransaction, TemporalPromotionManifest,
+        TemporalReviewReceipt, HELDOUT_SCORE_SCHEMA, PRODUCT_LAYERS, PROMOTION_SCHEMA,
+        REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -2909,6 +3759,8 @@ mod tests {
                 cols: 1,
                 geotransform: [0.0; 6],
                 epsg: None,
+                velocity_unit: "rad/yr".to_owned(),
+                process_variance_unit: "rad^2".to_owned(),
             },
             expected_products: PRODUCT_LAYERS
                 .iter()
@@ -3098,6 +3950,8 @@ mod tests {
                     cols: 1,
                     geotransform,
                     epsg: Some(32611),
+                    velocity_unit: "rad/yr".to_owned(),
+                    process_variance_unit: "rad^2".to_owned(),
                 },
                 expected_products: expected.clone(),
                 installed_artifacts: installed,
@@ -3126,6 +3980,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn complete_evidence_chain_rejects_tamper_and_scope_mismatch() {
         let synthetic = SyntheticResult {
             schema: SYNTHETIC_SCHEMA.to_owned(),
@@ -3143,7 +3998,28 @@ mod tests {
             resource_gates: BTreeMap::from([("rss".to_owned(), true)]),
         };
         validate_synthetic_result(&synthetic).unwrap();
+        let heldout_identity = HeldoutReceiptIdentity {
+            receipt_sha256: "aa".repeat(32),
+            manifest_file_sha256:
+                "75ce4e149aa8ed49ddb22cfedcac8056201a18c75af73ebb4fa22e7f9290ab1d".to_owned(),
+            manifest_sha256: "534b9c534255404a71d3e2f53cc55cccc41ef4ef372bc18bb16e3a842826ee7e"
+                .to_owned(),
+            freeze_receipt_sha256:
+                "cd3a0c4bdd5517fb310a55c2b34abbf78ff4bd7ccfe1aa6c1a5f5d61bae99f1c".to_owned(),
+            factor_scope_sha256: "ee35862925aa7e88e0c18e0f09633aa5c02ed5781c68c9c2afb3aed3168eb833"
+                .to_owned(),
+        };
         let heldout = HeldoutResult {
+            schema: HELDOUT_SCORE_SCHEMA.to_owned(),
+            schema_version: 1,
+            cohort_id: "f53-06-outer-nonfresno-v1".to_owned(),
+            manifest_file_sha256: heldout_identity.manifest_file_sha256.clone(),
+            manifest_sha256: heldout_identity.manifest_sha256.clone(),
+            freeze_receipt_sha256: heldout_identity.freeze_receipt_sha256.clone(),
+            factor_scope_sha256: heldout_identity.factor_scope_sha256.clone(),
+            heldout_receipt_sha256: heldout_identity.receipt_sha256.clone(),
+            primary_cluster_count: 96,
+            surplus_cluster_count: 20,
             status: "pass".to_owned(),
             errors: Vec::<Value>::new(),
             levels: ["68", "90", "95"]
@@ -3159,11 +4035,19 @@ mod tests {
                 .collect(),
             evaluated_clusters: 96,
             emission_rate: 0.99,
+            attrited_primary_ids: Vec::new(),
+            used_surplus_ids: Vec::new(),
+            unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
+            reasons_by_cluster: BTreeMap::new(),
         };
-        validate_heldout_result(&heldout).unwrap();
+        validate_heldout_result(&heldout, &heldout_identity).unwrap();
+        let mut stale_freeze = heldout;
+        stale_freeze.freeze_receipt_sha256 = "00".repeat(32);
+        assert!(validate_heldout_result(&stale_freeze, &heldout_identity).is_err());
         let expected = EvidenceDigests {
             synthetic_result_sha256: "11".repeat(32),
             heldout_result_sha256: "22".repeat(32),
+            heldout_receipt_sha256: "2a".repeat(32),
             spatial_factor_sha256: "33".repeat(32),
             spatial_manifest_sha256: "44".repeat(32),
             temporal_preregistration_sha256: "55".repeat(32),
@@ -3179,6 +4063,7 @@ mod tests {
             unresolved_findings: 0,
             synthetic_result_sha256: expected.synthetic_result_sha256.clone(),
             heldout_result_sha256: expected.heldout_result_sha256.clone(),
+            heldout_receipt_sha256: expected.heldout_receipt_sha256.clone(),
             spatial_manifest_sha256: expected.spatial_manifest_sha256.clone(),
             temporal_preregistration_sha256: expected.temporal_preregistration_sha256.clone(),
             heldout_preregistration_sha256: expected.heldout_preregistration_sha256.clone(),
@@ -3194,6 +4079,7 @@ mod tests {
             selected_method_version: COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
             synthetic_result_sha256: expected.synthetic_result_sha256.clone(),
             heldout_result_sha256: expected.heldout_result_sha256.clone(),
+            heldout_receipt_sha256: expected.heldout_receipt_sha256.clone(),
             review_receipt_sha256: "99".repeat(32),
             spatial_factor_sha256: expected.spatial_factor_sha256.clone(),
             spatial_manifest_sha256: expected.spatial_manifest_sha256.clone(),
@@ -3208,6 +4094,137 @@ mod tests {
         manifest.calibration_scope = "calibrated_scope_match".to_owned();
         manifest.synthetic_result_sha256 = "aa".repeat(32);
         assert!(validate_manifest(&manifest, &expected, &"99".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn heldout_receipt_requires_exact_frozen_slot_accounting() {
+        let primary = (0..96)
+            .map(|index| serde_json::json!({"candidate_id": format!("p{index:02}")}))
+            .collect::<Vec<_>>();
+        let surplus = (0..20)
+            .map(|index| serde_json::json!({"candidate_id": format!("s{index:02}")}))
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "frozen_clusters": primary,
+            "surplus_clusters": surplus,
+        });
+        let mut clusters = (0..96)
+            .map(
+                |index| serde_json::json!({"cluster_id": format!("p{index:02}"), "status": "pass"}),
+            )
+            .collect::<Vec<_>>();
+        clusters.extend((0..20).map(
+            |index| serde_json::json!({"cluster_id": format!("s{index:02}"), "status": "not_used"}),
+        ));
+        let mut receipt = super::HeldoutReceipt {
+            schema: super::HELDOUT_RECEIPT_SCHEMA.to_owned(),
+            schema_version: 1,
+            outcomes_present: true,
+            one_shot_unblinding: true,
+            cohort_id: "f53-06-outer-nonfresno-v1".to_owned(),
+            generation_id: "f53-06-v1".to_owned(),
+            preregistration_sha256: "11".repeat(32),
+            manifest_sha256: "22".repeat(32),
+            scope_hash: "33".repeat(32),
+            calibrated_scope_match: true,
+            factor_binding: serde_json::json!({}),
+            hashes: BTreeMap::new(),
+            cluster_counts: super::HeldoutClusterCounts {
+                primary: 96,
+                surplus: 20,
+                executed: 96,
+                evaluable: 96,
+            },
+            attrition: super::HeldoutAttrition {
+                attrited_primary_ids: Vec::new(),
+                used_surplus_ids: Vec::new(),
+                unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
+                reasons_by_cluster: BTreeMap::new(),
+            },
+            clusters,
+            run_identity: super::HeldoutRunIdentity {
+                generation_id: "f53-06-v1".to_owned(),
+                preregistration_sha256: "11".repeat(32),
+                manifest_sha256: "22".repeat(32),
+                freeze_receipt_sha256: "44".repeat(32),
+                run_plan_sha256: "55".repeat(32),
+                binary_sha256: "66".repeat(32),
+                implementation_source_hashes: BTreeMap::new(),
+                product_identities_sha256: "88".repeat(32),
+            },
+            run_identity_sha256: "77".repeat(32),
+        };
+        super::validate_heldout_accounting(&receipt, &manifest).unwrap();
+
+        receipt.clusters.swap(0, 1);
+        assert!(super::validate_heldout_accounting(&receipt, &manifest).is_err());
+        receipt.clusters.swap(0, 1);
+        receipt.attrition.used_surplus_ids.push("p00".to_owned());
+        receipt.attrition.unused_surplus_ids.pop();
+        assert!(super::validate_heldout_accounting(&receipt, &manifest).is_err());
+    }
+
+    #[test]
+    fn output_values_must_match_status_semantics_and_fit_f32() {
+        assert!(super::checked_f32(f64::MAX, "overflow contract").is_err());
+        assert!(super::checked_f32(f64::from(f32::MAX), "maximum f32").is_ok());
+        let mut layers: [Array2<f32>; super::LAYER_COUNT] =
+            std::array::from_fn(|_| Array2::from_elem((1, 1), f32::NAN));
+        layers[0][(0, 0)] = 1.0;
+        layers[1][(0, 0)] = 0.5;
+        layers[2][(0, 0)] = 0.0;
+        layers[3][(0, 0)] = 0.0;
+        layers[4][(0, 0)] = 0.0;
+        layers[5][(0, 0)] = 12.0;
+        layers[6][(0, 0)] = 1.0;
+        layers[7][(0, 0)] = 11.0;
+        layers[8][(0, 0)] = 0.1;
+        layers[9][(0, 0)] = 0.2;
+        layers[10][(0, 0)] = 1.0;
+        layers[11][(0, 0)] = 10.0;
+        layers[12][(0, 0)] = 200.0;
+        layers[13][(0, 0)] = 198.0;
+        validate_product_value_semantics(&layers).unwrap();
+        layers[1][(0, 0)] = f32::INFINITY;
+        assert!(validate_product_value_semantics(&layers).is_err());
+        layers[1][(0, 0)] = f32::NAN;
+        assert!(validate_product_value_semantics(&layers).is_err());
+        layers[0][(0, 0)] = f32::NAN;
+        layers[2][(0, 0)] = 1.0;
+        validate_product_value_semantics(&layers).unwrap();
+    }
+
+    #[test]
+    fn canonical_source_identity_binds_names_order_and_lengths() {
+        let first = super::canonical_named_sources_sha256(&[("a", b"bc"), ("ab", b"c")]);
+        let second = super::canonical_named_sources_sha256(&[("ab", b"c"), ("a", b"bc")]);
+        let concatenation_collision =
+            super::canonical_named_sources_sha256(&[("a", b"b"), ("c", b"")]);
+        assert_ne!(first, second);
+        assert_ne!(first, concatenation_collision);
+    }
+
+    #[test]
+    fn common_support_rejects_partial_epoch_series() {
+        let mut block = masked_block(13);
+        block.status[0] = SpatialReferenceCovarianceStatus::Valid;
+        block.rank_by_target[0] = 1;
+        for date in 1..13 {
+            block.difference_factor[date] = 1.0;
+        }
+        let mut observations = (1..13)
+            .map(|date| Array2::from_elem((2, 1), date as f32))
+            .collect::<Vec<_>>();
+        observations[4][(0, 0)] = f32::NAN;
+        let mask = Array2::from_shape_vec((2, 1), vec![1_u8, 0_u8]).unwrap();
+        assert!(super::evaluate_block(
+            &block,
+            &observations,
+            mask.view(),
+            &(0..13).map(|date| date as f64 * 12.0).collect::<Vec<_>>(),
+            &dolphin_timeseries::TemporalCovarianceOptions::default(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3237,7 +4254,7 @@ mod tests {
             velocity.view(),
             geotransform,
             Some(32611),
-            None,
+            Some(f64::NAN),
             &[
                 ("UNITTYPE", "rad/yr"),
                 ("VELOCITY_ESTIMATOR", "linear_post_gauge_unit_precision"),
@@ -3250,7 +4267,7 @@ mod tests {
             Array2::from_elem((2, 1), 0.25_f32).view(),
             geotransform,
             Some(32611),
-            None,
+            Some(f64::NAN),
         )
         .unwrap();
         let legacy_sigma_before = std::fs::read(directory.join("velocity_sigma.tif")).unwrap();
@@ -3478,7 +4495,7 @@ mod tests {
             Array2::from_elem((2, 1), 0.9_f32).view(),
             geotransform,
             Some(32611),
-            None,
+            Some(f64::NAN),
             &los_tags,
         )
         .unwrap();
@@ -3491,7 +4508,7 @@ mod tests {
             geometry.east.mapv(|value| value as f32).view(),
             geotransform,
             Some(32611),
-            None,
+            Some(f64::NAN),
             &los_tags,
         )
         .unwrap();
@@ -3799,6 +4816,16 @@ mod tests {
         for (name, _) in PRODUCT_LAYERS {
             assert!(directory.join(name).exists(), "missing {name}");
         }
+        assert_eq!(
+            dolphin_io::read_raster_header(
+                &directory.join("velocity_temporal_process_variance.tif")
+            )
+            .unwrap()
+            .metadata
+            .get("UNITTYPE")
+            .map(String::as_str),
+            Some("rad^2")
+        );
         assert!(directory
             .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
             .exists());

@@ -137,12 +137,19 @@ pub fn write_fixed_cube_bundle(
         ("los_north.tif", &geometry.north),
         ("los_up.tif", &geometry.up),
     ] {
+        let masked = ndarray::Array2::from_shape_fn(validity_mask.dim(), |index| {
+            if validity_mask[index] {
+                component[index] as f32
+            } else {
+                f32::NAN
+            }
+        });
         write_raster_with_metadata(
             &dir.join(name),
-            component.mapv(|value| value as f32).view(),
+            masked.view(),
             geotransform,
             epsg,
-            None,
+            Some(f64::NAN),
             &geometry_tags,
         )?;
     }
@@ -186,9 +193,11 @@ pub fn write_fixed_cube_bundle(
 }
 
 /// Add corrected-product identities only after every COG and provenance file exists.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn promote_fixed_cube_receipt(
     directory: &std::path::Path,
     provenance_source: &std::path::Path,
+    scratch: &std::path::Path,
     semantic_validation: FixedCubeSemanticValidation,
     corrected_velocity_sha256: String,
     corrected_sigma_sha256: String,
@@ -246,11 +255,18 @@ pub(crate) fn promote_fixed_cube_receipt(
     receipt.inference_provenance_sha256 = Some(provenance_sha256);
     receipt.temporal_promotion_manifest_sha256 = Some(promotion_manifest_sha256);
     receipt.semantic_validation = Some(semantic_validation);
-    let scratch = directory.join(".fixed_cube_receipt.json.temporal-partial");
-    std::fs::write(&scratch, serde_json::to_vec_pretty(&receipt)?)?;
-    std::fs::File::open(&scratch)?.sync_all()?;
-    if let Err(error) = std::fs::rename(&scratch, path) {
-        let _ = std::fs::remove_file(scratch);
+    ensure!(
+        scratch.parent() == Some(directory) && !scratch.exists(),
+        "fixed-cube receipt scratch is not a fresh owned path"
+    );
+    let mut scratch_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(scratch)?;
+    std::io::Write::write_all(&mut scratch_file, &serde_json::to_vec_pretty(&receipt)?)?;
+    scratch_file.sync_all()?;
+    drop(scratch_file);
+    if let Err(error) = std::fs::rename(scratch, path) {
         return Err(error.into());
     }
     std::fs::File::open(directory)?.sync_all()?;
@@ -309,10 +325,53 @@ fn sha256_days(days: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::sha256_days;
+    use dolphin_core::config::DisplacementWorkflow;
+    use ndarray::array;
 
     #[test]
     fn epoch_digest_is_stable_for_exact_float_bytes() {
         assert_eq!(sha256_days(&[0.0, 12.0]), sha256_days(&[0.0, 12.0]));
         assert_ne!(sha256_days(&[0.0, 12.0]), sha256_days(&[0.0, 13.0]));
+    }
+
+    #[test]
+    fn los_rasters_are_nodata_outside_exact_common_support() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_fixed_cube_masked_los_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let workflow = DisplacementWorkflow {
+            work_directory: directory.clone(),
+            ..DisplacementWorkflow::default()
+        };
+        let geometry = dolphin_corrections::LosGeometry {
+            east: array![[0.5], [0.5]],
+            north: array![[0.0], [0.0]],
+            up: array![[3.0_f64.sqrt() / 2.0], [3.0_f64.sqrt() / 2.0]],
+        };
+        super::write_fixed_cube_bundle(
+            &workflow,
+            &[0.0, 12.0],
+            crate::displacement::VelocityEstimator::LinearPostGaugeUnitPrecision,
+            false,
+            array![[true], [false]].view(),
+            &geometry,
+            Some((0, 0)),
+            Some(32611),
+            [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0],
+        )
+        .unwrap();
+        for name in ["los_east.tif", "los_north.tif", "los_up.tif"] {
+            let raster = dolphin_io::read_raster::<f32>(&directory.join(name)).unwrap();
+            assert!(raster.data[(0, 0)].is_finite());
+            assert!(raster.data[(1, 0)].is_nan());
+            assert!(dolphin_io::read_raster_header(&directory.join(name))
+                .unwrap()
+                .nodata
+                .is_some_and(f64::is_nan));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

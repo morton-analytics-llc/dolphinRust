@@ -96,18 +96,24 @@ pub fn temporal_covariance_workspace_composition(
 }
 
 fn nested_f64_matrix_bytes(dimension: usize) -> Option<u64> {
-    let rows = u64::try_from(dimension).ok()?;
-    let values = rows
-        .checked_mul(rows)?
+    let capacity = vector_capacity_upper_bound(dimension)?;
+    let values = capacity
+        .checked_mul(capacity)?
         .checked_mul(std::mem::size_of::<f64>() as u64)?;
-    let row_headers = rows.checked_mul(std::mem::size_of::<Vec<f64>>() as u64)?;
+    let row_headers = capacity.checked_mul(std::mem::size_of::<Vec<f64>>() as u64)?;
     values.checked_add(row_headers)
 }
 
 fn f64_vector_bytes(length: usize) -> Option<u64> {
-    u64::try_from(length)
-        .ok()?
-        .checked_mul(std::mem::size_of::<f64>() as u64)
+    vector_capacity_upper_bound(length)?.checked_mul(std::mem::size_of::<f64>() as u64)
+}
+
+fn vector_capacity_upper_bound(length: usize) -> Option<u64> {
+    if length == 0 {
+        Some(0)
+    } else {
+        u64::try_from(length.checked_next_power_of_two()?).ok()
+    }
 }
 
 fn checked_sum(values: &[u64]) -> Option<u64> {

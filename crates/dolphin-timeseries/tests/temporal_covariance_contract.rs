@@ -14,10 +14,11 @@ use statrs::function::erf::erf;
 
 #[test]
 fn temporal_workspace_retains_relative_shape_through_bootstrap() {
-    let acquisition_count = 13;
-    let matrix_bytes = (acquisition_count * acquisition_count * std::mem::size_of::<f64>()
-        + acquisition_count * std::mem::size_of::<Vec<f64>>()) as u64;
-    let vector_bytes = (acquisition_count * std::mem::size_of::<f64>()) as u64;
+    let acquisition_count: usize = 13;
+    let capacity = acquisition_count.next_power_of_two();
+    let matrix_bytes = (capacity * capacity * std::mem::size_of::<f64>()
+        + capacity * std::mem::size_of::<Vec<f64>>()) as u64;
+    let vector_bytes = (capacity * std::mem::size_of::<f64>()) as u64;
     let composition = temporal_covariance_workspace_composition(
         acquisition_count,
         COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
@@ -27,6 +28,16 @@ fn temporal_workspace_retains_relative_shape_through_bootstrap() {
         composition.retained_fit_bytes,
         3 * matrix_bytes + 4 * vector_bytes
     );
+}
+
+#[test]
+fn temporal_workspace_uses_vector_capacity_upper_bounds() {
+    let thirteen =
+        temporal_covariance_workspace_composition(13, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS).unwrap();
+    let sixteen =
+        temporal_covariance_workspace_composition(16, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS).unwrap();
+    assert_eq!(thirteen.input_bytes, sixteen.input_bytes);
+    assert_eq!(thirteen.retained_fit_bytes, sixteen.retained_fit_bytes);
 }
 
 fn twelve_date_fixture() -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
