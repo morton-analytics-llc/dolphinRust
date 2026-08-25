@@ -152,6 +152,7 @@ fn complete_refit_bootstrap_candidate_rejects_nonfinite_or_inconsistent_values()
         (Some(f64::NAN), Some(3.5), Some(0.4)),
         (Some(3.5), Some(f64::INFINITY), Some(0.4)),
         (Some(3.5), Some(3.5), Some(f64::NAN)),
+        (Some(3.5), Some(3.5), Some(0.0)),
         (Some(3.5), Some(3.5), Some(-0.1)),
         (Some(3.6), Some(3.5), Some(0.4)),
     ] {

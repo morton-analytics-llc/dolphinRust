@@ -905,7 +905,7 @@ pub fn complete_refit_bootstrap_estimate(
     if !fit_slope.is_finite()
         || !selected_slope.is_finite()
         || !standard_error.is_finite()
-        || standard_error < 0.0
+        || standard_error <= 0.0
         || fit_slope != selected_slope
     {
         return abstain(CompleteRefitBootstrapEstimateStatus::InvalidEstimate);
