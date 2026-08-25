@@ -38,19 +38,19 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 19734528
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "c99f37f51e510f6fc89574b43c3f966fe0cd729acdde5530e6f3ea58dba8cead"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ae98be2358f13081ed28b1b256e1d4dbb417e2f58a8af717896b43378aa6fac6"
-FROZEN_EXECUTION_SHA256 = "b2e2c7e43a8cc697a3412833079f77a4d511be7ffc91413da15f578a34842031"
-FROZEN_REDUCERS_SHA256 = "478f0230bfb694db0ab67bbaef84065641854fb9e86604c2792605821d78ecad"
+FROZEN_GENERATOR_SHA256 = "87fb642945613ea149ade0cc1826f440d94aefade1918a3bce32a7f9ad704957"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "1e31c877de204ec37f1c2ae7cccf64bc1b70160145a51f1371be7f33782a8f1d"
+FROZEN_EXECUTION_SHA256 = "cda511eaeb1dcf14870438636ec869c0de7e931049cea73f4f34c0ef4b007e6d"
+FROZEN_REDUCERS_SHA256 = "9982866bcd699ae4e899f476dea379450a687c2b72e4fa8599ca4e80e4747c99"
 FROZEN_MATRIX_SHA256 = "24c518e5d5c9df03f2914bdb909a083acbd8bc4d69d0b39ac3b63a709a72d64d"
-FROZEN_RECEIPT_SHA256 = "93459864f0a4d082105a270a5920310f52e5cb06fd5dca80f9e05c4594928b8e"
-FROZEN_HASH_FIELDS_SHA256 = "f73cee8b05be6742571d2780a4eff256b25737f7e606a155db7a6b1488cd8aae"
-FROZEN_RESOURCE_SAMPLING_SHA256 = "debc0979fd793f257529d0d43187dfe5b99998ee9f73e783fbd95391d75185d2"
+FROZEN_RECEIPT_SHA256 = "94e1629524af343fd195ec438f770ea91c3400411a9289c29a2c50fa63edf3ed"
+FROZEN_HASH_FIELDS_SHA256 = "ffa6d9df6e46c3950eb45cdd123e141326554e7cade1094328897d341185fbc5"
+FROZEN_RESOURCE_SAMPLING_SHA256 = "89e9bed5a0be8166885a1da87d0d02aabf2e1c9c59fa207847bed0e68fceed24"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "c08c067f3236a4b1aa1b169430cdc2bac87fc9ff05b9458dc93ccc67d7e296cc"
 FROZEN_V3_PREREGISTRATION_SHA256 = "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184"
-FROZEN_DETERMINISM_SHA256 = "217c2266b915782a409b1c822c9ce0ee06c450bdb2f371a82e5b6d7168ba0f96"
-FROZEN_NUMERIC_SHA256 = "09b55ff2edaaf50fbe4fd5fca4aae93bf72cbdbfa484cd98050f19342d330648"
+FROZEN_DETERMINISM_SHA256 = "764209985c1708094fcbb7fb6e093c668557bf574db551a0b66ddcc6d20fa838"
+FROZEN_NUMERIC_SHA256 = "e2a6df8922302cccf7c9318446a1748b005970ede8dd768e73bb0bb56adde713"
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -92,8 +92,8 @@ ATTEMPT_KEYS = {
     "intersection_source_count", "union_source_count", "realized_overlap_jaccard", "signed_cross_influence",
     "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "estimator_branch",
     "target_estimate_history", "reference_estimate_history", "predicted_difference_covariance",
-    "production_operator_matrix", "dense_oracle_matrix", "contrast_weights",
-    "operator_sha256", "oracle_sha256", "production_artifact", "production_artifact_sha256",
+    "production_operator_matrix", "contrast_weights", "operator_sha256",
+    "production_artifact", "production_artifact_sha256",
     "raw_input_shape", "raw_input_value_count", "target_raw_input_sha256", "reference_raw_input_sha256",
     "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
 }
@@ -103,7 +103,7 @@ ATTEMPT_HASH_FIELDS = (
     "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_support_sha256",
     "reference_support_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
     "sequential_ancestry_sha256", "raw_dgp_identity_sha256", "operator_sha256",
-    "oracle_sha256", "production_artifact_sha256",
+    "production_artifact_sha256",
 )
 CELL_SUMMARY_KEYS = {
     "schema", "cell_id", "cell_ordinal", "status", "attempted_seeds", "emitted_seeds",
@@ -114,6 +114,9 @@ CELL_SUMMARY_KEYS = {
     "effective_looks_fraction", "covariance_calibration_relative_error", "error_bias_norm",
     "operator_relative_error", "contrast_variance_relative_error",
     "target_reference_error_covariance_trace", "production_artifact_digest",
+    "target_support_digest", "reference_support_digest",
+    "target_predicted_covariance_trace", "reference_predicted_covariance_trace",
+    "target_empirical_error_covariance_trace", "reference_empirical_error_covariance_trace",
     "empirical_error_covariance_trace", "predicted_covariance_trace", "psd_min_eigenvalue",
     "coverage_95_by_date", "interval_score_mean_by_date", "interval_width_mean_by_date",
     "final_date_coverage_95", "final_date_interval_score_mean", "final_date_interval_width_mean",
@@ -144,8 +147,7 @@ RESOURCE_OBSERVATION_KEYS = {
 }
 RESOURCE_RAW_MEASUREMENT_KEYS = {
     "command", "exit_status", "wall_seconds", "max_rss_bytes", "rss_sampler", "rss_field", "os",
-    "hardware_class", "ram_bytes", "tool_versions", "allocation_measurement",
-    "allocation_measurement_sha256",
+    "hardware_class", "ram_bytes", "tool_versions", "stdout_bytes", "stdout_sha256", "stdout_json",
 }
 ALLOCATION_COMPONENT_NAMES = {
     "source_cache", "reverse_adjoint", "joint_covariance", "difference_covariance",
@@ -267,6 +269,38 @@ def _read_hashed_json_record(
 ) -> tuple[dict[str, Any], bytes, str]:
     value, raw = _read_single_json_record(path, byte_limit, label)
     return value, raw, hashlib.sha256(raw).hexdigest()
+
+
+def _hash_bounded_file(path: Path, byte_limit: int, label: str) -> tuple[str, int]:
+    path = Path(path)
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise SchemaError(f"{label} is not a regular file")
+    if before.st_size > byte_limit:
+        raise SchemaError(f"{label} exceeds its frozen byte cap before read")
+    digest = hashlib.sha256()
+    byte_count = 0
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if _file_identity(opened) != _file_identity(before):
+            raise SchemaError(f"{label} changed before it was opened")
+        while True:
+            chunk = handle.read(min(1 << 20, byte_limit + 1 - byte_count))
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > byte_limit:
+                raise SchemaError(f"{label} exceeds its frozen byte cap during read")
+            digest.update(chunk)
+        after = os.fstat(handle.fileno())
+    path_after = path.stat()
+    if (
+        _file_identity(after) != _file_identity(before)
+        or _file_identity(path_after) != _file_identity(before)
+        or byte_count != before.st_size
+    ):
+        raise SchemaError(f"{label} changed while it was being read")
+    return digest.hexdigest(), byte_count
 
 
 def resolve_below_run_root(run_root: Path, relative_path: Any, label: str) -> Path:
@@ -604,8 +638,23 @@ def _history(value: Any, date_count: int, label: str) -> np.ndarray:
     return history
 
 
+def _difference_covariance_from_joint(joint: np.ndarray) -> np.ndarray:
+    date_count = joint.shape[0] // 2
+    difference = (
+        joint[:date_count, :date_count]
+        + joint[date_count:, date_count:]
+        - joint[:date_count, date_count:]
+        - joint[date_count:, :date_count]
+    )
+    difference = 0.5 * (difference + difference.T)
+    difference[0, :] = 0.0
+    difference[:, 0] = 0.0
+    return difference
+
+
 def independently_recompute_metrics(
-    attempt: Mapping[str, Any], latent_target: Sequence[float], latent_reference: Sequence[float]
+    attempt: Mapping[str, Any], latent_target: Sequence[float], latent_reference: Sequence[float],
+    dense_oracle: np.ndarray,
 ) -> dict[str, Any]:
     date_count = len(latent_target)
     target = _history(attempt.get("target_estimate_history"), date_count, "target estimate history")
@@ -625,7 +674,7 @@ def independently_recompute_metrics(
     reference_error = reference - latent_reference_array
     error = target_error - reference_error
     operator = _matrix(attempt.get("production_operator_matrix"), "production operator matrix")
-    oracle = _matrix(attempt.get("dense_oracle_matrix"), "dense oracle matrix")
+    oracle = np.asarray(dense_oracle, dtype=np.float64)
     weights = np.asarray(attempt.get("contrast_weights"), dtype=np.float64)
     joint_count = 2 * date_count
     if operator.shape != (joint_count, joint_count) or oracle.shape != operator.shape or weights.shape != (joint_count,):
@@ -635,6 +684,9 @@ def independently_recompute_metrics(
     expected_weights[-1] = -1.0
     if not np.isfinite(weights).all() or not np.array_equal(weights, expected_weights):
         raise SchemaError("contrast weights must be the exact final-date target-minus-reference contrast")
+    derived_difference_covariance = _difference_covariance_from_joint(operator)
+    if not np.array_equal(covariance, derived_difference_covariance):
+        raise SchemaError("predicted difference covariance is not E C E' from the production joint operator")
     operator_error = _frobenius(operator - oracle) / max(_frobenius(oracle), 1e-15)
     operator_variance = _quadratic(weights, operator)
     oracle_variance = _quadratic(weights, oracle)
@@ -663,7 +715,8 @@ def independently_recompute_metrics(
         "estimate_sha256": numeric_digest("estimate-history-v4", [*target, *reference]),
         "predicted_covariance_sha256": numeric_digest("predicted-difference-covariance-v4", covariance.flat),
         "operator_sha256": numeric_digest("production-operator-v4", operator.flat),
-        "oracle_sha256": numeric_digest("dense-oracle-v4", oracle.flat),
+        "target_predicted_covariance_trace": float(np.trace(operator[:date_count, :date_count])),
+        "reference_predicted_covariance_trace": float(np.trace(operator[date_count:, date_count:])),
     }
 
 
@@ -862,6 +915,38 @@ def _effective_looks_fraction(support: Sequence[tuple[int, int]], spatial: bool)
     return len(support) / denominator
 
 
+def derive_dense_joint_oracle(
+    preregistration: Mapping[str, Any], cell_id: str, regenerated: Mapping[str, Any]
+) -> np.ndarray:
+    labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+    topology = preregistration["generator"]["acquisition"]["topologies"][labels["block_topology"]]
+    date_count = topology["acquisition_count"]
+    raw = preregistration["generator"]["raw_proper_complex"]
+    rho = math.exp(-preregistration["generator"]["acquisition"]["cadence_days"] / raw["correlation_days"])
+    temporal = np.fromfunction(
+        lambda row, column: rho ** np.abs(row - column),
+        (date_count, date_count),
+        dtype=float,
+    )
+    temporal = temporal - temporal[:, [0]] - temporal[[0], :] + temporal[0, 0]
+    target_scale = raw["noise_variance"] / regenerated["target_source_count"]
+    reference_scale = raw["noise_variance"] / regenerated["reference_source_count"]
+    sign = PAIR_SIGN[labels["pair_geometry"]]
+    signed_influence = (
+        regenerated.get("target_global_loading_mean", 0.0)
+        * regenerated.get("reference_global_loading_mean", 0.0)
+    )
+    coupling_scale = math.sqrt(target_scale * reference_scale) if sign == "zero" else (
+        0.5 * signed_influence * math.sqrt(target_scale * reference_scale)
+        if sign in {"positive", "negative"}
+        else 0.0
+    )
+    target = target_scale * temporal
+    reference = reference_scale * temporal
+    cross = coupling_scale * temporal
+    return np.block([[target, cross], [cross.T, reference]])
+
+
 def regenerate_frozen_attempt_inputs(
     preregistration: Mapping[str, Any], cell_id: str, seed_index: int
 ) -> dict[str, Any]:
@@ -878,11 +963,14 @@ def regenerate_frozen_attempt_inputs(
     candidate_union = sorted(set(target_candidates) | set(reference_candidates))
     topology = preregistration["generator"]["acquisition"]["topologies"][labels["block_topology"]]
     date_count = topology["acquisition_count"]
+    geometry = labels["pair_geometry"]
+    matched_geometry = geometry.rsplit("_", 1)[0] + "_matched" if geometry.endswith(("_positive", "_negative")) else geometry
+    matched_cell_id = cell_id.replace(geometry, matched_geometry)
     global_seed = hashlib.sha256(
-        f"{preregistration['seed_schedule']['validation_seed']}||{cell_id}||{seed_index}||global-source-process".encode("utf-8")
+        f"{preregistration['seed_schedule']['validation_seed']}||{matched_cell_id}||{seed_index}||global-source-process".encode("utf-8")
     ).hexdigest()
     global_normals = deterministic_normals(global_seed, 4 * date_count)
-    pair_orientation = -1.0 if labels["pair_geometry"].endswith("_negative") else 1.0
+    pair_orientation = 1.0
     negative_pair = labels["pair_geometry"].endswith("_negative")
     pair_has_signed_loading = PAIR_SIGN[labels["pair_geometry"]] in {"positive", "negative"}
     spatial = labels["source_process"] == "spatial_correlation_stress" or pair_has_signed_loading
@@ -896,9 +984,16 @@ def regenerate_frozen_attempt_inputs(
         )
         for coordinate in candidate_union
     }
+    support_selection_raw = {
+        coordinate: _generate_complex_source(
+            preregistration, matched_cell_id, seed_index, coordinate, date_count,
+            global_normals, spatial, labels["eigen_stress"], pair_orientation, 1.0,
+        )
+        for coordinate in candidate_union
+    }
     raw_by_source = {
         coordinate: _generate_complex_source(
-            preregistration, cell_id, seed_index, coordinate, date_count,
+            preregistration, matched_cell_id, seed_index, coordinate, date_count,
             global_normals, spatial, labels["eigen_stress"], pair_orientation,
             global_loading_by_source[coordinate],
         )
@@ -909,7 +1004,7 @@ def regenerate_frozen_attempt_inputs(
     for block in topology["expected_blocks"]:
         block_dates = range(block["real_start"], block["real_start"] + block["num_real"])
         block_raw = {
-            coordinate: [raw_by_source[coordinate][acquisition] for acquisition in block_dates]
+            coordinate: [support_selection_raw[coordinate][acquisition] for acquisition in block_dates]
             for coordinate in candidate_union
         }
         target_supports.append(_select_support(labels["support"], target_candidates, target, block_raw))
@@ -946,6 +1041,18 @@ def regenerate_frozen_attempt_inputs(
         "partial_tail_count": topology["partial_tail_count"],
     }
     sequential_ancestry_sha256 = sha256_json(ancestry)
+    provisional = {
+        "target_source_count": len(target_support),
+        "reference_source_count": len(reference_support),
+        "target_global_loading_mean": target_global_loading_mean,
+        "reference_global_loading_mean": reference_global_loading_mean,
+    }
+    dense_oracle = derive_dense_joint_oracle(preregistration, cell_id, provisional)
+    oracle_difference = _difference_covariance_from_joint(dense_oracle)
+    independent_oracle = dense_oracle.copy()
+    independent_oracle[:date_count, date_count:] = 0.0
+    independent_oracle[date_count:, :date_count] = 0.0
+    independent_difference = _difference_covariance_from_joint(independent_oracle)
     raw_identity = {
         "cell_id": cell_id,
         "seed_index": seed_index,
@@ -983,6 +1090,17 @@ def regenerate_frozen_attempt_inputs(
         "latent_reference_history": latent_reference,
         "latent_history_sha256": numeric_digest(
             "latent-phase-history-v4", [*latent_target, *latent_reference]
+        ),
+        "dense_joint_oracle": dense_oracle.tolist(),
+        "dense_oracle_sha256": numeric_digest("dense-oracle-v4", dense_oracle.flat),
+        "oracle_difference_covariance": oracle_difference.tolist(),
+        "oracle_difference_covariance_trace": float(np.trace(oracle_difference)),
+        "oracle_independent_covariance_trace": float(np.trace(independent_difference)),
+        "target_marginal_oracle_sha256": numeric_digest(
+            "target-marginal-oracle-v4", dense_oracle[:date_count, :date_count].flat
+        ),
+        "reference_marginal_oracle_sha256": numeric_digest(
+            "reference-marginal-oracle-v4", dense_oracle[date_count:, date_count:].flat
         ),
     }
 
@@ -1030,6 +1148,7 @@ class CellAccumulator:
     expected_seed_count: int | None = None
     code_sha256: str = "0" * 64
     binary_sha256: str = "0" * 64
+    artifact_root: Path | None = None
     next_seed_index: int = 0
     emitted: int = 0
     date_count: int = 0
@@ -1050,9 +1169,16 @@ class CellAccumulator:
     target_error_sum: np.ndarray | None = None
     reference_error_sum: np.ndarray | None = None
     target_reference_error_outer_sum: np.ndarray | None = None
+    target_error_outer_sum: np.ndarray | None = None
+    reference_error_outer_sum: np.ndarray | None = None
+    target_predicted_trace_sum: float = 0.0
+    reference_predicted_trace_sum: float = 0.0
     operator_relative_error_max: float = 0.0
     contrast_variance_relative_error_max: float = 0.0
-    field_digests: dict[str, Any] = field(default_factory=lambda: {name: hashlib.sha256() for name in ("estimate_sha256", "latent_history_sha256", "production_artifact_sha256")})
+    field_digests: dict[str, Any] = field(default_factory=lambda: {name: hashlib.sha256() for name in (
+        "estimate_sha256", "latent_history_sha256", "production_artifact_sha256",
+        "target_support_sha256", "reference_support_sha256",
+    )})
     request_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:requests:v4\0"))
     attempt_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:attempts:v4\0"))
 
@@ -1110,16 +1236,38 @@ class CellAccumulator:
         if (
             not isinstance(artifact, dict)
             or set(artifact) != {
-                "schema", "schema_version", "hdf5_sha256", "manifest_sha256",
-                "factor_sha256", "reference_provenance", "reference_provenance_sha256",
+                "schema", "hdf5_path", "sidecar_path", "hdf5_sha256", "sidecar_sha256",
             }
-            or artifact.get("schema") != "dolphinrust.spatial-reference-covariance-artifact/4"
-            or artifact.get("schema_version") != 4
-            or any(not _is_sha256(artifact.get(name)) for name in ("hdf5_sha256", "manifest_sha256", "factor_sha256"))
-            or artifact.get("factor_sha256") != attempt.get("operator_sha256")
-            or artifact.get("reference_provenance") != provenance
-            or artifact.get("reference_provenance_sha256") != sha256_json(provenance)
+            or artifact.get("schema") != "dolphinrust.spatial-covariance.production-artifact-binding/4"
+            or any(not _is_sha256(artifact.get(name)) for name in ("hdf5_sha256", "sidecar_sha256"))
             or attempt.get("production_artifact_sha256") != sha256_json(artifact)
+        ):
+            raise SchemaError(f"cell {self.cell_id} production HDF5 artifact identity mismatch")
+        if self.artifact_root is None:
+            raise SchemaError(f"cell {self.cell_id} production artifact run root is not bound")
+        hdf5_path = resolve_below_run_root(self.artifact_root, artifact["hdf5_path"], "production HDF5 artifact")
+        sidecar_path = resolve_below_run_root(self.artifact_root, artifact["sidecar_path"], "production HDF5 sidecar")
+        hdf5_sha256, _ = _hash_bounded_file(
+            hdf5_path, self.preregistration["execution_protocol"]["max_production_hdf5_bytes"],
+            "production HDF5 artifact",
+        )
+        sidecar, _, sidecar_sha256 = _read_hashed_json_record(
+            sidecar_path, FROZEN_MAX_RESOURCE_RECEIPT_BYTES, "production HDF5 sidecar"
+        )
+        if (
+            hdf5_sha256 != artifact["hdf5_sha256"]
+            or sidecar_sha256 != artifact["sidecar_sha256"]
+            or set(sidecar) != {
+                "schema", "schema_version", "hdf5_path", "hdf5_sha256", "factor_sha256",
+                "reference_provenance", "reference_provenance_sha256",
+            }
+            or sidecar.get("schema") != "dolphinrust.spatial-reference-covariance-artifact/4"
+            or sidecar.get("schema_version") != 4
+            or sidecar.get("hdf5_path") != artifact["hdf5_path"]
+            or sidecar.get("hdf5_sha256") != hdf5_sha256
+            or sidecar.get("factor_sha256") != attempt.get("operator_sha256")
+            or sidecar.get("reference_provenance") != provenance
+            or sidecar.get("reference_provenance_sha256") != sha256_json(provenance)
         ):
             raise SchemaError(f"cell {self.cell_id} production HDF5 artifact identity mismatch")
         if any(
@@ -1181,12 +1329,12 @@ class CellAccumulator:
         metrics = (
             "signed_cross_influence", "target_estimate_history", "reference_estimate_history",
             "predicted_difference_covariance", "production_operator_matrix",
-            "dense_oracle_matrix", "contrast_weights",
+            "contrast_weights",
         )
         if any(attempt.get(metric) is not None for metric in metrics):
             raise SchemaError(f"cell {self.cell_id} masked attempt must use null numeric evidence")
         if any(attempt.get(name) != "0" * 64 for name in (
-            "estimate_sha256", "predicted_covariance_sha256", "operator_sha256", "oracle_sha256",
+            "estimate_sha256", "predicted_covariance_sha256", "operator_sha256",
         )):
             raise SchemaError(f"cell {self.cell_id} masked attempt must use null estimator digests")
 
@@ -1229,7 +1377,8 @@ class CellAccumulator:
         self, attempt: Mapping[str, Any], expected: Mapping[str, Any]
     ) -> None:
         metrics = independently_recompute_metrics(
-            attempt, expected["latent_target_history"], expected["latent_reference_history"]
+            attempt, expected["latent_target_history"], expected["latent_reference_history"],
+            np.asarray(expected["dense_joint_oracle"], dtype=np.float64),
         )
         labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
         if labels["pair_geometry"] == "coincident" and (
@@ -1241,7 +1390,7 @@ class CellAccumulator:
         for field_name in ("estimate_sha256", "predicted_covariance_sha256"):
             if attempt.get(field_name) != metrics[field_name]:
                 raise SchemaError(f"cell {self.cell_id} has a {field_name} canonical digest mismatch")
-        for field_name in ("operator_sha256", "oracle_sha256"):
+        for field_name in ("operator_sha256",):
             if attempt.get(field_name) != metrics[field_name]:
                 raise SchemaError(f"cell {self.cell_id} has a {field_name} canonical digest mismatch")
         error = metrics["error"]
@@ -1254,6 +1403,8 @@ class CellAccumulator:
             self.target_error_sum = np.zeros(self.date_count, dtype=np.float64)
             self.reference_error_sum = np.zeros(self.date_count, dtype=np.float64)
             self.target_reference_error_outer_sum = np.zeros((self.date_count, self.date_count), dtype=np.float64)
+            self.target_error_outer_sum = np.zeros((self.date_count, self.date_count), dtype=np.float64)
+            self.reference_error_outer_sum = np.zeros((self.date_count, self.date_count), dtype=np.float64)
             self.coverage_counts = np.zeros(self.date_count, dtype=np.int64)
             self.interval_score_sums = np.zeros(self.date_count, dtype=np.float64)
             self.interval_width_sums = np.zeros(self.date_count, dtype=np.float64)
@@ -1265,6 +1416,11 @@ class CellAccumulator:
         self.target_error_sum += metrics["target_error"]
         self.reference_error_sum += metrics["reference_error"]
         self.target_reference_error_outer_sum += np.outer(metrics["target_error"], metrics["reference_error"])
+        assert self.target_error_outer_sum is not None and self.reference_error_outer_sum is not None
+        self.target_error_outer_sum += np.outer(metrics["target_error"], metrics["target_error"])
+        self.reference_error_outer_sum += np.outer(metrics["reference_error"], metrics["reference_error"])
+        self.target_predicted_trace_sum += metrics["target_predicted_covariance_trace"]
+        self.reference_predicted_trace_sum += metrics["reference_predicted_covariance_trace"]
         self.operator_relative_error_max = max(self.operator_relative_error_max, metrics["operator_relative_error"])
         self.contrast_variance_relative_error_max = max(
             self.contrast_variance_relative_error_max,
@@ -1298,6 +1454,8 @@ class CellAccumulator:
         empirical = predicted = None
         calibration_error = bias_norm = empirical_trace = predicted_trace = None
         target_reference_error_covariance_trace = None
+        target_empirical_trace = reference_empirical_trace = None
+        target_predicted_trace = reference_predicted_trace = None
         coverage_by_date = interval_score_by_date = interval_width_by_date = None
         final_coverage = final_interval_score = final_interval_width = None
         if self.emitted:
@@ -1317,6 +1475,17 @@ class CellAccumulator:
                 - np.outer(self.target_error_sum / self.emitted, self.reference_error_sum / self.emitted)
             )
             target_reference_error_covariance_trace = float(np.trace(cross_covariance))
+            assert self.target_error_outer_sum is not None and self.reference_error_outer_sum is not None
+            target_empirical = self.target_error_outer_sum / self.emitted - np.outer(
+                self.target_error_sum / self.emitted, self.target_error_sum / self.emitted
+            )
+            reference_empirical = self.reference_error_outer_sum / self.emitted - np.outer(
+                self.reference_error_sum / self.emitted, self.reference_error_sum / self.emitted
+            )
+            target_empirical_trace = float(np.trace(target_empirical))
+            reference_empirical_trace = float(np.trace(reference_empirical))
+            target_predicted_trace = self.target_predicted_trace_sum / self.emitted
+            reference_predicted_trace = self.reference_predicted_trace_sum / self.emitted
             if self.expected_seed_count != FROZEN_DETERMINISTIC_SEED_COUNT:
                 coverage_by_date = [None] + [
                     float(value / self.emitted) for value in self.coverage_counts[1:]
@@ -1344,6 +1513,10 @@ class CellAccumulator:
             "operator_relative_error": self.operator_relative_error_max if self.emitted else None,
             "contrast_variance_relative_error": self.contrast_variance_relative_error_max if self.emitted else None,
             "target_reference_error_covariance_trace": target_reference_error_covariance_trace,
+            "target_predicted_covariance_trace": target_predicted_trace,
+            "reference_predicted_covariance_trace": reference_predicted_trace,
+            "target_empirical_error_covariance_trace": target_empirical_trace,
+            "reference_empirical_error_covariance_trace": reference_empirical_trace,
             "empirical_error_covariance_trace": empirical_trace, "predicted_covariance_trace": predicted_trace,
             "psd_min_eigenvalue": self.min_psd_eigenvalue,
             "coverage_95_by_date": coverage_by_date,
@@ -1355,6 +1528,8 @@ class CellAccumulator:
             "estimate_digest": self.field_digests["estimate_sha256"].hexdigest(),
             "latent_history_digest": self.field_digests["latent_history_sha256"].hexdigest(),
             "production_artifact_digest": self.field_digests["production_artifact_sha256"].hexdigest(),
+            "target_support_digest": self.field_digests["target_support_sha256"].hexdigest(),
+            "reference_support_digest": self.field_digests["reference_support_sha256"].hexdigest(),
             "predicted_covariance_digest": None if predicted is None else numeric_digest("mean-predicted-covariance-v4", predicted.flat),
             "empirical_error_covariance_digest": None if empirical is None else numeric_digest("empirical-error-covariance-v4", empirical.flat),
             "code_sha256": self.code_sha256, "binary_sha256": self.binary_sha256,
@@ -1409,13 +1584,25 @@ class CellAccumulator:
 
 
 def validate_direct_pair_variance_order(
-    positive: Mapping[str, Any], independent: Mapping[str, Any], negative: Mapping[str, Any]
+    positive: Mapping[str, Any], negative: Mapping[str, Any]
 ) -> None:
-    for field_name in ("predicted_covariance_trace", "empirical_error_covariance_trace"):
-        values = (positive.get(field_name), independent.get(field_name), negative.get(field_name))
+    for identity in ("target_support_digest", "reference_support_digest", "latent_history_digest"):
+        if positive.get(identity) != negative.get(identity):
+            raise SchemaError(f"direct matched pair {identity} differs across signed coupling")
+    for difference_name, target_name, reference_name in (
+        ("predicted_covariance_trace", "target_predicted_covariance_trace", "reference_predicted_covariance_trace"),
+        ("empirical_error_covariance_trace", "target_empirical_error_covariance_trace", "reference_empirical_error_covariance_trace"),
+    ):
+        marginal_values = tuple(
+            item.get(name) for item in (positive, negative) for name in (target_name, reference_name)
+        )
+        if any(not _number(value) for value in marginal_values):
+            raise SchemaError(f"direct matched pair lacks {difference_name} marginals")
+        independent = 0.5 * sum(marginal_values)
+        values = (positive.get(difference_name), independent, negative.get(difference_name))
         if any(not _number(value) for value in values) or not values[0] < values[1] < values[2]:
             raise SchemaError(
-                f"direct pair contract requires positive < independent < negative {field_name}"
+                f"direct matched pair contract requires positive < independent < negative {difference_name}"
             )
 
 
@@ -1483,13 +1670,13 @@ def validate_input_shard(preregistration: Mapping[str, Any], input_path: Path, m
     with Path(input_path).open("rb") as handle:
         for cell_offset, cell_id in enumerate(spec.cell_ids):
             dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
-            for seed_index in range(FROZEN_SEED_COUNT):
+            for seed_index in range(expected_seed_count(cell_id)):
                 line_number += 1
                 request, raw = _read_json_line(handle, Path(input_path), line_number)
                 if request is None:
                     raise SchemaError(f"shard {spec.index} input is missing request {line_number}")
                 expected = {
-                    "schema": "dolphinrust.spatial-covariance.attempt/3",
+                    "schema": "dolphinrust.spatial-covariance.attempt/4",
                     "cell_id": cell_id,
                     "cell_ordinal": spec.cell_ordinal_start + cell_offset,
                     "seed_index": seed_index,
@@ -1522,8 +1709,11 @@ def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, mani
     line_number = 0
     with output_path.open("rb") as handle:
         for cell_offset, cell_id in enumerate(spec.cell_ids):
-            accumulator = CellAccumulator(preregistration, cell_id, spec.cell_ordinal_start + cell_offset)
-            for _ in range(FROZEN_SEED_COUNT):
+            accumulator = CellAccumulator(
+                preregistration, cell_id, spec.cell_ordinal_start + cell_offset,
+                artifact_root=run_root,
+            )
+            for _ in range(expected_seed_count(cell_id)):
                 line_number += 1
                 attempt, raw = _read_json_line(handle, output_path, line_number)
                 if attempt is None:
@@ -2036,9 +2226,18 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
                 or observation.get("raw_measurement_sha256") != sha256_json(raw_measurement)
             ):
                 raise SchemaError(f"resource {resource_id} raw resource measurement is invalid")
-            allocation_measurement = raw_measurement["allocation_measurement"]
-            if raw_measurement["allocation_measurement_sha256"] != sha256_json(allocation_measurement):
-                raise SchemaError(f"resource {resource_id} benchmark allocation hash mismatch")
+            stdout_json = raw_measurement["stdout_json"]
+            if (
+                not isinstance(stdout_json, str)
+                or not _integer(raw_measurement["stdout_bytes"])
+                or raw_measurement["stdout_bytes"] != len(stdout_json.encode("utf-8"))
+                or raw_measurement["stdout_sha256"] != hashlib.sha256(stdout_json.encode("utf-8")).hexdigest()
+            ):
+                raise SchemaError(f"resource {resource_id} captured benchmark stdout hash mismatch")
+            try:
+                allocation_measurement = json.loads(stdout_json)
+            except json.JSONDecodeError as exc:
+                raise SchemaError(f"resource {resource_id} captured benchmark stdout is malformed") from exc
             _validate_benchmark_allocation_measurement(
                 resource_id, allocation_measurement, item, expected
             )
@@ -2177,20 +2376,17 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
                 }
                 if all(labels[name] == value for name, value in defaults.items()):
                     geometry = labels["pair_geometry"]
-                    if geometry in {"shared_75_positive", "disjoint_immediate", "shared_75_negative"}:
+                    if geometry in {"shared_75_positive", "shared_75_negative"}:
                         direct_pair_summaries[geometry] = summary
                 any_failed = any_failed or summary["status"] == FAIL
                 any_not_evaluable = any_not_evaluable or summary["status"] == NOT_EVALUABLE
             manifest_digests.append(digest)
         if result_root_sha256(manifest_digests) != run_manifest["result_root_sha256"]:
             raise SchemaError("run result root does not bind the ordered shard manifests")
-        if set(direct_pair_summaries) != {
-            "shared_75_positive", "disjoint_immediate", "shared_75_negative"
-        }:
-            raise SchemaError("run omits the direct positive/independent/negative pair contract")
+        if set(direct_pair_summaries) != {"shared_75_positive", "shared_75_negative"}:
+            raise SchemaError("run omits the direct matched signed-pair contract")
         validate_direct_pair_variance_order(
             direct_pair_summaries["shared_75_positive"],
-            direct_pair_summaries["disjoint_immediate"],
             direct_pair_summaries["shared_75_negative"],
         )
         summary_receipt = sink.commit()

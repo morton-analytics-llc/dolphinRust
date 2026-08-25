@@ -8,6 +8,8 @@ import hashlib
 import json
 import math
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
@@ -93,6 +95,35 @@ def _load_bounded_json(path: Path, byte_limit: int, label: str) -> Any:
         raise SchemaError(f"{label} is malformed JSON") from exc
 
 
+def capture_benchmark_stdout(command: list[str], byte_limit: int = 8192) -> dict[str, Any]:
+    if not isinstance(command, list) or not command or any(not isinstance(value, str) or not value for value in command):
+        raise SchemaError("benchmark command is malformed")
+    with tempfile.TemporaryFile() as stdout_file:
+        completed = subprocess.run(
+            command, check=False, stdout=stdout_file, stderr=subprocess.DEVNULL
+        )
+        stdout_bytes = stdout_file.tell()
+        if completed.returncode != 0 or stdout_bytes > byte_limit:
+            raise SchemaError("benchmark command failed or exceeded the stdout cap")
+        stdout_file.seek(0)
+        stdout = stdout_file.read(byte_limit + 1)
+    if len(stdout) != stdout_bytes:
+        raise SchemaError("benchmark stdout changed while captured")
+    try:
+        parsed = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("benchmark stdout is malformed JSON") from exc
+    if not isinstance(parsed, dict) or stdout.count(b"\n") > 1:
+        raise SchemaError("benchmark stdout must contain one JSON object")
+    return {
+        "command": list(command),
+        "exit_status": completed.returncode,
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stdout_json": stdout.decode("utf-8"),
+    }
+
+
 def iter_attempt_requests(preregistration: Mapping[str, Any], spec: ShardSpec) -> Iterator[dict[str, Any]]:
     validate_preregistration(preregistration)
     for cell_offset, cell_id in enumerate(spec.cell_ids):
@@ -174,8 +205,11 @@ def inspect_one_input_one_output(
         for cell_offset, cell_id in enumerate(spec.cell_ids):
             cell_ordinal = spec.cell_ordinal_start + cell_offset
             dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
-            accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal)
-            for seed_index in range(FROZEN_SEED_COUNT):
+            accumulator = CellAccumulator(
+                preregistration, cell_id, cell_ordinal,
+                artifact_root=output_partial.parent,
+            )
+            for seed_index in range(expected_seed_count(cell_id)):
                 input_line = input_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
                 output_line = output_handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
                 if not input_line or not output_line:
@@ -188,7 +222,7 @@ def inspect_one_input_one_output(
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise SchemaError("batch input/output contains malformed JSON") from exc
                 expected_request = {
-                    "schema": "dolphinrust.spatial-covariance.attempt/3",
+                    "schema": "dolphinrust.spatial-covariance.attempt/4",
                     "cell_id": cell_id,
                     "cell_ordinal": cell_ordinal,
                     "seed_index": seed_index,
@@ -447,12 +481,16 @@ def commit_cell_transport(
     code_sha256: str,
     binary_sha256: str,
     expected_seed_count_override: int | None = None,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     if not _is_digest(code_sha256) or not _is_digest(binary_sha256):
         raise SchemaError("cell commit code/binary identity is invalid")
     transport_path = Path(transport_path)
     seed_count = expected_seed_count_override if expected_seed_count_override is not None else expected_seed_count(cell_id)
-    accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal, seed_count, code_sha256, binary_sha256)
+    accumulator = CellAccumulator(
+        preregistration, cell_id, cell_ordinal, seed_count, code_sha256, binary_sha256,
+        artifact_root=artifact_root,
+    )
     with transport_path.open("rb") as handle:
         for line_number in range(seed_count):
             raw = handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
@@ -485,6 +523,7 @@ def _summary_root(
     code_sha256: str,
     binary_sha256: str,
     attempt_regenerator: AttemptRegenerator | None = None,
+    artifact_root: Path | None = None,
 ) -> tuple[str, int]:
     digest = hashlib.sha256(b"dolphinrust:spatial-covariance:cell-summary-root:v4\0")
     total_bytes = 0
@@ -499,7 +538,8 @@ def _summary_root(
         validate_cell_summary(preregistration, summary, cell_id, cell_ordinal, code_sha256, binary_sha256)
         if attempt_regenerator is not None:
             accumulator = CellAccumulator(
-                preregistration, cell_id, cell_ordinal, expected_seed_count(cell_id), code_sha256, binary_sha256
+                preregistration, cell_id, cell_ordinal, expected_seed_count(cell_id), code_sha256, binary_sha256,
+                artifact_root=artifact_root,
             )
             for attempt in attempt_regenerator(cell_id, cell_ordinal):
                 accumulator.add(attempt)
@@ -534,7 +574,9 @@ def commit_output_shard(
         manifest_path.resolve().parent.relative_to(root)
     except (OSError, ValueError) as exc:
         raise SchemaError("compact shard paths must remain below run root") from exc
-    summary_digest, summary_bytes = _summary_root(preregistration, directory, spec, code_sha256, binary_sha256)
+    summary_digest, summary_bytes = _summary_root(
+        preregistration, directory, spec, code_sha256, binary_sha256, artifact_root=root
+    )
     manifest = {
         "schema": "dolphinrust.spatial-covariance.shard-manifest/4", "schema_version": 4,
         "shard_index": spec.index, "cell_ordinal_start": spec.cell_ordinal_start,
@@ -608,6 +650,7 @@ def _committed_shard_matches_manifest(
             expected_code_sha256,
             expected_binary_sha256,
             attempt_regenerator,
+            artifact_root=run_root,
         )
         return digest == manifest["summary_sha256"] and size == manifest["summary_bytes"]
     except (OSError, ValueError, json.JSONDecodeError, SchemaError):
@@ -668,10 +711,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preregistration", type=Path, default=Path(__file__).with_name("spatial_covariance_preregistration.json"))
     commands = parser.add_subparsers(dest="command", required=True)
+    capture = commands.add_parser("capture-resource", help="capture one benchmark allocation stdout record")
+    capture.add_argument("--destination", type=Path, required=True)
+    capture.add_argument("benchmark_command", nargs=argparse.REMAINDER)
     prepare = commands.add_parser("prepare", help="write one compact deterministic shard descriptor")
     prepare.add_argument("--run-root", type=Path, required=True)
     prepare.add_argument("--shard-index", type=int, required=True)
     reduce_cell = commands.add_parser("reduce-cell", help="independently reduce one ephemeral cell transport")
+    reduce_cell.add_argument("--run-root", type=Path, required=True)
     reduce_cell.add_argument("--cell-ordinal", type=int, required=True)
     reduce_cell.add_argument("--transport", type=Path, required=True)
     reduce_cell.add_argument("--destination", type=Path, required=True)
@@ -706,7 +753,13 @@ def main() -> None:
         spec = next((item for item in iter_shard_specs(preregistration) if item.index == args.shard_index), None)
         if spec is None:
             raise SystemExit(f"shard index is outside 0..{preregistration['execution_protocol']['shard_count'] - 1}")
-    if args.command == "prepare":
+    if args.command == "capture-resource":
+        command = args.benchmark_command
+        if command and command[0] == "--":
+            command = command[1:]
+        result = capture_benchmark_stdout(command)
+        write_jsonl_atomic((result,), args.destination, byte_limit=8192)
+    elif args.command == "prepare":
         destination = args.run_root / "requests" / f"shard-{spec.index:05d}.jsonl"
         result = prepare_input_shard(preregistration, spec, destination)
     elif args.command == "reduce-cell":
@@ -716,6 +769,7 @@ def main() -> None:
         result = commit_cell_transport(
             preregistration, cell_ids[args.cell_ordinal], args.cell_ordinal, args.transport,
             args.destination, args.code_sha256, args.binary_sha256,
+            artifact_root=args.run_root.resolve(strict=True),
         )
     elif args.command == "commit":
         result = commit_output_shard(
