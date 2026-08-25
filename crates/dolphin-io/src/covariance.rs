@@ -921,24 +921,25 @@ impl CovarianceGenerationRegistry {
             !self.generations.is_empty(),
             "covariance generation registry is empty",
         )?;
-        let mut keys = BTreeSet::new();
-        let mut block_ids = BTreeSet::new();
-        let mut next_by_burst = BTreeMap::<&str, (u32, u32)>::new();
+        let mut block_ids = Vec::new();
         let mut prior_key = None;
+        let mut active_burst = None;
+        let mut expected = (0_u32, 0_u32);
         for identity in &self.generations {
             let key = (identity.burst_id.as_str(), identity.generation);
             ensure_valid(
-                !identity.burst_id.is_empty()
-                    && prior_key.is_none_or(|prior| prior < key)
-                    && keys.insert(key),
+                !identity.burst_id.is_empty() && prior_key.is_none_or(|prior| prior < key),
                 "covariance generation registry repeats or omits a burst identity",
             )?;
             prior_key = Some(key);
+            if active_burst != Some(identity.burst_id.as_str()) {
+                active_burst = Some(identity.burst_id.as_str());
+                expected = (0, 0);
+            }
             ensure_valid(
                 consecutive(&identity.source_date_indices),
                 "covariance generation source dates are not consecutive",
             )?;
-            let expected = next_by_burst.entry(&identity.burst_id).or_insert((0, 0));
             ensure_valid(
                 identity.generation == expected.0
                     && identity.source_date_indices.first().copied() == Some(expected.1),
@@ -985,10 +986,7 @@ impl CovarianceGenerationRegistry {
                 "covariance generation has no planned blocks",
             )?;
             for block in &identity.blocks {
-                ensure_valid(
-                    block_ids.insert(block.block_id),
-                    "covariance generation registry repeats a block ID",
-                )?;
+                block_ids.push(block.block_id);
                 if identity.sealed {
                     ensure_valid(
                         block.block_sha256.iter().any(|byte| *byte != 0),
@@ -1003,6 +1001,11 @@ impl CovarianceGenerationRegistry {
                 }
             }
         }
+        block_ids.sort_unstable();
+        ensure_valid(
+            block_ids.windows(2).all(|pair| pair[0] != pair[1]),
+            "covariance generation registry repeats a block ID",
+        )?;
         if let Some(plan) = plan {
             self.validate_plan(plan)?;
         }
@@ -3182,7 +3185,7 @@ impl CovarianceOperatorWriter {
             "covariance operator block index changed before finalization",
         )?;
         drop(blocks);
-        let metadata_validation_bytes = inspect_metadata_layout(&self.file)?;
+        let metadata_validation_bytes = operator_header_read_allocation_bytes(&self.file)?;
         self.file.attr("complete")?.write_scalar(&1u8)?;
         self.file.flush()?;
         let filename = self.file.filename();
@@ -3277,7 +3280,7 @@ pub fn read_covariance_operator_metadata_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    let generation_registry = read_generation_registry(&file, &metadata)?;
+    let generation_registry = read_generation_registry(&file, &metadata, &mut budget)?;
     let names = nonempty_block_names_with_budget(&file, &mut budget)?;
     if let Some(registry) = &generation_registry {
         validate_generation_registry_block_links(&file.group("blocks")?, registry)?;
@@ -3305,7 +3308,7 @@ pub fn read_covariance_operator_header_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    let generation_registry = read_generation_registry(&file, &metadata)?;
+    let generation_registry = read_generation_registry(&file, &metadata, &mut budget)?;
     let blocks = file.group("blocks")?;
     validate_exact_schema(
         &blocks,
@@ -3373,7 +3376,7 @@ impl CovarianceOperatorBlockReader {
         let file = hdf5::File::open(path)?;
         let mut budget = ReadBudget::new(byte_cap);
         let metadata = read_checked_metadata(&file, &mut budget)?;
-        let generation_registry = read_generation_registry(&file, &metadata)?;
+        let generation_registry = read_generation_registry(&file, &metadata, &mut budget)?;
         let blocks = file.group("blocks")?;
         validate_exact_schema(
             &blocks,
@@ -3497,7 +3500,7 @@ pub fn read_covariance_operator_block_with_receipt(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    let generation_registry = read_generation_registry(&file, &metadata)?;
+    let generation_registry = read_generation_registry(&file, &metadata, &mut budget)?;
     read_covariance_operator_block_from_file(
         &file,
         &metadata,
@@ -3518,6 +3521,9 @@ fn read_covariance_operator_block_from_file(
 ) -> Result<CovarianceOperatorBlockRead> {
     let mut budget = ReadBudget::new(byte_cap);
     budget.charge(inspect_metadata_layout(file)?)?;
+    if let Some(registry) = generation_registry {
+        budget.charge(generation_registry_resident_bytes(registry)?)?;
+    }
     let blocks = file.group("blocks")?;
     validate_exact_schema(
         &blocks,
@@ -3584,7 +3590,7 @@ pub fn read_covariance_operator_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    let generation_registry = read_generation_registry(&file, &metadata)?;
+    let generation_registry = read_generation_registry(&file, &metadata, &mut budget)?;
     let names = nonempty_block_names_with_budget(&file, &mut budget)?;
     let mut payload_bytes = 0_u64;
     let mut topology_bytes = 0_u64;
@@ -3635,7 +3641,6 @@ fn read_checked_metadata(
     validate_registries(file)?;
     let metadata = read_metadata(file)?;
     metadata.validate()?;
-    read_generation_registry(file, &metadata)?;
     Ok(metadata)
 }
 
@@ -4158,8 +4163,40 @@ fn inspect_metadata_layout(file: &hdf5::File) -> Result<u64> {
             &mut bytes,
         )?;
     }
+    Ok(bytes)
+}
+
+fn operator_header_read_allocation_bytes(file: &hdf5::File) -> Result<u64> {
+    let mut budget = ReadBudget::new(u64::MAX);
+    budget.charge(inspect_metadata_layout(file)?)?;
     if file.link_exists("generation_identities") {
-        checked_add_bytes(&mut bytes, inspect_generation_registry_layout(file)?)?;
+        let allocation = inspect_generation_registry_layout(file, Some(&mut budget))?;
+        budget.charge(allocation)?;
+    }
+    Ok(budget.used)
+}
+
+fn generation_registry_resident_bytes(registry: &CovarianceGenerationRegistry) -> Result<u64> {
+    let mut bytes = (registry.generations.len() as u64)
+        .checked_mul(std::mem::size_of::<CovarianceGenerationIdentity>() as u64)
+        .ok_or_else(|| invalid("covariance generation resident byte count overflow"))?;
+    for identity in &registry.generations {
+        checked_add_bytes(&mut bytes, identity.burst_id.len() as u64)?;
+        checked_add_bytes(
+            &mut bytes,
+            (identity.source_date_indices.len() as u64)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .ok_or_else(|| invalid("covariance generation date byte count overflow"))?,
+        )?;
+        checked_add_bytes(
+            &mut bytes,
+            (identity.blocks.len() as u64)
+                .checked_mul(
+                    (std::mem::size_of::<CovarianceGenerationBlockIdentity>()
+                        + std::mem::size_of::<u64>()) as u64,
+                )
+                .ok_or_else(|| invalid("covariance generation block byte count overflow"))?,
+        )?;
     }
     Ok(bytes)
 }
@@ -4354,7 +4391,11 @@ fn write_generation_registry(
     Ok(())
 }
 
-fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
+#[allow(clippy::too_many_lines)]
+fn inspect_generation_registry_layout(
+    file: &hdf5::File,
+    budget: Option<&mut ReadBudget>,
+) -> Result<u64> {
     let root = file.group("generation_identities")?;
     validate_exact_schema(
         &root,
@@ -4362,7 +4403,47 @@ fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
         COVARIANCE_GENERATION_REGISTRY_ATTRIBUTES,
         "covariance generation registry schema contains unexpected attributes",
     )?;
-    let mut names = root.member_names()?;
+    struct GenerationNameScan {
+        budget: Option<ReadBudget>,
+        names: Vec<String>,
+        error: Option<IoError>,
+    }
+    let scan = root.iter_visit_default(
+        GenerationNameScan {
+            budget: budget.as_deref().copied(),
+            names: Vec::new(),
+            error: None,
+        },
+        |_, name, info, scan| {
+            if info.link_type != LinkType::Hard {
+                scan.error = Some(invalid(
+                    "covariance generation registry entry is not a hard link",
+                ));
+                return false;
+            }
+            let bytes = u64::try_from(name.len())
+                .ok()
+                .and_then(|length| length.checked_add(std::mem::size_of::<String>() as u64))
+                .ok_or_else(|| invalid("covariance generation name byte count overflow"));
+            if let Err(error) = bytes.and_then(|bytes| {
+                scan.budget
+                    .as_mut()
+                    .map_or(Ok(()), |budget| budget.charge(bytes))
+            }) {
+                scan.error = Some(error);
+                return false;
+            }
+            scan.names.push(name.to_owned());
+            true
+        },
+    )?;
+    if let (Some(budget), Some(scanned)) = (budget, scan.budget) {
+        *budget = scanned;
+    }
+    if let Some(error) = scan.error {
+        return Err(error);
+    }
+    let mut names = scan.names;
     ensure_valid(
         names.len() >= 2
             && names
@@ -4374,6 +4455,12 @@ fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
     add_exact_dataset::<u8>(&root, "full_source_manifest_digest", &[32], &mut bytes)?;
     names.retain(|name| name != "full_source_manifest_digest");
     names.sort();
+    checked_add_bytes(
+        &mut bytes,
+        (names.len() as u64)
+            .checked_mul(std::mem::size_of::<CovarianceGenerationIdentity>() as u64)
+            .ok_or_else(|| invalid("covariance generation allocation byte count overflow"))?,
+    )?;
     for (index, name) in names.iter().enumerate() {
         ensure_valid(
             *name == format!("{index:08}"),
@@ -4410,6 +4497,15 @@ fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
             "covariance generation block IDs are not a nonempty vector",
         )?;
         checked_add_bytes(&mut bytes, block_bytes)?;
+        checked_add_bytes(
+            &mut bytes,
+            (block_shape[0] as u64)
+                .checked_mul(
+                    (std::mem::size_of::<CovarianceGenerationBlockIdentity>()
+                        + std::mem::size_of::<u64>()) as u64,
+                )
+                .ok_or_else(|| invalid("covariance generation block-set byte count overflow"))?,
+        )?;
         add_exact_dataset::<u8>(
             &group,
             "block_sha256",
@@ -4425,11 +4521,13 @@ fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
 fn read_generation_registry(
     file: &hdf5::File,
     metadata: &CovarianceOperatorMetadata,
+    budget: &mut ReadBudget,
 ) -> Result<Option<CovarianceGenerationRegistry>> {
     if !file.link_exists("generation_identities") {
         return Ok(None);
     }
-    inspect_generation_registry_layout(file)?;
+    let allocation_bytes = inspect_generation_registry_layout(file, Some(budget))?;
+    budget.charge(allocation_bytes)?;
     let root = file.group("generation_identities")?;
     let mut names = root.member_names()?;
     names.retain(|name| name != "full_source_manifest_digest");

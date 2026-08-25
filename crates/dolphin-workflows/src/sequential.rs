@@ -777,7 +777,33 @@ where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
 {
     run_sequential_resumable_with_covariance_capture_impl(
-        slc_stack, None, cfg, engine, request, revision, emit,
+        slc_stack, None, cfg, engine, request, revision, None, emit,
+    )
+}
+
+/// Run an initial unmasked resumable capture with exact primitive source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sequential_resumable_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack,
+        None,
+        cfg,
+        engine,
+        request,
+        revision,
+        Some(source_resolver),
+        emit,
     )
 }
 
@@ -805,6 +831,34 @@ where
         engine,
         request,
         revision,
+        None,
+        emit,
+    )
+}
+
+/// Run an initial masked resumable capture with exact primitive source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sequential_resumable_masked_with_covariance_capture_and_source_factors<F>(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    run_sequential_resumable_with_covariance_capture_impl(
+        slc_stack,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        Some(source_resolver),
         emit,
     )
 }
@@ -817,6 +871,9 @@ fn run_sequential_resumable_with_covariance_capture_impl<F>(
     engine: &ComputeEngine,
     request: &SequentialCovarianceCaptureRequest,
     revision: &SequentialCovarianceRevision,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
     mut emit: F,
 ) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
 where
@@ -901,7 +958,7 @@ where
         engine,
         &topology,
         request,
-        None,
+        source_resolver,
         &mut capture,
     )?;
     let output = build_output(
@@ -982,6 +1039,42 @@ where
         revision,
         parent,
         sealed_block_byte_cap,
+        None,
+        copy_sealed,
+        emit,
+    )
+}
+
+/// Extend unmasked covariance state with exact source factors for the recaptured tail.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_with_covariance_capture_and_source_factors<C, F>(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    copy_sealed: C,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    C: FnMut(u64) -> Result<(), SequentialReplayError>,
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        None,
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        Some(source_resolver),
         copy_sealed,
         emit,
     )
@@ -1020,6 +1113,43 @@ where
         revision,
         parent,
         sealed_block_byte_cap,
+        None,
+        copy_sealed,
+        emit,
+    )
+}
+
+/// Extend masked covariance state with exact source factors for the recaptured tail.
+#[allow(clippy::too_many_arguments)]
+pub fn update_sequential_masked_with_covariance_capture_and_source_factors<C, F>(
+    state: &SequentialCovarianceState,
+    new_slcs: ArrayView3<Cf64>,
+    valid_mask: ArrayView2<bool>,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+    parent: &CovarianceOperatorBlockReader,
+    sealed_block_byte_cap: u64,
+    source_resolver: &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    copy_sealed: C,
+    emit: F,
+) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
+where
+    C: FnMut(u64) -> Result<(), SequentialReplayError>,
+    F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
+{
+    update_sequential_with_covariance_capture_impl(
+        state,
+        new_slcs,
+        Some(valid_mask),
+        cfg,
+        engine,
+        request,
+        revision,
+        parent,
+        sealed_block_byte_cap,
+        Some(source_resolver),
         copy_sealed,
         emit,
     )
@@ -1036,6 +1166,9 @@ fn update_sequential_with_covariance_capture_impl<C, F>(
     revision: &SequentialCovarianceRevision,
     parent: &CovarianceOperatorBlockReader,
     sealed_block_byte_cap: u64,
+    source_resolver: Option<
+        &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+    >,
     mut copy_sealed: C,
     mut emit: F,
 ) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError>
@@ -1208,7 +1341,7 @@ where
         engine,
         &topology,
         request,
-        None,
+        source_resolver,
         &mut capture,
     )?;
     let phases = chain(&state.sequential.sealed_phases, &drive.phases);

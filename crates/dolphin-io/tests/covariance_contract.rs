@@ -14,10 +14,10 @@ use dolphin_io::{
     read_covariance_operator_header_with_byte_cap, read_covariance_operator_metadata,
     read_covariance_operator_metadata_with_byte_cap, read_covariance_operator_with_byte_cap,
     CovarianceBurstPlan, CovarianceCalibrationStatus, CovarianceEstimatorBranch,
-    CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
-    CovarianceOperatorPlan, CovarianceOperatorStatus, CovarianceOperatorWriter,
-    CovariancePhaseComponent, CovariancePhaseComponentKind, CovarianceRectSupport,
-    CovarianceReplayStatus, CovarianceSupportOrdering, CovarianceTilePlan,
+    CovarianceOperatorBlock, CovarianceOperatorBlockReader, CovarianceOperatorGrid,
+    CovarianceOperatorMetadata, CovarianceOperatorPlan, CovarianceOperatorStatus,
+    CovarianceOperatorWriter, CovariancePhaseComponent, CovariancePhaseComponentKind,
+    CovarianceRectSupport, CovarianceReplayStatus, CovarianceSupportOrdering, CovarianceTilePlan,
     DownstreamInferenceStatus, SourceReplayIdentity, StitchedCovarianceStatus,
     COVARIANCE_OPERATOR_METHOD, COVARIANCE_OPERATOR_METHOD_VERSION,
     COVARIANCE_OPERATOR_SCHEMA_VERSION,
@@ -1417,6 +1417,46 @@ fn sealed_generation_registry_survives_append_and_capped_copy() {
     );
     let _ = std::fs::remove_file(parent_path);
     let _ = std::fs::remove_file(extended_path);
+}
+
+#[test]
+fn generation_registry_payload_is_admitted_before_numeric_read() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let blocks = generation_namespaced_chain();
+    let mut operator_metadata = metadata();
+    operator_metadata.source.manifest_digest = Some(digest(90));
+    let mut plan = plan_for_blocks(&blocks);
+    plan.source_manifest_digest = [90; 32];
+    let registry = generation_registry([90; 32], &blocks, &[0]);
+    let path = temporary_hdf5_path();
+    let mut writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &path,
+        &operator_metadata,
+        &plan,
+        &registry,
+    )
+    .unwrap();
+    for block in &blocks {
+        writer.write_block(block).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let file = hdf5::File::open_rw(&path).unwrap();
+    let generation = file.group("generation_identities/00000000").unwrap();
+    generation.unlink("source_date_indices").unwrap();
+    generation
+        .new_dataset_builder()
+        .with_data(&vec![0_u32; 1_000_000])
+        .create("source_date_indices")
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+
+    let error = CovarianceOperatorBlockReader::open(&path, 1024 * 1024).unwrap_err();
+    assert!(error.to_string().contains("byte cap"), "{error}");
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

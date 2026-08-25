@@ -399,6 +399,17 @@ pub trait SequentialPrimitiveSourceResolver {
     /// Verified source manifest and proper-complex model identity.
     fn identity(&self) -> &SequentialSourceProviderIdentity;
 
+    /// Generation-specific identity for one replay block.
+    ///
+    /// Batch resolvers use their artifact-wide identity. NRT resolver bundles
+    /// override this with the exact sealed/open generation member receipt.
+    fn identity_for_block(
+        &self,
+        _block: &SequentialReplayBlock,
+    ) -> Result<&SequentialSourceProviderIdentity, SequentialReplayError> {
+        Ok(self.identity())
+    }
+
     /// Maximum resolver-internal resident bytes beyond the returned source.
     fn maximum_resident_bytes(&self) -> u64;
 
@@ -602,6 +613,22 @@ where
             ));
         }
         topology.validate_provider_identity(&identity)?;
+        for block in topology.blocks() {
+            let block_identity = source_resolver.identity_for_block(block)?;
+            topology.validate_provider_identity_for_block(block, block_identity)?;
+            if block_identity.provider != identity.provider
+                || block_identity.provider_version != identity.provider_version
+                || block_identity.model != identity.model
+                || block_identity.model_version != identity.model_version
+                || block_identity.source_model_version_digest
+                    != identity.source_model_version_digest
+                || block_identity.source_model_hash != identity.source_model_hash
+            {
+                return Err(identity_mismatch(
+                    "artifact generation provider/model identity differs from the complete revision resolver",
+                ));
+            }
+        }
         Ok(Self {
             _artifact_read_lock: artifact_read_lock,
             operator_reader,
@@ -687,11 +714,12 @@ where
                         )
                     })?;
                 let stored = &receipt.block.source_factor_digests[start..start + 32];
+                let block_identity = self.source_resolver.identity_for_block(block)?;
                 let expected = masked_source_factor_receipt_digest(
                     block,
                     receipt.block.source_ids[native_index],
                     content,
-                    &self.identity,
+                    block_identity,
                 );
                 if stored != expected {
                     return Err(SequentialReplayError::Provider(
@@ -775,6 +803,10 @@ where
                 "source resolver identity changed after artifact admission",
             ));
         }
+        self.topology.validate_provider_identity_for_block(
+            block,
+            self.source_resolver.identity_for_block(block)?,
+        )?;
         let stored = self.read_block(block)?;
         let stored_source_id = stored.source_ids.get(native_index).copied();
         let digest_start = native_index
@@ -808,7 +840,7 @@ where
                     "artifact masked source ID is missing",
                 ))?,
                 stored_content_digest,
-                &self.identity,
+                self.source_resolver.identity_for_block(block)?,
             );
             if stored_factor_digest != expected {
                 return Err(SequentialReplayError::Provider(
@@ -3984,6 +4016,30 @@ impl SequentialReplayTopology {
         Ok(())
     }
 
+    fn validate_provider_identity_for_block(
+        &self,
+        block: &SequentialReplayBlock,
+        identity: &SequentialSourceProviderIdentity,
+    ) -> Result<(), SequentialReplayError> {
+        if identity.source_model_hash.iter().all(|byte| *byte == 0) {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceModelUnavailable,
+                "generation source provider has no proper-complex model digest",
+            ));
+        }
+        if identity.source_manifest_digest != self.generation_source_manifest_digest(block.id)?
+            || self.id_namespace.as_ref().is_none_or(|namespace| {
+                identity.source_model_version_digest != namespace.source_model_version_digest
+            })
+        {
+            return Err(SequentialReplayError::Provider(
+                ReplayStatus::SourceIdentityMismatch,
+                "source provider generation identity does not match the replay block namespace",
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate_operator_block_contract(
         &self,
@@ -5106,7 +5162,7 @@ pub(crate) fn build_covariance_operator_block(
         .collect::<Result<Vec<_>, _>>()?;
     let mut source_factor_digests = Vec::with_capacity(source_digest_bytes);
     if let Some(resolver) = source_resolver.as_mut() {
-        let identity = resolver.identity().clone();
+        let identity = resolver.identity_for_block(block)?.clone();
         if identity.source_manifest_digest != generation_source_manifest_digest
             || resolver.identity().source_model_version_digest
                 != request.source_model_version_digest
