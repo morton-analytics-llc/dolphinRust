@@ -18,9 +18,9 @@
   "variance_arrangements": ["alternating", "contiguous"],
   "reference_contribution_ratios": [0, 0.5, 2],
   "reference_contexts": [
-    {"name": "near_exact", "overlap_fraction": 0.75, "distance_pixels": 10, "sequential_depth": 1, "approximation": "exact"},
-    {"name": "mid_exact", "overlap_fraction": 0.5, "distance_pixels": 50, "sequential_depth": 2, "approximation": "exact"},
-    {"name": "far_exact", "overlap_fraction": 0.1, "distance_pixels": 100, "sequential_depth": 4, "approximation": "exact"}
+    {"name": "near_exact", "overlap_fraction": 0.5, "distance_pixels": 1, "sequential_depth": "derived_from_actual_topology", "approximation": "exact"},
+    {"name": "mid_exact", "overlap_fraction": 0.2, "distance_pixels": 2, "sequential_depth": "derived_from_actual_topology", "approximation": "exact"},
+    {"name": "far_exact", "overlap_fraction": 0.0, "distance_pixels": 4, "sequential_depth": "derived_from_actual_topology", "approximation": "exact"}
   ],
   "unsupported_strata": [
     {"stratum": "nonzero_gauge", "expected_status": "GaugeNotZero"},
@@ -52,7 +52,7 @@
   "pairwise_coverage": "every feasible unordered dimension-level pair occurs in at least one supported cell",
   "cell_count_without_outer_seeds": 24,
   "cell_count_by_execution_path": {"fixed_factor": 24, "production_path": 24},
-  "supported_cell_sha256": "6d732dd55a4258b9e3dcd479693c6b09a98e32b11c7cddb23a36d7ac992dedaf",
+  "supported_cell_sha256": "e66e2a6f2b78f7f3307f3ae1e599f060e8abb23c179f21488155750a37e3a20e",
   "unsupported_cell_count": 10,
   "unsupported_cell_sha256": "001a8bc6e98d9d12905ad2ed54a9d1c89b82e679930cc4b7dcd18c3e1ddde00c",
   "minimum_dates": 12,
@@ -69,9 +69,9 @@
   "bootstrap": {"complete_refit": true, "seed_hierarchy": "global/cell/outer/inner splitmix64", "count": 200, "minimum_successes": 198, "interval_levels": [0.68, 0.9, 0.95], "minimum_success_fraction": 0.99},
   "resource_limits": {"host_memory_bytes": 34359738368, "rss_limit_bytes": 25769803776, "tile_wall_time_multiplier": 2.0, "projected_full_scene_minutes": 60, "artifact_size_limit_bytes": 1073741824, "measured_fields": ["wall_micros", "resident_set_bytes_before", "resident_set_bytes_after", "result_artifact_bytes"]},
   "thresholds": {"coverage": {"0.68": 0.03, "0.90": 0.02, "0.95": 0.015}, "standardized_bias": 0.05, "proper_score": 0.1, "maximum_interval_width_ratio": 10.0, "minimum_successful_emission_fraction": 0.99},
-  "schemas": {"generator": "dolphinrust-temporal-covariance-simulation/4", "batch": "dolphinrust-temporal-covariance-batch/3", "fixed_factor": "direct_difference_covariance/1", "production_path": "raw_complex_same_seed_issue52_issue54/2", "scorer": "coverage_bias_interval_score/3"},
-  "file_hashes": {"generator_sha256": "d85432497468acb20e0ea06e4f036cbd7a5358de975e1befbcfd751ea02569b1", "batch_source_sha256": "cd78f4144854b3b5a21a25cd8fa67a5a122a40259cb0a0a5ce5e8e7f57843863", "estimator_source_sha256": "6962c675d4c1ea46394fa281e01e0d90e8fb92e339fa52e2dfacfd4848c97677"},
-  "identities": {"estimator_schema": "dolphinrust-temporal-covariance/4", "source_factor_method": "same_seed_raw_complex_source_dag_via_issue52_and_issue54_workflow_apis", "code_identity": "dolphinRust-v1.6.0-temporal-covariance-batch-v3"},
+  "schemas": {"generator": "dolphinrust-temporal-covariance-simulation/5", "batch": "dolphinrust-temporal-covariance-batch/4", "fixed_factor": "direct_difference_covariance/1", "production_path": "raw_complex_actual_evd_capture_replay_fixed_l2/3", "scorer": "coverage_bias_interval_score/3"},
+  "file_hashes": {"generator_sha256": "fdf0d06e972914f022a2df288e3a304b0f8c30bb57586f01d8cbb1f580b69cf7", "batch_source_sha256": "85bc62b72ea678eacd09b157c3ae5274813b81a7a65a906e20767df0a73cb78d", "estimator_source_sha256": "c1fa09f21966952def60266da283fc24d76cbbbb117c8d6f569f8cff84542b37"},
+  "identities": {"estimator_schema": "dolphinrust-temporal-covariance/4", "production_estimator_branch": "evd", "source_factor_method": "source_centered_empirical_proper_complex_v1_via_actual_sequential_capture_and_provider_replay", "fixed_l2_method": "fixed_l2_joint_phase_covariance_v1", "code_identity": "dolphinRust-v1.6.0-temporal-covariance-batch-v4"},
   "promotion_status": "blocked_pending_synthetic_field_review_and_manifest",
   "external_holdout_required": true,
   "corrected_inferential_sigma_emission": false

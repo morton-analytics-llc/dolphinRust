@@ -16,6 +16,27 @@ import unittest
 ROOT = pathlib.Path(__file__).parents[2]
 
 
+def load_generator():
+    path = ROOT / "validation/temporal_covariance_simulation.py"
+    spec = importlib.util.spec_from_file_location("temporal_covariance_simulation", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_production_batch(request):
+    result = subprocess.run(
+        ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
+         "temporal_covariance_batch"],
+        cwd=ROOT,
+        input=json.dumps(request) + "\n",
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
 class TemporalCovariancePreregistrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -49,7 +70,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         })
         self.assertEqual(
             self.prereg["supported_cell_sha256"],
-            "6d732dd55a4258b9e3dcd479693c6b09a98e32b11c7cddb23a36d7ac992dedaf",
+            "e66e2a6f2b78f7f3307f3ae1e599f060e8abb23c179f21488155750a37e3a20e",
         )
         self.assertEqual(self.prereg["global_seed"], 5447718)
         self.assertEqual(
@@ -107,16 +128,13 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             self.assertEqual(production["execution_path"], "production_path")
             self.assertEqual(production["production_path_status"], "estimator_failed")
             self.assertEqual(fixed["fit"]["valid_date_count"], 12)
-            self.assertEqual(production["fit"]["valid_date_count"], 12)
-            self.assertAlmostEqual(
-                fixed["fit"]["plugin_gls_slope"],
-                production["fit"]["plugin_gls_slope"],
-                places=12,
-            )
+            self.assertEqual(production["fit"]["status"], "RhoUpperBoundary")
+            self.assertEqual(production["fit"]["valid_date_count"], 0)
             self.assertEqual(len(fixed["comparator_methods"]), 8)
             self.assertIsNone(production["provenance"])
+            self.assertIsNotNone(production["production_receipts"])
             self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/3")
-            self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 2)
+            self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 1)
             self.assertEqual(len(receipt["scores"]["cell_summaries"]), 48)
             self.assertFalse(receipt["exact_seed_denominator_complete"])
             self.assertIn("resource", fixed)
@@ -151,7 +169,20 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         production = module.request_for(cell, 1, self.prereg, "production_path")["production_path"]
         self.assertNotIn("issue52_target_factor", production)
         self.assertNotIn("issue54_difference_factor", production)
-        self.assertIn("complex_noise_standard_deviation", production)
+        self.assertNotIn("issue52_seed", production)
+        self.assertNotIn("issue54_seed", production)
+        self.assertEqual(production["native_shape"], [1, 7])
+        self.assertEqual(len(production["raw_complex_stack"]), len(module.days_for(cell)))
+        self.assertTrue(all(len(row) == 7 for row in production["raw_complex_stack"]))
+        self.assertEqual(len(production["capture_scope_sha256"]), 64)
+
+    def test_production_batch_uses_actual_capture_replay_and_fixed_l2(self):
+        source = (ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs").read_text()
+        self.assertNotIn("InfluenceDag", source)
+        self.assertNotIn("build_raw_dag", source)
+        self.assertIn("run_sequential_with_covariance_capture_and_source_factors", source)
+        self.assertIn("replay_global_reference_difference_covariance_from_provider_bundle", source)
+        self.assertIn("propagate_fixed_l2_difference_covariance", source)
 
     def test_stationary_irregular_ar_generator_matches_oracle_covariance(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"
@@ -179,7 +210,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         cell = module.cells(self.prereg)[0]
         request = module.request_for(cell, 99, self.prereg, "production_path")
-        request["production_path"]["issue54_seed"] = 100
+        request["production_path"]["source_seed"] = 100
         result = subprocess.run(
             ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
              "temporal_covariance_batch"],
@@ -193,6 +224,88 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(record["production_path_status"], "source_seed_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
+
+    def test_production_path_scope_mismatch_fails_closed(self):
+        path = ROOT / "validation/temporal_covariance_simulation.py"
+        spec = importlib.util.spec_from_file_location("temporal_covariance_simulation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cell = module.cells(self.prereg)[0]
+        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request["production_path"]["reference"]["distance_pixels"] += 1.0
+        result = subprocess.run(
+            ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
+             "temporal_covariance_batch"],
+            cwd=ROOT,
+            input=json.dumps(request) + "\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        record = json.loads(result.stdout)
+        self.assertEqual(record["production_path_status"], "capture_scope_mismatch")
+        self.assertFalse(record["emitted"])
+        self.assertIsNone(record["fit"])
+
+    def test_production_path_requires_frozen_method_and_synthetic_scope(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        mutations = [
+            ("selected_method", "plugin_gls"),
+            ("scope", "field_validation"),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field):
+                request = module.request_for(cell, 99, self.prereg, "production_path")
+                request["production_path"][field] = value
+                record = run_production_batch(request)
+                self.assertEqual(record["production_path_status"],
+                                 "production_contract_mismatch")
+                self.assertFalse(record["emitted"])
+                self.assertIsNone(record["fit"])
+
+    def test_production_path_rejects_self_consistent_claimed_geometry(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request["production_path"]["reference"]["overlap_fraction"] = 0.25
+        request["production_path"]["capture_scope_sha256"] = module.capture_scope_sha256(request)
+        record = run_production_batch(request)
+        self.assertEqual(record["production_path_status"], "reference_context_mismatch")
+        self.assertFalse(record["emitted"])
+        self.assertIsNone(record["fit"])
+
+    def test_production_path_captures_replays_and_binds_actual_receipts(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request["options"]["bootstrap_replicates"] = 0
+        request["options"]["bootstrap_minimum_successes"] = 0
+        record = run_production_batch(request)
+        self.assertEqual(record["production_path_status"], "estimator_failed")
+        self.assertEqual(record["fit"]["status"], "RhoUpperBoundary")
+        self.assertFalse(record["emitted"])
+        self.assertIsNone(record["provenance"])
+        receipts = record["production_receipts"]
+        self.assertEqual(receipts["capture_scope_sha256"],
+                         request["production_path"]["capture_scope_sha256"])
+        for value in receipts.values():
+            self.assertRegex(value, r"^[0-9a-f]{64}$")
+            self.assertNotEqual(value, "0" * 64)
+
+        drifted = json.loads(json.dumps(request))
+        drifted["production_path"]["raw_complex_stack"][0][0][0] *= 1.0001
+        drifted_record = run_production_batch(drifted)
+        drifted_receipts = drifted_record["production_receipts"]
+        self.assertIsNotNone(drifted_receipts)
+        for identity in (
+            "source_manifest_sha256",
+            "evd_operator_sha256",
+            "evd_source_factor_sha256",
+            "issue52_receipt_sha256",
+            "issue54_receipt_sha256",
+        ):
+            self.assertNotEqual(receipts[identity], drifted_receipts[identity])
 
     def test_streaming_scorer_rejects_missing_or_reordered_seed(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"

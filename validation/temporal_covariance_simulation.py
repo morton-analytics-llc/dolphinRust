@@ -215,11 +215,29 @@ def missing_indices(cell: dict, seed: int, scheduled_count: int) -> set[int]:
     return set(selected)
 
 
+def capture_scope_sha256(request: dict) -> str:
+    production = request["production_path"]
+    payload = {
+        "cell_id": request["cell_id"],
+        "cell_index": request["cell_index"],
+        "days": request["days"],
+        "native_shape": production["native_shape"],
+        "reference": production["reference"],
+        "reference_pixel": production["reference_pixel"],
+        "scope": production["scope"],
+        "source_seed": production["source_seed"],
+        "target": production["target"],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execution_path: str) -> dict:
     seed, seed_sha256 = seed_identity(preregistration, cell["cell_index"], outer_seed_index)
     days = days_for(cell)
     missing = missing_indices(cell, seed, len(days) - 1)
     observations = []
+    generated_values = []
     diagonal = []
     for index in range(len(days)):
         if cell["variance_arrangement"] == "alternating":
@@ -236,6 +254,7 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
         shape = math.sqrt(diagonal[index] / geometric_mean)
         value = 0.01 * day + math.sqrt(process_variance) * shape * ar_path[index]
         value += math.sqrt(diagonal[index]) * measurement
+        generated_values.append(0.0 if index == 0 else value)
         observations.append(0.0 if index == 0 else (None if index in missing else value))
     covariance = [[0.0 for _ in days] for _ in days]
     for index in range(1, len(days)):
@@ -269,30 +288,53 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
         request["fixed_factor"] = {"observations": observations,
                                    "difference_covariance": covariance}
     else:
-        values = [0.0 if value is None else value for value in observations]
         overlap = cell["overlap_fraction"]
         noise = [1e-12]
         for index in range(1, len(days)):
-            denominator = 2.0 * (1.0 - overlap * math.cos(values[index]))
+            denominator = 2.0 * (1.0 - overlap * math.cos(generated_values[index]))
             noise.append(math.sqrt(diagonal[index] / denominator))
+        raw_complex_stack = []
+        for date_index, (value, scale) in enumerate(zip(generated_values, noise)):
+            reference_column = {"near_exact": 2, "mid_exact": 3, "far_exact": 5}[
+                cell["reference_context"]
+            ]
+            distance = reference_column - 1
+            row = []
+            for column in range(7):
+                nuisance_seed = seed ^ ((date_index + 1) << 32) ^ column
+                amplitude_draw = splitmix64(nuisance_seed) / 2**64
+                phase_draw = splitmix64(nuisance_seed ^ 0xA17C9E37) / 2**64
+                amplitude = (1.0 + scale) * (0.8 + 0.4 * amplitude_draw)
+                phase = ((reference_column - column) / distance) * value
+                if column not in (1, reference_column):
+                    phase += 0.8 * (phase_draw - 0.5)
+                row.append([amplitude * math.cos(phase), amplitude * math.sin(phase)])
+            raw_complex_stack.append(row)
+        realized_overlap = {"near_exact": 0.5, "mid_exact": 0.2, "far_exact": 0.0}[
+            cell["reference_context"]
+        ]
+        reference = {
+            "geometry_id": "synthetic_same_frame_reference",
+            "window_id": cell["reference_context"],
+            "overlap_fraction": realized_overlap,
+            "distance_pixels": float(reference_column - 1),
+            "sequential_depth": (len(days) - 1) // 3,
+            "approximation": cell["approximation"],
+        }
         request["production_path"] = {
-            "raw_complex_seed": seed, "issue52_seed": seed, "issue54_seed": seed,
-            "target_raw_complex": [[math.cos(value), math.sin(value)] for value in values],
-            "reference_raw_complex": [[1.0, 0.0] for _ in values],
-            "complex_noise_standard_deviation": noise,
+            "source_seed": seed,
+            "native_shape": [1, 7],
+            "target": [0, 1],
+            "reference_pixel": [0, reference_column],
+            "raw_complex_stack": raw_complex_stack,
             "validity": [value is not None for value in observations],
-            "reference": {
-                "geometry_id": "synthetic_same_frame_reference",
-                "window_id": cell["reference_context"],
-                "overlap_fraction": overlap,
-                "distance_pixels": cell["distance_pixels"],
-                "sequential_depth": cell["sequential_depth"],
-                "approximation": cell["approximation"],
-            },
+            "reference": reference,
             "scope": "synthetic_validation",
+            "capture_scope_sha256": "",
             "validation_receipt_sha256": "53" * 32,
             "selected_method": "complete_refit_bootstrap",
         }
+        request["production_path"]["capture_scope_sha256"] = capture_scope_sha256(request)
     return request
 
 
@@ -558,7 +600,7 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
             <= preregistration["resource_limits"]["projected_full_scene_minutes"],
     }
     return {
-        "schema": "dolphinrust-temporal-covariance-simulation/4",
+        "schema": "dolphinrust-temporal-covariance-simulation/5",
         "preregistration_schema": preregistration["schema"],
         "pre_outcome_status": preregistration["status"],
         "supported_cell_sha256": preregistration["supported_cell_sha256"],
