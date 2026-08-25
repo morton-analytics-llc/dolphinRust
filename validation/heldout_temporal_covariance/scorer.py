@@ -40,12 +40,12 @@ OBSERVATION_FIELDS = {
     "baseline_sigma",
 }
 PROVENANCE_FIELDS = {
-    "solution_source",
+    "solution_sources",
     "solution_sha256",
     "coordinate_frame",
     "los_source",
     "los_sha256",
-    "los_vector",
+    "station_los_vectors",
     "projection_convention",
     "epoch_zero_reference_sha256",
     "covariance_projection",
@@ -209,6 +209,11 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
         "unwrap_branch_sha256",
         "burst_ownership_sha256",
         "runtime_resource_receipt_sha256",
+        "approximation_receipt_sha256",
+        "resource_receipt_sha256",
+        "review_receipt_sha256",
+        "method_manifest_sha256",
+        "calibration_scope_sha256",
         "grid_sha256",
     ):
         if not _hash(scope[field]):
@@ -219,7 +224,11 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
         raise CohortValidationError("#54 factor hashes are missing or invalid")
 
 
-def _validate_gnss_provenance(cluster: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
+def _validate_gnss_provenance(
+    cluster: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    preregistration: Mapping[str, Any],
+) -> None:
     provenance = cluster.get("gnss_provenance")
     required = preregistration["gnss_provenance"]
     if not isinstance(provenance, Mapping) or set(provenance) != PROVENANCE_FIELDS:
@@ -230,19 +239,27 @@ def _validate_gnss_provenance(cluster: Mapping[str, Any], preregistration: Mappi
     for field in ("coordinate_frame", "projection_convention", "covariance_projection"):
         if provenance[field] != required[field if field != "projection_convention" else "projection"]:
             raise CohortValidationError("GNSS projection provenance mismatch")
-    if provenance["solution_source"] == "" or provenance["los_source"] != required["los_source"]:
+    sources = provenance["solution_sources"]
+    if (
+        not isinstance(sources, Mapping)
+        or set(sources) != set(candidate["station_ids"])
+        or provenance["los_source"] != required["los_source"]
+    ):
         raise CohortValidationError("GNSS solution or sourced LOS identity is missing")
-    vector = provenance["los_vector"]
-    if not isinstance(vector, Sequence) or len(vector) != 3 or any(not _finite(value) for value in vector):
-        raise CohortValidationError("GNSS LOS vector is invalid")
-    norm = math.sqrt(sum(value * value for value in vector))
-    if abs(norm - 1.0) > required["los_norm_tolerance"]:
-        raise CohortValidationError("GNSS LOS vector is not unit norm")
+    vectors = provenance["station_los_vectors"]
+    if not isinstance(vectors, Mapping) or set(vectors) != set(candidate["station_ids"]):
+        raise CohortValidationError("GNSS station LOS identities are incomplete")
+    for vector in vectors.values():
+        if not isinstance(vector, Sequence) or len(vector) != 3 or any(not _finite(value) for value in vector):
+            raise CohortValidationError("GNSS LOS vector is invalid")
+        norm = math.sqrt(sum(value * value for value in vector))
+        if abs(norm - 1.0) > required["los_norm_tolerance"]:
+            raise CohortValidationError("GNSS LOS vector is not unit norm")
 
 
 def _cluster_metrics(cluster: Mapping[str, Any], candidate: Mapping[str, Any], preregistration: Mapping[str, Any]) -> dict[str, Any]:
     _validate_factor_binding(cluster, candidate, preregistration)
-    _validate_gnss_provenance(cluster, preregistration)
+    _validate_gnss_provenance(cluster, candidate, preregistration)
     result = score_slope_difference(cluster["observation"])
     return result
 
@@ -265,6 +282,8 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
         errors.append("receipt is not an explicit one-shot outcome receipt")
     if receipt.get("generation_id") != preregistration["generation_id"]:
         errors.append("receipt is stale for the frozen generation")
+    if receipt.get("cohort_id") != preregistration["cohort_id"]:
+        errors.append("receipt cohort identity mismatch")
     if receipt.get("preregistration_sha256") != canonical_digest(preregistration):
         errors.append("preregistration identity mismatch")
     if receipt.get("manifest_sha256") != canonical_digest(manifest):
@@ -275,6 +294,22 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
         errors.append("#54 calibrated scope match is not asserted")
     if receipt.get("factor_binding") != preregistration["factor_binding"]:
         errors.append("#54 configuration identity mismatch")
+    expected_counts = {
+        "primary": len(manifest["frozen_clusters"]),
+        "surplus": len(manifest["surplus_clusters"]),
+        "executed": sum(
+            cluster.get("status") != "not_used"
+            for cluster in receipt.get("clusters", [])
+            if isinstance(cluster, Mapping)
+        ),
+        "evaluable": sum(
+            cluster.get("status") in {"pass", "fail"}
+            for cluster in receipt.get("clusters", [])
+            if isinstance(cluster, Mapping)
+        ),
+    }
+    if receipt.get("cluster_counts") != expected_counts:
+        errors.append("receipt exact 96+20 cluster accounting mismatch")
     hashes = receipt.get("hashes")
     if not isinstance(hashes, Mapping) or set(hashes) != RECEIPT_HASH_FIELDS or any(not _hash(hashes[field]) for field in RECEIPT_HASH_FIELDS):
         errors.append("receipt hash fields are incomplete or invalid")
@@ -296,6 +331,25 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
     primary_ids = [candidate["candidate_id"] for candidate in manifest["frozen_clusters"]]
     surplus_ids = sorted(candidate["candidate_id"] for candidate in manifest["surplus_clusters"])
     metrics_by_id: dict[str, dict[str, Any]] = {}
+    artifact_digests: dict[str, dict[str, str]] = {
+        field: {}
+        for field in (
+            "operator_sha256",
+            "operator_manifest_sha256",
+            "persisted_factor_sha256",
+            "persisted_factor_manifest_sha256",
+        )
+    }
+    gnss_digests: dict[str, str] = {}
+    scope_digests: dict[str, dict[str, str]] = {
+        field: {}
+        for field in (
+            "approximation_receipt_sha256",
+            "resource_receipt_sha256",
+            "calibration_scope_receipt_sha256",
+            "review_receipt_sha256",
+        )
+    }
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
     for cluster_id, candidate in candidates.items():
@@ -319,18 +373,35 @@ def score_receipt(preregistration: Mapping[str, Any], manifest: Mapping[str, Any
             if cluster_id not in surplus_ids:
                 errors.append("only surplus clusters may be not_used")
             continue
-        if status == "fail":
-            continue
         try:
             factor = cluster["difference_covariance"]
-            for digest_field in ("operator_sha256", "operator_manifest_sha256", "persisted_factor_sha256", "persisted_factor_manifest_sha256"):
-                if factor.get(digest_field) != hashes[digest_field]:
-                    raise CohortValidationError("#54 persisted artifact digest is cross-wired")
+            for digest_field in artifact_digests:
+                artifact_digests[digest_field][cluster_id] = factor[digest_field]
+            gnss_digests[cluster_id] = cluster["gnss_provenance"]["solution_sha256"]
+            scope = factor["scope"]
+            for output, source in (
+                ("approximation_receipt_sha256", "approximation_receipt_sha256"),
+                ("resource_receipt_sha256", "resource_receipt_sha256"),
+                ("calibration_scope_receipt_sha256", "method_manifest_sha256"),
+                ("review_receipt_sha256", "review_receipt_sha256"),
+            ):
+                scope_digests[output][cluster_id] = scope[source]
             metrics_by_id[cluster_id] = _cluster_metrics(cluster, candidate, preregistration)
         except (CohortValidationError, KeyError) as error:
             errors.append("cluster %s is not evaluable: %s" % (cluster_id, error))
     if errors:
         return {"status": "fail", "errors": errors}
+    for field, values in artifact_digests.items():
+        if hashes[field] != canonical_digest(values):
+            return {"status": "fail", "errors": ["#54 persisted artifact bundle digest is cross-wired"]}
+    if hashes["gnss_catalog_sha256"] != canonical_digest(gnss_digests):
+        return {"status": "fail", "errors": ["GNSS solution bundle digest is cross-wired"]}
+    for field, values in scope_digests.items():
+        if hashes[field] != canonical_digest(values):
+            return {
+                "status": "fail",
+                "errors": [f"#54 {field} factor-evidence bundle digest is cross-wired"],
+            }
     if any(statuses[cluster_id] == "fail" for cluster_id in primary_ids):
         return {"status": "fail", "errors": ["at least one frozen primary cluster reported fail"]}
 

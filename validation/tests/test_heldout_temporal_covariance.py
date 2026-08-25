@@ -10,6 +10,7 @@ from validation.heldout_temporal_covariance.cohort import (
     build_manifest,
     canonical_digest,
     discover_candidates,
+    validate_freeze_receipt,
     validate_manifest,
 )
 from validation.heldout_temporal_covariance.scorer import (
@@ -18,11 +19,14 @@ from validation.heldout_temporal_covariance.scorer import (
     score_receipt,
     score_slope_difference,
 )
-from validation.score_temporal_covariance_holdout import bind_factor_files
+from validation.score_temporal_covariance_holdout import bind_factor_files, build_scored_result
+from validation.run_temporal_covariance_holdout_cluster import scorer_source_sha256, validate_completed_receipt
 
 
 VALIDATION = Path(__file__).parents[1]
 PREREGISTRATION_PATH = VALIDATION / "temporal_covariance_heldout_preregistration.json"
+FROZEN_MANIFEST_PATH = VALIDATION / "temporal_covariance_heldout_cohort_manifest.json"
+FREEZE_RECEIPT_PATH = VALIDATION / "temporal_covariance_heldout_cohort_freeze_receipt.json"
 
 
 def candidate(index: int, query_digest="dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b", **overrides):
@@ -76,6 +80,11 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
         "unwrap_branch_sha256": "2" * 64,
         "burst_ownership_sha256": "3" * 64,
         "runtime_resource_receipt_sha256": "7" * 64,
+        "approximation_receipt_sha256": "8" * 64,
+        "resource_receipt_sha256": "9" * 64,
+        "review_receipt_sha256": "a" * 64,
+        "method_manifest_sha256": "b" * 64,
+        "calibration_scope_sha256": "c" * 64,
         "burst_id": candidate_value["burst_id"],
         "grid_sha256": "d" * 64,
         "units": "meters",
@@ -106,12 +115,18 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
                 "scope": scope,
             },
             "gnss_provenance": {
-                "solution_source": "frozen-gnss-catalog",
+                "solution_sources": {
+                    candidate_value["station_ids"][0]: {"sha256": "6" * 64},
+                    candidate_value["station_ids"][1]: {"sha256": "6" * 64},
+                },
                 "solution_sha256": "6" * 64,
                 "coordinate_frame": "ENU",
                 "los_source": "run_specific_sourced_los_components",
                 "los_sha256": "7" * 64,
-                "los_vector": [0.0, 0.0, 1.0],
+                "station_los_vectors": {
+                    candidate_value["station_ids"][0]: [0.0, 0.0, 1.0],
+                    candidate_value["station_ids"][1]: [0.0, 0.0, 1.0],
+                },
                 "projection_convention": "signed_ground_to_sensor_los_dot_enu",
                 "epoch_zero_reference_sha256": "8" * 64,
                 "covariance_projection": "u_transpose_C_u",
@@ -124,6 +139,7 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
                 "sensor_cross_covariance": 0.0,
                 "baseline_sigma": {"68": 10.0, "90": 10.0, "95": 10.0},
             },
+            "estimator": {"binary_sha256": "d" * 64},
         }
     )
     return cluster
@@ -150,6 +166,7 @@ def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), su
         "schema_version": 1,
         "outcomes_present": True,
         "one_shot_unblinding": True,
+        "cohort_id": preregistration["cohort_id"],
         "generation_id": preregistration["generation_id"],
         "preregistration_sha256": canonical_digest(preregistration),
         "manifest_sha256": canonical_digest(manifest),
@@ -172,6 +189,14 @@ def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), su
             "persisted_factor_sha256": "2" * 64,
             "persisted_factor_manifest_sha256": "3" * 64,
         },
+        "cluster_counts": {
+            "primary": len(manifest["frozen_clusters"]),
+            "surplus": len(manifest["surplus_clusters"]),
+            "executed": sum(cluster["status"] != "not_used" for cluster in clusters),
+            "evaluable": sum(
+                cluster["status"] in {"pass", "fail"} for cluster in clusters
+            ),
+        },
         "attrition": {
             "attrited_primary_ids": attrited,
             "used_surplus_ids": used,
@@ -180,6 +205,37 @@ def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), su
         },
         "clusters": clusters,
     }
+    passing = [cluster for cluster in clusters if cluster["status"] in {"pass", "fail"}]
+    for field in (
+        "operator_sha256",
+        "operator_manifest_sha256",
+        "persisted_factor_sha256",
+        "persisted_factor_manifest_sha256",
+    ):
+        receipt["hashes"][field] = canonical_digest(
+            {
+                cluster["cluster_id"]: cluster["difference_covariance"][field]
+                for cluster in passing
+            }
+        )
+    receipt["hashes"]["gnss_catalog_sha256"] = canonical_digest(
+        {
+            cluster["cluster_id"]: cluster["gnss_provenance"]["solution_sha256"]
+            for cluster in passing
+        }
+    )
+    for output, source in (
+        ("approximation_receipt_sha256", "approximation_receipt_sha256"),
+        ("resource_receipt_sha256", "resource_receipt_sha256"),
+        ("calibration_scope_receipt_sha256", "method_manifest_sha256"),
+        ("review_receipt_sha256", "review_receipt_sha256"),
+    ):
+        receipt["hashes"][output] = canonical_digest(
+            {
+                cluster["cluster_id"]: cluster["difference_covariance"]["scope"][source]
+                for cluster in passing
+            }
+        )
     return receipt
 
 
@@ -193,6 +249,106 @@ class HeldoutCohortTests(unittest.TestCase):
         self.assertEqual(output["schema_version"], 4)
         self.assertEqual(output["artifact_hdf5"], "referenced_displacement_covariance_factor.h5")
         self.assertEqual(output["artifact_manifest"], "referenced_displacement_covariance_provenance.json")
+
+    def test_completed_receipt_requires_exact_run_product_and_binary_identity(self):
+        manifest = build_manifest(
+            discover_candidates(
+                [
+                    candidate(
+                        index,
+                        query_digest=self.preregistration["candidate_query"][
+                            "query_digest"
+                        ],
+                    )
+                    for index in range(116)
+                ],
+                self.preregistration,
+            ),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        product_identities = {
+            cluster["cluster_id"]: canonical_digest(cluster["cluster_id"])
+            for cluster in receipt["clusters"]
+        }
+        identity = {
+            "binary_sha256": "d" * 64,
+            "run_plan_sha256": "e" * 64,
+        }
+        identity_digest = canonical_digest(identity)
+        for cluster in receipt["clusters"]:
+            if cluster["status"] != "not_used":
+                cluster["run_identity_sha256"] = identity_digest
+                cluster["product_identity_sha256"] = product_identities[
+                    cluster["cluster_id"]
+                ]
+        receipt["run_identity"] = identity
+        receipt["run_identity_sha256"] = identity_digest
+        receipt["hashes"]["binary_sha256"] = identity["binary_sha256"]
+        receipt["hashes"]["scorer_sha256"] = scorer_source_sha256()
+        validate_completed_receipt(
+            receipt,
+            self.preregistration,
+            manifest,
+            identity,
+            product_identities,
+        )
+        stale = copy.deepcopy(receipt)
+        stale["clusters"][0]["product_identity_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "product/run identity"):
+            validate_completed_receipt(
+                stale,
+                self.preregistration,
+                manifest,
+                identity,
+                product_identities,
+            )
+
+    def test_receipt_scores_to_exact_promotion_evidence_shape(self):
+        manifest = build_manifest(
+            discover_candidates(
+                [
+                    candidate(
+                        index,
+                        query_digest=self.preregistration["candidate_query"][
+                            "query_digest"
+                        ],
+                    )
+                    for index in range(116)
+                ],
+                self.preregistration,
+            ),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["run_identity"] = {"freeze_receipt_sha256": "f" * 64}
+        receipt["run_identity_sha256"] = canonical_digest(receipt["run_identity"])
+        score = score_receipt(self.preregistration, manifest, receipt)
+        shaped = build_scored_result(
+            score,
+            receipt,
+            self.preregistration,
+            manifest,
+            receipt_file_sha256="a" * 64,
+            manifest_file_sha256="b" * 64,
+        )
+        self.assertEqual(shaped["schema_version"], 1)
+        self.assertEqual(shaped["cohort_id"], self.preregistration["cohort_id"])
+        self.assertEqual(shaped["primary_cluster_count"], 96)
+        self.assertEqual(shaped["surplus_cluster_count"], 20)
+        self.assertEqual(shaped["evaluated_clusters"], 96)
+        self.assertEqual(shaped["heldout_receipt_sha256"], "a" * 64)
+        self.assertEqual(
+            set(shaped),
+            {
+                "schema", "schema_version", "cohort_id", "manifest_file_sha256",
+                "manifest_sha256", "freeze_receipt_sha256", "factor_scope_sha256",
+                "heldout_receipt_sha256", "primary_cluster_count", "surplus_cluster_count",
+                "status", "errors", "levels", "evaluated_clusters", "emission_rate",
+                "attrited_primary_ids", "used_surplus_ids", "unused_surplus_ids",
+                "reasons_by_cluster",
+            },
+        )
 
     def test_supplied_factor_bytes_are_bound_before_heldout_scoring(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -261,6 +417,88 @@ class HeldoutCohortTests(unittest.TestCase):
         overlapping["surplus_clusters"][0]["station_ids"] = overlapping["frozen_clusters"][0]["station_ids"]
         with self.assertRaises(CohortValidationError):
             validate_manifest(overlapping, self.preregistration)
+
+    def test_manifest_rejects_outcome_fields_and_skips_overlapping_surplus(self):
+        records = [candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(117)]
+        records[1]["station_ids"] = records[0]["station_ids"]
+        discovered = discover_candidates(records, self.preregistration)
+        manifest = build_manifest(discovered, self.preregistration)
+        self.assertEqual(len(manifest["frozen_clusters"]), 96)
+        self.assertEqual(len(manifest["surplus_clusters"]), 20)
+        self.assertEqual(manifest["excluded_after_selection"], ["candidate-001"])
+        validate_manifest(manifest, self.preregistration)
+        exposed = copy.deepcopy(manifest)
+        exposed["gnss_series"] = [0.0]
+        with self.assertRaisesRegex(CohortValidationError, "schema"):
+            validate_manifest(exposed, self.preregistration)
+
+    def test_relative_orbit_is_composite_provenance_not_a_global_exclusion(self):
+        records = [
+            candidate(
+                index,
+                query_digest=self.preregistration["candidate_query"]["query_digest"],
+                orbit_id="ascending-r001",
+            )
+            for index in range(116)
+        ]
+        manifest = build_manifest(
+            discover_candidates(records, self.preregistration), self.preregistration
+        )
+        self.assertEqual(manifest["status"], "frozen_metadata_only")
+        self.assertEqual(
+            manifest["selection_algorithm"],
+            "lexical_candidate_id_greedy_independent_burst_site_v2",
+        )
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(len(manifest["frozen_clusters"]), 96)
+        self.assertEqual(len(manifest["surplus_clusters"]), 20)
+        validate_manifest(manifest, self.preregistration)
+
+        old_v1 = copy.deepcopy(manifest)
+        old_v1["schema_version"] = 1
+        old_v1["selection_algorithm"] = "lexical_candidate_id_greedy_disjoint_v1"
+        with self.assertRaisesRegex(CohortValidationError, "schema/version mismatch"):
+            validate_manifest(old_v1, self.preregistration)
+
+    def test_burst_footprint_site_and_station_overlap_remain_excluded(self):
+        query_digest = self.preregistration["candidate_query"]["query_digest"]
+        for field in ("burst_id", "footprint_id", "site_id", "station_ids"):
+            with self.subTest(field=field):
+                records = [candidate(index, query_digest=query_digest) for index in range(117)]
+                records[1][field] = records[0][field]
+                manifest = build_manifest(
+                    discover_candidates(records, self.preregistration),
+                    self.preregistration,
+                )
+                self.assertEqual(manifest["excluded_after_selection"], ["candidate-001"])
+                validate_manifest(manifest, self.preregistration)
+
+    def test_persisted_freeze_receipt_recomputes_local_hashes_and_rejects_mutation(self):
+        receipt = json.loads(FREEZE_RECEIPT_PATH.read_text(encoding="utf-8"))
+        validate_freeze_receipt(
+            receipt,
+            FROZEN_MANIFEST_PATH,
+            PREREGISTRATION_PATH,
+        )
+
+        changed_receipt = copy.deepcopy(receipt)
+        changed_receipt["outcomes_present"] = True
+        with self.assertRaisesRegex(CohortValidationError, "outcome-blind"):
+            validate_freeze_receipt(
+                changed_receipt,
+                FROZEN_MANIFEST_PATH,
+                PREREGISTRATION_PATH,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            changed_manifest = Path(directory) / FROZEN_MANIFEST_PATH.name
+            changed_manifest.write_bytes(FROZEN_MANIFEST_PATH.read_bytes() + b"\n")
+            with self.assertRaisesRegex(CohortValidationError, "manifest file hash"):
+                validate_freeze_receipt(
+                    receipt,
+                    changed_manifest,
+                    PREREGISTRATION_PATH,
+                )
 
     def test_exact_power_contract_is_frozen(self):
         expected = {"68": 96, "90": 72, "95": 62}
@@ -335,6 +573,80 @@ class HeldoutCohortTests(unittest.TestCase):
         report = score_receipt(self.preregistration, manifest, receipt)
         self.assertEqual(report["status"], "fail")
         self.assertTrue(any("calibrated scope" in error for error in report["errors"]))
+
+    def test_actual_factor_evidence_bundle_hashes_reject_surrogate_mapping(self):
+        manifest = build_manifest(
+            discover_candidates(
+                [
+                    candidate(
+                        index,
+                        query_digest=self.preregistration["candidate_query"][
+                            "query_digest"
+                        ],
+                    )
+                    for index in range(116)
+                ],
+                self.preregistration,
+            ),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["hashes"]["review_receipt_sha256"] = canonical_digest(
+            {
+                cluster["cluster_id"]: cluster["difference_covariance"]["scope"][
+                    "reference_signature_sha256"
+                ]
+                for cluster in receipt["clusters"]
+                if cluster["status"] in {"pass", "fail"}
+            }
+        )
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(
+            any("review_receipt_sha256" in error for error in report["errors"])
+        )
+
+    def test_evaluable_fail_is_included_in_factor_and_gnss_bundles(self):
+        manifest = build_manifest(
+            discover_candidates(
+                [
+                    candidate(
+                        index,
+                        query_digest=self.preregistration["candidate_query"][
+                            "query_digest"
+                        ],
+                    )
+                    for index in range(116)
+                ],
+                self.preregistration,
+            ),
+            self.preregistration,
+        )
+        receipt = receipt_for_manifest(self.preregistration, manifest)
+        receipt["clusters"][0]["status"] = "fail"
+        for field in (
+            "operator_sha256",
+            "operator_manifest_sha256",
+            "persisted_factor_sha256",
+            "persisted_factor_manifest_sha256",
+        ):
+            receipt["hashes"][field] = canonical_digest(
+                {
+                    cluster["cluster_id"]: cluster["difference_covariance"][field]
+                    for cluster in receipt["clusters"]
+                    if cluster["status"] in {"pass", "fail"}
+                }
+            )
+        receipt["hashes"]["gnss_catalog_sha256"] = canonical_digest(
+            {
+                cluster["cluster_id"]: cluster["gnss_provenance"]["solution_sha256"]
+                for cluster in receipt["clusters"]
+                if cluster["status"] in {"pass", "fail"}
+            }
+        )
+        report = score_receipt(self.preregistration, manifest, receipt)
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["errors"], ["at least one frozen primary cluster reported fail"])
 
     def test_cross_wired_output_method_or_manifest_digest_is_rejected(self):
         manifest = build_manifest(

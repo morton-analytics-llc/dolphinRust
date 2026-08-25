@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA = "dolphinrust.temporal_covariance.heldout_cohort"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HASH_FIELDS = ("catalog_sha256", "burst_metadata_sha256", "gnss_station_metadata_sha256")
-CLUSTER_KEYS = ("burst_id", "orbit_id", "footprint_id", "site_id")
+INDEPENDENCE_KEYS = ("burst_id", "footprint_id", "site_id")
 PROTECTED_SITES = {"fresno"}
 PROTECTED_STATIONS = {"MMX1", "ICMX", "MXMX", "MXTM", "SSNX", "TNGF", "UJAL", "UNVA", "UTAC"}
 PROTECTED_BURSTS = {
@@ -48,6 +49,45 @@ RECORD_FIELDS = {
     "metadata_hashes",
     "query_digest",
 }
+MANIFEST_FIELDS = {
+    "schema",
+    "schema_version",
+    "cohort_id",
+    "status",
+    "outcomes_present",
+    "preregistration_sha256",
+    "candidate_query_digest",
+    "selection_algorithm",
+    "selection_outcome_blind",
+    "candidate_pool",
+    "frozen_clusters",
+    "surplus_clusters",
+    "excluded_after_selection",
+}
+FREEZE_RECEIPT_SCHEMA = "dolphinrust.temporal_covariance.heldout_cohort_freeze_receipt"
+FREEZE_RECEIPT_FIELDS = {
+    "schema",
+    "schema_version",
+    "cohort_id",
+    "outcomes_present",
+    "selection_outcome_blind",
+    "manifest",
+    "preregistration_path",
+    "runtime_query",
+    "runtime_query_digest",
+    "candidate_query_digest",
+    "exclusions",
+    "counts",
+    "hashes",
+}
+FREEZE_HASH_FIELDS = {
+    "discovery_file_sha256",
+    "manifest_file_sha256",
+    "manifest_canonical_sha256",
+    "preregistration_file_sha256",
+    "preregistration_canonical_sha256",
+    "metadata_cache_entry_set_sha256",
+}
 
 
 class CohortValidationError(ValueError):
@@ -57,6 +97,10 @@ class CohortValidationError(ValueError):
 def canonical_digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _is_hash(value: Any) -> bool:
@@ -145,20 +189,22 @@ def discover_candidates(records: Iterable[Mapping[str, Any]], preregistration: M
 
 
 def _disjoint(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    if any(left[key] == right[key] for key in CLUSTER_KEYS):
+    # Relative orbit is provenance within the composite cluster identity, not a
+    # global exclusion across otherwise independent burst/site clusters.
+    if any(left[key] == right[key] for key in INDEPENDENCE_KEYS):
         return False
     return not set(left["station_ids"]) & set(right["station_ids"])
 
 
 def _greedy_disjoint(candidates: Sequence[Mapping[str, Any]], count: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     chosen: list[dict[str, Any]] = []
-    surplus: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda item: item["candidate_id"]):
         if len(chosen) < count and all(_disjoint(candidate, prior) for prior in chosen):
             chosen.append(dict(candidate))
         else:
-            surplus.append(dict(candidate))
-    return chosen, surplus
+            excluded.append(dict(candidate))
+    return chosen, excluded
 
 
 def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, Any]) -> dict[str, Any]:
@@ -171,10 +217,12 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
         raise CohortValidationError("discovery candidates must be a list")
     for candidate in candidates:
         validate_candidate(candidate, preregistration)
+    ordered_candidates = sorted(candidates, key=lambda item: item["candidate_id"])
     required = preregistration["power"]["maximum_required_evaluable_clusters"]
     surplus_count = preregistration["attrition"]["frozen_surplus_clusters"]
-    selected, surplus = _greedy_disjoint(candidates, required)
-    surplus = surplus[:surplus_count]
+    selected_and_surplus, excluded = _greedy_disjoint(ordered_candidates, required + surplus_count)
+    selected = selected_and_surplus[:required]
+    surplus = selected_and_surplus[required:]
     status = "frozen_metadata_only" if len(selected) == required and len(surplus) == surplus_count else "not_evaluable_candidate_pool"
     return {
         "schema": SCHEMA,
@@ -184,15 +232,14 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
         "outcomes_present": False,
         "preregistration_sha256": canonical_digest(preregistration),
         "candidate_query_digest": discovery["query_digest"],
-        "selection_algorithm": "lexical_candidate_id_greedy_disjoint_v1",
+        "selection_algorithm": "lexical_candidate_id_greedy_independent_burst_site_v2",
         "selection_outcome_blind": True,
-        "candidate_pool": [dict(candidate) for candidate in candidates],
+        "candidate_pool": [dict(candidate) for candidate in ordered_candidates],
         "frozen_clusters": [dict(candidate) for candidate in selected],
         "surplus_clusters": [dict(candidate) for candidate in surplus],
         "excluded_after_selection": [
             candidate["candidate_id"]
-            for candidate in candidates
-            if candidate["candidate_id"] not in {item["candidate_id"] for item in selected + surplus}
+            for candidate in excluded
         ],
     }
 
@@ -200,6 +247,8 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
 def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
     if not isinstance(manifest, Mapping):
         raise CohortValidationError("manifest must be an object")
+    if set(manifest) != MANIFEST_FIELDS:
+        raise CohortValidationError("manifest fields do not match the metadata-only schema")
     if manifest.get("schema") != SCHEMA or manifest.get("schema_version") != SCHEMA_VERSION:
         raise CohortValidationError("manifest schema/version mismatch")
     if manifest.get("outcomes_present") is not False or manifest.get("selection_outcome_blind") is not True:
@@ -215,6 +264,9 @@ def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str,
         raise CohortValidationError("manifest candidate and cluster fields must be lists")
     for candidate in candidate_pool:
         validate_candidate(candidate, preregistration)
+    candidate_ids = [candidate["candidate_id"] for candidate in candidate_pool]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise CohortValidationError("manifest candidate IDs must be unique")
     pool_ids = {candidate["candidate_id"] for candidate in candidate_pool}
     cluster_ids = [candidate["candidate_id"] for candidate in frozen + surplus]
     if len(cluster_ids) != len(set(cluster_ids)) or not set(cluster_ids) <= pool_ids:
@@ -227,3 +279,96 @@ def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str,
     expected_status = "frozen_metadata_only" if len(frozen) == required and len(surplus) == surplus_count else "not_evaluable_candidate_pool"
     if manifest.get("status") != expected_status:
         raise CohortValidationError("manifest status does not match frozen pool sufficiency")
+    expected = build_manifest(
+        {
+            "query_digest": preregistration["candidate_query"]["query_digest"],
+            "metadata_only": True,
+            "bulk_fetch_performed": False,
+            "candidates": candidate_pool,
+        },
+        preregistration,
+    )
+    frozen_fields = (
+        "cohort_id",
+        "status",
+        "selection_algorithm",
+        "candidate_pool",
+        "frozen_clusters",
+        "surplus_clusters",
+        "excluded_after_selection",
+    )
+    if any(manifest.get(field) != expected[field] for field in frozen_fields):
+        raise CohortValidationError("manifest does not match the exact lexical disjoint freeze")
+
+
+def validate_freeze_receipt(
+    receipt: Mapping[str, Any],
+    manifest_path: Path,
+    preregistration_path: Path,
+) -> None:
+    if not isinstance(receipt, Mapping) or set(receipt) != FREEZE_RECEIPT_FIELDS:
+        raise CohortValidationError("freeze receipt fields do not match the schema")
+    if receipt.get("schema") != FREEZE_RECEIPT_SCHEMA or receipt.get("schema_version") != 1:
+        raise CohortValidationError("freeze receipt schema/version mismatch")
+    if receipt.get("outcomes_present") is not False or receipt.get("selection_outcome_blind") is not True:
+        raise CohortValidationError("freeze receipt must remain outcome-blind")
+
+    manifest_binding = receipt.get("manifest")
+    if not isinstance(manifest_binding, Mapping) or set(manifest_binding) != {
+        "path",
+        "schema_version",
+        "selection_algorithm",
+    }:
+        raise CohortValidationError("freeze receipt manifest binding is invalid")
+    if manifest_binding.get("path") != "validation/temporal_covariance_heldout_cohort_manifest.json":
+        raise CohortValidationError("freeze receipt manifest path is invalid")
+    if receipt.get("preregistration_path") != "validation/temporal_covariance_heldout_preregistration.json":
+        raise CohortValidationError("freeze receipt preregistration path is invalid")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        preregistration = json.loads(preregistration_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CohortValidationError("freeze receipt local artifacts are unreadable") from error
+    hashes = receipt.get("hashes")
+    if not isinstance(hashes, Mapping) or set(hashes) != FREEZE_HASH_FIELDS:
+        raise CohortValidationError("freeze receipt hashes are incomplete")
+    if any(not _is_hash(hashes[field]) for field in FREEZE_HASH_FIELDS):
+        raise CohortValidationError("freeze receipt hashes must be SHA-256 values")
+    if hashes["manifest_file_sha256"] != _file_digest(manifest_path):
+        raise CohortValidationError("freeze receipt manifest file hash mismatch")
+    if hashes["manifest_canonical_sha256"] != canonical_digest(manifest):
+        raise CohortValidationError("freeze receipt manifest canonical hash mismatch")
+    if hashes["preregistration_file_sha256"] != _file_digest(preregistration_path):
+        raise CohortValidationError("freeze receipt preregistration file hash mismatch")
+    if hashes["preregistration_canonical_sha256"] != canonical_digest(preregistration):
+        raise CohortValidationError("freeze receipt preregistration canonical hash mismatch")
+
+    validate_manifest(manifest, preregistration)
+    if receipt.get("cohort_id") != preregistration["cohort_id"] or manifest.get("cohort_id") != receipt.get("cohort_id"):
+        raise CohortValidationError("freeze receipt cohort identity mismatch")
+    if manifest_binding.get("schema_version") != manifest["schema_version"] or manifest_binding.get("selection_algorithm") != manifest["selection_algorithm"]:
+        raise CohortValidationError("freeze receipt manifest contract mismatch")
+    candidate_query_digest = preregistration["candidate_query"]["query_digest"]
+    if receipt.get("candidate_query_digest") != candidate_query_digest or manifest["candidate_query_digest"] != candidate_query_digest:
+        raise CohortValidationError("freeze receipt candidate query mismatch")
+    runtime_query = receipt.get("runtime_query")
+    if not isinstance(runtime_query, Mapping) or runtime_query.get("candidate_query_digest") != candidate_query_digest:
+        raise CohortValidationError("freeze receipt runtime query is invalid")
+    if receipt.get("runtime_query_digest") != canonical_digest(runtime_query):
+        raise CohortValidationError("freeze receipt runtime query digest mismatch")
+
+    expected_exclusions = {
+        field: sorted(preregistration["exclusions"][field])
+        for field in ("station_ids", "burst_ids", "site_ids")
+    }
+    if receipt.get("exclusions") != expected_exclusions:
+        raise CohortValidationError("freeze receipt exclusions mismatch")
+    expected_counts = {
+        "candidate_pool": len(manifest["candidate_pool"]),
+        "frozen_clusters": len(manifest["frozen_clusters"]),
+        "surplus_clusters": len(manifest["surplus_clusters"]),
+        "excluded_after_selection": len(manifest["excluded_after_selection"]),
+    }
+    if receipt.get("counts") != expected_counts:
+        raise CohortValidationError("freeze receipt counts mismatch")
