@@ -22,7 +22,7 @@ use dolphin_timeseries::{
 };
 use dolphin_workflows::{
     estimate_global_reference_difference_covariance_from_provider_bundle,
-    replay_global_reference_difference_covariance_from_provider_bundle,
+    replay_global_reference_difference_covariance_from_provider_bundle, run_sequential,
     run_sequential_with_covariance_capture_and_source_factors, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest, GlobalBlockId, GlobalDateId,
     GlobalReferenceCovarianceQuery, ReplayBackend, ReplayExecutionScope, ReplayIdNamespace,
@@ -72,6 +72,10 @@ struct ProductionPathInput {
     target: [usize; 2],
     reference_pixel: [usize; 2],
     raw_complex_stack: Vec<Vec<[f64; 2]>>,
+    carrier_stack: Vec<Vec<[f64; 2]>>,
+    intended_difference_variance: Vec<f64>,
+    effective_looks_model: String,
+    effective_looks_distance_scale_pixels: f64,
     validity: Vec<bool>,
     reference: TemporalReferenceProvenance,
     scope: TemporalValidationScope,
@@ -90,6 +94,14 @@ struct ProductionReceipts {
     fixed_l2_map_sha256: Sha256Digest,
     issue52_receipt_sha256: Sha256Digest,
     issue54_receipt_sha256: Sha256Digest,
+    fixed_l2_difference_covariance: Vec<Vec<f64>>,
+    fixed_l2_difference_variance: Vec<f64>,
+    carrier_difference_history: Vec<f64>,
+    linked_difference_history: Vec<f64>,
+    effective_looks_model: &'static str,
+    effective_looks_distance_scale_pixels: f64,
+    effective_looks_fraction: f64,
+    effective_looks_receipt_sha256: Sha256Digest,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +229,8 @@ fn evaluate_production(request: &Request) -> Evaluation {
     }
     if input.scope != TemporalValidationScope::SyntheticValidation
         || input.selected_method != "complete_refit_bootstrap"
+        || input.effective_looks_model != EFFECTIVE_LOOKS_MODEL
+        || input.effective_looks_distance_scale_pixels != EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
     {
         return (None, Some("production_contract_mismatch"), None, None, None);
     }
@@ -233,23 +247,45 @@ fn evaluate_production(request: &Request) -> Evaluation {
         || input.reference_pixel[0] >= input.native_shape[0]
         || input.reference_pixel[1] >= input.native_shape[1]
         || input.raw_complex_stack.len() != dates
+        || input.carrier_stack.len() != dates
+        || input.intended_difference_variance.len() != dates
         || input
             .raw_complex_stack
             .iter()
             .any(|row| row.len() != native_area)
+        || input
+            .carrier_stack
+            .iter()
+            .any(|row| row.len() != native_area)
+        || input
+            .intended_difference_variance
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        || input.intended_difference_variance[0] != 0.0
         || input.validity.len() != dates
         || !input.validity.first().copied().unwrap_or(false)
     {
         return (None, Some("raw_complex_invalid"), None, None, None);
     }
-    let Some(stack) = raw_stack(input) else {
+    let Some(stack) = complex_stack(&input.raw_complex_stack, input.native_shape) else {
         return (None, Some("raw_complex_invalid"), None, None, None);
     };
-    let source_manifest = source_manifest_digest(request, input, &stack);
+    let Some(carrier) = complex_stack(&input.carrier_stack, input.native_shape) else {
+        return (None, Some("raw_complex_invalid"), None, None, None);
+    };
     let source_model = match source_model_config() {
         Ok(value) => value,
         Err(_) => return (None, Some("source_model_invalid"), None, None, None),
     };
+    let carrier_difference_history = match difference_history(
+        &carrier,
+        (input.target[0], input.target[1]),
+        (input.reference_pixel[0], input.reference_pixel[1]),
+    ) {
+        Ok(value) => value,
+        Err(status) => return (None, Some(status), None, None, None),
+    };
+    let source_manifest = source_manifest_digest(request, input, &stack);
     let evd = match run_production_branch(
         &stack,
         source_manifest,
@@ -264,7 +300,11 @@ fn evaluate_production(request: &Request) -> Evaluation {
         Ok(value) => value,
         Err(status) => return (None, Some(status), None, None, None),
     };
-    let mut observations = evd.difference_history;
+    if evd.effective_looks_model != input.effective_looks_model {
+        return (None, Some("effective_looks_mismatch"), None, None, None);
+    }
+    let linked_difference_history = evd.difference_history.clone();
+    let mut observations = linked_difference_history.clone();
     observations
         .iter_mut()
         .zip(&input.validity)
@@ -285,6 +325,13 @@ fn evaluate_production(request: &Request) -> Evaluation {
         evd.replay_source_factor_receipt.as_str(),
         evd.replay_support_receipt.as_str(),
         evd.reference_signature.as_str(),
+        input.effective_looks_model.as_str(),
+        input.effective_looks_distance_scale_pixels,
+        evd.effective_looks_receipt.as_str(),
+        PHASELINK_SOURCE_JVP_METHOD,
+        PHASELINK_SOURCE_JVP_CONTRACT,
+        PHASELINK_SPATIAL_JVP_CONTRACT,
+        sequential_replay_kernel_digest(),
         &evd.difference_covariance,
     ));
     let fit = fit_temporal_covariance(
@@ -293,6 +340,12 @@ fn evaluate_production(request: &Request) -> Evaluation {
         &evd.difference_covariance,
         &request.options,
     );
+    let fixed_l2_difference_covariance = evd.difference_covariance.clone();
+    let fixed_l2_difference_variance = fixed_l2_difference_covariance
+        .iter()
+        .enumerate()
+        .map(|(index, row)| row[index])
+        .collect();
     let provenance = temporal_covariance_provenance(
         &fit,
         TemporalCovarianceProvenanceInputs {
@@ -319,6 +372,14 @@ fn evaluate_production(request: &Request) -> Evaluation {
         fixed_l2_map_sha256: evd.fixed_l2_map_receipt,
         issue52_receipt_sha256: issue52_receipt,
         issue54_receipt_sha256: issue54_receipt,
+        fixed_l2_difference_covariance,
+        fixed_l2_difference_variance,
+        carrier_difference_history,
+        linked_difference_history,
+        effective_looks_model: evd.effective_looks_model,
+        effective_looks_distance_scale_pixels: input.effective_looks_distance_scale_pixels,
+        effective_looks_fraction: evd.effective_looks_fraction,
+        effective_looks_receipt_sha256: evd.effective_looks_receipt,
     };
     let status = if fit.status == TemporalInferenceStatus::Evaluated {
         "evaluated"
@@ -364,6 +425,13 @@ const SOURCE_MODEL: &str = "source_centered_empirical_proper_complex_v1";
 const SOURCE_MODEL_VERSION: &str = "1";
 const BRANCH_TOLERANCE: f64 = 1e-10;
 const REPLAY_BYTE_CAP: u64 = 1 << 30;
+const EFFECTIVE_LOOKS_MODEL: &str = "source_factor_declared_v1";
+const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
+const PHASELINK_SOURCE_JVP_METHOD: &str = "raw_complex_to_phase_source_jvp_v1";
+const PHASELINK_SOURCE_JVP_CONTRACT: &str =
+    "dolphin_phaselink::source_influence_contract::evd_phase_source_jvp_matches_raw_complex_difference";
+const PHASELINK_SPATIAL_JVP_CONTRACT: &str =
+    "dolphin_phaselink::spatial_reference_covariance_contract::evd_and_emi_source_jvps_match_finite_difference";
 
 struct ProductionBranch {
     difference_history: Vec<f64>,
@@ -374,6 +442,9 @@ struct ProductionBranch {
     replay_source_factor_receipt: Sha256Digest,
     replay_support_receipt: Sha256Digest,
     reference_signature: Sha256Digest,
+    effective_looks_model: &'static str,
+    effective_looks_fraction: f64,
+    effective_looks_receipt: Sha256Digest,
     reference: TemporalReferenceProvenance,
 }
 
@@ -677,6 +748,14 @@ fn run_production_branch(
     if replay.resource_high_water_bytes != estimate.total_bytes {
         return Err("production replay exceeded its exact preflight receipt");
     }
+    let effective_looks = replay
+        .replay
+        .effective_looks
+        .as_ref()
+        .ok_or("production replay omitted effective looks")?;
+    let effective_looks_model = effective_looks.model;
+    let effective_looks_fraction = effective_looks.fraction;
+    let effective_looks_receipt = digest_bytes(effective_looks.receipt);
     let target_history = phase_history(&output.cpx_phase, (target.0 as usize, target.1 as usize));
     let reference_history = phase_history(
         &output.cpx_phase,
@@ -742,6 +821,9 @@ fn run_production_branch(
         replay_source_factor_receipt: digest_bytes(replay.replay.source_factor_receipt),
         replay_support_receipt: digest_bytes(replay.replay.support_receipt),
         reference_signature: digest_bytes(replay.replay.reference_signature),
+        effective_looks_model,
+        effective_looks_fraction,
+        effective_looks_receipt,
         reference: realized_reference,
     })
 }
@@ -750,28 +832,48 @@ fn matrix_rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
     matrix.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
-fn raw_stack(input: &ProductionPathInput) -> Option<Array3<Cf64>> {
-    let values = input
-        .raw_complex_stack
+fn complex_stack(values: &[Vec<[f64; 2]>], native_shape: [usize; 2]) -> Option<Array3<Cf64>> {
+    let complex_values = values
         .iter()
         .flat_map(|row| row.iter())
         .map(|value| Cf64::new(value[0], value[1]))
         .collect::<Vec<_>>();
-    if values
+    if complex_values
         .iter()
         .any(|value| !value.is_finite() || value.norm_sqr() == 0.0)
     {
         return None;
     }
     Array3::from_shape_vec(
-        (
-            input.raw_complex_stack.len(),
-            input.native_shape[0],
-            input.native_shape[1],
-        ),
-        values,
+        (values.len(), native_shape[0], native_shape[1]),
+        complex_values,
     )
     .ok()
+}
+
+fn difference_history(
+    carrier: &Array3<Cf64>,
+    target: (usize, usize),
+    reference: (usize, usize),
+) -> Result<Vec<f64>, &'static str> {
+    let config = sequential_config();
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    let output = run_sequential(carrier.view(), &config, &engine)
+        .map_err(|_| "carrier_sequential_failed")?;
+    let target_history = phase_history(&output.cpx_phase, target);
+    let reference_history = phase_history(&output.cpx_phase, reference);
+    let mut difference = target_history
+        .iter()
+        .zip(reference_history)
+        .map(|(target, reference)| target - reference)
+        .collect::<Vec<_>>();
+    unwrap_phases(&mut difference);
+    difference[0] = 0.0;
+    difference
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(difference)
+        .ok_or("carrier_sequential_failed")
 }
 
 fn capture_scope_digest(request: &Request, input: &ProductionPathInput) -> Sha256Digest {
@@ -785,6 +887,8 @@ fn capture_scope_digest(request: &Request, input: &ProductionPathInput) -> Sha25
         "scope": input.scope,
         "source_seed": input.source_seed,
         "target": input.target,
+        "effective_looks_model": input.effective_looks_model,
+        "effective_looks_distance_scale_pixels": input.effective_looks_distance_scale_pixels,
     }))
 }
 
@@ -796,6 +900,13 @@ fn source_manifest_digest(
     let mut digest = Sha256::new();
     digest.update(b"dolphinrust:temporal-validation-raw-source-manifest:v1");
     digest.update(input.source_seed.to_le_bytes());
+    digest.update(input.effective_looks_model.as_bytes());
+    digest.update(
+        input
+            .effective_looks_distance_scale_pixels
+            .to_bits()
+            .to_le_bytes(),
+    );
     digest.update((request.days.len() as u64).to_le_bytes());
     for &day in &request.days {
         digest.update(day.to_bits().to_le_bytes());
@@ -813,7 +924,7 @@ fn source_manifest_digest(
 fn source_model_config(
 ) -> Result<EmpiricalProperComplexConfig, dolphin_phaselink::EmpiricalSourceModelError> {
     let model_identity = Sha256::digest(b"dolphinrust:temporal-validation-source-model:v1").into();
-    EmpiricalProperComplexConfig::new(0, 1, 1.0, 1e-8, model_identity)
+    EmpiricalProperComplexConfig::new(0, 1, 0.1, 1e-8, model_identity)
 }
 
 fn operator_receipt(blocks: &[CovarianceOperatorBlock], use_evd: bool) -> Sha256Digest {

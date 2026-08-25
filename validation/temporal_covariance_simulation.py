@@ -172,6 +172,117 @@ def normal_noise(state: int) -> tuple[int, float]:
     return state, math.sqrt(-2.0 * math.log(u1)) * math.cos(math.tau * u2)
 
 
+PROPER_COMPLEX_MOMENT_SEEDS = 4096
+EFFECTIVE_LOOKS_MODEL = "source_factor_declared_v1"
+EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS = 1.5
+
+
+def _proper_complex_draw(
+        cell_index: int, outer_seed_index: int, date_index: int, column: int,
+        role: int) -> tuple[float, float]:
+    key = splitmix64((cell_index + 1) ^ 0xA0761D6478BD642F)
+    key ^= splitmix64((outer_seed_index + 1) ^ 0xE7037ED1A0B428DB)
+    key ^= splitmix64((date_index + 1) ^ 0x8EBC6AF09C88C6E3)
+    key ^= splitmix64((column + 1) ^ 0x589965CC75374CC3)
+    key ^= splitmix64((role + 1) ^ 0x1D8E4E27C47D124F)
+    key, real = normal_noise(key)
+    _, imaginary = normal_noise(key)
+    return real, imaginary
+
+
+def proper_complex_speckle(
+        cell_index: int, outer_seed_index: int, column: int) -> tuple[float, float]:
+    return proper_complex_spatial_draw(cell_index, outer_seed_index, 0, 0)[column]
+
+
+def proper_complex_innovation(
+        cell_index: int, outer_seed_index: int, date_index: int, column: int) -> tuple[float, float]:
+    return proper_complex_spatial_draw(
+        cell_index, outer_seed_index, date_index, 1
+    )[column]
+
+
+def spatial_correlation(left: int, right: int) -> float:
+    return math.exp(
+        -abs(left - right) / EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+    )
+
+
+def spatial_correlation_cholesky(width: int) -> list[list[float]]:
+    covariance = [
+        [spatial_correlation(left, right) for right in range(width)]
+        for left in range(width)
+    ]
+    lower = [[0.0 for _ in range(width)] for _ in range(width)]
+    for row in range(width):
+        for column in range(row + 1):
+            residual = covariance[row][column] - sum(
+                lower[row][inner] * lower[column][inner]
+                for inner in range(column)
+            )
+            lower[row][column] = (
+                math.sqrt(residual) if row == column
+                else residual / lower[column][column]
+            )
+    return lower
+
+
+def proper_complex_spatial_draw(
+        cell_index: int, outer_seed_index: int, date_index: int,
+        role: int, width: int = 7) -> tuple[tuple[float, float], ...]:
+    independent = [
+        complex(*_proper_complex_draw(
+            cell_index, outer_seed_index, date_index, column, role
+        ))
+        for column in range(width)
+    ]
+    lower = spatial_correlation_cholesky(width)
+    return tuple(
+        (
+            sum(lower[row][column] * independent[column]
+                for column in range(row + 1)).real,
+            sum(lower[row][column] * independent[column]
+                for column in range(row + 1)).imag,
+        )
+        for row in range(width)
+    )
+
+
+def support_columns(column: int, width: int) -> tuple[int, ...]:
+    if width < 3 or column < 0 or column >= width:
+        raise ValueError("three-column support is outside the native width")
+    start = min(max(column - 1, 0), width - 3)
+    return tuple(range(start, start + 3))
+
+
+def support_intersection_correlation(target_column: int, reference_column: int, width: int) -> float:
+    target = set(support_columns(target_column, width))
+    reference = set(support_columns(reference_column, width))
+    return len(target & reference) / 3.0
+
+
+def production_support_correlation(
+        target_column: int, reference_column: int, width: int) -> float:
+    target = support_columns(target_column, width)
+    reference = support_columns(reference_column, width)
+    covariance = sum(spatial_correlation(left, right)
+                     for left in target for right in reference)
+    target_variance = sum(spatial_correlation(left, right)
+                          for left in target for right in target)
+    reference_variance = sum(spatial_correlation(left, right)
+                             for left in reference for right in reference)
+    return covariance / math.sqrt(target_variance * reference_variance)
+
+
+def production_temporal_noise_fraction(
+        difference_variance: float,
+        support_correlation: float) -> float:
+    if difference_variance < 0.0 or not 0.0 <= support_correlation < 1.0:
+        raise ValueError("production noise moment is outside the supported contract")
+    output_variance = difference_variance / (2.0 * (1.0 - support_correlation))
+    return -math.expm1(-output_variance)
+
+
 def stationary_ar_path(days: list[float], rho: float, state: int) -> tuple[int, list[float]]:
     """Draw the exact stationary irregular continuous-time AR(1) truth."""
     state, current = normal_noise(state)
@@ -227,6 +338,10 @@ def capture_scope_sha256(request: dict) -> str:
         "scope": production["scope"],
         "source_seed": production["source_seed"],
         "target": production["target"],
+        "effective_looks_model": production["effective_looks_model"],
+        "effective_looks_distance_scale_pixels": production[
+            "effective_looks_distance_scale_pixels"
+        ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -237,7 +352,7 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
     days = days_for(cell)
     missing = missing_indices(cell, seed, len(days) - 1)
     observations = []
-    generated_values = []
+    carrier_values = []
     diagonal = []
     for index in range(len(days)):
         if cell["variance_arrangement"] == "alternating":
@@ -252,9 +367,10 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
     for index, day in enumerate(days):
         state, measurement = normal_noise(state)
         shape = math.sqrt(diagonal[index] / geometric_mean)
-        value = 0.01 * day + math.sqrt(process_variance) * shape * ar_path[index]
-        value += math.sqrt(diagonal[index]) * measurement
-        generated_values.append(0.0 if index == 0 else value)
+        carrier = 0.01 * day + math.sqrt(process_variance) * shape * ar_path[index]
+        carrier = 0.0 if index == 0 else carrier
+        value = carrier + math.sqrt(diagonal[index]) * measurement
+        carrier_values.append(carrier)
         observations.append(0.0 if index == 0 else (None if index in missing else value))
     covariance = [[0.0 for _ in days] for _ in days]
     for index in range(1, len(days)):
@@ -288,28 +404,40 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
         request["fixed_factor"] = {"observations": observations,
                                    "difference_covariance": covariance}
     else:
-        overlap = cell["overlap_fraction"]
-        noise = [1e-12]
-        for index in range(1, len(days)):
-            denominator = 2.0 * (1.0 - overlap * math.cos(generated_values[index]))
-            noise.append(math.sqrt(diagonal[index] / denominator))
         raw_complex_stack = []
-        for date_index, (value, scale) in enumerate(zip(generated_values, noise)):
+        carrier_stack = []
+        common_speckle = [
+            complex(*value) for value in proper_complex_spatial_draw(
+                cell["cell_index"], outer_seed_index, 0, 0
+            )
+        ]
+        for date_index, value in enumerate(carrier_values):
             reference_column = {"near_exact": 2, "mid_exact": 3, "far_exact": 5}[
                 cell["reference_context"]
             ]
             distance = reference_column - 1
+            support_correlation = production_support_correlation(1, reference_column, 7)
+            noise_fraction = production_temporal_noise_fraction(
+                0.0 if date_index == 0 else diagonal[date_index], support_correlation
+            )
+            innovation_row = proper_complex_spatial_draw(
+                cell["cell_index"], outer_seed_index, date_index, 1
+            )
             row = []
+            carrier_row = []
             for column in range(7):
-                nuisance_seed = seed ^ ((date_index + 1) << 32) ^ column
-                amplitude_draw = splitmix64(nuisance_seed) / 2**64
-                phase_draw = splitmix64(nuisance_seed ^ 0xA17C9E37) / 2**64
-                amplitude = (1.0 + scale) * (0.8 + 0.4 * amplitude_draw)
                 phase = ((reference_column - column) / distance) * value
-                if column not in (1, reference_column):
-                    phase += 0.8 * (phase_draw - 0.5)
-                row.append([amplitude * math.cos(phase), amplitude * math.sin(phase)])
+                carrier = complex(math.cos(phase), math.sin(phase))
+                innovation = complex(*innovation_row[column])
+                source = (
+                    math.sqrt(1.0 - noise_fraction) * common_speckle[column]
+                    + math.sqrt(noise_fraction) * innovation
+                )
+                sample = carrier * source
+                row.append([sample.real, sample.imag])
+                carrier_row.append([carrier.real, carrier.imag])
             raw_complex_stack.append(row)
+            carrier_stack.append(carrier_row)
         realized_overlap = {"near_exact": 0.5, "mid_exact": 0.2, "far_exact": 0.0}[
             cell["reference_context"]
         ]
@@ -327,6 +455,10 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
             "target": [0, 1],
             "reference_pixel": [0, reference_column],
             "raw_complex_stack": raw_complex_stack,
+            "carrier_stack": carrier_stack,
+            "intended_difference_variance": [0.0] + diagonal[1:],
+            "effective_looks_model": EFFECTIVE_LOOKS_MODEL,
+            "effective_looks_distance_scale_pixels": EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
             "validity": [value is not None for value in observations],
             "reference": reference,
             "scope": "synthetic_validation",
