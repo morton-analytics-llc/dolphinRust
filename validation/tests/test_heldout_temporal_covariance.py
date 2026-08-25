@@ -262,6 +262,20 @@ class HeldoutCohortTests(unittest.TestCase):
         with self.assertRaises(CohortValidationError):
             validate_manifest(overlapping, self.preregistration)
 
+    def test_manifest_rejects_outcome_fields_and_skips_overlapping_surplus(self):
+        records = [candidate(index, query_digest=self.preregistration["candidate_query"]["query_digest"]) for index in range(117)]
+        records[1]["station_ids"] = records[0]["station_ids"]
+        discovered = discover_candidates(records, self.preregistration)
+        manifest = build_manifest(discovered, self.preregistration)
+        self.assertEqual(len(manifest["frozen_clusters"]), 96)
+        self.assertEqual(len(manifest["surplus_clusters"]), 20)
+        self.assertEqual(manifest["excluded_after_selection"], ["candidate-001"])
+        validate_manifest(manifest, self.preregistration)
+        exposed = copy.deepcopy(manifest)
+        exposed["gnss_series"] = [0.0]
+        with self.assertRaisesRegex(CohortValidationError, "schema"):
+            validate_manifest(exposed, self.preregistration)
+
     def test_exact_power_contract_is_frozen(self):
         expected = {"68": 96, "90": 72, "95": 62}
         self.assertEqual(self.preregistration["power"]["required_evaluable_clusters"], expected)

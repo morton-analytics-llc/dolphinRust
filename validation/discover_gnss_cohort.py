@@ -15,12 +15,29 @@ from typing import Any, Sequence
 import asf_search as asf
 import requests
 
-from fetch_real import result_hdf5_bytes
-from gps_ground_truth import NotEvaluable, align_records, parse_tenv3
+from heldout_temporal_covariance.cohort import (
+    build_manifest,
+    canonical_digest,
+    validate_candidate,
+    validate_manifest,
+)
 
 HOLDINGS_URL = "https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt"
-TENV3_ROOT = "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20"
-STATION_ROOT = "https://geodesy.unr.edu/NGLStationPages/stations"
+CANDIDATE_FIELDS = {
+    "candidate_id",
+    "source_kind",
+    "burst_id",
+    "orbit_id",
+    "footprint_id",
+    "site_id",
+    "frame_id",
+    "station_ids",
+    "date_start",
+    "date_end",
+    "epoch_count",
+    "metadata_hashes",
+    "query_digest",
+}
 
 
 @dataclass(frozen=True)
@@ -101,6 +118,18 @@ def select_shared_burst(
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def station_metadata(station: Station) -> dict[str, Any]:
+    return {
+        "station_id": station.station_id,
+        "latitude": station.latitude,
+        "longitude": station.longitude,
+        "height_m": station.height_m,
+        "first_date": station.first_date.isoformat(),
+        "last_date": station.last_date.isoformat(),
+        "solution_count": station.solution_count,
+    }
 
 
 def parse_holdings(text: str) -> list[Station]:
@@ -229,31 +258,107 @@ def results_by_burst(results: Sequence[Any]) -> dict[str, dict[str, Any]]:
     return output
 
 
-def aligned_fraction(station: Station, dates: Sequence[str], max_gap_days: int) -> tuple[float, dict[str, Any]]:
-    url = f"{TENV3_ROOT}/{station.station_id}.tenv3"
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    records = parse_tenv3(response.text)
-    aligned = 0
-    quality: dict[str, str] = {}
-    for value in dates:
-        date = dt.date.fromisoformat(value)
-        try:
-            match = align_records(records, [date], max_gap_days)[0]
-        except NotEvaluable:
-            quality[value] = "unavailable"
-        else:
-            aligned += 1
-            quality[value] = match.quality
-    return aligned / len(dates), {
-        "url": url,
-        "sha256": sha256_text(response.text),
-        "bytes": len(response.content),
-        "quality": quality,
+def result_geometry(result: Any) -> dict[str, Any]:
+    feature = result.geojson()
+    geometry = feature.get("geometry") if isinstance(feature, dict) else None
+    if not isinstance(geometry, dict):
+        raise ValueError("ASF result is missing GeoJSON geometry")
+    return geometry
+
+
+def frame_identity(properties: dict[str, Any]) -> tuple[str, str]:
+    direction = properties.get("flightDirection")
+    path_number = properties.get("pathNumber")
+    burst_id = properties.get("operaBurstID")
+    group_id = properties.get("groupID")
+    if not isinstance(direction, str) or not isinstance(path_number, int):
+        raise ValueError("ASF result is missing flight direction or relative orbit")
+    if not isinstance(burst_id, str) or not burst_id:
+        raise ValueError("ASF result is missing burst identity")
+    if not isinstance(group_id, str):
+        raise ValueError("ASF result is missing scene group metadata")
+    parts = group_id.split("_")
+    if len(parts) < 6 or not parts[2].isdigit() or not parts[3].isdigit():
+        raise ValueError("ASF scene group metadata is not recognized")
+    orbit_id = f"{direction.lower()}-r{path_number:03d}"
+    return orbit_id, f"{orbit_id}-burst-{burst_id.lower()}"
+
+
+def burst_metadata(result: Any) -> dict[str, Any]:
+    properties = result.properties
+    required = (
+        "operaBurstID",
+        "startTime",
+        "fileName",
+        "fileID",
+        "flightDirection",
+        "pathNumber",
+        "orbit",
+        "groupID",
+        "processingDate",
+        "productVersion",
+    )
+    missing = [field for field in required if properties.get(field) is None]
+    if missing:
+        raise ValueError("ASF result is missing metadata fields: " + ", ".join(missing))
+    return {
+        **{field: properties[field] for field in required},
+        "geometry": result_geometry(result),
     }
 
 
+def catalog_candidate(
+    first: Station,
+    second: Station,
+    burst: str,
+    dates: Sequence[str],
+    results: dict[str, Any],
+    catalog_sha256: str,
+    query_digest: str,
+) -> dict[str, Any]:
+    if not dates or set(dates) != set(results):
+        raise ValueError("candidate dates and ASF metadata do not match")
+    metadata = [burst_metadata(results[date]) for date in dates]
+    identities = {frame_identity(entry) for entry in metadata}
+    if len(identities) != 1:
+        raise ValueError("candidate ASF epochs do not share an orbit/frame")
+    orbit_id, frame_id = identities.pop()
+    geometry_digests = sorted(
+        {canonical_digest(entry["geometry"]) for entry in metadata}
+    )
+    station_ids = sorted((first.station_id, second.station_id))
+    site_id = cohort_site_id(burst, station_ids[0], station_ids[1])
+    candidate = {
+        "candidate_id": site_id,
+        "source_kind": "catalog_metadata",
+        "burst_id": burst,
+        "orbit_id": orbit_id,
+        "footprint_id": "sha256-" + canonical_digest(geometry_digests),
+        "site_id": site_id,
+        "frame_id": frame_id,
+        "station_ids": station_ids,
+        "date_start": dates[0],
+        "date_end": dates[-1],
+        "epoch_count": len(dates),
+        "metadata_hashes": {
+            "catalog_sha256": catalog_sha256,
+            "burst_metadata_sha256": canonical_digest(metadata),
+            "gnss_station_metadata_sha256": canonical_digest(
+                sorted(
+                    (station_metadata(first), station_metadata(second)),
+                    key=lambda value: value["station_id"],
+                )
+            ),
+        },
+        "query_digest": query_digest,
+    }
+    if set(candidate) != CANDIDATE_FIELDS:
+        raise AssertionError("candidate schema construction is incomplete")
+    return candidate
+
+
 def discover(args: argparse.Namespace) -> dict[str, Any]:
+    preregistration = json.loads(args.preregistration.read_text(encoding="utf-8"))
     exclusions = load_exclusions(args.preregistration)
     response = requests.get(HOLDINGS_URL, timeout=60)
     response.raise_for_status()
@@ -301,65 +406,28 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         )
         if burst is None or dates is None:
             continue
-        first_fraction, first_source = aligned_fraction(first, dates, args.max_gap_days)
-        second_fraction, second_source = aligned_fraction(second, dates, args.max_gap_days)
-        common_fraction = sum(
-            first_source["quality"][date] != "unavailable"
-            and second_source["quality"][date] != "unavailable"
-            for date in dates
-        ) / len(dates)
-        if common_fraction < args.min_gnss_fraction:
-            examined_entry["gnss_fraction"] = {
-                first.station_id: first_fraction,
-                second.station_id: second_fraction,
-                "common": common_fraction,
-            }
-            continue
-        results = [first_bursts[burst][date] for date in dates]
-        estimated_bytes = sum(result_hdf5_bytes(result) or 0 for result in results)
-        site_id = cohort_site_id(burst, first.station_id, second.station_id)
-        selected.append(
-            {
-                "site_id": site_id,
-                "burst_id": burst,
-                "burst_filename_id": burst.replace("_", "-"),
-                "start": dates[0],
-                "end": dates[-1],
-                "expected_dates": dates,
-                "epoch_count": len(dates),
-                "span_days": (dt.date.fromisoformat(dates[-1]) - dt.date.fromisoformat(dates[0])).days,
-                "distance_km": distance,
-                "common_gnss_fraction": common_fraction,
-                "estimated_cslc_bytes": estimated_bytes,
-                "stations": {
-                    station.station_id: {
-                        "latitude": station.latitude,
-                        "longitude": station.longitude,
-                        "tenv3_url": f"{TENV3_ROOT}/{station.station_id}.tenv3",
-                        "metadata_url": f"{STATION_ROOT}/{station.station_id}.sta",
-                        "availability_fraction": fraction,
-                        "source": source,
-                    }
-                    for station, fraction, source in [
-                        (first, first_fraction, first_source),
-                        (second, second_fraction, second_source),
-                    ]
-                },
-                "comparison": {
-                    "id": f"{first.station_id}_minus_{second.station_id}",
-                    "primary_station": first.station_id,
-                    "control_station": second.station_id,
-                },
-            }
+        candidate = catalog_candidate(
+            first,
+            second,
+            burst,
+            dates,
+            {date: first_bursts[burst][date] for date in dates},
+            sha256_text(response.text),
+            preregistration["candidate_query"]["query_digest"],
         )
+        validate_candidate(candidate, preregistration)
+        selected.append(candidate)
         used_bursts.add(burst)
         if len(selected) == args.target_sites:
             break
-    total_bytes = sum(site["estimated_cslc_bytes"] for site in selected)
     return {
-        "schema": "dolphinrust-gnss-cohort-feasibility/1",
+        "schema": "dolphinrust.temporal_covariance.heldout_discovery",
+        "schema_version": 1,
         "status": "eligible" if len(selected) == args.target_sites else "not_evaluable",
-        "selection_blinded_to_insar_outcomes": True,
+        "query_digest": preregistration["candidate_query"]["query_digest"],
+        "metadata_only": True,
+        "bulk_fetch_performed": False,
+        "selection_outcome_blind": True,
         "preregistration": {
             "path": str(args.preregistration),
             "sha256": hashlib.sha256(args.preregistration.read_bytes()).hexdigest(),
@@ -373,8 +441,6 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "target_sites": args.target_sites,
             "minimum_epochs": args.min_epochs,
             "minimum_span_days": args.min_span_days,
-            "minimum_gnss_fraction": args.min_gnss_fraction,
-            "maximum_interpolation_gap_days": args.max_gap_days,
             "station_pair_distance_km": [args.min_distance_km, args.max_distance_km],
             "date_window": [args.start, args.end],
             "geographic_bounds": [args.west, args.south, args.east, args.north],
@@ -385,10 +451,22 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "sha256": sha256_text(response.text),
             "bytes": len(response.content),
         },
-        "selected_sites": selected,
-        "selected_site_count": len(selected),
-        "estimated_cslc_bytes": total_bytes,
-        "estimated_cslc_gb": total_bytes / 1e9,
+        "runtime_query_digest": canonical_digest(
+            {
+                "criteria": {
+                    "target_sites": args.target_sites,
+                    "minimum_epochs": args.min_epochs,
+                    "minimum_span_days": args.min_span_days,
+                    "station_pair_distance_km": [args.min_distance_km, args.max_distance_km],
+                    "date_window": [args.start, args.end],
+                    "geographic_bounds": [args.west, args.south, args.east, args.north],
+                    "maximum_pairs_examined": args.max_pairs,
+                },
+                "candidate_query_digest": preregistration["candidate_query"]["query_digest"],
+            }
+        ),
+        "candidates": selected,
+        "rejected": [],
         "examined_pairs": examined,
     }
 
@@ -400,8 +478,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-sites", type=int, default=5)
     parser.add_argument("--min-epochs", type=int, default=24)
     parser.add_argument("--min-span-days", type=int, default=330)
-    parser.add_argument("--min-gnss-fraction", type=float, default=0.9)
-    parser.add_argument("--max-gap-days", type=int, default=4)
     parser.add_argument("--min-distance-km", type=float, default=1.0)
     parser.add_argument("--max-distance-km", type=float, default=30.0)
     parser.add_argument("--max-pairs", type=int, default=60)
@@ -417,6 +493,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--manifest-output", type=Path)
     return parser.parse_args()
 
 
@@ -425,13 +502,22 @@ def main() -> None:
     payload = discover(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    if args.manifest_output is not None:
+        preregistration = json.loads(args.preregistration.read_text(encoding="utf-8"))
+        manifest = build_manifest(payload, preregistration)
+        validate_manifest(manifest, preregistration)
+        args.manifest_output.parent.mkdir(parents=True, exist_ok=True)
+        args.manifest_output.write_text(
+            json.dumps(manifest, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
     print(
         json.dumps(
             {
                 "status": payload["status"],
-                "selected_site_count": payload["selected_site_count"],
-                "estimated_cslc_gb": payload["estimated_cslc_gb"],
+                "candidate_count": len(payload["candidates"]),
                 "output": str(args.output),
+                "manifest_output": str(args.manifest_output) if args.manifest_output else None,
             },
             indent=2,
         )

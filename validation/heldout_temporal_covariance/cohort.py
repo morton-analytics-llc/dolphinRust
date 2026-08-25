@@ -48,6 +48,21 @@ RECORD_FIELDS = {
     "metadata_hashes",
     "query_digest",
 }
+MANIFEST_FIELDS = {
+    "schema",
+    "schema_version",
+    "cohort_id",
+    "status",
+    "outcomes_present",
+    "preregistration_sha256",
+    "candidate_query_digest",
+    "selection_algorithm",
+    "selection_outcome_blind",
+    "candidate_pool",
+    "frozen_clusters",
+    "surplus_clusters",
+    "excluded_after_selection",
+}
 
 
 class CohortValidationError(ValueError):
@@ -152,13 +167,13 @@ def _disjoint(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 
 def _greedy_disjoint(candidates: Sequence[Mapping[str, Any]], count: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     chosen: list[dict[str, Any]] = []
-    surplus: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda item: item["candidate_id"]):
         if len(chosen) < count and all(_disjoint(candidate, prior) for prior in chosen):
             chosen.append(dict(candidate))
         else:
-            surplus.append(dict(candidate))
-    return chosen, surplus
+            excluded.append(dict(candidate))
+    return chosen, excluded
 
 
 def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, Any]) -> dict[str, Any]:
@@ -171,10 +186,12 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
         raise CohortValidationError("discovery candidates must be a list")
     for candidate in candidates:
         validate_candidate(candidate, preregistration)
+    ordered_candidates = sorted(candidates, key=lambda item: item["candidate_id"])
     required = preregistration["power"]["maximum_required_evaluable_clusters"]
     surplus_count = preregistration["attrition"]["frozen_surplus_clusters"]
-    selected, surplus = _greedy_disjoint(candidates, required)
-    surplus = surplus[:surplus_count]
+    selected_and_surplus, excluded = _greedy_disjoint(ordered_candidates, required + surplus_count)
+    selected = selected_and_surplus[:required]
+    surplus = selected_and_surplus[required:]
     status = "frozen_metadata_only" if len(selected) == required and len(surplus) == surplus_count else "not_evaluable_candidate_pool"
     return {
         "schema": SCHEMA,
@@ -186,13 +203,12 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
         "candidate_query_digest": discovery["query_digest"],
         "selection_algorithm": "lexical_candidate_id_greedy_disjoint_v1",
         "selection_outcome_blind": True,
-        "candidate_pool": [dict(candidate) for candidate in candidates],
+        "candidate_pool": [dict(candidate) for candidate in ordered_candidates],
         "frozen_clusters": [dict(candidate) for candidate in selected],
         "surplus_clusters": [dict(candidate) for candidate in surplus],
         "excluded_after_selection": [
             candidate["candidate_id"]
-            for candidate in candidates
-            if candidate["candidate_id"] not in {item["candidate_id"] for item in selected + surplus}
+            for candidate in excluded
         ],
     }
 
@@ -200,6 +216,8 @@ def build_manifest(discovery: Mapping[str, Any], preregistration: Mapping[str, A
 def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
     if not isinstance(manifest, Mapping):
         raise CohortValidationError("manifest must be an object")
+    if set(manifest) != MANIFEST_FIELDS:
+        raise CohortValidationError("manifest fields do not match the metadata-only schema")
     if manifest.get("schema") != SCHEMA or manifest.get("schema_version") != SCHEMA_VERSION:
         raise CohortValidationError("manifest schema/version mismatch")
     if manifest.get("outcomes_present") is not False or manifest.get("selection_outcome_blind") is not True:
@@ -215,6 +233,9 @@ def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str,
         raise CohortValidationError("manifest candidate and cluster fields must be lists")
     for candidate in candidate_pool:
         validate_candidate(candidate, preregistration)
+    candidate_ids = [candidate["candidate_id"] for candidate in candidate_pool]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise CohortValidationError("manifest candidate IDs must be unique")
     pool_ids = {candidate["candidate_id"] for candidate in candidate_pool}
     cluster_ids = [candidate["candidate_id"] for candidate in frozen + surplus]
     if len(cluster_ids) != len(set(cluster_ids)) or not set(cluster_ids) <= pool_ids:
@@ -227,3 +248,23 @@ def validate_manifest(manifest: Mapping[str, Any], preregistration: Mapping[str,
     expected_status = "frozen_metadata_only" if len(frozen) == required and len(surplus) == surplus_count else "not_evaluable_candidate_pool"
     if manifest.get("status") != expected_status:
         raise CohortValidationError("manifest status does not match frozen pool sufficiency")
+    expected = build_manifest(
+        {
+            "query_digest": preregistration["candidate_query"]["query_digest"],
+            "metadata_only": True,
+            "bulk_fetch_performed": False,
+            "candidates": candidate_pool,
+        },
+        preregistration,
+    )
+    frozen_fields = (
+        "cohort_id",
+        "status",
+        "selection_algorithm",
+        "candidate_pool",
+        "frozen_clusters",
+        "surplus_clusters",
+        "excluded_after_selection",
+    )
+    if any(manifest.get(field) != expected[field] for field in frozen_fields):
+        raise CohortValidationError("manifest does not match the exact lexical disjoint freeze")
