@@ -74,7 +74,8 @@
       "sourced_los_invalid",
       "gnss_los_projection_invalid",
       "total_covariance_not_positive_definite",
-      "total_covariance_ill_conditioned"
+      "total_covariance_ill_conditioned",
+      "temporal_estimator_abstained"
     ]
   },
   "power": {
@@ -132,6 +133,8 @@
       "source_replay_sha256", "l2_map_sha256", "mask_sha256", "source_model_sha256",
       "effective_looks_sha256", "support_sha256", "correction_order_sha256",
       "unwrap_branch_sha256", "burst_ownership_sha256", "runtime_resource_receipt_sha256",
+      "approximation_receipt_sha256", "resource_receipt_sha256", "review_receipt_sha256",
+      "method_manifest_sha256", "calibration_scope_sha256",
       "burst_id", "grid_sha256", "units"
     ]
   },
@@ -144,6 +147,55 @@
     "covariance_projection": "u_transpose_C_u",
     "epoch_zero_reference_required": true,
     "solution_outcome_blinded_at_freeze": true
+  },
+  "fixed_cube_binding": {
+    "contract_version": "fixed-cube-v1",
+    "velocity_estimator": "linear_post_gauge_unit_precision",
+    "inference_status": "conditional_only",
+    "geometry_source": "CSLC-S1-STATIC",
+    "geometry_provenance": "geometry_provenance.json",
+    "validity_mask_raster": "velocity_validity_mask.tif",
+    "displacement_units": "meters",
+    "reference_role": "control_station"
+  },
+  "estimator_binding": {
+    "binary": "temporal_covariance_batch",
+    "schema": "dolphinrust-temporal-covariance-batch/6",
+    "execution_path": "fixed_factor",
+    "method": "complete_refit_bootstrap",
+    "method_version": 1,
+    "baseline": "conditional_wls",
+    "bootstrap_replicates": 200,
+    "bootstrap_minimum_successes": 198,
+    "options": {
+      "reference_lag_days": 12.0,
+      "rho_min": 0.0,
+      "rho_max": 0.98,
+      "oracle_rho": 0.0,
+      "oracle_process_variance": 0.0,
+      "condition_limit": 1000000000000.0,
+      "minimum_dates": 12,
+      "bootstrap_replicates": 200,
+      "bootstrap_minimum_successes": 198,
+      "bootstrap_seed": 0,
+      "profile_max_expansions": 12,
+      "profile_max_iterations": 48,
+      "optimizer_max_iterations": 12,
+      "optimizer_tolerance": 0.0001,
+      "process_variance_min_ratio": 0.000001,
+      "process_variance_max_ratio": 1000000.0,
+      "minimum_profile_curvature": 0.000001,
+      "minimum_gap_days": 4.0,
+      "maximum_gap_days": 36.0
+    }
+  },
+  "execution": {
+    "run_plan_schema": "dolphinrust.temporal_covariance.heldout_run_plan/1",
+    "cluster_order": "all_primary_then_lexical_surplus_until_fill",
+    "result_directory": "validation/results/temporal_covariance/f53-06-v1",
+    "one_shot_ledger": "unblinding_ledger.json",
+    "scored_result": "temporal_covariance_heldout_result.json",
+    "resume_requires_exact_identity": true
   },
   "thresholds": {
     "coverage_error_max": {
