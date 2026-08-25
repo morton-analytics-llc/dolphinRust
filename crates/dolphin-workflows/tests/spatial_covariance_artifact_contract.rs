@@ -1,10 +1,10 @@
 use dolphin_io::{
-    spatial_reference_calibration_scope_digest, spatial_reference_runtime_resource_receipt_digest,
-    write_spatial_reference_covariance, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
-    SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceMetadata,
-    SpatialReferenceCovarianceStatus, SpatialReferenceRuntimeResourceReceipt,
-    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    spatial_reference_calibration_scope_digest, spatial_reference_effective_looks_digest,
+    spatial_reference_runtime_resource_receipt_digest, write_spatial_reference_covariance,
+    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    SpatialReferenceRuntimeResourceReceipt, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
 use dolphin_workflows::spatial_covariance_artifact::{
     spatial_reference_covariance_code_digest, spatial_reference_covariance_design_digest,
@@ -53,7 +53,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         working_set_admission_high_water_bytes: 1024,
         working_set_observed_high_water_bytes: 768,
     };
-    SpatialReferenceCovarianceMetadata {
+    let mut metadata = SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
         method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
         method_version: 1,
@@ -100,13 +100,22 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_source_burst_index: 0,
         calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
         maximum_block_bytes: 1024,
-    }
+    };
+    metadata.effective_looks_digest = spatial_reference_effective_looks_digest(&[block()]).unwrap();
+    metadata
 }
 
 fn block() -> SpatialReferenceCovarianceBlock {
     SpatialReferenceCovarianceBlock {
         block_id: 1,
-        target_grid: metadata().full_grid,
+        target_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 1,
+            cols: 1,
+            stride_y: 1,
+            stride_x: 1,
+        },
         maximum_rank: 1,
         rank_by_target: vec![1],
         status: vec![SpatialReferenceCovarianceStatus::Valid],
@@ -117,7 +126,7 @@ fn block() -> SpatialReferenceCovarianceBlock {
         support_union_count: Some(vec![9]),
         effective_looks_receipt: Some(vec![0x71; 32]),
         resource_high_water_bytes: Some(vec![256]),
-        condition_number: Some(vec![2.0]),
+        condition_number: Some(vec![1.0]),
         source_factor_digest: digest(0x77),
     }
 }

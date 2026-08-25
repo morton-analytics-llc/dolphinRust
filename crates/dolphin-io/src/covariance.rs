@@ -4045,6 +4045,8 @@ const SPATIAL_RUNTIME_RESOURCE_MEMBERS: &[&str] = &[
     "working_set_admission_high_water_bytes",
     "working_set_observed_high_water_bytes",
 ];
+const SPATIAL_REFERENCE_MAX_FACTOR_CONDITION_NUMBER: f64 = 1.0e8;
+const SPATIAL_REFERENCE_FACTOR_ORTHOGONALITY_TOLERANCE: f64 = 1.0e-10;
 
 /// Calibration scope bound to a persisted reference-specific factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4367,6 +4369,112 @@ pub fn spatial_reference_runtime_resource_receipt_digest(
         digest.update(value.to_le_bytes());
     }
     format!("sha256:{:x}", digest.finalize())
+}
+
+/// Digest exact persisted effective-look realizations in target-coordinate order.
+///
+/// # Errors
+/// Returns an error when block realization arrays are missing or malformed.
+pub fn spatial_reference_effective_looks_digest(
+    blocks: &[SpatialReferenceCovarianceBlock],
+) -> Result<String> {
+    let mut ordered = blocks.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|block| (block.target_grid.row_start, block.target_grid.col_start));
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:production-effective-looks-realization:v2");
+    for block in ordered {
+        digest.update(spatial_reference_effective_looks_block_digest(block)?);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn spatial_reference_effective_looks_block_digest(
+    block: &SpatialReferenceCovarianceBlock,
+) -> Result<[u8; 32]> {
+    let targets = block.target_grid.area()?;
+    let cols = usize::try_from(block.target_grid.cols)
+        .map_err(|_| invalid("effective-look grid width exceeds usize"))?;
+    let fractions = block
+        .effective_looks_fraction
+        .as_ref()
+        .ok_or_else(|| invalid("effective-look fractions are missing"))?;
+    let support = block
+        .support_union_count
+        .as_ref()
+        .ok_or_else(|| invalid("effective-look support counts are missing"))?;
+    let receipts = block
+        .effective_looks_receipt
+        .as_ref()
+        .ok_or_else(|| invalid("effective-look receipts are missing"))?;
+    ensure_valid(
+        fractions.len() == targets && support.len() == targets && receipts.len() == targets * 32,
+        "effective-look realization shapes disagree",
+    )?;
+    let mut digest = Sha256::new();
+    digest.update(block.source_factor_digest.as_bytes());
+    for target in 0..targets {
+        let row = u64::try_from(target / cols)
+            .map_err(|_| invalid("effective-look target row exceeds u64"))?;
+        let col = u64::try_from(target % cols)
+            .map_err(|_| invalid("effective-look target column exceeds u64"))?;
+        digest.update(
+            block
+                .target_grid
+                .row_start
+                .checked_add(row)
+                .ok_or_else(|| invalid("effective-look target row overflows"))?
+                .to_le_bytes(),
+        );
+        digest.update(
+            block
+                .target_grid
+                .col_start
+                .checked_add(col)
+                .ok_or_else(|| invalid("effective-look target column overflows"))?
+                .to_le_bytes(),
+        );
+        digest.update(fractions[target].to_bits().to_le_bytes());
+        digest.update(support[target].to_le_bytes());
+        digest.update(&receipts[target * 32..(target + 1) * 32]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn spatial_reference_effective_looks_file_digest(file: &hdf5::File) -> Result<String> {
+    let blocks = file.group("blocks")?;
+    let mut entries = Vec::new();
+    for name in blocks.member_names()? {
+        validate_selected_block_link(&blocks, &name)?;
+        let group = blocks.group(&name)?;
+        let target_grid = read_grid(&group, "target_grid")?;
+        let block = SpatialReferenceCovarianceBlock {
+            block_id: read_scalar_attr(&group, "block_id")?,
+            target_grid,
+            maximum_rank: 1,
+            rank_by_target: Vec::new(),
+            status: Vec::new(),
+            source_burst_index_by_target: Vec::new(),
+            difference_factor: Vec::new(),
+            approximation_error_bound: Vec::new(),
+            effective_looks_fraction: Some(group.dataset("effective_looks_fraction")?.read_raw()?),
+            support_union_count: Some(group.dataset("support_union_count")?.read_raw()?),
+            effective_looks_receipt: Some(group.dataset("effective_looks_receipt")?.read_raw()?),
+            resource_high_water_bytes: None,
+            condition_number: None,
+            source_factor_digest: read_string(&group, "source_factor_digest")?,
+        };
+        entries.push((
+            (target_grid.row_start, target_grid.col_start),
+            spatial_reference_effective_looks_block_digest(&block)?,
+        ));
+    }
+    entries.sort_by_key(|(target, _)| *target);
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:production-effective-looks-realization:v2");
+    for (_, block) in entries {
+        digest.update(block);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 /// Artifact-level identity for bounded reference-specific covariance blocks.
@@ -4928,6 +5036,8 @@ impl SpatialReferenceCovarianceBlock {
                 "legacy spatial reference approximation bounds are invalid",
             )?;
         }
+        let target_cols = usize::try_from(self.target_grid.cols)
+            .map_err(|_| invalid("spatial reference target width exceeds usize"))?;
         for target in 0..targets {
             let realized = usize::try_from(self.rank_by_target[target])
                 .map_err(|_| invalid("spatial reference rank exceeds usize"))?;
@@ -4935,8 +5045,19 @@ impl SpatialReferenceCovarianceBlock {
                 realized <= rank,
                 "spatial reference target rank exceeds maximum",
             )?;
+            let target_row = self.target_grid.row_start
+                + u64::try_from(target / target_cols)
+                    .map_err(|_| invalid("spatial reference target row exceeds u64"))?;
+            let target_col = self.target_grid.col_start
+                + u64::try_from(target % target_cols)
+                    .map_err(|_| invalid("spatial reference target column exceeds u64"))?;
+            let coincident =
+                target_row == metadata.reference_row && target_col == metadata.reference_col;
             ensure_valid(
-                (self.status[target] == SpatialReferenceCovarianceStatus::Valid) == (realized > 0),
+                match self.status[target] == SpatialReferenceCovarianceStatus::Valid {
+                    true => realized > 0 || coincident,
+                    false => realized == 0,
+                },
                 "spatial reference status and target rank disagree",
             )?;
             let target_offset = target
@@ -4965,8 +5086,14 @@ impl SpatialReferenceCovarianceBlock {
                                 && support[target] > 0
                                 && receipt.iter().any(|byte| *byte != 0)
                                 && resource[target] > 0
-                                && condition[target].is_finite()
-                                && condition[target] >= 1.0
+                                && if realized == 0 {
+                                    coincident && condition[target].is_nan()
+                                } else {
+                                    condition[target].is_finite()
+                                        && condition[target] >= 1.0
+                                        && condition[target]
+                                            <= SPATIAL_REFERENCE_MAX_FACTOR_CONDITION_NUMBER
+                                }
                         }
                         false => {
                             effective[target].is_nan()
@@ -4977,6 +5104,48 @@ impl SpatialReferenceCovarianceBlock {
                     },
                     "spatial reference effective-look/resource receipt disagrees with target status",
                 )?;
+            }
+            if realized > 0 {
+                let mut norms = Vec::with_capacity(realized);
+                for component in 0..realized {
+                    let norm = (0..dates)
+                        .map(|date| {
+                            let value =
+                                self.difference_factor[target_offset + date * rank + component];
+                            value * value
+                        })
+                        .sum::<f64>();
+                    ensure_valid(
+                        norm.is_finite() && norm > 0.0,
+                        "factor column has zero norm",
+                    )?;
+                    norms.push(norm);
+                }
+                for left in 0..realized {
+                    for right in left + 1..realized {
+                        let cross = (0..dates)
+                            .map(|date| {
+                                self.difference_factor[target_offset + date * rank + left]
+                                    * self.difference_factor[target_offset + date * rank + right]
+                            })
+                            .sum::<f64>();
+                        let scale = (norms[left] * norms[right]).sqrt();
+                        ensure_valid(
+                            cross.abs() <= SPATIAL_REFERENCE_FACTOR_ORTHOGONALITY_TOLERANCE * scale,
+                            "spatial reference factor columns are not orthogonal",
+                        )?;
+                    }
+                }
+                if let Some((_, _, _, _, condition)) = realization {
+                    let maximum = norms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let minimum = norms.iter().copied().fold(f64::INFINITY, f64::min);
+                    let computed = maximum / minimum;
+                    ensure_valid(
+                        computed <= SPATIAL_REFERENCE_MAX_FACTOR_CONDITION_NUMBER
+                            && (computed - condition[target]).abs() <= 1.0e-8 * computed.max(1.0),
+                        "spatial reference factor condition receipt disagrees with factor columns",
+                    )?;
+                }
             }
             if metadata.schema_version != SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
                 let approximation_bound = self.approximation_error_bound[target];
@@ -5058,6 +5227,7 @@ pub struct SpatialReferenceCovarianceWriter {
     metadata: SpatialReferenceCovarianceMetadata,
     block_ids: BTreeSet<u64>,
     target_grids: Vec<CovarianceOperatorGrid>,
+    effective_looks_blocks: Vec<((u64, u64), [u8; 32])>,
 }
 
 impl SpatialReferenceCovarianceWriter {
@@ -5079,6 +5249,7 @@ impl SpatialReferenceCovarianceWriter {
             metadata: metadata.clone(),
             block_ids: BTreeSet::new(),
             target_grids: Vec::new(),
+            effective_looks_blocks: Vec::new(),
         })
     }
 
@@ -5107,6 +5278,10 @@ impl SpatialReferenceCovarianceWriter {
         let group = block_group.create_group(&format!("{:020}", block.block_id))?;
         write_spatial_reference_block(&group, &self.metadata, block)?;
         self.target_grids.push(block.target_grid);
+        self.effective_looks_blocks.push((
+            (block.target_grid.row_start, block.target_grid.col_start),
+            spatial_reference_effective_looks_block_digest(block)?,
+        ));
         Ok(())
     }
 
@@ -5158,14 +5333,7 @@ impl SpatialReferenceCovarianceWriter {
     ///
     /// # Errors
     /// Returns an error for an invalid digest or HDF5 update failure.
-    pub fn seal_effective_looks_digest(
-        &mut self,
-        digest: String,
-    ) -> Result<SpatialReferenceCovarianceMetadata> {
-        ensure_valid(
-            is_nonzero_sha256_digest(&digest),
-            "effective looks digest is invalid",
-        )?;
+    pub fn seal_effective_looks_digest(&mut self) -> Result<SpatialReferenceCovarianceMetadata> {
         ensure_valid(
             self.metadata.calibration_scope == SpatialReferenceCalibrationScope::Uncalibrated,
             "calibrated spatial reference effective-look evidence is immutable",
@@ -5174,6 +5342,14 @@ impl SpatialReferenceCovarianceWriter {
             .file
             .as_ref()
             .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
+        self.effective_looks_blocks
+            .sort_by_key(|(target, _)| *target);
+        let mut realization = Sha256::new();
+        realization.update(b"dolphinrust:production-effective-looks-realization:v2");
+        for (_, digest) in &self.effective_looks_blocks {
+            realization.update(digest);
+        }
+        let digest = format!("sha256:{:x}", realization.finalize());
         file.group("metadata")?
             .dataset("effective_looks_digest")?
             .write_raw(digest.as_bytes())?;
@@ -5199,6 +5375,17 @@ impl SpatialReferenceCovarianceWriter {
         ensure_valid(
             covered_targets == self.metadata.full_grid.area()?,
             "spatial reference target blocks do not exactly cover the full grid",
+        )?;
+        self.effective_looks_blocks
+            .sort_by_key(|(target, _)| *target);
+        let mut realization = Sha256::new();
+        realization.update(b"dolphinrust:production-effective-looks-realization:v2");
+        for (_, digest) in &self.effective_looks_blocks {
+            realization.update(digest);
+        }
+        ensure_valid(
+            self.metadata.effective_looks_digest == format!("sha256:{:x}", realization.finalize()),
+            "effective-look digest disagrees with persisted factor blocks",
         )?;
         let file = self
             .file
@@ -5503,7 +5690,13 @@ pub fn write_spatial_reference_covariance(
     metadata: &SpatialReferenceCovarianceMetadata,
     blocks: &[SpatialReferenceCovarianceBlock],
 ) -> Result<SpatialReferenceCovarianceWriteReceipt> {
-    let mut writer = SpatialReferenceCovarianceWriter::create(path, metadata)?;
+    let mut metadata = metadata.clone();
+    if metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION
+        && metadata.calibration_scope == SpatialReferenceCalibrationScope::Uncalibrated
+    {
+        metadata.effective_looks_digest = spatial_reference_effective_looks_digest(blocks)?;
+    }
+    let mut writer = SpatialReferenceCovarianceWriter::create(path, &metadata)?;
     for block in blocks {
         writer.write_block(block)?;
     }
@@ -5678,6 +5871,13 @@ pub fn read_spatial_reference_covariance_block(
     budget.charge(metadata_bytes)?;
     budget.charge(logical_payload_bytes)?;
     let metadata = read_spatial_metadata(&file)?;
+    if schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+        ensure_valid(
+            spatial_reference_effective_looks_file_digest(&file)?
+                == metadata.effective_looks_digest,
+            "effective-look digest disagrees with persisted factor blocks",
+        )?;
+    }
     let status = group
         .dataset("status")?
         .read_raw::<u16>()?

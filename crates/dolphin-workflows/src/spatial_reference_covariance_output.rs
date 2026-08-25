@@ -236,40 +236,6 @@ fn production_target_receipt(
     digest.finalize().into()
 }
 
-fn effective_looks_block_realization_digest(
-    block: &SpatialReferenceCovarianceBlock,
-) -> Result<[u8; 32]> {
-    let mut digest = Sha256::new();
-    digest.update(b"dolphinrust:production-effective-looks-block-realization:v1");
-    let fractions = block
-        .effective_looks_fraction
-        .as_ref()
-        .context("current factor block is missing effective-look fractions")?;
-    let counts = block
-        .support_union_count
-        .as_ref()
-        .context("current factor block is missing support-union counts")?;
-    let receipts = block
-        .effective_looks_receipt
-        .as_ref()
-        .context("current factor block is missing effective-look receipts")?;
-    let cols = usize::try_from(block.target_grid.cols)?;
-    anyhow::ensure!(
-        fractions.len() == counts.len() && receipts.len() == fractions.len() * 32,
-        "effective-look realization arrays disagree"
-    );
-    for target in 0..fractions.len() {
-        let row = block.target_grid.row_start + u64::try_from(target / cols)?;
-        let col = block.target_grid.col_start + u64::try_from(target % cols)?;
-        digest.update(row.to_le_bytes());
-        digest.update(col.to_le_bytes());
-        digest.update(fractions[target].to_bits().to_le_bytes());
-        digest.update(counts[target].to_le_bytes());
-        digest.update(&receipts[target * 32..(target + 1) * 32]);
-    }
-    Ok(digest.finalize().into())
-}
-
 #[cfg(test)]
 pub(crate) fn build_factor_block(
     block_id: u64,
@@ -362,7 +328,6 @@ impl FactorBlockBuilder {
             (Some(factor), SpatialReferenceCovarianceStatus::Valid) => {
                 anyhow::ensure!(
                     factor.nrows() == self.dates
-                        && factor.ncols() > 0
                         && factor.ncols() <= self.dates
                         && factor.iter().all(|value| value.is_finite())
                         && (0..factor.ncols())
@@ -785,7 +750,6 @@ impl ProductionCovarianceState {
             .wavelength
             .map_or(1.0, |wavelength| -wavelength / (4.0 * std::f64::consts::PI));
         let mut block_id = 0_u64;
-        let mut effective_looks_blocks = Vec::new();
         let mut replay_observed_high_water_bytes = 0_u64;
         let mut fixed_l2_was_used = false;
         let plans = production_block_plans(
@@ -860,10 +824,6 @@ impl ProductionCovarianceState {
                     }
                 }
                 let block = builder.finish()?;
-                effective_looks_blocks.push((
-                    (block.target_grid.row_start, block.target_grid.col_start),
-                    effective_looks_block_realization_digest(&block)?,
-                ));
                 if let Some(resource) = &block.resource_high_water_bytes {
                     replay_observed_high_water_bytes = replay_observed_high_water_bytes
                         .max(resource.iter().copied().max().unwrap_or(0));
@@ -930,24 +890,7 @@ impl ProductionCovarianceState {
             ..preflight_resource_receipt
         };
         writer.seal_runtime_resource_receipt(runtime_resource_receipt)?;
-        effective_looks_blocks.sort_by_key(|(target, _)| *target);
-        let mut effective_looks_realization = Sha256::new();
-        effective_looks_realization
-            .update(b"dolphinrust:production-effective-looks-realization:v1");
-        effective_looks_realization.update(EFFECTIVE_LOOKS_MODEL.as_bytes());
-        effective_looks_realization.update(
-            EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
-                .to_bits()
-                .to_le_bytes(),
-        );
-        for (target, digest) in effective_looks_blocks {
-            effective_looks_realization.update(target.0.to_le_bytes());
-            effective_looks_realization.update(target.1.to_le_bytes());
-            effective_looks_realization.update(digest);
-        }
-        metadata = writer.seal_effective_looks_digest(sha256_string(
-            effective_looks_realization.finalize().into(),
-        ))?;
+        metadata = writer.seal_effective_looks_digest()?;
         let write_receipt = writer.finish()?;
         replay_context
             .source_manifest
@@ -1638,12 +1581,11 @@ fn production_target_factor(
         propagated.status == SpatialL2Status::Valid,
         "successful production L2 propagation returned a non-valid status"
     );
-    if propagated.date_factor.ncols() == 0 {
-        return Ok(nonvalid_target_with_resource(
-            SpatialReferenceCovarianceStatus::L2RankDeficient,
-            replay.resource_high_water_bytes,
-        ));
-    }
+    let condition_number = if propagated.date_factor.ncols() == 0 {
+        f64::NAN
+    } else {
+        propagated.covariance_condition_number
+    };
     Ok(TargetFactor {
         status: SpatialReferenceCovarianceStatus::Valid,
         source_burst_index: owner,
@@ -1664,7 +1606,7 @@ fn production_target_factor(
             .context("effective-look support union exceeds u64")?,
         effective_looks_receipt: effective.receipt,
         resource_high_water_bytes: replay.resource_high_water_bytes,
-        condition_number: propagated.covariance_condition_number,
+        condition_number,
     })
 }
 
@@ -2186,7 +2128,7 @@ mod tests {
             support_union_count: 9,
             effective_looks_receipt: [2; 32],
             resource_high_water_bytes: 1024,
-            condition_number: 2.0,
+            condition_number: 1.0,
         };
         let base = build_factor_block(0, grid, 2, 1.0, std::slice::from_ref(&outcome)).unwrap();
         let mut changed_fraction = outcome.clone();
@@ -2196,12 +2138,20 @@ mod tests {
         changed_receipt.effective_looks_receipt = [3; 32];
         let changed_receipt = build_factor_block(0, grid, 2, 1.0, &[changed_receipt]).unwrap();
         assert_ne!(
-            effective_looks_block_realization_digest(&base).unwrap(),
-            effective_looks_block_realization_digest(&changed_fraction).unwrap()
+            dolphin_io::spatial_reference_effective_looks_digest(std::slice::from_ref(&base))
+                .unwrap(),
+            dolphin_io::spatial_reference_effective_looks_digest(std::slice::from_ref(
+                &changed_fraction,
+            ))
+            .unwrap()
         );
         assert_ne!(
-            effective_looks_block_realization_digest(&base).unwrap(),
-            effective_looks_block_realization_digest(&changed_receipt).unwrap()
+            dolphin_io::spatial_reference_effective_looks_digest(std::slice::from_ref(&base))
+                .unwrap(),
+            dolphin_io::spatial_reference_effective_looks_digest(std::slice::from_ref(
+                &changed_receipt,
+            ))
+            .unwrap()
         );
     }
 
@@ -2313,13 +2263,13 @@ mod tests {
                 TargetFactor {
                     status: SpatialReferenceCovarianceStatus::Valid,
                     source_burst_index: 0,
-                    date_factor: Some(array![[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]]),
+                    date_factor: Some(array![[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]]),
                     source_factor_receipt: [1; 32],
                     effective_looks_fraction: 0.75,
                     support_union_count: 9,
                     effective_looks_receipt: [0x71; 32],
                     resource_high_water_bytes: 2048,
-                    condition_number: 2.0,
+                    condition_number: 4.0,
                 },
                 TargetFactor {
                     status: SpatialReferenceCovarianceStatus::Valid,
@@ -2362,7 +2312,7 @@ mod tests {
             .all(|bound| bound.is_nan()));
         assert_eq!(
             &block.difference_factor[0..9],
-            &[0.0, 0.0, 0.0, -2.0, -4.0, 0.0, -6.0, -8.0, 0.0]
+            &[0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, -4.0, 0.0]
         );
         assert_eq!(block.difference_factor[9 + 6], -2.0);
         assert!(block.difference_factor[18..]
