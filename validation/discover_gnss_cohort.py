@@ -205,29 +205,17 @@ def candidate_pairs(
                     seen.add(pair_id)
                     distance = haversine_km(first, second)
                     if min_distance_km <= distance <= max_distance_km:
-                        pairs.append((first, second, distance))
-    # One metadata-blind pair per 5-degree cell. Prefer longer records, then shorter separation.
-    by_region: dict[tuple[int, int], tuple[Station, Station, float]] = {}
-    for pair in pairs:
-        first, second, distance = pair
-        region = (
-            math.floor(((first.latitude + second.latitude) / 2) / 5),
-            math.floor(((first.longitude + second.longitude) / 2) / 5),
-        )
-        incumbent = by_region.get(region)
-        rank = (min(first.solution_count, second.solution_count), -distance, pair[0].station_id, pair[1].station_id)
-        if incumbent is None:
-            by_region[region] = pair
-            continue
-        incumbent_rank = (
-            min(incumbent[0].solution_count, incumbent[1].solution_count),
-            -incumbent[2],
-            incumbent[0].station_id,
-            incumbent[1].station_id,
-        )
-        if rank > incumbent_rank:
-            by_region[region] = pair
-    return sorted(by_region.values(), key=lambda item: (-min(item[0].solution_count, item[1].solution_count), item[0].station_id, item[1].station_id))
+                        ordered = sorted((first, second), key=lambda value: value.station_id)
+                        pairs.append((ordered[0], ordered[1], distance))
+    return sorted(
+        pairs,
+        key=lambda item: (
+            -min(item[0].solution_count, item[1].solution_count),
+            item[2],
+            item[0].station_id,
+            item[1].station_id,
+        ),
+    )
 
 
 def search_station(station: Station, start: str, end: str) -> list[Any]:

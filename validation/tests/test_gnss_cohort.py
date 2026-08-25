@@ -73,6 +73,40 @@ class CohortContract(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual({pairs[0][0].station_id, pairs[0][1].station_id}, {"AAAA", "BBBB"})
 
+    def test_pair_selection_keeps_disjoint_pairs_in_the_same_region(self) -> None:
+        holdings = HOLDINGS + """EEEE 35.2000 -120.0000 12 0 0 0 2020-01-01 2025-01-01 2025-01-02 800
+FFFF 35.3000 -120.0000 13 0 0 0 2020-01-01 2025-01-01 2025-01-02 700
+"""
+        pairs = discovery.candidate_pairs(
+            discovery.parse_holdings(holdings),
+            discovery.dt.date(2023, 1, 1),
+            discovery.dt.date(2024, 1, 1),
+            1.0,
+            30.0,
+            (-170.0, 5.0, -50.0, 75.0),
+        )
+        station_pairs = [
+            tuple(sorted((first.station_id, second.station_id)))
+            for first, second, _ in pairs
+        ]
+        lines = holdings.splitlines()
+        reversed_pairs = discovery.candidate_pairs(
+            discovery.parse_holdings("\n".join([lines[0], *reversed(lines[1:])])),
+            discovery.dt.date(2023, 1, 1),
+            discovery.dt.date(2024, 1, 1),
+            1.0,
+            30.0,
+            (-170.0, 5.0, -50.0, 75.0),
+        )
+        reversed_station_pairs = [
+            tuple(sorted((first.station_id, second.station_id)))
+            for first, second, _ in reversed_pairs
+        ]
+        self.assertIn(("AAAA", "BBBB"), station_pairs)
+        self.assertIn(("EEEE", "FFFF"), station_pairs)
+        self.assertEqual(station_pairs, reversed_station_pairs)
+        self.assertEqual(len(station_pairs), len(set(station_pairs)))
+
     def test_preregistered_exclusions_are_applied_before_cohort_freeze(self) -> None:
         stations = discovery.parse_holdings(HOLDINGS)
         exclusions = discovery.Exclusions(
