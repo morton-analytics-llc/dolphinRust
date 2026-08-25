@@ -42,7 +42,7 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "dddd98e66031deea8535705016106ab1bec32e73f020b6f296de26ed2652cef6"
+FROZEN_GENERATOR_SHA256 = "6bdc16d655105f7db8a25ba7f965f171d682b9c8c8604760ad3459500ebcafcf"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ec37d83f50ae66f24d2b371809cc1e733c8207253b5e3e21c185882349619e25"
 FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "7dd2dd03fd95a51996761006254a641ab4d15d8ebdbfe75559b67192c0351b69"
+FROZEN_SOURCE_SET_SHA256 = "99dd6e426ac609ca327cd06b32897ff5536fa1e3560ee8a31e497a968f6e0d69"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -2671,14 +2671,17 @@ def _replay_positive_overlap_cohort(
     except ModuleNotFoundError:
         from spatial_covariance_simulation import generate_positive_overlap_cohort
 
-    return generate_positive_overlap_cohort(
-        preregistration,
-        preregistration_path,
-        batch_binary,
-        code_sha256,
-        binary_sha256,
-        FROZEN_POSITIVE_OVERLAP_SEED_COUNT,
-    )
+    try:
+        return generate_positive_overlap_cohort(
+            preregistration,
+            preregistration_path,
+            batch_binary,
+            code_sha256,
+            binary_sha256,
+            FROZEN_POSITIVE_OVERLAP_SEED_COUNT,
+        )
+    except Exception as exc:
+        raise SchemaError(f"positive-overlap execution replay failed: {exc}") from exc
 
 
 def _validate_positive_overlap_execution_replay(

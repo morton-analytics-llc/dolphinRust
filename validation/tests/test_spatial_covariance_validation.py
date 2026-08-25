@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -1566,6 +1567,66 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                     attempt_regenerator=lambda *_: iter(()),
                     production_parity_fixture={},
                 )
+
+    def test_direct_file_scorer_translates_foreign_replay_exception_to_fail_json(self):
+        namespace = runpy.run_path(
+            str(VALIDATION / "score_spatial_covariance.py"),
+            run_name="direct_score_spatial_covariance",
+        )
+        self.assertIsNot(namespace["SchemaError"], SchemaError)
+        run_manifest = {
+            name: None for name in namespace["RUN_MANIFEST_KEYS"]
+        }
+        run_manifest.update({
+            "schema": "dolphinrust.spatial-covariance.run-manifest/5",
+            "schema_version": 5,
+            "preregistration_sha256": preregistration_digest(self.preregistration),
+            "code_sha256": CODE,
+            "binary_sha256": BINARY,
+            "generator_protocol_sha256": sha256_json(
+                self.preregistration["execution_protocol"]
+            ),
+            "performance_probe": {},
+            "resources": [],
+            "production_parity_fixture": {},
+            "production_parity_fixture_sha256": "c" * 64,
+            "preoutcome_manifest_sha256": "d" * 64,
+            "positive_overlap_cohort_sha256": "e" * 64,
+        })
+        score_run = namespace["score_run_manifest"]
+        replacements = {
+            "validate_preregistration": lambda *_: None,
+            "_read_hashed_json_record": lambda *_: (run_manifest, b"", "f" * 64),
+            "validate_producer_identities": lambda *_: None,
+            "_validate_performance_probe": lambda *_: None,
+            "_validate_resources": lambda *_: [],
+            "validate_production_parity_fixture": lambda *_: None,
+            "validate_positive_overlap_run_binding": lambda *_: None,
+        }
+        with (
+            mock.patch.dict(score_run.__globals__, replacements),
+            mock.patch(
+                "validation.spatial_covariance_simulation.generate_positive_overlap_cohort",
+                side_effect=SchemaError("foreign generator failure"),
+            ),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            manifest_path = Path(directory) / "run-manifest.jsonl"
+            manifest_path.write_bytes(b"{}\n")
+            result = score_run(
+                self.preregistration,
+                manifest_path,
+                source_root=Path("."),
+                batch_binary=Path("batch"),
+                benchmark_binary=Path("benchmark"),
+                preregistration_path=PREREGISTRATION,
+            )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(
+            result["errors"],
+            ["positive-overlap execution replay failed: foreign generator failure"],
+        )
+        self.assertIsInstance(json.dumps(result), str)
 
     def test_resume_rejects_self_consistent_replaced_summary_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
