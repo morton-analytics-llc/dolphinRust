@@ -759,6 +759,30 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertEqual(summary["emitted_seeds"], 1)
         self.assertEqual(summary["status"], "fail")
 
+    def test_coincident_cell_passes_with_one_ill_conditioned_abstention(self):
+        cell_ordinal = expected_cell_ids(self.preregistration).index(CELL)
+        accumulator = self._accumulator(CELL, ordinal=cell_ordinal, seeds=128)
+        for seed_index in range(128):
+            attempt = (
+                self._nondifferentiable_attempt(
+                    CELL, cell_ordinal, seed_index, status="ill_conditioned"
+                )
+                if seed_index == 127
+                else self._attempt(CELL, cell_ordinal, seed_index)
+            )
+            accumulator.add(attempt)
+        with mock.patch.object(
+            accumulator, "_aggregate_operator_errors", return_value=(0.0, 0.0)
+        ):
+            summary = accumulator.finalize()
+        self.assertEqual(summary["status"], "pass")
+        self.assertEqual(summary["emitted_seeds"], 127)
+        self.assertEqual(summary["status_histogram"]["ill_conditioned"], 1)
+        self.assertTrue(all(value == 1.0 for value in summary["coverage_95_by_date"][1:]))
+        validate_cell_summary(
+            self.preregistration, summary, CELL, cell_ordinal, CODE, BINARY
+        )
+
     def test_coverage_is_gated_per_date_and_names_final_date(self):
         accumulator = self._accumulator(SUPPORTED_CELL, seeds=2)
         for seed_index in range(2):
