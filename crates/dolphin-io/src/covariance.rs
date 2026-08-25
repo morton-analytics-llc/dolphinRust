@@ -2794,6 +2794,42 @@ impl CovarianceOperatorWriter {
         })
     }
 
+    /// Mark one fully written generation immutable for subsequent NRT reuse.
+    ///
+    /// # Errors
+    /// Returns an error when the registry/generation is absent or any planned
+    /// tile block has not yet been written and content-bound.
+    pub fn seal_generation(&mut self, burst_id: &str, generation: u32) -> Result<()> {
+        ensure_valid(
+            !self.poisoned,
+            "covariance operator writer is poisoned by an earlier rejected block",
+        )?;
+        let identity = self
+            .generation_registry
+            .as_mut()
+            .and_then(|registry| {
+                registry.generations.iter_mut().find(|identity| {
+                    identity.burst_id == burst_id && identity.generation == generation
+                })
+            })
+            .ok_or_else(|| invalid("covariance generation is absent from the writer registry"))?;
+        ensure_valid(
+            identity
+                .blocks
+                .iter()
+                .all(|block| block.block_sha256.iter().any(|byte| *byte != 0)),
+            "covariance generation cannot seal before every planned block is written",
+        )?;
+        identity.sealed = true;
+        Ok(())
+    }
+
+    /// Current generation registry including recorded logical block digests.
+    #[must_use]
+    pub const fn generation_registry(&self) -> Option<&CovarianceGenerationRegistry> {
+        self.generation_registry.as_ref()
+    }
+
     fn write_block_inner(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
         block.validate(self.metadata.gauge_date_index)?;
         let topology = CovarianceBlockTopology::from(block);

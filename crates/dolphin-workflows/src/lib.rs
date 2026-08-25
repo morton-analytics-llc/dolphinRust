@@ -51,11 +51,15 @@ pub use provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
-    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    plan_sequential_covariance_capture, plan_sequential_masked_covariance_capture, run_sequential,
+    run_sequential_masked, run_sequential_masked_with_covariance_capture,
     run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
-    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
+    run_sequential_resumable_masked, run_sequential_resumable_masked_with_covariance_capture,
+    run_sequential_resumable_with_covariance_capture, run_sequential_with_covariance_capture,
     run_sequential_with_covariance_capture_and_source_factors, update_sequential,
-    update_sequential_masked, SequentialConfig, SequentialOutput, SequentialState,
+    update_sequential_masked, update_sequential_masked_with_covariance_capture,
+    update_sequential_with_covariance_capture, SequentialConfig, SequentialCovarianceCapturePlan,
+    SequentialCovarianceRevision, SequentialCovarianceState, SequentialOutput, SequentialState,
 };
 pub use sequential_covariance::{
     empirical_source_factor_receipt_digest, sequential_replay_config_digest,
