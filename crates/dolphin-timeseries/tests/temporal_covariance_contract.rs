@@ -1,11 +1,14 @@
 //! Red/green analytic contracts for the pure temporal #53 kernel.
 
 use dolphin_timeseries::{
-    continuous_time_ar1_correlation, fit_temporal_covariance, relative_standard_deviation_shape,
-    subset_origin_anchored_covariance, temporal_covariance_provenance,
-    temporal_parameter_boundary_status, total_difference_covariance, Sha256Digest,
-    TemporalCovarianceApproximation, TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs,
-    TemporalInferenceStatus, TemporalReferenceProvenance, TemporalValidationScope,
+    complete_refit_bootstrap_estimate, continuous_time_ar1_correlation, fit_temporal_covariance,
+    relative_standard_deviation_shape, subset_origin_anchored_covariance,
+    temporal_covariance_provenance, temporal_parameter_boundary_status,
+    total_difference_covariance, CompleteRefitBootstrapCadenceStatus,
+    CompleteRefitBootstrapEstimateStatus, Sha256Digest, TemporalCovarianceApproximation,
+    TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
+    TemporalReferenceProvenance, TemporalValidationScope, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
+    COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
 };
 use statrs::function::erf::erf;
 
@@ -45,6 +48,157 @@ fn issue54_difference_variance(name: &str) -> f64 {
     let difference = case["expected_difference_variance"].as_f64().unwrap();
     assert_eq!(difference, target + reference - 2.0 * cross);
     difference
+}
+
+fn frozen_bootstrap_candidate_fixture() -> (
+    dolphin_timeseries::TemporalCovarianceFit,
+    TemporalCovarianceOptions,
+) {
+    let (days, observations, covariance) = twelve_date_fixture();
+    let fit_options = TemporalCovarianceOptions {
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let mut fit = fit_temporal_covariance(&days, &observations, &covariance, &fit_options);
+    assert_eq!(fit.status, TemporalInferenceStatus::Evaluated);
+    fit.bootstrap_slope = Some(3.5);
+    fit.bootstrap_attempts = COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS;
+    fit.bootstrap_successes = COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES;
+    fit.complete_refit_bootstrap.status = TemporalInferenceStatus::Evaluated;
+    fit.complete_refit_bootstrap.point_estimate = Some(3.5);
+    fit.complete_refit_bootstrap.standard_error_diagnostic = Some(0.4);
+    fit.complete_refit_bootstrap.attempted_replicates = COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS;
+    fit.complete_refit_bootstrap.successful_replicates = COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES;
+    (fit, TemporalCovarianceOptions::default())
+}
+
+#[test]
+fn complete_refit_bootstrap_candidate_requires_frozen_evaluated_evidence() {
+    let (fit, options) = frozen_bootstrap_candidate_fixture();
+    let selected = complete_refit_bootstrap_estimate(&fit, &options);
+
+    assert_eq!(
+        selected.status,
+        CompleteRefitBootstrapEstimateStatus::Evaluated
+    );
+    assert_eq!(selected.slope_per_year, Some(3.5));
+    assert_eq!(selected.standard_error_per_year, Some(0.4));
+    assert_eq!(selected.valid_date_count, fit.valid_date_count);
+    assert_eq!(selected.rank, fit.rank);
+    assert_eq!(selected.degrees_of_freedom, fit.degrees_of_freedom);
+    assert_eq!(selected.raw_rho, fit.raw_correlation.rho);
+    assert_eq!(selected.fitted_rho, fit.fitted_rho);
+    assert_eq!(
+        selected.fitted_process_variance,
+        fit.fitted_process_variance
+    );
+    assert_eq!(selected.condition_number, fit.covariance_condition_number);
+    assert_eq!(
+        selected.cadence_status,
+        CompleteRefitBootstrapCadenceStatus::Supported
+    );
+    assert_eq!(selected.method, "complete_refit_bootstrap");
+    assert_eq!(selected.method_version, 1);
+    assert_eq!(
+        selected.bootstrap_attempts,
+        COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS
+    );
+    assert_eq!(
+        selected.bootstrap_successes,
+        COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES
+    );
+    assert_eq!(
+        serde_json::to_value(selected).unwrap()["status"],
+        "evaluated"
+    );
+    assert_eq!(
+        serde_json::to_value(TemporalInferenceStatus::OptimizerNonconverged).unwrap(),
+        "optimizer_nonconverged"
+    );
+}
+
+#[test]
+fn complete_refit_bootstrap_candidate_abstains_on_fit_or_comparator_failure() {
+    let (mut fit, options) = frozen_bootstrap_candidate_fixture();
+    fit.status = TemporalInferenceStatus::OptimizerNonconverged;
+    let selected = complete_refit_bootstrap_estimate(&fit, &options);
+    assert_eq!(
+        selected.status,
+        CompleteRefitBootstrapEstimateStatus::FitNotEvaluated
+    );
+    assert!(selected.slope_per_year.is_none());
+    assert!(selected.standard_error_per_year.is_none());
+
+    fit.status = TemporalInferenceStatus::UnsupportedCadence;
+    let selected = complete_refit_bootstrap_estimate(&fit, &options);
+    assert_eq!(
+        selected.cadence_status,
+        CompleteRefitBootstrapCadenceStatus::Unsupported
+    );
+
+    let (mut fit, options) = frozen_bootstrap_candidate_fixture();
+    fit.complete_refit_bootstrap.status = TemporalInferenceStatus::BootstrapInsufficientSuccess;
+    assert_eq!(
+        complete_refit_bootstrap_estimate(&fit, &options).status,
+        CompleteRefitBootstrapEstimateStatus::ComparatorNotEvaluated
+    );
+}
+
+#[test]
+fn complete_refit_bootstrap_candidate_rejects_nonfinite_or_inconsistent_values() {
+    let (fit, options) = frozen_bootstrap_candidate_fixture();
+    for (bootstrap_slope, point_estimate, standard_error) in [
+        (Some(f64::NAN), Some(3.5), Some(0.4)),
+        (Some(3.5), Some(f64::INFINITY), Some(0.4)),
+        (Some(3.5), Some(3.5), Some(f64::NAN)),
+        (Some(3.5), Some(3.5), Some(-0.1)),
+        (Some(3.6), Some(3.5), Some(0.4)),
+    ] {
+        let mut invalid = fit.clone();
+        invalid.bootstrap_slope = bootstrap_slope;
+        invalid.complete_refit_bootstrap.point_estimate = point_estimate;
+        invalid.complete_refit_bootstrap.standard_error_diagnostic = standard_error;
+        let selected = complete_refit_bootstrap_estimate(&invalid, &options);
+        assert_eq!(
+            selected.status,
+            CompleteRefitBootstrapEstimateStatus::InvalidEstimate
+        );
+        assert!(selected.slope_per_year.is_none());
+        assert!(selected.standard_error_per_year.is_none());
+    }
+}
+
+#[test]
+fn complete_refit_bootstrap_candidate_requires_exact_frozen_accounting() {
+    let (fit, mut options) = frozen_bootstrap_candidate_fixture();
+    options.bootstrap_replicates -= 1;
+    assert_eq!(
+        complete_refit_bootstrap_estimate(&fit, &options).status,
+        CompleteRefitBootstrapEstimateStatus::FrozenConfigurationMismatch
+    );
+
+    let (mut fit, options) = frozen_bootstrap_candidate_fixture();
+    fit.bootstrap_attempts -= 1;
+    assert_eq!(
+        complete_refit_bootstrap_estimate(&fit, &options).status,
+        CompleteRefitBootstrapEstimateStatus::BootstrapAccountingMismatch
+    );
+
+    let (mut fit, options) = frozen_bootstrap_candidate_fixture();
+    fit.complete_refit_bootstrap.successful_replicates -= 1;
+    assert_eq!(
+        complete_refit_bootstrap_estimate(&fit, &options).status,
+        CompleteRefitBootstrapEstimateStatus::BootstrapAccountingMismatch
+    );
+
+    let (mut fit, options) = frozen_bootstrap_candidate_fixture();
+    fit.bootstrap_successes = COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES - 1;
+    fit.complete_refit_bootstrap.successful_replicates = fit.bootstrap_successes;
+    assert_eq!(
+        complete_refit_bootstrap_estimate(&fit, &options).status,
+        CompleteRefitBootstrapEstimateStatus::BootstrapInsufficientSuccess
+    );
 }
 
 #[test]

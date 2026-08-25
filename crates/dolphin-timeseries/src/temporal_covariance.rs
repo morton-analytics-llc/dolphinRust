@@ -13,10 +13,20 @@ use statrs::distribution::{ChiSquared, ContinuousCDF, Normal, StudentsT};
 const DAYS_PER_YEAR: f64 = 365.25;
 const SYMMETRY_TOLERANCE: f64 = 1e-10;
 
+/// Frozen complete-refit bootstrap attempt count from the #53 preregistration.
+pub const COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS: usize = 200;
+/// Frozen minimum successful bootstrap count from the #53 preregistration.
+pub const COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES: usize = 198;
+/// Stable identity of the preregistered #53 estimate candidate.
+pub const COMPLETE_REFIT_BOOTSTRAP_METHOD: &str = "complete_refit_bootstrap";
+/// Stable schema/method version of the preregistered #53 estimate candidate.
+pub const COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION: u16 = 1;
+
 type SubsetSeries = (Vec<f64>, Vec<f64>, Vec<Vec<f64>>);
 
 /// Stable failure/status codes for temporal covariance fitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TemporalInferenceStatus {
     /// All requested point-estimate and validation computations completed.
     Evaluated,
@@ -230,6 +240,81 @@ pub struct TemporalCovarianceFit {
     /// Number of bootstrap attempts.
     pub bootstrap_attempts: usize,
     /// Number of successful bootstrap refits.
+    pub bootstrap_successes: usize,
+}
+
+/// Fail-closed disposition of the preregistered complete-refit estimate candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompleteRefitBootstrapEstimateStatus {
+    /// The frozen complete-refit candidate is numerically complete.
+    Evaluated,
+    /// The overall temporal covariance fit did not evaluate.
+    FitNotEvaluated,
+    /// The selected complete-refit comparator did not evaluate.
+    ComparatorNotEvaluated,
+    /// Runtime options do not match the frozen preregistration.
+    FrozenConfigurationMismatch,
+    /// Fit and comparator bootstrap counters are not the exact frozen accounting.
+    BootstrapAccountingMismatch,
+    /// Successful refits do not meet both frozen and 99% requirements.
+    BootstrapInsufficientSuccess,
+    /// The selected point estimate or standard error is absent, non-finite, or invalid.
+    InvalidEstimate,
+}
+
+/// Supported-cadence disposition carried by the complete-refit candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompleteRefitBootstrapCadenceStatus {
+    /// The fit reached the frozen supported-cadence predicate.
+    Supported,
+    /// The scheduled acquisition cadence was outside the frozen predicate.
+    Unsupported,
+    /// Cadence could not be classified before another input failure.
+    Unavailable,
+}
+
+/// Promotion-neutral, persistable complete-refit estimate candidate.
+///
+/// Calibration and product-promotion evidence are intentionally absent. The
+/// workflow evidence validator must add those claims after validating the
+/// immutable #52/#54/#53 receipt bundle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteRefitBootstrapEstimate {
+    /// Numeric selection disposition.
+    pub status: CompleteRefitBootstrapEstimateStatus,
+    /// Exact upstream fit disposition.
+    pub fit_status: TemporalInferenceStatus,
+    /// Selected origin-anchored slope in units per year.
+    pub slope_per_year: Option<f64>,
+    /// Complete-refit bootstrap standard error in units per year.
+    pub standard_error_per_year: Option<f64>,
+    /// Retained post-gauge date count.
+    pub valid_date_count: usize,
+    /// Origin-anchored design rank.
+    pub rank: usize,
+    /// Residual degrees of freedom.
+    pub degrees_of_freedom: usize,
+    /// Minimum, median, and maximum retained cadence in days.
+    pub cadence_days: [Option<f64>; 3],
+    /// Frozen supported-cadence disposition.
+    pub cadence_status: CompleteRefitBootstrapCadenceStatus,
+    /// Unclamped adjacent residual correlation.
+    pub raw_rho: Option<f64>,
+    /// Fitted continuous-time correlation.
+    pub fitted_rho: Option<f64>,
+    /// Fitted residual process variance.
+    pub fitted_process_variance: Option<f64>,
+    /// Stable selected-method identity.
+    pub method: String,
+    /// Stable selected-method version.
+    pub method_version: u16,
+    /// Fitted total covariance condition number.
+    pub condition_number: Option<f64>,
+    /// Complete-refit bootstrap attempts.
+    pub bootstrap_attempts: usize,
+    /// Successful complete-refit bootstrap attempts.
     pub bootstrap_successes: usize,
 }
 
@@ -743,6 +828,93 @@ pub fn fit_temporal_covariance(
         bootstrap_attempts: bootstrap.attempts,
         bootstrap_successes: bootstrap.successes,
     }
+}
+
+/// Select the frozen complete-refit bootstrap estimate as a promotion-neutral candidate.
+///
+/// The returned point estimate and standard error remain absent unless the
+/// overall fit and selected comparator evaluated, the frozen preregistration
+/// is unchanged, bootstrap accounting is exact, and all selected values are
+/// finite. This function does not validate calibration or promotion evidence.
+#[must_use]
+pub fn complete_refit_bootstrap_estimate(
+    fit: &TemporalCovarianceFit,
+    options: &TemporalCovarianceOptions,
+) -> CompleteRefitBootstrapEstimate {
+    let cadence_status = match fit.status {
+        TemporalInferenceStatus::Evaluated => CompleteRefitBootstrapCadenceStatus::Supported,
+        TemporalInferenceStatus::UnsupportedCadence => {
+            CompleteRefitBootstrapCadenceStatus::Unsupported
+        }
+        _ => CompleteRefitBootstrapCadenceStatus::Unavailable,
+    };
+    let result = |status, slope_per_year, standard_error_per_year| CompleteRefitBootstrapEstimate {
+        status,
+        fit_status: fit.status,
+        slope_per_year,
+        standard_error_per_year,
+        valid_date_count: fit.valid_date_count,
+        rank: fit.rank,
+        degrees_of_freedom: fit.degrees_of_freedom,
+        cadence_days: [
+            fit.raw_correlation.minimum_gap_days,
+            fit.raw_correlation.median_gap_days,
+            fit.raw_correlation.maximum_gap_days,
+        ],
+        cadence_status,
+        raw_rho: fit.raw_correlation.rho,
+        fitted_rho: fit.fitted_rho,
+        fitted_process_variance: fit.fitted_process_variance,
+        method: COMPLETE_REFIT_BOOTSTRAP_METHOD.to_owned(),
+        method_version: COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+        condition_number: fit.covariance_condition_number,
+        bootstrap_attempts: fit.bootstrap_attempts,
+        bootstrap_successes: fit.bootstrap_successes,
+    };
+    let abstain = |status| result(status, None, None);
+    if options.bootstrap_replicates != COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS
+        || options.bootstrap_minimum_successes != COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES
+    {
+        return abstain(CompleteRefitBootstrapEstimateStatus::FrozenConfigurationMismatch);
+    }
+    if fit.status != TemporalInferenceStatus::Evaluated {
+        return abstain(CompleteRefitBootstrapEstimateStatus::FitNotEvaluated);
+    }
+    let selected = &fit.complete_refit_bootstrap;
+    if selected.status != TemporalInferenceStatus::Evaluated {
+        return abstain(CompleteRefitBootstrapEstimateStatus::ComparatorNotEvaluated);
+    }
+    if fit.bootstrap_attempts != COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS
+        || selected.attempted_replicates != COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS
+        || fit.bootstrap_successes != selected.successful_replicates
+    {
+        return abstain(CompleteRefitBootstrapEstimateStatus::BootstrapAccountingMismatch);
+    }
+    let minimum_successes = required_bootstrap_successes(COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS)
+        .max(COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES);
+    if fit.bootstrap_successes < minimum_successes {
+        return abstain(CompleteRefitBootstrapEstimateStatus::BootstrapInsufficientSuccess);
+    }
+    let (Some(fit_slope), Some(selected_slope), Some(standard_error)) = (
+        fit.bootstrap_slope,
+        selected.point_estimate,
+        selected.standard_error_diagnostic,
+    ) else {
+        return abstain(CompleteRefitBootstrapEstimateStatus::InvalidEstimate);
+    };
+    if !fit_slope.is_finite()
+        || !selected_slope.is_finite()
+        || !standard_error.is_finite()
+        || standard_error < 0.0
+        || fit_slope != selected_slope
+    {
+        return abstain(CompleteRefitBootstrapEstimateStatus::InvalidEstimate);
+    }
+    result(
+        CompleteRefitBootstrapEstimateStatus::Evaluated,
+        Some(selected_slope),
+        Some(standard_error),
+    )
 }
 
 /// Build validation-only F53-03 provenance without enabling any product writer.

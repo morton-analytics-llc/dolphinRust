@@ -34,12 +34,16 @@ pub use spatial_covariance::{
     FIXED_L2_SPATIAL_COVARIANCE_METHOD,
 };
 pub use temporal_covariance::{
-    continuous_time_ar1_correlation, fit_temporal_covariance, raw_adjacent_correlation,
-    relative_standard_deviation_shape, subset_origin_anchored_covariance,
+    complete_refit_bootstrap_estimate, continuous_time_ar1_correlation, fit_temporal_covariance,
+    raw_adjacent_correlation, relative_standard_deviation_shape, subset_origin_anchored_covariance,
     temporal_covariance_provenance, temporal_parameter_boundary_status,
-    total_difference_covariance, RawCorrelationDiagnostics, Sha256Digest,
-    TemporalCovarianceApproximation, TemporalCovarianceFit, TemporalCovarianceOptions,
-    TemporalCovarianceProvenance, TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
-    TemporalReferenceProvenance, TemporalValidationScope, ValidationInterval,
+    total_difference_covariance, CompleteRefitBootstrapCadenceStatus,
+    CompleteRefitBootstrapEstimate, CompleteRefitBootstrapEstimateStatus,
+    RawCorrelationDiagnostics, Sha256Digest, TemporalCovarianceApproximation,
+    TemporalCovarianceFit, TemporalCovarianceOptions, TemporalCovarianceProvenance,
+    TemporalCovarianceProvenanceInputs, TemporalInferenceStatus, TemporalReferenceProvenance,
+    TemporalValidationScope, ValidationInterval, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
+    COMPLETE_REFIT_BOOTSTRAP_METHOD, COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+    COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
 };
 pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};
