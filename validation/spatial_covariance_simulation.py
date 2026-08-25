@@ -546,7 +546,20 @@ def commit_output_shard(
         "elapsed_seconds": elapsed_seconds, "peak_rss_bytes": peak_rss_bytes, "committed": True,
     }
     validate_shard_manifest(preregistration, manifest, spec)
-    return write_jsonl_atomic((manifest,), manifest_path, byte_limit=preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"])
+    receipt = write_jsonl_atomic(
+        (manifest,), manifest_path,
+        byte_limit=preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
+    )
+    descriptor = root / "requests" / f"shard-{spec.index:05d}.jsonl"
+    descriptor.unlink(missing_ok=True)
+    requests_directory = descriptor.parent
+    if requests_directory.exists():
+        descriptor_directory = os.open(requests_directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor_directory)
+        finally:
+            os.close(descriptor_directory)
+    return receipt
 
 
 def committed_shard_matches(

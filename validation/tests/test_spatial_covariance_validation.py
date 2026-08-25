@@ -35,12 +35,14 @@ from validation.score_spatial_covariance import (
     deterministic_normals,
     expected_cell_ids,
     expected_seed_count,
+    expected_production_artifact_provenance,
     independently_recompute_metrics,
     load_preregistration,
     numeric_digest,
     regenerate_frozen_attempt_inputs,
     sha256_json,
     validate_cell_summary,
+    validate_direct_pair_variance_order,
     validate_preregistration,
 )
 from validation.spatial_covariance_simulation import (
@@ -80,11 +82,16 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         sign = "zero"
         influence = 0.0
         if labels["pair_geometry"].endswith("_positive"):
-            sign, influence = "positive", 0.1
+            sign = "positive"
         elif labels["pair_geometry"].endswith("_negative"):
-            sign, influence = "negative", -0.1
+            sign = "negative"
         elif labels["pair_geometry"].startswith("disjoint_"):
             sign = "none"
+        if sign in {"positive", "negative"}:
+            influence = (
+                frozen["target_global_loading_mean"]
+                * frozen["reference_global_loading_mean"]
+            )
         attempt = {
             "schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
             "cell_id": cell_id,
@@ -125,7 +132,26 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "target_estimate_history": None if masked else copy.deepcopy(frozen["latent_target_history"]),
             "reference_estimate_history": None if masked else copy.deepcopy(frozen["latent_reference_history"]),
             "predicted_difference_covariance": None,
+            "production_operator_matrix": None,
+            "dense_oracle_matrix": None,
+            "contrast_weights": None,
+            "operator_sha256": "0" * 64,
+            "oracle_sha256": "0" * 64,
         }
+        provenance = expected_production_artifact_provenance(
+            self.preregistration, cell_id, seed_index
+        )
+        artifact = {
+            "schema": "dolphinrust.spatial-reference-covariance-artifact/4",
+            "schema_version": 4,
+            "hdf5_sha256": "c" * 64,
+            "manifest_sha256": "d" * 64,
+            "factor_sha256": "0" * 64,
+            "reference_provenance": provenance,
+            "reference_provenance_sha256": sha256_json(provenance),
+        }
+        attempt["production_artifact"] = artifact
+        attempt["production_artifact_sha256"] = sha256_json(artifact)
         if not masked:
             dates = len(frozen["latent_target_history"])
             covariance = [[0.0] * dates for _ in range(dates)]
@@ -133,6 +159,16 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 for index in range(1, dates):
                     covariance[index][index] = 1.0
             attempt["predicted_difference_covariance"] = covariance
+            joint = [[0.0] * (2 * dates) for _ in range(2 * dates)]
+            if labels["pair_geometry"] != "coincident":
+                for index in range(1, dates):
+                    joint[index][index] = 0.5
+                    joint[dates + index][dates + index] = 0.5
+            attempt["production_operator_matrix"] = copy.deepcopy(joint)
+            attempt["dense_oracle_matrix"] = copy.deepcopy(joint)
+            attempt["contrast_weights"] = [0.0] * (2 * dates)
+            attempt["contrast_weights"][dates - 1] = 1.0
+            attempt["contrast_weights"][-1] = -1.0
             attempt["estimate_sha256"] = numeric_digest(
                 "estimate-history-v4",
                 [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
@@ -141,6 +177,14 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 "predicted-difference-covariance-v4",
                 [value for row in covariance for value in row],
             )
+            attempt["operator_sha256"] = numeric_digest(
+                "production-operator-v4", [value for row in joint for value in row]
+            )
+            attempt["oracle_sha256"] = numeric_digest(
+                "dense-oracle-v4", [value for row in joint for value in row]
+            )
+            artifact["factor_sha256"] = attempt["operator_sha256"]
+            attempt["production_artifact_sha256"] = sha256_json(artifact)
         self.assertEqual(set(attempt), ATTEMPT_KEYS)
         return attempt
 
@@ -158,7 +202,13 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             date_count = matrix[name]["dates"]
             microbatch_pixels = min(tile_pixels, 4096)
             allocation_model = {"model": "named-allocation-components-v1", "area_axis": "tile_pixels", "date_axis": "date_count", "forbid_multiple_area_scaled_axes": True}
-            dependency_cone = {"model": "spatial-query-cone-v1", "tile_pixels": tile_pixels, "date_count": date_count, "maximum_sources": tile_pixels}
+            block_count = max(1, math.ceil(date_count / 7))
+            dependency_cone = {
+                "model": "spatial-query-cone-v1", "tile_pixels": tile_pixels,
+                "date_count": date_count, "maximum_sources": tile_pixels,
+                "block_count": block_count, "maximum_dependency_depth": block_count - 1,
+                "reference_cone_sources": tile_pixels,
+            }
             microbatch = {"model": "bounded-microbatch-v1", "microbatch_pixels": microbatch_pixels, "batch_count": (tile_pixels + microbatch_pixels - 1) // microbatch_pixels}
             component_specs = (
                 ("source_cache", 16, [("tile_pixels", tile_pixels, True), ("date_count", date_count, False)]),
@@ -183,6 +233,23 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 components.append(component)
             observations = []
             for repetition in range(3):
+                allocation_measurement = {
+                    "block_count": dependency_cone["block_count"],
+                    "maximum_sources_per_block": matrix[name]["tile_pixels"],
+                    "maximum_dependency_depth": dependency_cone["maximum_dependency_depth"],
+                    "reference_cone_sources": matrix[name]["tile_pixels"],
+                    "persisted_block_bytes": 16 * matrix[name]["tile_pixels"] * matrix[name]["dates"],
+                    "scratch_bytes": 16 * matrix[name]["tile_pixels"] * matrix[name]["dates"],
+                    "final_bytes": 8 * matrix[name]["dates"] * matrix[name]["dates"],
+                    "allocation_components": copy.deepcopy(components),
+                    "maximum_simultaneously_retained_bytes": 0,
+                }
+                allocation_measurement["maximum_simultaneously_retained_bytes"] = (
+                    allocation_measurement["persisted_block_bytes"]
+                    + allocation_measurement["scratch_bytes"]
+                    + allocation_measurement["final_bytes"]
+                    + sum(component["bytes"] for component in components)
+                )
                 raw_measurement = {
                     "command": ["cargo", "run", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_bench", "--", "--tile-pixels", str(matrix[name]["tile_pixels"]), "--dates", str(matrix[name]["dates"])],
                     "exit_status": 0,
@@ -194,6 +261,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                     "hardware_class": sampling["hardware_class"],
                     "ram_bytes": sampling["ram_bytes"],
                     "tool_versions": {"rustc": "rustc test", "cargo": "cargo test", "uname": "Darwin test"},
+                    "allocation_measurement": allocation_measurement,
+                    "allocation_measurement_sha256": sha256_json(allocation_measurement),
                 }
                 observations.append({"repetition": repetition, "tile_pixels": matrix[name]["tile_pixels"], "date_count": matrix[name]["dates"], "peak_rss_bytes": peaks[name] - 2 + repetition, "wall_seconds": 1.0, "raw_measurement": raw_measurement, "raw_measurement_sha256": sha256_json(raw_measurement)})
             item = {"resource_id": name, "status": PASS, "rss_bytes": peaks[name], "growth_class": "linear", "resource_hash": "", "config_hash": sha256_json(self.preregistration["generator"]), "binary_hash": BINARY, "os": sampling["os"], "hardware_class": sampling["hardware_class"], "ram_bytes": sampling["ram_bytes"], "rss_sampler": sampling["rss_sampler"], "rss_field": sampling["rss_field"], "warmup_runs": sampling["warmup_runs"], "measured_repetitions": sampling["measured_repetitions"], "tool_versions": sampling["tool_versions"], "growth_observation": observations, "area_growth_exponent": area, "date_growth_exponent": dates, "acceptance": sampling["acceptance"], "allocation_model": allocation_model, "allocation_model_sha256": sha256_json(allocation_model), "dependency_cone": dependency_cone, "dependency_cone_sha256": sha256_json(dependency_cone), "microbatch": microbatch, "microbatch_sha256": sha256_json(microbatch), "allocation_components": components}
@@ -253,6 +322,28 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         attempt["latent_history_sha256"] = "f" * 64
         with self.assertRaisesRegex(SchemaError, "latent"):
             CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY).add(attempt)
+
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["production_artifact"]["reference_provenance"]["estimator_branch"] = "evd"
+        attempt["production_artifact"]["reference_provenance_sha256"] = sha256_json(
+            attempt["production_artifact"]["reference_provenance"]
+        )
+        attempt["production_artifact_sha256"] = sha256_json(attempt["production_artifact"])
+        with self.assertRaisesRegex(SchemaError, "production HDF5 artifact"):
+            CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY).add(attempt)
+
+    def test_operator_and_contrast_variance_errors_are_independently_gated(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["production_operator_matrix"][-1][-1] = 2.0
+        attempt["operator_sha256"] = numeric_digest(
+            "production-operator-v4",
+            [value for row in attempt["production_operator_matrix"] for value in row],
+        )
+        attempt["production_artifact"]["factor_sha256"] = attempt["operator_sha256"]
+        attempt["production_artifact_sha256"] = sha256_json(attempt["production_artifact"])
+        accumulator = CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY)
+        accumulator.add(attempt)
+        self.assertEqual(accumulator.finalize()["status"], "fail")
 
     def test_emi_and_evd_estimator_histories_are_both_exercised_and_bound(self):
         for cell_id, branch in ((SUPPORTED_CELL, "emi"), (RISK_CELL, "evd")):
@@ -439,6 +530,46 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         accumulator.add(masked)
         self.assertIsNone(accumulator.finalize()["coverage_95_by_date"])
 
+    def test_negative_pair_dgp_has_negative_target_reference_error_loading(self):
+        negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative").replace(
+            "independent_complex_looks", "spatial_correlation_stress"
+        )
+        positive = negative.replace("shared_75_negative", "shared_75_positive")
+        negative_dgp = regenerate_frozen_attempt_inputs(self.preregistration, negative, 0)
+        positive_dgp = regenerate_frozen_attempt_inputs(self.preregistration, positive, 0)
+        self.assertLess(
+            negative_dgp["target_global_loading_mean"]
+            * negative_dgp["reference_global_loading_mean"],
+            0.0,
+        )
+        self.assertGreater(
+            positive_dgp["target_global_loading_mean"]
+            * positive_dgp["reference_global_loading_mean"],
+            0.0,
+        )
+
+    def test_attempt_contract_restores_operator_error_and_production_artifact_bindings(self):
+        for field in (
+            "production_operator_matrix", "dense_oracle_matrix", "contrast_weights",
+            "operator_sha256", "oracle_sha256", "production_artifact",
+            "production_artifact_sha256",
+        ):
+            self.assertIn(field, ATTEMPT_KEYS)
+        for threshold in (
+            "deterministic_operator_relative_error_max",
+            "stochastic_operator_relative_error_max",
+            "contrast_variance_relative_error_max",
+        ):
+            self.assertIn(threshold, self.preregistration["thresholds"])
+
+    def test_direct_pair_contract_requires_positive_independent_negative_order(self):
+        positive = {"predicted_covariance_trace": 1.0, "empirical_error_covariance_trace": 1.1}
+        independent = {"predicted_covariance_trace": 2.0, "empirical_error_covariance_trace": 2.1}
+        negative = {"predicted_covariance_trace": 3.0, "empirical_error_covariance_trace": 3.1}
+        validate_direct_pair_variance_order(positive, independent, negative)
+        with self.assertRaisesRegex(SchemaError, "positive < independent < negative"):
+            validate_direct_pair_variance_order(negative, independent, positive)
+
     def test_cell_summary_binds_attempt_digest_and_scope(self):
         accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
         accumulator.add(self._attempt(CELL, 0, 0))
@@ -515,6 +646,26 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             self.assertEqual(descriptor["expected_attempts"], expected_seed_count(CELL))
             self.assertEqual(descriptor["seed_counts"], [expected_seed_count(CELL)])
 
+    def test_committing_shard_deletes_preparation_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
+            descriptor = root / "requests" / "shard-00000.jsonl"
+            prepare_input_shard(self.preregistration, spec, descriptor)
+            transport = root / "attempts.jsonl"
+            transport.write_bytes(compact_json_line(self._attempt(MASKED_CELL, 0, 0, masked=True)))
+            commit_cell_transport(
+                self.preregistration, MASKED_CELL, 0, transport,
+                cells / "cell-00000.jsonl", CODE, BINARY,
+            )
+            commit_output_shard(
+                self.preregistration, spec, root, cells, root / "manifest.jsonl",
+                CODE, BINARY, 1.0, 1_000_000,
+            )
+            self.assertFalse(descriptor.exists())
+
     def test_area_and_date_sweeps_are_independently_identifiable(self):
         matrix = self.preregistration["resource_matrix"]
         self.assertEqual(len({item["tile_pixels"] for item in matrix if item["dates"] == 26}), 3)
@@ -559,6 +710,20 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
         resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
         with self.assertRaisesRegex(SchemaError, "named allocation formula"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_allocation_receipt_is_benchmark_emitted_and_hash_bound(self):
+        resources = self._resource_receipts()
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        self.assertIn("allocation_measurement", raw)
+        self.assertIn("allocation_measurement_sha256", raw)
+        raw["allocation_measurement"]["maximum_simultaneously_retained_bytes"] += 1
+        raw["allocation_measurement_sha256"] = sha256_json(raw["allocation_measurement"])
+        resources[0]["growth_observation"][0]["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json(
+            {key: value for key, value in resources[0].items() if key != "resource_hash"}
+        )
+        with self.assertRaisesRegex(SchemaError, "allocation arithmetic"):
             _validate_resources(self.preregistration, resources, BINARY)
 
     def test_manifest_hash_and_parse_use_one_identical_bounded_read(self):
