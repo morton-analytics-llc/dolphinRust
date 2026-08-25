@@ -2489,6 +2489,58 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 self.preregistration, cell_id, cell_ordinal, 1, CODE, BINARY
             ).add(attempt)
 
+    def test_adaptive_support_topology_binds_exact_effective_support(self):
+        expected_by_topology = {
+            "one_block": (
+                16,
+                "ce2759081c4e8257313bc381da9087f73fcbb207d8f8a08fd365d0ebf6aa3fb3",
+                0.249992593944808,
+            ),
+            "two_blocks": (
+                18,
+                "a06703e77a8a7d605d4902cc7dad6142dbaac3c80568155b4eb9b95145118ef0",
+                0.21680743563593532,
+            ),
+        }
+        for topology, expected in expected_by_topology.items():
+            cell_id = (
+                "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|"
+                f"{topology}|emi|well_separated|spatial_correlation_stress"
+            )
+            cell_ordinal = expected_cell_ids(self.preregistration).index(cell_id)
+            labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+            request = _cell_request_at(
+                self.preregistration, cell_id, cell_ordinal, labels, 0
+            )
+            completed = subprocess.run(
+                [
+                    str(Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch"),
+                    "--preregistration", str(PREREGISTRATION),
+                    "--cell-id", cell_id,
+                    "--ephemeral-evidence-stdout",
+                ],
+                input=compact_json_line(request),
+                check=True,
+                capture_output=True,
+            )
+            attempt = json.loads(completed.stdout)
+            regenerated = regenerate_frozen_attempt_inputs(
+                self.preregistration, cell_id, 0
+            )
+            self.assertEqual(regenerated["effective_support_union_count"], expected[0])
+            self.assertEqual(regenerated["source_correlation_receipt_sha256"], expected[1])
+            self.assertAlmostEqual(
+                regenerated["effective_looks_fraction"], expected[2], places=15
+            )
+            self.assertEqual(attempt["effective_support_union_count"], expected[0])
+            self.assertEqual(attempt["source_correlation_receipt_sha256"], expected[1])
+            self.assertAlmostEqual(
+                attempt["effective_looks_fraction"], expected[2], places=15
+            )
+            CellAccumulator(
+                self.preregistration, cell_id, cell_ordinal, 1, CODE, BINARY
+            ).add(attempt)
+
     def test_near_tie_attempt_binds_exact_dependency_cone_support(self):
         labels = dict(zip(DIMENSION_NAMES, NEAR_TIE_CELL.split("|")))
         cell_ordinal = expected_cell_ids(self.preregistration).index(NEAR_TIE_CELL)
