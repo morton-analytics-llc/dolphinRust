@@ -21,6 +21,7 @@ pub mod sequential_covariance;
 pub mod spatial_covariance_artifact;
 pub mod spatial_covariance_validation;
 mod spatial_reference_covariance_output;
+pub mod temporal_covariance_product;
 pub mod tiling;
 pub mod unwrap_backend;
 
@@ -94,5 +95,12 @@ pub use spatial_covariance_artifact::{
     read_spatial_reference_covariance_artifact_manifest,
     SpatialReferenceCovarianceArtifactManifest, SpatialReferenceCovarianceArtifactTransaction,
     SPATIAL_REFERENCE_COVARIANCE_FILENAME, SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
+};
+pub use temporal_covariance_product::{
+    validate_temporal_covariance_promotion, write_temporal_covariance_products,
+    TemporalCovarianceProductReceipt, TemporalCovariancePromotion,
+    TEMPORAL_HELDOUT_RESULT_FILENAME, TEMPORAL_INFERENCE_PROVENANCE_FILENAME,
+    TEMPORAL_PROMOTION_MANIFEST_FILENAME, TEMPORAL_REVIEW_RECEIPT_FILENAME,
+    TEMPORAL_SYNTHETIC_RESULT_FILENAME,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
