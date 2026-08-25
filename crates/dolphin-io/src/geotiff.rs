@@ -119,6 +119,9 @@ pub struct BoundedCogWriter<T: GdalType + Copy> {
     dataset: Dataset,
     scratch_path: PathBuf,
     shape: (usize, usize),
+    total_area: usize,
+    written_area: usize,
+    written_blocks: Vec<BlockIndices>,
     value_type: PhantomData<T>,
 }
 
@@ -138,6 +141,11 @@ impl<T: GdalType + Copy> BoundedCogWriter<T> {
                 "bounded GeoTIFF shape must be non-zero".into(),
             ));
         }
+        let total_area = shape.0.checked_mul(shape.1).ok_or_else(|| {
+            IoError::Shape(format!(
+                "bounded GeoTIFF shape area overflows usize: {shape:?}"
+            ))
+        })?;
         if scratch_path.exists() {
             return Err(IoError::Geo(format!(
                 "bounded GeoTIFF scratch path already exists: {}",
@@ -175,6 +183,9 @@ impl<T: GdalType + Copy> BoundedCogWriter<T> {
             dataset,
             scratch_path: scratch_path.to_path_buf(),
             shape,
+            total_area,
+            written_area: 0,
+            written_blocks: Vec::new(),
             value_type: PhantomData,
         })
     }
@@ -201,6 +212,24 @@ impl<T: GdalType + Copy> BoundedCogWriter<T> {
                 expected
             )));
         }
+        if self.written_blocks.iter().any(|written| {
+            block.row_start < written.row_stop
+                && written.row_start < block.row_stop
+                && block.col_start < written.col_stop
+                && written.col_start < block.col_stop
+        }) {
+            return Err(IoError::Shape(format!(
+                "bounded GeoTIFF window {block:?} overlaps a previously written window"
+            )));
+        }
+        let area = block.height().checked_mul(block.width()).ok_or_else(|| {
+            IoError::Shape(format!(
+                "bounded GeoTIFF window area overflows usize: {block:?}"
+            ))
+        })?;
+        let written_area = self.written_area.checked_add(area).ok_or_else(|| {
+            IoError::Shape("bounded GeoTIFF accumulated written area overflows usize".into())
+        })?;
         let mut buffer = Buffer::new(
             (block.width(), block.height()),
             values.iter().copied().collect(),
@@ -210,6 +239,8 @@ impl<T: GdalType + Copy> BoundedCogWriter<T> {
             (block.width(), block.height()),
             &mut buffer,
         )?;
+        self.written_blocks.push(block);
+        self.written_area = written_area;
         Ok(())
     }
 
@@ -217,6 +248,12 @@ impl<T: GdalType + Copy> BoundedCogWriter<T> {
     /// `destination`. The destination must not already exist and is never used
     /// as a work path.
     pub fn finalize(mut self, destination: &Path) -> Result<()> {
+        if self.written_area != self.total_area {
+            return Err(IoError::Shape(format!(
+                "bounded GeoTIFF is incomplete: wrote {} of {} cells",
+                self.written_area, self.total_area
+            )));
+        }
         if destination == self.scratch_path {
             return Err(IoError::Geo(
                 "bounded GeoTIFF scratch and destination paths must differ".into(),
