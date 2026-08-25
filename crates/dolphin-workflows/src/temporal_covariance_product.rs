@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,6 +51,11 @@ const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/1";
 const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
 const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/5";
 const LAYER_COUNT: usize = 14;
+const COMBINED_WORKING_SET_CAP_BYTES: u64 = 512 * 1024 * 1024;
+const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
+const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.json";
+const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/1";
+static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 const TEMPORAL_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_preregistration.json");
@@ -89,6 +96,45 @@ pub struct TemporalCovarianceProductReceipt {
     pub provenance_sha256: String,
     /// SHA-256 of the promotion manifest that authorized emission.
     pub promotion_manifest_sha256: String,
+}
+
+struct TemporalProductTransaction {
+    directory: PathBuf,
+    _lock: File,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProductRollbackJournal {
+    schema: String,
+    original_fixed_cube_receipt: Vec<u8>,
+}
+
+impl TemporalProductTransaction {
+    #[cfg(unix)]
+    fn acquire(directory: &Path) -> Result<Self> {
+        let lock_path = directory.join(TRANSACTION_LOCK_FILENAME);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening temporal product lock {}", lock_path.display()))?;
+        // SAFETY: `lock` owns a live descriptor for the lifetime of this guard.
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        ensure!(result == 0, "temporal covariance product is already locked");
+        let transaction = Self {
+            directory: directory.to_owned(),
+            _lock: lock,
+        };
+        recover_incomplete_product(&transaction.directory)?;
+        Ok(transaction)
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_directory: &Path) -> Result<Self> {
+        anyhow::bail!("temporal covariance product locking is unsupported on this platform")
+    }
 }
 
 #[derive(Deserialize)]
@@ -372,6 +418,7 @@ pub fn write_temporal_covariance_products(
         config.method == TemporalUncertaintyMethod::CompleteRefitBootstrap,
         "corrected temporal inference is disabled"
     );
+    let transaction = TemporalProductTransaction::acquire(output_directory)?;
     let evidence_directory = config
         .evidence_directory
         .as_deref()
@@ -408,6 +455,7 @@ pub fn write_temporal_covariance_products(
         config,
         factor_directory,
         &promotion,
+        &transaction,
     );
     let receipt = match result {
         Ok(receipt) => receipt,
@@ -464,6 +512,7 @@ fn write_product_transaction(
     config: &TemporalUncertaintyOptions,
     factor_directory: &Path,
     promotion: &TemporalCovariancePromotion,
+    transaction: &TemporalProductTransaction,
 ) -> Result<TemporalCovarianceProductReceipt> {
     ensure_same_run_factor_directory(output_directory, factor_directory)?;
     let evidence_directory = config
@@ -477,6 +526,7 @@ fn write_product_transaction(
         config,
         factor_directory,
         promotion,
+        transaction,
         || validate_temporal_covariance_promotion(evidence_directory, factor_directory),
     )
 }
@@ -492,6 +542,7 @@ fn ensure_same_run_factor_directory(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_product_transaction_with_validator(
     output_directory: &Path,
     displacement_rasters: &[PathBuf],
@@ -499,8 +550,13 @@ fn write_product_transaction_with_validator(
     config: &TemporalUncertaintyOptions,
     factor_directory: &Path,
     promotion: &TemporalCovariancePromotion,
-    revalidate: impl FnOnce() -> Result<TemporalCovariancePromotion>,
+    transaction: &TemporalProductTransaction,
+    mut revalidate: impl FnMut() -> Result<TemporalCovariancePromotion>,
 ) -> Result<TemporalCovarianceProductReceipt> {
+    ensure!(
+        transaction.directory == output_directory,
+        "temporal product transaction owns a different output directory"
+    );
     let scope = prepare_product_scope(
         output_directory,
         displacement_rasters,
@@ -510,6 +566,7 @@ fn write_product_transaction_with_validator(
     )?;
     let stage = create_stage_directory(output_directory)?;
     let transaction = (|| {
+        admit_combined_working_set(config, acquisition_days.len())?;
         let mut layers = create_layer_writers(&stage, &scope.velocity_header)?;
         process_factor_blocks(
             &scope.factor_path,
@@ -532,9 +589,20 @@ fn write_product_transaction_with_validator(
             input_raster_receipts(&scope.fixed_cube_paths)? == scope.fixed_cube_inputs,
             "fixed-cube inputs changed during temporal inference"
         );
-        publish_product_receipt(output_directory, &stage, acquisition_days, scope, promotion)
+        publish_product_receipt(
+            output_directory,
+            &stage,
+            displacement_rasters,
+            acquisition_days,
+            scope,
+            promotion,
+            &mut revalidate,
+        )
     })();
     let _ = std::fs::remove_dir_all(&stage);
+    if transaction.is_err() && output_directory.join(ROLLBACK_JOURNAL_FILENAME).exists() {
+        recover_incomplete_product(output_directory)?;
+    }
     transaction
 }
 
@@ -546,6 +614,7 @@ struct ProductScope {
     input_receipts: Vec<InputRasterReceipt>,
     fixed_cube_paths: Vec<PathBuf>,
     fixed_cube_inputs: Vec<InputRasterReceipt>,
+    fixed_cube_semantics: crate::fixed_cube::FixedCubeSemanticValidation,
 }
 
 fn prepare_product_scope(
@@ -593,7 +662,7 @@ fn prepare_product_scope(
             && usize::try_from(full_grid.cols).ok() == Some(velocity_header.shape.1),
         "factor full grid differs from displacement raster shape"
     );
-    let fixed_cube = validate_fixed_cube_scope(
+    let (fixed_cube, fixed_cube_semantics) = validate_fixed_cube_scope(
         output_directory,
         acquisition_days,
         &velocity_header,
@@ -609,6 +678,7 @@ fn prepare_product_scope(
         input_receipts: input_raster_receipts(displacement_rasters)?,
         fixed_cube_paths,
         fixed_cube_inputs,
+        fixed_cube_semantics,
     })
 }
 
@@ -659,37 +729,114 @@ fn process_factor_blocks(
     Ok(())
 }
 
+fn admit_combined_working_set(
+    config: &TemporalUncertaintyOptions,
+    acquisition_count: usize,
+) -> Result<u64> {
+    let targets = u64::try_from(config.maximum_targets_per_block)?;
+    let dates = u64::try_from(acquisition_count)?;
+    let post_gauge_dates = dates
+        .checked_sub(1)
+        .context("temporal working-set admission requires a gauge acquisition")?;
+    let displacement_windows = targets
+        .checked_mul(post_gauge_dates)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        .context("displacement-window working-set size overflow")?;
+    let output_windows = targets
+        .checked_mul(LAYER_COUNT as u64)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        .context("output-window working-set size overflow")?;
+    let covariance_scratch = dates
+        .checked_mul(dates)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>() as u64))
+        .and_then(|value| {
+            dates
+                .checked_mul(std::mem::size_of::<f64>() as u64)
+                .and_then(|series| value.checked_add(series))
+        })
+        .context("temporal fit scratch working-set size overflow")?;
+    let combined = config
+        .factor_block_read_cap_bytes
+        .checked_add(displacement_windows)
+        .and_then(|value| value.checked_add(output_windows))
+        .and_then(|value| value.checked_add(covariance_scratch))
+        .context("combined temporal working-set size overflow")?;
+    ensure!(
+        combined <= COMBINED_WORKING_SET_CAP_BYTES,
+        "combined temporal working set {combined} exceeds cap {COMBINED_WORKING_SET_CAP_BYTES}"
+    );
+    Ok(combined)
+}
+
 fn publish_product_receipt(
     output_directory: &Path,
     stage: &Path,
+    displacement_rasters: &[PathBuf],
     acquisition_days: &[f64],
     scope: ProductScope,
     promotion: &TemporalCovariancePromotion,
+    revalidate: &mut impl FnMut() -> Result<TemporalCovariancePromotion>,
 ) -> Result<TemporalCovarianceProductReceipt> {
-    publish_layers(output_directory, stage)?;
+    let original_fixed_cube_receipt = read_bounded(
+        &output_directory.join("fixed_cube_receipt.json"),
+        1024 * 1024,
+    )?;
+    write_rollback_journal(output_directory, &original_fixed_cube_receipt)?;
+    let staged_products = product_receipts(stage)?;
+    publish_layers_no_replace(output_directory, stage)?;
+    verify_final_cogs(output_directory, &staged_products, &scope.velocity_header)?;
     let corrected_velocity_sha256 =
         sha256_file(&output_directory.join("velocity_temporal_gls.tif"))?;
     let corrected_sigma_sha256 =
         sha256_file(&output_directory.join("velocity_sigma_corrected.tif"))?;
+    let final_product_receipts = product_receipts(output_directory)?;
     let provenance = TemporalInferenceProvenance::new(
         acquisition_days,
         &scope,
         promotion,
         &corrected_velocity_sha256,
         &corrected_sigma_sha256,
+        final_product_receipts,
     );
     let provenance_path = output_directory.join(TEMPORAL_INFERENCE_PROVENANCE_FILENAME);
     let provenance_scratch = stage.join(TEMPORAL_INFERENCE_PROVENANCE_FILENAME);
     std::fs::write(&provenance_scratch, serde_json::to_vec_pretty(&provenance)?)?;
-    std::fs::rename(&provenance_scratch, &provenance_path)?;
-    let provenance_sha256 = sha256_file(&provenance_path)?;
+    File::open(&provenance_scratch)?.sync_all()?;
+    let provenance_sha256 = sha256_file(&provenance_scratch)?;
     promote_fixed_cube_receipt(
         output_directory,
+        &provenance_scratch,
+        scope.fixed_cube_semantics.clone(),
         corrected_velocity_sha256.clone(),
         corrected_sigma_sha256.clone(),
         provenance_sha256.clone(),
         promotion.manifest_sha256.clone(),
     )?;
+    verify_final_cogs(output_directory, &staged_products, &scope.velocity_header)?;
+    verify_promoted_fixed_cube_receipt(
+        output_directory,
+        &corrected_velocity_sha256,
+        &corrected_sigma_sha256,
+        &provenance_sha256,
+        &promotion.manifest_sha256,
+        &scope.fixed_cube_semantics,
+    )?;
+    ensure!(
+        revalidate()? == *promotion,
+        "temporal promotion or factor evidence changed before completion marker"
+    );
+    ensure!(
+        input_raster_receipts(displacement_rasters)? == scope.input_receipts,
+        "displacement rasters changed before temporal completion marker"
+    );
+    ensure!(
+        input_raster_receipts(&scope.fixed_cube_paths[1..])? == scope.fixed_cube_inputs[1..],
+        "fixed-cube inputs changed before temporal completion marker"
+    );
+    install_no_replace(&provenance_scratch, &provenance_path)?;
+    if let Err(error) = remove_rollback_journal(output_directory) {
+        tracing::warn!(%error, "committed temporal product left a recovery journal");
+    }
     Ok(TemporalCovarianceProductReceipt {
         corrected_velocity_sha256,
         corrected_sigma_sha256,
@@ -703,7 +850,10 @@ fn validate_fixed_cube_scope(
     acquisition_days: &[f64],
     header: &dolphin_io::RasterHeader,
     factor: &dolphin_io::SpatialReferenceCovarianceMetadata,
-) -> Result<crate::fixed_cube::FixedCubeReceipt> {
+) -> Result<(
+    crate::fixed_cube::FixedCubeReceipt,
+    crate::fixed_cube::FixedCubeSemanticValidation,
+)> {
     let bytes = read_bounded(&directory.join("fixed_cube_receipt.json"), 1024 * 1024)?;
     let receipt: crate::fixed_cube::FixedCubeReceipt = serde_json::from_slice(&bytes)?;
     let reference_row = factor
@@ -728,6 +878,7 @@ fn validate_fixed_cube_scope(
             && receipt.inference_status == "conditional_only"
             && receipt.corrected_velocity_raster.is_none()
             && receipt.corrected_sigma_raster.is_none()
+            && receipt.semantic_validation.is_none()
             && receipt.acquisition_days == acquisition_days
             && receipt.rows == header.shape.0
             && receipt.cols == header.shape.1
@@ -750,7 +901,195 @@ fn validate_fixed_cube_scope(
                 ],
         "fixed-cube receipt does not match the factor and displacement scope"
     );
-    Ok(receipt)
+    let semantics = validate_fixed_cube_semantics(directory, header, &receipt)?;
+    Ok((receipt, semantics))
+}
+
+fn validate_fixed_cube_semantics(
+    directory: &Path,
+    velocity_header: &dolphin_io::RasterHeader,
+    receipt: &crate::fixed_cube::FixedCubeReceipt,
+) -> Result<crate::fixed_cube::FixedCubeSemanticValidation> {
+    ensure!(
+        velocity_header
+            .metadata
+            .get("VELOCITY_ESTIMATOR")
+            .map(String::as_str)
+            == Some(receipt.velocity_estimator.as_str()),
+        "fixed-cube estimator identity differs from velocity.tif"
+    );
+    validate_single_band_type(
+        &directory.join(&receipt.velocity_raster),
+        gdal::raster::GdalDataType::Float32,
+    )?;
+    if let Some(sigma) = &receipt.velocity_sigma_raster {
+        validate_fixed_cube_grid(&directory.join(sigma), velocity_header)?;
+        validate_single_band_type(&directory.join(sigma), gdal::raster::GdalDataType::Float32)?;
+    }
+    let mask_path = directory.join(&receipt.validity_mask_raster);
+    let mask_header = validate_fixed_cube_grid(&mask_path, velocity_header)?;
+    validate_single_band_type(&mask_path, gdal::raster::GdalDataType::UInt8)?;
+    ensure!(
+        mask_header.metadata.get("MASK_ROLE").map(String::as_str) == Some("velocity_support")
+            && mask_header.metadata.get("MASK_VALUES").map(String::as_str)
+                == Some("0=invalid;1=valid")
+            && mask_header.metadata.get("MASK_POLICY").map(String::as_str)
+                == Some("common_epoch_complete_support")
+            && mask_header.nodata == Some(0.0),
+        "fixed-cube validity mask metadata is invalid"
+    );
+    let los_paths = receipt
+        .los_rasters
+        .each_ref()
+        .map(|name| directory.join(name));
+    for path in &los_paths {
+        let los_header = validate_fixed_cube_grid(path, velocity_header)?;
+        validate_single_band_type(path, gdal::raster::GdalDataType::Float32)?;
+        ensure!(
+            los_header
+                .metadata
+                .get("GEOMETRY_SOURCE")
+                .map(String::as_str)
+                == Some("CSLC-S1-STATIC")
+                && los_header
+                    .metadata
+                    .get("LOS_SIGN_CONVENTION")
+                    .map(String::as_str)
+                    == Some("ground_to_sensor_positive_toward_sensor")
+                && los_header
+                    .metadata
+                    .get("LOS_COMPONENTS")
+                    .map(String::as_str)
+                    == Some("east,north,up")
+                && los_header.metadata.get("RASTER_ROLE").map(String::as_str)
+                    == Some("fixed_cube_run_geometry"),
+            "fixed-cube LOS metadata is invalid: {}",
+            path.display()
+        );
+    }
+    let mut semantics = validate_fixed_cube_pixels(
+        &mask_path,
+        &los_paths,
+        velocity_header.shape,
+        receipt.valid_pixels,
+    )?;
+    validate_geometry_provenance(&directory.join(&receipt.geometry_provenance))?;
+    semantics.geometry_provenance_status = "sourced_no_fallback".to_owned();
+    Ok(semantics)
+}
+
+fn validate_fixed_cube_grid(
+    path: &Path,
+    expected: &dolphin_io::RasterHeader,
+) -> Result<dolphin_io::RasterHeader> {
+    let header = read_raster_header(path)?;
+    ensure!(
+        header.shape == expected.shape
+            && header.geotransform == expected.geotransform
+            && header.epsg == expected.epsg,
+        "fixed-cube raster grid differs from velocity.tif: {}",
+        path.display()
+    );
+    Ok(header)
+}
+
+fn validate_single_band_type(path: &Path, expected: gdal::raster::GdalDataType) -> Result<()> {
+    let dataset = gdal::Dataset::open(path)?;
+    ensure!(
+        dataset.raster_count() == 1 && dataset.rasterband(1)?.band_type() == expected,
+        "fixed-cube raster has invalid band count or type: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn validate_fixed_cube_pixels(
+    mask_path: &Path,
+    los_paths: &[PathBuf; 3],
+    shape: (usize, usize),
+    expected_valid_pixels: usize,
+) -> Result<crate::fixed_cube::FixedCubeSemanticValidation> {
+    let mut valid_pixels = 0usize;
+    let mut maximum_los_norm_error = 0.0_f32;
+    let mut minimum_los_up = f32::INFINITY;
+    let bytes_per_pixel = std::mem::size_of::<u8>() + 3 * std::mem::size_of::<f32>();
+    let maximum_pixels = usize::try_from(COMBINED_WORKING_SET_CAP_BYTES)?
+        .checked_div(bytes_per_pixel)
+        .context("fixed-cube semantic byte cap is too small")?
+        .min(65_536);
+    for row_start in (0..shape.0).step_by(256) {
+        let row_stop = (row_start + 256).min(shape.0);
+        let rows = row_stop - row_start;
+        let columns_per_window = (maximum_pixels / rows).max(1);
+        for col_start in (0..shape.1).step_by(columns_per_window) {
+            let col_stop = (col_start + columns_per_window).min(shape.1);
+            let window = BlockIndices {
+                row_start,
+                row_stop,
+                col_start,
+                col_stop,
+            };
+            let mask = read_raster_window::<u8>(mask_path, window)?;
+            let east = read_raster_window::<f32>(&los_paths[0], window)?;
+            let north = read_raster_window::<f32>(&los_paths[1], window)?;
+            let up = read_raster_window::<f32>(&los_paths[2], window)?;
+            for (((mask, east), north), up) in mask.iter().zip(&east).zip(&north).zip(&up) {
+                ensure!(
+                    *mask <= 1,
+                    "fixed-cube validity mask contains a value other than 0 or 1"
+                );
+                valid_pixels = valid_pixels
+                    .checked_add(usize::from(*mask))
+                    .context("fixed-cube valid-pixel count overflow")?;
+                let norm_error = (east.mul_add(*east, north.mul_add(*north, up * up)) - 1.0).abs();
+                ensure!(
+                    east.is_finite()
+                        && north.is_finite()
+                        && up.is_finite()
+                        && *up > 0.0
+                        && norm_error <= 5e-4,
+                    "fixed-cube LOS vector is nonfinite, non-unit, or sign-inconsistent"
+                );
+                maximum_los_norm_error = maximum_los_norm_error.max(norm_error);
+                minimum_los_up = minimum_los_up.min(*up);
+            }
+        }
+    }
+    ensure!(
+        valid_pixels == expected_valid_pixels && minimum_los_up.is_finite(),
+        "fixed-cube validity count differs from receipt"
+    );
+    Ok(crate::fixed_cube::FixedCubeSemanticValidation {
+        observed_valid_pixels: valid_pixels,
+        maximum_los_norm_error,
+        minimum_los_up,
+        los_sign_convention: "ground_to_sensor_positive_toward_sensor".to_owned(),
+        geometry_source: "CSLC-S1-STATIC".to_owned(),
+        geometry_provenance_status: "pending".to_owned(),
+    })
+}
+
+fn validate_geometry_provenance(path: &Path) -> Result<()> {
+    let provenance: Value = serde_json::from_slice(&read_bounded(path, 1024 * 1024)?)?;
+    let incidence = &provenance["geometry_provenance"]["fields"]["incidence_angle_deg"];
+    ensure!(
+        provenance["schema"].as_str() == Some("dolphinrust-geometry-provenance/4")
+            && provenance["incidence_angle_deg"].as_f64().is_some()
+            && incidence["status"].as_str() == Some("sourced")
+            && incidence["source_files"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+            && incidence["source_keys"].as_array().is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str() == Some("/data/los_east"))
+                    && values
+                        .iter()
+                        .any(|value| value.as_str() == Some("/data/los_north"))
+            }),
+        "geometry provenance is incomplete, unsourced, or fallback-derived"
+    );
+    Ok(())
 }
 
 fn fixed_cube_input_paths(
@@ -852,18 +1191,27 @@ fn finalize_layers(stage: &Path, layers: &mut [ProductLayer]) -> Result<()> {
     Ok(())
 }
 
-fn publish_layers(output_directory: &Path, stage: &Path) -> Result<()> {
-    let mut published = Vec::new();
+fn publish_layers_no_replace(output_directory: &Path, stage: &Path) -> Result<()> {
     for (name, _) in PRODUCT_LAYERS {
-        let destination = output_directory.join(name);
-        if let Err(error) = std::fs::rename(stage.join(name), &destination) {
-            for path in published {
-                let _ = std::fs::remove_file(path);
-            }
-            return Err(error.into());
-        }
-        published.push(destination);
+        install_no_replace(&stage.join(name), &output_directory.join(name))?;
     }
+    Ok(())
+}
+
+fn install_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    ensure!(
+        !destination.exists(),
+        "refusing to replace existing temporal product {}",
+        destination.display()
+    );
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)?;
+    File::open(
+        destination
+            .parent()
+            .context("temporal product destination has no parent")?,
+    )?
+    .sync_all()?;
     Ok(())
 }
 
@@ -1121,6 +1469,7 @@ struct TemporalInferenceProvenance<'a> {
     acquisition_days_sha256: String,
     displacement_rasters: Vec<InputRasterReceipt>,
     fixed_cube_inputs: Vec<InputRasterReceipt>,
+    fixed_cube_semantics: crate::fixed_cube::FixedCubeSemanticValidation,
     rows: usize,
     cols: usize,
     geotransform: [f64; 6],
@@ -1158,6 +1507,7 @@ struct TemporalInferenceProvenance<'a> {
     inference_status_map: &'static str,
     cadence_status_map: &'static str,
     product_files: Vec<&'static str>,
+    product_receipts: Vec<InputRasterReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1173,6 +1523,7 @@ impl<'a> TemporalInferenceProvenance<'a> {
         promotion: &'a TemporalCovariancePromotion,
         velocity_sha256: &'a str,
         sigma_sha256: &'a str,
+        product_receipts: Vec<InputRasterReceipt>,
     ) -> Self {
         let header = &scope.velocity_header;
         let factor = &scope.factor_metadata;
@@ -1189,6 +1540,7 @@ impl<'a> TemporalInferenceProvenance<'a> {
             acquisition_days_sha256: sha256(&day_bytes),
             displacement_rasters: scope.input_receipts.clone(),
             fixed_cube_inputs: scope.fixed_cube_inputs.clone(),
+            fixed_cube_semantics: scope.fixed_cube_semantics.clone(),
             rows: header.shape.0,
             cols: header.shape.1,
             geotransform: header.geotransform,
@@ -1226,6 +1578,7 @@ impl<'a> TemporalInferenceProvenance<'a> {
             inference_status_map: "0=evaluated;1=fit_not_evaluated;2=comparator_not_evaluated;3=frozen_configuration_mismatch;4=bootstrap_accounting_mismatch;5=bootstrap_insufficient_success;6=invalid_estimate;factor_failures=1000+spatial_status_code",
             cadence_status_map: "0=supported;1=unsupported;2=unavailable",
             product_files: PRODUCT_LAYERS.iter().map(|(name, _)| *name).collect(),
+            product_receipts,
         }
     }
 }
@@ -1240,6 +1593,159 @@ fn input_raster_receipts(paths: &[PathBuf]) -> Result<Vec<InputRasterReceipt>> {
             })
         })
         .collect()
+}
+
+fn product_receipts(directory: &Path) -> Result<Vec<InputRasterReceipt>> {
+    input_raster_receipts(
+        &PRODUCT_LAYERS
+            .iter()
+            .map(|(name, _)| directory.join(name))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn verify_final_cogs(
+    directory: &Path,
+    expected: &[InputRasterReceipt],
+    grid: &dolphin_io::RasterHeader,
+) -> Result<()> {
+    ensure!(
+        expected.len() == PRODUCT_LAYERS.len(),
+        "temporal product receipt count is incomplete"
+    );
+    for ((name, role), expected_receipt) in PRODUCT_LAYERS.iter().zip(expected) {
+        let path = directory.join(name);
+        ensure!(
+            sha256_file(&path)? == expected_receipt.sha256,
+            "published temporal product hash changed: {name}"
+        );
+        let header = read_raster_header(&path)?;
+        ensure!(
+            header.shape == grid.shape
+                && header.geotransform == grid.geotransform
+                && header.epsg == grid.epsg
+                && header.nodata.is_some_and(f64::is_nan)
+                && header.metadata.get("PRODUCT_ROLE").map(String::as_str) == Some(*role)
+                && header
+                    .metadata
+                    .get("TEMPORAL_ESTIMATOR")
+                    .map(String::as_str)
+                    == Some(COMPLETE_REFIT_BOOTSTRAP_METHOD),
+            "published temporal product header changed: {name}"
+        );
+    }
+    Ok(())
+}
+
+fn verify_promoted_fixed_cube_receipt(
+    directory: &Path,
+    velocity_sha256: &str,
+    sigma_sha256: &str,
+    provenance_sha256: &str,
+    promotion_sha256: &str,
+    semantic_validation: &crate::fixed_cube::FixedCubeSemanticValidation,
+) -> Result<()> {
+    let receipt: crate::fixed_cube::FixedCubeReceipt = serde_json::from_slice(&read_bounded(
+        &directory.join("fixed_cube_receipt.json"),
+        1024 * 1024,
+    )?)?;
+    ensure!(
+        receipt.inference_status == "calibrated_scope_match"
+            && receipt.corrected_velocity_raster.as_deref() == Some("velocity_temporal_gls.tif")
+            && receipt.corrected_sigma_raster.as_deref() == Some("velocity_sigma_corrected.tif")
+            && receipt.corrected_velocity_sha256.as_deref() == Some(velocity_sha256)
+            && receipt.corrected_sigma_sha256.as_deref() == Some(sigma_sha256)
+            && receipt.inference_provenance.as_deref()
+                == Some(TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
+            && receipt.inference_provenance_sha256.as_deref() == Some(provenance_sha256)
+            && receipt.temporal_promotion_manifest_sha256.as_deref() == Some(promotion_sha256)
+            && receipt.semantic_validation.as_ref() == Some(semantic_validation),
+        "fixed-cube receipt changed before temporal completion marker"
+    );
+    Ok(())
+}
+
+fn write_rollback_journal(directory: &Path, original_receipt: &[u8]) -> Result<()> {
+    let journal = ProductRollbackJournal {
+        schema: ROLLBACK_JOURNAL_SCHEMA.to_owned(),
+        original_fixed_cube_receipt: original_receipt.to_vec(),
+    };
+    let scratch = directory.join(format!(
+        ".temporal-product-journal-{}-{}",
+        std::process::id(),
+        NEXT_TRANSACTION_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&scratch, serde_json::to_vec(&journal)?)?;
+    File::open(&scratch)?.sync_all()?;
+    install_no_replace(&scratch, &directory.join(ROLLBACK_JOURNAL_FILENAME))
+}
+
+fn remove_rollback_journal(directory: &Path) -> Result<()> {
+    let path = directory.join(ROLLBACK_JOURNAL_FILENAME);
+    if path.exists() {
+        std::fs::remove_file(path)?;
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn recover_incomplete_product(directory: &Path) -> Result<()> {
+    let journal_path = directory.join(ROLLBACK_JOURNAL_FILENAME);
+    if journal_path.exists() {
+        let journal: ProductRollbackJournal =
+            serde_json::from_slice(&read_bounded(&journal_path, JSON_CAP)?)?;
+        ensure!(
+            journal.schema == ROLLBACK_JOURNAL_SCHEMA,
+            "temporal product rollback journal schema is unsupported"
+        );
+        if completed_bundle_marker_is_valid(directory)? {
+            remove_rollback_journal(directory)?;
+        } else {
+            remove_published_products(directory)?;
+            restore_fixed_cube_receipt(directory, &journal.original_fixed_cube_receipt)?;
+            remove_rollback_journal(directory)?;
+        }
+    }
+    remove_stale_stage_directories(directory)
+}
+
+fn completed_bundle_marker_is_valid(directory: &Path) -> Result<bool> {
+    let marker = directory.join(TEMPORAL_INFERENCE_PROVENANCE_FILENAME);
+    if !marker.exists()
+        || PRODUCT_LAYERS
+            .iter()
+            .any(|(name, _)| !directory.join(name).exists())
+    {
+        return Ok(false);
+    }
+    let provenance: Value = match serde_json::from_slice(&read_bounded(&marker, JSON_CAP)?) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let receipt: Value = match serde_json::from_slice(&read_bounded(
+        &directory.join("fixed_cube_receipt.json"),
+        1024 * 1024,
+    )?) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    Ok(provenance["schema"].as_str() == Some(PRODUCT_SCHEMA)
+        && receipt["inference_status"].as_str() == Some("calibrated_scope_match"))
+}
+
+fn remove_stale_stage_directories(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".temporal-inference-stage-"))
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_no_existing_products(directory: &Path) -> Result<()> {
@@ -1355,12 +1861,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        complete_publication_after_legacy_check, ensure_same_run_factor_directory, output_window,
+        admit_combined_working_set, complete_publication_after_legacy_check,
+        ensure_same_run_factor_directory, install_no_replace, output_window,
         reconstruct_covariance, validate_heldout_result, validate_manifest, validate_review,
-        validate_synthetic_result, write_product_transaction_with_validator, EvidenceDigests,
-        HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
+        validate_synthetic_result, write_product_transaction_with_validator,
+        write_rollback_journal, EvidenceDigests, HeldoutLevel, HeldoutResult, SyntheticResult,
+        SyntheticScores, TemporalCovariancePromotion, TemporalProductTransaction,
         TemporalPromotionManifest, TemporalReviewReceipt, PRODUCT_LAYERS, PROMOTION_SCHEMA,
-        REVIEW_SCHEMA, SYNTHETIC_SCHEMA,
+        REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -1426,6 +1934,99 @@ mod tests {
         std::fs::create_dir_all(&foreign).unwrap();
         ensure_same_run_factor_directory(&output, &output).unwrap();
         assert!(ensure_same_run_factor_directory(&output, &foreign).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn combined_working_set_rejects_large_date_stacks_before_block_read() {
+        let config = TemporalUncertaintyOptions::default();
+        assert!(admit_combined_working_set(&config, 12).is_ok());
+        assert!(admit_combined_working_set(&config, 100_000).is_err());
+    }
+
+    #[test]
+    fn transaction_lock_is_exclusive_and_publication_never_replaces() {
+        let directory =
+            std::env::temp_dir().join(format!("dolphin_temporal_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let first = TemporalProductTransaction::acquire(&directory).unwrap();
+        assert!(TemporalProductTransaction::acquire(&directory).is_err());
+        drop(first);
+        let source = directory.join("source");
+        let destination = directory.join("destination");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        assert!(install_no_replace(&source, &destination).is_err());
+        assert_eq!(std::fs::read(destination).unwrap(), b"existing");
+        let malformed = directory.join("malformed");
+        std::fs::create_dir(&malformed).unwrap();
+        std::fs::write(malformed.join(ROLLBACK_JOURNAL_FILENAME), b"{malformed").unwrap();
+        std::fs::write(
+            malformed.join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME),
+            b"marker",
+        )
+        .unwrap();
+        assert!(TemporalProductTransaction::acquire(&malformed).is_err());
+        assert!(malformed.join(ROLLBACK_JOURNAL_FILENAME).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_crash_after_each_product_install() {
+        let root =
+            std::env::temp_dir().join(format!("dolphin_temporal_recovery_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let original = br#"{"inference_status":"conditional_only"}"#;
+        for installed in 0..=PRODUCT_LAYERS.len() {
+            let directory = root.join(installed.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("fixed_cube_receipt.json"), original).unwrap();
+            write_rollback_journal(&directory, original).unwrap();
+            std::fs::write(
+                directory.join("fixed_cube_receipt.json"),
+                br#"{"inference_status":"calibrated_scope_match"}"#,
+            )
+            .unwrap();
+            for (name, _) in PRODUCT_LAYERS.iter().take(installed) {
+                std::fs::write(directory.join(name), b"partial").unwrap();
+            }
+            let transaction = TemporalProductTransaction::acquire(&directory).unwrap();
+            assert!(PRODUCT_LAYERS
+                .iter()
+                .all(|(name, _)| !directory.join(name).exists()));
+            assert_eq!(
+                std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
+                original
+            );
+            assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
+            drop(transaction);
+        }
+        let completed = root.join("completed_marker");
+        std::fs::create_dir(&completed).unwrap();
+        std::fs::write(completed.join("fixed_cube_receipt.json"), original).unwrap();
+        write_rollback_journal(&completed, original).unwrap();
+        let promoted = br#"{"inference_status":"calibrated_scope_match"}"#;
+        std::fs::write(completed.join("fixed_cube_receipt.json"), promoted).unwrap();
+        for (name, _) in PRODUCT_LAYERS {
+            std::fs::write(completed.join(name), b"complete").unwrap();
+        }
+        std::fs::write(
+            completed.join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME),
+            br#"{"schema":"dolphinrust-temporal-inference-product/1"}"#,
+        )
+        .unwrap();
+        let transaction = TemporalProductTransaction::acquire(&completed).unwrap();
+        assert!(PRODUCT_LAYERS
+            .iter()
+            .all(|(name, _)| completed.join(name).exists()));
+        assert_eq!(
+            std::fs::read(completed.join("fixed_cube_receipt.json")).unwrap(),
+            promoted
+        );
+        assert!(!completed.join(ROLLBACK_JOURNAL_FILENAME).exists());
+        drop(transaction);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1516,6 +2117,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     fn bounded_transaction_abstains_and_promotes_receipt_without_touching_legacy() {
         let directory = std::env::temp_dir().join(format!(
             "dolphin_temporal_product_{}_{}",
@@ -1541,7 +2143,10 @@ mod tests {
             geotransform,
             Some(32611),
             None,
-            &[("UNITTYPE", "rad/yr")],
+            &[
+                ("UNITTYPE", "rad/yr"),
+                ("VELOCITY_ESTIMATOR", "linear_post_gauge_unit_precision"),
+            ],
         )
         .unwrap();
         let legacy_before = std::fs::read(directory.join("velocity.tif")).unwrap();
@@ -1580,7 +2185,7 @@ mod tests {
             north: Array2::from_elem((2, 1), 0.0),
             up: Array2::from_elem((2, 1), 3.0_f64.sqrt() / 2.0),
         };
-        crate::fixed_cube::write_fixed_cube_bundle(
+        let fixed_cube = crate::fixed_cube::write_fixed_cube_bundle(
             &workflow,
             &days,
             crate::displacement::VelocityEstimator::LinearPostGaugeUnitPrecision,
@@ -1592,11 +2197,114 @@ mod tests {
             geotransform,
         )
         .unwrap();
+        let valid_geometry_provenance = br#"{
+            "schema":"dolphinrust-geometry-provenance/4",
+            "orbit_direction":"ascending",
+            "incidence_angle_deg":30.0,
+            "heading_deg":10.0,
+            "decomposition_geometry_complete":true,
+            "geometry_provenance":{"fields":{"incidence_angle_deg":{
+                "status":"sourced",
+                "source_files":["static.h5"],
+                "source_keys":["/data/los_east","/data/los_north"],
+                "method":"test"
+            }}}
+        }"#;
         std::fs::write(
             directory.join("geometry_provenance.json"),
-            br#"{"schema":"test_geometry_provenance"}"#,
+            valid_geometry_provenance,
         )
         .unwrap();
+        let velocity_header =
+            dolphin_io::read_raster_header(&directory.join("velocity.tif")).unwrap();
+        super::validate_fixed_cube_semantics(&directory, &velocity_header, &fixed_cube).unwrap();
+        let mut wrong_count = fixed_cube.clone();
+        wrong_count.valid_pixels += 1;
+        assert!(
+            super::validate_fixed_cube_semantics(&directory, &velocity_header, &wrong_count)
+                .is_err()
+        );
+        let mut wrong_estimator = fixed_cube.clone();
+        wrong_estimator.velocity_estimator = "different_estimator".to_owned();
+        assert!(super::validate_fixed_cube_semantics(
+            &directory,
+            &velocity_header,
+            &wrong_estimator
+        )
+        .is_err());
+        std::fs::write(
+            directory.join("geometry_provenance.json"),
+            br#"{"schema":"dolphinrust-geometry-provenance/4","decomposition_geometry_complete":false}"#,
+        )
+        .unwrap();
+        assert!(
+            super::validate_fixed_cube_semantics(&directory, &velocity_header, &fixed_cube)
+                .is_err()
+        );
+        std::fs::write(
+            directory.join("geometry_provenance.json"),
+            valid_geometry_provenance,
+        )
+        .unwrap();
+        let mask_tags = [
+            ("MASK_ROLE", "velocity_support"),
+            ("MASK_VALUES", "0=invalid;1=valid"),
+            ("MASK_POLICY", "common_epoch_complete_support"),
+        ];
+        dolphin_io::write_raster_with_metadata(
+            &directory.join("velocity_validity_mask.tif"),
+            Array2::from_elem((2, 1), 1.0_f32).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+            &mask_tags,
+        )
+        .unwrap();
+        assert!(
+            super::validate_fixed_cube_semantics(&directory, &velocity_header, &fixed_cube)
+                .is_err()
+        );
+        dolphin_io::write_raster_with_metadata(
+            &directory.join("velocity_validity_mask.tif"),
+            Array2::from_elem((2, 1), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+            &mask_tags,
+        )
+        .unwrap();
+        let los_tags = [
+            ("GEOMETRY_SOURCE", "CSLC-S1-STATIC"),
+            (
+                "LOS_SIGN_CONVENTION",
+                "ground_to_sensor_positive_toward_sensor",
+            ),
+            ("LOS_COMPONENTS", "east,north,up"),
+            ("RASTER_ROLE", "fixed_cube_run_geometry"),
+        ];
+        dolphin_io::write_raster_with_metadata(
+            &directory.join("los_east.tif"),
+            Array2::from_elem((2, 1), 0.9_f32).view(),
+            geotransform,
+            Some(32611),
+            None,
+            &los_tags,
+        )
+        .unwrap();
+        assert!(
+            super::validate_fixed_cube_semantics(&directory, &velocity_header, &fixed_cube)
+                .is_err()
+        );
+        dolphin_io::write_raster_with_metadata(
+            &directory.join("los_east.tif"),
+            geometry.east.mapv(|value| value as f32).view(),
+            geotransform,
+            Some(32611),
+            None,
+            &los_tags,
+        )
+        .unwrap();
+        super::validate_fixed_cube_semantics(&directory, &velocity_header, &fixed_cube).unwrap();
         let fixed_cube_receipt_before =
             std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap();
         let legacy_velocity_sha256 = super::sha256_file(&directory.join("velocity.tif")).unwrap();
@@ -1618,6 +2326,7 @@ mod tests {
             block_id_read_cap_bytes: 1024 * 1024,
             factor_block_read_cap_bytes: 1024 * 1024,
         };
+        let product_transaction = TemporalProductTransaction::acquire(&directory).unwrap();
         let mut rejected = config.clone();
         rejected.maximum_targets_per_block = 1;
         assert!(write_product_transaction_with_validator(
@@ -1627,6 +2336,7 @@ mod tests {
             &rejected,
             &directory,
             &promotion,
+            &product_transaction,
             || Ok(promotion.clone()),
         )
         .is_err());
@@ -1650,6 +2360,7 @@ mod tests {
             &config,
             &directory,
             &promotion,
+            &product_transaction,
             || {
                 let finalized_stage_exists = std::fs::read_dir(&directory)?.any(|entry| {
                     entry.is_ok_and(|entry| {
@@ -1664,7 +2375,7 @@ mod tests {
                     finalized_stage_exists,
                     "promotion revalidation ran before COG finalization"
                 );
-                Ok(changed_promotion)
+                Ok(changed_promotion.clone())
             },
         )
         .is_err());
@@ -1676,6 +2387,7 @@ mod tests {
             .all(|(name, _)| !directory.join(name).exists()));
         let geometry_path = directory.join("geometry_provenance.json");
         let geometry_before = std::fs::read(&geometry_path).unwrap();
+        let mut revalidation_calls = 0usize;
         assert!(write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
@@ -1683,15 +2395,20 @@ mod tests {
             &config,
             &directory,
             &promotion,
+            &product_transaction,
             || {
-                std::fs::write(
-                    &geometry_path,
-                    br#"{"schema":"tampered_geometry_provenance"}"#,
-                )?;
+                revalidation_calls += 1;
+                if revalidation_calls == 2 {
+                    std::fs::write(
+                        &geometry_path,
+                        br#"{"schema":"tampered_geometry_provenance"}"#,
+                    )?;
+                }
                 Ok(promotion.clone())
             },
         )
         .is_err());
+        assert_eq!(revalidation_calls, 2);
         assert!(PRODUCT_LAYERS
             .iter()
             .all(|(name, _)| !directory.join(name).exists()));
@@ -1706,6 +2423,7 @@ mod tests {
             &config,
             &directory,
             &promotion,
+            &product_transaction,
             || Ok(promotion.clone()),
         )
         .unwrap();
@@ -1736,6 +2454,7 @@ mod tests {
             &config,
             &directory,
             &promotion,
+            &product_transaction,
             || Ok(promotion.clone()),
         )
         .unwrap();
@@ -1757,6 +2476,16 @@ mod tests {
             &std::fs::read(directory.join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)).unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            provenance["fixed_cube_semantics"]["observed_valid_pixels"],
+            2
+        );
+        assert_eq!(
+            provenance["fixed_cube_semantics"]["geometry_provenance_status"],
+            "sourced_no_fallback"
+        );
+        assert_eq!(provenance["product_receipts"].as_array().unwrap().len(), 14);
+        assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
         let fixed_cube_inputs = provenance["fixed_cube_inputs"].as_array().unwrap();
         assert_eq!(fixed_cube_inputs.len(), 8);
         let fixed_cube_names = fixed_cube_inputs
@@ -1787,6 +2516,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixed.inference_status, "calibrated_scope_match");
+        assert_eq!(
+            fixed
+                .semantic_validation
+                .as_ref()
+                .unwrap()
+                .observed_valid_pixels,
+            2
+        );
         assert_eq!(
             fixed.corrected_velocity_sha256,
             Some(receipt.corrected_velocity_sha256)

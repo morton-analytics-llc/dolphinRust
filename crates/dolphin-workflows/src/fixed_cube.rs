@@ -43,6 +43,9 @@ pub struct FixedCubeReceipt {
     /// SHA-256 of the immutable #53 promotion manifest.
     #[serde(default)]
     pub temporal_promotion_manifest_sha256: Option<String>,
+    /// Streamed validation of the exact fixed-cube mask and LOS rasters.
+    #[serde(default)]
+    pub semantic_validation: Option<FixedCubeSemanticValidation>,
     /// Fixed-cube validity mask filename.
     pub validity_mask_raster: String,
     /// Velocity raster filename.
@@ -67,6 +70,23 @@ pub struct FixedCubeReceipt {
     pub cols: usize,
     /// Count of valid mask pixels.
     pub valid_pixels: usize,
+}
+
+/// Observed fixed-cube semantics bound into the promoted receipt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedCubeSemanticValidation {
+    /// Valid mask pixels observed by the bounded raster scan.
+    pub observed_valid_pixels: usize,
+    /// Maximum absolute error in squared LOS-vector norm.
+    pub maximum_los_norm_error: f32,
+    /// Minimum observed upward LOS component.
+    pub minimum_los_up: f32,
+    /// Validated signed-LOS convention.
+    pub los_sign_convention: String,
+    /// Validated geometry source.
+    pub geometry_source: String,
+    /// Validation status of the sourced geometry provenance.
+    pub geometry_provenance_status: String,
 }
 
 /// Emit the fixed-cube mask, sourced signed LOS vectors, and receipt.
@@ -142,6 +162,7 @@ pub fn write_fixed_cube_bundle(
         inference_provenance: None,
         inference_provenance_sha256: None,
         temporal_promotion_manifest_sha256: None,
+        semantic_validation: None,
         validity_mask_raster: "velocity_validity_mask.tif".to_owned(),
         velocity_raster: "velocity.tif".to_owned(),
         velocity_sigma_raster: velocity_sigma_present.then(|| "velocity_sigma.tif".to_owned()),
@@ -167,6 +188,8 @@ pub fn write_fixed_cube_bundle(
 /// Add corrected-product identities only after every COG and provenance file exists.
 pub(crate) fn promote_fixed_cube_receipt(
     directory: &std::path::Path,
+    provenance_source: &std::path::Path,
+    semantic_validation: FixedCubeSemanticValidation,
     corrected_velocity_sha256: String,
     corrected_sigma_sha256: String,
     provenance_sha256: String,
@@ -183,7 +206,8 @@ pub(crate) fn promote_fixed_cube_receipt(
         receipt.contract_version == "fixed-cube-v1"
             && receipt.inference_status == "conditional_only"
             && receipt.corrected_velocity_raster.is_none()
-            && receipt.corrected_sigma_raster.is_none(),
+            && receipt.corrected_sigma_raster.is_none()
+            && receipt.semantic_validation.is_none(),
         "fixed-cube receipt is not eligible for temporal-inference promotion"
     );
     for (name, expected_sha256) in [
@@ -203,12 +227,11 @@ pub(crate) fn promote_fixed_cube_receipt(
             "{name} grid differs from the fixed cube"
         );
     }
-    let provenance_path = directory.join("velocity_inference_provenance.json");
     ensure!(
-        sha256_file(&provenance_path)? == provenance_sha256,
+        sha256_file(provenance_source)? == provenance_sha256,
         "temporal provenance hash does not match completion marker"
     );
-    let provenance: serde_json::Value = serde_json::from_slice(&std::fs::read(provenance_path)?)?;
+    let provenance: serde_json::Value = serde_json::from_slice(&std::fs::read(provenance_source)?)?;
     ensure!(
         provenance.get("schema").and_then(|value| value.as_str())
             == Some("dolphinrust-temporal-inference-product/1"),
@@ -222,6 +245,7 @@ pub(crate) fn promote_fixed_cube_receipt(
     receipt.inference_provenance = Some("velocity_inference_provenance.json".to_owned());
     receipt.inference_provenance_sha256 = Some(provenance_sha256);
     receipt.temporal_promotion_manifest_sha256 = Some(promotion_manifest_sha256);
+    receipt.semantic_validation = Some(semantic_validation);
     let scratch = directory.join(".fixed_cube_receipt.json.temporal-partial");
     std::fs::write(&scratch, serde_json::to_vec_pretty(&receipt)?)?;
     std::fs::File::open(&scratch)?.sync_all()?;
@@ -229,6 +253,7 @@ pub(crate) fn promote_fixed_cube_receipt(
         let _ = std::fs::remove_file(scratch);
         return Err(error.into());
     }
+    std::fs::File::open(directory)?.sync_all()?;
     Ok(receipt)
 }
 
