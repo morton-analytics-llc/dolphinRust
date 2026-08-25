@@ -3981,14 +3981,24 @@ const SPATIAL_METADATA_MEMBERS_V4: &[&str] = &[
     "unwrap_branch_digest",
     "burst_ownership_digest",
     "source_burst_ids",
-    "aggregate_byte_cap",
+    "working_set_byte_cap",
     "factor_block_high_water_bytes",
     "serialization_high_water_bytes",
-    "fixed_l2_workspace_bytes",
-    "replay_reservation_high_water_bytes",
+    "fixed_l2_workspace_admission_bytes",
+    "fixed_l2_workspace_observed_high_water_bytes",
+    "replay_admission_high_water_bytes",
+    "replay_observed_high_water_bytes",
     "provider_peak_count",
     "provider_peak_bytes",
-    "aggregate_high_water_bytes",
+    "preflight_provider_open_count",
+    "production_provider_open_count",
+    "operator_block_reads",
+    "operator_block_cache_hits",
+    "source_member_window_reads",
+    "source_tile_cache_loads",
+    "source_resolutions",
+    "working_set_admission_high_water_bytes",
+    "working_set_observed_high_water_bytes",
 ];
 const SPATIAL_BLOCK_MEMBERS_V2: &[&str] = &[
     "target_grid",
@@ -4011,18 +4021,29 @@ const SPATIAL_BLOCK_MEMBERS_V4: &[&str] = &[
     "support_union_count",
     "effective_looks_receipt",
     "resource_high_water_bytes",
+    "condition_number",
     "source_factor_digest",
 ];
 const SPATIAL_BLOCK_ATTRIBUTES: &[&str] = &["block_id", "maximum_rank"];
 const SPATIAL_RUNTIME_RESOURCE_MEMBERS: &[&str] = &[
-    "aggregate_byte_cap",
+    "working_set_byte_cap",
     "factor_block_high_water_bytes",
     "serialization_high_water_bytes",
-    "fixed_l2_workspace_bytes",
-    "replay_reservation_high_water_bytes",
+    "fixed_l2_workspace_admission_bytes",
+    "fixed_l2_workspace_observed_high_water_bytes",
+    "replay_admission_high_water_bytes",
+    "replay_observed_high_water_bytes",
     "provider_peak_count",
     "provider_peak_bytes",
-    "aggregate_high_water_bytes",
+    "preflight_provider_open_count",
+    "production_provider_open_count",
+    "operator_block_reads",
+    "operator_block_cache_hits",
+    "source_member_window_reads",
+    "source_tile_cache_loads",
+    "source_resolutions",
+    "working_set_admission_high_water_bytes",
+    "working_set_observed_high_water_bytes",
 ];
 
 /// Calibration scope bound to a persisted reference-specific factor.
@@ -4243,48 +4264,80 @@ pub const SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY: &[CovarianceRegistryEntr
 /// Artifact-level identity for bounded reference-specific covariance blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpatialReferenceRuntimeResourceReceipt {
-    /// Single aggregate production resident-byte cap.
-    pub aggregate_byte_cap: u64,
+    /// Cap for the incremental #54 covariance working set.
+    pub working_set_byte_cap: u64,
     /// Largest resident in-progress factor block.
     pub factor_block_high_water_bytes: u64,
     /// Largest HDF5 serialization reservation for one factor block.
     pub serialization_high_water_bytes: u64,
-    /// Dynamically projected fixed-L2 propagation workspace.
-    pub fixed_l2_workspace_bytes: u64,
+    /// Dynamically projected fixed-L2 propagation workspace admission.
+    pub fixed_l2_workspace_admission_bytes: u64,
+    /// Fixed-L2 workspace used by an executed propagation.
+    pub fixed_l2_workspace_observed_high_water_bytes: u64,
     /// Largest admitted replay reservation after all other components.
-    pub replay_reservation_high_water_bytes: u64,
+    pub replay_admission_high_water_bytes: u64,
+    /// Largest high-water reported by an executed global replay.
+    pub replay_observed_high_water_bytes: u64,
     /// Observed maximum simultaneously live replay providers.
     pub provider_peak_count: u64,
     /// Observed maximum resident bytes held by live replay providers.
     pub provider_peak_bytes: u64,
-    /// Exact sum of the admitted component high-water bounds.
-    pub aggregate_high_water_bytes: u64,
+    /// Providers opened by resource-only preflight.
+    pub preflight_provider_open_count: u64,
+    /// Providers opened by numeric production replay.
+    pub production_provider_open_count: u64,
+    /// Operator HDF5 block reads during numeric replay.
+    pub operator_block_reads: u64,
+    /// Operator block cache hits during numeric replay.
+    pub operator_block_cache_hits: u64,
+    /// Source member-window reads during numeric replay.
+    pub source_member_window_reads: u64,
+    /// Source tile-cache loads during numeric replay.
+    pub source_tile_cache_loads: u64,
+    /// Source factor resolutions during numeric replay.
+    pub source_resolutions: u64,
+    /// Sum of the admitted incremental covariance components.
+    pub working_set_admission_high_water_bytes: u64,
+    /// Sum of the observed incremental covariance components.
+    pub working_set_observed_high_water_bytes: u64,
 }
 
 impl SpatialReferenceRuntimeResourceReceipt {
     fn validate(&self, maximum_block_bytes: u64) -> Result<()> {
-        let composed = self
+        let admitted = self
             .factor_block_high_water_bytes
             .checked_add(self.serialization_high_water_bytes)
-            .and_then(|bytes| bytes.checked_add(self.fixed_l2_workspace_bytes))
-            .and_then(|bytes| bytes.checked_add(self.replay_reservation_high_water_bytes))
+            .and_then(|bytes| bytes.checked_add(self.fixed_l2_workspace_admission_bytes))
+            .and_then(|bytes| bytes.checked_add(self.replay_admission_high_water_bytes))
             .ok_or_else(|| invalid("spatial reference resource receipt overflows u64"))?;
+        let observed = self
+            .factor_block_high_water_bytes
+            .checked_add(self.serialization_high_water_bytes)
+            .and_then(|bytes| bytes.checked_add(self.fixed_l2_workspace_observed_high_water_bytes))
+            .and_then(|bytes| bytes.checked_add(self.replay_observed_high_water_bytes))
+            .ok_or_else(|| invalid("spatial reference observed resource receipt overflows u64"))?;
         ensure_valid(
-            self.aggregate_byte_cap == maximum_block_bytes
-                && self.aggregate_byte_cap > 0
+            self.working_set_byte_cap == maximum_block_bytes
+                && self.working_set_byte_cap > 0
                 && self.factor_block_high_water_bytes > 0
                 && self.serialization_high_water_bytes > 0
-                && self.fixed_l2_workspace_bytes > 0
+                && self.fixed_l2_workspace_admission_bytes > 0
+                && self.fixed_l2_workspace_observed_high_water_bytes
+                    <= self.fixed_l2_workspace_admission_bytes
+                && self.replay_observed_high_water_bytes <= self.replay_admission_high_water_bytes
                 && self.provider_peak_count <= 2
-                && self.provider_peak_bytes <= self.replay_reservation_high_water_bytes
-                && self.aggregate_high_water_bytes == composed
-                && self.aggregate_high_water_bytes <= self.aggregate_byte_cap,
+                && self.provider_peak_bytes <= self.replay_admission_high_water_bytes
+                && self.working_set_admission_high_water_bytes == admitted
+                && self.working_set_observed_high_water_bytes == observed
+                && self.working_set_observed_high_water_bytes
+                    <= self.working_set_admission_high_water_bytes
+                && self.working_set_admission_high_water_bytes <= self.working_set_byte_cap,
             "spatial reference runtime resource receipt is inconsistent",
         )
     }
 }
 
-/// Digest the exact aggregate resource receipt committed by a production run.
+/// Digest the exact incremental covariance working-set receipt committed by a production run.
 #[must_use]
 pub fn spatial_reference_runtime_resource_receipt_digest(
     receipt: SpatialReferenceRuntimeResourceReceipt,
@@ -4292,14 +4345,24 @@ pub fn spatial_reference_runtime_resource_receipt_digest(
     let mut digest = Sha256::new();
     digest.update(b"dolphinrust:production-runtime-resource-receipt:v1");
     for value in [
-        receipt.aggregate_byte_cap,
+        receipt.working_set_byte_cap,
         receipt.factor_block_high_water_bytes,
         receipt.serialization_high_water_bytes,
-        receipt.fixed_l2_workspace_bytes,
-        receipt.replay_reservation_high_water_bytes,
+        receipt.fixed_l2_workspace_admission_bytes,
+        receipt.fixed_l2_workspace_observed_high_water_bytes,
+        receipt.replay_admission_high_water_bytes,
+        receipt.replay_observed_high_water_bytes,
         receipt.provider_peak_count,
         receipt.provider_peak_bytes,
-        receipt.aggregate_high_water_bytes,
+        receipt.preflight_provider_open_count,
+        receipt.production_provider_open_count,
+        receipt.operator_block_reads,
+        receipt.operator_block_cache_hits,
+        receipt.source_member_window_reads,
+        receipt.source_tile_cache_loads,
+        receipt.source_resolutions,
+        receipt.working_set_admission_high_water_bytes,
+        receipt.working_set_observed_high_water_bytes,
     ] {
         digest.update(value.to_le_bytes());
     }
@@ -4351,9 +4414,9 @@ pub struct SpatialReferenceCovarianceMetadata {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
-    /// Digest of the machine-readable runtime aggregate receipt.
+    /// Digest of the machine-readable incremental covariance working-set receipt.
     pub runtime_resource_receipt_digest: String,
-    /// Machine-readable aggregate production resource receipt. Legacy schema
+    /// Machine-readable incremental covariance working-set receipt. Legacy schema
     /// v2 and v3 artifacts explicitly lack this runtime evidence.
     pub runtime_resource_receipt: Option<SpatialReferenceRuntimeResourceReceipt>,
     /// Independent-review receipt authorizing this exact scope, when calibrated.
@@ -4709,6 +4772,8 @@ pub struct SpatialReferenceCovarianceBlock {
     pub effective_looks_receipt: Option<Vec<u8>>,
     /// Conservative replay resource high-water bound for each target.
     pub resource_high_water_bytes: Option<Vec<u64>>,
+    /// Retained date-covariance condition number for each target.
+    pub condition_number: Option<Vec<f64>>,
     /// Digest of the exact replayed source factors represented by this block.
     pub source_factor_digest: String,
 }
@@ -4749,6 +4814,10 @@ impl SpatialReferenceCovarianceBlock {
             .ok()
             .and_then(|count| count.checked_mul(8))
             .ok_or_else(|| invalid("resource high-water byte count overflow"))?;
+        let condition = u64::try_from(self.condition_number.as_ref().map_or(0, Vec::len))
+            .ok()
+            .and_then(|count| count.checked_mul(8))
+            .ok_or_else(|| invalid("condition-number byte count overflow"))?;
         factor
             .checked_add(rank)
             .and_then(|value| value.checked_add(status))
@@ -4758,12 +4827,27 @@ impl SpatialReferenceCovarianceBlock {
             .and_then(|value| value.checked_add(support))
             .and_then(|value| value.checked_add(receipts))
             .and_then(|value| value.checked_add(resource))
+            .and_then(|value| value.checked_add(condition))
             .ok_or_else(|| invalid("spatial reference block byte count overflow"))
     }
 
     #[allow(clippy::too_many_lines)]
     fn validate(&self, metadata: &SpatialReferenceCovarianceMetadata) -> Result<()> {
         let targets = self.target_grid.area()?;
+        if let Some(receipt) = metadata.runtime_resource_receipt {
+            ensure_valid(
+                self.logical_payload_bytes()? <= receipt.factor_block_high_water_bytes,
+                "spatial reference block exceeds its factor working-set receipt",
+            )?;
+            if let Some(resource) = &self.resource_high_water_bytes {
+                ensure_valid(
+                    resource
+                        .iter()
+                        .all(|bytes| *bytes <= receipt.replay_admission_high_water_bytes),
+                    "per-target replay high-water exceeds artifact runtime receipt",
+                )?;
+            }
+        }
         ensure_valid(
             metadata.full_grid.contains(self.target_grid),
             "spatial reference target block is outside the full grid",
@@ -4794,7 +4878,8 @@ impl SpatialReferenceCovarianceBlock {
                     self.effective_looks_fraction.is_none()
                         && self.support_union_count.is_none()
                         && self.effective_looks_receipt.is_none()
-                        && self.resource_high_water_bytes.is_none(),
+                        && self.resource_high_water_bytes.is_none()
+                        && self.condition_number.is_none(),
                     "legacy spatial reference block cannot claim unavailable realization receipts",
                 )?;
                 None
@@ -4812,14 +4897,18 @@ impl SpatialReferenceCovarianceBlock {
                 let resource = self.resource_high_water_bytes.as_ref().ok_or_else(|| {
                     invalid("current spatial reference block requires resource high-water bounds")
                 })?;
+                let condition = self.condition_number.as_ref().ok_or_else(|| {
+                    invalid("current spatial reference block requires condition numbers")
+                })?;
                 ensure_valid(
                     effective.len() == targets
                         && support.len() == targets
                         && receipts.len() == targets * 32
-                        && resource.len() == targets,
+                        && resource.len() == targets
+                        && condition.len() == targets,
                     "spatial reference realization receipt shapes do not match",
                 )?;
-                Some((effective, support, receipts, resource))
+                Some((effective, support, receipts, resource, condition))
             }
             _ => unreachable!("schema version was validated above"),
         };
@@ -4846,18 +4935,26 @@ impl SpatialReferenceCovarianceBlock {
                 realized <= rank,
                 "spatial reference target rank exceeds maximum",
             )?;
-            let legacy =
-                metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION;
             ensure_valid(
-                if legacy {
-                    (self.status[target] == SpatialReferenceCovarianceStatus::Valid)
-                        == (realized > 0)
-                } else {
-                    self.status[target] == SpatialReferenceCovarianceStatus::Valid || realized == 0
-                },
+                (self.status[target] == SpatialReferenceCovarianceStatus::Valid) == (realized > 0),
                 "spatial reference status and target rank disagree",
             )?;
-            if let Some((effective, support, receipts, resource)) = realization {
+            let target_offset = target
+                .checked_mul(dates)
+                .and_then(|value| value.checked_mul(rank))
+                .ok_or_else(|| invalid("spatial reference target factor offset overflows"))?;
+            for component in 0..rank {
+                let nonzero = (0..dates).any(|date| {
+                    self.difference_factor[target_offset + date * rank + component] != 0.0
+                });
+                ensure_valid(
+                    nonzero == (component < realized),
+                    "spatial reference realized rank disagrees with factor columns",
+                )?;
+            }
+            let legacy =
+                metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION;
+            if let Some((effective, support, receipts, resource, condition)) = realization {
                 let receipt = &receipts[target * 32..(target + 1) * 32];
                 ensure_valid(
                     match self.status[target] == SpatialReferenceCovarianceStatus::Valid {
@@ -4868,17 +4965,20 @@ impl SpatialReferenceCovarianceBlock {
                                 && support[target] > 0
                                 && receipt.iter().any(|byte| *byte != 0)
                                 && resource[target] > 0
+                                && condition[target].is_finite()
+                                && condition[target] >= 1.0
                         }
                         false => {
                             effective[target].is_nan()
                                 && support[target] == 0
                                 && receipt.iter().all(|byte| *byte == 0)
+                                && condition[target].is_nan()
                         }
                     },
                     "spatial reference effective-look/resource receipt disagrees with target status",
                 )?;
             }
-            if !legacy {
+            if metadata.schema_version != SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION {
                 let approximation_bound = self.approximation_error_bound[target];
                 let validated_bound_required = self.status[target]
                     == SpatialReferenceCovarianceStatus::Valid
@@ -5030,12 +5130,54 @@ impl SpatialReferenceCovarianceWriter {
             .as_ref()
             .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
         let identity = file.group("metadata")?;
+        let blocks = file.group("blocks")?;
+        for name in blocks.member_names()? {
+            let resource = blocks
+                .group(&name)?
+                .dataset("resource_high_water_bytes")?
+                .read_raw::<u64>()?;
+            ensure_valid(
+                resource
+                    .iter()
+                    .all(|bytes| *bytes <= receipt.replay_observed_high_water_bytes),
+                "per-target replay high-water exceeds observed runtime receipt",
+            )?;
+        }
         write_runtime_resource_receipt_datasets(&identity, receipt, true)?;
         identity
             .dataset("runtime_resource_receipt_digest")?
             .write_raw(digest.as_bytes())?;
         self.metadata.runtime_resource_receipt = Some(receipt);
         self.metadata.runtime_resource_receipt_digest = digest;
+        self.metadata.validate()?;
+        Ok(self.metadata.clone())
+    }
+
+    /// Replace the preflight effective-look identity with the exact ordered
+    /// per-target realization before sealing the artifact.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid digest or HDF5 update failure.
+    pub fn seal_effective_looks_digest(
+        &mut self,
+        digest: String,
+    ) -> Result<SpatialReferenceCovarianceMetadata> {
+        ensure_valid(
+            is_nonzero_sha256_digest(&digest),
+            "effective looks digest is invalid",
+        )?;
+        ensure_valid(
+            self.metadata.calibration_scope == SpatialReferenceCalibrationScope::Uncalibrated,
+            "calibrated spatial reference effective-look evidence is immutable",
+        )?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| invalid("spatial reference writer is already finished"))?;
+        file.group("metadata")?
+            .dataset("effective_looks_digest")?
+            .write_raw(digest.as_bytes())?;
+        self.metadata.effective_looks_digest = digest;
         self.metadata.validate()?;
         Ok(self.metadata.clone())
     }
@@ -5210,7 +5352,7 @@ fn write_runtime_resource_receipt_datasets(
             }
         };
     }
-    write_receipt_value!("aggregate_byte_cap", receipt.aggregate_byte_cap);
+    write_receipt_value!("working_set_byte_cap", receipt.working_set_byte_cap);
     write_receipt_value!(
         "factor_block_high_water_bytes",
         receipt.factor_block_high_water_bytes
@@ -5219,16 +5361,50 @@ fn write_runtime_resource_receipt_datasets(
         "serialization_high_water_bytes",
         receipt.serialization_high_water_bytes
     );
-    write_receipt_value!("fixed_l2_workspace_bytes", receipt.fixed_l2_workspace_bytes);
     write_receipt_value!(
-        "replay_reservation_high_water_bytes",
-        receipt.replay_reservation_high_water_bytes
+        "fixed_l2_workspace_admission_bytes",
+        receipt.fixed_l2_workspace_admission_bytes
+    );
+    write_receipt_value!(
+        "fixed_l2_workspace_observed_high_water_bytes",
+        receipt.fixed_l2_workspace_observed_high_water_bytes
+    );
+    write_receipt_value!(
+        "replay_admission_high_water_bytes",
+        receipt.replay_admission_high_water_bytes
+    );
+    write_receipt_value!(
+        "replay_observed_high_water_bytes",
+        receipt.replay_observed_high_water_bytes
     );
     write_receipt_value!("provider_peak_count", receipt.provider_peak_count);
     write_receipt_value!("provider_peak_bytes", receipt.provider_peak_bytes);
     write_receipt_value!(
-        "aggregate_high_water_bytes",
-        receipt.aggregate_high_water_bytes
+        "preflight_provider_open_count",
+        receipt.preflight_provider_open_count
+    );
+    write_receipt_value!(
+        "production_provider_open_count",
+        receipt.production_provider_open_count
+    );
+    write_receipt_value!("operator_block_reads", receipt.operator_block_reads);
+    write_receipt_value!(
+        "operator_block_cache_hits",
+        receipt.operator_block_cache_hits
+    );
+    write_receipt_value!(
+        "source_member_window_reads",
+        receipt.source_member_window_reads
+    );
+    write_receipt_value!("source_tile_cache_loads", receipt.source_tile_cache_loads);
+    write_receipt_value!("source_resolutions", receipt.source_resolutions);
+    write_receipt_value!(
+        "working_set_admission_high_water_bytes",
+        receipt.working_set_admission_high_water_bytes
+    );
+    write_receipt_value!(
+        "working_set_observed_high_water_bytes",
+        receipt.working_set_observed_high_water_bytes
     );
     Ok(())
 }
@@ -5306,6 +5482,14 @@ fn write_spatial_reference_block(
             .as_ref()
             .ok_or_else(|| invalid("current block resource high-water bounds are missing"))?,
     )?;
+    write_chunked_1d(
+        group,
+        "condition_number",
+        block
+            .condition_number
+            .as_ref()
+            .ok_or_else(|| invalid("current block condition numbers are missing"))?,
+    )?;
     write_string(group, "source_factor_digest", &block.source_factor_digest)
 }
 
@@ -5338,7 +5522,13 @@ pub fn read_spatial_reference_covariance_header(
     let file = hdf5::File::open(path)?;
     validate_spatial_root_schema(&file)?;
     let schema_version: u16 = read_scalar_attr(&file, "schema_version")?;
+    let metadata_bytes = spatial_reference_metadata_logical_bytes(&file, schema_version)?;
     let mut budget = ReadBudget::new(byte_cap);
+    budget.charge(metadata_bytes)?;
+    read_spatial_metadata(&file)
+}
+
+fn spatial_reference_metadata_logical_bytes(file: &hdf5::File, schema_version: u16) -> Result<u64> {
     let identity = file.group("metadata")?;
     let metadata_members = match schema_version {
         SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V2,
@@ -5346,6 +5536,8 @@ pub fn read_spatial_reference_covariance_header(
         SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_METADATA_MEMBERS_V4,
         _ => return Err(invalid("unsupported spatial reference covariance schema")),
     };
+    let (_, date_bytes) = inspect_dataset::<u32>(&identity, "ordered_date_indices", None)?;
+    let mut logical_bytes = date_bytes;
     for name in metadata_members.iter().copied().filter(|name| {
         !matches!(
             *name,
@@ -5353,22 +5545,28 @@ pub fn read_spatial_reference_covariance_header(
         ) && !SPATIAL_RUNTIME_RESOURCE_MEMBERS.contains(name)
     }) {
         let (_, bytes) = inspect_dataset::<u8>(&identity, name, None)?;
-        budget.charge(bytes)?;
+        logical_bytes = logical_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("spatial reference metadata byte count overflows u64"))?;
     }
-    let (_, date_bytes) = inspect_dataset::<u32>(&identity, "ordered_date_indices", None)?;
-    budget.charge(date_bytes)?;
     if schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
         let (_, acquisition_bytes) = inspect_dataset::<f64>(&identity, "acquisition_days", None)?;
-        budget.charge(acquisition_bytes)?;
+        logical_bytes = logical_bytes
+            .checked_add(acquisition_bytes)
+            .ok_or_else(|| invalid("spatial reference metadata byte count overflows u64"))?;
         let (_, geotransform_bytes) =
             inspect_dataset::<f64>(&identity, "geotransform", Some(&[6]))?;
-        budget.charge(geotransform_bytes)?;
+        logical_bytes = logical_bytes
+            .checked_add(geotransform_bytes)
+            .ok_or_else(|| invalid("spatial reference metadata byte count overflows u64"))?;
         for name in SPATIAL_RUNTIME_RESOURCE_MEMBERS {
             let (_, bytes) = inspect_dataset::<u64>(&identity, name, Some(&[1]))?;
-            budget.charge(bytes)?;
+            logical_bytes = logical_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("spatial reference metadata byte count overflows u64"))?;
         }
     }
-    read_spatial_metadata(&file)
+    Ok(logical_bytes)
 }
 
 /// Read one bounded factor block after shape checks and byte-cap admission.
@@ -5384,12 +5582,20 @@ pub fn read_spatial_reference_covariance_block(
 ) -> Result<SpatialReferenceCovarianceBlockRead> {
     let file = hdf5::File::open(path)?;
     validate_spatial_root_schema(&file)?;
-    let metadata = read_spatial_metadata(&file)?;
+    let schema_version: u16 = read_scalar_attr(&file, "schema_version")?;
+    let metadata_bytes = spatial_reference_metadata_logical_bytes(&file, schema_version)?;
+    let identity = file.group("metadata")?;
+    let (date_shape, _) = inspect_dataset::<u32>(&identity, "ordered_date_indices", None)?;
+    ensure_valid(
+        date_shape.len() == 1,
+        "ordered date indices must be one-dimensional",
+    )?;
+    let dates = date_shape[0];
     let blocks = file.group("blocks")?;
     let name = format!("{block_id:020}");
     validate_selected_block_link(&blocks, &name)?;
     let group = blocks.group(&name)?;
-    let block_members = match metadata.schema_version {
+    let block_members = match schema_version {
         SPATIAL_REFERENCE_COVARIANCE_LEGACY_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V2,
         SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V3,
         SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => SPATIAL_BLOCK_MEMBERS_V4,
@@ -5406,7 +5612,6 @@ pub fn read_spatial_reference_covariance_block(
     let maximum_rank: u32 = read_scalar_attr(&group, "maximum_rank")?;
     let rank = usize::try_from(maximum_rank)
         .map_err(|_| invalid("spatial reference maximum rank exceeds usize"))?;
-    let dates = metadata.ordered_date_indices.len();
     let mut logical_payload_bytes = 0_u64;
     add_exact_dataset::<u32>(
         &group,
@@ -5433,7 +5638,7 @@ pub fn read_spatial_reference_covariance_block(
         &[targets],
         &mut logical_payload_bytes,
     )?;
-    if metadata.schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
+    if schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION {
         add_exact_dataset::<f64>(
             &group,
             "effective_looks_fraction",
@@ -5443,6 +5648,12 @@ pub fn read_spatial_reference_covariance_block(
         add_exact_dataset::<u64>(
             &group,
             "support_union_count",
+            &[targets],
+            &mut logical_payload_bytes,
+        )?;
+        add_exact_dataset::<f64>(
+            &group,
+            "condition_number",
             &[targets],
             &mut logical_payload_bytes,
         )?;
@@ -5460,11 +5671,13 @@ pub fn read_spatial_reference_covariance_block(
         )?;
     }
     ensure_valid(
-        logical_payload_bytes <= metadata.maximum_block_bytes,
+        logical_payload_bytes <= read_scalar_attr::<u64>(&file, "maximum_block_bytes")?,
         "spatial reference block exceeds embedded byte cap",
     )?;
     let mut budget = ReadBudget::new(byte_cap);
+    budget.charge(metadata_bytes)?;
     budget.charge(logical_payload_bytes)?;
+    let metadata = read_spatial_metadata(&file)?;
     let status = group
         .dataset("status")?
         .read_raw::<u16>()?
@@ -5499,6 +5712,11 @@ pub fn read_spatial_reference_covariance_block(
             &group,
             metadata.schema_version,
             "resource_high_water_bytes",
+        )?,
+        condition_number: read_current_block_dataset(
+            &group,
+            metadata.schema_version,
+            "condition_number",
         )?,
         source_factor_digest: read_string(&group, "source_factor_digest")?,
     };
@@ -5621,9 +5839,9 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
             | SPATIAL_REFERENCE_COVARIANCE_PREVIOUS_SCHEMA_VERSION => None,
             SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION => {
                 Some(SpatialReferenceRuntimeResourceReceipt {
-                    aggregate_byte_cap: read_runtime_resource_value(
+                    working_set_byte_cap: read_runtime_resource_value(
                         &identity,
-                        "aggregate_byte_cap",
+                        "working_set_byte_cap",
                     )?,
                     factor_block_high_water_bytes: read_runtime_resource_value(
                         &identity,
@@ -5633,13 +5851,21 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
                         &identity,
                         "serialization_high_water_bytes",
                     )?,
-                    fixed_l2_workspace_bytes: read_runtime_resource_value(
+                    fixed_l2_workspace_admission_bytes: read_runtime_resource_value(
                         &identity,
-                        "fixed_l2_workspace_bytes",
+                        "fixed_l2_workspace_admission_bytes",
                     )?,
-                    replay_reservation_high_water_bytes: read_runtime_resource_value(
+                    fixed_l2_workspace_observed_high_water_bytes: read_runtime_resource_value(
                         &identity,
-                        "replay_reservation_high_water_bytes",
+                        "fixed_l2_workspace_observed_high_water_bytes",
+                    )?,
+                    replay_admission_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "replay_admission_high_water_bytes",
+                    )?,
+                    replay_observed_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "replay_observed_high_water_bytes",
                     )?,
                     provider_peak_count: read_runtime_resource_value(
                         &identity,
@@ -5649,9 +5875,41 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
                         &identity,
                         "provider_peak_bytes",
                     )?,
-                    aggregate_high_water_bytes: read_runtime_resource_value(
+                    preflight_provider_open_count: read_runtime_resource_value(
                         &identity,
-                        "aggregate_high_water_bytes",
+                        "preflight_provider_open_count",
+                    )?,
+                    production_provider_open_count: read_runtime_resource_value(
+                        &identity,
+                        "production_provider_open_count",
+                    )?,
+                    operator_block_reads: read_runtime_resource_value(
+                        &identity,
+                        "operator_block_reads",
+                    )?,
+                    operator_block_cache_hits: read_runtime_resource_value(
+                        &identity,
+                        "operator_block_cache_hits",
+                    )?,
+                    source_member_window_reads: read_runtime_resource_value(
+                        &identity,
+                        "source_member_window_reads",
+                    )?,
+                    source_tile_cache_loads: read_runtime_resource_value(
+                        &identity,
+                        "source_tile_cache_loads",
+                    )?,
+                    source_resolutions: read_runtime_resource_value(
+                        &identity,
+                        "source_resolutions",
+                    )?,
+                    working_set_admission_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "working_set_admission_high_water_bytes",
+                    )?,
+                    working_set_observed_high_water_bytes: read_runtime_resource_value(
+                        &identity,
+                        "working_set_observed_high_water_bytes",
                     )?,
                 })
             }
@@ -5678,6 +5936,11 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         )?)?,
         maximum_block_bytes: read_scalar_attr(file, "maximum_block_bytes")?,
     };
+    ensure_valid(
+        schema_version == SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION
+            || metadata.calibration_scope == SpatialReferenceCalibrationScope::Uncalibrated,
+        "legacy spatial reference covariance cannot retain calibrated scope without coordinates and runtime evidence",
+    )?;
     metadata.validate()?;
     Ok(metadata)
 }

@@ -94,6 +94,7 @@ fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_
         .as_mut()
         .unwrap()
         .truncate(1);
+    partial.condition_number.as_mut().unwrap().truncate(1);
     let mut writer = SpatialReferenceCovarianceWriter::create(&partial_path, &metadata()).unwrap();
     writer.write_block(&partial).unwrap();
     let mut overlap = partial.clone();
@@ -126,12 +127,23 @@ fn runtime_resource_receipt_seals_observed_provider_peak_and_rejects_tamper() {
         sealed.runtime_resource_receipt_digest,
         spatial_reference_runtime_resource_receipt_digest(observed)
     );
+    let realized_effective = digest(0x9a);
+    let sealed = writer
+        .seal_effective_looks_digest(realized_effective.clone())
+        .unwrap();
+    assert_eq!(sealed.effective_looks_digest, realized_effective);
     writer.finish().unwrap();
     assert_eq!(
         read_spatial_reference_covariance_header(&path, 4096)
             .unwrap()
             .runtime_resource_receipt,
         Some(observed)
+    );
+    assert_eq!(
+        read_spatial_reference_covariance_header(&path, 4096)
+            .unwrap()
+            .effective_looks_digest,
+        digest(0x9a)
     );
     let file = hdf5::File::open_rw(&path).unwrap();
     file.dataset("metadata/provider_peak_bytes")
@@ -157,14 +169,24 @@ fn grid(row_start: u64, rows: u32) -> CovarianceOperatorGrid {
 
 fn metadata() -> SpatialReferenceCovarianceMetadata {
     let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
-        aggregate_byte_cap: 4096,
-        factor_block_high_water_bytes: 512,
-        serialization_high_water_bytes: 512,
-        fixed_l2_workspace_bytes: 1024,
-        replay_reservation_high_water_bytes: 2048,
+        working_set_byte_cap: 16384,
+        factor_block_high_water_bytes: 8192,
+        serialization_high_water_bytes: 2048,
+        fixed_l2_workspace_admission_bytes: 2048,
+        fixed_l2_workspace_observed_high_water_bytes: 1024,
+        replay_admission_high_water_bytes: 4096,
+        replay_observed_high_water_bytes: 1536,
         provider_peak_count: 2,
         provider_peak_bytes: 1024,
-        aggregate_high_water_bytes: 4096,
+        preflight_provider_open_count: 4,
+        production_provider_open_count: 2,
+        operator_block_reads: 2,
+        operator_block_cache_hits: 3,
+        source_member_window_reads: 4,
+        source_tile_cache_loads: 2,
+        source_resolutions: 5,
+        working_set_admission_high_water_bytes: 16384,
+        working_set_observed_high_water_bytes: 12800,
     };
     SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
@@ -205,7 +227,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         source_burst_ids: vec!["T078-165482-IW1".to_owned()],
         reference_source_burst_index: 0,
         calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
-        maximum_block_bytes: 4096,
+        maximum_block_bytes: 16384,
     }
 }
 
@@ -221,14 +243,15 @@ fn block() -> SpatialReferenceCovarianceBlock {
         ],
         source_burst_index_by_target: vec![0, 0],
         difference_factor: vec![
-            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, // target 0
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.25, // target 0
             0.0, 0.0, 0.5, 0.0, 1.5, 0.0, // target 1
         ],
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; 2],
         effective_looks_fraction: Some(vec![0.75, 0.5]),
         support_union_count: Some(vec![9, 12]),
         effective_looks_receipt: Some([vec![0x71; 32], vec![0x72; 32]].concat()),
-        resource_high_water_bytes: Some(vec![2048, 3072]),
+        resource_high_water_bytes: Some(vec![1024, 1536]),
+        condition_number: Some(vec![2.0, 3.0]),
         source_factor_digest: digest(0x77),
     }
 }
@@ -257,7 +280,7 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
     assert_eq!(read.block.difference_factor, block().difference_factor);
     assert_eq!(read.block.effective_looks_fraction, Some(vec![0.75, 0.5]));
     assert_eq!(read.block.support_union_count, Some(vec![9, 12]));
-    assert_eq!(read.block.resource_high_water_bytes, Some(vec![2048, 3072]));
+    assert_eq!(read.block.resource_high_water_bytes, Some(vec![1024, 1536]));
     assert_eq!(
         read.block.effective_looks_receipt.as_ref().unwrap().len(),
         64
@@ -269,10 +292,22 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
         .all(|bound| bound.is_nan()));
     assert_eq!(
         read.logical_payload_bytes,
-        12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8 + 2 * 8 + 2 * 8 + 2 * 32 + 2 * 8
+        12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8 + 2 * 8 + 2 * 8 + 2 * 32 + 2 * 8 + 2 * 8
     );
-
-    let error = read_spatial_reference_covariance_block(&path, 7, 32).unwrap_err();
+    let mut lower = 0_u64;
+    let mut upper = 4096_u64;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if read_spatial_reference_covariance_header(&path, middle).is_ok() {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    let exact_combined_cap = lower + read.logical_payload_bytes;
+    read_spatial_reference_covariance_block(&path, 7, exact_combined_cap).unwrap();
+    let error =
+        read_spatial_reference_covariance_block(&path, 7, exact_combined_cap - 1).unwrap_err();
     assert!(error.to_string().contains("byte cap"));
     std::fs::remove_file(path).unwrap();
 }
@@ -308,6 +343,7 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
         support_union_count: Some(vec![0; target_count]),
         effective_looks_receipt: Some(vec![0; target_count * 32]),
         resource_high_water_bytes: Some(vec![0; target_count]),
+        condition_number: Some(vec![f64::NAN; target_count]),
         source_factor_digest: digest(0x77),
     };
     status_block.rank_by_target[0] = 1;
@@ -316,8 +352,9 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
     status_block.effective_looks_fraction.as_mut().unwrap()[0] = 0.75;
     status_block.support_union_count.as_mut().unwrap()[0] = 9;
     status_block.effective_looks_receipt.as_mut().unwrap()[..32].fill(0x71);
-    status_block.resource_high_water_bytes.as_mut().unwrap()[0] = 2048;
-    status_block.resource_high_water_bytes.as_mut().unwrap()[8] = 8192;
+    status_block.resource_high_water_bytes.as_mut().unwrap()[0] = 1024;
+    status_block.condition_number.as_mut().unwrap()[0] = 2.0;
+    status_block.resource_high_water_bytes.as_mut().unwrap()[8] = 1536;
 
     assert_eq!(
         SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY.len(),
@@ -376,7 +413,7 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
 }
 
 #[test]
-fn coincident_valid_target_persists_exact_zero_rank() {
+fn declared_valid_target_rejects_zero_realized_rank() {
     let _hdf5 = hdf5_guard();
     let path = std::env::temp_dir().join(format!(
         "dolphin_spatial_reference_coincident_{}.h5",
@@ -386,17 +423,17 @@ fn coincident_valid_target_persists_exact_zero_rank() {
     let mut coincident = block();
     coincident.rank_by_target[0] = 0;
     coincident.difference_factor[..6].fill(0.0);
-    write_spatial_reference_covariance(&path, &metadata(), &[coincident]).unwrap();
-    let read = read_spatial_reference_covariance_block(&path, 7, 4096).unwrap();
-    assert_eq!(
-        read.block.status[0],
-        SpatialReferenceCovarianceStatus::Valid
-    );
-    assert_eq!(read.block.rank_by_target[0], 0);
-    assert!(read.block.difference_factor[..6]
-        .iter()
-        .all(|coefficient| *coefficient == 0.0));
-    std::fs::remove_file(path).unwrap();
+    assert!(write_spatial_reference_covariance(&path, &metadata(), &[coincident]).is_err());
+    let mut zero_declared_column = block();
+    for index in [1, 3, 5] {
+        zero_declared_column.difference_factor[index] = 0.0;
+    }
+    assert!(write_spatial_reference_covariance(
+        path.with_extension("zero-column.h5"),
+        &metadata(),
+        &[zero_declared_column]
+    )
+    .is_err());
 }
 
 #[test]
@@ -448,6 +485,7 @@ fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
     unsupported.support_union_count.as_mut().unwrap()[0] = 0;
     unsupported.effective_looks_receipt.as_mut().unwrap()[..32].fill(0);
     unsupported.resource_high_water_bytes.as_mut().unwrap()[0] = 0;
+    unsupported.condition_number.as_mut().unwrap()[0] = f64::NAN;
     unsupported.approximation_error_bound[0] = 0.01;
     assert!(write_spatial_reference_covariance(
         base.with_extension("unsupported-bound.h5"),
@@ -468,6 +506,7 @@ fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
         .resource_high_water_bytes
         .as_mut()
         .unwrap()[0] = 0;
+    calibrated_masked.condition_number.as_mut().unwrap()[0] = f64::NAN;
     calibrated_masked.approximation_error_bound[1] = 0.02;
     write_spatial_reference_covariance(
         base.with_extension("calibrated-masked.h5"),
@@ -581,14 +620,24 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v4()
         .unlink("runtime_resource_receipt_digest")
         .unwrap();
     for name in [
-        "aggregate_byte_cap",
+        "working_set_byte_cap",
         "factor_block_high_water_bytes",
         "serialization_high_water_bytes",
-        "fixed_l2_workspace_bytes",
-        "replay_reservation_high_water_bytes",
+        "fixed_l2_workspace_admission_bytes",
+        "fixed_l2_workspace_observed_high_water_bytes",
+        "replay_admission_high_water_bytes",
+        "replay_observed_high_water_bytes",
         "provider_peak_count",
         "provider_peak_bytes",
-        "aggregate_high_water_bytes",
+        "preflight_provider_open_count",
+        "production_provider_open_count",
+        "operator_block_reads",
+        "operator_block_cache_hits",
+        "source_member_window_reads",
+        "source_tile_cache_loads",
+        "source_resolutions",
+        "working_set_admission_high_water_bytes",
+        "working_set_observed_high_water_bytes",
     ] {
         metadata_group.unlink(name).unwrap();
     }
@@ -598,6 +647,7 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v4()
         "support_union_count",
         "effective_looks_receipt",
         "resource_high_water_bytes",
+        "condition_number",
     ] {
         block_group.unlink(name).unwrap();
     }
@@ -617,7 +667,16 @@ fn legacy_v2_uncalibrated_finite_bounds_are_readable_but_new_writes_require_v4()
     assert_eq!(legacy_block.support_union_count, None);
     assert_eq!(legacy_block.effective_looks_receipt, None);
     assert_eq!(legacy_block.resource_high_water_bytes, None);
+    assert_eq!(legacy_block.condition_number, None);
     assert!(SpatialReferenceCovarianceWriter::create(&path, &legacy).is_err());
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.attr("calibration_scope")
+        .unwrap()
+        .write_scalar(&1_u16)
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+    assert!(read_spatial_reference_covariance_header(&path, 4096).is_err());
     std::fs::remove_file(path).unwrap();
 }
 
@@ -640,14 +699,24 @@ fn previous_v3_layout_without_coordinates_or_runtime_receipts_remains_readable()
         "geotransform",
         "acquisition_days",
         "runtime_resource_receipt_digest",
-        "aggregate_byte_cap",
+        "working_set_byte_cap",
         "factor_block_high_water_bytes",
         "serialization_high_water_bytes",
-        "fixed_l2_workspace_bytes",
-        "replay_reservation_high_water_bytes",
+        "fixed_l2_workspace_admission_bytes",
+        "fixed_l2_workspace_observed_high_water_bytes",
+        "replay_admission_high_water_bytes",
+        "replay_observed_high_water_bytes",
         "provider_peak_count",
         "provider_peak_bytes",
-        "aggregate_high_water_bytes",
+        "preflight_provider_open_count",
+        "production_provider_open_count",
+        "operator_block_reads",
+        "operator_block_cache_hits",
+        "source_member_window_reads",
+        "source_tile_cache_loads",
+        "source_resolutions",
+        "working_set_admission_high_water_bytes",
+        "working_set_observed_high_water_bytes",
     ] {
         metadata_group.unlink(name).unwrap();
     }
@@ -657,6 +726,7 @@ fn previous_v3_layout_without_coordinates_or_runtime_receipts_remains_readable()
         "support_union_count",
         "effective_looks_receipt",
         "resource_high_water_bytes",
+        "condition_number",
     ] {
         block_group.unlink(name).unwrap();
     }
@@ -680,6 +750,7 @@ fn previous_v3_layout_without_coordinates_or_runtime_receipts_remains_readable()
     assert_eq!(previous.support_union_count, None);
     assert_eq!(previous.effective_looks_receipt, None);
     assert_eq!(previous.resource_high_water_bytes, None);
+    assert_eq!(previous.condition_number, None);
     std::fs::remove_file(path).unwrap();
 }
 

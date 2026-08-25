@@ -248,24 +248,44 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
-    /// Exact runtime aggregate resource receipt identity.
+    /// Exact runtime incremental covariance working-set receipt identity.
     pub runtime_resource_receipt_digest: String,
-    /// Single aggregate production resident-byte cap.
-    pub aggregate_byte_cap: u64,
+    /// Cap for the incremental #54 covariance working set.
+    pub working_set_byte_cap: u64,
     /// Largest resident in-progress factor block.
     pub factor_block_high_water_bytes: u64,
     /// Largest HDF5 serialization reservation.
     pub serialization_high_water_bytes: u64,
-    /// Dynamically projected fixed-L2 workspace.
-    pub fixed_l2_workspace_bytes: u64,
+    /// Dynamically projected fixed-L2 workspace admission.
+    pub fixed_l2_workspace_admission_bytes: u64,
+    /// Fixed-L2 workspace used by an executed propagation.
+    pub fixed_l2_workspace_observed_high_water_bytes: u64,
     /// Largest admitted replay reservation.
-    pub replay_reservation_high_water_bytes: u64,
+    pub replay_admission_high_water_bytes: u64,
+    /// Largest high-water reported by an executed replay.
+    pub replay_observed_high_water_bytes: u64,
     /// Observed maximum simultaneously live replay providers.
     pub provider_peak_count: u64,
     /// Observed maximum resident bytes held by live replay providers.
     pub provider_peak_bytes: u64,
-    /// Exact aggregate admitted high-water bound.
-    pub aggregate_high_water_bytes: u64,
+    /// Providers opened by resource-only preflight.
+    pub preflight_provider_open_count: u64,
+    /// Providers opened by numeric production replay.
+    pub production_provider_open_count: u64,
+    /// Operator HDF5 block reads during numeric replay.
+    pub operator_block_reads: u64,
+    /// Operator block cache hits during numeric replay.
+    pub operator_block_cache_hits: u64,
+    /// Source member-window reads during numeric replay.
+    pub source_member_window_reads: u64,
+    /// Source tile-cache loads during numeric replay.
+    pub source_tile_cache_loads: u64,
+    /// Source factor resolutions during numeric replay.
+    pub source_resolutions: u64,
+    /// Sum of admitted incremental covariance components.
+    pub working_set_admission_high_water_bytes: u64,
+    /// Sum of observed incremental covariance components.
+    pub working_set_observed_high_water_bytes: u64,
     /// Independent-review receipt identity.
     pub review_receipt_digest: String,
     /// Immutable reviewed method-manifest identity.
@@ -284,6 +304,10 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub effective_looks_receipt_dataset: String,
     /// HDF5 block dataset containing per-target replay resource high-water bounds.
     pub resource_high_water_bytes_dataset: String,
+    /// HDF5 block dataset containing per-target realized factor rank.
+    pub rank_by_target_dataset: String,
+    /// HDF5 block dataset containing per-target retained condition number.
+    pub condition_number_dataset: String,
     /// Realized fixed-support method.
     pub support_method: String,
     /// Realized fixed-support identity.
@@ -1010,14 +1034,25 @@ fn manifest(
         approximation_receipt_digest: metadata.approximation_receipt_digest.clone(),
         resource_receipt_digest: metadata.resource_receipt_digest.clone(),
         runtime_resource_receipt_digest: metadata.runtime_resource_receipt_digest.clone(),
-        aggregate_byte_cap: resource.aggregate_byte_cap,
+        working_set_byte_cap: resource.working_set_byte_cap,
         factor_block_high_water_bytes: resource.factor_block_high_water_bytes,
         serialization_high_water_bytes: resource.serialization_high_water_bytes,
-        fixed_l2_workspace_bytes: resource.fixed_l2_workspace_bytes,
-        replay_reservation_high_water_bytes: resource.replay_reservation_high_water_bytes,
+        fixed_l2_workspace_admission_bytes: resource.fixed_l2_workspace_admission_bytes,
+        fixed_l2_workspace_observed_high_water_bytes: resource
+            .fixed_l2_workspace_observed_high_water_bytes,
+        replay_admission_high_water_bytes: resource.replay_admission_high_water_bytes,
+        replay_observed_high_water_bytes: resource.replay_observed_high_water_bytes,
         provider_peak_count: resource.provider_peak_count,
         provider_peak_bytes: resource.provider_peak_bytes,
-        aggregate_high_water_bytes: resource.aggregate_high_water_bytes,
+        preflight_provider_open_count: resource.preflight_provider_open_count,
+        production_provider_open_count: resource.production_provider_open_count,
+        operator_block_reads: resource.operator_block_reads,
+        operator_block_cache_hits: resource.operator_block_cache_hits,
+        source_member_window_reads: resource.source_member_window_reads,
+        source_tile_cache_loads: resource.source_tile_cache_loads,
+        source_resolutions: resource.source_resolutions,
+        working_set_admission_high_water_bytes: resource.working_set_admission_high_water_bytes,
+        working_set_observed_high_water_bytes: resource.working_set_observed_high_water_bytes,
         review_receipt_digest: metadata.review_receipt_digest.clone(),
         method_manifest_digest: metadata.method_manifest_digest.clone(),
         calibration_scope_digest: metadata.calibration_scope_digest.clone(),
@@ -1029,6 +1064,8 @@ fn manifest(
         effective_looks_receipt_dataset: "blocks/{block_id:020}/effective_looks_receipt".to_owned(),
         resource_high_water_bytes_dataset: "blocks/{block_id:020}/resource_high_water_bytes"
             .to_owned(),
+        rank_by_target_dataset: "blocks/{block_id:020}/rank_by_target".to_owned(),
+        condition_number_dataset: "blocks/{block_id:020}/condition_number".to_owned(),
         support_method: metadata.support_method.clone(),
         support_digest: metadata.support_digest.clone(),
         correction_order_digest: metadata.correction_order_digest.clone(),

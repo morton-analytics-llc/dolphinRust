@@ -639,6 +639,10 @@ where
         }
     }
 
+    pub(crate) const fn source_resolver(&self) -> &R {
+        &self.source_resolver
+    }
+
     fn read_block(
         &mut self,
         block: &SequentialReplayBlock,

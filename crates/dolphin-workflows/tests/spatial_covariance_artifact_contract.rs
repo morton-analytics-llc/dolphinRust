@@ -34,14 +34,24 @@ fn digest(byte: u8) -> String {
 
 fn metadata() -> SpatialReferenceCovarianceMetadata {
     let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
-        aggregate_byte_cap: 1024,
+        working_set_byte_cap: 1024,
         factor_block_high_water_bytes: 128,
         serialization_high_water_bytes: 128,
-        fixed_l2_workspace_bytes: 256,
-        replay_reservation_high_water_bytes: 512,
+        fixed_l2_workspace_admission_bytes: 256,
+        fixed_l2_workspace_observed_high_water_bytes: 256,
+        replay_admission_high_water_bytes: 512,
+        replay_observed_high_water_bytes: 256,
         provider_peak_count: 2,
         provider_peak_bytes: 256,
-        aggregate_high_water_bytes: 1024,
+        preflight_provider_open_count: 4,
+        production_provider_open_count: 2,
+        operator_block_reads: 2,
+        operator_block_cache_hits: 3,
+        source_member_window_reads: 4,
+        source_tile_cache_loads: 2,
+        source_resolutions: 5,
+        working_set_admission_high_water_bytes: 1024,
+        working_set_observed_high_water_bytes: 768,
     };
     SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
@@ -106,7 +116,8 @@ fn block() -> SpatialReferenceCovarianceBlock {
         effective_looks_fraction: Some(vec![0.75]),
         support_union_count: Some(vec![9]),
         effective_looks_receipt: Some(vec![0x71; 32]),
-        resource_high_water_bytes: Some(vec![2048]),
+        resource_high_water_bytes: Some(vec![256]),
+        condition_number: Some(vec![2.0]),
         source_factor_digest: digest(0x77),
     }
 }
@@ -372,32 +383,51 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
         manifest.runtime_resource_receipt_digest,
         metadata().runtime_resource_receipt_digest
     );
-    assert_eq!(manifest.aggregate_byte_cap, runtime.aggregate_byte_cap);
     assert_eq!(
-        manifest.factor_block_high_water_bytes,
-        runtime.factor_block_high_water_bytes
+        (
+            manifest.working_set_byte_cap,
+            manifest.factor_block_high_water_bytes,
+            manifest.provider_peak_count,
+            manifest.provider_peak_bytes,
+            manifest.working_set_admission_high_water_bytes,
+            manifest.preflight_provider_open_count,
+            manifest.production_provider_open_count,
+            manifest.operator_block_reads,
+            manifest.source_member_window_reads,
+            manifest.source_tile_cache_loads,
+            manifest.source_resolutions,
+        ),
+        (
+            runtime.working_set_byte_cap,
+            runtime.factor_block_high_water_bytes,
+            runtime.provider_peak_count,
+            runtime.provider_peak_bytes,
+            runtime.working_set_admission_high_water_bytes,
+            runtime.preflight_provider_open_count,
+            runtime.production_provider_open_count,
+            runtime.operator_block_reads,
+            runtime.source_member_window_reads,
+            runtime.source_tile_cache_loads,
+            runtime.source_resolutions,
+        )
     );
-    assert_eq!(manifest.provider_peak_count, runtime.provider_peak_count);
-    assert_eq!(manifest.provider_peak_bytes, runtime.provider_peak_bytes);
     assert_eq!(
-        manifest.aggregate_high_water_bytes,
-        runtime.aggregate_high_water_bytes
-    );
-    assert_eq!(
-        manifest.effective_looks_fraction_dataset,
-        "blocks/{block_id:020}/effective_looks_fraction"
-    );
-    assert_eq!(
-        manifest.support_union_count_dataset,
-        "blocks/{block_id:020}/support_union_count"
-    );
-    assert_eq!(
-        manifest.effective_looks_receipt_dataset,
-        "blocks/{block_id:020}/effective_looks_receipt"
-    );
-    assert_eq!(
-        manifest.resource_high_water_bytes_dataset,
-        "blocks/{block_id:020}/resource_high_water_bytes"
+        (
+            manifest.effective_looks_fraction_dataset.as_str(),
+            manifest.support_union_count_dataset.as_str(),
+            manifest.effective_looks_receipt_dataset.as_str(),
+            manifest.resource_high_water_bytes_dataset.as_str(),
+            manifest.rank_by_target_dataset.as_str(),
+            manifest.condition_number_dataset.as_str(),
+        ),
+        (
+            "blocks/{block_id:020}/effective_looks_fraction",
+            "blocks/{block_id:020}/support_union_count",
+            "blocks/{block_id:020}/effective_looks_receipt",
+            "blocks/{block_id:020}/resource_high_water_bytes",
+            "blocks/{block_id:020}/rank_by_target",
+            "blocks/{block_id:020}/condition_number",
+        )
     );
     assert_eq!(manifest.calibration_scope, "uncalibrated");
     assert!(directory
