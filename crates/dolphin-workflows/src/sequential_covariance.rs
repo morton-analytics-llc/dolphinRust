@@ -2876,9 +2876,6 @@ impl SequentialReplayTopology {
             cone,
             estimate: mut dependency_cone,
         } = self.plan_reference_difference_query(target_selection, reference_selection, query)?;
-        if dependency_cone.total_bytes > query.byte_cap {
-            return Err(SequentialReplayError::Budget(dependency_cone));
-        }
         if selection.iter().all(|(date, _)| date.get() == 0) {
             let dates = target_selection.len();
             return Ok(ReferenceDifferenceCovarianceReplay {

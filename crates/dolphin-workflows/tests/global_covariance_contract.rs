@@ -1888,6 +1888,26 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         )
         .unwrap();
     assert_eq!(exact.dependency_cone.total_bytes, single_provider_bound);
+    let mut low_cap_provider = provider_for_same_topology();
+    let low_cap_error = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: 0,
+            },
+            request.branch_tolerance,
+            &mut low_cap_provider,
+        )
+        .unwrap_err();
+    assert_eq!(
+        low_cap_error.status(),
+        ReplayStatus::DependencyConeExceedsBudget
+    );
+    assert_eq!(low_cap_error.estimate(), Some(&exact.dependency_cone));
+    assert_eq!(low_cap_provider.source_reads, 0);
 
     let mut target_provider = provider_for_same_topology();
     let mut reference_provider = provider_for_same_topology();
