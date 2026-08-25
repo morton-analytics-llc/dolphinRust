@@ -77,6 +77,10 @@ fn streaming_writer_keeps_incomplete_artifacts_unreadable_and_rejects_duplicate_
     partial.source_burst_index_by_target.truncate(1);
     partial.difference_factor.truncate(6);
     partial.approximation_error_bound.truncate(1);
+    partial.effective_looks_fraction.truncate(1);
+    partial.support_union_count.truncate(1);
+    partial.effective_looks_receipt.truncate(32);
+    partial.resource_high_water_bytes.truncate(1);
     let mut writer = SpatialReferenceCovarianceWriter::create(&partial_path, &metadata()).unwrap();
     writer.write_block(&partial).unwrap();
     let mut overlap = partial.clone();
@@ -108,11 +112,13 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         burst_id: "T078-165482-IW1".to_owned(),
         crs: "EPSG:32611".to_owned(),
         units: "radians".to_owned(),
+        geotransform: [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0],
         full_grid: grid(0, 2),
         reference_row: 1,
         reference_col: 0,
         gauge_date_index: 0,
         ordered_date_indices: vec![0, 1, 2],
+        acquisition_days: vec![0.0, 12.0, 24.0],
         mask_digest: digest(0x11),
         source_replay_digest: digest(0x22),
         l2_map_digest: digest(0x33),
@@ -152,6 +158,10 @@ fn block() -> SpatialReferenceCovarianceBlock {
             0.0, 0.0, 0.5, 0.0, 1.5, 0.0, // target 1
         ],
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; 2],
+        effective_looks_fraction: vec![0.75, 0.5],
+        support_union_count: vec![9, 12],
+        effective_looks_receipt: [vec![0x71; 32], vec![0x72; 32]].concat(),
+        resource_high_water_bytes: vec![2048, 3072],
         source_factor_digest: digest(0x77),
     }
 }
@@ -171,9 +181,17 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
 
     let read_metadata = read_spatial_reference_covariance_header(&path, 4096).unwrap();
     assert_eq!(read_metadata, metadata());
+    assert_eq!(
+        read_metadata.geotransform,
+        [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0]
+    );
     let read = read_spatial_reference_covariance_block(&path, 7, 4096).unwrap();
     assert_eq!(read.block.status, block().status);
     assert_eq!(read.block.difference_factor, block().difference_factor);
+    assert_eq!(read.block.effective_looks_fraction, vec![0.75, 0.5]);
+    assert_eq!(read.block.support_union_count, vec![9, 12]);
+    assert_eq!(read.block.resource_high_water_bytes, vec![2048, 3072]);
+    assert_eq!(read.block.effective_looks_receipt.len(), 64);
     assert!(read
         .block
         .approximation_error_bound
@@ -181,7 +199,7 @@ fn chunked_reference_factor_round_trips_under_a_byte_cap() {
         .all(|bound| bound.is_nan()));
     assert_eq!(
         read.logical_payload_bytes,
-        12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8
+        12 * 8 + 2 * 4 + 2 * 2 + 2 * 4 + 2 * 8 + 2 * 8 + 2 * 8 + 2 * 32 + 2 * 8
     );
 
     let error = read_spatial_reference_covariance_block(&path, 7, 32).unwrap_err();
@@ -216,11 +234,20 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
             SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE;
             target_count
         ],
+        effective_looks_fraction: vec![f64::NAN; target_count],
+        support_union_count: vec![0; target_count],
+        effective_looks_receipt: vec![0; target_count * 32],
+        resource_high_water_bytes: vec![0; target_count],
         source_factor_digest: digest(0x77),
     };
     status_block.rank_by_target[0] = 1;
     status_block.source_burst_index_by_target[0] = 0;
     status_block.difference_factor[1] = 1.0;
+    status_block.effective_looks_fraction[0] = 0.75;
+    status_block.support_union_count[0] = 9;
+    status_block.effective_looks_receipt[..32].fill(0x71);
+    status_block.resource_high_water_bytes[0] = 2048;
+    status_block.resource_high_water_bytes[8] = 8192;
 
     assert_eq!(
         SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY.len(),
@@ -259,6 +286,10 @@ fn detailed_status_registry_round_trips_and_unknown_codes_fail_closed() {
     write_spatial_reference_covariance(&path, &metadata, &[status_block.clone()]).unwrap();
     let read = read_spatial_reference_covariance_block(&path, 9, 16_384).unwrap();
     assert_eq!(read.block.status, status_block.status);
+    assert_eq!(
+        read.block.resource_high_water_bytes,
+        status_block.resource_high_water_bytes
+    );
 
     let file = hdf5::File::open_rw(&path).unwrap();
     let dataset = file.dataset("blocks/00000000000000000009/status").unwrap();
@@ -343,6 +374,10 @@ fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
     unsupported.rank_by_target[0] = 0;
     unsupported.status[0] = SpatialReferenceCovarianceStatus::MaskedTarget;
     unsupported.difference_factor[..6].fill(0.0);
+    unsupported.effective_looks_fraction[0] = f64::NAN;
+    unsupported.support_union_count[0] = 0;
+    unsupported.effective_looks_receipt[..32].fill(0);
+    unsupported.resource_high_water_bytes[0] = 0;
     unsupported.approximation_error_bound[0] = 0.01;
     assert!(write_spatial_reference_covariance(
         base.with_extension("unsupported-bound.h5"),
@@ -356,6 +391,10 @@ fn approximation_bounds_are_absent_until_a_valid_scope_is_calibrated() {
     calibrated_masked.status[0] = SpatialReferenceCovarianceStatus::MaskedTarget;
     calibrated_masked.source_burst_index_by_target[0] = SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE;
     calibrated_masked.difference_factor[..6].fill(0.0);
+    calibrated_masked.effective_looks_fraction[0] = f64::NAN;
+    calibrated_masked.support_union_count[0] = 0;
+    calibrated_masked.effective_looks_receipt[..32].fill(0);
+    calibrated_masked.resource_high_water_bytes[0] = 0;
     calibrated_masked.approximation_error_bound[1] = 0.02;
     write_spatial_reference_covariance(
         base.with_extension("calibrated-masked.h5"),

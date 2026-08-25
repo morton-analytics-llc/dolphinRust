@@ -1130,6 +1130,7 @@ fn emit_displacement(
                 reference,
                 output_epsg,
                 spatial.geotransform,
+                &days,
             )
         })?;
     }

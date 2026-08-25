@@ -41,6 +41,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         burst_id: "T078-165482-IW1".to_owned(),
         crs: "EPSG:32611".to_owned(),
         units: "radians".to_owned(),
+        geotransform: [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0],
         full_grid: CovarianceOperatorGrid {
             row_start: 0,
             col_start: 0,
@@ -53,6 +54,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_col: 0,
         gauge_date_index: 0,
         ordered_date_indices: vec![0, 1],
+        acquisition_days: vec![0.0, 12.0],
         mask_digest: digest(0x11),
         source_replay_digest: digest(0x22),
         l2_map_digest: digest(0x33),
@@ -86,6 +88,10 @@ fn block() -> SpatialReferenceCovarianceBlock {
         source_burst_index_by_target: vec![0],
         difference_factor: vec![0.0, 1.0],
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE],
+        effective_looks_fraction: vec![0.75],
+        support_union_count: vec![9],
+        effective_looks_receipt: vec![0x71; 32],
+        resource_high_water_bytes: vec![2048],
         source_factor_digest: digest(0x77),
     }
 }
@@ -147,6 +153,8 @@ fn write_promotion_evidence(
             "burst_id": value.burst_id,
             "crs": value.crs,
             "units": value.units,
+            "geotransform": value.geotransform,
+            "acquisition_days": value.acquisition_days,
             "grid_row_start": value.full_grid.row_start,
             "grid_col_start": value.full_grid.col_start,
             "grid_rows": value.full_grid.rows,
@@ -341,6 +349,25 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     .unwrap();
     assert_eq!(manifest.hdf5_sha256, receipt.hdf5_sha256);
     assert_eq!(manifest.reference_signature_digest, digest(0x44));
+    assert_eq!(manifest.schema_version, 3);
+    assert_eq!(manifest.geotransform, metadata().geotransform);
+    assert_eq!(manifest.acquisition_days, metadata().acquisition_days);
+    assert_eq!(
+        manifest.effective_looks_fraction_dataset,
+        "blocks/{block_id:020}/effective_looks_fraction"
+    );
+    assert_eq!(
+        manifest.support_union_count_dataset,
+        "blocks/{block_id:020}/support_union_count"
+    );
+    assert_eq!(
+        manifest.effective_looks_receipt_dataset,
+        "blocks/{block_id:020}/effective_looks_receipt"
+    );
+    assert_eq!(
+        manifest.resource_high_water_bytes_dataset,
+        "blocks/{block_id:020}/resource_high_water_bytes"
+    );
     assert_eq!(manifest.calibration_scope, "uncalibrated");
     assert!(directory
         .join(SPATIAL_REFERENCE_COVARIANCE_FILENAME)
@@ -372,6 +399,24 @@ fn tampered_hdf5_or_manifest_identity_fails_closed() {
     let original = std::fs::read(&manifest_path).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
     manifest["reference_signature_digest"] = serde_json::Value::String(digest(0x99));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    manifest["geotransform"][0] = serde_json::json!(500_030.0);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    manifest["acquisition_days"][1] = serde_json::json!(13.0);
     std::fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).unwrap(),

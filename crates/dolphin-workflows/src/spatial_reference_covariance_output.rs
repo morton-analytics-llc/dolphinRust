@@ -1,7 +1,9 @@
 //! Production identities and fixed-L2 state for reference-specific covariance output.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{CorrectionOptions, DisplacementWorkflow, ShpMethod, UnwrapMethod};
@@ -24,7 +26,7 @@ use crate::corrections::CorrectionLayers;
 use crate::covariance_artifact::{
     read_covariance_artifact_manifest_with_byte_cap, CovarianceArtifactManifest,
 };
-use crate::cslc_covariance_source::CslcCovarianceManifest;
+use crate::cslc_covariance_source::{CslcCovarianceManifest, CslcCovarianceSourceResolver};
 use crate::displacement::PreparedBurstMask;
 use crate::sequential::SequentialConfig;
 use crate::sequential_covariance::{
@@ -33,7 +35,7 @@ use crate::sequential_covariance::{
     CovarianceArtifactReplayProvider, EffectiveLooksReplay, GlobalDateId,
     GlobalReferenceCovarianceQuery, ReplayBackend, ReplayExecutionScope, ReplayStatus,
     SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
-    SequentialTileReplayProvider,
+    SequentialSourceReplayProvider, SequentialTileReplayProvider,
 };
 use crate::spatial_covariance_artifact::{
     finalize_spatial_reference_covariance_artifact, SpatialReferenceCovarianceArtifactTransaction,
@@ -69,6 +71,10 @@ pub(crate) struct TargetFactor {
     pub(crate) source_burst_index: u32,
     pub(crate) date_factor: Option<Array2<f64>>,
     pub(crate) source_factor_receipt: [u8; 32],
+    pub(crate) effective_looks_fraction: f64,
+    pub(crate) support_union_count: u64,
+    pub(crate) effective_looks_receipt: [u8; 32],
+    pub(crate) resource_high_water_bytes: u64,
 }
 
 pub(crate) fn fixed_l2_status(status: SpatialL2Status) -> SpatialReferenceCovarianceStatus {
@@ -253,6 +259,10 @@ pub(crate) fn build_factor_block(
     let mut rank_by_target = Vec::with_capacity(targets);
     let mut status = Vec::with_capacity(targets);
     let mut source_burst_index_by_target = Vec::with_capacity(targets);
+    let mut effective_looks_fraction = Vec::with_capacity(targets);
+    let mut support_union_count = Vec::with_capacity(targets);
+    let mut effective_looks_receipt = Vec::with_capacity(targets * 32);
+    let mut resource_high_water_bytes = Vec::with_capacity(targets);
     let mut receipt = Sha256::new();
     receipt.update(b"dolphinrust:production-source-factor-block:v1");
     receipt.update(block_id.to_le_bytes());
@@ -291,6 +301,10 @@ pub(crate) fn build_factor_block(
         rank_by_target.push(rank);
         status.push(outcome.status);
         source_burst_index_by_target.push(outcome.source_burst_index);
+        effective_looks_fraction.push(outcome.effective_looks_fraction);
+        support_union_count.push(outcome.support_union_count);
+        effective_looks_receipt.extend_from_slice(&outcome.effective_looks_receipt);
+        resource_high_water_bytes.push(outcome.resource_high_water_bytes);
         receipt.update((target as u64).to_le_bytes());
         receipt.update((outcome.status as u16).to_le_bytes());
         receipt.update(outcome.source_burst_index.to_le_bytes());
@@ -306,6 +320,10 @@ pub(crate) fn build_factor_block(
         source_burst_index_by_target,
         difference_factor,
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; targets],
+        effective_looks_fraction,
+        support_union_count,
+        effective_looks_receipt,
+        resource_high_water_bytes,
         source_factor_digest: format!("sha256:{:x}", receipt.finalize()),
     })
 }
@@ -416,6 +434,7 @@ impl ProductionCovarianceState {
         reference: (usize, usize),
         epsg: u32,
         geotransform: [f64; 6],
+        acquisition_days: &[f64],
     ) -> Result<()> {
         let fixed_l2 = self
             .fixed_l2_inputs
@@ -476,54 +495,28 @@ impl ProductionCovarianceState {
             .iter()
             .map(|tile| topology_for_tile(tile, sequential_cfg))
             .collect::<Result<Vec<_>>>()?;
-        let mut source_resolvers = replay_context
-            .tiles
-            .iter()
-            .map(|tile| {
-                replay_context.source_manifest.resolver(
-                    &tile.member_indices,
-                    tile.request.burst_id.clone(),
-                    tile.processed_origin,
-                    tile.processed_shape,
-                    tile.request.native_grid,
-                    &cfg.phase_linking.empirical_source_factor,
-                    tile.request.source_model_version_digest,
-                    replay_context
-                        .masks
-                        .get(&tile.request.burst_id)
-                        .and_then(Option::as_ref)
-                        .map(|mask| {
-                            mask as &dyn crate::cslc_covariance_source::CslcCovarianceValidityReader
-                        }),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
         let build_identity = SequentialReplayBuildIdentity {
             normalized_config_digest: sequential_replay_config_digest(sequential_cfg),
             kernel_digest: sequential_replay_kernel_digest(),
             branch_tolerance: replay_context.tiles[0].request.branch_tolerance,
         };
-        let mut providers = topologies
-            .iter()
-            .zip(source_resolvers.drain(..))
-            .map(|(topology, resolver)| {
-                CovarianceArtifactReplayProvider::open(
-                    &cfg.work_directory,
-                    replay_context.operator_block_byte_cap,
-                    topology,
-                    build_identity,
-                    resolver,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::new)?;
-
+        let provider_residency = ProviderResidencyTracker::default();
+        for tile_index in 0..replay_context.tiles.len() {
+            drop(open_production_provider(
+                cfg,
+                replay_context,
+                &topologies,
+                build_identity,
+                tile_index,
+            )?);
+        }
         let dates = fixed_l2
             .pixel_map(reference)
             .map_err(anyhow::Error::new)?
             .date_count();
         anyhow::ensure!(
             dates > 0
+                && acquisition_days.len() == dates
                 && dates == replay_context.tiles[0].num_real_dates
                 && replay_context
                     .tiles
@@ -599,6 +592,7 @@ impl ProductionCovarianceState {
             &[
                 &PRODUCTION_REFERENCE_REPLAY_BYTE_CAP.to_le_bytes(),
                 &replay_context.operator_block_byte_cap.to_le_bytes(),
+                &2_u64.to_le_bytes(),
             ],
         );
         let metadata = SpatialReferenceCovarianceMetadata {
@@ -613,11 +607,13 @@ impl ProductionCovarianceState {
                 Some(_) => "meters".to_owned(),
                 None => "radians".to_owned(),
             },
+            geotransform,
             full_grid,
             reference_row: reference_global.0,
             reference_col: reference_global.1,
             gauge_date_index: 0,
             ordered_date_indices,
+            acquisition_days: acquisition_days.to_vec(),
             mask_digest: sha256_string(mask_digest),
             source_replay_digest,
             l2_map_digest: sha256_string(l2_map_digest),
@@ -651,6 +647,7 @@ impl ProductionCovarianceState {
             .map_or(1.0, |wavelength| -wavelength / (4.0 * std::f64::consts::PI));
         let block_shape = factor_block_shape(validity.dim(), dates, metadata.maximum_block_bytes)?;
         let mut block_id = 0_u64;
+        let mut maximum_persisted_resource_bytes = 0_u64;
         for row_start in (0..validity.nrows()).step_by(block_shape.0) {
             let rows = block_shape.0.min(validity.nrows() - row_start);
             for col_start in (0..validity.ncols()).step_by(block_shape.1) {
@@ -677,11 +674,21 @@ impl ProductionCovarianceState {
                             &ordered_dates,
                             source_rank,
                             build_identity.branch_tolerance,
+                            cfg,
+                            replay_context,
+                            build_identity,
+                            &provider_residency,
                             &topologies,
-                            &mut providers,
                         )?);
                     }
                 }
+                maximum_persisted_resource_bytes = maximum_persisted_resource_bytes.max(
+                    outcomes
+                        .iter()
+                        .map(|outcome| outcome.resource_high_water_bytes)
+                        .max()
+                        .unwrap_or(0),
+                );
                 writer.write_block(&build_factor_block(
                     block_id,
                     target_grid,
@@ -694,6 +701,14 @@ impl ProductionCovarianceState {
                     .context("factor block ID overflow")?;
             }
         }
+        let provider_receipt = provider_residency.receipt();
+        anyhow::ensure!(
+            provider_receipt.current_count == 0
+                && provider_receipt.current_bytes == 0
+                && provider_receipt.peak_count <= 2
+                && provider_receipt.peak_bytes <= maximum_persisted_resource_bytes,
+            "production replay provider residency exceeded its two-provider bound"
+        );
         let write_receipt = writer.finish()?;
         replay_context
             .source_manifest
@@ -783,8 +798,173 @@ fn topology_for_tile(
     .map_err(anyhow::Error::new)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn production_target_factor<R>(
+fn owning_replay_tile(
+    replay_context: &ProductionCovarianceReplayContext,
+    burst_id: &str,
+    coordinate: (u64, u64),
+) -> Result<usize> {
+    let mut owner = None;
+    for (index, tile) in replay_context.tiles.iter().enumerate() {
+        let grid = tile.request.owned_output_grid;
+        let row_stop = grid
+            .row_start
+            .checked_add(u64::from(grid.rows))
+            .context("owned replay row extent overflows u64")?;
+        let col_stop = grid
+            .col_start
+            .checked_add(u64::from(grid.cols))
+            .context("owned replay column extent overflows u64")?;
+        if tile.request.burst_id == burst_id
+            && coordinate.0 >= grid.row_start
+            && coordinate.0 < row_stop
+            && coordinate.1 >= grid.col_start
+            && coordinate.1 < col_stop
+        {
+            anyhow::ensure!(
+                owner.replace(index).is_none(),
+                "global output has multiple owning replay tiles"
+            );
+        }
+    }
+    owner.context("global output has no owning replay tile")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveProviderPlan {
+    target_tile: usize,
+    reference_tile: Option<usize>,
+}
+
+impl ActiveProviderPlan {
+    const fn new(target_tile: usize, reference_tile: usize) -> Self {
+        Self {
+            target_tile,
+            reference_tile: if target_tile == reference_tile {
+                None
+            } else {
+                Some(reference_tile)
+            },
+        }
+    }
+
+    const fn provider_count(self) -> usize {
+        1 + self.reference_tile.is_some() as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProviderResidencyReceipt {
+    current_count: usize,
+    peak_count: usize,
+    current_bytes: u64,
+    peak_bytes: u64,
+}
+
+#[derive(Clone, Default)]
+struct ProviderResidencyTracker {
+    receipt: Rc<Cell<ProviderResidencyReceipt>>,
+}
+
+impl ProviderResidencyTracker {
+    fn track<P>(&self, provider: P, reservation_bytes: u64) -> Result<ResidentProvider<P>> {
+        let mut receipt = self.receipt.get();
+        receipt.current_count = receipt
+            .current_count
+            .checked_add(1)
+            .context("active provider count overflow")?;
+        receipt.current_bytes = receipt
+            .current_bytes
+            .checked_add(reservation_bytes)
+            .context("active provider reservation overflow")?;
+        receipt.peak_count = receipt.peak_count.max(receipt.current_count);
+        receipt.peak_bytes = receipt.peak_bytes.max(receipt.current_bytes);
+        self.receipt.set(receipt);
+        Ok(ResidentProvider {
+            provider: Some(provider),
+            tracker: self.clone(),
+            reservation_bytes,
+        })
+    }
+
+    fn release(&self, reservation_bytes: u64) {
+        let mut receipt = self.receipt.get();
+        receipt.current_count = receipt
+            .current_count
+            .checked_sub(1)
+            .expect("provider residency count underflow");
+        receipt.current_bytes = receipt
+            .current_bytes
+            .checked_sub(reservation_bytes)
+            .expect("provider residency bytes underflow");
+        self.receipt.set(receipt);
+    }
+
+    fn receipt(&self) -> ProviderResidencyReceipt {
+        self.receipt.get()
+    }
+}
+
+struct ResidentProvider<P> {
+    provider: Option<P>,
+    tracker: ProviderResidencyTracker,
+    reservation_bytes: u64,
+}
+
+impl<P> ResidentProvider<P> {
+    fn provider_mut(&mut self) -> &mut P {
+        self.provider
+            .as_mut()
+            .expect("resident provider is available until drop")
+    }
+}
+
+impl<P> Drop for ResidentProvider<P> {
+    fn drop(&mut self) {
+        drop(self.provider.take());
+        self.tracker.release(self.reservation_bytes);
+    }
+}
+
+fn open_production_provider<'a>(
+    cfg: &DisplacementWorkflow,
+    replay_context: &'a ProductionCovarianceReplayContext,
+    topologies: &'a [SequentialReplayTopology],
+    build_identity: SequentialReplayBuildIdentity,
+    tile_index: usize,
+) -> Result<CovarianceArtifactReplayProvider<'a, CslcCovarianceSourceResolver<'a>>> {
+    let tile = replay_context
+        .tiles
+        .get(tile_index)
+        .context("production replay tile index is out of range")?;
+    let topology = topologies
+        .get(tile_index)
+        .context("production replay topology index is out of range")?;
+    let resolver = replay_context.source_manifest.resolver(
+        &tile.member_indices,
+        tile.request.burst_id.clone(),
+        tile.processed_origin,
+        tile.processed_shape,
+        tile.request.native_grid,
+        &cfg.phase_linking.empirical_source_factor,
+        tile.request.source_model_version_digest,
+        replay_context
+            .masks
+            .get(&tile.request.burst_id)
+            .and_then(Option::as_ref)
+            .map(|mask| mask as &dyn crate::cslc_covariance_source::CslcCovarianceValidityReader),
+    )?;
+    CovarianceArtifactReplayProvider::open(
+        &cfg.work_directory,
+        replay_context.operator_block_byte_cap,
+        topology,
+        build_identity,
+        resolver,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn production_target_factor(
     state: &ProductionCovarianceState,
     fixed_l2: &FixedL2WorkflowInputs,
     validity: ArrayView2<'_, bool>,
@@ -794,12 +974,12 @@ fn production_target_factor<R>(
     ordered_dates: &[GlobalDateId],
     source_rank: usize,
     branch_tolerance: f64,
+    cfg: &DisplacementWorkflow,
+    replay_context: &ProductionCovarianceReplayContext,
+    build_identity: SequentialReplayBuildIdentity,
+    provider_residency: &ProviderResidencyTracker,
     topologies: &[SequentialReplayTopology],
-    providers: &mut [CovarianceArtifactReplayProvider<'_, R>],
-) -> Result<TargetFactor>
-where
-    R: crate::sequential_covariance::SequentialPrimitiveSourceResolver,
-{
+) -> Result<TargetFactor> {
     if !validity[target] {
         return Ok(nonvalid_target(
             SpatialReferenceCovarianceStatus::MaskedTarget,
@@ -819,26 +999,87 @@ where
         .source_burst_ids
         .get(usize::try_from(owner)?)
         .context("target burst owner is outside the source registry")?;
-    let mut bundle = topologies
-        .iter()
-        .zip(providers.iter_mut())
-        .map(|(topology, provider)| SequentialTileReplayProvider::new(topology, provider))
-        .collect::<Vec<_>>();
-    let replay = match replay_global_reference_difference_covariance_from_provider_bundle(
-        &mut bundle,
-        GlobalReferenceCovarianceQuery {
-            burst_id: burst,
-            target: target_output,
-            reference: reference_output,
-            ordered_dates,
-            source_rank,
-            byte_cap: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
-            branch_tolerance,
-        },
-    ) {
+    let target_tile = owning_replay_tile(replay_context, burst, target_output)?;
+    let reference_tile = owning_replay_tile(replay_context, burst, reference_output)?;
+    let provider_plan = ActiveProviderPlan::new(target_tile, reference_tile);
+    debug_assert!(provider_plan.provider_count() <= 2);
+    let query = GlobalReferenceCovarianceQuery {
+        burst_id: burst,
+        target: target_output,
+        reference: reference_output,
+        ordered_dates,
+        source_rank,
+        byte_cap: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
+        branch_tolerance,
+    };
+    let (replay_result, active_provider_bytes) = if provider_plan.reference_tile.is_none() {
+        let provider = open_production_provider(
+            cfg,
+            replay_context,
+            topologies,
+            build_identity,
+            provider_plan.target_tile,
+        )?;
+        let reservation = provider.maximum_resident_bytes();
+        let mut provider = provider_residency.track(provider, reservation)?;
+        let mut bundle = [SequentialTileReplayProvider::new(
+            &topologies[provider_plan.target_tile],
+            provider.provider_mut(),
+        )];
+        (
+            replay_global_reference_difference_covariance_from_provider_bundle(&mut bundle, query),
+            reservation,
+        )
+    } else {
+        let target_provider = open_production_provider(
+            cfg,
+            replay_context,
+            topologies,
+            build_identity,
+            provider_plan.target_tile,
+        )?;
+        let target_reservation = target_provider.maximum_resident_bytes();
+        let mut target_provider = provider_residency.track(target_provider, target_reservation)?;
+        let reference_tile = provider_plan
+            .reference_tile
+            .context("two-provider replay plan lost its reference tile")?;
+        let reference_provider = open_production_provider(
+            cfg,
+            replay_context,
+            topologies,
+            build_identity,
+            reference_tile,
+        )?;
+        let reference_reservation = reference_provider.maximum_resident_bytes();
+        let active_provider_bytes = target_reservation
+            .checked_add(reference_reservation)
+            .context("active provider reservation overflows u64")?;
+        let mut reference_provider =
+            provider_residency.track(reference_provider, reference_reservation)?;
+        let mut bundle = [
+            SequentialTileReplayProvider::new(
+                &topologies[provider_plan.target_tile],
+                target_provider.provider_mut(),
+            ),
+            SequentialTileReplayProvider::new(
+                &topologies[reference_tile],
+                reference_provider.provider_mut(),
+            ),
+        ];
+        (
+            replay_global_reference_difference_covariance_from_provider_bundle(&mut bundle, query),
+            active_provider_bytes,
+        )
+    };
+    let replay = match replay_result {
         Ok(replay) => replay,
         Err(error) if replay_failure_aborts(&error) => return Err(anyhow::Error::new(error)),
-        Err(error) => return Ok(nonvalid_target(replay_status(error.status()))),
+        Err(error) => {
+            return Ok(nonvalid_target_with_resource(
+                replay_status(error.status()),
+                active_provider_bytes,
+            ));
+        }
     };
     let effective = replay
         .replay
@@ -852,7 +1093,12 @@ where
         replay.joint_phase_covariance.view(),
     ) {
         Ok(propagated) => propagated,
-        Err(error) => return Ok(nonvalid_target(fixed_l2_status(error.status))),
+        Err(error) => {
+            return Ok(nonvalid_target_with_resource(
+                fixed_l2_status(error.status),
+                replay.resource_high_water_bytes,
+            ));
+        }
     };
     anyhow::ensure!(
         propagated.status == SpatialL2Status::Valid,
@@ -873,6 +1119,11 @@ where
             effective.receipt,
             replay.resource_high_water_bytes,
         ),
+        effective_looks_fraction: effective.fraction,
+        support_union_count: u64::try_from(effective.support_union_count)
+            .context("effective-look support union exceeds u64")?,
+        effective_looks_receipt: effective.receipt,
+        resource_high_water_bytes: replay.resource_high_water_bytes,
     })
 }
 
@@ -900,11 +1151,22 @@ fn validate_effective_looks(effective: &EffectiveLooksReplay) -> Result<()> {
 }
 
 fn nonvalid_target(status: SpatialReferenceCovarianceStatus) -> TargetFactor {
+    nonvalid_target_with_resource(status, 0)
+}
+
+fn nonvalid_target_with_resource(
+    status: SpatialReferenceCovarianceStatus,
+    resource_high_water_bytes: u64,
+) -> TargetFactor {
     TargetFactor {
         status,
         source_burst_index: SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
         date_factor: None,
         source_factor_receipt: [0; 32],
+        effective_looks_fraction: f64::NAN,
+        support_union_count: 0,
+        effective_looks_receipt: [0; 32],
+        resource_high_water_bytes,
     }
 }
 
@@ -916,7 +1178,7 @@ fn factor_block_shape(
     let per_target = u64::try_from(dates)?
         .checked_mul(u64::try_from(dates)?)
         .and_then(|value| value.checked_mul(8))
-        .and_then(|value| value.checked_add(18))
+        .and_then(|value| value.checked_add(74))
         .context("factor target payload bytes overflow u64")?;
     let targets = usize::try_from(maximum_block_bytes / per_target)
         .context("factor target block capacity exceeds usize")?;
@@ -1416,18 +1678,30 @@ mod tests {
                     source_burst_index: 0,
                     date_factor: Some(array![[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]]),
                     source_factor_receipt: [1; 32],
+                    effective_looks_fraction: 0.75,
+                    support_union_count: 9,
+                    effective_looks_receipt: [0x71; 32],
+                    resource_high_water_bytes: 2048,
                 },
                 TargetFactor {
                     status: SpatialReferenceCovarianceStatus::Valid,
                     source_burst_index: 0,
                     date_factor: Some(Array2::zeros((3, 0))),
                     source_factor_receipt: [2; 32],
+                    effective_looks_fraction: 0.5,
+                    support_union_count: 12,
+                    effective_looks_receipt: [0x72; 32],
+                    resource_high_water_bytes: 3072,
                 },
                 TargetFactor {
                     status: SpatialReferenceCovarianceStatus::UnsupportedMultiburstReference,
                     source_burst_index: SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
                     date_factor: None,
                     source_factor_receipt: [0; 32],
+                    effective_looks_fraction: f64::NAN,
+                    support_union_count: 0,
+                    effective_looks_receipt: [0; 32],
+                    resource_high_water_bytes: 0,
                 },
             ],
         )
@@ -1471,6 +1745,10 @@ mod tests {
             source_burst_index: SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
             date_factor: None,
             source_factor_receipt: [0; 32],
+            effective_looks_fraction: f64::NAN,
+            support_union_count: 0,
+            effective_looks_receipt: [0; 32],
+            resource_high_water_bytes: 0,
         };
         assert!(build_factor_block(0, grid, 2, 1.0, &[false_valid]).is_err());
         let false_failure = TargetFactor {
@@ -1478,6 +1756,10 @@ mod tests {
             source_burst_index: 0,
             date_factor: Some(Array2::zeros((2, 0))),
             source_factor_receipt: [0; 32],
+            effective_looks_fraction: f64::NAN,
+            support_union_count: 0,
+            effective_looks_receipt: [0; 32],
+            resource_high_water_bytes: 0,
         };
         assert!(build_factor_block(0, grid, 2, 1.0, &[false_failure]).is_err());
     }
@@ -1577,7 +1859,7 @@ mod tests {
     #[test]
     fn factor_block_plan_is_rectangular_bounded_and_covers_narrow_caps() {
         let dates = 52;
-        let per_target = (dates * dates * 8 + 18) as u64;
+        let per_target = (dates * dates * 8 + 74) as u64;
         assert_eq!(
             factor_block_shape((4, 7), dates, per_target).unwrap(),
             (1, 1)
@@ -1587,5 +1869,59 @@ mod tests {
             (2, 7)
         );
         assert!(factor_block_shape((4, 7), dates, per_target - 1).is_err());
+    }
+
+    #[test]
+    fn production_provider_residency_never_accumulates_across_visited_tiles() {
+        struct DropProbe {
+            tracker: ProviderResidencyTracker,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                assert!(self.tracker.receipt().current_count > 0);
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let reference_tile = 17;
+        let provider_reservation = 4096_u64;
+        let tracker = ProviderResidencyTracker::default();
+        let drops = Rc::new(Cell::new(0));
+        for target_tile in 0..10_000 {
+            let plan = ActiveProviderPlan::new(target_tile, reference_tile);
+            let target = tracker
+                .track(
+                    DropProbe {
+                        tracker: tracker.clone(),
+                        drops: Rc::clone(&drops),
+                    },
+                    provider_reservation,
+                )
+                .unwrap();
+            let reference = plan
+                .reference_tile
+                .map(|_| {
+                    tracker.track(
+                        DropProbe {
+                            tracker: tracker.clone(),
+                            drops: Rc::clone(&drops),
+                        },
+                        provider_reservation,
+                    )
+                })
+                .transpose()
+                .unwrap();
+            assert_eq!(tracker.receipt().current_count, plan.provider_count());
+            drop(reference);
+            drop(target);
+            assert_eq!(tracker.receipt().current_count, 0);
+            assert_eq!(tracker.receipt().current_bytes, 0);
+        }
+        let receipt = tracker.receipt();
+        assert_eq!(receipt.peak_count, 2);
+        assert_eq!(receipt.peak_bytes, 2 * provider_reservation);
+        assert_eq!(drops.get(), 19_999);
     }
 }

@@ -54,7 +54,7 @@ pub const SPATIAL_REFERENCE_COVARIANCE_DESIGN_FILENAME: &str =
 /// Exact producer executable copied or linked into the artifact evidence directory.
 pub const SPATIAL_REFERENCE_COVARIANCE_PRODUCER_BINARY_FILENAME: &str =
     "referenced_displacement_covariance_producer_binary";
-const MANIFEST_SCHEMA_VERSION: u16 = 2;
+const MANIFEST_SCHEMA_VERSION: u16 = 3;
 const METADATA_READ_CAP: u64 = 1024 * 1024;
 const BINARY_READ_CAP: u64 = 512 * 1024 * 1024;
 const PREREGISTRATION_BYTES: &[u8] =
@@ -126,12 +126,14 @@ struct SpatialCovarianceResourceReceipt {
     maximum_block_bytes: u64,
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct SpatialCovarianceResultScope {
     burst_id: String,
     crs: String,
     units: String,
+    geotransform: [f64; 6],
+    acquisition_days: Vec<f64>,
     grid_row_start: u64,
     grid_col_start: u64,
     grid_rows: u32,
@@ -206,7 +208,7 @@ enum EvidenceValidationMode {
 }
 
 /// Durable receipt binding factor bytes to every scope identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpatialReferenceCovarianceArtifactManifest {
     /// Manifest schema version.
     pub schema_version: u16,
@@ -230,6 +232,10 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub crs: String,
     /// Factor units.
     pub units: String,
+    /// Exact GDAL affine geotransform of the factor grid.
+    pub geotransform: [f64; 6],
+    /// Exact acquisition day coordinates relative to the gauge acquisition.
+    pub acquisition_days: Vec<f64>,
     /// Selected reference/grid signature.
     pub reference_signature_digest: String,
     /// Native/output mask identity.
@@ -252,6 +258,14 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub source_model_digest: String,
     /// Effective-look rule identity.
     pub effective_looks_digest: String,
+    /// HDF5 block dataset containing per-target effective-look fractions.
+    pub effective_looks_fraction_dataset: String,
+    /// HDF5 block dataset containing per-target support-union counts.
+    pub support_union_count_dataset: String,
+    /// HDF5 block dataset containing per-target exact effective-look receipts.
+    pub effective_looks_receipt_dataset: String,
+    /// HDF5 block dataset containing per-target replay resource high-water bounds.
+    pub resource_high_water_bytes_dataset: String,
     /// Realized fixed-support method.
     pub support_method: String,
     /// Realized fixed-support identity.
@@ -868,6 +882,8 @@ fn result_scope(metadata: &SpatialReferenceCovarianceMetadata) -> SpatialCovaria
         burst_id: metadata.burst_id.clone(),
         crs: metadata.crs.clone(),
         units: metadata.units.clone(),
+        geotransform: metadata.geotransform,
+        acquisition_days: metadata.acquisition_days.clone(),
         grid_row_start: metadata.full_grid.row_start,
         grid_col_start: metadata.full_grid.col_start,
         grid_rows: metadata.full_grid.rows,
@@ -964,6 +980,8 @@ fn manifest(
         burst_id: metadata.burst_id.clone(),
         crs: metadata.crs.clone(),
         units: metadata.units.clone(),
+        geotransform: metadata.geotransform,
+        acquisition_days: metadata.acquisition_days.clone(),
         reference_signature_digest: metadata.reference_signature_digest.clone(),
         mask_digest: metadata.mask_digest.clone(),
         source_replay_digest: metadata.source_replay_digest.clone(),
@@ -975,6 +993,12 @@ fn manifest(
         calibration_scope_digest: metadata.calibration_scope_digest.clone(),
         source_model_digest: metadata.source_model_digest.clone(),
         effective_looks_digest: metadata.effective_looks_digest.clone(),
+        effective_looks_fraction_dataset: "blocks/{block_id:020}/effective_looks_fraction"
+            .to_owned(),
+        support_union_count_dataset: "blocks/{block_id:020}/support_union_count".to_owned(),
+        effective_looks_receipt_dataset: "blocks/{block_id:020}/effective_looks_receipt".to_owned(),
+        resource_high_water_bytes_dataset: "blocks/{block_id:020}/resource_high_water_bytes"
+            .to_owned(),
         support_method: metadata.support_method.clone(),
         support_digest: metadata.support_digest.clone(),
         correction_order_digest: metadata.correction_order_digest.clone(),

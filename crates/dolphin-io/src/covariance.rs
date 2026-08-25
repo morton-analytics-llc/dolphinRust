@@ -3932,7 +3932,9 @@ const SPATIAL_METADATA_MEMBERS: &[&str] = &[
     "burst_id",
     "crs",
     "units",
+    "geotransform",
     "ordered_date_indices",
+    "acquisition_days",
     "mask_digest",
     "source_replay_digest",
     "l2_map_digest",
@@ -3958,6 +3960,10 @@ const SPATIAL_BLOCK_MEMBERS: &[&str] = &[
     "source_burst_index_by_target",
     "difference_factor",
     "approximation_error_bound",
+    "effective_looks_fraction",
+    "support_union_count",
+    "effective_looks_receipt",
+    "resource_high_water_bytes",
     "source_factor_digest",
 ];
 const SPATIAL_BLOCK_ATTRIBUTES: &[&str] = &["block_id", "maximum_rank"];
@@ -4178,7 +4184,7 @@ pub const SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY: &[CovarianceRegistryEntr
 ];
 
 /// Artifact-level identity for bounded reference-specific covariance blocks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpatialReferenceCovarianceMetadata {
     /// HDF5 schema version.
     pub schema_version: u16,
@@ -4196,6 +4202,8 @@ pub struct SpatialReferenceCovarianceMetadata {
     pub crs: String,
     /// Factor output units.
     pub units: String,
+    /// Exact GDAL affine geotransform for the emitted output grid.
+    pub geotransform: [f64; 6],
     /// Complete output grid covered by the artifact.
     pub full_grid: CovarianceOperatorGrid,
     /// Selected reference row in the full output grid.
@@ -4206,6 +4214,8 @@ pub struct SpatialReferenceCovarianceMetadata {
     pub gauge_date_index: u32,
     /// Fixed output date map, including the gauge date.
     pub ordered_date_indices: Vec<u32>,
+    /// Exact acquisition day coordinates, relative to acquisition zero.
+    pub acquisition_days: Vec<f64>,
     /// Native/output mask identity.
     pub mask_digest: String,
     /// Persisted #52 replay/source identity.
@@ -4297,8 +4307,23 @@ impl SpatialReferenceCovarianceMetadata {
         ensure_valid(
             self.gauge_date_index == 0
                 && self.ordered_date_indices.first() == Some(&0)
-                && consecutive(&self.ordered_date_indices),
+                && consecutive(&self.ordered_date_indices)
+                && self.acquisition_days.len() == self.ordered_date_indices.len()
+                && self.acquisition_days.first() == Some(&0.0)
+                && self.acquisition_days.iter().all(|day| day.is_finite())
+                && self
+                    .acquisition_days
+                    .windows(2)
+                    .all(|pair| pair[1] > pair[0]),
             "spatial reference date map or gauge is invalid",
+        )?;
+        let determinant = self.geotransform[1] * self.geotransform[5]
+            - self.geotransform[2] * self.geotransform[4];
+        ensure_valid(
+            self.geotransform.iter().all(|value| value.is_finite())
+                && determinant.is_finite()
+                && determinant != 0.0,
+            "spatial reference affine geotransform is invalid",
         )?;
         ensure_valid(
             self.maximum_block_bytes > 0,
@@ -4458,8 +4483,14 @@ pub fn spatial_reference_calibration_scope_digest(
     digest.update(metadata.reference_row.to_le_bytes());
     digest.update(metadata.reference_col.to_le_bytes());
     digest.update(metadata.gauge_date_index.to_le_bytes());
+    for value in metadata.geotransform {
+        digest.update(value.to_bits().to_le_bytes());
+    }
     for date in &metadata.ordered_date_indices {
         digest.update(date.to_le_bytes());
+    }
+    for day in &metadata.acquisition_days {
+        digest.update(day.to_bits().to_le_bytes());
     }
     for burst in &metadata.source_burst_ids {
         digest.update((burst.len() as u64).to_le_bytes());
@@ -4491,6 +4522,14 @@ pub struct SpatialReferenceCovarianceBlock {
     /// Validated approximation-error bound for each target. Uncalibrated and
     /// non-valid targets use [`SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE`].
     pub approximation_error_bound: Vec<f64>,
+    /// Exact effective-look fraction applied for each target.
+    pub effective_looks_fraction: Vec<f64>,
+    /// Exact target/reference realized support-union cardinality.
+    pub support_union_count: Vec<u64>,
+    /// Target-major 32-byte effective-look realization receipts.
+    pub effective_looks_receipt: Vec<u8>,
+    /// Conservative replay resource high-water bound for each target.
+    pub resource_high_water_bytes: Vec<u64>,
     /// Digest of the exact replayed source factors represented by this block.
     pub source_factor_digest: String,
 }
@@ -4517,11 +4556,29 @@ impl SpatialReferenceCovarianceBlock {
             .ok()
             .and_then(|count| count.checked_mul(4))
             .ok_or_else(|| invalid("spatial reference ownership byte count overflow"))?;
+        let effective = u64::try_from(self.effective_looks_fraction.len())
+            .ok()
+            .and_then(|count| count.checked_mul(8))
+            .ok_or_else(|| invalid("effective-look fraction byte count overflow"))?;
+        let support = u64::try_from(self.support_union_count.len())
+            .ok()
+            .and_then(|count| count.checked_mul(8))
+            .ok_or_else(|| invalid("support-union count byte count overflow"))?;
+        let receipts = u64::try_from(self.effective_looks_receipt.len())
+            .map_err(|_| invalid("effective-look receipt byte count overflow"))?;
+        let resource = u64::try_from(self.resource_high_water_bytes.len())
+            .ok()
+            .and_then(|count| count.checked_mul(8))
+            .ok_or_else(|| invalid("resource high-water byte count overflow"))?;
         factor
             .checked_add(rank)
             .and_then(|value| value.checked_add(status))
             .and_then(|value| value.checked_add(ownership))
             .and_then(|value| value.checked_add(bounds))
+            .and_then(|value| value.checked_add(effective))
+            .and_then(|value| value.checked_add(support))
+            .and_then(|value| value.checked_add(receipts))
+            .and_then(|value| value.checked_add(resource))
             .ok_or_else(|| invalid("spatial reference block byte count overflow"))
     }
 
@@ -4544,6 +4601,10 @@ impl SpatialReferenceCovarianceBlock {
                 && self.status.len() == targets
                 && self.source_burst_index_by_target.len() == targets
                 && self.approximation_error_bound.len() == targets
+                && self.effective_looks_fraction.len() == targets
+                && self.support_union_count.len() == targets
+                && self.effective_looks_receipt.len() == targets * 32
+                && self.resource_high_water_bytes.len() == targets
                 && self.difference_factor.len()
                     == targets
                         .checked_mul(dates)
@@ -4584,6 +4645,25 @@ impl SpatialReferenceCovarianceBlock {
                     self.status[target] == SpatialReferenceCovarianceStatus::Valid || realized == 0
                 },
                 "spatial reference status and target rank disagree",
+            )?;
+            let receipt = &self.effective_looks_receipt[target * 32..(target + 1) * 32];
+            ensure_valid(
+                match self.status[target] == SpatialReferenceCovarianceStatus::Valid {
+                    true => {
+                        self.effective_looks_fraction[target].is_finite()
+                            && self.effective_looks_fraction[target] > 0.0
+                            && self.effective_looks_fraction[target] <= 1.0
+                            && self.support_union_count[target] > 0
+                            && receipt.iter().any(|byte| *byte != 0)
+                            && self.resource_high_water_bytes[target] > 0
+                    }
+                    false => {
+                        self.effective_looks_fraction[target].is_nan()
+                            && self.support_union_count[target] == 0
+                            && receipt.iter().all(|byte| *byte == 0)
+                    }
+                },
+                "spatial reference effective-look/resource receipt disagrees with target status",
             )?;
             if !legacy {
                 let approximation_bound = self.approximation_error_bound[target];
@@ -4832,6 +4912,8 @@ fn write_spatial_reference_metadata(
         "ordered_date_indices",
         &metadata.ordered_date_indices,
     )?;
+    write_chunked_1d(&identity, "acquisition_days", &metadata.acquisition_days)?;
+    write_chunked_1d(&identity, "geotransform", &metadata.geotransform)?;
     write_scalar_attr(&identity, "reference_row", metadata.reference_row)?;
     write_scalar_attr(&identity, "reference_col", metadata.reference_col)?;
     write_scalar_attr(
@@ -4883,6 +4965,25 @@ fn write_spatial_reference_block(
         "approximation_error_bound",
         &block.approximation_error_bound,
     )?;
+    write_chunked_1d(
+        group,
+        "effective_looks_fraction",
+        &block.effective_looks_fraction,
+    )?;
+    write_chunked_1d(group, "support_union_count", &block.support_union_count)?;
+    let receipt_view =
+        ndarray::ArrayView2::from_shape((target_count, 32), &block.effective_looks_receipt)
+            .map_err(|error| invalid(format!("effective-look receipt shape: {error}")))?;
+    group
+        .new_dataset_builder()
+        .with_data(receipt_view)
+        .chunk((target_count.min(64), 32))
+        .create("effective_looks_receipt")?;
+    write_chunked_1d(
+        group,
+        "resource_high_water_bytes",
+        &block.resource_high_water_bytes,
+    )?;
     write_string(group, "source_factor_digest", &block.source_factor_digest)
 }
 
@@ -4916,16 +5017,21 @@ pub fn read_spatial_reference_covariance_header(
     validate_spatial_root_schema(&file)?;
     let mut budget = ReadBudget::new(byte_cap);
     let identity = file.group("metadata")?;
-    for name in SPATIAL_METADATA_MEMBERS
-        .iter()
-        .copied()
-        .filter(|name| *name != "ordered_date_indices")
-    {
+    for name in SPATIAL_METADATA_MEMBERS.iter().copied().filter(|name| {
+        !matches!(
+            *name,
+            "ordered_date_indices" | "acquisition_days" | "geotransform"
+        )
+    }) {
         let (_, bytes) = inspect_dataset::<u8>(&identity, name, None)?;
         budget.charge(bytes)?;
     }
     let (_, date_bytes) = inspect_dataset::<u32>(&identity, "ordered_date_indices", None)?;
     budget.charge(date_bytes)?;
+    let (_, acquisition_bytes) = inspect_dataset::<f64>(&identity, "acquisition_days", None)?;
+    budget.charge(acquisition_bytes)?;
+    let (_, geotransform_bytes) = inspect_dataset::<f64>(&identity, "geotransform", Some(&[6]))?;
+    budget.charge(geotransform_bytes)?;
     read_spatial_metadata(&file)
 }
 
@@ -4934,6 +5040,7 @@ pub fn read_spatial_reference_covariance_header(
 /// # Errors
 /// Returns an error for a missing/malformed block or numeric allocation above
 /// `byte_cap`.
+#[allow(clippy::too_many_lines)]
 pub fn read_spatial_reference_covariance_block(
     path: impl AsRef<Path>,
     block_id: u64,
@@ -4984,6 +5091,30 @@ pub fn read_spatial_reference_covariance_block(
         &[targets],
         &mut logical_payload_bytes,
     )?;
+    add_exact_dataset::<f64>(
+        &group,
+        "effective_looks_fraction",
+        &[targets],
+        &mut logical_payload_bytes,
+    )?;
+    add_exact_dataset::<u64>(
+        &group,
+        "support_union_count",
+        &[targets],
+        &mut logical_payload_bytes,
+    )?;
+    add_exact_dataset::<u8>(
+        &group,
+        "effective_looks_receipt",
+        &[targets, 32],
+        &mut logical_payload_bytes,
+    )?;
+    add_exact_dataset::<u64>(
+        &group,
+        "resource_high_water_bytes",
+        &[targets],
+        &mut logical_payload_bytes,
+    )?;
     ensure_valid(
         logical_payload_bytes <= metadata.maximum_block_bytes,
         "spatial reference block exceeds embedded byte cap",
@@ -5005,6 +5136,10 @@ pub fn read_spatial_reference_covariance_block(
         source_burst_index_by_target: group.dataset("source_burst_index_by_target")?.read_raw()?,
         difference_factor: group.dataset("difference_factor")?.read_raw()?,
         approximation_error_bound: group.dataset("approximation_error_bound")?.read_raw()?,
+        effective_looks_fraction: group.dataset("effective_looks_fraction")?.read_raw()?,
+        support_union_count: group.dataset("support_union_count")?.read_raw()?,
+        effective_looks_receipt: group.dataset("effective_looks_receipt")?.read_raw()?,
+        resource_high_water_bytes: group.dataset("resource_high_water_bytes")?.read_raw()?,
         source_factor_digest: read_string(&group, "source_factor_digest")?,
     };
     ensure_valid(
@@ -5058,11 +5193,17 @@ fn read_spatial_metadata(file: &hdf5::File) -> Result<SpatialReferenceCovariance
         burst_id: read_string(&identity, "burst_id")?,
         crs: read_string(&identity, "crs")?,
         units: read_string(&identity, "units")?,
+        geotransform: identity
+            .dataset("geotransform")?
+            .read_raw::<f64>()?
+            .try_into()
+            .map_err(|_| invalid("spatial reference geotransform must contain six values"))?,
         full_grid: read_grid(file, "full_grid")?,
         reference_row: read_scalar_attr(&identity, "reference_row")?,
         reference_col: read_scalar_attr(&identity, "reference_col")?,
         gauge_date_index: read_scalar_attr(file, "gauge_date_index")?,
         ordered_date_indices: identity.dataset("ordered_date_indices")?.read_raw()?,
+        acquisition_days: identity.dataset("acquisition_days")?.read_raw()?,
         mask_digest: read_string(&identity, "mask_digest")?,
         source_replay_digest: read_string(&identity, "source_replay_digest")?,
         l2_map_digest: read_string(&identity, "l2_map_digest")?,
