@@ -42,9 +42,9 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21315584
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "923a30d297de46bf7ad33006a39188d8d3ff301bb03be1ed5c052401c24faf39"
+FROZEN_GENERATOR_SHA256 = "4e111c317c0659298d738e253f0d8c74115585d2bf76c806a88a2f7af315fd67"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "0454db5925bbb3076ec40d59f2fc861f5950b88c860cbf66ab68425f709425d5"
-FROZEN_EXECUTION_SHA256 = "b155147747e4a6628e69d13f53b1742394c93c657c83496a3623316c3c863015"
+FROZEN_EXECUTION_SHA256 = "0c4f33b189555caffbcf703edc13a075d0499c1ff8c1bf56b033d1020a8190ea"
 FROZEN_REDUCERS_SHA256 = "bdab964569b074caf0bc27ec758a2f7ca633a911368333610fd42c96bb6740dd"
 FROZEN_MATRIX_SHA256 = "7d56f01b6b759de9f722f476d7c2346e2c614580b3fdfc5ffecc00e030636244"
 FROZEN_RECEIPT_SHA256 = "b25997a99ecd2c67f37949744687b8530cccf3e4d7515daec1d6fb87117cb957"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "204831714f38b5923009d25d589d537ab56a4cce11ae0480eb4ea764ab40b920"
+FROZEN_SOURCE_SET_SHA256 = "ac1ad658931af8e0c59c59f527159b5889cc030d901d19017a327e4e54ec0182"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -1587,9 +1587,21 @@ def derive_dense_joint_oracle(
 
 
 def regenerate_frozen_attempt_inputs(
-    preregistration: Mapping[str, Any], cell_id: str, seed_index: int
+    preregistration: Mapping[str, Any],
+    cell_id: str,
+    seed_index: int,
+    *,
+    matched_cohort_replay: bool = False,
 ) -> dict[str, Any]:
-    if not _integer(seed_index) or seed_index < 0 or seed_index >= expected_seed_count(cell_id):
+    matched_cells = {FROZEN_MATCHED_POSITIVE_CELL, FROZEN_MATCHED_NEGATIVE_CELL}
+    if matched_cohort_replay and cell_id not in matched_cells:
+        raise SchemaError("matched cohort replay is restricted to the two frozen signed cells")
+    seed_limit = (
+        FROZEN_MATCHED_SEED_COUNT
+        if matched_cohort_replay
+        else expected_seed_count(cell_id)
+    )
+    if not _integer(seed_index) or seed_index < 0 or seed_index >= seed_limit:
         raise SchemaError("frozen DGP seed index is outside the preregistered schedule")
     labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
     if set(labels) != set(DIMENSION_NAMES):
@@ -1874,6 +1886,7 @@ class CellAccumulator:
     code_sha256: str = "0" * 64
     binary_sha256: str = "0" * 64
     artifact_root: Path | None = None
+    matched_cohort_replay: bool = False
     next_seed_index: int = 0
     emitted: int = 0
     date_count: int = 0
@@ -1909,6 +1922,18 @@ class CellAccumulator:
     attempt_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:attempts:v4\0"))
 
     def __post_init__(self) -> None:
+        if self.matched_cohort_replay:
+            if self.cell_id not in {
+                FROZEN_MATCHED_POSITIVE_CELL,
+                FROZEN_MATCHED_NEGATIVE_CELL,
+            }:
+                raise SchemaError(
+                    "matched cohort accumulator is restricted to the two frozen signed cells"
+                )
+            if self.expected_seed_count is None:
+                self.expected_seed_count = FROZEN_MATCHED_SEED_COUNT
+            if self.expected_seed_count != FROZEN_MATCHED_SEED_COUNT:
+                raise SchemaError("matched cohort accumulator must use the frozen seed schedule")
         if self.expected_seed_count is None:
             self.expected_seed_count = expected_seed_count(self.cell_id)
 
@@ -1956,7 +1981,10 @@ class CellAccumulator:
         if attempt.get("estimator_branch") != expected_estimator:
             raise SchemaError(f"cell {self.cell_id} estimator identity differs from the frozen branch")
         regenerated = regenerate_frozen_attempt_inputs(
-            self.preregistration, self.cell_id, self.next_seed_index
+            self.preregistration,
+            self.cell_id,
+            self.next_seed_index,
+            matched_cohort_replay=self.matched_cohort_replay,
         )
         if any(
             not isinstance(attempt.get(field_name), list)

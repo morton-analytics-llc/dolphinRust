@@ -122,11 +122,24 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             artifact_root=self.artifact_root,
         )
 
-    def _attempt(self, cell_id, ordinal, seed_index, masked=False, artifact_root=None):
+    def _attempt(
+        self,
+        cell_id,
+        ordinal,
+        seed_index,
+        masked=False,
+        artifact_root=None,
+        matched_cohort_replay=False,
+    ):
         artifact_root = self.artifact_root if artifact_root is None else Path(artifact_root)
         labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
         generator = self.preregistration["generator"]
-        frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
+        frozen = regenerate_frozen_attempt_inputs(
+            self.preregistration,
+            cell_id,
+            seed_index,
+            matched_cohort_replay=matched_cohort_replay,
+        )
         tied = labels["eigen_stress"] == "tied_eigenvalue" and labels["position"] != "masked"
         empty = expected_empty_support(cell_id)
         emitted = not masked and not tied and not empty
@@ -1992,6 +2005,70 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 self.preregistration, PREREGISTRATION, Path("missing-batch"),
                 CODE, BINARY, 512,
             )
+
+    def test_matched_replay_schedule_is_explicit_and_does_not_widen_outcomes(self):
+        negative_cell = FROZEN_MATCHED_POSITIVE_CELL.replace(
+            "shared_75_positive", "shared_75_negative"
+        )
+        for cell_id in (FROZEN_MATCHED_POSITIVE_CELL, negative_cell):
+            for seed_index in (127, 128, 511):
+                regenerate_frozen_attempt_inputs(
+                    self.preregistration,
+                    cell_id,
+                    seed_index,
+                    matched_cohort_replay=True,
+                )
+            with self.assertRaisesRegex(SchemaError, "schedule"):
+                regenerate_frozen_attempt_inputs(
+                    self.preregistration,
+                    cell_id,
+                    512,
+                    matched_cohort_replay=True,
+                )
+        with self.assertRaisesRegex(SchemaError, "schedule"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration, FROZEN_MATCHED_POSITIVE_CELL, 128
+            )
+        with self.assertRaisesRegex(SchemaError, "matched cohort"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration,
+                CELL,
+                128,
+                matched_cohort_replay=True,
+            )
+
+        cell_ordinal = expected_cell_ids(self.preregistration).index(
+            FROZEN_MATCHED_POSITIVE_CELL
+        )
+        ordinary = CellAccumulator(
+            self.preregistration,
+            FROZEN_MATCHED_POSITIVE_CELL,
+            cell_ordinal,
+            128,
+            CODE,
+            BINARY,
+        )
+        ordinary.next_seed_index = 128
+        top_up = self._attempt(
+            FROZEN_MATCHED_POSITIVE_CELL,
+            cell_ordinal,
+            128,
+            matched_cohort_replay=True,
+        )
+        with self.assertRaisesRegex(SchemaError, "top-up"):
+            ordinary.add(top_up)
+
+        matched = CellAccumulator(
+            self.preregistration,
+            FROZEN_MATCHED_POSITIVE_CELL,
+            cell_ordinal,
+            512,
+            CODE,
+            BINARY,
+            matched_cohort_replay=True,
+        )
+        matched.next_seed_index = 128
+        matched.add(top_up)
 
     def test_matched_signed_dgp_separates_joint_identity_from_exact_marginals(self):
         positive = regenerate_frozen_attempt_inputs(
