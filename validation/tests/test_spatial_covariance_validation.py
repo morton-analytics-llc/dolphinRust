@@ -55,6 +55,7 @@ from validation.score_spatial_covariance import (
     producer_identities,
     regenerate_frozen_attempt_inputs,
     sha256_json,
+    score_attempt_shard,
     validate_cell_summary,
     validate_direct_pair_variance_order,
     validate_matched_pair_cohorts,
@@ -911,12 +912,23 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 "bounded_artifact_semantics": evidence["bounded_artifact_semantics"],
             }
             validate_production_parity_fixture(
-                self.preregistration, Path(directory), binding, sha256_json(binding)
+                self.preregistration, Path(directory), binding, sha256_json(binding),
+                Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch",
             )
-            (Path(directory) / binding["hdf5_path"]).write_bytes(b"tamper")
-            with self.assertRaisesRegex(SchemaError, "production parity"):
+            whole_hdf5 = Path(directory) / binding["hdf5_path"]
+            bounded_hdf5 = Path(directory) / binding["bounded_hdf5_path"]
+            whole_hdf5.write_bytes(bounded_hdf5.read_bytes())
+            binding["hdf5_sha256"] = hashlib.sha256(whole_hdf5.read_bytes()).hexdigest()
+            sidecar_path = Path(directory) / binding["sidecar_path"]
+            sidecar = json.loads(sidecar_path.read_text())
+            sidecar["hdf5_bytes"] = whole_hdf5.stat().st_size
+            sidecar["hdf5_sha256"] = binding["hdf5_sha256"]
+            sidecar_path.write_text(json.dumps(sidecar, sort_keys=True, separators=(",", ":")))
+            binding["sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(SchemaError, "production parity Rust inspection"):
                 validate_production_parity_fixture(
-                    self.preregistration, Path(directory), binding, sha256_json(binding)
+                    self.preregistration, Path(directory), binding, sha256_json(binding),
+                    Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch",
                 )
 
     def test_production_parity_rejects_bounded_sidecar_corruption(self):
@@ -960,7 +972,8 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             binding["bounded_sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
             with self.assertRaisesRegex(SchemaError, "production parity"):
                 validate_production_parity_fixture(
-                    self.preregistration, Path(directory), binding, sha256_json(binding)
+                    self.preregistration, Path(directory), binding, sha256_json(binding),
+                    Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch",
                 )
 
     def test_production_parity_rejects_semantic_corruption_with_recomputed_enclosing_hash(self):
@@ -1000,9 +1013,10 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 "estimator_branch": evidence["estimator"],
             }
             binding["whole_artifact_semantics"]["blocks"][0]["source_burst_indices"][0] = 99
-            with self.assertRaisesRegex(SchemaError, "persisted block receipt"):
+            with self.assertRaisesRegex(SchemaError, "Rust-inspected HDF5 semantics"):
                 validate_production_parity_fixture(
-                    self.preregistration, Path(directory), binding, sha256_json(binding)
+                    self.preregistration, Path(directory), binding, sha256_json(binding),
+                    Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch",
                 )
 
     def test_parity_driver_cannot_masquerade_as_full_cell_generator(self):
@@ -1162,6 +1176,41 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             self.assertTrue(transport.exists())
             self.assertFalse((root / "cell-00001.jsonl").exists())
 
+    def test_cell_commit_crash_windows_preserve_one_recoverable_boundary(self):
+        for failure_call, transport_remains in ((1, True), (2, False)):
+            with self.subTest(failure_call=failure_call), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transport = root / "attempts.jsonl"
+                transport.write_bytes(compact_json_line(
+                    self._attempt(MASKED_CELL, 0, 0, masked=True, artifact_root=root)
+                ))
+                destination = root / "cell-00000.jsonl"
+                calls = 0
+
+                def fail_at_boundary(_path):
+                    nonlocal calls
+                    calls += 1
+                    if calls == failure_call:
+                        raise OSError("injected directory fsync crash")
+
+                with (
+                    mock.patch(
+                        "validation.spatial_covariance_simulation._fsync_directory",
+                        side_effect=fail_at_boundary,
+                    ),
+                    self.assertRaisesRegex(OSError, "injected directory fsync crash"),
+                ):
+                    commit_cell_transport(
+                        self.preregistration, MASKED_CELL, 0, transport,
+                        destination, CODE, BINARY, artifact_root=root,
+                    )
+                self.assertTrue(destination.exists())
+                self.assertEqual(transport.exists(), transport_remains)
+                validate_cell_summary(
+                    self.preregistration, json.loads(destination.read_text()),
+                    MASKED_CELL, 0, CODE, BINARY,
+                )
+
     def test_compact_shard_commit_resume_and_tamper(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1180,6 +1229,96 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             cells.joinpath("cell-00000.jsonl").write_text("{}\n")
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+
+    def test_final_scorer_replays_exact_rust_and_rejects_rehashed_summary_replacement(self):
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/debug/examples/spatial_covariance_batch"
+        subprocess.run(
+            [
+                "cargo", "build", "--quiet", "-p", "dolphin-workflows",
+                "--no-default-features", "--features", "no-gpu", "--example",
+                "spatial_covariance_batch",
+            ],
+            check=True,
+            cwd=source_root,
+        )
+        cell_ordinal = expected_cell_ids(self.preregistration).index(MASKED_CELL)
+        request = next(_iter_cell_requests(self.preregistration, MASKED_CELL, 1))
+        completed = subprocess.run(
+            [
+                str(batch), "--preregistration", str(PREREGISTRATION),
+                "--cell-id", MASKED_CELL, "--ephemeral-evidence-stdout",
+            ],
+            input=compact_json_line(request),
+            check=True,
+            capture_output=True,
+            cwd=source_root,
+        )
+        attempt = json.loads(completed.stdout)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells = root / "cells"
+            cells.mkdir()
+            accumulator = CellAccumulator(
+                self.preregistration, MASKED_CELL, cell_ordinal, 1, CODE, BINARY,
+                artifact_root=root,
+            )
+            accumulator.add(attempt)
+            summary = accumulator.finalize()
+            path = cells / f"cell-{cell_ordinal:05d}.jsonl"
+            raw = compact_json_line(summary)
+            path.write_bytes(raw)
+
+            def summary_root(value):
+                digest = hashlib.sha256(
+                    b"dolphinrust:spatial-covariance:cell-summary-root:v4\0"
+                )
+                digest.update((0).to_bytes(8, "big"))
+                digest.update(hashlib.sha256(value).digest())
+                return digest.hexdigest()
+
+            manifest = {
+                "schema": "dolphinrust.spatial-covariance.shard-manifest/4",
+                "schema_version": 4,
+                "shard_index": 0,
+                "cell_ordinal_start": cell_ordinal,
+                "cell_ordinal_end_exclusive": cell_ordinal + 1,
+                "expected_cells": 1,
+                "expected_attempts": 1,
+                "summary_path": "cells",
+                "summary_sha256": summary_root(raw),
+                "summary_bytes": len(raw),
+                "summary_records": 1,
+                "preregistration_sha256": preregistration_digest(self.preregistration),
+                "code_sha256": CODE,
+                "binary_sha256": BINARY,
+                "generator_protocol_sha256": sha256_json(
+                    self.preregistration["execution_protocol"]
+                ),
+                "elapsed_seconds": 1.0,
+                "peak_rss_bytes": 1,
+                "committed": True,
+            }
+            spec = ShardSpec(
+                0, cell_ordinal, cell_ordinal + 1, (MASKED_CELL,), (1,)
+            )
+            self.assertEqual(
+                len(score_attempt_shard(
+                    self.preregistration, root, manifest, spec,
+                    PREREGISTRATION, batch,
+                )),
+                1,
+            )
+            summary["attempt_digest"] = "f" * 64
+            replaced = compact_json_line(summary)
+            path.write_bytes(replaced)
+            manifest["summary_sha256"] = summary_root(replaced)
+            manifest["summary_bytes"] = len(replaced)
+            with self.assertRaisesRegex(SchemaError, "differs from exact Rust replay"):
+                score_attempt_shard(
+                    self.preregistration, root, manifest, spec,
+                    PREREGISTRATION, batch,
+                )
 
     def test_high_level_outcome_runner_commits_resumes_and_rejects_tamper(self):
         source_root = Path(__file__).parents[2]
@@ -1227,11 +1366,25 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 )
                 self.assertFalse(first["reusable"])
                 self.assertEqual(first["generated_cells"], 1)
+                manifest = root / "shards/manifest-00000.jsonl"
+                manifest.unlink()
+                residual = root / "transports/cell-00000.jsonl"
+                residual.write_bytes(compact_json_line(next(attempt(MASKED_CELL, 0))))
+                residual_partial = residual.with_name(residual.name + ".partial")
+                residual_partial.write_bytes(b"owned crash residue")
                 second = run_outcomes(
                     preregistration, PREREGISTRATION, source_root, batch, benchmark,
                     Path(directory) / "preoutcome", root, 0, spec, attempt,
                 )
-                self.assertTrue(second["reusable"])
+                self.assertFalse(second["reusable"])
+                self.assertEqual(second["resumed_cells"], 1)
+                self.assertFalse(residual.exists())
+                self.assertFalse(residual_partial.exists())
+                third = run_outcomes(
+                    preregistration, PREREGISTRATION, source_root, batch, benchmark,
+                    Path(directory) / "preoutcome", root, 0, spec, attempt,
+                )
+                self.assertTrue(third["reusable"])
                 summary = root / "cells/shard-00000/cell-00000.jsonl"
                 summary.write_text("{}\n")
                 with self.assertRaisesRegex(SchemaError, "resume validation"):

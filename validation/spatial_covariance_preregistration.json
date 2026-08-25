@@ -620,7 +620,7 @@
           "Cargo.lock",
           "Cargo.toml"
         ],
-          "sha256": "15543bf0b9e8c349aa2bf7337fb865bffa1676d258ffe6495c19670a2835c7e6"
+        "sha256": "7c2bb91c4b5f2d1a7782122d1dbc160c4626b667e33097d0241bbb391e900a99"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",

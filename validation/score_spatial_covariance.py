@@ -10,6 +10,7 @@ import math
 import os
 import stat
 import struct
+import subprocess
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -41,7 +42,7 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21315584
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "41ba7168e403e532ee2da9f97b2d7af5e974c94d0604efad3c6a333251c3bf39"
+FROZEN_GENERATOR_SHA256 = "2d0615066f36e2c1ad40fe811f9e5055a1811bf75a490064a7427d97c3b1dda2"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "7697e728c554821ba4cc5bc7ffa4c28be06b2e6c177b644543e8876f7941eba5"
 FROZEN_EXECUTION_SHA256 = "44f1d6bcf80b681214bf7fddacaa8889afdd8e39f8d2a4bc48777a6305e0df0a"
 FROZEN_REDUCERS_SHA256 = "bdab964569b074caf0bc27ec758a2f7ca633a911368333610fd42c96bb6740dd"
@@ -60,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "15543bf0b9e8c349aa2bf7337fb865bffa1676d258ffe6495c19670a2835c7e6"
+FROZEN_SOURCE_SET_SHA256 = "7c2bb91c4b5f2d1a7782122d1dbc160c4626b667e33097d0241bbb391e900a99"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = ("Cargo.lock", "Cargo.toml")
 FROZEN_MATCHED_POSITIVE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
@@ -2473,6 +2474,78 @@ def validate_input_shard(preregistration: Mapping[str, Any], input_path: Path, m
         raise SchemaError(f"shard {spec.index} input hash/byte count mismatch")
 
 
+def _rust_replay_cell_summary(
+    preregistration: Mapping[str, Any],
+    preregistration_path: Path,
+    batch_binary: Path,
+    run_root: Path,
+    cell_id: str,
+    cell_ordinal: int,
+    code_sha256: str,
+    binary_sha256: str,
+) -> dict[str, Any]:
+    process = subprocess.Popen(
+        [
+            str(Path(batch_binary).resolve(strict=True)),
+            "--preregistration",
+            str(Path(preregistration_path).resolve(strict=True)),
+            "--cell-id",
+            cell_id,
+            "--ephemeral-evidence-stdout",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        process.wait()
+        raise SchemaError("exact Rust summary replay pipes are unavailable")
+    accumulator = CellAccumulator(
+        preregistration,
+        cell_id,
+        cell_ordinal,
+        expected_seed_count(cell_id),
+        code_sha256,
+        binary_sha256,
+        artifact_root=run_root,
+    )
+    dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+    try:
+        for seed_index in range(expected_seed_count(cell_id)):
+            request = {
+                "schema": "dolphinrust.spatial-covariance.attempt/4",
+                "cell_id": cell_id,
+                "cell_ordinal": cell_ordinal,
+                "seed_index": seed_index,
+                "seed_sha256": _expected_seed_hash(preregistration, cell_id, seed_index),
+                **dimensions,
+            }
+            process.stdin.write(_canonical_bytes(request) + b"\n")
+            process.stdin.flush()
+            raw = process.stdout.readline(FROZEN_MAX_RECORD_BYTES + 2)
+            if not raw or len(raw) > FROZEN_MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                raise SchemaError("exact Rust summary replay is incomplete or oversized")
+            try:
+                attempt = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SchemaError("exact Rust summary replay emitted malformed JSON") from exc
+            accumulator.add(attempt)
+        process.stdin.close()
+        if process.stdout.read(1) or process.wait() != 0:
+            raise SchemaError("exact Rust summary replay failed or emitted top-up evidence")
+    except (BrokenPipeError, OSError) as exc:
+        raise SchemaError("exact Rust summary replay process failed") from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
+    return accumulator.finalize()
+
+
 def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, manifest: Mapping[str, Any], spec: ShardSpec) -> list[dict[str, Any]]:
     validate_shard_manifest(preregistration, manifest, spec)
     input_path = resolve_below_run_root(run_root, manifest["input_path"], f"shard {spec.index} input path")
@@ -2691,7 +2764,14 @@ def validate_shard_manifest(preregistration: Mapping[str, Any], manifest: Any, s
         raise SchemaError(f"shard {spec.index} summary path escapes the run root")
 
 
-def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, manifest: Mapping[str, Any], spec: ShardSpec) -> list[dict[str, Any]]:
+def score_attempt_shard(
+    preregistration: Mapping[str, Any],
+    run_root: Path,
+    manifest: Mapping[str, Any],
+    spec: ShardSpec,
+    preregistration_path: Path,
+    batch_binary: Path,
+) -> list[dict[str, Any]]:
     validate_shard_manifest(preregistration, manifest, spec)
     directory = resolve_below_run_root(run_root, manifest["summary_path"], f"shard {spec.index} summary path")
     if not directory.is_dir():
@@ -2703,16 +2783,34 @@ def score_attempt_shard(preregistration: Mapping[str, Any], run_root: Path, mani
         path = directory / f"cell-{spec.cell_ordinal_start + offset:05d}.jsonl"
         if path.is_symlink():
             raise SchemaError(f"shard {spec.index} cell summary must not be a symlink")
-        if path.stat().st_size > FROZEN_MAX_CELL_SUMMARY_BYTES:
-            raise SchemaError(f"shard {spec.index} cell summary exceeds its cap before read")
-        with path.open("rb") as handle:
-            summary, raw = _read_json_line(handle, path, 1)
-            if summary is None:
-                raise SchemaError(f"shard {spec.index} is missing compact cell summary {offset}")
-            extra, _ = _read_json_line(handle, path, 2)
-            if extra is not None:
-                raise SchemaError(f"shard {spec.index} contains duplicate compact summary {offset}")
-            validate_cell_summary(preregistration, summary, cell_id, spec.cell_ordinal_start + offset, manifest["code_sha256"], manifest["binary_sha256"])
+        summary, raw = _read_single_json_record(
+            path,
+            FROZEN_MAX_CELL_SUMMARY_BYTES,
+            f"shard {spec.index} cell summary {offset}",
+        )
+        cell_ordinal = spec.cell_ordinal_start + offset
+        validate_cell_summary(
+            preregistration,
+            summary,
+            cell_id,
+            cell_ordinal,
+            manifest["code_sha256"],
+            manifest["binary_sha256"],
+        )
+        replayed = _rust_replay_cell_summary(
+            preregistration,
+            preregistration_path,
+            batch_binary,
+            run_root,
+            cell_id,
+            cell_ordinal,
+            manifest["code_sha256"],
+            manifest["binary_sha256"],
+        )
+        if _canonical_bytes(replayed) + b"\n" != raw:
+            raise SchemaError(
+                f"shard {spec.index} cell summary {offset} differs from exact Rust replay"
+            )
         item_digest = hashlib.sha256(raw).digest()
         digest.update(offset.to_bytes(8, "big"))
         digest.update(item_digest)
@@ -2867,7 +2965,11 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
 
 
 def validate_production_parity_fixture(
-    preregistration: Mapping[str, Any], run_root: Path, binding: Any, binding_sha256: Any
+    preregistration: Mapping[str, Any],
+    run_root: Path,
+    binding: Any,
+    binding_sha256: Any,
+    batch_binary: Path,
 ) -> None:
     def prefixed_sha256(value: Any) -> bool:
         return isinstance(value, str) and value.startswith("sha256:") and _is_sha256(value[7:])
@@ -2902,6 +3004,30 @@ def validate_production_parity_fixture(
         or binding["factor_digest"] != binding["persisted_factor_digest"]
     ):
         raise SchemaError("production parity fixture identity is malformed")
+    inspector = Path(batch_binary).resolve(strict=True)
+    completed = subprocess.run(
+        [str(inspector), "--inspect-existing", str(Path(run_root).resolve(strict=True))],
+        check=False,
+        capture_output=True,
+    )
+    if (
+        completed.returncode != 0
+        or not completed.stdout
+        or len(completed.stdout) > FROZEN_MAX_RECORD_BYTES
+        or completed.stderr
+    ):
+        raise SchemaError("production parity Rust inspection failed")
+    try:
+        inspection = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("production parity Rust inspection is malformed") from exc
+    if (
+        not isinstance(inspection, dict)
+        or set(inspection) != {"schema", "whole", "bounded"}
+        or inspection.get("schema")
+        != "dolphinrust.spatial-covariance.existing-fixture-inspection/1"
+    ):
+        raise SchemaError("production parity Rust inspection scope differs")
     for prefix, expected_transform in (
         ("", [100.0, 30.0, 0.0, 200.0, 0.0, -30.0]),
         ("bounded_", [130.0, 30.0, 0.0, 170.0, 0.0, -30.0]),
@@ -2948,6 +3074,18 @@ def validate_production_parity_fixture(
         ):
             raise SchemaError("production parity HDF5/sidecar binding mismatch")
         semantics = binding[f"{'whole_' if not prefix else 'bounded_'}artifact_semantics"]
+        inspected = inspection["whole" if not prefix else "bounded"]
+        if (
+            not isinstance(inspected, dict)
+            or set(inspected)
+            != {"hdf5_bytes", "hdf5_sha256", "sidecar_sha256", "semantics"}
+            or not _integer(inspected["hdf5_bytes"])
+            or inspected["hdf5_bytes"] <= 0
+            or inspected["hdf5_sha256"] != binding[f"{prefix}hdf5_sha256"]
+            or inspected["sidecar_sha256"] != binding[f"{prefix}sidecar_sha256"]
+            or inspected["semantics"] != semantics
+        ):
+            raise SchemaError("production parity Rust-inspected HDF5 semantics differ")
         _validate_persisted_artifact_semantics(
             semantics,
             sidecar,
@@ -2981,7 +3119,9 @@ def _validate_persisted_artifact_semantics(
         "ordered_date_indices", "acquisition_days", "mask_digest", "source_replay_digest",
         "l2_map_digest", "reference_signature_digest", "approximation_receipt_digest",
         "resource_receipt_digest", "runtime_resource_receipt_digest",
-        "runtime_resource_receipt", "source_model_digest", "effective_looks_digest",
+        "runtime_resource_receipt", "review_receipt_digest", "method_manifest_digest",
+        "calibration_scope_digest", "calibration_scope", "source_model_digest",
+        "effective_looks_digest",
         "support_method", "support_digest", "correction_order_digest",
         "unwrap_branch_digest", "burst_ownership_digest", "source_burst_ids",
         "reference_source_burst_index", "blocks",
@@ -3017,6 +3157,11 @@ def _validate_persisted_artifact_semantics(
         or semantics["gauge_date_index"] != 0
         or semantics["ordered_date_indices"] != [0, 1]
         or semantics["acquisition_days"] != [0.0, 12.0]
+        or semantics["calibration_scope"] != "uncalibrated"
+        or any(semantics[name] != sidecar.get(name) for name in (
+            "review_receipt_digest", "method_manifest_digest",
+            "calibration_scope_digest", "calibration_scope",
+        ))
         or semantics["source_burst_ids"] != [
             "spatial-covariance-validation",
             "spatial-covariance-validation-seam-neighbor",
@@ -3397,10 +3542,15 @@ def score_run_manifest(
     source_root: Path,
     batch_binary: Path,
     benchmark_binary: Path,
+    preregistration_path: Path | None = None,
 ) -> dict[str, Any]:
     sink = _CellSummarySink(cell_summary_path)
     try:
         validate_preregistration(preregistration)
+        if preregistration_path is None:
+            preregistration_path = Path(__file__).with_name(
+                "spatial_covariance_preregistration.json"
+            )
         manifest_path = Path(manifest_path)
         if manifest_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
             raise SchemaError("partial run manifests are not admissible")
@@ -3436,6 +3586,7 @@ def score_run_manifest(
             run_root,
             run_manifest["production_parity_fixture"],
             run_manifest["production_parity_fixture_sha256"],
+            batch_binary,
         )
         validate_matched_pair_cohorts(
             run_manifest["matched_pair_cohorts"],
@@ -3469,7 +3620,14 @@ def score_run_manifest(
                 raise SchemaError(f"shard {spec.index} manifest hash mismatch")
             if shard_manifest.get("code_sha256") != run_manifest["code_sha256"] or shard_manifest.get("binary_sha256") != run_manifest["binary_sha256"]:
                 raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
-            for summary in score_attempt_shard(preregistration, run_root, shard_manifest, spec):
+            for summary in score_attempt_shard(
+                preregistration,
+                run_root,
+                shard_manifest,
+                spec,
+                preregistration_path,
+                batch_binary,
+            ):
                 sink.add(summary)
                 cell_count += 1
                 any_failed = any_failed or summary["status"] == FAIL
@@ -3515,4 +3673,5 @@ if __name__ == "__main__":
         source_root=args.source_root,
         batch_binary=args.batch_binary,
         benchmark_binary=args.benchmark_binary,
+        preregistration_path=args.preregistration,
     ), indent=2, sort_keys=True))

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use dolphin_workflows::spatial_covariance_validation::{
-    run_frozen_attempt, run_validation_case, write_validation_fixture, FrozenAttemptRequest,
-    PortableDgpTables, ValidationCoupling,
+    inspect_existing_validation_fixture, run_frozen_attempt, run_validation_case,
+    write_validation_fixture, FrozenAttemptRequest, PortableDgpTables, ValidationCoupling,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ struct Arguments {
     artifact_directory: Option<PathBuf>,
     cell_id: Option<String>,
     parity_fixture: bool,
+    inspect_existing: Option<PathBuf>,
 }
 
 fn coupling(request: &FrozenAttemptRequest) -> Result<ValidationCoupling> {
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Arguments> {
     let mut preregistration = None;
     let mut cell_id = None;
     let mut parity_fixture = false;
+    let mut inspect_existing = None;
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--parity-fixture" => {
@@ -56,6 +58,17 @@ fn parse_args() -> Result<Arguments> {
                     "--parity-fixture may be supplied only once"
                 );
                 parity_fixture = true;
+            }
+            "--inspect-existing" => {
+                ensure!(
+                    inspect_existing.is_none(),
+                    "--inspect-existing may be supplied only once"
+                );
+                inspect_existing = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .context("--inspect-existing requires a directory")?,
+                ));
             }
             "--ephemeral-evidence-stdout" => {}
             "--artifact-directory" => {
@@ -94,20 +107,40 @@ fn parse_args() -> Result<Arguments> {
         }
     }
     ensure!(
-        parity_fixture || preregistration.is_some(),
+        parity_fixture || preregistration.is_some() || inspect_existing.is_some(),
         "full-cell mode requires --preregistration"
+    );
+    ensure!(
+        !(inspect_existing.is_some()
+            && (parity_fixture
+                || preregistration.is_some()
+                || artifact_directory.is_some()
+                || cell_id.is_some())),
+        "--inspect-existing is an exclusive bounded inspection mode"
     );
     Ok(Arguments {
         preregistration,
         artifact_directory,
         cell_id,
         parity_fixture,
+        inspect_existing,
     })
 }
 
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let arguments = parse_args()?;
+    if let Some(directory) = arguments.inspect_existing.as_ref() {
+        let inspection = inspect_existing_validation_fixture(directory)?;
+        let encoded = serde_json::to_vec(&inspection)?;
+        ensure!(
+            encoded.len() < MAX_RECORD_BYTES,
+            "existing fixture inspection exceeds the byte cap"
+        );
+        io::stdout().write_all(&encoded)?;
+        io::stdout().write_all(b"\n")?;
+        return Ok(());
+    }
     let preregistration = arguments
         .preregistration
         .as_ref()

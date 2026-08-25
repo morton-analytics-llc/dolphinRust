@@ -19,10 +19,11 @@ use dolphin_io::{
     read_spatial_reference_covariance_block, read_spatial_reference_covariance_header,
     CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
     CovarianceOperatorStatus, CovarianceOperatorWriter, CovarianceReplayStatus,
-    DownstreamInferenceStatus, SourceReplayIdentity, SpatialReferenceCovarianceMetadata,
-    SpatialReferenceCovarianceStatus, SpatialReferenceRuntimeResourceReceipt,
-    StitchedCovarianceStatus, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
-    SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+    DownstreamInferenceStatus, SourceReplayIdentity, SpatialReferenceCalibrationScope,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    SpatialReferenceRuntimeResourceReceipt, StitchedCovarianceStatus,
+    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY,
+    SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
 use dolphin_phaselink::source_model::{
     estimate_empirical_proper_complex_factor, EmpiricalProperComplexConfig,
@@ -2440,6 +2441,14 @@ pub struct PersistedCovarianceArtifactSemantics {
     pub runtime_resource_receipt_digest: String,
     /// Machine-readable observed runtime receipt.
     pub runtime_resource_receipt: BenchmarkRuntimeResourceReceipt,
+    /// Independent-review receipt identity read from HDF5.
+    pub review_receipt_digest: String,
+    /// Immutable method-manifest identity read from HDF5.
+    pub method_manifest_digest: String,
+    /// Exact calibrated-scope identity read from HDF5.
+    pub calibration_scope_digest: String,
+    /// Exact calibration scope read from HDF5.
+    pub calibration_scope: String,
     /// Proper-complex primitive source-model receipt.
     pub source_model_digest: String,
     /// Realized effective-look receipt over all factor blocks.
@@ -2460,6 +2469,30 @@ pub struct PersistedCovarianceArtifactSemantics {
     pub reference_source_burst_index: u32,
     /// Exact per-block semantics covering the complete grid.
     pub blocks: Vec<PersistedCovarianceBlockSemantics>,
+}
+
+/// One bounded, independently inspected production fixture artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExistingCovarianceArtifactInspection {
+    /// Exact HDF5 byte count.
+    pub hdf5_bytes: u64,
+    /// Exact HDF5 SHA-256.
+    pub hdf5_sha256: String,
+    /// Exact provenance-sidecar SHA-256.
+    pub sidecar_sha256: String,
+    /// Semantics independently read through the capped HDF5 reader.
+    pub semantics: PersistedCovarianceArtifactSemantics,
+}
+
+/// Whole and bounded fixture semantics independently read from existing files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExistingValidationFixtureInspection {
+    /// Stable inspection schema.
+    pub schema: String,
+    /// Whole-frame production artifact.
+    pub whole: ExistingCovarianceArtifactInspection,
+    /// Bounded-frame production artifact.
+    pub bounded: ExistingCovarianceArtifactInspection,
 }
 
 /// Numeric evidence emitted by the validation runner.
@@ -3556,6 +3589,15 @@ fn read_persisted_artifact_semantics(hdf5: &Path) -> Result<PersistedCovarianceA
         resource_receipt_digest: header.resource_receipt_digest,
         runtime_resource_receipt_digest: header.runtime_resource_receipt_digest,
         runtime_resource_receipt,
+        review_receipt_digest: header.review_receipt_digest,
+        method_manifest_digest: header.method_manifest_digest,
+        calibration_scope_digest: header.calibration_scope_digest,
+        calibration_scope: match header.calibration_scope {
+            SpatialReferenceCalibrationScope::Uncalibrated => "uncalibrated".to_owned(),
+            SpatialReferenceCalibrationScope::CalibratedScopeMatch => {
+                "calibrated_scope_match".to_owned()
+            }
+        },
         source_model_digest: header.source_model_digest,
         effective_looks_digest: header.effective_looks_digest,
         support_method: header.support_method,
@@ -3566,6 +3608,84 @@ fn read_persisted_artifact_semantics(hdf5: &Path) -> Result<PersistedCovarianceA
         source_burst_ids: header.source_burst_ids,
         reference_source_burst_index: header.reference_source_burst_index,
         blocks,
+    })
+}
+
+/// Independently inspect the whole and bounded HDF5 artifacts of an existing
+/// validation fixture through the production capped reader.
+///
+/// # Errors
+/// Returns an error when either artifact exceeds the cap, differs from its
+/// sidecar, or contains malformed production semantics.
+pub fn inspect_existing_validation_fixture(
+    root: &Path,
+) -> Result<ExistingValidationFixtureInspection> {
+    Ok(ExistingValidationFixtureInspection {
+        schema: "dolphinrust.spatial-covariance.existing-fixture-inspection/1".to_owned(),
+        whole: inspect_existing_covariance_artifact(&root.join("whole"))?,
+        bounded: inspect_existing_covariance_artifact(&root.join("bounded"))?,
+    })
+}
+
+fn inspect_existing_covariance_artifact(
+    directory: &Path,
+) -> Result<ExistingCovarianceArtifactInspection> {
+    let hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    let metadata = std::fs::symlink_metadata(&hdf5)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= VALIDATION_BYTE_CAP,
+        "existing production HDF5 exceeds the validation byte cap"
+    );
+    let sidecar = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
+    let sidecar_metadata = std::fs::symlink_metadata(&sidecar)?;
+    anyhow::ensure!(
+        sidecar_metadata.file_type().is_file()
+            && !sidecar_metadata.file_type().is_symlink()
+            && sidecar_metadata.len() <= VALIDATION_BYTE_CAP,
+        "existing production sidecar exceeds the validation byte cap"
+    );
+    let manifest = read_spatial_reference_covariance_artifact_manifest(directory)?;
+    let semantics = read_persisted_artifact_semantics(&hdf5)?;
+    anyhow::ensure!(
+        manifest.hdf5_bytes == metadata.len()
+            && manifest.hdf5_sha256 == sha256_path(&hdf5)?
+            && manifest.method == semantics.method
+            && manifest.method_version == semantics.method_version
+            && manifest.burst_id == semantics.burst_id
+            && manifest.crs == semantics.crs
+            && manifest.units == semantics.units
+            && manifest.geotransform == Some(semantics.geotransform)
+            && manifest.acquisition_days.as_ref() == Some(&semantics.acquisition_days)
+            && manifest.mask_digest == semantics.mask_digest
+            && manifest.source_replay_digest == semantics.source_replay_digest
+            && manifest.l2_map_digest == semantics.l2_map_digest
+            && manifest.reference_signature_digest == semantics.reference_signature_digest
+            && manifest.approximation_receipt_digest == semantics.approximation_receipt_digest
+            && manifest.resource_receipt_digest == semantics.resource_receipt_digest
+            && manifest.runtime_resource_receipt_digest
+                == semantics.runtime_resource_receipt_digest
+            && manifest.review_receipt_digest == semantics.review_receipt_digest
+            && manifest.method_manifest_digest == semantics.method_manifest_digest
+            && manifest.calibration_scope_digest == semantics.calibration_scope_digest
+            && manifest.calibration_scope == semantics.calibration_scope
+            && manifest.source_model_digest == semantics.source_model_digest
+            && manifest.effective_looks_digest == semantics.effective_looks_digest
+            && manifest.support_method == semantics.support_method
+            && manifest.support_digest == semantics.support_digest
+            && manifest.correction_order_digest == semantics.correction_order_digest
+            && manifest.unwrap_branch_digest == semantics.unwrap_branch_digest
+            && manifest.burst_ownership_digest == semantics.burst_ownership_digest
+            && manifest.source_burst_ids == semantics.source_burst_ids
+            && manifest.reference_source_burst_index == semantics.reference_source_burst_index,
+        "existing production HDF5 and sidecar semantics differ"
+    );
+    Ok(ExistingCovarianceArtifactInspection {
+        hdf5_bytes: metadata.len(),
+        hdf5_sha256: manifest.hdf5_sha256,
+        sidecar_sha256: sha256_path(&sidecar)?,
+        semantics,
     })
 }
 
@@ -4073,6 +4193,10 @@ mod tests {
         assert!(artifact
             .runtime_resource_receipt_digest
             .starts_with("sha256:"));
+        assert_eq!(artifact.calibration_scope, "uncalibrated");
+        assert!(artifact.review_receipt_digest.is_empty());
+        assert!(artifact.method_manifest_digest.is_empty());
+        assert!(artifact.calibration_scope_digest.is_empty());
         assert!(
             artifact
                 .runtime_resource_receipt
@@ -4542,6 +4666,21 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let result =
             write_validation_fixture(&directory, ValidationCoupling::Independent, 17).unwrap();
+        let inspection = inspect_existing_validation_fixture(&directory).unwrap();
+        assert_eq!(
+            inspection.schema,
+            "dolphinrust.spatial-covariance.existing-fixture-inspection/1"
+        );
+        assert_eq!(
+            &inspection.whole.semantics,
+            result.whole_artifact_semantics.as_ref().unwrap()
+        );
+        assert_eq!(
+            &inspection.bounded.semantics,
+            result.bounded_artifact_semantics.as_ref().unwrap()
+        );
+        assert_eq!(inspection.whole.hdf5_sha256, result.hdf5_sha256);
+        assert_eq!(inspection.bounded.hdf5_sha256, result.bounded_hdf5_sha256);
         let whole = result.whole_artifact_semantics.unwrap();
         let bounded = result.bounded_artifact_semantics.unwrap();
 

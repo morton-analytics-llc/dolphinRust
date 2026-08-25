@@ -11,6 +11,7 @@ import os
 import platform
 import resource
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,14 @@ def _write_bounded_json_atomic(value: Any, destination: Path, byte_limit: int) -
         partial.unlink(missing_ok=True)
         raise
     return {"sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded)}
+
+
+def _fsync_directory(path: Path) -> None:
+    handle = os.open(Path(path), os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
 
 
 def _tool_output(command: list[str]) -> str:
@@ -1024,7 +1033,9 @@ def commit_cell_transport(
     summary = accumulator.finalize()
     validate_cell_summary(preregistration, summary, cell_id, cell_ordinal, code_sha256, binary_sha256)
     receipt = write_jsonl_atomic((summary,), destination, byte_limit=FROZEN_MAX_RECORD_BYTES)
+    _fsync_directory(Path(destination).parent)
     transport_path.unlink()
+    _fsync_directory(transport_path.parent)
     return receipt
 
 
@@ -1559,6 +1570,7 @@ def run_outcomes(
     for offset, cell_id in enumerate(spec.cell_ids):
         cell_ordinal = spec.cell_ordinal_start + offset
         destination = summary_directory / f"cell-{cell_ordinal:05d}.jsonl"
+        transport = transport_directory / f"cell-{cell_ordinal:05d}.jsonl"
         cell_spec = ShardSpec(
             spec.index,
             cell_ordinal,
@@ -1572,11 +1584,20 @@ def run_outcomes(
                 code_sha256, binary_sha256, attempt_regenerator,
                 artifact_root=run_root,
             )
+            for residual in (
+                transport,
+                transport.with_name(transport.name + ".partial"),
+            ):
+                if residual.exists() or residual.is_symlink():
+                    metadata = residual.lstat()
+                    if residual.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                        raise SchemaError("owned residual cell transport is not a regular file")
+                    residual.unlink()
+                    _fsync_directory(residual.parent)
             resumed_cells += 1
             continue
         partial_summary = destination.with_name(destination.name + ".partial")
         partial_summary.unlink(missing_ok=True)
-        transport = transport_directory / f"cell-{cell_ordinal:05d}.jsonl"
         if not transport.exists():
             transport.with_name(transport.name + ".partial").unlink(missing_ok=True)
             measurement = run_parallel_batch(
