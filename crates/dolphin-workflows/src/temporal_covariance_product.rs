@@ -64,10 +64,8 @@ const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/1";
 const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
 const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/7";
 const TEMPORAL_BATCH_SCHEMA: &str = "dolphinrust-temporal-covariance-batch/6";
-const TEMPORAL_PRODUCER_IDENTITY_SCHEMA: &str =
-    "dolphinrust-temporal-covariance-run-identity/1";
-const TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA: &str =
-    "dolphinrust.canonical-producer-source-set/2";
+const TEMPORAL_PRODUCER_IDENTITY_SCHEMA: &str = "dolphinrust-temporal-covariance-run-identity/1";
+const TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA: &str = "dolphinrust.canonical-producer-source-set/2";
 const HELDOUT_SCORE_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_score";
 const HELDOUT_RECEIPT_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_receipt";
 const LAYER_COUNT: usize = 14;
@@ -88,7 +86,7 @@ const HELDOUT_MANIFEST_FILE_SHA256: &str =
 const HELDOUT_MANIFEST_CANONICAL_SHA256: &str =
     "2b9208eaf1f54f10f971544062df348062d4a9b9eb518dd1b373bd8ebe561050";
 const HELDOUT_FREEZE_FILE_SHA256: &str =
-    "a10505a0e7ba3afd370c44eb9747e2021265626eb80aced72433096ce51c873e";
+    "5b1317197c55865cfff398c9ecf67a3181bd479f4a615af83bf9b72b30923500";
 const HELDOUT_RECEIPT_SCORER_SHA256: &str =
     "942bda853ce55b28b7f92698f28ba9982cce370adfedde42da9e0b0e14426671";
 const HELDOUT_REVIEW_SCORER_SHA256: &str =
@@ -675,7 +673,7 @@ fn expected_heldout_implementation_source_hashes() -> BTreeMap<String, String> {
         ),
         (
             "cohort_sha256",
-            "2a19bbceda51be62134944a8af1b6a2db32d469bbc828581c5cb8e97ea3b9183",
+            "89bdb8adc569e31e3bb45872767795b4d5a7bbf563c8b8a5b20dfa1d75482614",
         ),
         (
             "gps_ground_truth_sha256",
