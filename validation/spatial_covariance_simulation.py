@@ -27,6 +27,7 @@ try:
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
+        expected_cell_ids,
         load_preregistration,
         preregistration_digest,
         resolve_below_run_root,
@@ -34,6 +35,7 @@ try:
         sha256_file,
         sha256_json,
         validate_input_shard,
+        validate_cell_summary,
         validate_preregistration,
         validate_shard_manifest,
     )
@@ -53,6 +55,7 @@ except ModuleNotFoundError:
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
+        expected_cell_ids,
         load_preregistration,
         preregistration_digest,
         resolve_below_run_root,
@@ -60,6 +63,7 @@ except ModuleNotFoundError:
         sha256_file,
         sha256_json,
         validate_input_shard,
+        validate_cell_summary,
         validate_preregistration,
         validate_shard_manifest,
     )
@@ -75,7 +79,7 @@ def iter_attempt_requests(preregistration: Mapping[str, Any], spec: ShardSpec) -
         dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
         for seed_index in range(FROZEN_SEED_COUNT):
             yield {
-                "schema": "dolphinrust.spatial-covariance.attempt/3",
+                "schema": "dolphinrust.spatial-covariance.attempt/4",
                 "cell_id": cell_id,
                 "cell_ordinal": spec.cell_ordinal_start + cell_offset,
                 "seed_index": seed_index,
@@ -394,18 +398,178 @@ def write_run_manifest_atomic(run_manifest: Mapping[str, Any], destination: Path
     return {"sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded)}
 
 
+def _request_digest(preregistration: Mapping[str, Any], spec: ShardSpec) -> str:
+    digest = hashlib.sha256(b"dolphinrust:spatial-covariance:shard-requests:v4\0")
+    for request in iter_attempt_requests(preregistration, spec):
+        encoded = compact_json_line(request)
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def prepare_input_shard(preregistration: Mapping[str, Any], spec: ShardSpec, destination: Path) -> dict[str, Any]:
+    descriptor = {
+        "schema": "dolphinrust.spatial-covariance.shard-request/4",
+        "shard_index": spec.index,
+        "cell_ordinal_start": spec.cell_ordinal_start,
+        "cell_ordinal_end_exclusive": spec.cell_ordinal_end_exclusive,
+        "cell_ids": list(spec.cell_ids),
+        "attempts_per_cell": FROZEN_SEED_COUNT,
+        "expected_attempts": spec.expected_attempts,
+        "preregistration_sha256": preregistration_digest(preregistration),
+        "request_digest": _request_digest(preregistration, spec),
+        "retained": False,
+    }
+    return write_jsonl_atomic((descriptor,), destination, byte_limit=FROZEN_MAX_RECORD_BYTES)
+
+
+def commit_cell_transport(
+    preregistration: Mapping[str, Any],
+    cell_id: str,
+    cell_ordinal: int,
+    transport_path: Path,
+    destination: Path,
+    code_sha256: str,
+    binary_sha256: str,
+    expected_seed_count: int = FROZEN_SEED_COUNT,
+) -> dict[str, Any]:
+    if not _is_digest(code_sha256) or not _is_digest(binary_sha256):
+        raise SchemaError("cell commit code/binary identity is invalid")
+    transport_path = Path(transport_path)
+    accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal, expected_seed_count, code_sha256, binary_sha256)
+    with transport_path.open("rb") as handle:
+        for line_number in range(expected_seed_count):
+            raw = handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
+            if not raw or len(raw) > FROZEN_MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                raise SchemaError("ephemeral attempt transport is incomplete or oversized")
+            try:
+                accumulator.add(json.loads(raw))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SchemaError("ephemeral attempt transport is malformed") from exc
+        if handle.read(1):
+            raise SchemaError("ephemeral attempt transport contains top-up evidence")
+    summary = accumulator.finalize()
+    validate_cell_summary(preregistration, summary, cell_id, cell_ordinal, code_sha256, binary_sha256)
+    receipt = write_jsonl_atomic((summary,), destination, byte_limit=FROZEN_MAX_RECORD_BYTES)
+    transport_path.unlink()
+    return receipt
+
+
+def _is_digest(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= set("0123456789abcdef")
+
+
+def _summary_root(preregistration: Mapping[str, Any], directory: Path, spec: ShardSpec, code_sha256: str, binary_sha256: str) -> tuple[str, int]:
+    digest = hashlib.sha256(b"dolphinrust:spatial-covariance:cell-summary-root:v4\0")
+    total_bytes = 0
+    for offset, cell_id in enumerate(spec.cell_ids):
+        path = directory / f"cell-{spec.cell_ordinal_start + offset:05d}.jsonl"
+        raw = path.read_bytes()
+        if len(raw.splitlines()) != 1 or len(raw) > FROZEN_MAX_RECORD_BYTES:
+            raise SchemaError(f"cell {cell_id} compact summary is malformed")
+        summary = json.loads(raw)
+        validate_cell_summary(preregistration, summary, cell_id, spec.cell_ordinal_start + offset, code_sha256, binary_sha256)
+        digest.update(offset.to_bytes(8, "big"))
+        digest.update(hashlib.sha256(raw).digest())
+        total_bytes += len(raw)
+    return digest.hexdigest(), total_bytes
+
+
+def commit_output_shard(
+    preregistration: Mapping[str, Any],
+    spec: ShardSpec,
+    run_root: Path,
+    summary_directory: Path,
+    manifest_path: Path,
+    code_sha256: str,
+    binary_sha256: str,
+    elapsed_seconds: float,
+    peak_rss_bytes: int,
+) -> dict[str, Any]:
+    validate_preregistration(preregistration)
+    root = Path(run_root).resolve(strict=True)
+    directory = Path(summary_directory).resolve(strict=True)
+    manifest_path = Path(manifest_path)
+    if manifest_path.name.endswith(".partial") or manifest_path.exists() or not directory.is_dir():
+        raise SchemaError("compact shard commit destination/state is invalid")
+    try:
+        relative = directory.relative_to(root).as_posix()
+        manifest_path.resolve().parent.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise SchemaError("compact shard paths must remain below run root") from exc
+    summary_digest, summary_bytes = _summary_root(preregistration, directory, spec, code_sha256, binary_sha256)
+    manifest = {
+        "schema": "dolphinrust.spatial-covariance.shard-manifest/4", "schema_version": 4,
+        "shard_index": spec.index, "cell_ordinal_start": spec.cell_ordinal_start,
+        "cell_ordinal_end_exclusive": spec.cell_ordinal_end_exclusive, "expected_cells": len(spec.cell_ids),
+        "expected_attempts": spec.expected_attempts, "summary_path": relative, "summary_sha256": summary_digest,
+        "summary_bytes": summary_bytes, "summary_records": len(spec.cell_ids),
+        "preregistration_sha256": preregistration_digest(preregistration), "code_sha256": code_sha256,
+        "binary_sha256": binary_sha256, "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]),
+        "elapsed_seconds": elapsed_seconds, "peak_rss_bytes": peak_rss_bytes, "committed": True,
+    }
+    validate_shard_manifest(preregistration, manifest, spec)
+    return write_jsonl_atomic((manifest,), manifest_path, byte_limit=preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"])
+
+
+def committed_shard_matches(preregistration: Mapping[str, Any], spec: ShardSpec, run_root: Path, manifest_path: Path, expected_code_sha256: str, expected_binary_sha256: str) -> bool:
+    try:
+        raw = Path(manifest_path).read_bytes().splitlines()
+        if len(raw) != 1:
+            return False
+        manifest = json.loads(raw[0])
+        validate_shard_manifest(preregistration, manifest, spec)
+        if manifest["code_sha256"] != expected_code_sha256 or manifest["binary_sha256"] != expected_binary_sha256:
+            return False
+        directory = resolve_below_run_root(Path(run_root), manifest["summary_path"], "compact summary directory")
+        digest, size = _summary_root(preregistration, directory, spec, expected_code_sha256, expected_binary_sha256)
+        return digest == manifest["summary_sha256"] and size == manifest["summary_bytes"]
+    except (OSError, ValueError, json.JSONDecodeError, SchemaError):
+        return False
+
+
+def build_run_manifest(preregistration: Mapping[str, Any], run_root: Path, shard_manifest_paths: Iterable[Path], code_sha256: str, binary_sha256: str, performance_probe: Mapping[str, Any], resources: list[Mapping[str, Any]]) -> dict[str, Any]:
+    validate_preregistration(preregistration)
+    paths = tuple(shard_manifest_paths)
+    if len(paths) != FROZEN_SHARD_COUNT:
+        raise SchemaError("run manifest requires exactly 891 compact shards")
+    _validate_performance_probe(preregistration, performance_probe, code_sha256, binary_sha256)
+    _validate_resources(preregistration, resources, binary_sha256)
+    root = Path(run_root).resolve(strict=True)
+    entries = []
+    digests = []
+    for spec, path in zip(iter_shard_specs(preregistration), paths):
+        resolved = Path(path).resolve(strict=True)
+        relative = resolved.relative_to(root).as_posix()
+        digest, _ = sha256_file(resolved)
+        if not committed_shard_matches(preregistration, spec, root, resolved, code_sha256, binary_sha256):
+            raise SchemaError(f"shard {spec.index} is not exact compact committed evidence")
+        entries.append({"path": relative, "sha256": digest})
+        digests.append(digest)
+    return {"schema": "dolphinrust.spatial-covariance.run-manifest/4", "schema_version": 4,
+            "preregistration_sha256": preregistration_digest(preregistration), "code_sha256": code_sha256,
+            "binary_sha256": binary_sha256, "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]),
+            "performance_probe": dict(performance_probe), "resources": [dict(item) for item in resources],
+            "shard_manifests": entries, "result_root_sha256": result_root_sha256(digests)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preregistration", type=Path, default=Path(__file__).with_name("spatial_covariance_preregistration.json"))
     commands = parser.add_subparsers(dest="command", required=True)
-    prepare = commands.add_parser("prepare", help="write one deterministic input shard")
+    prepare = commands.add_parser("prepare", help="write one compact deterministic shard descriptor")
     prepare.add_argument("--run-root", type=Path, required=True)
     prepare.add_argument("--shard-index", type=int, required=True)
-    commit = commands.add_parser("commit", help="validate and atomically commit one completed output shard")
+    reduce_cell = commands.add_parser("reduce-cell", help="independently reduce one ephemeral cell transport")
+    reduce_cell.add_argument("--cell-ordinal", type=int, required=True)
+    reduce_cell.add_argument("--transport", type=Path, required=True)
+    reduce_cell.add_argument("--destination", type=Path, required=True)
+    reduce_cell.add_argument("--code-sha256", required=True)
+    reduce_cell.add_argument("--binary-sha256", required=True)
+    commit = commands.add_parser("commit", help="validate and atomically commit one compact shard")
     commit.add_argument("--run-root", type=Path, required=True)
     commit.add_argument("--shard-index", type=int, required=True)
-    commit.add_argument("--input", type=Path, required=True)
-    commit.add_argument("--output-partial", type=Path, required=True)
+    commit.add_argument("--summary-directory", type=Path, required=True)
     commit.add_argument("--manifest", type=Path, required=True)
     commit.add_argument("--code-sha256", required=True)
     commit.add_argument("--binary-sha256", required=True)
@@ -432,11 +596,19 @@ def main() -> None:
         if spec is None:
             raise SystemExit(f"shard index is outside 0..{preregistration['execution_protocol']['shard_count'] - 1}")
     if args.command == "prepare":
-        destination = args.run_root / "shards" / f"input-{spec.index:05d}.jsonl"
+        destination = args.run_root / "requests" / f"shard-{spec.index:05d}.jsonl"
         result = prepare_input_shard(preregistration, spec, destination)
+    elif args.command == "reduce-cell":
+        cell_ids = expected_cell_ids(preregistration)
+        if args.cell_ordinal < 0 or args.cell_ordinal >= len(cell_ids):
+            raise SchemaError("cell ordinal is outside the frozen matrix")
+        result = commit_cell_transport(
+            preregistration, cell_ids[args.cell_ordinal], args.cell_ordinal, args.transport,
+            args.destination, args.code_sha256, args.binary_sha256,
+        )
     elif args.command == "commit":
         result = commit_output_shard(
-            preregistration, spec, args.run_root, args.input, args.output_partial, args.manifest,
+            preregistration, spec, args.run_root, args.summary_directory, args.manifest,
             args.code_sha256, args.binary_sha256, args.elapsed_seconds, args.peak_rss_bytes,
         )
     elif args.command == "resume":
