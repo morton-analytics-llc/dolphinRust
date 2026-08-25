@@ -14,13 +14,13 @@ import requests
 if __package__:
     from validation.heldout_temporal_covariance.cohort import canonical_digest, validate_freeze_receipt, validate_manifest
     from validation.heldout_temporal_covariance.executor import run_product_cluster, write_one_shot
-    from validation.heldout_temporal_covariance.runner import CohortRunLedger, assemble_heldout_receipt, product_identity_sha256, validate_product_run_plan
+    from validation.heldout_temporal_covariance.runner import CohortRunLedger, RUN_IDENTITY_FIELDS, assemble_heldout_receipt, pre_outcome_product_manifest_sha256, product_identity_sha256, validate_product_run_plan
     from validation.heldout_temporal_covariance.scorer import score_receipt
     from validation.score_temporal_covariance_holdout import read_json
 else:
     from heldout_temporal_covariance.cohort import canonical_digest, validate_freeze_receipt, validate_manifest
     from heldout_temporal_covariance.executor import run_product_cluster, write_one_shot
-    from heldout_temporal_covariance.runner import CohortRunLedger, assemble_heldout_receipt, product_identity_sha256, validate_product_run_plan
+    from heldout_temporal_covariance.runner import CohortRunLedger, RUN_IDENTITY_FIELDS, assemble_heldout_receipt, pre_outcome_product_manifest_sha256, product_identity_sha256, validate_product_run_plan
     from heldout_temporal_covariance.scorer import score_receipt
     from score_temporal_covariance_holdout import read_json
 
@@ -192,7 +192,12 @@ def main() -> int:
         "run_plan_sha256": canonical_digest(plan),
         "binary_sha256": sha256_file(rust_batch),
         "implementation_source_hashes": implementation_source_hashes(),
+        "product_identities_sha256": pre_outcome_product_manifest_sha256(
+            product_roots, preregistration
+        ),
     }
+    if set(identity) != RUN_IDENTITY_FIELDS:
+        raise ValueError("held-out run identity differs from the promotion contract")
     ledger = CohortRunLedger.acquire(ledger_path, identity)
     product_identities = {
         cluster_id: product_identity_sha256(root, preregistration)

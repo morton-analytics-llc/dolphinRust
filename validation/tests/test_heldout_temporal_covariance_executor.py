@@ -36,7 +36,9 @@ from validation.heldout_temporal_covariance.executor import (
 )
 from validation.heldout_temporal_covariance.runner import (
     CohortRunLedger,
+    RUN_IDENTITY_FIELDS,
     assemble_heldout_receipt,
+    pre_outcome_product_manifest_sha256,
     product_identity_sha256,
     run_production_temporal_estimator,
     validate_product_run_plan,
@@ -366,6 +368,46 @@ class HeldoutTemporalCovarianceExecutorContract(unittest.TestCase):
             ]
             with self.assertRaisesRegex(ValueError, "reuses"):
                 validate_product_run_plan(reused, manifest)
+
+    def test_pre_outcome_product_manifest_matches_pr82_run_identity_contract(self) -> None:
+        expected_fields = {
+            "generation_id",
+            "preregistration_sha256",
+            "manifest_sha256",
+            "freeze_receipt_sha256",
+            "run_plan_sha256",
+            "binary_sha256",
+            "implementation_source_hashes",
+            "product_identities_sha256",
+        }
+        self.assertEqual(RUN_IDENTITY_FIELDS, expected_fields)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            product_roots = {"cluster-b": second, "cluster-a": first}
+            digest = pre_outcome_product_manifest_sha256(
+                product_roots, PREREGISTRATION
+            )
+            self.assertEqual(
+                digest,
+                pre_outcome_product_manifest_sha256(
+                    {"cluster-a": first, "cluster-b": second}, PREREGISTRATION
+                ),
+            )
+            self.assertEqual(len(digest), 64)
+            self.assertFalse(any(first.iterdir()))
+            self.assertFalse(any(second.iterdir()))
+            moved = root / "moved"
+            second.rename(moved)
+            self.assertNotEqual(
+                digest,
+                pre_outcome_product_manifest_sha256(
+                    {"cluster-a": first, "cluster-b": moved}, PREREGISTRATION
+                ),
+            )
 
     def test_attrited_surplus_is_retained_and_next_lexical_surplus_fills(self) -> None:
         manifest = frozen_manifest()

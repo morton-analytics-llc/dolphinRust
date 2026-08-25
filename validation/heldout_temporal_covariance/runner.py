@@ -21,6 +21,16 @@ LEDGER_SCHEMA = "dolphinrust.temporal_covariance.heldout_run_ledger"
 RECEIPT_SCHEMA = "dolphinrust.temporal_covariance.heldout_receipt"
 MAX_ESTIMATOR_STDOUT_BYTES = 1024 * 1024
 PRODUCT_FILE_BYTE_CAP = 4 * 1024 * 1024 * 1024
+RUN_IDENTITY_FIELDS = {
+    "generation_id",
+    "preregistration_sha256",
+    "manifest_sha256",
+    "freeze_receipt_sha256",
+    "run_plan_sha256",
+    "binary_sha256",
+    "implementation_source_hashes",
+    "product_identities_sha256",
+}
 
 
 def _sha256_file(path: Path) -> str:
@@ -87,6 +97,53 @@ def product_identity_sha256(
             raise ValueError("held-out product changed while it was hashed")
         identities[name] = {"bytes": before.st_size, "sha256": digest.hexdigest()}
     return canonical_digest(identities)
+
+
+def pre_outcome_product_manifest_sha256(
+    product_roots: Mapping[str, Path], preregistration: Mapping[str, Any]
+) -> str:
+    """Bind exact product locations and required artifacts without reading outcomes."""
+
+    factor = preregistration["factor_binding"]
+    required_names = sorted(
+        {
+            "fixed_cube_receipt.json",
+            "los_east.tif",
+            "los_north.tif",
+            "los_up.tif",
+            "velocity_validity_mask.tif",
+            "geometry_provenance.json",
+            factor["input_operator"]["artifact_hdf5"],
+            factor["input_operator"]["artifact_manifest"],
+            factor["output_factor"]["artifact_hdf5"],
+            factor["output_factor"]["artifact_manifest"],
+            "referenced_displacement_covariance_approximation_receipt.json",
+            "referenced_displacement_covariance_resource_receipt.json",
+            "referenced_displacement_covariance_review_receipt.json",
+            "referenced_displacement_covariance_method_manifest.json",
+            "referenced_displacement_covariance_approximation_result.json",
+            "referenced_displacement_covariance_preregistration.json",
+            "referenced_displacement_covariance_design.md",
+            "referenced_displacement_covariance_producer_binary",
+        }
+    )
+    clusters = []
+    for cluster_id, path in sorted(product_roots.items()):
+        root = path.resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("held-out product root is not a directory")
+        clusters.append(
+            {"cluster_id": cluster_id, "product_directory": os.fspath(root)}
+        )
+    return canonical_digest(
+        {
+            "schema": "dolphinrust.temporal_covariance.pre_outcome_product_manifest",
+            "schema_version": 1,
+            "clusters": clusters,
+            "required_artifact_names": required_names,
+            "displacement_artifact_pattern": "displacement_[0-9][0-9].tif",
+        }
+    )
 
 
 def validate_product_run_plan(
