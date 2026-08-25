@@ -1,5 +1,7 @@
 import copy
+import hashlib
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from validation.heldout_temporal_covariance.scorer import (
     score_receipt,
     score_slope_difference,
 )
+from validation.score_temporal_covariance_holdout import bind_factor_files
 
 
 VALIDATION = Path(__file__).parents[1]
@@ -190,6 +193,32 @@ class HeldoutCohortTests(unittest.TestCase):
         self.assertEqual(output["schema_version"], 4)
         self.assertEqual(output["artifact_hdf5"], "referenced_displacement_covariance_factor.h5")
         self.assertEqual(output["artifact_manifest"], "referenced_displacement_covariance_provenance.json")
+
+    def test_supplied_factor_bytes_are_bound_before_heldout_scoring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            factor = root / "referenced_displacement_covariance_factor.h5"
+            provenance = root / "referenced_displacement_covariance_provenance.json"
+            factor.write_bytes(b"production-factor-v4")
+            factor_sha256 = hashlib.sha256(factor.read_bytes()).hexdigest()
+            manifest = {
+                "schema_version": 3,
+                "method": "reference_specific_influence_v1",
+                "method_version": 1,
+                "hdf5_file": factor.name,
+                "hdf5_bytes": factor.stat().st_size,
+                "hdf5_sha256": factor_sha256,
+                "calibration_scope": "calibrated_scope_match",
+            }
+            provenance.write_text(json.dumps(manifest), encoding="utf-8")
+            receipt = {"hashes": {
+                "persisted_factor_sha256": factor_sha256,
+                "persisted_factor_manifest_sha256": hashlib.sha256(provenance.read_bytes()).hexdigest(),
+            }}
+            bind_factor_files(receipt, factor, provenance)
+            factor.write_bytes(b"tampered-factor-v4")
+            with self.assertRaisesRegex(ValueError, "factor hash differs"):
+                bind_factor_files(receipt, factor, provenance)
 
     def test_metadata_discovery_excludes_exposed_and_outcome_records(self):
         records = [
