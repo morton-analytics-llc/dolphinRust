@@ -1,12 +1,16 @@
 //! Production identities and fixed-L2 state for reference-specific covariance output.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{CorrectionOptions, UnwrapMethod};
+use dolphin_core::config::{CorrectionOptions, DisplacementWorkflow, ShpMethod, UnwrapMethod};
 use dolphin_io::{
-    CovarianceOperatorGrid, SpatialReferenceCovarianceBlock, SpatialReferenceCovarianceStatus,
-    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+    CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
+    SpatialReferenceCovarianceWriter, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
 use dolphin_timeseries::inversion::{fixed_l2_pixel_map, PixelL2MapError, PixelL2ObservationMap};
 use dolphin_timeseries::spatial_covariance::{
@@ -17,10 +21,29 @@ use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use sha2::{Digest, Sha256};
 
 use crate::corrections::CorrectionLayers;
-use crate::covariance_artifact::CovarianceArtifactManifest;
+use crate::covariance_artifact::{
+    read_covariance_artifact_manifest_with_byte_cap, CovarianceArtifactManifest,
+};
 use crate::cslc_covariance_source::CslcCovarianceManifest;
 use crate::displacement::PreparedBurstMask;
-use crate::sequential_covariance::ReplayStatus;
+use crate::sequential::SequentialConfig;
+use crate::sequential_covariance::{
+    replay_global_reference_difference_covariance_from_provider_bundle,
+    sequential_replay_config_digest, sequential_replay_kernel_digest,
+    CovarianceArtifactReplayProvider, EffectiveLooksReplay, GlobalDateId,
+    GlobalReferenceCovarianceQuery, ReplayBackend, ReplayExecutionScope, ReplayStatus,
+    SequentialReplayBuildIdentity, SequentialReplayError, SequentialReplayTopology,
+    SequentialTileReplayProvider,
+};
+use crate::spatial_covariance_artifact::{
+    finalize_spatial_reference_covariance_artifact, SpatialReferenceCovarianceArtifactTransaction,
+    SPATIAL_REFERENCE_COVARIANCE_FILENAME, SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME,
+    SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
+};
+
+const PRODUCTION_REFERENCE_REPLAY_BYTE_CAP: u64 = 1_073_741_824;
+const EFFECTIVE_LOOKS_MODEL: &str = "source_factor_declared_v1";
+const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
 
 pub(crate) const NO_BURST_OWNER: u32 = u32::MAX;
 
@@ -154,6 +177,7 @@ pub(crate) fn final_reference_signature_digest(
     reference: (u64, u64),
     owner: u32,
     ordered_dates: &[u32],
+    geotransform: [f64; 6],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"dolphinrust:production-final-reference:v1");
@@ -164,6 +188,40 @@ pub(crate) fn final_reference_signature_digest(
     for &date in ordered_dates {
         digest.update(date.to_le_bytes());
     }
+    for value in geotransform {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_target_receipt(
+    source_factor_receipt: [u8; 32],
+    support_receipt: [u8; 32],
+    reference_signature: [u8; 32],
+    effective_looks_model: &str,
+    effective_looks_distance_scale_pixels: f64,
+    support_union_count: usize,
+    effective_looks_fraction: f64,
+    effective_looks_receipt: [u8; 32],
+    resource_high_water_bytes: u64,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:production-target-source-support-reference-resource:v1");
+    digest.update(source_factor_receipt);
+    digest.update(support_receipt);
+    digest.update(reference_signature);
+    digest.update((effective_looks_model.len() as u64).to_le_bytes());
+    digest.update(effective_looks_model.as_bytes());
+    digest.update(
+        effective_looks_distance_scale_pixels
+            .to_bits()
+            .to_le_bytes(),
+    );
+    digest.update((support_union_count as u64).to_le_bytes());
+    digest.update(effective_looks_fraction.to_bits().to_le_bytes());
+    digest.update(effective_looks_receipt);
+    digest.update(resource_high_water_bytes.to_le_bytes());
     digest.finalize().into()
 }
 
@@ -348,6 +406,557 @@ impl ProductionCovarianceState {
         }
         digest.finalize().into()
     }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn emit(
+        self,
+        cfg: &DisplacementWorkflow,
+        sequential_cfg: &SequentialConfig,
+        validity: ArrayView2<'_, bool>,
+        reference: (usize, usize),
+        epsg: u32,
+        geotransform: [f64; 6],
+    ) -> Result<()> {
+        let fixed_l2 = self
+            .fixed_l2_inputs
+            .as_ref()
+            .context("production spatial covariance requires the retained fixed-L2 map")?;
+        anyhow::ensure!(
+            validity.dim() == (self.ownership.dim().1, self.ownership.dim().2)
+                && reference.0 < validity.nrows()
+                && reference.1 < validity.ncols()
+                && validity[reference],
+            "production spatial covariance reference or validity grid is invalid"
+        );
+        let reference_owner = same_constant_owner(self.ownership.view(), reference, reference)
+            .context(
+                "production spatial covariance reference has mixed or missing burst ownership",
+            )?;
+        let reference_owner_index =
+            usize::try_from(reference_owner).context("reference burst owner exceeds usize")?;
+        let reference_burst = self
+            .source_burst_ids
+            .get(reference_owner_index)
+            .context("reference burst owner is outside the source registry")?;
+        let reference_output = self
+            .owner_output_coordinate(reference_owner, reference)
+            .context("selected reference is outside its captured burst output")?;
+        let replay_context = self
+            .replay_context
+            .as_ref()
+            .context("production spatial covariance requires captured replay context")?;
+        anyhow::ensure!(
+            !replay_context.tiles.is_empty()
+                && replay_context.operator_block_byte_cap > 0
+                && replay_context
+                    .tiles
+                    .iter()
+                    .all(|tile| tile.request.branch_tolerance
+                        == replay_context.tiles[0].request.branch_tolerance),
+            "captured replay tiles do not share one positive branch contract"
+        );
+
+        preflight_existing_output(&cfg.work_directory)?;
+        let live_operator = read_covariance_artifact_manifest_with_byte_cap(
+            &cfg.work_directory,
+            replay_context.operator_block_byte_cap,
+        )
+        .context("validating the committed covariance operator before production replay")?;
+        anyhow::ensure!(
+            live_operator == replay_context.operator_manifest,
+            "committed covariance operator changed after production capture"
+        );
+        replay_context
+            .source_manifest
+            .verify_unchanged()
+            .context("verifying immutable CSLC members before production replay")?;
+
+        let topologies = replay_context
+            .tiles
+            .iter()
+            .map(|tile| topology_for_tile(tile, sequential_cfg))
+            .collect::<Result<Vec<_>>>()?;
+        let mut source_resolvers = replay_context
+            .tiles
+            .iter()
+            .map(|tile| {
+                replay_context.source_manifest.resolver(
+                    &tile.member_indices,
+                    tile.request.burst_id.clone(),
+                    tile.processed_origin,
+                    tile.processed_shape,
+                    tile.request.native_grid,
+                    &cfg.phase_linking.empirical_source_factor,
+                    tile.request.source_model_version_digest,
+                    replay_context
+                        .masks
+                        .get(&tile.request.burst_id)
+                        .and_then(Option::as_ref)
+                        .map(|mask| {
+                            mask as &dyn crate::cslc_covariance_source::CslcCovarianceValidityReader
+                        }),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let build_identity = SequentialReplayBuildIdentity {
+            normalized_config_digest: sequential_replay_config_digest(sequential_cfg),
+            kernel_digest: sequential_replay_kernel_digest(),
+            branch_tolerance: replay_context.tiles[0].request.branch_tolerance,
+        };
+        let mut providers = topologies
+            .iter()
+            .zip(source_resolvers.drain(..))
+            .map(|(topology, resolver)| {
+                CovarianceArtifactReplayProvider::open(
+                    &cfg.work_directory,
+                    replay_context.operator_block_byte_cap,
+                    topology,
+                    build_identity,
+                    resolver,
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)?;
+
+        let dates = fixed_l2
+            .pixel_map(reference)
+            .map_err(anyhow::Error::new)?
+            .date_count();
+        anyhow::ensure!(
+            dates > 0
+                && dates == replay_context.tiles[0].num_real_dates
+                && replay_context
+                    .tiles
+                    .iter()
+                    .all(|tile| tile.num_real_dates == dates),
+            "production L2 dates differ from captured replay dates"
+        );
+        let ordered_date_indices = (0..dates)
+            .map(|date| u32::try_from(date).context("date index exceeds u32"))
+            .collect::<Result<Vec<_>>>()?;
+        let ordered_dates = ordered_date_indices
+            .iter()
+            .copied()
+            .map(GlobalDateId::new)
+            .collect::<Vec<_>>();
+        let source_rank = 2_usize
+            .checked_mul(dates.min(sequential_cfg.ministack_size))
+            .context("production source rank overflows usize")?;
+        let full_grid = CovarianceOperatorGrid {
+            row_start: u64::try_from(self.analysis_origin.0)?,
+            col_start: u64::try_from(self.analysis_origin.1)?,
+            rows: u32::try_from(validity.nrows())?,
+            cols: u32::try_from(validity.ncols())?,
+            stride_y: u32::try_from(sequential_cfg.strides.y)?,
+            stride_x: u32::try_from(sequential_cfg.strides.x)?,
+        };
+        let reference_global = (
+            full_grid.row_start + u64::try_from(reference.0)?,
+            full_grid.col_start + u64::try_from(reference.1)?,
+        );
+        let mask_digest = production_mask_digest(validity, self.ownership.view())?;
+        let l2_map_digest = fixed_l2_frame_digest(Some(fixed_l2))?;
+        let reference_signature = final_reference_signature_digest(
+            full_grid,
+            reference_global,
+            reference_owner,
+            &ordered_date_indices,
+            geotransform,
+        );
+        let support_method = support_method(cfg.phase_linking.shp_method);
+        let source_replay_digest = hash_serialized_identity(
+            b"dolphinrust:production-source-replay-artifact:v1",
+            &replay_context.operator_manifest,
+        )?;
+        let source_model_digest = replay_context
+            .operator_manifest
+            .source_model_receipt_digest
+            .clone()
+            .context("production operator is missing its source-model receipt")?;
+        let effective_looks_digest = digest_string(
+            b"dolphinrust:production-effective-looks:v1",
+            &[
+                EFFECTIVE_LOOKS_MODEL.as_bytes(),
+                &EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+                    .to_bits()
+                    .to_le_bytes(),
+            ],
+        );
+        let support_digest = digest_string(
+            b"dolphinrust:production-realized-support:v1",
+            &[
+                support_method.as_bytes(),
+                replay_context.operator_manifest.hdf5_sha256.as_bytes(),
+                &mask_digest,
+            ],
+        );
+        let approximation_receipt_digest = digest_string(
+            b"dolphinrust:production-approximation-unavailable:v1",
+            &[b"uncalibrated"],
+        );
+        let resource_receipt_digest = digest_string(
+            b"dolphinrust:production-resource-admission:v1",
+            &[
+                &PRODUCTION_REFERENCE_REPLAY_BYTE_CAP.to_le_bytes(),
+                &replay_context.operator_block_byte_cap.to_le_bytes(),
+            ],
+        );
+        let metadata = SpatialReferenceCovarianceMetadata {
+            schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+            method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
+            method_version: 1,
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            producer_commit: option_env!("DOLPHIN_GIT_COMMIT").map(str::to_owned),
+            burst_id: reference_burst.clone(),
+            crs: format!("EPSG:{epsg}"),
+            units: match cfg.input_options.wavelength {
+                Some(_) => "meters".to_owned(),
+                None => "radians".to_owned(),
+            },
+            full_grid,
+            reference_row: reference_global.0,
+            reference_col: reference_global.1,
+            gauge_date_index: 0,
+            ordered_date_indices,
+            mask_digest: sha256_string(mask_digest),
+            source_replay_digest,
+            l2_map_digest: sha256_string(l2_map_digest),
+            reference_signature_digest: sha256_string(reference_signature),
+            approximation_receipt_digest,
+            resource_receipt_digest,
+            review_receipt_digest: String::new(),
+            method_manifest_digest: String::new(),
+            calibration_scope_digest: String::new(),
+            source_model_digest,
+            effective_looks_digest,
+            support_method: support_method.to_owned(),
+            support_digest,
+            correction_order_digest: sha256_string(self.correction_order_digest),
+            unwrap_branch_digest: sha256_string(self.unwrap_branch_digest),
+            burst_ownership_digest: sha256_string(self.burst_ownership_digest()),
+            source_burst_ids: self.source_burst_ids.clone(),
+            reference_source_burst_index: reference_owner,
+            calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
+            maximum_block_bytes: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
+        };
+        let transaction =
+            SpatialReferenceCovarianceArtifactTransaction::acquire(&cfg.work_directory)?;
+        let scratch = cfg
+            .work_directory
+            .join(SPATIAL_REFERENCE_COVARIANCE_HDF5_SCRATCH_FILENAME);
+        let mut writer = SpatialReferenceCovarianceWriter::create(&scratch, &metadata)?;
+        let phase_to_displacement = cfg
+            .input_options
+            .wavelength
+            .map_or(1.0, |wavelength| -wavelength / (4.0 * std::f64::consts::PI));
+        let block_shape = factor_block_shape(validity.dim(), dates, metadata.maximum_block_bytes)?;
+        let mut block_id = 0_u64;
+        for row_start in (0..validity.nrows()).step_by(block_shape.0) {
+            let rows = block_shape.0.min(validity.nrows() - row_start);
+            for col_start in (0..validity.ncols()).step_by(block_shape.1) {
+                let cols = block_shape.1.min(validity.ncols() - col_start);
+                let target_grid = CovarianceOperatorGrid {
+                    row_start: full_grid.row_start + u64::try_from(row_start)?,
+                    col_start: full_grid.col_start + u64::try_from(col_start)?,
+                    rows: u32::try_from(rows)?,
+                    cols: u32::try_from(cols)?,
+                    stride_y: full_grid.stride_y,
+                    stride_x: full_grid.stride_x,
+                };
+                let mut outcomes = Vec::with_capacity(rows * cols);
+                for row in row_start..row_start + rows {
+                    for column in col_start..col_start + cols {
+                        let target = (row, column);
+                        outcomes.push(production_target_factor(
+                            &self,
+                            fixed_l2,
+                            validity,
+                            target,
+                            reference,
+                            reference_output,
+                            &ordered_dates,
+                            source_rank,
+                            build_identity.branch_tolerance,
+                            &topologies,
+                            &mut providers,
+                        )?);
+                    }
+                }
+                writer.write_block(&build_factor_block(
+                    block_id,
+                    target_grid,
+                    dates,
+                    phase_to_displacement,
+                    &outcomes,
+                )?)?;
+                block_id = block_id
+                    .checked_add(1)
+                    .context("factor block ID overflow")?;
+            }
+        }
+        let write_receipt = writer.finish()?;
+        replay_context
+            .source_manifest
+            .verify_unchanged()
+            .context("verifying immutable CSLC members before factor commit")?;
+        let live_operator_after = read_covariance_artifact_manifest_with_byte_cap(
+            &cfg.work_directory,
+            replay_context.operator_block_byte_cap,
+        )?;
+        anyhow::ensure!(
+            live_operator_after == replay_context.operator_manifest,
+            "committed covariance operator changed during factor replay"
+        );
+        finalize_spatial_reference_covariance_artifact(
+            &transaction,
+            &scratch,
+            &metadata,
+            &write_receipt,
+        )?;
+        Ok(())
+    }
+}
+
+fn preflight_existing_output(directory: &Path) -> Result<()> {
+    let hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    let manifest = directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME);
+    if hdf5.try_exists()? && manifest.try_exists()? {
+        crate::spatial_covariance_artifact::read_spatial_reference_covariance_artifact_manifest(
+            directory,
+        )?;
+        anyhow::bail!("a valid spatial covariance artifact already exists");
+    }
+    Ok(())
+}
+
+fn topology_for_tile(
+    tile: &CapturedReplayTile,
+    cfg: &SequentialConfig,
+) -> Result<SequentialReplayTopology> {
+    let native_shape = (
+        usize::try_from(tile.request.native_grid.rows)?,
+        usize::try_from(tile.request.native_grid.cols)?,
+    );
+    let output_shape = (
+        usize::try_from(tile.request.output_grid.rows)?,
+        usize::try_from(tile.request.output_grid.cols)?,
+    );
+    anyhow::ensure!(
+        tile.native_validity.dim() == native_shape,
+        "captured replay tile validity differs from its native grid"
+    );
+    let support_rows = cfg
+        .half_window
+        .y
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("support rows overflow usize")?;
+    let support_cols = cfg
+        .half_window
+        .x
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("support columns overflow usize")?;
+    let namespace = tile
+        .request
+        .namespace_for(native_shape, output_shape, cfg.strides)
+        .map_err(anyhow::Error::new)?;
+    SequentialReplayTopology::plan_identified(
+        tile.num_real_dates,
+        native_shape,
+        output_shape,
+        support_rows
+            .checked_mul(support_cols)
+            .context("support area overflows usize")?,
+        tile.native_validity.view(),
+        cfg,
+        ReplayExecutionScope {
+            enabled: true,
+            backend: ReplayBackend::CpuF64,
+            estimator_fallback: false,
+            phase_bias_correction: false,
+            strong_source_identity: true,
+            stitched_burst_count: 1,
+        },
+        namespace,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_target_factor<R>(
+    state: &ProductionCovarianceState,
+    fixed_l2: &FixedL2WorkflowInputs,
+    validity: ArrayView2<'_, bool>,
+    target: (usize, usize),
+    reference: (usize, usize),
+    reference_output: (u64, u64),
+    ordered_dates: &[GlobalDateId],
+    source_rank: usize,
+    branch_tolerance: f64,
+    topologies: &[SequentialReplayTopology],
+    providers: &mut [CovarianceArtifactReplayProvider<'_, R>],
+) -> Result<TargetFactor>
+where
+    R: crate::sequential_covariance::SequentialPrimitiveSourceResolver,
+{
+    if !validity[target] {
+        return Ok(nonvalid_target(
+            SpatialReferenceCovarianceStatus::MaskedTarget,
+        ));
+    }
+    let Some(owner) = same_constant_owner(state.ownership.view(), target, reference) else {
+        return Ok(nonvalid_target(
+            SpatialReferenceCovarianceStatus::UnsupportedMultiburstReference,
+        ));
+    };
+    let Some(target_output) = state.owner_output_coordinate(owner, target) else {
+        return Ok(nonvalid_target(
+            SpatialReferenceCovarianceStatus::InvalidReference,
+        ));
+    };
+    let burst = state
+        .source_burst_ids
+        .get(usize::try_from(owner)?)
+        .context("target burst owner is outside the source registry")?;
+    let mut bundle = topologies
+        .iter()
+        .zip(providers.iter_mut())
+        .map(|(topology, provider)| SequentialTileReplayProvider::new(topology, provider))
+        .collect::<Vec<_>>();
+    let replay = match replay_global_reference_difference_covariance_from_provider_bundle(
+        &mut bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: burst,
+            target: target_output,
+            reference: reference_output,
+            ordered_dates,
+            source_rank,
+            byte_cap: PRODUCTION_REFERENCE_REPLAY_BYTE_CAP,
+            branch_tolerance,
+        },
+    ) {
+        Ok(replay) => replay,
+        Err(error) if replay_failure_aborts(&error) => return Err(anyhow::Error::new(error)),
+        Err(error) => return Ok(nonvalid_target(replay_status(error.status()))),
+    };
+    let effective = replay
+        .replay
+        .effective_looks
+        .as_ref()
+        .context("production replay did not apply the declared effective-look source factor")?;
+    validate_effective_looks(effective)?;
+    let propagated = match fixed_l2.propagate_joint_phase_covariance(
+        target,
+        reference,
+        replay.joint_phase_covariance.view(),
+    ) {
+        Ok(propagated) => propagated,
+        Err(error) => return Ok(nonvalid_target(fixed_l2_status(error.status))),
+    };
+    anyhow::ensure!(
+        propagated.status == SpatialL2Status::Valid,
+        "successful production L2 propagation returned a non-valid status"
+    );
+    Ok(TargetFactor {
+        status: SpatialReferenceCovarianceStatus::Valid,
+        source_burst_index: owner,
+        date_factor: Some(propagated.date_factor),
+        source_factor_receipt: production_target_receipt(
+            replay.replay.source_factor_receipt,
+            replay.replay.support_receipt,
+            replay.replay.reference_signature,
+            effective.model,
+            effective.distance_scale_pixels,
+            effective.support_union_count,
+            effective.fraction,
+            effective.receipt,
+            replay.resource_high_water_bytes,
+        ),
+    })
+}
+
+fn replay_failure_aborts(error: &SequentialReplayError) -> bool {
+    matches!(
+        error.status(),
+        ReplayStatus::SourceUnavailable
+            | ReplayStatus::SourceIdentityMismatch
+            | ReplayStatus::ReplayStateMismatch
+    )
+}
+
+fn validate_effective_looks(effective: &EffectiveLooksReplay) -> Result<()> {
+    anyhow::ensure!(
+        effective.model == EFFECTIVE_LOOKS_MODEL
+            && effective.distance_scale_pixels == EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+            && effective.support_union_count > 0
+            && effective.fraction.is_finite()
+            && effective.fraction > 0.0
+            && effective.fraction <= 1.0
+            && effective.receipt.iter().any(|byte| *byte != 0),
+        "production replay effective-look receipt differs from source_factor_declared_v1"
+    );
+    Ok(())
+}
+
+fn nonvalid_target(status: SpatialReferenceCovarianceStatus) -> TargetFactor {
+    TargetFactor {
+        status,
+        source_burst_index: SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+        date_factor: None,
+        source_factor_receipt: [0; 32],
+    }
+}
+
+fn factor_block_shape(
+    shape: (usize, usize),
+    dates: usize,
+    maximum_block_bytes: u64,
+) -> Result<(usize, usize)> {
+    let per_target = u64::try_from(dates)?
+        .checked_mul(u64::try_from(dates)?)
+        .and_then(|value| value.checked_mul(8))
+        .and_then(|value| value.checked_add(18))
+        .context("factor target payload bytes overflow u64")?;
+    let targets = usize::try_from(maximum_block_bytes / per_target)
+        .context("factor target block capacity exceeds usize")?;
+    anyhow::ensure!(targets > 0, "factor byte cap cannot hold one target");
+    let cols = shape.1.min(targets).max(1);
+    let rows = shape.0.min(targets / cols).max(1);
+    Ok((rows, cols))
+}
+
+fn support_method(method: ShpMethod) -> &'static str {
+    match method {
+        ShpMethod::Rect => "rect",
+        ShpMethod::Glrt => "glrt_frozen",
+        ShpMethod::Ks => "ks_frozen",
+    }
+}
+
+fn hash_serialized_identity<T: serde::Serialize>(domain: &[u8], value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(digest_string(domain, &[&bytes]))
+}
+
+fn digest_string(domain: &[u8], values: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for value in values {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn sha256_string(value: [u8; 32]) -> String {
+    value
+        .iter()
+        .fold(String::from("sha256:"), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 /// Exact post-loop-QC observations and weights used by the production L2 solve.
@@ -655,6 +1264,49 @@ mod tests {
     }
 
     #[test]
+    fn production_receipt_binds_effective_looks_support_reference_and_resource() {
+        let base = production_target_receipt(
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            "source_factor_declared_v1",
+            1.5,
+            17,
+            0.25,
+            [4; 32],
+            4096,
+        );
+        assert_ne!(
+            base,
+            production_target_receipt(
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                "source_factor_declared_v1",
+                1.5,
+                18,
+                0.25,
+                [4; 32],
+                4096,
+            )
+        );
+        assert_ne!(
+            base,
+            production_target_receipt(
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                "source_factor_declared_v1",
+                1.5,
+                17,
+                0.25,
+                [4; 32],
+                4097,
+            )
+        );
+    }
+
+    #[test]
     fn bounded_trim_preserves_global_captured_output_coordinates() {
         let retained = FixedL2WorkflowInputs::new(
             array![[-1.0, 0.0], [0.0, 1.0]],
@@ -889,8 +1541,51 @@ mod tests {
             stride_x: 3,
         };
         assert_ne!(
-            final_reference_signature_digest(grid, (5, 9), 0, &[0, 1, 2]),
-            final_reference_signature_digest(grid, (5, 10), 0, &[0, 1, 2])
+            final_reference_signature_digest(
+                grid,
+                (5, 9),
+                0,
+                &[0, 1, 2],
+                [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            ),
+            final_reference_signature_digest(
+                grid,
+                (5, 10),
+                0,
+                &[0, 1, 2],
+                [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            )
         );
+        assert_ne!(
+            final_reference_signature_digest(
+                grid,
+                (5, 9),
+                0,
+                &[0, 1, 2],
+                [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            ),
+            final_reference_signature_digest(
+                grid,
+                (5, 9),
+                0,
+                &[0, 1, 2],
+                [10.0, 1.0, 0.0, 20.0, 0.0, -1.0],
+            )
+        );
+    }
+
+    #[test]
+    fn factor_block_plan_is_rectangular_bounded_and_covers_narrow_caps() {
+        let dates = 52;
+        let per_target = (dates * dates * 8 + 18) as u64;
+        assert_eq!(
+            factor_block_shape((4, 7), dates, per_target).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            factor_block_shape((4, 7), dates, per_target * 14).unwrap(),
+            (2, 7)
+        );
+        assert!(factor_block_shape((4, 7), dates, per_target - 1).is_err());
     }
 }

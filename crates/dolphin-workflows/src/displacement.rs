@@ -1117,6 +1117,22 @@ fn emit_displacement(
     ) {
         reference_variance_to_point(variance, point);
     }
+    if let Some(covariance) = spatial.production_covariance.take() {
+        let reference = spatial
+            .reference_point
+            .context("production spatial covariance requires a final analysis reference")?;
+        let output_epsg = epsg.context("production spatial covariance requires an exact CRS")?;
+        timed("spatial_reference_covariance", || {
+            covariance.emit(
+                cfg,
+                &sequential_config(cfg),
+                spatial.validity_mask.view(),
+                reference,
+                output_epsg,
+                spatial.geotransform,
+            )
+        })?;
+    }
     let scaled = scale_outputs(cfg, &spatial);
     let quality = QualityLayers {
         network_residual_dof: spatial
@@ -2964,7 +2980,7 @@ fn burst_link(
     let covariance_output_origin = if cfg.phase_linking.write_covariance_operator {
         let strides = cfg.output_options.strides;
         anyhow::ensure!(
-            source_offset.0 % strides.y == 0 && source_offset.1 % strides.x == 0,
+            source_offset.0.is_multiple_of(strides.y) && source_offset.1.is_multiple_of(strides.x),
             "covariance burst origin is not on the output stride lattice"
         );
         Some((
@@ -3520,6 +3536,10 @@ fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
             !cfg.phase_linking.correct_phase_bias,
             "phase_linking.write_covariance_operator requires correct_phase_bias = false"
         );
+        anyhow::ensure!(
+            cfg.timeseries_options.method == TimeseriesMethod::L2,
+            "phase_linking.write_covariance_operator requires timeseries_options.method = l2"
+        );
     }
     Ok(())
 }
@@ -3554,6 +3574,7 @@ struct Stitched {
 
 /// Mosaic the per-burst phase-linking products onto the frame grid. A single
 /// burst is returned as-is (identity path).
+#[allow(clippy::too_many_lines)]
 fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
@@ -6664,6 +6685,7 @@ mod tests {
     fn covariance_operator_rejects_unsupported_producer_scope_before_io() {
         let mut cfg = DisplacementWorkflow::default();
         cfg.phase_linking.write_covariance_operator = true;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.phase_linking.shp_method = ShpMethod::Rect;
         for method in [ShpMethod::Rect, ShpMethod::Glrt, ShpMethod::Ks] {
             cfg.phase_linking.shp_method = method;
@@ -6704,6 +6726,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("correct_phase_bias = false"));
+        cfg.phase_linking.correct_phase_bias = false;
+
+        cfg.timeseries_options.method = TimeseriesMethod::L1;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("timeseries_options.method = l2"));
     }
 
     #[test]
@@ -6777,6 +6806,7 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.phase_linking.write_covariance_operator = true;
         cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.cslc_file_list = vec![PathBuf::from("definitely-missing-covariance-source.h5")];
 
         let error =
