@@ -263,6 +263,7 @@ impl PortableDgpTables {
     ///
     /// # Errors
     /// Returns an error for asset hash/size drift or malformed numeric tables.
+    #[allow(clippy::too_many_lines)]
     pub fn from_documents(preregistration: &Value, tables: &Value) -> Result<Self> {
         let identity_text = preregistration
             .pointer("/determinism/dgp_generator_identity_sha256")
@@ -412,6 +413,7 @@ impl PortableDgpTables {
     ///
     /// # Errors
     /// Returns an error when the frozen coefficient tables do not cover the coordinate/date cell.
+    #[allow(clippy::too_many_arguments)]
     pub fn source_history(
         &self,
         cell_ordinal: u64,
@@ -817,6 +819,7 @@ fn execute_tied_probe(preregistration: &Value) -> Result<CovarianceOperatorStatu
     Ok(block.status[0])
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_tied_probe_evidence(
     preregistration: &Value,
     request: &FrozenAttemptRequest,
@@ -939,6 +942,7 @@ fn build_tied_probe_evidence(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn build_empty_support_evidence(
     preregistration: &Value,
     tables: &PortableDgpTables,
@@ -1337,7 +1341,8 @@ pub fn run_frozen_attempt(
     );
     let crop_shape = (crop_stop.0 - crop_start.0, crop_stop.1 - crop_start.1);
     anyhow::ensure!(
-        crop_shape.0 % geometry.stride.0 == 0 && crop_shape.1 % geometry.stride.1 == 0,
+        crop_shape.0.is_multiple_of(geometry.stride.0)
+            && crop_shape.1.is_multiple_of(geometry.stride.1),
         "frozen production crop is not stride aligned"
     );
     let spatial = request.source_process == "spatial_correlation_stress"
@@ -1480,7 +1485,7 @@ pub fn run_frozen_attempt(
     let make_inputs = |attempt_validity: Array2<bool>| ProductionCellInputs {
         stack: stack.clone(),
         validity: attempt_validity,
-        config: config.clone(),
+        config,
         capture: capture.clone(),
         target,
         reference,
@@ -2473,6 +2478,7 @@ impl From<SpatialReferenceRuntimeResourceReceipt> for BenchmarkRuntimeResourceRe
 /// # Errors
 /// Returns a fail-closed production replay or fixed-L2 error when the cell is
 /// unsupported, masked, tied, malformed, or above the byte cap.
+#[allow(clippy::too_many_lines)]
 pub fn run_production_cell(inputs: ProductionCellInputs) -> Result<ProductionCellResult> {
     let (dates, native_rows, native_columns) = inputs.stack.dim();
     anyhow::ensure!(

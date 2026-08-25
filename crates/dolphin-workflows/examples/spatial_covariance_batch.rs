@@ -1,7 +1,7 @@
 //! JSONL driver for the bounded production spatial-covariance validation runner.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use dolphin_workflows::spatial_covariance_validation::{
@@ -105,6 +105,7 @@ fn parse_args() -> Result<Arguments> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let arguments = parse_args()?;
     let preregistration = arguments
@@ -230,7 +231,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_json(path: &PathBuf, byte_cap: u64) -> Result<Value> {
+fn read_json(path: &Path, byte_cap: u64) -> Result<Value> {
     Ok(read_json_bytes(path, byte_cap)?.0)
 }
 
