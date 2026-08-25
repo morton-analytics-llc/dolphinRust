@@ -15,6 +15,8 @@ use crate::{IoError, Result};
 
 /// HDF5 schema version for covariance replay operators.
 pub const COVARIANCE_OPERATOR_SCHEMA_VERSION: u16 = 1;
+/// Schema version for the optional NRT sealed-generation identity registry.
+pub const COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION: u16 = 1;
 /// Stable method name for the source-keyed sequential replay DAG.
 pub const COVARIANCE_OPERATOR_METHOD: &str = "sequential_source_dag_v1";
 /// Numeric version of [`COVARIANCE_OPERATOR_METHOD`].
@@ -30,6 +32,31 @@ const COVARIANCE_ROOT_MEMBERS: &[&str] = &[
     "registries",
     "blocks",
 ];
+const COVARIANCE_ROOT_MEMBERS_WITH_GENERATIONS: &[&str] = &[
+    "method",
+    "crate_version",
+    "producer_commit",
+    "normalized_config_digest",
+    "kernel_digest",
+    "source",
+    "registries",
+    "generation_identities",
+    "blocks",
+];
+const COVARIANCE_GENERATION_REGISTRY_ATTRIBUTES: &[&str] = &["schema_version"];
+const COVARIANCE_GENERATION_MEMBERS: &[&str] = &[
+    "burst_id",
+    "source_date_indices",
+    "source_member_manifest_digest",
+    "source_model_version_digest",
+    "source_model_receipt_digest",
+    "normalized_config_digest",
+    "kernel_digest",
+    "mask_digest",
+    "block_ids",
+    "block_sha256",
+];
+const COVARIANCE_GENERATION_ATTRIBUTES: &[&str] = &["generation", "sealed"];
 const COVARIANCE_ROOT_ATTRIBUTES: &[&str] = &[
     "schema_version",
     "method_version",
@@ -793,6 +820,252 @@ impl CovarianceOperatorMetadata {
     }
 }
 
+/// Stable ID and canonical logical-content digest for one generation block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovarianceGenerationBlockIdentity {
+    /// Deterministic replay block ID.
+    pub block_id: u64,
+    /// SHA-256 of every logical field in the persisted block.
+    pub block_sha256: [u8; 32],
+}
+
+/// Exact replay identity for one burst-local sequential generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovarianceGenerationIdentity {
+    /// Immutable burst identity.
+    pub burst_id: String,
+    /// Sequential generation index.
+    pub generation: u32,
+    /// Exact ordered real-acquisition indices in this generation.
+    pub source_date_indices: Vec<u32>,
+    /// Digest of only the immutable source members used by this generation.
+    pub source_member_manifest_digest: [u8; 32],
+    /// Provider/model code identity digest.
+    pub source_model_version_digest: [u8; 32],
+    /// Exact numeric source-model/configuration receipt.
+    pub source_model_receipt_digest: [u8; 32],
+    /// Normalized phase-linking configuration digest.
+    pub normalized_config_digest: [u8; 32],
+    /// Replay kernel digest.
+    pub kernel_digest: [u8; 32],
+    /// Exact native validity/mask identity for this generation.
+    pub mask_digest: [u8; 32],
+    /// Expected tile blocks in plan order.
+    pub blocks: Vec<CovarianceGenerationBlockIdentity>,
+    /// Whether this generation is immutable and eligible for parent reuse.
+    pub sealed: bool,
+}
+
+/// Versioned per-burst generation registry for resumable covariance operators.
+///
+/// Legacy batch artifacts omit this registry and continue to use the complete
+/// source manifest as every block namespace. NRT artifacts include it and use
+/// each generation's member digest for block/source/node identities while this
+/// registry retains the complete revision digest separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovarianceGenerationRegistry {
+    /// Registry schema version.
+    pub schema_version: u16,
+    /// Complete ordered source manifest for this artifact revision.
+    pub full_source_manifest_digest: [u8; 32],
+    /// Unique `(burst_id, generation)` identities in burst/generation order.
+    pub generations: Vec<CovarianceGenerationIdentity>,
+}
+
+impl CovarianceGenerationRegistry {
+    #[allow(clippy::too_many_lines)]
+    fn validate(
+        &self,
+        metadata: &CovarianceOperatorMetadata,
+        plan: Option<&CovarianceOperatorPlan>,
+    ) -> Result<()> {
+        ensure_valid(
+            self.schema_version == COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+            "unsupported covariance generation registry schema version",
+        )?;
+        ensure_valid(
+            self.full_source_manifest_digest
+                .iter()
+                .any(|byte| *byte != 0)
+                && metadata
+                    .source
+                    .manifest_digest
+                    .as_deref()
+                    .and_then(sha256_digest_bytes)
+                    == Some(self.full_source_manifest_digest),
+            "covariance generation registry full source manifest differs from metadata",
+        )?;
+        if let Some(plan) = plan {
+            ensure_valid(
+                plan.source_manifest_digest == self.full_source_manifest_digest,
+                "covariance generation registry full source manifest differs from plan",
+            )?;
+        }
+        let config_digest = sha256_digest_bytes(&metadata.normalized_config_digest)
+            .ok_or_else(|| invalid("covariance generation config digest is invalid"))?;
+        let kernel_digest = sha256_digest_bytes(&metadata.kernel_digest)
+            .ok_or_else(|| invalid("covariance generation kernel digest is invalid"))?;
+        let model_version_digest = metadata
+            .source
+            .model_version_digest
+            .as_deref()
+            .and_then(sha256_digest_bytes)
+            .ok_or_else(|| invalid("covariance generation model version digest is missing"))?;
+        let model_receipt_digest = metadata
+            .source
+            .model_receipt_digest
+            .as_deref()
+            .and_then(sha256_digest_bytes)
+            .ok_or_else(|| invalid("covariance generation model receipt digest is missing"))?;
+        ensure_valid(
+            !self.generations.is_empty(),
+            "covariance generation registry is empty",
+        )?;
+        let mut keys = BTreeSet::new();
+        let mut block_ids = BTreeSet::new();
+        let mut next_by_burst = BTreeMap::<&str, (u32, u32)>::new();
+        let mut prior_key = None;
+        for identity in &self.generations {
+            let key = (identity.burst_id.as_str(), identity.generation);
+            ensure_valid(
+                !identity.burst_id.is_empty()
+                    && prior_key.is_none_or(|prior| prior < key)
+                    && keys.insert(key),
+                "covariance generation registry repeats or omits a burst identity",
+            )?;
+            prior_key = Some(key);
+            ensure_valid(
+                consecutive(&identity.source_date_indices),
+                "covariance generation source dates are not consecutive",
+            )?;
+            let expected = next_by_burst.entry(&identity.burst_id).or_insert((0, 0));
+            ensure_valid(
+                identity.generation == expected.0
+                    && identity.source_date_indices.first().copied() == Some(expected.1),
+                "covariance generation registry is not a contiguous burst/date sequence",
+            )?;
+            expected.0 = expected
+                .0
+                .checked_add(1)
+                .ok_or_else(|| invalid("covariance generation index overflow"))?;
+            expected.1 = identity
+                .source_date_indices
+                .last()
+                .and_then(|date| date.checked_add(1))
+                .ok_or_else(|| invalid("covariance generation date overflow"))?;
+            ensure_valid(
+                identity
+                    .source_member_manifest_digest
+                    .iter()
+                    .any(|byte| *byte != 0),
+                "covariance generation source manifest digest is missing",
+            )?;
+            ensure_valid(
+                identity.source_model_version_digest == model_version_digest,
+                "covariance generation model version drift",
+            )?;
+            ensure_valid(
+                identity.source_model_receipt_digest == model_receipt_digest,
+                "covariance generation model receipt drift",
+            )?;
+            ensure_valid(
+                identity.normalized_config_digest == config_digest,
+                "covariance generation config drift",
+            )?;
+            ensure_valid(
+                identity.kernel_digest == kernel_digest,
+                "covariance generation kernel drift",
+            )?;
+            ensure_valid(
+                identity.mask_digest.iter().any(|byte| *byte != 0),
+                "covariance generation mask digest is missing",
+            )?;
+            ensure_valid(
+                !identity.blocks.is_empty(),
+                "covariance generation has no planned blocks",
+            )?;
+            for block in &identity.blocks {
+                ensure_valid(
+                    block_ids.insert(block.block_id),
+                    "covariance generation registry repeats a block ID",
+                )?;
+                if identity.sealed {
+                    ensure_valid(
+                        block.block_sha256.iter().any(|byte| *byte != 0),
+                        "sealed covariance generation block SHA-256 is missing",
+                    )?;
+                }
+                if plan.is_none() {
+                    ensure_valid(
+                        block.block_sha256.iter().any(|byte| *byte != 0),
+                        "committed covariance generation block SHA-256 is missing",
+                    )?;
+                }
+            }
+        }
+        if let Some(plan) = plan {
+            self.validate_plan(plan)?;
+        }
+        Ok(())
+    }
+
+    fn validate_plan(&self, plan: &CovarianceOperatorPlan) -> Result<()> {
+        let planned = plan.expected_generations()?;
+        let tiles = plan.expected_tiles();
+        ensure_valid(
+            self.generations.len() == planned.values().map(BTreeMap::len).sum::<usize>(),
+            "covariance generation registry differs from the complete plan",
+        )?;
+        for identity in &self.generations {
+            let expected_dates = planned
+                .get(&identity.burst_id)
+                .and_then(|generations| generations.get(&identity.generation));
+            ensure_valid(
+                expected_dates == Some(&identity.source_date_indices),
+                "covariance generation source dates differ from the complete plan",
+            )?;
+            let expected_tiles = tiles
+                .get(&identity.burst_id)
+                .ok_or_else(|| invalid("covariance generation burst is absent from tile plan"))?;
+            ensure_valid(
+                identity.blocks.len() == expected_tiles.len(),
+                "covariance generation block count differs from tile plan",
+            )?;
+            for (block, tile) in identity.blocks.iter().zip(expected_tiles) {
+                let expected = covariance_record_block_id(
+                    &identity.burst_id,
+                    identity.source_member_manifest_digest,
+                    identity.source_model_version_digest,
+                    identity.generation,
+                    tile.native_grid,
+                    tile.output_grid,
+                    tile.owned_output_grid,
+                );
+                ensure_valid(
+                    block.block_id == expected,
+                    "covariance generation block ID is not canonically derived",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn identity(&self, burst_id: &str, generation: u32) -> Option<&CovarianceGenerationIdentity> {
+        self.generations
+            .iter()
+            .find(|identity| identity.burst_id == burst_id && identity.generation == generation)
+    }
+
+    fn identity_for_block(&self, block_id: u64) -> Option<&CovarianceGenerationIdentity> {
+        self.generations.iter().find(|identity| {
+            identity
+                .blocks
+                .iter()
+                .any(|block| block.block_id == block_id)
+        })
+    }
+}
+
 /// Expected source-date generations for one burst in a complete operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovarianceBurstPlan {
@@ -1518,6 +1791,115 @@ impl CovarianceOperatorBlock {
     }
 }
 
+/// Canonical SHA-256 over every logical field of one operator block.
+///
+/// The digest is independent of HDF5 allocation/layout and therefore remains
+/// stable when a validated sealed block is streamed into a new revision.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn covariance_operator_block_sha256(block: &CovarianceOperatorBlock) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dolphinrust:covariance_operator_block:v1");
+    hash_bytes(&mut digest, block.burst_id.as_bytes());
+    digest.update(block.source_manifest_digest);
+    digest.update(block.source_model_version_digest);
+    for value in [block.block_id, u64::from(block.generation)] {
+        digest.update(value.to_le_bytes());
+    }
+    for grid in [
+        block.native_grid,
+        block.output_grid,
+        block.owned_output_grid,
+    ] {
+        for value in [
+            grid.row_start,
+            grid.col_start,
+            u64::from(grid.rows),
+            u64::from(grid.cols),
+            u64::from(grid.stride_y),
+            u64::from(grid.stride_x),
+        ] {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    for value in [
+        block.rect_support.half_window_rows,
+        block.rect_support.half_window_cols,
+    ] {
+        digest.update(value.to_le_bytes());
+    }
+    digest.update(block.rect_support.ordering.code().to_le_bytes());
+    digest.update(block.estimator_branch.code().to_le_bytes());
+    digest.update(block.branch_tolerance.to_bits().to_le_bytes());
+    digest.update(block.reference_date_index.to_le_bytes());
+    hash_u32s(&mut digest, &block.source_date_indices);
+    hash_u32s(&mut digest, &block.ordered_date_indices);
+    hash_u64s(&mut digest, &block.source_ids);
+    hash_bytes(&mut digest, &block.source_content_digests);
+    hash_bytes(&mut digest, &block.source_factor_digests);
+    hash_u64s(&mut digest, &block.phase_node_ids);
+    hash_u64s(&mut digest, &block.compressed_node_ids);
+    hash_u64s(&mut digest, &block.carry_parent_ids);
+    hash_u32s(&mut digest, &block.nearest_output_map);
+    digest.update((block.phase_components.len() as u64).to_le_bytes());
+    for component in &block.phase_components {
+        digest.update(component.kind.code().to_le_bytes());
+        digest.update(component.id.to_le_bytes());
+    }
+    hash_f64s(&mut digest, &block.phase_angles);
+    digest.update((block.compressed_raster.len() as u64).to_le_bytes());
+    for value in &block.compressed_raster {
+        digest.update(value.re.to_bits().to_le_bytes());
+        digest.update(value.im.to_bits().to_le_bytes());
+    }
+    digest.update((block.compressed_status.len() as u64).to_le_bytes());
+    for status in &block.compressed_status {
+        digest.update(status.code().to_le_bytes());
+    }
+    digest.update((block.projection_accumulator.len() as u64).to_le_bytes());
+    for value in &block.projection_accumulator {
+        digest.update(value.re.to_bits().to_le_bytes());
+        digest.update(value.im.to_bits().to_le_bytes());
+    }
+    hash_f64s(&mut digest, &block.mean_amplitude);
+    digest.update(block.support_bits_per_output.to_le_bytes());
+    hash_bytes(&mut digest, &block.support_bits);
+    hash_bytes(&mut digest, &block.native_validity_bits);
+    hash_f64s(&mut digest, &block.selected_eigenvalue);
+    hash_f64s(&mut digest, &block.eigen_gap);
+    digest.update((block.status.len() as u64).to_le_bytes());
+    for status in &block.status {
+        digest.update(status.code().to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn hash_bytes(digest: &mut Sha256, values: &[u8]) {
+    digest.update((values.len() as u64).to_le_bytes());
+    digest.update(values);
+}
+
+fn hash_u32s(digest: &mut Sha256, values: &[u32]) {
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update(value.to_le_bytes());
+    }
+}
+
+fn hash_u64s(digest: &mut Sha256, values: &[u64]) {
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update(value.to_le_bytes());
+    }
+}
+
+fn hash_f64s(digest: &mut Sha256, values: &[f64]) {
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CovarianceBlockTopology {
     block_id: u64,
@@ -2222,6 +2604,7 @@ pub struct CovarianceOperatorWriter {
     metadata: CovarianceOperatorMetadata,
     source_manifest_digest: [u8; 32],
     source_model_version_digest: [u8; 32],
+    generation_registry: Option<CovarianceGenerationRegistry>,
     expected_generations: BTreeMap<String, BTreeMap<u32, Vec<u32>>>,
     expected_tiles: BTreeMap<String, Vec<CovarianceTilePlan>>,
     identity_index: CovarianceIdentityIndex,
@@ -2276,7 +2659,20 @@ impl CovarianceOperatorWriter {
         metadata: &CovarianceOperatorMetadata,
         plan: &CovarianceOperatorPlan,
     ) -> Result<Self> {
-        Self::create_with_identity_index_disk_cap(path, metadata, plan, u64::MAX)
+        Self::create_internal(path, metadata, plan, None, u64::MAX)
+    }
+
+    /// Create an NRT-capable scratch artifact with exact generation identities.
+    ///
+    /// Registry/config/model/mask validation completes before any scratch or
+    /// identity-index path is created.
+    pub fn create_with_generation_registry(
+        path: impl AsRef<Path>,
+        metadata: &CovarianceOperatorMetadata,
+        plan: &CovarianceOperatorPlan,
+        registry: &CovarianceGenerationRegistry,
+    ) -> Result<Self> {
+        Self::create_internal(path, metadata, plan, Some(registry), u64::MAX)
     }
 
     /// Create a scratch artifact with an explicit temporary identity-index disk cap.
@@ -2286,13 +2682,29 @@ impl CovarianceOperatorWriter {
         plan: &CovarianceOperatorPlan,
         identity_index_disk_cap_bytes: u64,
     ) -> Result<Self> {
+        Self::create_internal(path, metadata, plan, None, identity_index_disk_cap_bytes)
+    }
+
+    fn create_internal(
+        path: impl AsRef<Path>,
+        metadata: &CovarianceOperatorMetadata,
+        plan: &CovarianceOperatorPlan,
+        registry: Option<&CovarianceGenerationRegistry>,
+        identity_index_disk_cap_bytes: u64,
+    ) -> Result<Self> {
         metadata.validate()?;
         plan.validate(metadata)?;
+        if let Some(registry) = registry {
+            registry.validate(metadata, Some(plan))?;
+        }
         let path = path.as_ref();
         let identity_index = CovarianceIdentityIndex::create(path, identity_index_disk_cap_bytes)?;
         let file = hdf5::File::create(path)?;
         write_metadata(&file, metadata)?;
         write_registries(&file)?;
+        if let Some(registry) = registry {
+            write_generation_registry(&file, registry)?;
+        }
         file.create_group("blocks")?;
         file.new_attr::<u8>().create("complete")?.write_scalar(&0)?;
         file.flush()?;
@@ -2301,6 +2713,7 @@ impl CovarianceOperatorWriter {
             metadata: metadata.clone(),
             source_manifest_digest: plan.source_manifest_digest,
             source_model_version_digest: plan.source_model_version_digest,
+            generation_registry: registry.cloned(),
             expected_generations: plan.expected_generations()?,
             expected_tiles: plan.expected_tiles(),
             identity_index,
@@ -2331,6 +2744,56 @@ impl CovarianceOperatorWriter {
         result
     }
 
+    /// Read, validate, and stream one immutable sealed parent block into this
+    /// revision. HDF5 links/objects are never copied directly.
+    ///
+    /// # Errors
+    /// Returns an error before the destination block is created when either
+    /// artifact lacks an exact matching sealed generation identity, the source
+    /// block is missing/corrupt, or `byte_cap` is insufficient.
+    pub fn copy_validated_sealed_block(
+        &mut self,
+        parent: &CovarianceOperatorBlockReader,
+        block_id: u64,
+        byte_cap: u64,
+    ) -> Result<CovarianceSealedBlockCopyReceipt> {
+        let destination = self
+            .generation_registry
+            .as_ref()
+            .and_then(|registry| registry.identity_for_block(block_id))
+            .ok_or_else(|| invalid("destination has no generation identity for parent block"))?;
+        ensure_valid(
+            destination.sealed,
+            "destination generation is not sealed for parent reuse",
+        )?;
+        let source = parent
+            .generation_registry()
+            .and_then(|registry| registry.identity_for_block(block_id))
+            .ok_or_else(|| invalid("parent has no generation identity for requested block"))?;
+        ensure_valid(
+            source.sealed && source == destination,
+            "parent sealed generation identity differs from destination",
+        )?;
+        let expected = destination
+            .blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .copied()
+            .ok_or_else(|| invalid("destination generation block identity is missing"))?;
+        let read = parent.read_block_with_receipt(block_id, byte_cap)?;
+        let actual = covariance_operator_block_sha256(&read.block);
+        ensure_valid(
+            actual == expected.block_sha256,
+            "parent sealed generation block SHA-256 mismatch",
+        )?;
+        self.write_block(&read.block)?;
+        Ok(CovarianceSealedBlockCopyReceipt {
+            block_id,
+            block_sha256: actual,
+            source_read_bytes: read.read_allocation_bytes,
+        })
+    }
+
     fn write_block_inner(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
         block.validate(self.metadata.gauge_date_index)?;
         let topology = CovarianceBlockTopology::from(block);
@@ -2344,11 +2807,7 @@ impl CovarianceOperatorWriter {
         if topology.generation == 0 {
             self.begin_tile_chain(&topology)?;
         }
-        ensure_valid(
-            topology.source_manifest_digest == self.source_manifest_digest
-                && topology.source_model_version_digest == self.source_model_version_digest,
-            "covariance block source namespace differs from the capture plan",
-        )?;
+        self.validate_block_generation_identity(block, &topology)?;
         ensure_valid(
             self.current_chain
                 .blocks
@@ -2369,6 +2828,7 @@ impl CovarianceOperatorWriter {
         inspect_block_layout(&group)?;
         self.file.flush()?;
         self.current_chain.insert(topology);
+        self.record_generation_block_digest(block)?;
         self.peak_retained_topology_blocks = self
             .peak_retained_topology_blocks
             .max(self.current_chain.blocks.len());
@@ -2376,6 +2836,60 @@ impl CovarianceOperatorWriter {
             .block_count
             .checked_add(1)
             .ok_or_else(|| invalid("covariance operator block count overflow"))?;
+        Ok(())
+    }
+
+    fn validate_block_generation_identity(
+        &self,
+        block: &CovarianceOperatorBlock,
+        topology: &CovarianceBlockTopology,
+    ) -> Result<()> {
+        let Some(registry) = &self.generation_registry else {
+            return ensure_valid(
+                topology.source_manifest_digest == self.source_manifest_digest
+                    && topology.source_model_version_digest == self.source_model_version_digest,
+                "covariance block source namespace differs from the capture plan",
+            );
+        };
+        let identity = registry
+            .identity(&topology.burst_id, topology.generation)
+            .ok_or_else(|| invalid("covariance block generation is absent from the registry"))?;
+        ensure_valid(
+            topology.source_manifest_digest == identity.source_member_manifest_digest
+                && topology.source_model_version_digest == identity.source_model_version_digest
+                && topology.source_date_indices == identity.source_date_indices,
+            "covariance block source namespace differs from its generation registry",
+        )?;
+        let expected = identity
+            .blocks
+            .iter()
+            .find(|expected| expected.block_id == block.block_id)
+            .ok_or_else(|| invalid("covariance block ID is absent from its generation registry"))?;
+        let actual_digest = covariance_operator_block_sha256(block);
+        ensure_valid(
+            expected.block_sha256.iter().all(|byte| *byte == 0)
+                || expected.block_sha256 == actual_digest,
+            "covariance block SHA-256 differs from its generation registry",
+        )
+    }
+
+    fn record_generation_block_digest(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
+        let Some(registry) = &mut self.generation_registry else {
+            return Ok(());
+        };
+        let identity = registry
+            .generations
+            .iter_mut()
+            .find(|identity| {
+                identity.burst_id == block.burst_id && identity.generation == block.generation
+            })
+            .ok_or_else(|| invalid("covariance generation disappeared while writing"))?;
+        let expected = identity
+            .blocks
+            .iter_mut()
+            .find(|expected| expected.block_id == block.block_id)
+            .ok_or_else(|| invalid("covariance generation block disappeared while writing"))?;
+        expected.block_sha256 = covariance_operator_block_sha256(block);
         Ok(())
     }
 
@@ -2605,6 +3119,19 @@ impl CovarianceOperatorWriter {
                 .all(|invariant| invariant.next_tile_index == invariant.expected_tiles.len()),
             "covariance operator omits a planned tile chain",
         )?;
+        if let Some(registry) = &self.generation_registry {
+            ensure_valid(
+                registry.generations.iter().all(|identity| {
+                    identity
+                        .blocks
+                        .iter()
+                        .all(|block| block.block_sha256.iter().any(|byte| *byte != 0))
+                }),
+                "covariance generation registry omits a completed block SHA-256",
+            )?;
+            self.file.unlink("generation_identities")?;
+            write_generation_registry(&self.file, registry)?;
+        }
         self.identity_index.finish()?;
         validate_root_schema(&self.file)?;
         inspect_metadata_layout(&self.file)?;
@@ -2714,7 +3241,11 @@ pub fn read_covariance_operator_metadata_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
+    let generation_registry = read_generation_registry(&file, &metadata)?;
     let names = nonempty_block_names_with_budget(&file, &mut budget)?;
+    if let Some(registry) = &generation_registry {
+        validate_generation_registry_block_links(&file.group("blocks")?, registry)?;
+    }
     let mut topology_bytes = 0_u64;
     for name in &names {
         let group = file.group(&format!("blocks/{name}"))?;
@@ -2722,7 +3253,7 @@ pub fn read_covariance_operator_metadata_with_byte_cap(
         checked_add_bytes(&mut topology_bytes, inspect_topology_layout(&group)?)?;
     }
     budget.charge(topology_workspace_bytes(topology_bytes)?)?;
-    validate_topology_headers(&file, &names, &metadata)?;
+    validate_topology_headers(&file, &names, &metadata, generation_registry.as_ref())?;
     Ok(metadata)
 }
 
@@ -2738,6 +3269,7 @@ pub fn read_covariance_operator_header_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
+    let generation_registry = read_generation_registry(&file, &metadata)?;
     let blocks = file.group("blocks")?;
     validate_exact_schema(
         &blocks,
@@ -2750,6 +3282,9 @@ pub fn read_covariance_operator_header_with_byte_cap(
         "covariance operator requires at least one block",
     )?;
     validate_block_links_streaming(&blocks)?;
+    if let Some(registry) = &generation_registry {
+        validate_generation_registry_block_links(&blocks, registry)?;
+    }
     Ok(metadata)
 }
 
@@ -2760,6 +3295,28 @@ pub struct CovarianceOperatorBlockRead {
     pub block: CovarianceOperatorBlock,
     /// Sum of selected-block dataset payload bytes inspected before allocation.
     pub logical_payload_bytes: u64,
+    /// Exact allocation charge accepted by the selected-block reader.
+    pub read_allocation_bytes: u64,
+}
+
+/// Bounded validation receipt for every sealed block in a parent operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovarianceSealedValidationReceipt {
+    /// Number of sealed blocks verified against their registry digests.
+    pub sealed_block_count: u64,
+    /// Maximum exact selected-block allocation across the validation pass.
+    pub maximum_block_read_bytes: u64,
+}
+
+/// Receipt for streaming one validated sealed parent block into a new writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovarianceSealedBlockCopyReceipt {
+    /// Copied deterministic block ID.
+    pub block_id: u64,
+    /// Canonical logical block digest verified at both boundaries.
+    pub block_sha256: [u8; 32],
+    /// Exact source-reader allocation charge.
+    pub source_read_bytes: u64,
 }
 
 /// Reusable reader whose block-link index is validated once at open.
@@ -2767,6 +3324,7 @@ pub struct CovarianceOperatorBlockRead {
 pub struct CovarianceOperatorBlockReader {
     file: hdf5::File,
     metadata: CovarianceOperatorMetadata,
+    generation_registry: Option<CovarianceGenerationRegistry>,
 }
 
 impl CovarianceOperatorBlockReader {
@@ -2779,6 +3337,7 @@ impl CovarianceOperatorBlockReader {
         let file = hdf5::File::open(path)?;
         let mut budget = ReadBudget::new(byte_cap);
         let metadata = read_checked_metadata(&file, &mut budget)?;
+        let generation_registry = read_generation_registry(&file, &metadata)?;
         let blocks = file.group("blocks")?;
         validate_exact_schema(
             &blocks,
@@ -2791,13 +3350,69 @@ impl CovarianceOperatorBlockReader {
             "covariance operator requires at least one block",
         )?;
         validate_block_links_streaming(&blocks)?;
-        Ok(Self { file, metadata })
+        if let Some(registry) = &generation_registry {
+            validate_generation_registry_block_links(&blocks, registry)?;
+        }
+        Ok(Self {
+            file,
+            metadata,
+            generation_registry,
+        })
     }
 
     /// Checked operator metadata loaded at open.
     #[must_use]
     pub const fn metadata(&self) -> &CovarianceOperatorMetadata {
         &self.metadata
+    }
+
+    /// Persisted NRT generation registry, absent for legacy batch artifacts.
+    #[must_use]
+    pub const fn generation_registry(&self) -> Option<&CovarianceGenerationRegistry> {
+        self.generation_registry.as_ref()
+    }
+
+    /// Stream and hash every sealed block under a per-block allocation cap.
+    ///
+    /// # Errors
+    /// Returns an error for a legacy artifact, missing/corrupt block, digest
+    /// mismatch, or a selected-block allocation above `byte_cap`.
+    pub fn validate_sealed_blocks(
+        &self,
+        byte_cap: u64,
+    ) -> Result<CovarianceSealedValidationReceipt> {
+        let registry = self
+            .generation_registry
+            .as_ref()
+            .ok_or_else(|| invalid("covariance parent has no generation registry"))?;
+        let mut sealed_block_count = 0_u64;
+        let mut maximum_block_read_bytes = 0_u64;
+        for identity in registry
+            .generations
+            .iter()
+            .filter(|identity| identity.sealed)
+        {
+            for expected in &identity.blocks {
+                let read = self.read_block_with_receipt(expected.block_id, byte_cap)?;
+                let actual = covariance_operator_block_sha256(&read.block);
+                ensure_valid(
+                    actual == expected.block_sha256,
+                    "sealed covariance generation block SHA-256 mismatch",
+                )?;
+                sealed_block_count = sealed_block_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("sealed covariance block count overflow"))?;
+                maximum_block_read_bytes = maximum_block_read_bytes.max(read.read_allocation_bytes);
+            }
+        }
+        ensure_valid(
+            sealed_block_count > 0,
+            "covariance parent has no sealed generation blocks",
+        )?;
+        Ok(CovarianceSealedValidationReceipt {
+            sealed_block_count,
+            maximum_block_read_bytes,
+        })
     }
 
     /// Read one block without rescanning the already validated block-link set.
@@ -2812,6 +3427,7 @@ impl CovarianceOperatorBlockReader {
         read_covariance_operator_block_from_file(
             &self.file,
             &self.metadata,
+            self.generation_registry.as_ref(),
             block_id,
             byte_cap,
             false,
@@ -2845,12 +3461,21 @@ pub fn read_covariance_operator_block_with_receipt(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
-    read_covariance_operator_block_from_file(&file, &metadata, block_id, byte_cap, true)
+    let generation_registry = read_generation_registry(&file, &metadata)?;
+    read_covariance_operator_block_from_file(
+        &file,
+        &metadata,
+        generation_registry.as_ref(),
+        block_id,
+        byte_cap,
+        true,
+    )
 }
 
 fn read_covariance_operator_block_from_file(
     file: &hdf5::File,
     metadata: &CovarianceOperatorMetadata,
+    generation_registry: Option<&CovarianceGenerationRegistry>,
     block_id: u64,
     byte_cap: u64,
     validate_link: bool,
@@ -2864,6 +3489,9 @@ fn read_covariance_operator_block_from_file(
         &[],
         "covariance blocks schema contains unexpected attributes",
     )?;
+    if let Some(registry) = generation_registry {
+        validate_generation_registry_block_links(&blocks, registry)?;
+    }
     let name = format!("{block_id:020}");
     budget.charge(
         u64::try_from(name.len())
@@ -2882,7 +3510,7 @@ fn read_covariance_operator_block_from_file(
     let block = read_block(&group)?;
     block.validate(metadata.gauge_date_index)?;
     let topology = CovarianceBlockTopology::from(&block);
-    validate_block_namespace(&topology, metadata)?;
+    validate_block_namespace(&topology, metadata, generation_registry)?;
     if metadata.replay_status == CovarianceReplayStatus::Replayable {
         validate_replayable_ids(&topology)?;
     }
@@ -2890,9 +3518,25 @@ fn read_covariance_operator_block_from_file(
         block.block_id == block_id,
         "covariance block group ID mismatch",
     )?;
+    if let Some(registry) = generation_registry {
+        let expected = registry
+            .identity_for_block(block_id)
+            .and_then(|identity| {
+                identity
+                    .blocks
+                    .iter()
+                    .find(|expected| expected.block_id == block_id)
+            })
+            .ok_or_else(|| invalid("covariance block is absent from generation registry"))?;
+        ensure_valid(
+            covariance_operator_block_sha256(&block) == expected.block_sha256,
+            "covariance generation block SHA-256 mismatch",
+        )?;
+    }
     Ok(CovarianceOperatorBlockRead {
         block,
         logical_payload_bytes,
+        read_allocation_bytes: budget.used,
     })
 }
 
@@ -2904,6 +3548,7 @@ pub fn read_covariance_operator_with_byte_cap(
     let file = hdf5::File::open(path)?;
     let mut budget = ReadBudget::new(byte_cap);
     let metadata = read_checked_metadata(&file, &mut budget)?;
+    let generation_registry = read_generation_registry(&file, &metadata)?;
     let names = nonempty_block_names_with_budget(&file, &mut budget)?;
     let mut payload_bytes = 0_u64;
     let mut topology_bytes = 0_u64;
@@ -2916,7 +3561,7 @@ pub fn read_covariance_operator_with_byte_cap(
     }
     budget.charge(payload_bytes)?;
     budget.charge(topology_workspace_bytes(topology_bytes)?)?;
-    validate_topology_headers(&file, &names, &metadata)?;
+    validate_topology_headers(&file, &names, &metadata, generation_registry.as_ref())?;
 
     let mut blocks = Vec::with_capacity(names.len());
     for name in names {
@@ -2954,6 +3599,7 @@ fn read_checked_metadata(
     validate_registries(file)?;
     let metadata = read_metadata(file)?;
     metadata.validate()?;
+    read_generation_registry(file, &metadata)?;
     Ok(metadata)
 }
 
@@ -3053,6 +3699,25 @@ fn validate_block_links_streaming(blocks: &Group) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn validate_generation_registry_block_links(
+    blocks: &Group,
+    registry: &CovarianceGenerationRegistry,
+) -> Result<()> {
+    let expected = registry
+        .generations
+        .iter()
+        .flat_map(|identity| identity.blocks.iter().map(|block| block.block_id))
+        .collect::<BTreeSet<_>>();
+    ensure_valid(
+        blocks.len() == expected.len() as u64,
+        "covariance generation registry block count differs from HDF5",
+    )?;
+    for block_id in expected {
+        validate_selected_block_link(blocks, &format!("{block_id:020}"))?;
+    }
+    Ok(())
 }
 
 fn validate_selected_block_link(blocks: &Group, selected: &str) -> Result<()> {
@@ -3270,7 +3935,11 @@ fn validate_topology_headers(
     file: &hdf5::File,
     names: &[String],
     metadata: &CovarianceOperatorMetadata,
+    generation_registry: Option<&CovarianceGenerationRegistry>,
 ) -> Result<()> {
+    if let Some(registry) = generation_registry {
+        validate_generation_registry_block_links(&file.group("blocks")?, registry)?;
+    }
     let mut topology = CovarianceTopologyState::default();
     for name in names {
         let group = file.group(&format!("blocks/{name}"))?;
@@ -3279,7 +3948,7 @@ fn validate_topology_headers(
             *name == format!("{:020}", entry.block_id),
             "covariance block group ID mismatch",
         )?;
-        validate_block_namespace(&entry, metadata)?;
+        validate_block_namespace(&entry, metadata, generation_registry)?;
         validate_topology_header(&entry, metadata.gauge_date_index, names.len())?;
         if metadata.replay_status == CovarianceReplayStatus::Replayable {
             validate_replayable_ids(&entry)?;
@@ -3293,16 +3962,29 @@ fn validate_topology_headers(
 fn validate_block_namespace(
     block: &CovarianceBlockTopology,
     metadata: &CovarianceOperatorMetadata,
+    generation_registry: Option<&CovarianceGenerationRegistry>,
 ) -> Result<()> {
-    ensure_valid(
-        metadata
-            .source
-            .manifest_digest
-            .as_deref()
-            .and_then(sha256_digest_bytes)
-            == Some(block.source_manifest_digest),
-        "covariance block source manifest differs from operator metadata",
-    )?;
+    match generation_registry {
+        Some(registry) => {
+            let identity = registry
+                .identity(&block.burst_id, block.generation)
+                .ok_or_else(|| invalid("covariance block generation is absent from registry"))?;
+            ensure_valid(
+                identity.source_member_manifest_digest == block.source_manifest_digest
+                    && identity.source_date_indices == block.source_date_indices,
+                "covariance block source manifest differs from generation registry",
+            )?;
+        }
+        None => ensure_valid(
+            metadata
+                .source
+                .manifest_digest
+                .as_deref()
+                .and_then(sha256_digest_bytes)
+                == Some(block.source_manifest_digest),
+            "covariance block source manifest differs from operator metadata",
+        )?,
+    }
     ensure_valid(
         metadata
             .source
@@ -3352,9 +4034,14 @@ fn read_digest_dataset(group: &Group, name: &str) -> Result<[u8; 32]> {
 }
 
 fn validate_root_schema(file: &hdf5::File) -> Result<()> {
+    let root_members = if file.link_exists("generation_identities") {
+        COVARIANCE_ROOT_MEMBERS_WITH_GENERATIONS
+    } else {
+        COVARIANCE_ROOT_MEMBERS
+    };
     validate_exact_schema(
         file,
-        Some(COVARIANCE_ROOT_MEMBERS),
+        Some(root_members),
         COVARIANCE_ROOT_ATTRIBUTES,
         "covariance root schema contains missing or unexpected members",
     )?;
@@ -3434,6 +4121,9 @@ fn inspect_metadata_layout(file: &hdf5::File) -> Result<u64> {
             &[expected_names.len()],
             &mut bytes,
         )?;
+    }
+    if file.link_exists("generation_identities") {
+        checked_add_bytes(&mut bytes, inspect_generation_registry_layout(file)?)?;
     }
     Ok(bytes)
 }
@@ -3571,6 +4261,192 @@ fn write_registries(file: &hdf5::File) -> Result<()> {
         write_string(&group, &format!("{name}_names"), &names)?;
     }
     Ok(())
+}
+
+fn write_generation_registry(
+    file: &hdf5::File,
+    registry: &CovarianceGenerationRegistry,
+) -> Result<()> {
+    let root = file.create_group("generation_identities")?;
+    write_scalar_attr(&root, "schema_version", registry.schema_version)?;
+    write_chunked_1d(
+        &root,
+        "full_source_manifest_digest",
+        &registry.full_source_manifest_digest,
+    )?;
+    for (index, identity) in registry.generations.iter().enumerate() {
+        let group = root.create_group(&format!("{index:08}"))?;
+        write_scalar_attr(&group, "generation", identity.generation)?;
+        write_scalar_attr(&group, "sealed", u8::from(identity.sealed))?;
+        write_string(&group, "burst_id", &identity.burst_id)?;
+        write_chunked_1d(&group, "source_date_indices", &identity.source_date_indices)?;
+        for (name, digest) in [
+            (
+                "source_member_manifest_digest",
+                identity.source_member_manifest_digest,
+            ),
+            (
+                "source_model_version_digest",
+                identity.source_model_version_digest,
+            ),
+            (
+                "source_model_receipt_digest",
+                identity.source_model_receipt_digest,
+            ),
+            (
+                "normalized_config_digest",
+                identity.normalized_config_digest,
+            ),
+            ("kernel_digest", identity.kernel_digest),
+            ("mask_digest", identity.mask_digest),
+        ] {
+            write_chunked_1d(&group, name, &digest)?;
+        }
+        let block_ids = identity
+            .blocks
+            .iter()
+            .map(|block| block.block_id)
+            .collect::<Vec<_>>();
+        let block_sha256 = identity
+            .blocks
+            .iter()
+            .flat_map(|block| block.block_sha256)
+            .collect::<Vec<_>>();
+        write_chunked_1d(&group, "block_ids", &block_ids)?;
+        write_chunked_1d(&group, "block_sha256", &block_sha256)?;
+    }
+    Ok(())
+}
+
+fn inspect_generation_registry_layout(file: &hdf5::File) -> Result<u64> {
+    let root = file.group("generation_identities")?;
+    validate_exact_schema(
+        &root,
+        None,
+        COVARIANCE_GENERATION_REGISTRY_ATTRIBUTES,
+        "covariance generation registry schema contains unexpected attributes",
+    )?;
+    let mut names = root.member_names()?;
+    ensure_valid(
+        names.len() >= 2
+            && names
+                .iter()
+                .any(|name| name == "full_source_manifest_digest"),
+        "covariance generation registry has no generation entries",
+    )?;
+    let mut bytes = 0_u64;
+    add_exact_dataset::<u8>(&root, "full_source_manifest_digest", &[32], &mut bytes)?;
+    names.retain(|name| name != "full_source_manifest_digest");
+    names.sort();
+    for (index, name) in names.iter().enumerate() {
+        ensure_valid(
+            *name == format!("{index:08}"),
+            "covariance generation registry entries are not canonical",
+        )?;
+        let group = root.group(name)?;
+        validate_exact_schema(
+            &group,
+            Some(COVARIANCE_GENERATION_MEMBERS),
+            COVARIANCE_GENERATION_ATTRIBUTES,
+            "covariance generation identity schema contains missing or unexpected members",
+        )?;
+        add_string_dataset(&group, "burst_id", &mut bytes)?;
+        let (dates_shape, dates_bytes) =
+            inspect_dataset::<u32>(&group, "source_date_indices", None)?;
+        ensure_valid(
+            dates_shape.len() == 1 && dates_shape[0] > 0,
+            "covariance generation source dates are not a nonempty vector",
+        )?;
+        checked_add_bytes(&mut bytes, dates_bytes)?;
+        for digest_name in [
+            "source_member_manifest_digest",
+            "source_model_version_digest",
+            "source_model_receipt_digest",
+            "normalized_config_digest",
+            "kernel_digest",
+            "mask_digest",
+        ] {
+            add_exact_dataset::<u8>(&group, digest_name, &[32], &mut bytes)?;
+        }
+        let (block_shape, block_bytes) = inspect_dataset::<u64>(&group, "block_ids", None)?;
+        ensure_valid(
+            block_shape.len() == 1 && block_shape[0] > 0,
+            "covariance generation block IDs are not a nonempty vector",
+        )?;
+        checked_add_bytes(&mut bytes, block_bytes)?;
+        add_exact_dataset::<u8>(
+            &group,
+            "block_sha256",
+            &[block_shape[0]
+                .checked_mul(32)
+                .ok_or_else(|| invalid("covariance generation block digest size overflow"))?],
+            &mut bytes,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn read_generation_registry(
+    file: &hdf5::File,
+    metadata: &CovarianceOperatorMetadata,
+) -> Result<Option<CovarianceGenerationRegistry>> {
+    if !file.link_exists("generation_identities") {
+        return Ok(None);
+    }
+    inspect_generation_registry_layout(file)?;
+    let root = file.group("generation_identities")?;
+    let mut names = root.member_names()?;
+    names.retain(|name| name != "full_source_manifest_digest");
+    names.sort();
+    let mut generations = Vec::with_capacity(names.len());
+    for name in names {
+        let group = root.group(&name)?;
+        let block_ids: Vec<u64> = group.dataset("block_ids")?.read_raw()?;
+        let block_digests: Vec<u8> = group.dataset("block_sha256")?.read_raw()?;
+        let blocks = block_ids
+            .into_iter()
+            .zip(block_digests.chunks_exact(32))
+            .map(|(block_id, digest)| {
+                Ok(CovarianceGenerationBlockIdentity {
+                    block_id,
+                    block_sha256: digest
+                        .try_into()
+                        .map_err(|_| invalid("covariance generation block SHA-256 width"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sealed = read_scalar_attr::<u8>(&group, "sealed")?;
+        ensure_valid(sealed <= 1, "covariance generation sealed flag is invalid")?;
+        generations.push(CovarianceGenerationIdentity {
+            burst_id: read_string(&group, "burst_id")?,
+            generation: read_scalar_attr(&group, "generation")?,
+            source_date_indices: group.dataset("source_date_indices")?.read_raw()?,
+            source_member_manifest_digest: read_digest_dataset(
+                &group,
+                "source_member_manifest_digest",
+            )?,
+            source_model_version_digest: read_digest_dataset(
+                &group,
+                "source_model_version_digest",
+            )?,
+            source_model_receipt_digest: read_digest_dataset(
+                &group,
+                "source_model_receipt_digest",
+            )?,
+            normalized_config_digest: read_digest_dataset(&group, "normalized_config_digest")?,
+            kernel_digest: read_digest_dataset(&group, "kernel_digest")?,
+            mask_digest: read_digest_dataset(&group, "mask_digest")?,
+            blocks,
+            sealed: sealed == 1,
+        });
+    }
+    let registry = CovarianceGenerationRegistry {
+        schema_version: read_scalar_attr(&root, "schema_version")?,
+        full_source_manifest_digest: read_digest_dataset(&root, "full_source_manifest_digest")?,
+        generations,
+    };
+    registry.validate(metadata, None)?;
+    Ok(Some(registry))
 }
 
 fn validate_registries(file: &hdf5::File) -> Result<()> {

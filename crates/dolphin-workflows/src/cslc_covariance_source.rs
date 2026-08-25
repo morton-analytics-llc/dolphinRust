@@ -197,6 +197,108 @@ impl CslcCovarianceManifest {
         Ok(())
     }
 
+    /// Verify that this manifest is the exact ordered prefix of `paths`, rehash
+    /// every prior decoded member, then capture only the appended members.
+    ///
+    /// Prior members are verified both before and after extension capture so a
+    /// concurrent mutation cannot be admitted into the returned revision.
+    ///
+    /// # Errors
+    /// Returns an error before reading any appended member when the path prefix
+    /// differs or a prior member's metadata, shape, or decoded values changed.
+    pub fn verify_prefix_and_extend(&self, paths: &[PathBuf]) -> Result<Self> {
+        anyhow::ensure!(
+            paths.len() > self.members.len()
+                && paths[..self.members.len()]
+                    .iter()
+                    .zip(&self.members)
+                    .all(|(path, member)| *path == member.path),
+            "CSLC extension does not preserve the exact ordered prefix"
+        );
+        self.verify_unchanged()?;
+        let mut members = self.members.clone();
+        for path in &paths[self.members.len()..] {
+            let shape = read_cslc_shape(path, &self.subdataset)
+                .with_context(|| format!("reading CSLC extension shape from {}", path.display()))?;
+            let fingerprint = file_fingerprint(path)?;
+            let content_digest =
+                member_content_digest(self.input_type, path, &self.subdataset, shape)
+                    .with_context(|| format!("hashing CSLC extension member {}", path.display()))?;
+            anyhow::ensure!(
+                content_digest.iter().any(|byte| *byte != 0),
+                "CSLC extension member digest is missing"
+            );
+            anyhow::ensure!(
+                file_fingerprint(path)? == fingerprint,
+                "CSLC extension member changed during manifest capture"
+            );
+            members.push(CslcMemberIdentity {
+                path: path.clone(),
+                shape,
+                content_digest,
+                file_fingerprint: fingerprint,
+            });
+        }
+        self.verify_unchanged()?;
+        let digest = manifest_digest(self.input_type, &self.subdataset, &members);
+        let resource_estimate = manifest_resource_estimate(&members)?;
+        let extended = Self {
+            input_type: self.input_type,
+            subdataset: self.subdataset.clone(),
+            members,
+            digest,
+            resource_estimate,
+        };
+        extended.verify_unchanged()?;
+        Ok(extended)
+    }
+
+    /// Exact ordered member receipt for one burst-local sequential generation.
+    ///
+    /// # Errors
+    /// Returns an error for an empty burst, empty generation, repeated/out-of-order
+    /// member indices, or an index outside this revision.
+    pub fn generation_member_manifest_digest(
+        &self,
+        member_indices: &[usize],
+        burst_id: &str,
+        generation: u32,
+    ) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            !burst_id.is_empty(),
+            "CSLC generation burst identity is empty"
+        );
+        anyhow::ensure!(
+            !member_indices.is_empty()
+                && member_indices
+                    .windows(2)
+                    .all(|pair| pair[0].checked_add(1) == Some(pair[1])),
+            "CSLC generation member indices must be nonempty and consecutive"
+        );
+        let mut digest = Sha256::new();
+        digest.update(b"dolphinrust:cslc_generation_member_manifest:v1");
+        digest.update(input_type_tag(self.input_type));
+        digest.update((self.subdataset.len() as u64).to_le_bytes());
+        digest.update(self.subdataset.as_bytes());
+        digest.update((burst_id.len() as u64).to_le_bytes());
+        digest.update(burst_id.as_bytes());
+        digest.update(generation.to_le_bytes());
+        digest.update((member_indices.len() as u64).to_le_bytes());
+        for &index in member_indices {
+            let member = self.members.get(index).with_context(|| {
+                format!("CSLC generation member index {index} is outside the manifest")
+            })?;
+            let path = member.path.as_os_str().as_encoded_bytes();
+            digest.update((index as u64).to_le_bytes());
+            digest.update((path.len() as u64).to_le_bytes());
+            digest.update(path);
+            digest.update((member.shape.0 as u64).to_le_bytes());
+            digest.update((member.shape.1 as u64).to_le_bytes());
+            digest.update(member.content_digest);
+        }
+        Ok(digest.finalize().into())
+    }
+
     /// Build a resolver for one burst and one captured native tile.
     ///
     /// `member_indices` are burst-local date order into this immutable manifest.
@@ -208,6 +310,73 @@ impl CslcCovarianceManifest {
         &self,
         member_indices: &[usize],
         burst_id: impl Into<String>,
+        processed_origin: (usize, usize),
+        processed_shape: (usize, usize),
+        tile_grid: CovarianceOperatorGrid,
+        options: &EmpiricalSourceFactorOptions,
+        source_model_version_digest: [u8; 32],
+        validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
+    ) -> Result<CslcCovarianceSourceResolver<'a>> {
+        self.resolver_with_manifest_digest(
+            member_indices,
+            burst_id.into(),
+            self.digest,
+            processed_origin,
+            processed_shape,
+            tile_grid,
+            options,
+            source_model_version_digest,
+            validity_reader,
+        )
+    }
+
+    /// Build a resolver over the full burst-local `member_indices` whose replay
+    /// namespace is the exact `generation_member_indices` receipt while retaining
+    /// the complete revision identity. Keeping the full burst-local member list
+    /// preserves global acquisition offsets for later generations.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid generation receipt, member, grid, or
+    /// factor configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolver_for_generation<'a>(
+        &self,
+        member_indices: &[usize],
+        generation_member_indices: &[usize],
+        burst_id: impl Into<String>,
+        generation: u32,
+        processed_origin: (usize, usize),
+        processed_shape: (usize, usize),
+        tile_grid: CovarianceOperatorGrid,
+        options: &EmpiricalSourceFactorOptions,
+        source_model_version_digest: [u8; 32],
+        validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
+    ) -> Result<CslcCovarianceSourceResolver<'a>> {
+        let burst_id = burst_id.into();
+        let generation_digest = self.generation_member_manifest_digest(
+            generation_member_indices,
+            &burst_id,
+            generation,
+        )?;
+        self.resolver_with_manifest_digest(
+            member_indices,
+            burst_id,
+            generation_digest,
+            processed_origin,
+            processed_shape,
+            tile_grid,
+            options,
+            source_model_version_digest,
+            validity_reader,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolver_with_manifest_digest<'a>(
+        &self,
+        member_indices: &[usize],
+        burst_id: String,
+        source_manifest_digest: [u8; 32],
         processed_origin: (usize, usize),
         processed_shape: (usize, usize),
         tile_grid: CovarianceOperatorGrid,
@@ -248,7 +417,7 @@ impl CslcCovarianceManifest {
         let factor_config = empirical_factor_config(options)?;
         let source_model_hash = *factor_config.config_digest();
         let identity = SequentialSourceProviderIdentity {
-            source_manifest_digest: self.digest,
+            source_manifest_digest,
             provider: CSLC_COVARIANCE_SOURCE_PROVIDER.to_owned(),
             provider_version: CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned(),
             model: CSLC_COVARIANCE_SOURCE_MODEL.to_owned(),
@@ -260,12 +429,13 @@ impl CslcCovarianceManifest {
             input_type: self.input_type,
             subdataset: self.subdataset.clone(),
             members,
-            burst_id: burst_id.into(),
+            burst_id,
             native_origin: (0, 0),
             native_shape,
             tile_grid,
             factor_config,
             identity,
+            full_revision_manifest_digest: self.digest,
             validity_reader,
             tile_cache: None,
             metrics: CslcCovarianceResolverMetrics::default(),
@@ -306,6 +476,7 @@ pub struct CslcCovarianceSourceResolver<'a> {
     tile_grid: CovarianceOperatorGrid,
     factor_config: EmpiricalProperComplexConfig,
     identity: SequentialSourceProviderIdentity,
+    full_revision_manifest_digest: [u8; 32],
     validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
     tile_cache: Option<CslcSourceTileCache>,
     metrics: CslcCovarianceResolverMetrics,
@@ -317,6 +488,18 @@ impl CslcCovarianceSourceResolver<'_> {
     #[must_use]
     pub const fn source_identity(&self) -> &SequentialSourceProviderIdentity {
         &self.identity
+    }
+
+    /// Generation-member manifest digest used by replay IDs.
+    #[must_use]
+    pub const fn generation_manifest_digest(&self) -> [u8; 32] {
+        self.identity.source_manifest_digest
+    }
+
+    /// Full ordered manifest digest for the complete artifact revision.
+    #[must_use]
+    pub const fn full_revision_manifest_digest(&self) -> [u8; 32] {
+        self.full_revision_manifest_digest
     }
 
     /// Physical-read and cache high-water evidence.

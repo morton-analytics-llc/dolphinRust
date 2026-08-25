@@ -3,6 +3,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use dolphin_io::covariance::{
+    covariance_operator_block_sha256, CovarianceGenerationBlockIdentity,
+    CovarianceGenerationIdentity, CovarianceGenerationRegistry,
+    COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+};
 use dolphin_io::{
     covariance_source_model_identity_digest, read_covariance_operator,
     read_covariance_operator_block, read_covariance_operator_block_with_receipt,
@@ -366,6 +371,77 @@ fn overlapping_tile_root(tile_row: u64, tile_col: u64, block_id: u64) -> Covaria
         eigen_gap: vec![0.5; area],
         status: vec![CovarianceOperatorStatus::Valid; area],
     }
+}
+
+fn generation_registry(
+    full_manifest_digest: [u8; 32],
+    blocks: &[CovarianceOperatorBlock],
+    sealed_generations: &[u32],
+) -> CovarianceGenerationRegistry {
+    let mut generations = BTreeMap::<(String, u32), Vec<&CovarianceOperatorBlock>>::new();
+    for block in blocks {
+        generations
+            .entry((block.burst_id.clone(), block.generation))
+            .or_default()
+            .push(block);
+    }
+    CovarianceGenerationRegistry {
+        schema_version: COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+        full_source_manifest_digest: full_manifest_digest,
+        generations: generations
+            .into_iter()
+            .map(
+                |((burst_id, generation), blocks)| CovarianceGenerationIdentity {
+                    burst_id,
+                    generation,
+                    source_date_indices: blocks[0].source_date_indices.clone(),
+                    source_member_manifest_digest: blocks[0].source_manifest_digest,
+                    source_model_version_digest: blocks[0].source_model_version_digest,
+                    source_model_receipt_digest: [4; 32],
+                    normalized_config_digest: [1; 32],
+                    kernel_digest: [2; 32],
+                    mask_digest: [5; 32],
+                    blocks: blocks
+                        .into_iter()
+                        .map(|block| CovarianceGenerationBlockIdentity {
+                            block_id: block.block_id,
+                            block_sha256: covariance_operator_block_sha256(block),
+                        })
+                        .collect(),
+                    sealed: sealed_generations.contains(&generation),
+                },
+            )
+            .collect(),
+    }
+}
+
+fn generation_namespaced_chain() -> Vec<CovarianceOperatorBlock> {
+    let mut blocks = block_chain();
+    let model_digest = blocks[0].source_model_version_digest;
+    let mut parents = Vec::new();
+    for block in &mut blocks {
+        block.source_manifest_digest = [10 + block.generation as u8; 32];
+        block.block_id = dolphin_io::covariance_record_block_id(
+            &block.burst_id,
+            block.source_manifest_digest,
+            model_digest,
+            block.generation,
+            block.native_grid,
+            block.output_grid,
+            block.owned_output_grid,
+        );
+        block.carry_parent_ids = parents.clone();
+        for (component, parent) in block
+            .phase_components
+            .iter_mut()
+            .filter(|component| component.kind == CovariancePhaseComponentKind::CompressedParent)
+            .zip(&parents)
+        {
+            component.id = *parent;
+        }
+        parents.push(block.block_id);
+    }
+    blocks
 }
 
 fn write_artifact(path: &PathBuf, blocks: &[CovarianceOperatorBlock]) {
@@ -1260,4 +1336,217 @@ fn covariance_operator_writer_rejects_unknown_schema_and_method_versions() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("SHA-256"), "{error}");
+}
+
+#[test]
+fn sealed_generation_registry_survives_append_and_capped_copy() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let blocks = generation_namespaced_chain();
+    let parent_blocks = &blocks[..2];
+    let mut parent_metadata = metadata();
+    parent_metadata.source.manifest_digest = Some(digest(90));
+    let mut parent_plan = plan_for_blocks(parent_blocks);
+    parent_plan.source_manifest_digest = [90; 32];
+    let parent_registry = generation_registry([90; 32], parent_blocks, &[0]);
+    let parent_path = temporary_hdf5_path();
+    let mut parent_writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &parent_path,
+        &parent_metadata,
+        &parent_plan,
+        &parent_registry,
+    )
+    .unwrap();
+    for block in parent_blocks {
+        parent_writer.write_block(block).unwrap();
+    }
+    parent_writer.finish().unwrap();
+
+    let parent_reader =
+        dolphin_io::CovarianceOperatorBlockReader::open(&parent_path, u64::MAX).unwrap();
+    assert_eq!(parent_reader.generation_registry(), Some(&parent_registry));
+    let validation = parent_reader.validate_sealed_blocks(u64::MAX).unwrap();
+    parent_reader
+        .validate_sealed_blocks(validation.maximum_block_read_bytes)
+        .unwrap();
+    assert!(parent_reader
+        .validate_sealed_blocks(validation.maximum_block_read_bytes - 1)
+        .is_err());
+
+    let mut extended_metadata = metadata();
+    extended_metadata.source.manifest_digest = Some(digest(91));
+    let mut extended_plan = plan_for_blocks(&blocks);
+    extended_plan.source_manifest_digest = [91; 32];
+    let extended_registry = generation_registry([91; 32], &blocks, &[0]);
+    let extended_path = temporary_hdf5_path();
+    let mut writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &extended_path,
+        &extended_metadata,
+        &extended_plan,
+        &extended_registry,
+    )
+    .unwrap();
+    let copied = writer
+        .copy_validated_sealed_block(&parent_reader, blocks[0].block_id, u64::MAX)
+        .unwrap();
+    assert!(copied.source_read_bytes > 0);
+    assert_eq!(
+        copied.block_sha256,
+        covariance_operator_block_sha256(&blocks[0])
+    );
+    for block in &blocks[1..] {
+        writer.write_block(block).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let copied_block =
+        read_covariance_operator_block(&extended_path, blocks[0].block_id, u64::MAX).unwrap();
+    assert_eq!(copied_block, blocks[0]);
+    assert_eq!(
+        covariance_operator_block_sha256(&copied_block),
+        covariance_operator_block_sha256(&blocks[0])
+    );
+    let _ = std::fs::remove_file(parent_path);
+    let _ = std::fs::remove_file(extended_path);
+}
+
+#[test]
+fn generation_registry_drift_fails_before_scratch_creation() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let blocks = generation_namespaced_chain();
+    let mut operator_metadata = metadata();
+    operator_metadata.source.manifest_digest = Some(digest(90));
+    let mut plan = plan_for_blocks(&blocks);
+    plan.source_manifest_digest = [90; 32];
+    let base = generation_registry([90; 32], &blocks, &[0]);
+    for label in ["config", "kernel", "model", "mask"] {
+        let mut changed = base.clone();
+        match label {
+            "config" => changed.generations[0].normalized_config_digest = [9; 32],
+            "kernel" => changed.generations[0].kernel_digest = [9; 32],
+            "model" => changed.generations[0].source_model_receipt_digest = [9; 32],
+            "mask" => changed.generations[0].mask_digest = [0; 32],
+            _ => unreachable!(),
+        }
+        let path = std::env::temp_dir().join(format!(
+            "dolphin-generation-registry-{label}-{}-{}.h5",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ));
+        let error = CovarianceOperatorWriter::create_with_generation_registry(
+            &path,
+            &operator_metadata,
+            &plan,
+            &changed,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(label), "{label}: {error}");
+        assert!(!path.exists(), "{label} drift created a scratch artifact");
+    }
+    let mut unknown_schema = base;
+    unknown_schema.schema_version += 1;
+    let path = temporary_hdf5_path();
+    let error = CovarianceOperatorWriter::create_with_generation_registry(
+        &path,
+        &operator_metadata,
+        &plan,
+        &unknown_schema,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("schema version"), "{error}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn sealed_generation_content_corruption_fails_closed() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let blocks = generation_namespaced_chain();
+    let mut operator_metadata = metadata();
+    operator_metadata.source.manifest_digest = Some(digest(90));
+    let mut plan = plan_for_blocks(&blocks);
+    plan.source_manifest_digest = [90; 32];
+    let registry = generation_registry([90; 32], &blocks, &[0]);
+    let path = temporary_hdf5_path();
+    let mut writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &path,
+        &operator_metadata,
+        &plan,
+        &registry,
+    )
+    .unwrap();
+    for block in &blocks {
+        writer.write_block(block).unwrap();
+    }
+    writer.finish().unwrap();
+    let file = hdf5::File::open_rw(&path).unwrap();
+    let dataset = file
+        .dataset(&format!("blocks/{:020}/mean_amplitude", blocks[0].block_id))
+        .unwrap();
+    let mut values: Vec<f64> = dataset.read_raw().unwrap();
+    values[0] += 1.0;
+    dataset.write_raw(&values).unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+
+    let reader = dolphin_io::CovarianceOperatorBlockReader::open(&path, u64::MAX).unwrap();
+    let error = reader.validate_sealed_blocks(u64::MAX).unwrap_err();
+    assert!(error.to_string().contains("SHA-256"), "{error}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn missing_sealed_generation_block_fails_at_parent_open() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let blocks = generation_namespaced_chain();
+    let mut operator_metadata = metadata();
+    operator_metadata.source.manifest_digest = Some(digest(90));
+    let mut plan = plan_for_blocks(&blocks);
+    plan.source_manifest_digest = [90; 32];
+    let registry = generation_registry([90; 32], &blocks, &[0]);
+    let path = temporary_hdf5_path();
+    let mut writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &path,
+        &operator_metadata,
+        &plan,
+        &registry,
+    )
+    .unwrap();
+    for block in &blocks {
+        writer.write_block(block).unwrap();
+    }
+    writer.finish().unwrap();
+    let file = hdf5::File::open_rw(&path).unwrap();
+    file.group("blocks")
+        .unwrap()
+        .unlink(&format!("{:020}", blocks[0].block_id))
+        .unwrap();
+    file.flush().unwrap();
+    file.close().unwrap();
+    let error = dolphin_io::CovarianceOperatorBlockReader::open(&path, u64::MAX).unwrap_err();
+    assert!(error.to_string().contains("block count"), "{error}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn legacy_operator_has_explicitly_absent_generation_registry() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = temporary_hdf5_path();
+    write_artifact(&path, &block_chain());
+    let reader = dolphin_io::CovarianceOperatorBlockReader::open(&path, u64::MAX).unwrap();
+    assert!(reader.generation_registry().is_none());
+    let error = reader.validate_sealed_blocks(u64::MAX).unwrap_err();
+    assert!(
+        error.to_string().contains("no generation registry"),
+        "{error}"
+    );
+    let _ = std::fs::remove_file(path);
 }
