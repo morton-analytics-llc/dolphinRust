@@ -454,7 +454,7 @@ def run_production_temporal_estimator(
     if (
         not isinstance(binding, Mapping)
         or binding.get("binary") != "temporal_covariance_batch"
-        or binding.get("schema") != "dolphinrust-temporal-covariance-batch/4"
+        or binding.get("schema") != "dolphinrust-temporal-covariance-batch/6"
         or binding.get("execution_path") != "fixed_factor"
         or binding.get("method") != "complete_refit_bootstrap"
         or binding.get("method_version") != 1
@@ -505,7 +505,7 @@ def run_production_temporal_estimator(
         raise ValueError("production temporal estimator output is invalid") from error
     fit = response.get("fit") if isinstance(response, Mapping) else None
     if (
-        response.get("schema") != "dolphinrust-temporal-covariance-batch/4"
+        response.get("schema") != "dolphinrust-temporal-covariance-batch/6"
         or response.get("execution_path") != "fixed_factor"
         or response.get("fixed_factor_status") != "evaluated"
         or response.get("emitted") is not True

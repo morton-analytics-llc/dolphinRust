@@ -160,7 +160,7 @@
   },
   "estimator_binding": {
     "binary": "temporal_covariance_batch",
-    "schema": "dolphinrust-temporal-covariance-batch/4",
+    "schema": "dolphinrust-temporal-covariance-batch/6",
     "execution_path": "fixed_factor",
     "method": "complete_refit_bootstrap",
     "method_version": 1,

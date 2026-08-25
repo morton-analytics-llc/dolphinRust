@@ -518,7 +518,7 @@ fit={"status":"evaluated","bootstrap_attempts":200,"bootstrap_successes":200,
 "complete_refit_bootstrap":{"status":"evaluated","point_estimate":0.01,
 "standard_error_diagnostic":0.002,"attempted_replicates":200,"successful_replicates":200},
 "conditional_wls":{"status":"evaluated","standard_error_diagnostic":0.001}}
-print(json.dumps({"schema":"dolphinrust-temporal-covariance-batch/4",
+print(json.dumps({"schema":"dolphinrust-temporal-covariance-batch/6",
 "execution_path":"fixed_factor","fixed_factor_status":"evaluated","emitted":True,
 "failed":False,"fit":fit,"resource":{"wall_micros":1,"resident_set_bytes_before":1,
 "resident_set_bytes_after":1}}))
