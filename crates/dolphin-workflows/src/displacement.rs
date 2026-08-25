@@ -1205,12 +1205,8 @@ fn emit_displacement(
                         spatial.corrections.los_geometry.is_some(),
                         "corrected temporal inference requires a completed fixed-cube receipt"
                     );
-                    let displacement_rasters = (0..days.len())
-                        .map(|date| {
-                            cfg.work_directory
-                                .join(format!("displacement_{date:02}.tif"))
-                        })
-                        .collect::<Vec<_>>();
+                    let displacement_rasters =
+                        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
                     crate::temporal_covariance_product::write_temporal_covariance_products(
                         &cfg.work_directory,
                         &displacement_rasters,
@@ -1266,6 +1262,18 @@ fn emit_displacement(
         los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
+}
+
+fn temporal_product_displacement_rasters(
+    directory: &Path,
+    acquisition_count: usize,
+) -> Result<Vec<PathBuf>> {
+    let persisted_count = acquisition_count
+        .checked_sub(1)
+        .context("temporal inference requires a gauge acquisition")?;
+    Ok((0..persisted_count)
+        .map(|date| directory.join(format!("displacement_{date:02}.tif")))
+        .collect())
 }
 
 fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenance {
@@ -4664,6 +4672,21 @@ mod tests {
     use super::*;
     use dolphin_core::config::{CompressedSlcPlan, InterferogramNetwork, ShpMethod};
     use dolphin_core::{HalfWindow, Strides};
+
+    #[test]
+    fn temporal_product_uses_only_persisted_post_gauge_displacement_names() {
+        let directory = Path::new("/tmp/dolphin-temporal-product-contract");
+        let paths = temporal_product_displacement_rasters(directory, 4).unwrap();
+        assert_eq!(
+            paths,
+            [
+                directory.join("displacement_00.tif"),
+                directory.join("displacement_01.tif"),
+                directory.join("displacement_02.tif"),
+            ]
+        );
+        assert!(temporal_product_displacement_rasters(directory, 0).is_err());
+    }
 
     fn run_isolated_hdf5_test(name: &str) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())

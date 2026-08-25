@@ -68,13 +68,14 @@ const PRODUCT_SOURCE_BYTES: &[u8] = include_bytes!("temporal_covariance_product.
 const FIXED_CUBE_SOURCE_BYTES: &[u8] = include_bytes!("fixed_cube.rs");
 
 /// A promotion authorization that cannot be constructed outside this module.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemporalCovariancePromotion {
     manifest_sha256: String,
     review_sha256: String,
     synthetic_sha256: String,
     heldout_sha256: String,
     spatial_manifest_sha256: String,
+    spatial_factor_sha256: String,
 }
 
 /// Persisted identities of one completed corrected product bundle.
@@ -213,6 +214,7 @@ pub fn validate_temporal_covariance_promotion(
         synthetic_sha256: expected.synthetic_result_sha256,
         heldout_sha256: expected.heldout_result_sha256,
         spatial_manifest_sha256,
+        spatial_factor_sha256: expected.spatial_factor_sha256,
     })
 }
 
@@ -378,11 +380,15 @@ pub fn write_temporal_covariance_products(
         .factor_directory
         .as_deref()
         .context("temporal uncertainty factor directory is missing")?;
+    ensure_same_run_factor_directory(output_directory, factor_directory)?;
     let promotion = validate_temporal_covariance_promotion(evidence_directory, factor_directory)?;
     validate_no_existing_products(output_directory)?;
     ensure!(
-        displacement_rasters.len() == acquisition_days.len(),
-        "displacement raster count differs from acquisition-day count"
+        displacement_rasters
+            .len()
+            .checked_add(1)
+            .is_some_and(|count| count == acquisition_days.len()),
+        "post-gauge displacement raster count must equal acquisition-day count minus one"
     );
     let velocity_path = output_directory.join("velocity.tif");
     let legacy_velocity_before = sha256_file(&velocity_path)?;
@@ -423,6 +429,42 @@ fn write_product_transaction(
     factor_directory: &Path,
     promotion: &TemporalCovariancePromotion,
 ) -> Result<TemporalCovarianceProductReceipt> {
+    ensure_same_run_factor_directory(output_directory, factor_directory)?;
+    let evidence_directory = config
+        .evidence_directory
+        .as_deref()
+        .context("temporal uncertainty evidence directory is missing")?;
+    write_product_transaction_with_validator(
+        output_directory,
+        displacement_rasters,
+        acquisition_days,
+        config,
+        factor_directory,
+        promotion,
+        || validate_temporal_covariance_promotion(evidence_directory, factor_directory),
+    )
+}
+
+fn ensure_same_run_factor_directory(
+    output_directory: &Path,
+    factor_directory: &Path,
+) -> Result<()> {
+    ensure!(
+        std::fs::canonicalize(output_directory)? == std::fs::canonicalize(factor_directory)?,
+        "temporal inference requires the run-specific #54 factor from the output directory"
+    );
+    Ok(())
+}
+
+fn write_product_transaction_with_validator(
+    output_directory: &Path,
+    displacement_rasters: &[PathBuf],
+    acquisition_days: &[f64],
+    config: &TemporalUncertaintyOptions,
+    factor_directory: &Path,
+    promotion: &TemporalCovariancePromotion,
+    revalidate: impl FnOnce() -> Result<TemporalCovariancePromotion>,
+) -> Result<TemporalCovarianceProductReceipt> {
     let scope = prepare_product_scope(
         output_directory,
         displacement_rasters,
@@ -445,6 +487,14 @@ fn write_product_transaction(
             input_raster_receipts(displacement_rasters)? == scope.input_receipts,
             "displacement rasters changed during temporal inference"
         );
+        ensure!(
+            revalidate()? == *promotion,
+            "temporal promotion or factor evidence changed during product generation"
+        );
+        ensure!(
+            input_raster_receipts(&scope.fixed_cube_paths)? == scope.fixed_cube_inputs,
+            "fixed-cube inputs changed during temporal inference"
+        );
         finalize_layers(&stage, &mut layers)?;
         publish_product_receipt(output_directory, &stage, acquisition_days, scope, promotion)
     })();
@@ -458,6 +508,8 @@ struct ProductScope {
     velocity_header: dolphin_io::RasterHeader,
     velocity_unit: String,
     input_receipts: Vec<InputRasterReceipt>,
+    fixed_cube_paths: Vec<PathBuf>,
+    fixed_cube_inputs: Vec<InputRasterReceipt>,
 }
 
 fn prepare_product_scope(
@@ -505,18 +557,22 @@ fn prepare_product_scope(
             && usize::try_from(full_grid.cols).ok() == Some(velocity_header.shape.1),
         "factor full grid differs from displacement raster shape"
     );
-    validate_fixed_cube_scope(
+    let fixed_cube = validate_fixed_cube_scope(
         output_directory,
         acquisition_days,
         &velocity_header,
         &factor_metadata,
     )?;
+    let fixed_cube_paths = fixed_cube_input_paths(output_directory, &fixed_cube);
+    let fixed_cube_inputs = input_raster_receipts(&fixed_cube_paths)?;
     Ok(ProductScope {
         factor_path,
         factor_metadata,
         velocity_header,
         velocity_unit,
         input_receipts: input_raster_receipts(displacement_rasters)?,
+        fixed_cube_paths,
+        fixed_cube_inputs,
     })
 }
 
@@ -611,7 +667,7 @@ fn validate_fixed_cube_scope(
     acquisition_days: &[f64],
     header: &dolphin_io::RasterHeader,
     factor: &dolphin_io::SpatialReferenceCovarianceMetadata,
-) -> Result<()> {
+) -> Result<crate::fixed_cube::FixedCubeReceipt> {
     let bytes = read_bounded(&directory.join("fixed_cube_receipt.json"), 1024 * 1024)?;
     let receipt: crate::fixed_cube::FixedCubeReceipt = serde_json::from_slice(&bytes)?;
     let reference_row = factor
@@ -642,10 +698,40 @@ fn validate_fixed_cube_scope(
             && receipt.geotransform == header.geotransform
             && receipt.epsg == header.epsg
             && receipt.reference_point == Some(reference)
-            && receipt.velocity_raster == "velocity.tif",
+            && receipt.velocity_raster == "velocity.tif"
+            && receipt
+                .velocity_sigma_raster
+                .as_deref()
+                .is_none_or(|name| name == "velocity_sigma.tif")
+            && receipt.validity_mask_raster == "velocity_validity_mask.tif"
+            && receipt.geometry_provenance == "geometry_provenance.json"
+            && receipt.geometry_source == "CSLC-S1-STATIC"
+            && receipt.los_rasters
+                == [
+                    "los_east.tif".to_owned(),
+                    "los_north.tif".to_owned(),
+                    "los_up.tif".to_owned(),
+                ],
         "fixed-cube receipt does not match the factor and displacement scope"
     );
-    Ok(())
+    Ok(receipt)
+}
+
+fn fixed_cube_input_paths(
+    directory: &Path,
+    receipt: &crate::fixed_cube::FixedCubeReceipt,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
+        directory.join("fixed_cube_receipt.json"),
+        directory.join(&receipt.velocity_raster),
+        directory.join(&receipt.validity_mask_raster),
+        directory.join(&receipt.geometry_provenance),
+    ];
+    if let Some(sigma) = &receipt.velocity_sigma_raster {
+        paths.push(directory.join(sigma));
+    }
+    paths.extend(receipt.los_rasters.iter().map(|name| directory.join(name)));
+    paths
 }
 
 struct ProductLayer {
@@ -757,7 +843,10 @@ fn evaluate_block(
     );
     let target_count = shape.0 * shape.1;
     ensure!(
-        observations.len() == acquisition_days.len()
+        observations
+            .len()
+            .checked_add(1)
+            .is_some_and(|count| count == acquisition_days.len())
             && observations.iter().all(|values| values.dim() == shape),
         "displacement windows differ from factor block"
     );
@@ -782,10 +871,13 @@ fn evaluate_block(
         )?;
         let row = target / shape.1;
         let col = target % shape.1;
-        let series = observations
-            .iter()
-            .map(|values| f64::from(values[(row, col)]))
-            .collect::<Vec<_>>();
+        let mut series = Vec::with_capacity(acquisition_days.len());
+        series.push(0.0);
+        series.extend(
+            observations
+                .iter()
+                .map(|values| f64::from(values[(row, col)])),
+        );
         let fit = fit_temporal_covariance(acquisition_days, &series, &covariance, options);
         let selected = complete_refit_bootstrap_estimate(&fit, options);
         write_target_diagnostics(&mut output, target, &selected)?;
@@ -992,6 +1084,7 @@ struct TemporalInferenceProvenance<'a> {
     acquisition_days: &'a [f64],
     acquisition_days_sha256: String,
     displacement_rasters: Vec<InputRasterReceipt>,
+    fixed_cube_inputs: Vec<InputRasterReceipt>,
     rows: usize,
     cols: usize,
     geotransform: [f64; 6],
@@ -1059,6 +1152,7 @@ impl<'a> TemporalInferenceProvenance<'a> {
             acquisition_days: days,
             acquisition_days_sha256: sha256(&day_bytes),
             displacement_rasters: scope.input_receipts.clone(),
+            fixed_cube_inputs: scope.fixed_cube_inputs.clone(),
             rows: header.shape.0,
             cols: header.shape.1,
             geotransform: header.geotransform,
@@ -1194,11 +1288,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        output_window, reconstruct_covariance, validate_heldout_result, validate_manifest,
-        validate_review, validate_synthetic_result, write_product_transaction, EvidenceDigests,
-        HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
-        TemporalPromotionManifest, TemporalReviewReceipt, PRODUCT_LAYERS, PROMOTION_SCHEMA,
-        REVIEW_SCHEMA, SYNTHETIC_SCHEMA,
+        ensure_same_run_factor_directory, output_window, reconstruct_covariance,
+        validate_heldout_result, validate_manifest, validate_review, validate_synthetic_result,
+        write_product_transaction_with_validator, EvidenceDigests, HeldoutLevel, HeldoutResult,
+        SyntheticResult, SyntheticScores, TemporalCovariancePromotion, TemporalPromotionManifest,
+        TemporalReviewReceipt, PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -1249,6 +1343,22 @@ mod tests {
         let window = output_window(target, full).unwrap();
         assert_eq!((window.row_start, window.row_stop), (2, 5));
         assert_eq!((window.col_start, window.col_stop), (3, 7));
+    }
+
+    #[test]
+    fn rejects_cross_run_factor_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "dolphin_temporal_factor_scope_{}",
+            std::process::id()
+        ));
+        let output = root.join("output");
+        let foreign = root.join("foreign");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        ensure_same_run_factor_directory(&output, &output).unwrap();
+        assert!(ensure_same_run_factor_directory(&output, &foreign).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1367,8 +1477,18 @@ mod tests {
         )
         .unwrap();
         let legacy_before = std::fs::read(directory.join("velocity.tif")).unwrap();
+        write_raster(
+            &directory.join("velocity_sigma.tif"),
+            Array2::from_elem((2, 1), 0.25_f32).view(),
+            geotransform,
+            Some(32611),
+            None,
+        )
+        .unwrap();
+        let legacy_sigma_before = std::fs::read(directory.join("velocity_sigma.tif")).unwrap();
         let displacement_rasters = days
             .iter()
+            .skip(1)
             .enumerate()
             .map(|(date, _)| {
                 let path = directory.join(format!("displacement_{date:02}.tif"));
@@ -1396,12 +1516,17 @@ mod tests {
             &workflow,
             &days,
             crate::displacement::VelocityEstimator::LinearPostGaugeUnitPrecision,
-            false,
+            true,
             Array2::from_elem((2, 1), true).view(),
             &geometry,
             Some((0, 0)),
             Some(32611),
             geotransform,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("geometry_provenance.json"),
+            br#"{"schema":"test_geometry_provenance"}"#,
         )
         .unwrap();
         let promotion = TemporalCovariancePromotion {
@@ -1410,6 +1535,7 @@ mod tests {
             synthetic_sha256: "33".repeat(32),
             heldout_sha256: "44".repeat(32),
             spatial_manifest_sha256: "55".repeat(32),
+            spatial_factor_sha256: "66".repeat(32),
         };
         let config = TemporalUncertaintyOptions {
             method: TemporalUncertaintyMethod::CompleteRefitBootstrap,
@@ -1421,13 +1547,14 @@ mod tests {
         };
         let mut rejected = config.clone();
         rejected.maximum_targets_per_block = 1;
-        assert!(write_product_transaction(
+        assert!(write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
             &days,
             &rejected,
             &directory,
             &promotion,
+            || Ok(promotion.clone()),
         )
         .is_err());
         assert!(!directory
@@ -1441,18 +1568,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(conditional.inference_status, "conditional_only");
-        let receipt = write_product_transaction(
+        let mut changed_promotion = promotion.clone();
+        changed_promotion.spatial_factor_sha256 = "77".repeat(32);
+        assert!(write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
             &days,
             &config,
             &directory,
             &promotion,
+            || Ok(changed_promotion),
+        )
+        .is_err());
+        assert!(!directory
+            .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
+            .exists());
+        assert!(PRODUCT_LAYERS
+            .iter()
+            .all(|(name, _)| !directory.join(name).exists()));
+        let geometry_path = directory.join("geometry_provenance.json");
+        let geometry_before = std::fs::read(&geometry_path).unwrap();
+        assert!(write_product_transaction_with_validator(
+            &directory,
+            &displacement_rasters,
+            &days,
+            &config,
+            &directory,
+            &promotion,
+            || {
+                std::fs::write(
+                    &geometry_path,
+                    br#"{"schema":"tampered_geometry_provenance"}"#,
+                )?;
+                Ok(promotion.clone())
+            },
+        )
+        .is_err());
+        assert!(PRODUCT_LAYERS
+            .iter()
+            .all(|(name, _)| !directory.join(name).exists()));
+        assert!(!directory
+            .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
+            .exists());
+        std::fs::write(&geometry_path, geometry_before).unwrap();
+        let receipt = write_product_transaction_with_validator(
+            &directory,
+            &displacement_rasters,
+            &days,
+            &config,
+            &directory,
+            &promotion,
+            || Ok(promotion.clone()),
         )
         .unwrap();
         assert_eq!(
             std::fs::read(directory.join("velocity.tif")).unwrap(),
             legacy_before
+        );
+        assert_eq!(
+            std::fs::read(directory.join("velocity_sigma.tif")).unwrap(),
+            legacy_sigma_before
         );
         for (name, _) in PRODUCT_LAYERS {
             assert!(directory.join(name).exists(), "missing {name}");
@@ -1460,6 +1635,35 @@ mod tests {
         assert!(directory
             .join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)
             .exists());
+        let provenance: Value = serde_json::from_slice(
+            &std::fs::read(directory.join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        let fixed_cube_inputs = provenance["fixed_cube_inputs"].as_array().unwrap();
+        assert_eq!(fixed_cube_inputs.len(), 8);
+        let fixed_cube_names = fixed_cube_inputs
+            .iter()
+            .map(|entry| {
+                std::path::Path::new(entry["path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fixed_cube_names,
+            [
+                "fixed_cube_receipt.json",
+                "velocity.tif",
+                "velocity_validity_mask.tif",
+                "geometry_provenance.json",
+                "velocity_sigma.tif",
+                "los_east.tif",
+                "los_north.tif",
+                "los_up.tif",
+            ]
+        );
         let fixed: crate::fixed_cube::FixedCubeReceipt = serde_json::from_slice(
             &std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
         )
