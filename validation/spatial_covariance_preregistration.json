@@ -1,14 +1,15 @@
 {
   "schema": "dolphinrust.spatial_covariance.preregistration",
-  "schema_version": 5,
+  "schema_version": 6,
   "validation_id": "F54-07-spatial-covariance-approximation",
   "status": "preregistered",
   "outcomes_present": false,
   "supersedes": {
-    "schema_version": 4,
-    "canonical_preregistration_sha256": "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35",
+    "schema_version": 5,
+    "canonical_preregistration_sha256": "568e2f713c5468b5ad76a3b82aa61b8b2959c415beeca6fec252b11a9376907c",
     "outcomes_present": false,
-    "reason": "v4 froze 353 cells and 665220 attempts before execution. Exact pre-outcome timing observed 32 hw_7x14 GLRT attempts require about 91 wall seconds with 12 ordered workers, while the 128-attempt run remained active beyond 615 wall seconds; projected full execution was measured in weeks, and the required KS 32/128 probe contradicted v4's one-seed KS selector. No outcomes existed. v5 retains scientific acceptance axes and moves engineering behaviors to deterministic contracts."
+    "diagnostics_excluded": true,
+    "reason": "v5 signed-conjugate diagnostics, including observed status counts and numeric traces, were excluded before any accepted scientific outcome because the stochastic negative branch was outside the production Hermitian positive-kernel source-correlation model. v6 keeps the representable proper-complex positive-overlap model, retains the exact analytic ValidationCoupling::Negative DAG/source-factor oracle, and prospectively evaluates the unchanged 0.95 emission gate on fresh seed indices 512 through 1023."
   },
   "design": "explicit-acceptance-axis-matrix-with-deterministic-engineering-contracts",
   "seed_schedule": {
@@ -116,12 +117,12 @@
     }
   },
   "execution_protocol": {
-    "protocol_version": 5,
+    "protocol_version": 6,
     "request_schema": "dolphinrust.spatial-covariance.attempt/4",
     "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
     "cell_summary_schema": "dolphinrust.spatial-covariance.cell-summary/4",
     "shard_manifest_schema": "dolphinrust.spatial-covariance.shard-manifest/4",
-    "run_manifest_schema": "dolphinrust.spatial-covariance.run-manifest/4",
+    "run_manifest_schema": "dolphinrust.spatial-covariance.run-manifest/5",
     "production_hdf5_schema_version": 4,
     "max_production_hdf5_bytes": 1048576,
     "attempt_transport": "ephemeral_pipe_or_delete_after_verified_cell_commit",
@@ -192,20 +193,27 @@
     },
     "positive_overlap_cohort": {
       "cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "scheduled_cell_ordinal": 13,
+      "dgp_cell_ordinal": 14,
+      "seed_start": 512,
       "seed_count": 512,
+      "seed_end_exclusive": 1024,
       "stderr_bytes_max": 16384,
+      "record_deadline_seconds": 30.0,
+      "final_exit_deadline_seconds": 10.0,
       "emission_rate_min": 0.95,
-      "execution": "stream exactly 512 attempts for the frozen positive-overlap cell through the exact prebuilt spatial_covariance_batch under an explicit extended replay and accumulator context that does not widen the ordinary 128-seed outcome schedule; Python independently regenerates each seed's support, ancestry, latent truth, marginal oracle, correlation receipt, coordinates, shape, counts, and source process; all attempt identities are retained and exact emitted and abstained seed counts/digests are persisted; predicted and empirical numeric traces are reduced only over emitted attempts subject to the frozen minimum emission rate, with no top-ups or fabricated values; the positive-overlap difference trace must be below its own target-plus-reference marginal trace for both predicted and empirical evidence; negative coupling is not represented by this stochastic proper-complex production model and remains covered only by the exact ValidationCoupling::Negative production DAG/source-factor oracle"
+      "execution": "stream exactly 512 attempts for the frozen positive-overlap cell at scheduled/request ordinal 13 and preserved DGP ordinal 14 through the exact prebuilt spatial_covariance_batch under an explicit extended replay and accumulator context that does not widen the ordinary 128-seed outcome schedule; a bounded supervisor concurrently drains stdout and stderr, kills and waits on stderr above 16 KiB, bounds stdout to one capped record, and enforces the frozen per-record and final-exit deadlines so missing, partial, stalled, or top-up output fails closed; Python independently regenerates each seed's support, ancestry, latent truth, marginal oracle, correlation receipt, coordinates, shape, counts, and source process; all attempt identities are retained and exact emitted and abstained seed counts/digests are persisted; predicted and empirical numeric traces are reduced only over emitted attempts subject to the frozen minimum emission rate, with no top-ups or fabricated values; the positive-overlap difference trace must be below its own target-plus-reference marginal trace for both predicted and empirical evidence; negative coupling is not represented by this stochastic proper-complex production model and remains covered only by the exact ValidationCoupling::Negative production DAG/source-factor oracle"
     },
     "max_production_sidecar_bytes": 1048576
   },
   "determinism": {
     "text_encoding": "UTF-8",
     "dgp_generator_identity_sha256": "7589a2bba764e66b99bf7cfffbd6f979df94a00ca0ca5e179b5aabae4903a49e",
-    "dgp_generator_identity_definition": "frozen v5 counter-generator identity over the exact preserved 40-entry DGP order with one nonexecutable tombstone; DGP cell ordinal, seed, coordinate, date, and stream are separate counter-key fields",
-    "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le positive_overlap_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
+    "dgp_generator_identity_definition": "frozen v6 counter-generator identity over the exact preserved 40-entry DGP order with one nonexecutable tombstone; DGP cell ordinal, seed, coordinate, date, and stream are separate counter-key fields",
+    "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le dgp_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
     "counter_domain": "dolphinrust:spatial-covariance-dgp:v1\\0",
-    "positive_overlap_cell_ordinal": "the 512-seed positive-overlap cohort retains its ordinary matrix cell ordinal",
+    "positive_overlap_scheduled_cell_ordinal": 13,
+    "positive_overlap_dgp_cell_ordinal": 14,
     "dgp_cell_order": [
       "hw_1x1|stride_1|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
       "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
@@ -598,7 +606,10 @@
       "binary_sha256",
       "generator_protocol_sha256",
       "result_root_sha256",
-      "production_parity_fixture_sha256"
+      "production_parity_fixture_sha256",
+      "preoutcome_manifest",
+      "preoutcome_manifest_sha256",
+      "positive_overlap_cohort_sha256"
     ],
     "shard_manifest_required": [
       "summary_sha256",
@@ -675,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "7caa00c0bdddca5dafe5db412331063c686c30dcd0d53204b437f6a6d72114fc"
+        "sha256": "9f28e9b1e0e379516551bdad92f7185f71abaf818a086f0d3a11f2b11004ec75"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed compact scorer for the outcome-free F54-07 v5 protocol."""
+"""Fail-closed compact scorer for the outcome-free F54-07 v6 protocol."""
 
 from __future__ import annotations
 
@@ -42,18 +42,18 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "9b2f36fb19ca7ba8407128e07c8c060b47ef5d5ba684aa480a757c79bba06a6b"
+FROZEN_GENERATOR_SHA256 = "aed164a3027c28fbbc51d74106895d1edf097378a170dece0e46861a780b422b"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ec37d83f50ae66f24d2b371809cc1e733c8207253b5e3e21c185882349619e25"
-FROZEN_EXECUTION_SHA256 = "7e563007476178ebe68005ee7ff39052400dca19a5df43a789ec0b4bc52ce2d2"
+FROZEN_EXECUTION_SHA256 = "90c9f4184795a08392901399fc7d5426dfa5013180f1205fc40cd10b9720d997"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
 FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
 FROZEN_RECEIPT_SHA256 = "b25997a99ecd2c67f37949744687b8530cccf3e4d7515daec1d6fb87117cb957"
-FROZEN_HASH_FIELDS_SHA256 = "ce6b747b1b562225537ccf1148778517e60c1a54b42c02404011a467d4f2b7ed"
+FROZEN_HASH_FIELDS_SHA256 = "1982e0123553f6933f18ed87e9fd9c3382530ffe5239f1f792ecc5c2b074106c"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "0874fc530fda38d9f0e72b548549f47d749789e2c380c16c506bab03e0431559"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "393edffc872fa11fcb7c5c788205735ca622dc913ae818ce115714ffeeabec79"
-FROZEN_V4_PREREGISTRATION_SHA256 = "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35"
-FROZEN_DETERMINISM_SHA256 = "84d899959ae8abeaed6d60d6d7d9af24d1e933959c3e077e799f760f25da52de"
+FROZEN_V5_PREREGISTRATION_SHA256 = "568e2f713c5468b5ad76a3b82aa61b8b2959c415beeca6fec252b11a9376907c"
+FROZEN_DETERMINISM_SHA256 = "c75bd7704d175d128790a11901f646e9792f81cc753859828e8ae2ff27a2afe2"
 FROZEN_NUMERIC_SHA256 = "3ba716628b06bc83004c1d7fb971eef39f9a86dc9f5f4330e5cb649961a3f413"
 FROZEN_NORMAL_QUANTILE_SHA256 = "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4"
 FROZEN_DGP_COEFFICIENT_SHA256 = "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "7caa00c0bdddca5dafe5db412331063c686c30dcd0d53204b437f6a6d72114fc"
+FROZEN_SOURCE_SET_SHA256 = "9f28e9b1e0e379516551bdad92f7185f71abaf818a086f0d3a11f2b11004ec75"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -74,6 +74,9 @@ FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS = (
     "FROZEN_SOURCE_SET_SHA256",
 )
 FROZEN_POSITIVE_OVERLAP_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL = 13
+FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL = 14
+FROZEN_POSITIVE_OVERLAP_SEED_START = 512
 FROZEN_POSITIVE_OVERLAP_SEED_COUNT = 512
 FROZEN_POSITIVE_OVERLAP_EMISSION_RATE_MIN = 0.95
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
@@ -164,6 +167,7 @@ RUN_MANIFEST_KEYS = {
     "schema", "schema_version", "preregistration_sha256", "code_sha256", "binary_sha256",
     "generator_protocol_sha256", "performance_probe", "resources", "shard_manifests", "result_root_sha256",
     "production_parity_fixture", "production_parity_fixture_sha256", "positive_overlap_cohort",
+    "preoutcome_manifest", "preoutcome_manifest_sha256", "positive_overlap_cohort_sha256",
 }
 RESOURCE_KEYS = {
     "resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "os",
@@ -707,13 +711,22 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
 
 def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
     errors: List[str] = []
-    if preregistration.get("schema") != "dolphinrust.spatial_covariance.preregistration" or not _integer(preregistration.get("schema_version")) or preregistration.get("schema_version") != 5:
-        errors.append("preregistration must use the F54-07 v5 schema")
+    if preregistration.get("schema") != "dolphinrust.spatial_covariance.preregistration" or not _integer(preregistration.get("schema_version")) or preregistration.get("schema_version") != 6:
+        errors.append("preregistration must use the F54-07 v6 schema")
     if preregistration.get("status") != "preregistered" or preregistration.get("outcomes_present") is not False:
         errors.append("preregistration must remain outcome-free and preregistered")
     supersedes = preregistration.get("supersedes")
-    if not isinstance(supersedes, dict) or supersedes.get("schema_version") != 4 or supersedes.get("canonical_preregistration_sha256") != FROZEN_V4_PREREGISTRATION_SHA256 or supersedes.get("outcomes_present") is not False:
-        errors.append("v5 must bind and outcome-free supersede the exact v4 preregistration")
+    if (
+        not isinstance(supersedes, dict)
+        or supersedes.get("schema_version") != 5
+        or supersedes.get("canonical_preregistration_sha256")
+        != FROZEN_V5_PREREGISTRATION_SHA256
+        or supersedes.get("outcomes_present") is not False
+        or supersedes.get("diagnostics_excluded") is not True
+        or "signed-conjugate diagnostics" not in supersedes.get("reason", "")
+        or "512 through 1023" not in supersedes.get("reason", "")
+    ):
+        errors.append("v6 must bind and supersede exact v5 before accepted outcomes")
     dimensions = preregistration.get("dimensions")
     if not isinstance(dimensions, dict) or tuple(dimensions) != DIMENSION_NAMES:
         errors.append("dimensions must contain the nine frozen axes in order")
@@ -734,6 +747,11 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         if isinstance(stochastic_cells, list) and isinstance(deterministic_cells, list)
         else []
     )
+    scheduled_order = (
+        ["|".join(labels) for labels in sorted(tuple(cell_id.split("|")) for cell_id in scheduled_cells)]
+        if all(isinstance(cell_id, str) for cell_id in scheduled_cells)
+        else []
+    )
     dgp_order_valid = (
         isinstance(dgp_cell_order, list)
         and len(dgp_cell_order) == 40
@@ -747,6 +765,17 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         and all(isinstance(cell_id, str) for cell_id in scheduled_cells)
         and tombstone_cell not in scheduled_cells
         and set(dgp_cell_order) - {tombstone_cell} == set(scheduled_cells)
+        and determinism.get("positive_overlap_scheduled_cell_ordinal")
+        == FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        and determinism.get("positive_overlap_dgp_cell_ordinal")
+        == FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL
+        and len(scheduled_order) > FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        and scheduled_order[
+            FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        ]
+        == FROZEN_POSITIVE_OVERLAP_CELL
+        and dgp_cell_order[FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL]
+        == FROZEN_POSITIVE_OVERLAP_CELL
     )
     if not dgp_order_valid:
         errors.append(
@@ -764,10 +793,10 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
     if preregistration.get("thresholds") != FROZEN_THRESHOLDS:
         errors.append("thresholds differ from immutable F54-07 thresholds")
     for field_name, frozen_hash, message in (
-        ("matrix_contract", FROZEN_MATRIX_SHA256, "matrix contract must freeze the exact v5 acceptance design and attempt count"),
-        ("execution_protocol", FROZEN_EXECUTION_SHA256, "execution protocol differs from the frozen v5 compact contract"),
-        ("cell_reducers", FROZEN_REDUCERS_SHA256, "cell reducers or denominators differ from the frozen v5 contract"),
-        ("receipt_contract", FROZEN_RECEIPT_SHA256, "receipt contract differs from the frozen v5 contract"),
+        ("matrix_contract", FROZEN_MATRIX_SHA256, "matrix contract must freeze the exact v6 acceptance design and attempt count"),
+        ("execution_protocol", FROZEN_EXECUTION_SHA256, "execution protocol differs from the frozen v6 compact contract"),
+        ("cell_reducers", FROZEN_REDUCERS_SHA256, "cell reducers or denominators differ from the frozen v6 contract"),
+        ("receipt_contract", FROZEN_RECEIPT_SHA256, "receipt contract differs from the frozen v6 contract"),
         ("hash_fields", FROZEN_HASH_FIELDS_SHA256, "receipt identity fields differ from the frozen contract"),
         ("resource_sampling", FROZEN_RESOURCE_SAMPLING_SHA256, "resource sampling differs from the frozen contract"),
         ("resource_matrix", FROZEN_RESOURCE_MATRIX_SHA256, "resource matrix differs from the frozen contract"),
@@ -780,10 +809,11 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
             errors.append(message)
     generator = preregistration.get("generator")
     if not isinstance(generator, dict) or sha256_json(generator) != FROZEN_GENERATOR_SHA256:
-        errors.append("generator parameters/protocol differ from the frozen v5 generator")
+        errors.append("generator parameters/protocol differ from the frozen v6 generator")
     elif sha256_json(_scientific_generator(generator)) != FROZEN_SCIENTIFIC_GENERATOR_SHA256:
         errors.append("scientific generator differs from the outcome-free v2 design")
     execution = preregistration.get("execution_protocol", {})
+    positive_overlap = execution.get("positive_overlap_cohort", {})
     retained_bound = (
         FROZEN_CELL_COUNT * execution.get("max_encoded_cell_summary_bytes", 0)
         + FROZEN_SHARD_COUNT * execution.get("max_encoded_shard_manifest_bytes", 0)
@@ -792,9 +822,29 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         + 2 * execution.get("max_production_sidecar_bytes", 0)
     )
     if execution.get("retained_attempt_records") is not False or execution.get("request_files_retained") is not False or retained_bound > execution.get("retained_size_bound_bytes", -1) or execution.get("retained_size_bound_bytes") != FROZEN_RETAINED_SIZE_BOUND_BYTES:
-        errors.append("v5 retained evidence does not satisfy the frozen compact bound")
+        errors.append("v6 retained evidence does not satisfy the frozen compact bound")
     if execution.get("process_rss_bytes_max") != FROZEN_PROCESS_RSS_BYTES:
         errors.append("execution process cap must equal the frozen 24 GiB resource threshold")
+    if (
+        execution.get("protocol_version") != 6
+        or execution.get("run_manifest_schema")
+        != "dolphinrust.spatial-covariance.run-manifest/5"
+        or positive_overlap.get("cell") != FROZEN_POSITIVE_OVERLAP_CELL
+        or positive_overlap.get("scheduled_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        or positive_overlap.get("dgp_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL
+        or positive_overlap.get("seed_start") != FROZEN_POSITIVE_OVERLAP_SEED_START
+        or positive_overlap.get("seed_count") != FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        or positive_overlap.get("seed_end_exclusive")
+        != FROZEN_POSITIVE_OVERLAP_SEED_START + FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        or positive_overlap.get("stderr_bytes_max") != 16384
+        or positive_overlap.get("record_deadline_seconds") != 30.0
+        or positive_overlap.get("final_exit_deadline_seconds") != 10.0
+        or positive_overlap.get("emission_rate_min")
+        != FROZEN_POSITIVE_OVERLAP_EMISSION_RATE_MIN
+    ):
+        errors.append("v6 positive-overlap replay scope differs from the frozen contract")
     _validate_portable_dgp_tables(preregistration, errors)
     _validate_executable_generator(preregistration, errors)
     if errors:
@@ -808,15 +858,15 @@ def iter_expected_cell_ids(preregistration: Mapping[str, Any]) -> Iterator[str]:
     stochastic = matrix.get("stochastic_cells")
     deterministic = matrix.get("deterministic_contract_cells")
     if not isinstance(stochastic, list) or len(stochastic) != 24 or not isinstance(deterministic, list) or len(deterministic) != 15:
-        raise SchemaError("v5 explicit stochastic/deterministic cell counts differ")
+        raise SchemaError("v6 explicit stochastic/deterministic cell counts differ")
     cells: set[tuple[str, ...]] = set()
     for cell_id in (*stochastic, *deterministic):
         labels = tuple(cell_id.split("|"))
         if len(labels) != len(DIMENSION_NAMES) or any(labels[index] not in values[index] for index in range(len(labels))):
-            raise SchemaError("explicit v5 cell is outside the frozen dimensions")
+            raise SchemaError("explicit v6 cell is outside the frozen dimensions")
         cells.add(labels)
     if len(cells) != FROZEN_CELL_COUNT:
-        raise SchemaError("explicit v5 design does not contain its exact frozen cell count")
+        raise SchemaError("explicit v6 design does not contain its exact frozen cell count")
     axes = matrix["stochastic_axes"]
     representative = axes["representative"]
     expected_stochastic = {
@@ -836,7 +886,7 @@ def iter_expected_cell_ids(preregistration: Mapping[str, Any]) -> Iterator[str]:
         for estimator in axes["estimator"]
     }
     if set(stochastic) != expected_stochastic:
-        raise SchemaError("v5 stochastic cells do not equal the explicit 3 by 4 by 2 axes")
+        raise SchemaError("v6 stochastic cells do not equal the explicit 3 by 4 by 2 axes")
     return ("|".join(labels) for labels in sorted(cells))
 
 
@@ -1620,12 +1670,13 @@ def regenerate_frozen_attempt_inputs(
 ) -> dict[str, Any]:
     if positive_overlap_replay and cell_id != FROZEN_POSITIVE_OVERLAP_CELL:
         raise SchemaError("positive-overlap replay is restricted to its frozen cell")
-    seed_limit = (
-        FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+    seed_start = FROZEN_POSITIVE_OVERLAP_SEED_START if positive_overlap_replay else 0
+    seed_end = (
+        seed_start + FROZEN_POSITIVE_OVERLAP_SEED_COUNT
         if positive_overlap_replay
         else expected_seed_count(cell_id)
     )
-    if not _integer(seed_index) or seed_index < 0 or seed_index >= seed_limit:
+    if not _integer(seed_index) or seed_index < seed_start or seed_index >= seed_end:
         raise SchemaError("frozen DGP seed index is outside the preregistered schedule")
     labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
     if set(labels) != set(DIMENSION_NAMES):
@@ -1911,7 +1962,8 @@ class CellAccumulator:
     binary_sha256: str = "0" * 64
     artifact_root: Path | None = None
     positive_overlap_replay: bool = False
-    next_seed_index: int = 0
+    seed_start: int | None = None
+    next_seed_index: int = field(init=False)
     emitted: int = 0
     date_count: int = 0
     target_total: int = 0
@@ -1953,8 +2005,17 @@ class CellAccumulator:
                 self.expected_seed_count = FROZEN_POSITIVE_OVERLAP_SEED_COUNT
             if self.expected_seed_count != FROZEN_POSITIVE_OVERLAP_SEED_COUNT:
                 raise SchemaError("positive-overlap accumulator must use the frozen seed schedule")
+            if self.seed_start is None:
+                self.seed_start = FROZEN_POSITIVE_OVERLAP_SEED_START
+            if self.seed_start != FROZEN_POSITIVE_OVERLAP_SEED_START:
+                raise SchemaError("positive-overlap accumulator must use the frozen seed start")
+        elif self.seed_start not in (None, 0):
+            raise SchemaError("ordinary cell accumulator seed start must be zero")
         if self.expected_seed_count is None:
             self.expected_seed_count = expected_seed_count(self.cell_id)
+        if self.seed_start is None:
+            self.seed_start = 0
+        self.next_seed_index = self.seed_start
 
     def add(self, attempt: Any) -> None:
         if not isinstance(attempt, dict) or set(attempt) != ATTEMPT_KEYS:
@@ -1963,7 +2024,11 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has the wrong attempt schema")
         if attempt.get("cell_id") != self.cell_id or not _integer(attempt.get("cell_ordinal")) or attempt.get("cell_ordinal") != self.cell_ordinal:
             raise SchemaError(f"cell {self.cell_id} has an out-of-order cell identity")
-        if not _integer(attempt.get("seed_index")) or attempt.get("seed_index") != self.next_seed_index or self.next_seed_index >= self.expected_seed_count:
+        if (
+            not _integer(attempt.get("seed_index"))
+            or attempt.get("seed_index") != self.next_seed_index
+            or self.next_seed_index >= self.seed_start + self.expected_seed_count
+        ):
             raise SchemaError(f"cell {self.cell_id} has a missing, duplicate, top-up, or out-of-order seed")
         if attempt.get("seed_sha256") != _expected_seed_hash(self.preregistration, self.cell_id, self.next_seed_index):
             raise SchemaError(f"cell {self.cell_id} has a seed derivation mismatch")
@@ -2239,7 +2304,7 @@ class CellAccumulator:
         self.interval_width_sums += metrics["interval_width"]
 
     def finalize(self) -> dict[str, Any]:
-        if self.next_seed_index != self.expected_seed_count:
+        if self.next_seed_index != self.seed_start + self.expected_seed_count:
             raise SchemaError(f"cell {self.cell_id} is missing one or more seed indices")
         labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
         if labels["position"] == "masked":
@@ -2476,7 +2541,8 @@ def validate_positive_overlap_cohort(
         "schema", "cell_id", "marginal_dgp_digest", "target_support_digest", "reference_support_digest",
         "latent_history_digest", "phase_orientation_digest", "predicted_covariance_trace",
         "predicted_marginal_covariance_trace", "empirical_error_covariance_trace",
-        "empirical_marginal_covariance_trace", "attempted_seed_count", "emitted_seed_count",
+        "empirical_marginal_covariance_trace", "seed_start", "seed_end_exclusive",
+        "attempted_seed_count", "emitted_seed_count",
         "emitted_seed_digest", "abstained_seed_count", "abstained_seed_digest", "attempt_digest",
         "code_sha256", "binary_sha256", "config_sha256",
     }
@@ -2485,6 +2551,9 @@ def validate_positive_overlap_cohort(
         or set(value) != keys
         or value.get("schema") != "dolphinrust.spatial-covariance.positive-overlap-cohort/1"
         or value.get("cell_id") != FROZEN_POSITIVE_OVERLAP_CELL
+        or value.get("seed_start") != FROZEN_POSITIVE_OVERLAP_SEED_START
+        or value.get("seed_end_exclusive")
+        != FROZEN_POSITIVE_OVERLAP_SEED_START + FROZEN_POSITIVE_OVERLAP_SEED_COUNT
         or any(not _is_sha256(value.get(name)) for name in (
             "marginal_dgp_digest", "target_support_digest", "reference_support_digest",
             "latent_history_digest", "phase_orientation_digest", "attempt_digest",
@@ -2518,6 +2587,74 @@ def validate_positive_overlap_cohort(
         )
     ):
         raise SchemaError("positive-overlap cohort evidence is malformed")
+
+
+def validate_positive_overlap_run_binding(
+    run_manifest: Mapping[str, Any],
+    code_sha256: str,
+    binary_sha256: str,
+    config_sha256: str,
+) -> None:
+    if not _is_sha256(run_manifest.get("preoutcome_manifest_sha256")) or not _is_sha256(
+        run_manifest.get("positive_overlap_cohort_sha256")
+    ):
+        raise SchemaError("run manifest preoutcome receipt binding is malformed")
+    preoutcome_manifest = run_manifest.get("preoutcome_manifest")
+    expected_manifest_identity = {
+        "schema": "dolphinrust.spatial-covariance.preoutcome-receipts/1",
+        "code_sha256": code_sha256,
+        "binary_sha256": binary_sha256,
+        "config_sha256": config_sha256,
+        "preregistration_sha256": run_manifest.get("preregistration_sha256"),
+    }
+    expected_receipt_names = {
+        "performance.json", "resources.json", "positive-overlap-cohort.json"
+    }
+    if (
+        not isinstance(preoutcome_manifest, dict)
+        or set(preoutcome_manifest) != {*expected_manifest_identity, "receipts"}
+        or any(
+            preoutcome_manifest.get(name) != value
+            for name, value in expected_manifest_identity.items()
+        )
+        or not isinstance(preoutcome_manifest.get("receipts"), dict)
+        or set(preoutcome_manifest["receipts"]) != expected_receipt_names
+    ):
+        raise SchemaError("embedded preoutcome manifest identity is malformed")
+    embedded_manifest_sha256 = hashlib.sha256(
+        _canonical_bytes(preoutcome_manifest) + b"\n"
+    ).hexdigest()
+    if embedded_manifest_sha256 != run_manifest["preoutcome_manifest_sha256"]:
+        raise SchemaError("embedded preoutcome manifest differs from its bound hash")
+    cohort = run_manifest.get("positive_overlap_cohort")
+    validate_positive_overlap_cohort(
+        cohort,
+        code_sha256,
+        binary_sha256,
+        config_sha256,
+    )
+    receipt_payloads = {
+        "performance.json": run_manifest.get("performance_probe"),
+        "resources.json": run_manifest.get("resources"),
+        "positive-overlap-cohort.json": cohort,
+    }
+    for name, payload in receipt_payloads.items():
+        encoded = _canonical_bytes(payload) + b"\n"
+        entry = preoutcome_manifest["receipts"].get(name)
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"sha256", "bytes"}
+            or entry.get("sha256") != hashlib.sha256(encoded).hexdigest()
+            or entry.get("bytes") != len(encoded)
+        ):
+            raise SchemaError(f"embedded preoutcome receipt {name} differs from its manifest")
+    embedded_sha256 = preoutcome_manifest["receipts"][
+        "positive-overlap-cohort.json"
+    ]["sha256"]
+    if embedded_sha256 != run_manifest["positive_overlap_cohort_sha256"]:
+        raise SchemaError(
+            "embedded positive-overlap cohort differs from its bound preoutcome receipt"
+        )
 
 
 def _read_json_line(handle: BinaryIO, path: Path, line_number: int) -> tuple[dict[str, Any] | None, bytes]:
@@ -3697,11 +3834,16 @@ def score_run_manifest(
         )
         if not isinstance(run_manifest, dict) or set(run_manifest) != RUN_MANIFEST_KEYS:
             raise SchemaError("run manifest has unknown or missing fields")
-        if run_manifest["schema"] != "dolphinrust.spatial-covariance.run-manifest/4" or not _integer(run_manifest["schema_version"]) or run_manifest["schema_version"] != 4:
-            raise SchemaError("run manifest must use schema v4")
+        if run_manifest["schema"] != "dolphinrust.spatial-covariance.run-manifest/5" or not _integer(run_manifest["schema_version"]) or run_manifest["schema_version"] != 5:
+            raise SchemaError("run manifest must use schema v5")
         if run_manifest["preregistration_sha256"] != preregistration_digest(preregistration):
             raise SchemaError("run manifest preregistration identity mismatch")
-        for field_name in ("code_sha256", "binary_sha256"):
+        for field_name in (
+            "code_sha256",
+            "binary_sha256",
+            "preoutcome_manifest_sha256",
+            "positive_overlap_cohort_sha256",
+        ):
             if not _is_sha256(run_manifest[field_name]):
                 raise SchemaError(f"run manifest {field_name} is invalid")
         validate_producer_identities(
@@ -3724,8 +3866,8 @@ def score_run_manifest(
             run_manifest["production_parity_fixture_sha256"],
             batch_binary,
         )
-        validate_positive_overlap_cohort(
-            run_manifest["positive_overlap_cohort"],
+        validate_positive_overlap_run_binding(
+            run_manifest,
             run_manifest["code_sha256"],
             run_manifest["binary_sha256"],
             sha256_json(preregistration["generator"]),
@@ -3733,7 +3875,7 @@ def score_run_manifest(
         sink.open()
         entries = run_manifest["shard_manifests"]
         if not isinstance(entries, list) or len(entries) != FROZEN_SHARD_COUNT:
-            raise SchemaError("run manifest must contain exactly four ordered shard manifests")
+            raise SchemaError("run manifest must contain exactly one ordered shard manifest")
         manifest_digests = []
         cell_count = 0
         any_failed = FAIL in resource_statuses

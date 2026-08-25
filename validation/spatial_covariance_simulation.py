@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic shard preparation and commit driver for F54-07 v5."""
+"""Deterministic shard preparation and commit driver for F54-07 v6."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import resource
+import selectors
 import shutil
 import stat
 import subprocess
@@ -29,6 +30,8 @@ try:
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
+        FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL,
+        FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL,
         FROZEN_SEED_COUNT,
         FROZEN_SHARD_COUNT,
         SchemaError,
@@ -41,6 +44,7 @@ try:
         _validate_resources,
         regenerate_frozen_attempt_inputs,
         validate_positive_overlap_cohort,
+        validate_positive_overlap_run_binding,
         iter_shard_specs,
         expected_cell_ids,
         expected_seed_count,
@@ -64,6 +68,8 @@ except ModuleNotFoundError:
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
+        FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL,
+        FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL,
         FROZEN_SEED_COUNT,
         FROZEN_SHARD_COUNT,
         SchemaError,
@@ -76,6 +82,7 @@ except ModuleNotFoundError:
         _validate_resources,
         regenerate_frozen_attempt_inputs,
         validate_positive_overlap_cohort,
+        validate_positive_overlap_run_binding,
         iter_shard_specs,
         expected_cell_ids,
         expected_seed_count,
@@ -147,7 +154,10 @@ PARALLEL_BATCH_WORKER_COUNT = FROZEN_PROCESS_RSS_BYTES // PARALLEL_BATCH_WORKER_
 PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD = 3
 PARALLEL_BATCH_RSS_SAMPLE_SECONDS = 0.05
 POSITIVE_OVERLAP_SEED_COUNT = 512
+POSITIVE_OVERLAP_SEED_START = 512
 POSITIVE_OVERLAP_STDERR_BYTES_MAX = 16_384
+POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS = 30.0
+POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS = 10.0
 POSITIVE_OVERLAP_EMISSION_RATE_MIN = 0.95
 
 
@@ -1169,30 +1179,137 @@ def _positive_overlap_identity(regenerated: Mapping[str, Any]) -> dict[str, Any]
 
 def _positive_overlap_process_diagnostic(
     process: subprocess.Popen[bytes],
-    stderr_file: BinaryIO,
+    stderr: bytes,
     cell_id: str,
     seed_index: int,
     reason: str,
 ) -> str:
     exit_status = process.poll()
-    stderr_text = "unavailable while producer is running"
-    if exit_status is not None:
-        stderr_bytes = os.fstat(stderr_file.fileno()).st_size
-        stderr_file.seek(0)
-        stderr = stderr_file.read(POSITIVE_OVERLAP_STDERR_BYTES_MAX + 1)
-        if len(stderr) > POSITIVE_OVERLAP_STDERR_BYTES_MAX:
-            raise SchemaError(
-                f"positive-overlap Rust cohort {cell_id} seed {seed_index} stderr exceeds "
-                f"the {POSITIVE_OVERLAP_STDERR_BYTES_MAX}-byte cap"
-            )
-        if len(stderr) != stderr_bytes:
-            raise SchemaError("positive-overlap Rust cohort stderr changed during bounded read")
-        stderr_text = stderr.decode("utf-8", errors="replace").strip() or "<empty>"
+    if len(stderr) > POSITIVE_OVERLAP_STDERR_BYTES_MAX:
+        raise SchemaError(
+            f"positive-overlap Rust cohort {cell_id} seed {seed_index} stderr exceeds "
+            f"the {POSITIVE_OVERLAP_STDERR_BYTES_MAX}-byte cap"
+        )
+    stderr_text = stderr.decode("utf-8", errors="replace").strip() or "<empty>"
     return (
         f"positive-overlap Rust cohort {cell_id} seed {seed_index} {reason}; "
         f"exit_status={exit_status if exit_status is not None else 'running'}; "
         f"stderr={stderr_text}"
     )
+
+
+class _BoundedPositiveOverlapProducer:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        stderr_bytes_max: int,
+    ) -> None:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise SchemaError("positive-overlap producer pipes are incomplete")
+        self.process = process
+        self.stderr_bytes_max = stderr_bytes_max
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.stdout_eof = False
+        self.stderr_eof = False
+        self.selector = selectors.DefaultSelector()
+        for name, handle in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(handle.fileno(), False)
+            self.selector.register(handle, selectors.EVENT_READ, name)
+
+    def _terminate(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+
+    def _abort(self, cell_id: str, seed_index: int, reason: str) -> None:
+        self._terminate()
+        raise SchemaError(
+            _positive_overlap_process_diagnostic(
+                self.process, bytes(self.stderr), cell_id, seed_index, reason
+            )
+        )
+
+    def _drain_ready(self, timeout: float, cell_id: str, seed_index: int) -> None:
+        for key, _ in self.selector.select(timeout):
+            name = key.data
+            limit = FROZEN_MAX_RECORD_BYTES if name == "stdout" else self.stderr_bytes_max
+            storage_limit = limit + 1 if name == "stdout" else limit
+            target = self.stdout if name == "stdout" else self.stderr
+            remaining = max(1, storage_limit - len(target))
+            try:
+                chunk = os.read(key.fileobj.fileno(), min(8192, remaining))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                self.selector.unregister(key.fileobj)
+                if name == "stdout":
+                    self.stdout_eof = True
+                else:
+                    self.stderr_eof = True
+                continue
+            allowed = storage_limit - len(target)
+            target.extend(chunk[:allowed])
+            if len(chunk) > allowed or len(target) > limit:
+                self._abort(
+                    cell_id,
+                    seed_index,
+                    f"{name} exceeds the {limit}-byte cap",
+                )
+
+    def read_record(
+        self,
+        cell_id: str,
+        seed_index: int,
+        deadline_seconds: float,
+    ) -> bytes:
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            newline = self.stdout.find(b"\n")
+            if newline >= 0:
+                raw = bytes(self.stdout[: newline + 1])
+                del self.stdout[: newline + 1]
+                if self.stdout:
+                    self._abort(cell_id, seed_index, "emitted buffered stdout top-up bytes")
+                return raw
+            if self.stdout_eof:
+                self._abort(
+                    cell_id,
+                    seed_index,
+                    f"output is incomplete ({len(self.stdout)} bytes)",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                self._abort(cell_id, seed_index, "exceeded the per-record deadline")
+            self._drain_ready(remaining, cell_id, seed_index)
+
+    def finish(
+        self,
+        cell_id: str,
+        seed_index: int,
+        deadline_seconds: float,
+    ) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.close()
+        deadline = time.monotonic() + deadline_seconds
+        while not (self.stdout_eof and self.stderr_eof and self.process.poll() is not None):
+            if self.stdout:
+                self._abort(cell_id, seed_index, "emitted stdout top-up bytes")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                self._abort(cell_id, seed_index, "exceeded the final-exit deadline")
+            self._drain_ready(remaining, cell_id, seed_index)
+        if self.stdout:
+            self._abort(cell_id, seed_index, "emitted stdout top-up bytes")
+        if self.process.returncode != 0 or self.stderr:
+            self._abort(cell_id, seed_index, "failed final exit validation")
+
+    def close(self) -> None:
+        self._terminate()
+        self.selector.close()
+        for handle in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if handle is not None and not handle.closed:
+                handle.close()
 
 
 def generate_positive_overlap_cohort(
@@ -1208,16 +1325,28 @@ def generate_positive_overlap_cohort(
     frozen_cohort = preregistration["execution_protocol"]["positive_overlap_cohort"]
     if (
         frozen_cohort.get("cell") != POSITIVE_OVERLAP_CELL
+        or frozen_cohort.get("scheduled_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        or frozen_cohort.get("dgp_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL
+        or frozen_cohort.get("seed_start") != POSITIVE_OVERLAP_SEED_START
         or frozen_cohort.get("seed_count") != POSITIVE_OVERLAP_SEED_COUNT
+        or frozen_cohort.get("seed_end_exclusive")
+        != POSITIVE_OVERLAP_SEED_START + POSITIVE_OVERLAP_SEED_COUNT
         or frozen_cohort.get("stderr_bytes_max") != POSITIVE_OVERLAP_STDERR_BYTES_MAX
+        or frozen_cohort.get("record_deadline_seconds")
+        != POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS
+        or frozen_cohort.get("final_exit_deadline_seconds")
+        != POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS
         or frozen_cohort.get("emission_rate_min") != POSITIVE_OVERLAP_EMISSION_RATE_MIN
         or seed_count != frozen_cohort.get("seed_count")
         or POSITIVE_OVERLAP_CELL not in cell_ids
+        or cell_ids.index(POSITIVE_OVERLAP_CELL)
+        != FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
     ):
         raise SchemaError("positive-overlap cell or seed count is outside the frozen matrix")
     preregistration_path = Path(preregistration_path).resolve(strict=True)
     batch_binary = Path(batch_binary).resolve(strict=True)
-    stderr_file = tempfile.TemporaryFile()
     process = subprocess.Popen(
         [
             str(batch_binary), "--preregistration", str(preregistration_path),
@@ -1225,11 +1354,15 @@ def generate_positive_overlap_cohort(
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=stderr_file,
+        stderr=subprocess.PIPE,
+    )
+    supervisor = _BoundedPositiveOverlapProducer(
+        process, POSITIVE_OVERLAP_STDERR_BYTES_MAX
     )
     accumulator = CellAccumulator(
         preregistration, POSITIVE_OVERLAP_CELL, cell_ids.index(POSITIVE_OVERLAP_CELL),
         seed_count, code_sha256, binary_sha256, positive_overlap_replay=True,
+        seed_start=POSITIVE_OVERLAP_SEED_START,
     )
     target_errors = _TraceAccumulator()
     reference_errors = _TraceAccumulator()
@@ -1247,7 +1380,10 @@ def generate_positive_overlap_cohort(
     emitted_seed_count = 0
     abstained_seed_count = 0
     try:
-        for seed_index in range(seed_count):
+        for seed_index in range(
+            POSITIVE_OVERLAP_SEED_START,
+            POSITIVE_OVERLAP_SEED_START + seed_count,
+        ):
             assert process.stdin is not None and process.stdout is not None
             request = _cell_request_at(
                 preregistration, POSITIVE_OVERLAP_CELL,
@@ -1256,26 +1392,18 @@ def generate_positive_overlap_cohort(
             )
             process.stdin.write(compact_json_line(request))
             process.stdin.flush()
-            raw = process.stdout.readline(FROZEN_MAX_RECORD_BYTES + 2)
-            if not raw or len(raw) > FROZEN_MAX_RECORD_BYTES or not raw.endswith(b"\n"):
-                raise SchemaError(_positive_overlap_process_diagnostic(
-                    process, stderr_file, POSITIVE_OVERLAP_CELL, seed_index,
-                    f"output is incomplete or oversized ({len(raw)} bytes)",
-                ))
+            raw = supervisor.read_record(
+                POSITIVE_OVERLAP_CELL,
+                seed_index,
+                POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS,
+            )
             try:
                 attempt = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise SchemaError(_positive_overlap_process_diagnostic(
-                    process, stderr_file, POSITIVE_OVERLAP_CELL, seed_index,
+                    process, bytes(supervisor.stderr), POSITIVE_OVERLAP_CELL, seed_index,
                     f"output is malformed ({len(raw)} bytes)",
                 )) from exc
-            if os.fstat(stderr_file.fileno()).st_size > POSITIVE_OVERLAP_STDERR_BYTES_MAX:
-                process.kill()
-                process.wait()
-                raise SchemaError(_positive_overlap_process_diagnostic(
-                    process, stderr_file, POSITIVE_OVERLAP_CELL, seed_index,
-                    "stderr exceeded its byte cap",
-                ))
             accumulator.add(attempt)
             attempt_digest.update(len(raw).to_bytes(8, "big"))
             attempt_digest.update(raw)
@@ -1336,25 +1464,13 @@ def generate_positive_overlap_cohort(
                 joint[date][date] + joint[dates + date][dates + date]
                 for date in range(dates)
             )
-        assert process.stdin is not None and process.stdout is not None
-        process.stdin.close()
-        extra = process.stdout.readline(FROZEN_MAX_RECORD_BYTES + 2)
-        exit_status = process.wait()
-        diagnostic = _positive_overlap_process_diagnostic(
-            process, stderr_file, POSITIVE_OVERLAP_CELL, seed_count,
-            f"emitted {len(extra)} top-up bytes or exited after the frozen stream",
+        supervisor.finish(
+            POSITIVE_OVERLAP_CELL,
+            POSITIVE_OVERLAP_SEED_START + seed_count,
+            POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS,
         )
-        if extra or exit_status != 0 or os.fstat(stderr_file.fileno()).st_size != 0:
-            raise SchemaError(diagnostic)
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        if process.stdout is not None:
-            process.stdout.close()
-        stderr_file.close()
+        supervisor.close()
     if emitted_seed_count + abstained_seed_count != seed_count:
         raise SchemaError("positive-overlap emission accounting is incomplete")
     if emitted_seed_count < math.ceil(
@@ -1372,6 +1488,8 @@ def generate_positive_overlap_cohort(
         "reference_support_digest": reference_support_digest.hexdigest(),
         "latent_history_digest": latent_digest.hexdigest(),
         "phase_orientation_digest": orientation_digest.hexdigest(),
+        "seed_start": POSITIVE_OVERLAP_SEED_START,
+        "seed_end_exclusive": POSITIVE_OVERLAP_SEED_START + seed_count,
         "attempted_seed_count": seed_count,
         "emitted_seed_count": emitted_seed_count,
         "emitted_seed_digest": emitted_seed_digest.hexdigest(),
@@ -1471,13 +1589,17 @@ def validate_preoutcome_receipts(
     directory: Path,
     code_sha256: str,
     binary_sha256: str,
-) -> None:
+) -> dict[str, Any]:
     directory = Path(directory).resolve(strict=True)
-    manifest = _load_bounded_json(
+    manifest_raw = _read_bounded_bytes(
         directory / "manifest.json",
         FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
         "pre-outcome receipt manifest",
     )
+    try:
+        manifest = json.loads(manifest_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("pre-outcome receipt manifest is malformed") from exc
     expected_identity = {
         "schema": "dolphinrust.spatial-covariance.preoutcome-receipts/1",
         "code_sha256": code_sha256,
@@ -1489,6 +1611,8 @@ def validate_preoutcome_receipts(
         manifest.get(name) != value for name, value in expected_identity.items()
     ):
         raise SchemaError("pre-outcome receipt manifest identity differs")
+    if manifest_raw != compact_json_line(manifest):
+        raise SchemaError("pre-outcome receipt manifest is not canonical")
     expected_names = (
         "performance.json", "resources.json", "positive-overlap-cohort.json"
     )
@@ -1522,6 +1646,11 @@ def validate_preoutcome_receipts(
         binary_sha256,
         sha256_json(preregistration["generator"]),
     )
+    return {
+        "manifest": manifest,
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "receipts": values,
+    }
 
 
 def _summary_root(
@@ -1824,20 +1953,30 @@ def build_run_manifest(
     binary_sha256: str,
     performance_probe: Mapping[str, Any],
     resources: list[Mapping[str, Any]],
+    preoutcome_directory: Path,
     attempt_regenerator: AttemptRegenerator | None = None,
     production_parity_fixture: Mapping[str, Any] | None = None,
-    positive_overlap_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_preregistration(preregistration)
     if attempt_regenerator is None:
         raise SchemaError(
             "exact shard assembly requires the Rust spatial_covariance_batch replay executable"
         )
-    if production_parity_fixture is None or positive_overlap_cohort is None:
-        raise SchemaError("run assembly requires production parity and positive-overlap evidence")
+    if production_parity_fixture is None:
+        raise SchemaError("run assembly requires production parity evidence")
+    preoutcome = validate_preoutcome_receipts(
+        preregistration,
+        preoutcome_directory,
+        code_sha256,
+        binary_sha256,
+    )
+    positive_overlap_cohort = preoutcome["receipts"]["positive-overlap-cohort.json"]
+    positive_overlap_cohort_sha256 = preoutcome["manifest"]["receipts"][
+        "positive-overlap-cohort.json"
+    ]["sha256"]
     paths = tuple(shard_manifest_paths)
     if len(paths) != FROZEN_SHARD_COUNT:
-        raise SchemaError("run manifest requires exactly four compact shards")
+        raise SchemaError("run manifest requires exactly one compact shard")
     _validate_performance_probe(preregistration, performance_probe, code_sha256, binary_sha256)
     _validate_resources(preregistration, resources, binary_sha256)
     validate_positive_overlap_cohort(
@@ -1867,14 +2006,24 @@ def build_run_manifest(
             raise SchemaError(f"shard {spec.index} is not exact compact committed evidence")
         entries.append({"path": relative, "sha256": digest})
         digests.append(digest)
-    return {"schema": "dolphinrust.spatial-covariance.run-manifest/4", "schema_version": 4,
+    result = {"schema": "dolphinrust.spatial-covariance.run-manifest/5", "schema_version": 5,
             "preregistration_sha256": preregistration_digest(preregistration), "code_sha256": code_sha256,
             "binary_sha256": binary_sha256, "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]),
             "performance_probe": dict(performance_probe), "resources": [dict(item) for item in resources],
             "shard_manifests": entries, "result_root_sha256": result_root_sha256(digests),
             "production_parity_fixture": dict(production_parity_fixture),
             "production_parity_fixture_sha256": sha256_json(production_parity_fixture),
+            "preoutcome_manifest": dict(preoutcome["manifest"]),
+            "preoutcome_manifest_sha256": preoutcome["manifest_sha256"],
+            "positive_overlap_cohort_sha256": positive_overlap_cohort_sha256,
             "positive_overlap_cohort": dict(positive_overlap_cohort)}
+    validate_positive_overlap_run_binding(
+        result,
+        code_sha256,
+        binary_sha256,
+        sha256_json(preregistration["generator"]),
+    )
+    return result
 
 
 def main() -> None:
@@ -1927,7 +2076,7 @@ def main() -> None:
     assemble.add_argument("--performance-probe", type=Path, required=True)
     assemble.add_argument("--resources", type=Path, required=True)
     assemble.add_argument("--production-parity-fixture", type=Path, required=True)
-    assemble.add_argument("--positive-overlap-cohort", type=Path, required=True)
+    assemble.add_argument("--preoutcome-directory", type=Path, required=True)
     assemble.add_argument("--destination", type=Path, required=True)
     performance = commands.add_parser(
         "generate-performance", help="measure all frozen outcome-discarding performance classes"
@@ -2070,15 +2219,10 @@ def main() -> None:
             FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
             "production parity fixture",
         )
-        positive_overlap_cohort = _load_bounded_json(
-            args.positive_overlap_cohort,
-            FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
-            "positive-overlap cohort",
-        )
         run_manifest = build_run_manifest(
             preregistration, run_root, manifest_paths, code_sha256, binary_sha256,
-            performance_probe, resources, attempt_regenerator,
-            production_parity_fixture, positive_overlap_cohort,
+            performance_probe, resources, args.preoutcome_directory, attempt_regenerator,
+            production_parity_fixture,
         )
         result = write_run_manifest_atomic(run_manifest, args.destination)
     print(json.dumps(result, sort_keys=True))

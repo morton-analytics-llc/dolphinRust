@@ -144,6 +144,7 @@ impl FrozenAttemptRequest {
         ]
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self, preregistration: &Value) -> Result<u64> {
         anyhow::ensure!(
             self.schema == "dolphinrust.spatial-covariance.attempt/4",
@@ -212,6 +213,69 @@ impl FrozenAttemptRequest {
             .iter()
             .position(|cell| *cell == self.cell_id)
             .context("frozen attempt cell is absent from the stable DGP order")?;
+        if self.cell_id
+            == "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+        {
+            anyhow::ensure!(
+                preregistration
+                    .pointer("/determinism/positive_overlap_scheduled_cell_ordinal")
+                    .and_then(Value::as_u64)
+                    == Some(self.cell_ordinal)
+                    && preregistration
+                        .pointer("/determinism/positive_overlap_dgp_cell_ordinal")
+                        .and_then(Value::as_u64)
+                        == Some(u64::try_from(dgp_ordinal)?)
+                    && preregistration
+                        .pointer(
+                            "/execution_protocol/positive_overlap_cohort/scheduled_cell_ordinal",
+                        )
+                        .and_then(Value::as_u64)
+                        == Some(self.cell_ordinal)
+                    && preregistration
+                        .pointer("/execution_protocol/positive_overlap_cohort/dgp_cell_ordinal")
+                        .and_then(Value::as_u64)
+                        == Some(u64::try_from(dgp_ordinal)?),
+                "positive-overlap scheduled and DGP ordinals differ from the frozen bindings"
+            );
+        }
+        let stochastic_cells = preregistration
+            .pointer("/matrix_contract/stochastic_cells")
+            .and_then(Value::as_array)
+            .context("preregistration omits stochastic cells")?;
+        let stochastic = stochastic_cells
+            .iter()
+            .any(|cell| cell.as_str() == Some(self.cell_id.as_str()));
+        let ordinary_seed_count = preregistration
+            .pointer(if stochastic {
+                "/seed_schedule/supported_monte_carlo_seeds"
+            } else {
+                "/seed_schedule/deterministic_contract_seeds"
+            })
+            .and_then(Value::as_u64)
+            .context("preregistration omits the ordinary seed count")?;
+        let ordinary_seed = self.seed_index < ordinary_seed_count;
+        let prospective_seed = if self.cell_id
+            == "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+        {
+            let start = preregistration
+                .pointer("/execution_protocol/positive_overlap_cohort/seed_start")
+                .and_then(Value::as_u64)
+                .context("positive-overlap cohort omits its seed start")?;
+            let count = preregistration
+                .pointer("/execution_protocol/positive_overlap_cohort/seed_count")
+                .and_then(Value::as_u64)
+                .context("positive-overlap cohort omits its seed count")?;
+            let end = start
+                .checked_add(count)
+                .context("positive-overlap seed range overflows")?;
+            self.seed_index >= start && self.seed_index < end
+        } else {
+            false
+        };
+        anyhow::ensure!(
+            ordinary_seed || prospective_seed,
+            "frozen attempt seed is outside its ordinary or prospective schedule"
+        );
         let seed = preregistration
             .pointer("/seed_schedule/validation_seed")
             .and_then(Value::as_str)
@@ -4821,6 +4885,20 @@ mod tests {
             source_process: "spatial_correlation_stress".to_owned(),
         };
         assert_eq!(request(0).validate(&preregistration).unwrap(), 14);
+        assert_eq!(request(512).validate(&preregistration).unwrap(), 14);
+        assert_eq!(request(1023).validate(&preregistration).unwrap(), 14);
+        assert!(request(511).validate(&preregistration).is_err());
+        assert!(request(1024).validate(&preregistration).is_err());
+        let mut wrong_ordinals = preregistration.clone();
+        *wrong_ordinals
+            .pointer_mut("/determinism/positive_overlap_scheduled_cell_ordinal")
+            .unwrap() = serde_json::json!(12);
+        assert!(request(0).validate(&wrong_ordinals).is_err());
+        let mut wrong_execution_ordinal = preregistration.clone();
+        *wrong_execution_ordinal
+            .pointer_mut("/execution_protocol/positive_overlap_cohort/dgp_cell_ordinal")
+            .unwrap() = serde_json::json!(13);
+        assert!(request(512).validate(&wrong_execution_ordinal).is_err());
         let mut tombstone = request(0);
         tombstone.cell_id = tombstone
             .cell_id
