@@ -52,7 +52,13 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
         "control_station_id": candidate_value["station_ids"][1],
         "target_station_pixel": [10, 10],
         "control_station_pixel": [20, 20],
+        "schema_version": 4,
+        "method_version": 1,
+        "method": "reference_specific_influence_v1",
+        "calibration_scope": "calibrated_scope_match",
         "common_dates_sha256": "4" * 64,
+        "acquisition_days_sha256": "5" * 64,
+        "geotransform_sha256": "6" * 64,
         "window": "frozen",
         "overlap": "coincident",
         "distance": "same_frame",
@@ -60,9 +66,16 @@ def outcome_cluster(candidate_value, preregistration, status="pass", difference=
         "source_replay_sha256": "a" * 64,
         "l2_map_sha256": "b" * 64,
         "mask_sha256": "c" * 64,
+        "source_model_sha256": "e" * 64,
+        "effective_looks_sha256": "f" * 64,
+        "support_sha256": "0" * 64,
+        "correction_order_sha256": "1" * 64,
+        "unwrap_branch_sha256": "2" * 64,
+        "burst_ownership_sha256": "3" * 64,
+        "runtime_resource_receipt_sha256": "7" * 64,
         "burst_id": candidate_value["burst_id"],
         "grid_sha256": "d" * 64,
-        "units": "radians_to_displacement_m",
+        "units": "meters",
     }
     cluster = {
         "cluster_id": candidate_value["candidate_id"],
@@ -171,6 +184,12 @@ class HeldoutCohortTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.preregistration = json.loads(PREREGISTRATION_PATH.read_text(encoding="utf-8"))
+
+    def test_factor_binding_matches_current_production_artifact(self):
+        output = self.preregistration["factor_binding"]["output_factor"]
+        self.assertEqual(output["schema_version"], 4)
+        self.assertEqual(output["artifact_hdf5"], "referenced_displacement_covariance_factor.h5")
+        self.assertEqual(output["artifact_manifest"], "referenced_displacement_covariance_provenance.json")
 
     def test_metadata_discovery_excludes_exposed_and_outcome_records(self):
         records = [

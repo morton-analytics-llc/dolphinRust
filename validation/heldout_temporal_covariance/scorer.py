@@ -185,9 +185,32 @@ def _validate_factor_binding(cluster: Mapping[str, Any], candidate: Mapping[str,
         raise CohortValidationError("#54 factor scope fields are incomplete")
     if scope["target_station_id"] != candidate["station_ids"][0] or scope["control_station_id"] != candidate["station_ids"][1]:
         raise CohortValidationError("#54 target/control station scope mismatch")
-    if scope["burst_id"] != candidate["burst_id"] or scope["units"] != "radians_to_displacement_m":
+    if (
+        scope["schema_version"] != required["output_factor"]["schema_version"]
+        or scope["method_version"] != required["output_factor"]["method_version"]
+        or scope["method"] != required["output_factor"]["method"]
+        or scope["calibration_scope"] != required["output_factor"]["calibration_status"]
+    ):
+        raise CohortValidationError("#54 factor schema, method, or calibration scope mismatch")
+    if scope["burst_id"] != candidate["burst_id"] or scope["units"] not in {"meters", "millimeters"}:
         raise CohortValidationError("#54 burst or unit scope mismatch")
-    for field in ("common_dates_sha256", "reference_signature_sha256", "source_replay_sha256", "l2_map_sha256", "mask_sha256", "grid_sha256"):
+    for field in (
+        "common_dates_sha256",
+        "acquisition_days_sha256",
+        "geotransform_sha256",
+        "reference_signature_sha256",
+        "source_replay_sha256",
+        "l2_map_sha256",
+        "mask_sha256",
+        "source_model_sha256",
+        "effective_looks_sha256",
+        "support_sha256",
+        "correction_order_sha256",
+        "unwrap_branch_sha256",
+        "burst_ownership_sha256",
+        "runtime_resource_receipt_sha256",
+        "grid_sha256",
+    ):
         if not _hash(scope[field]):
             raise CohortValidationError("#54 scope digest is missing or invalid")
     if binding["scope_sha256"] != canonical_digest(scope):

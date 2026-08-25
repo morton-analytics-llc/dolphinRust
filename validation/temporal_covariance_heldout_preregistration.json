@@ -115,9 +115,9 @@
     "output_factor": {
       "method": "reference_specific_influence_v1",
       "method_version": 1,
-      "schema_version": 1,
-      "artifact_hdf5": "spatial_reference_covariance.h5",
-      "artifact_manifest": "spatial_reference_covariance.json",
+      "schema_version": 4,
+      "artifact_hdf5": "referenced_displacement_covariance_factor.h5",
+      "artifact_manifest": "referenced_displacement_covariance_provenance.json",
       "calibration_status": "calibrated_scope_match"
     },
     "mode": "batch",
@@ -126,8 +126,13 @@
     "marginal_rss_combination_allowed": false,
     "scope_fields": [
       "target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel",
-      "common_dates_sha256", "window", "overlap", "distance", "reference_signature_sha256",
-      "source_replay_sha256", "l2_map_sha256", "mask_sha256", "burst_id", "grid_sha256", "units"
+      "schema_version", "method_version", "method", "calibration_scope",
+      "common_dates_sha256", "acquisition_days_sha256", "geotransform_sha256",
+      "window", "overlap", "distance", "reference_signature_sha256",
+      "source_replay_sha256", "l2_map_sha256", "mask_sha256", "source_model_sha256",
+      "effective_looks_sha256", "support_sha256", "correction_order_sha256",
+      "unwrap_branch_sha256", "burst_ownership_sha256", "runtime_resource_receipt_sha256",
+      "burst_id", "grid_sha256", "units"
     ]
   },
   "gnss_provenance": {
