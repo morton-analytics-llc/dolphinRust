@@ -31,6 +31,7 @@ use dolphin_phaselink::source_model::{
 use dolphin_phaselink::{
     ComputeEngine, InfluenceDag, InfluenceNode, NodeId, SourceDefinition, SourceEdge, SourceId,
 };
+use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_timeseries::spatial_covariance::fixed_l2_difference_workspace_composition;
 use ndarray::{array, s, Array1, Array2, Array3, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
@@ -164,6 +165,53 @@ impl FrozenAttemptRequest {
             expected_cell == Some(&self.cell_id),
             "frozen attempt cell ordinal differs from the preregistered iterator: expected {expected_cell:?}"
         );
+        let dgp_order = preregistration
+            .pointer("/determinism/dgp_cell_order")
+            .and_then(Value::as_array)
+            .context("preregistration omits the stable DGP cell order")?;
+        anyhow::ensure!(dgp_order.len() == 40, "stable DGP cell order width differs");
+        let ordered_cells = dgp_order
+            .iter()
+            .map(|cell| {
+                cell.as_str()
+                    .context("stable DGP cell order contains a non-string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ordered_set = ordered_cells.iter().copied().collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            ordered_set.len() == ordered_cells.len(),
+            "stable DGP cell order contains a duplicate"
+        );
+        let tombstone = preregistration
+            .pointer("/determinism/dgp_cell_order_tombstone")
+            .context("preregistration omits the DGP cell-order tombstone")?;
+        let tombstone_cell = tombstone
+            .get("cell_id")
+            .and_then(Value::as_str)
+            .context("DGP cell-order tombstone omits its cell")?;
+        let tombstone_ordinal = tombstone
+            .get("dgp_cell_ordinal")
+            .and_then(Value::as_u64)
+            .context("DGP cell-order tombstone omits its ordinal")?;
+        anyhow::ensure!(
+            tombstone.get("executable").and_then(Value::as_bool) == Some(false)
+                && ordered_cells.get(tombstone_ordinal as usize) == Some(&tombstone_cell),
+            "DGP cell-order tombstone differs from the stable order"
+        );
+        let scheduled_set = cells.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let executable_set = ordered_set
+            .iter()
+            .copied()
+            .filter(|cell| *cell != tombstone_cell)
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            executable_set == scheduled_set && !scheduled_set.contains(tombstone_cell),
+            "stable DGP cell order differs from the executable matrix"
+        );
+        let dgp_ordinal = ordered_cells
+            .iter()
+            .position(|cell| *cell == self.cell_id)
+            .context("frozen attempt cell is absent from the stable DGP order")?;
         let seed = preregistration
             .pointer("/seed_schedule/validation_seed")
             .and_then(Value::as_str)
@@ -176,16 +224,7 @@ impl FrozenAttemptRequest {
             self.seed_sha256 == expected_seed,
             "frozen attempt seed digest differs"
         );
-        let dgp_id = if self.pair_geometry.ends_with("_negative") {
-            let positive_id = self.cell_id.replace("_negative|", "_positive|");
-            cells
-                .iter()
-                .position(|cell| cell == &positive_id)
-                .map_or(self.cell_ordinal, |ordinal| ordinal as u64)
-        } else {
-            self.cell_ordinal
-        };
-        Ok(dgp_id)
+        Ok(u64::try_from(dgp_ordinal)?)
     }
 }
 
@@ -1143,6 +1182,101 @@ fn build_empty_support_evidence(
     Ok(Value::Object(evidence))
 }
 
+fn reconstruct_nondifferentiable_supports(
+    request: &FrozenAttemptRequest,
+    geometry: &FrozenCellGeometry,
+    raw: &BTreeMap<(i64, i64), Vec<Cf64>>,
+    blocks: &[Value],
+    center: (i64, i64),
+    candidates: &[(i64, i64)],
+) -> Result<Vec<BTreeSet<(i64, i64)>>> {
+    if request.support == "rect" {
+        return Ok(vec![candidates.iter().copied().collect(); blocks.len()]);
+    }
+    anyhow::ensure!(
+        matches!(request.support.as_str(), "glrt_frozen" | "ks_frozen"),
+        "unsupported nondifferentiable support reconstruction"
+    );
+    let output = (
+        native_center_to_output(center.0, geometry.stride.0)?,
+        native_center_to_output(center.1, geometry.stride.1)?,
+    );
+    let half_window = dolphin_core::HalfWindow {
+        y: geometry.half_window.0,
+        x: geometry.half_window.1,
+    };
+    let strides = dolphin_core::Strides {
+        y: geometry.stride.0,
+        x: geometry.stride.1,
+    };
+    let window_columns = 2 * geometry.half_window.1 + 1;
+    blocks
+        .iter()
+        .map(|block| {
+            let real_start = usize::try_from(
+                block
+                    .get("real_start")
+                    .and_then(Value::as_u64)
+                    .context("expected block omits real start")?,
+            )?;
+            let num_real = usize::try_from(
+                block
+                    .get("num_real")
+                    .and_then(Value::as_u64)
+                    .context("expected block omits real count")?,
+            )?;
+            let mut amplitude = Array3::zeros((
+                num_real,
+                geometry.native_tile_shape.0,
+                geometry.native_tile_shape.1,
+            ));
+            for &(row, column) in candidates {
+                let history = raw
+                    .get(&(row, column))
+                    .context("nondifferentiable support candidate is absent from raw DGP")?;
+                anyhow::ensure!(
+                    real_start + num_real <= history.len(),
+                    "nondifferentiable block exceeds raw DGP dates"
+                );
+                let row = usize::try_from(row)?;
+                let column = usize::try_from(column)?;
+                for date in 0..num_real {
+                    amplitude[(date, row, column)] = history[real_start + date].norm();
+                }
+            }
+            let mask = if request.support == "glrt_frozen" {
+                let mean = amplitude
+                    .mean_axis(Axis(0))
+                    .context("nondifferentiable GLRT block is empty")?;
+                let variance = amplitude.var_axis(Axis(0), 0.0);
+                estimate_neighbors_glrt(
+                    mean.view(),
+                    variance.view(),
+                    half_window,
+                    num_real,
+                    strides,
+                    0.001,
+                )
+            } else {
+                estimate_neighbors_ks(amplitude.view(), half_window, strides, 0.001, false)
+            };
+            Ok(candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &coordinate)| {
+                    mask[(
+                        output.0,
+                        output.1,
+                        slot / window_columns,
+                        slot % window_columns,
+                    )]
+                        .then_some(coordinate)
+                })
+                .collect())
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_nondifferentiable_evidence(
     preregistration: &Value,
@@ -1152,31 +1286,47 @@ fn build_nondifferentiable_evidence(
     geometry: &FrozenCellGeometry,
     raw: &BTreeMap<(i64, i64), Vec<Cf64>>,
 ) -> Result<Value> {
-    anyhow::ensure!(
-        request.support == "rect",
-        "nondifferentiable support reconstruction is only defined for rectangular support"
-    );
     let blocks = geometry
         .topology
         .get("expected_blocks")
         .and_then(Value::as_array)
         .context("topology omits expected blocks")?;
-    let target_phase = inward_clamped_support(
+    let target_candidates = inward_clamped_support(
         geometry.target,
         geometry.half_window,
         geometry.native_tile_shape,
-    )?
-    .into_iter()
-    .collect::<std::collections::BTreeSet<_>>();
-    let reference_phase = inward_clamped_support(
+    )?;
+    let reference_candidates = inward_clamped_support(
         geometry.reference,
         geometry.half_window,
         geometry.native_tile_shape,
-    )?
-    .into_iter()
-    .collect::<std::collections::BTreeSet<_>>();
-    let target_support_by_block = vec![target_phase.clone(); blocks.len()];
-    let reference_support_by_block = vec![reference_phase.clone(); blocks.len()];
+    )?;
+    let target_support_by_block = reconstruct_nondifferentiable_supports(
+        request,
+        geometry,
+        raw,
+        blocks,
+        geometry.target,
+        &target_candidates,
+    )?;
+    let reference_support_by_block = reconstruct_nondifferentiable_supports(
+        request,
+        geometry,
+        raw,
+        blocks,
+        geometry.reference,
+        &reference_candidates,
+    )?;
+    let target_phase = target_support_by_block
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let reference_phase = reference_support_by_block
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let target_receipt = support_halo_receipt(blocks, &target_support_by_block)?;
     let reference_receipt = support_halo_receipt(blocks, &reference_support_by_block)?;
     let target_support_sha256 = sha256_json_value(&target_receipt)?;
@@ -1208,12 +1358,10 @@ fn build_nondifferentiable_evidence(
     let intersection = target_phase.intersection(&reference_phase).count();
     let union = target_phase.union(&reference_phase).count();
     anyhow::ensure!(union > 0, "nondifferentiable production support is empty");
-    let mut effective_support = target_phase
-        .union(&reference_phase)
-        .copied()
+    let effective_support = target_candidates
+        .into_iter()
+        .chain(reference_candidates)
         .collect::<std::collections::BTreeSet<_>>();
-    effective_support.insert(geometry.target);
-    effective_support.insert(geometry.reference);
     let source_correlation_model = if request.source_process == "independent_complex_looks" {
         "identity_v1"
     } else {
@@ -4654,7 +4802,7 @@ mod tests {
         let request = |seed_index| FrozenAttemptRequest {
             schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
             cell_id: cell_id.to_owned(),
-            cell_ordinal: 14,
+            cell_ordinal: 13,
             seed_index,
             seed_sha256: format!(
                 "{:x}",
@@ -4672,6 +4820,21 @@ mod tests {
             eigen_stress: "well_separated".to_owned(),
             source_process: "spatial_correlation_stress".to_owned(),
         };
+        assert_eq!(request(0).validate(&preregistration).unwrap(), 14);
+        let mut tombstone = request(0);
+        tombstone.cell_id = tombstone
+            .cell_id
+            .replace("shared_75_positive", "shared_75_negative");
+        tombstone.pair_geometry = "shared_75_negative".to_owned();
+        tombstone.cell_ordinal = 10;
+        tombstone.seed_sha256 = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "spatial-covariance-f54-07-v2||{}||0",
+                tombstone.cell_id
+            ))
+        );
+        assert!(tombstone.validate(&preregistration).is_err());
         let first = run_frozen_attempt(&preregistration, &tables, &request(0)).unwrap();
         assert_eq!(first["status"], "valid");
         assert_eq!(first["emitted"], true);
@@ -4680,6 +4843,18 @@ mod tests {
         assert_eq!(emitted["status"], "valid");
         assert_eq!(emitted["emitted"], true);
         assert_eq!(first["raw_input_shape"], emitted["raw_input_shape"]);
+        let nondifferentiable =
+            run_frozen_attempt(&preregistration, &tables, &request(22)).unwrap();
+        assert_eq!(nondifferentiable["status"], "nondifferentiable_node");
+        assert_eq!(nondifferentiable["emitted"], false);
+        assert_eq!(nondifferentiable["factor_emitted"], false);
+        assert!(nondifferentiable["target_source_count"].as_u64().unwrap() > 0);
+        assert!(
+            nondifferentiable["reference_source_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
@@ -4760,7 +4935,7 @@ mod tests {
             &FrozenAttemptRequest {
                 schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
                 cell_id: cell_id.to_owned(),
-                cell_ordinal: 21,
+                cell_ordinal: 20,
                 seed_index: 0,
                 seed_sha256: format!(
                     "{:x}",
@@ -4790,7 +4965,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_cohorts_use_production_replay_fixed_l2_and_factor_writer() {
+    fn analytic_signed_couplings_use_production_replay_fixed_l2_and_factor_writer() {
         let independent = run_validation_case(ValidationCoupling::Independent, 7).unwrap();
         let positive = run_validation_case(ValidationCoupling::Positive, 7).unwrap();
         let negative = run_validation_case(ValidationCoupling::Negative, 7).unwrap();

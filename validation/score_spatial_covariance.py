@@ -29,8 +29,8 @@ ATTEMPT_STATUSES = {
 HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 128
 FROZEN_DETERMINISTIC_SEED_COUNT = 1
-FROZEN_CELL_COUNT = 40
-FROZEN_ATTEMPT_COUNT = 3088
+FROZEN_CELL_COUNT = 39
+FROZEN_ATTEMPT_COUNT = 3087
 FROZEN_MAX_CELLS_PER_SHARD = 100
 FROZEN_SHARD_COUNT = 1
 FROZEN_MAX_SHARD_BYTES = 100 * 8192
@@ -40,28 +40,28 @@ FROZEN_MAX_SHARD_MANIFEST_BYTES = 16384
 FROZEN_MAX_RUN_MANIFEST_BYTES = 16777216
 FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
-FROZEN_RETAINED_SIZE_BOUND_BYTES = 21315584
+FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "4e111c317c0659298d738e253f0d8c74115585d2bf76c806a88a2f7af315fd67"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "0454db5925bbb3076ec40d59f2fc861f5950b88c860cbf66ab68425f709425d5"
-FROZEN_EXECUTION_SHA256 = "0c4f33b189555caffbcf703edc13a075d0499c1ff8c1bf56b033d1020a8190ea"
-FROZEN_REDUCERS_SHA256 = "bdab964569b074caf0bc27ec758a2f7ca633a911368333610fd42c96bb6740dd"
-FROZEN_MATRIX_SHA256 = "7d56f01b6b759de9f722f476d7c2346e2c614580b3fdfc5ffecc00e030636244"
+FROZEN_GENERATOR_SHA256 = "9b2f36fb19ca7ba8407128e07c8c060b47ef5d5ba684aa480a757c79bba06a6b"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ec37d83f50ae66f24d2b371809cc1e733c8207253b5e3e21c185882349619e25"
+FROZEN_EXECUTION_SHA256 = "7e563007476178ebe68005ee7ff39052400dca19a5df43a789ec0b4bc52ce2d2"
+FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
+FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
 FROZEN_RECEIPT_SHA256 = "b25997a99ecd2c67f37949744687b8530cccf3e4d7515daec1d6fb87117cb957"
 FROZEN_HASH_FIELDS_SHA256 = "ce6b747b1b562225537ccf1148778517e60c1a54b42c02404011a467d4f2b7ed"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "0874fc530fda38d9f0e72b548549f47d749789e2c380c16c506bab03e0431559"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "393edffc872fa11fcb7c5c788205735ca622dc913ae818ce115714ffeeabec79"
 FROZEN_V4_PREREGISTRATION_SHA256 = "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35"
-FROZEN_DETERMINISM_SHA256 = "2a8140057a3305527cd6e8af814e563fe5b6f5b8618b204660e285ca55995b54"
-FROZEN_NUMERIC_SHA256 = "2ee08381f7346bf27309798294687986a7d9a9a3dcc38dbd7c37a0b727a74f79"
+FROZEN_DETERMINISM_SHA256 = "84d899959ae8abeaed6d60d6d7d9af24d1e933959c3e077e799f760f25da52de"
+FROZEN_NUMERIC_SHA256 = "3ba716628b06bc83004c1d7fb971eef39f9a86dc9f5f4330e5cb649961a3f413"
 FROZEN_NORMAL_QUANTILE_SHA256 = "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4"
 FROZEN_DGP_COEFFICIENT_SHA256 = "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3"
 FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "ac1ad658931af8e0c59c59f527159b5889cc030d901d19017a327e4e54ec0182"
+FROZEN_SOURCE_SET_SHA256 = "7caa00c0bdddca5dafe5db412331063c686c30dcd0d53204b437f6a6d72114fc"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -73,9 +73,9 @@ FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS = (
     "FROZEN_GENERATOR_SHA256",
     "FROZEN_SOURCE_SET_SHA256",
 )
-FROZEN_MATCHED_POSITIVE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
-FROZEN_MATCHED_NEGATIVE_CELL = FROZEN_MATCHED_POSITIVE_CELL.replace("shared_75_positive", "shared_75_negative")
-FROZEN_MATCHED_SEED_COUNT = 512
+FROZEN_POSITIVE_OVERLAP_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+FROZEN_POSITIVE_OVERLAP_SEED_COUNT = 512
+FROZEN_POSITIVE_OVERLAP_EMISSION_RATE_MIN = 0.95
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -163,7 +163,7 @@ SHARD_MANIFEST_KEYS = {
 RUN_MANIFEST_KEYS = {
     "schema", "schema_version", "preregistration_sha256", "code_sha256", "binary_sha256",
     "generator_protocol_sha256", "performance_probe", "resources", "shard_manifests", "result_root_sha256",
-    "production_parity_fixture", "production_parity_fixture_sha256", "matched_pair_cohorts",
+    "production_parity_fixture", "production_parity_fixture_sha256", "positive_overlap_cohort",
 }
 RESOURCE_KEYS = {
     "resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "os",
@@ -721,6 +721,37 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         for name in DIMENSION_NAMES:
             if _dimension_values(preregistration, name) != FROZEN_DIMENSION_IDS[name]:
                 errors.append(f"dimension {name} does not match the frozen matrix")
+    matrix = preregistration.get("matrix_contract", {})
+    stochastic_cells = matrix.get("stochastic_cells", [])
+    deterministic_cells = matrix.get("deterministic_contract_cells", [])
+    determinism = preregistration.get("determinism", {})
+    dgp_cell_order = determinism.get("dgp_cell_order", [])
+    tombstone = determinism.get("dgp_cell_order_tombstone", {})
+    tombstone_cell = tombstone.get("cell_id")
+    tombstone_ordinal = tombstone.get("dgp_cell_ordinal")
+    scheduled_cells = (
+        [*stochastic_cells, *deterministic_cells]
+        if isinstance(stochastic_cells, list) and isinstance(deterministic_cells, list)
+        else []
+    )
+    dgp_order_valid = (
+        isinstance(dgp_cell_order, list)
+        and len(dgp_cell_order) == 40
+        and all(isinstance(cell_id, str) for cell_id in dgp_cell_order)
+        and len(set(dgp_cell_order)) == 40
+        and isinstance(tombstone_cell, str)
+        and _integer(tombstone_ordinal)
+        and 0 <= tombstone_ordinal < len(dgp_cell_order)
+        and dgp_cell_order[tombstone_ordinal] == tombstone_cell
+        and tombstone.get("executable") is False
+        and all(isinstance(cell_id, str) for cell_id in scheduled_cells)
+        and tombstone_cell not in scheduled_cells
+        and set(dgp_cell_order) - {tombstone_cell} == set(scheduled_cells)
+    )
+    if not dgp_order_valid:
+        errors.append(
+            "DGP cell order must preserve the exact 40-entry order with one nonexecutable tombstone"
+        )
     schedule = preregistration.get("seed_schedule")
     if (
         not isinstance(schedule, dict)
@@ -776,7 +807,7 @@ def iter_expected_cell_ids(preregistration: Mapping[str, Any]) -> Iterator[str]:
     matrix = preregistration["matrix_contract"]
     stochastic = matrix.get("stochastic_cells")
     deterministic = matrix.get("deterministic_contract_cells")
-    if not isinstance(stochastic, list) or len(stochastic) != 24 or not isinstance(deterministic, list) or len(deterministic) != 16:
+    if not isinstance(stochastic, list) or len(stochastic) != 24 or not isinstance(deterministic, list) or len(deterministic) != 15:
         raise SchemaError("v5 explicit stochastic/deterministic cell counts differ")
     cells: set[tuple[str, ...]] = set()
     for cell_id in (*stochastic, *deterministic):
@@ -895,7 +926,7 @@ def iter_shard_specs(preregistration: Mapping[str, Any]) -> Iterator[ShardSpec]:
         )
         ordinal = end
     if next(cells, None) is not None or ordinal != FROZEN_CELL_COUNT:
-        raise SchemaError("frozen shards do not cover exactly 40 cells")
+        raise SchemaError("frozen shards do not cover exactly 39 cells")
 
 
 def _expected_seed_hash(preregistration: Mapping[str, Any], cell_id: str, index: int) -> str:
@@ -918,25 +949,19 @@ def _dgp_generator_identity(preregistration: Mapping[str, Any]) -> str:
 def _dgp_cell_ordinal(preregistration: Mapping[str, Any], cell_id: str) -> int:
     cached = _CELL_ORDINAL_CACHE.get(id(preregistration))
     if cached is None or cached[0] is not preregistration:
+        scheduled_cells = set(expected_cell_ids(preregistration))
         ordinal_by_cell = {
-            expected_cell_id: ordinal
-            for ordinal, expected_cell_id in enumerate(expected_cell_ids(preregistration))
+            ordered_cell_id: ordinal
+            for ordinal, ordered_cell_id in enumerate(
+                preregistration["determinism"]["dgp_cell_order"]
+            )
+            if ordered_cell_id in scheduled_cells
         }
         cached = (preregistration, ordinal_by_cell)
         _CELL_ORDINAL_CACHE[id(preregistration)] = cached
     ordinal_by_cell = cached[1]
-    matched_cell_id = cell_id
-    labels = cell_id.split("|")
-    if len(labels) == len(DIMENSION_NAMES):
-        geometry_index = DIMENSION_NAMES.index("pair_geometry")
-        geometry = labels[geometry_index]
-        if geometry.endswith("_negative"):
-            labels[geometry_index] = geometry.removesuffix("_negative") + "_positive"
-            positive_cell_id = "|".join(labels)
-            if positive_cell_id in ordinal_by_cell:
-                matched_cell_id = positive_cell_id
     try:
-        return ordinal_by_cell[matched_cell_id]
+        return ordinal_by_cell[cell_id]
     except KeyError as exc:
         raise SchemaError("frozen DGP cell is outside the preregistered matrix") from exc
 
@@ -1591,14 +1616,13 @@ def regenerate_frozen_attempt_inputs(
     cell_id: str,
     seed_index: int,
     *,
-    matched_cohort_replay: bool = False,
+    positive_overlap_replay: bool = False,
 ) -> dict[str, Any]:
-    matched_cells = {FROZEN_MATCHED_POSITIVE_CELL, FROZEN_MATCHED_NEGATIVE_CELL}
-    if matched_cohort_replay and cell_id not in matched_cells:
-        raise SchemaError("matched cohort replay is restricted to the two frozen signed cells")
+    if positive_overlap_replay and cell_id != FROZEN_POSITIVE_OVERLAP_CELL:
+        raise SchemaError("positive-overlap replay is restricted to its frozen cell")
     seed_limit = (
-        FROZEN_MATCHED_SEED_COUNT
-        if matched_cohort_replay
+        FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        if positive_overlap_replay
         else expected_seed_count(cell_id)
     )
     if not _integer(seed_index) or seed_index < 0 or seed_index >= seed_limit:
@@ -1886,7 +1910,7 @@ class CellAccumulator:
     code_sha256: str = "0" * 64
     binary_sha256: str = "0" * 64
     artifact_root: Path | None = None
-    matched_cohort_replay: bool = False
+    positive_overlap_replay: bool = False
     next_seed_index: int = 0
     emitted: int = 0
     date_count: int = 0
@@ -1922,18 +1946,13 @@ class CellAccumulator:
     attempt_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:attempts:v4\0"))
 
     def __post_init__(self) -> None:
-        if self.matched_cohort_replay:
-            if self.cell_id not in {
-                FROZEN_MATCHED_POSITIVE_CELL,
-                FROZEN_MATCHED_NEGATIVE_CELL,
-            }:
-                raise SchemaError(
-                    "matched cohort accumulator is restricted to the two frozen signed cells"
-                )
+        if self.positive_overlap_replay:
+            if self.cell_id != FROZEN_POSITIVE_OVERLAP_CELL:
+                raise SchemaError("positive-overlap accumulator is restricted to its frozen cell")
             if self.expected_seed_count is None:
-                self.expected_seed_count = FROZEN_MATCHED_SEED_COUNT
-            if self.expected_seed_count != FROZEN_MATCHED_SEED_COUNT:
-                raise SchemaError("matched cohort accumulator must use the frozen seed schedule")
+                self.expected_seed_count = FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+            if self.expected_seed_count != FROZEN_POSITIVE_OVERLAP_SEED_COUNT:
+                raise SchemaError("positive-overlap accumulator must use the frozen seed schedule")
         if self.expected_seed_count is None:
             self.expected_seed_count = expected_seed_count(self.cell_id)
 
@@ -1984,7 +2003,7 @@ class CellAccumulator:
             self.preregistration,
             self.cell_id,
             self.next_seed_index,
-            matched_cohort_replay=self.matched_cohort_replay,
+            positive_overlap_replay=self.positive_overlap_replay,
         )
         if any(
             not isinstance(attempt.get(field_name), list)
@@ -2447,53 +2466,58 @@ def validate_direct_pair_variance_order(
             )
 
 
-def validate_matched_pair_cohorts(
+def validate_positive_overlap_cohort(
     value: Any,
     code_sha256: str | None = None,
     binary_sha256: str | None = None,
     config_sha256: str | None = None,
 ) -> None:
     keys = {
-        "coupling", "marginal_dgp_digest", "target_support_digest", "reference_support_digest",
+        "schema", "cell_id", "marginal_dgp_digest", "target_support_digest", "reference_support_digest",
         "latent_history_digest", "phase_orientation_digest", "predicted_covariance_trace",
-        "empirical_error_covariance_trace", "positive_cell_id", "negative_cell_id",
-        "seed_count", "positive_attempt_digest", "negative_attempt_digest",
+        "predicted_marginal_covariance_trace", "empirical_error_covariance_trace",
+        "empirical_marginal_covariance_trace", "attempted_seed_count", "emitted_seed_count",
+        "emitted_seed_digest", "abstained_seed_count", "abstained_seed_digest", "attempt_digest",
         "code_sha256", "binary_sha256", "config_sha256",
     }
     if (
-        not isinstance(value, list)
-        or len(value) != 3
-        or any(not isinstance(item, dict) or set(item) != keys for item in value)
-        or [item["coupling"] for item in value] != ["positive", "independent", "negative"]
-        or any(not _is_sha256(item.get(name)) for item in value for name in (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("schema") != "dolphinrust.spatial-covariance.positive-overlap-cohort/1"
+        or value.get("cell_id") != FROZEN_POSITIVE_OVERLAP_CELL
+        or any(not _is_sha256(value.get(name)) for name in (
             "marginal_dgp_digest", "target_support_digest", "reference_support_digest",
-            "latent_history_digest", "phase_orientation_digest", "positive_attempt_digest",
-            "negative_attempt_digest", "code_sha256", "binary_sha256", "config_sha256",
+            "latent_history_digest", "phase_orientation_digest", "attempt_digest",
+            "emitted_seed_digest", "abstained_seed_digest", "code_sha256", "binary_sha256",
+            "config_sha256"
         ))
-        or any(item.get("positive_cell_id") != FROZEN_MATCHED_POSITIVE_CELL for item in value)
-        or any(item.get("negative_cell_id") != FROZEN_MATCHED_NEGATIVE_CELL for item in value)
-        or any(item.get("seed_count") != FROZEN_MATCHED_SEED_COUNT for item in value)
+        or value.get("attempted_seed_count") != FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        or not _integer(value.get("emitted_seed_count"))
+        or value["emitted_seed_count"] < math.ceil(
+            FROZEN_POSITIVE_OVERLAP_SEED_COUNT * FROZEN_POSITIVE_OVERLAP_EMISSION_RATE_MIN
+        )
+        or value["emitted_seed_count"] > FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        or not _integer(value.get("abstained_seed_count"))
+        or value["abstained_seed_count"] < 0
+        or value["emitted_seed_count"] + value["abstained_seed_count"]
+        != FROZEN_POSITIVE_OVERLAP_SEED_COUNT
+        or any(not _number(value.get(name)) for name in (
+            "predicted_covariance_trace", "predicted_marginal_covariance_trace",
+            "empirical_error_covariance_trace", "empirical_marginal_covariance_trace",
+        ))
+        or value["predicted_covariance_trace"] >= value["predicted_marginal_covariance_trace"]
+        or value["empirical_error_covariance_trace"]
+        >= value["empirical_marginal_covariance_trace"]
         or any(
-            item.get(name) != value[0].get(name)
-            for item in value[1:]
-            for name in (
-                "positive_cell_id", "negative_cell_id", "seed_count",
-                "positive_attempt_digest", "negative_attempt_digest",
-                "code_sha256", "binary_sha256", "config_sha256",
+            expected is not None and value.get(name) != expected
+            for name, expected in (
+                ("code_sha256", code_sha256),
+                ("binary_sha256", binary_sha256),
+                ("config_sha256", config_sha256),
             )
         )
     ):
-        raise SchemaError("matched positive/independent/negative cohort evidence is malformed")
-    if any(
-        expected is not None and any(item.get(name) != expected for item in value)
-        for name, expected in (
-            ("code_sha256", code_sha256),
-            ("binary_sha256", binary_sha256),
-            ("config_sha256", config_sha256),
-        )
-    ):
-        raise SchemaError("matched cohort producer identity differs from the run")
-    validate_direct_pair_variance_order(*value)
+        raise SchemaError("positive-overlap cohort evidence is malformed")
 
 
 def _read_json_line(handle: BinaryIO, path: Path, line_number: int) -> tuple[dict[str, Any] | None, bytes]:
@@ -3700,8 +3724,8 @@ def score_run_manifest(
             run_manifest["production_parity_fixture_sha256"],
             batch_binary,
         )
-        validate_matched_pair_cohorts(
-            run_manifest["matched_pair_cohorts"],
+        validate_positive_overlap_cohort(
+            run_manifest["positive_overlap_cohort"],
             run_manifest["code_sha256"],
             run_manifest["binary_sha256"],
             sha256_json(preregistration["generator"]),
