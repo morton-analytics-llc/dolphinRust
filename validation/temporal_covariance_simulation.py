@@ -179,6 +179,17 @@ SOURCE_CORRELATION_MODEL = "exponential_euclidean_v1"
 SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS = 1.5
 OUTER_COVERAGE_DGP = "physical_raw_space_v1"
 CONDITIONAL_COVARIANCE_ORACLE = "fixed_capture_common_factor_monte_carlo_v1"
+FROZEN_SOURCE_SET_SCHEMA = "dolphinrust.canonical-producer-source-set/2"
+FROZEN_SOURCE_SET_SHA256 = "398c73491231c4417503b5d8bdc908ecded95deb1426c63fac86dc0b7625348d"
+FROZEN_SOURCE_SET_ROOTS = ("crates",)
+FROZEN_SOURCE_SET_FILES = (
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs",
+    "validation/temporal_covariance_simulation.py",
+    "crates/dolphin-timeseries/src/temporal_covariance.rs",
+)
+FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS = ("FROZEN_SOURCE_SET_SHA256",)
 MAX_REQUEST_LINE_BYTES = 4 * 1024 * 1024
 MAX_RESPONSE_LINE_BYTES = 4 * 1024 * 1024
 MAX_SHARD_RECORD_BYTES = 16 * 1024 * 1024
@@ -501,6 +512,32 @@ METHOD_FIELDS = {
         "slope_profile_likelihood_ml": "adjusted_profile",
         "complete_refit_bootstrap": "complete_refit_bootstrap",
 }
+COMPARATOR_METHOD_IDENTITIES = [
+    "ols", "oracle_gls", "legacy_intercept_slope_wls_non_comparable",
+    "lag_one_scalar_effective_n", "plugin_gls_reml",
+    "reml_covariance_parameter_adjusted_scalar", "slope_profile_likelihood_ml",
+    "complete_refit_bootstrap",
+]
+TEMPORAL_STATUSES = {
+    "Evaluated", "InsufficientDates", "DatesNotStrictlyIncreasing", "GaugeMissing",
+    "GaugeNotZero", "DesignRankDeficient", "DesignIllConditioned",
+    "CovarianceNonfinite", "TotalCovarianceNotPositiveDefinite",
+    "CovarianceParameterAtBoundary", "RhoLowerBoundary", "RhoUpperBoundary",
+    "ProcessVarianceLowerBoundary", "ProcessVarianceUpperBoundary",
+    "BootstrapInsufficientSuccess", "UnsupportedCadence", "OptimizerNonconverged",
+    "WeakParameterIdentification", "LegacyNonComparable",
+}
+PRODUCTION_FAIL_CLOSED_STATUSES = {
+    "production_inputs_missing", "source_seed_mismatch", "production_contract_mismatch",
+    "capture_scope_mismatch", "raw_complex_invalid", "source_model_invalid",
+    "carrier_sequential_failed", "topology planning failed",
+    "production sequential capture failed", "production replay preflight failed",
+    "production replay failed", "production replay exceeded its exact preflight receipt",
+    "target fixed-L2 map failed", "reference fixed-L2 map failed",
+    "fixed-L2 covariance propagation failed", "reference_context_mismatch",
+    "source_correlation_mismatch", "conditional common-factor oracle input is invalid",
+    "conditional common-factor covariance is not positive semidefinite",
+}
 
 
 class MethodReducer:
@@ -722,6 +759,72 @@ def sha256_file(path: Path, byte_cap: int) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _producer_source_bytes(path: Path, relative_path: str) -> bytes:
+    raw = _read_bounded_regular(path, 64 * 1024 * 1024)
+    if relative_path != "validation/temporal_covariance_simulation.py":
+        return raw
+    try:
+        lines = raw.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError as error:
+        raise RuntimeError("temporal producer source is not UTF-8") from error
+    seen = set()
+    normalized = []
+    for line in lines:
+        name = next(
+            (candidate for candidate in FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS
+             if line.startswith(f'{candidate} = "')),
+            None,
+        )
+        if name is None:
+            normalized.append(line)
+            continue
+        if name in seen or not line.rstrip("\r\n").endswith('"'):
+            raise RuntimeError("temporal producer identity assignment is malformed")
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        normalized.append(f'{name} = "<producer-source-set-v2>"{ending}')
+        seen.add(name)
+    if seen != set(FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS):
+        raise RuntimeError("temporal producer identity assignments are missing")
+    return "".join(normalized).encode("utf-8")
+
+
+def _canonical_source_entries(source_root: Path) -> list[dict]:
+    source_root = source_root.resolve(strict=True)
+    paths = [source_root / name for name in FROZEN_SOURCE_SET_FILES]
+    for root_name in FROZEN_SOURCE_SET_ROOTS:
+        root = source_root / root_name
+        paths.extend(
+            path for path in root.rglob("*")
+            if path.is_file() and (path.suffix == ".rs" or path.name == "Cargo.toml")
+        )
+    entries = []
+    for path in sorted(set(paths), key=lambda value: value.relative_to(source_root).as_posix()):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(
+                "source identity contains a missing, non-regular, or symlinked file"
+            )
+        relative_path = path.relative_to(source_root).as_posix()
+        normalized = _producer_source_bytes(path, relative_path)
+        entries.append({
+            "path": relative_path,
+            "byte_count": len(normalized),
+            "sha256": hashlib.sha256(normalized).hexdigest(),
+        })
+    if not entries:
+        raise RuntimeError("source identity set is empty")
+    return entries
+
+
+def canonical_source_set_sha256(source_root: Path) -> str:
+    return hashlib.sha256(canonical_json_bytes({
+        "schema": FROZEN_SOURCE_SET_SCHEMA,
+        "roots": list(FROZEN_SOURCE_SET_ROOTS),
+        "files": list(FROZEN_SOURCE_SET_FILES),
+        "normalized_assignments": list(FROZEN_SOURCE_SET_NORMALIZED_ASSIGNMENTS),
+        "entries": _canonical_source_entries(source_root),
+    })).hexdigest()
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -762,6 +865,18 @@ def atomic_write_no_replace(path: Path, payload: bytes) -> None:
 
 def producer_identity(preregistration: dict, binary: Path) -> dict:
     root = Path(__file__).parents[1]
+    expected_binary = root / "target/release/examples/temporal_covariance_batch"
+    try:
+        resolved_binary = Path(binary).resolve(strict=True)
+        resolved_expected = expected_binary.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("temporal producer must be the exact prebuilt release executable") from error
+    metadata = resolved_binary.stat()
+    if (
+            resolved_binary != resolved_expected
+            or not stat.S_ISREG(metadata.st_mode)
+            or not os.access(resolved_binary, os.X_OK)):
+        raise RuntimeError("temporal producer must be the exact prebuilt release executable")
     paths = {
         "generator_sha256": Path(__file__),
         "batch_source_sha256": (
@@ -777,13 +892,28 @@ def producer_identity(preregistration: dict, binary: Path) -> dict:
     }
     if actual_hashes != preregistration["file_hashes"]:
         raise RuntimeError("frozen temporal covariance source hashes do not match the run")
-    binary_sha256, binary_bytes = sha256_file(binary, 1024 * 1024 * 1024)
+    source_set_sha256 = canonical_source_set_sha256(root)
+    binary_sha256, binary_bytes = sha256_file(resolved_binary, 1024 * 1024 * 1024)
+    frozen_identity = preregistration.get("producer_identity")
+    expected_identity = {
+        "schema": "dolphinrust.temporal-covariance.producer-identity/1",
+        "source_set_schema": FROZEN_SOURCE_SET_SCHEMA,
+        "source_set_sha256": source_set_sha256,
+        "binary_path": "target/release/examples/temporal_covariance_batch",
+        "binary_sha256": binary_sha256,
+        "binary_bytes": binary_bytes,
+    }
+    if frozen_identity != expected_identity or source_set_sha256 != FROZEN_SOURCE_SET_SHA256:
+        raise RuntimeError("frozen temporal producer source/binary identity does not match the run")
     return {
         "schema": RUN_IDENTITY_SCHEMA,
         "preregistration_sha256": hashlib.sha256(
             canonical_json_bytes(preregistration)
         ).hexdigest(),
         **actual_hashes,
+        "source_set_schema": FROZEN_SOURCE_SET_SCHEMA,
+        "source_set_sha256": source_set_sha256,
+        "binary_path": "target/release/examples/temporal_covariance_batch",
         "binary_sha256": binary_sha256,
         "binary_bytes": binary_bytes,
         "batch_schema": preregistration["schemas"]["batch"],
@@ -835,14 +965,25 @@ def _read_bounded_line(handle, cap: int) -> bytes:
 
 
 def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> None:
+    response_keys = {
+        "schema", "execution_path", "cell_id", "cell_index", "outer_seed_index",
+        "seed_sha256", "seed", "fixed_factor_status", "production_path_status",
+        "comparator_methods", "attempted", "emitted", "failed", "fit", "provenance",
+        "production_receipts", "resource",
+    }
     identity = (
         "execution_path", "cell_id", "cell_index", "outer_seed_index",
         "seed_sha256", "seed",
     )
-    if not isinstance(record, dict) or record.get("schema") != batch_schema:
+    if (
+            not isinstance(record, dict)
+            or set(record) != response_keys
+            or record.get("schema") != batch_schema):
         raise RuntimeError("batch returned a malformed schema")
     if any(record.get(field) != request[field] for field in identity):
         raise RuntimeError("batch returned a stale or mismatched attempt identity")
+    if record["comparator_methods"] != COMPARATOR_METHOD_IDENTITIES:
+        raise RuntimeError("batch returned stale comparator identities")
     if record.get("attempted") is not True:
         raise RuntimeError("batch omitted the attempted disposition")
     if type(record.get("emitted")) is not bool or type(record.get("failed")) is not bool:
@@ -850,14 +991,177 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
     if record["emitted"] == record["failed"]:
         raise RuntimeError("batch emission and failure dispositions are inconsistent")
     resource = record.get("resource")
-    if not isinstance(resource, dict) or any(
-            type(resource.get(field)) is not int or resource[field] < 0
-            for field in (
+    if (
+            not isinstance(resource, dict)
+            or set(resource) != {
                 "wall_micros", "resident_set_bytes_before", "resident_set_bytes_after"
-            )):
+            }
+            or any(
+                type(resource.get(field)) is not int or resource[field] < 0
+                for field in (
+                    "wall_micros", "resident_set_bytes_before", "resident_set_bytes_after"
+                )
+            )
+    ):
         raise RuntimeError("batch returned a malformed resource receipt")
+
+    def finite_optional(value, *, nonnegative=False):
+        return value is None or (
+            type(value) in (int, float)
+            and math.isfinite(value)
+            and (not nonnegative or value >= 0.0)
+        )
+
+    def validate_interval(interval):
+        if interval is None:
+            return True
+        return (
+            isinstance(interval, dict)
+            and set(interval) == {"lower", "upper", "successful_replicates"}
+            and finite_optional(interval["lower"])
+            and finite_optional(interval["upper"])
+            and interval["lower"] is not None
+            and interval["upper"] is not None
+            and interval["lower"] <= interval["upper"]
+            and type(interval["successful_replicates"]) is int
+            and interval["successful_replicates"] >= 0
+        )
+
+    fit = record["fit"]
+    if fit is not None:
+        fit_keys = {
+            "status", "ols_slope", "oracle_gls_slope", "plugin_gls_slope",
+            "adjusted_profile_slope", "bootstrap_slope", "bootstrap_interval",
+            "fitted_rho", "fitted_process_variance", "raw_correlation",
+            "valid_date_count", "rank", "degrees_of_freedom",
+            "covariance_condition_number", "ols", "oracle_gls", "conditional_wls",
+            "scalar_effective_n", "plugin_gls", "adjusted_scalar", "adjusted_profile",
+            "complete_refit_bootstrap", "bootstrap_attempts", "bootstrap_successes",
+        }
+        if not isinstance(fit, dict) or set(fit) != fit_keys or fit["status"] not in TEMPORAL_STATUSES:
+            raise RuntimeError("batch returned a malformed fit schema or status")
+        for field in (
+                "ols_slope", "oracle_gls_slope", "plugin_gls_slope",
+                "adjusted_profile_slope", "bootstrap_slope", "fitted_rho",
+                "fitted_process_variance", "covariance_condition_number"):
+            if not finite_optional(fit[field], nonnegative=field in {
+                    "fitted_process_variance", "covariance_condition_number"}):
+                raise RuntimeError("batch returned a non-finite fit value")
+        if not validate_interval(fit["bootstrap_interval"]):
+            raise RuntimeError("batch returned a malformed bootstrap interval")
+        for field in (
+                "valid_date_count", "rank", "degrees_of_freedom",
+                "bootstrap_attempts", "bootstrap_successes"):
+            if type(fit[field]) is not int or fit[field] < 0:
+                raise RuntimeError("batch returned a malformed fit count")
+        if fit["bootstrap_successes"] > fit["bootstrap_attempts"]:
+            raise RuntimeError("batch returned inconsistent bootstrap accounting")
+        raw = fit["raw_correlation"]
+        if (
+                not isinstance(raw, dict)
+                or set(raw) != {
+                    "rho", "pair_count", "minimum_gap_days", "median_gap_days",
+                    "maximum_gap_days"
+                }
+                or type(raw["pair_count"]) is not int
+                or raw["pair_count"] < 0
+                or any(not finite_optional(raw[field]) for field in (
+                    "rho", "minimum_gap_days", "median_gap_days", "maximum_gap_days"
+                ))):
+            raise RuntimeError("batch returned malformed raw-correlation diagnostics")
+        comparator_keys = {
+            "point_estimate", "standard_error_diagnostic", "interval_68", "interval_90",
+            "interval_95", "width_68", "width_90", "width_95", "status",
+            "attempted_replicates", "successful_replicates",
+        }
+        for field in (
+                "ols", "oracle_gls", "conditional_wls", "scalar_effective_n", "plugin_gls",
+                "adjusted_scalar", "adjusted_profile", "complete_refit_bootstrap"):
+            comparator = fit[field]
+            if (
+                    not isinstance(comparator, dict)
+                    or set(comparator) != comparator_keys
+                    or comparator["status"] not in TEMPORAL_STATUSES
+                    or not finite_optional(comparator["point_estimate"])
+                    or not finite_optional(
+                        comparator["standard_error_diagnostic"], nonnegative=True
+                    )
+                    or any(not finite_optional(comparator[name], nonnegative=True)
+                           for name in ("width_68", "width_90", "width_95"))
+                    or any(not validate_interval(comparator[name])
+                           for name in ("interval_68", "interval_90", "interval_95"))
+                    or type(comparator["attempted_replicates"]) is not int
+                    or type(comparator["successful_replicates"]) is not int
+                    or comparator["attempted_replicates"] < 0
+                    or comparator["successful_replicates"] < 0
+                    or comparator["successful_replicates"]
+                    > comparator["attempted_replicates"]):
+                raise RuntimeError("batch returned malformed comparator diagnostics")
+        if fit["status"] == "Evaluated" and (
+                any(fit[field] is None for field in (
+                    "ols_slope", "oracle_gls_slope", "plugin_gls_slope", "bootstrap_slope",
+                    "fitted_rho", "fitted_process_variance", "covariance_condition_number"
+                ))
+                or fit["valid_date_count"] == 0
+                or fit["rank"] == 0):
+            raise RuntimeError("batch returned an incomplete evaluated fit")
+
+    evaluated = fit is not None and fit["status"] == "Evaluated"
+    if record["emitted"] != evaluated:
+        raise RuntimeError("batch fit and emission dispositions are inconsistent")
+    if request["execution_path"] == "fixed_factor":
+        if (
+                record["production_path_status"] is not None
+                or record["fixed_factor_status"] not in TEMPORAL_STATUSES
+                or fit is None
+                or record["fixed_factor_status"] != fit["status"]
+                or record["provenance"] is not None
+                or record["production_receipts"] is not None):
+            raise RuntimeError("batch returned inconsistent fixed-factor state")
+        return
+
+    if record["fixed_factor_status"] is not None:
+        raise RuntimeError("batch returned inconsistent production-path state")
+    production_status = record["production_path_status"]
+    if production_status == "evaluated":
+        if not evaluated or record["provenance"] is None or record["production_receipts"] is None:
+            raise RuntimeError("batch returned incomplete evaluated production state")
+    elif production_status == "estimator_failed":
+        if fit is None or evaluated or record["provenance"] is not None \
+                or record["production_receipts"] is None:
+            raise RuntimeError("batch returned inconsistent estimator-failure state")
+    elif production_status in PRODUCTION_FAIL_CLOSED_STATUSES:
+        if fit is not None or record["provenance"] is not None \
+                or record["production_receipts"] is not None:
+            raise RuntimeError("batch returned evidence for a fail-closed production state")
+        return
+    else:
+        raise RuntimeError("batch returned an unknown production status")
+
     receipts = record.get("production_receipts")
-    if request["execution_path"] == "production_path" and receipts is not None:
+    if receipts is not None:
+        receipt_keys = {
+            "capture_scope_sha256", "source_manifest_sha256", "source_model_sha256",
+            "evd_operator_sha256", "evd_source_factor_sha256", "fixed_l2_map_sha256",
+            "issue52_receipt_sha256", "issue54_receipt_sha256", "numeric_evidence_sha256",
+            "source_correlation_model", "source_correlation_distance_scale_pixels",
+            "source_correlation_support_union_count", "effective_looks_fraction",
+            "source_correlation_receipt_sha256", "outer_coverage_dgp",
+            "conditional_covariance_oracle", "conditional_oracle_replicates",
+        }
+        dense_fields = {
+            "fixed_l2_difference_covariance", "fixed_l2_difference_variance",
+            "carrier_difference_history", "linked_difference_history",
+        }
+        if request.get("retain_dense_evidence", False):
+            receipt_keys.update(dense_fields)
+        oracle_replicates = request.get("conditional_oracle_replicates", 0)
+        if oracle_replicates > 0:
+            receipt_keys.update({
+                "conditional_oracle_covariance", "conditional_oracle_receipt_sha256"
+            })
+        if not isinstance(receipts, dict) or set(receipts) != receipt_keys:
+            raise RuntimeError("batch returned a malformed production receipt schema")
         if (
             receipts.get("source_correlation_model") != SOURCE_CORRELATION_MODEL
             or receipts.get("source_correlation_distance_scale_pixels")
@@ -869,16 +1173,15 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
             != CONDITIONAL_COVARIANCE_ORACLE
         ):
             raise RuntimeError("batch returned stale source-correlation provenance")
-        if any(field in receipts for field in (
-            "fixed_l2_difference_covariance", "fixed_l2_difference_variance",
-            "carrier_difference_history", "linked_difference_history",
-        )):
+        if not request.get("retain_dense_evidence", False) and any(
+                field in receipts for field in dense_fields):
             raise RuntimeError("batch retained dense per-attempt evidence")
-        for field in ("numeric_evidence_sha256", "source_correlation_receipt_sha256"):
-            value = receipts.get(field)
-            if not isinstance(value, str) or len(value) != 64:
+        for field, value in receipts.items():
+            if field.endswith("_sha256") and (
+                    not isinstance(value, str)
+                    or len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)):
                 raise RuntimeError("batch omitted compact numeric evidence identity")
-        oracle_replicates = request.get("conditional_oracle_replicates", 0)
         if receipts.get("conditional_oracle_replicates") != oracle_replicates:
             raise RuntimeError("batch returned stale conditional-oracle provenance")
         oracle_fields = (
@@ -894,9 +1197,62 @@ def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> 
                     or len(covariance) != len(request["days"])
                     or any(not isinstance(row, list) or len(row) != len(covariance)
                            for row in covariance)
+                    or any(not finite_optional(value) or value is None
+                           for row in covariance for value in row)
                     or not isinstance(receipt, str)
                     or len(receipt) != 64):
                 raise RuntimeError("batch returned a malformed conditional oracle")
+        if (
+                not finite_optional(receipts["source_correlation_distance_scale_pixels"])
+                or not finite_optional(receipts["effective_looks_fraction"])
+                or not 0.0 < receipts["effective_looks_fraction"] <= 1.0):
+            raise RuntimeError("batch returned malformed source-correlation measurements")
+
+    provenance = record["provenance"]
+    if provenance is not None:
+        provenance_keys = {
+            "schema", "estimator", "estimator_version", "valid_date_count", "rank",
+            "degrees_of_freedom", "cadence_days", "raw_rho", "fitted_rho",
+            "fitted_process_variance", "issue52_receipt_sha256", "issue54_receipt_sha256",
+            "reference", "condition_number", "scope", "bootstrap_attempts",
+            "bootstrap_successes", "validation_receipt_sha256", "estimator_input_sha256",
+            "bootstrap_minimum_success_fraction", "selected_method",
+        }
+        if (
+                not isinstance(provenance, dict)
+                or set(provenance) != provenance_keys
+                or provenance["schema"] != "dolphinrust-temporal-covariance-provenance/1"
+                or provenance["estimator"] != "origin_anchored_temporal_covariance_slope"
+                or provenance["estimator_version"] != "1.6.0"
+                or provenance["valid_date_count"] != fit["valid_date_count"]
+                or provenance["rank"] != fit["rank"]
+                or provenance["degrees_of_freedom"] != fit["degrees_of_freedom"]
+                or provenance["cadence_days"] != [
+                    fit["raw_correlation"]["minimum_gap_days"],
+                    fit["raw_correlation"]["median_gap_days"],
+                    fit["raw_correlation"]["maximum_gap_days"],
+                ]
+                or provenance["raw_rho"] != fit["raw_correlation"]["rho"]
+                or provenance["fitted_rho"] != fit["fitted_rho"]
+                or provenance["fitted_process_variance"] != fit["fitted_process_variance"]
+                or provenance["condition_number"] != fit["covariance_condition_number"]
+                or provenance["bootstrap_attempts"] != fit["bootstrap_attempts"]
+                or provenance["bootstrap_successes"] != fit["bootstrap_successes"]
+                or provenance["issue52_receipt_sha256"] != receipts["issue52_receipt_sha256"]
+                or provenance["issue54_receipt_sha256"] != receipts["issue54_receipt_sha256"]
+                or provenance["reference"] != request["production_path"]["reference"]
+                or provenance["scope"] != request["production_path"]["scope"]
+                or provenance["validation_receipt_sha256"]
+                != request["production_path"]["validation_receipt_sha256"]
+                or provenance["selected_method"]
+                != request["production_path"]["selected_method"]
+                or provenance["bootstrap_minimum_success_fraction"] != 0.99):
+            raise RuntimeError("batch returned malformed or stale production provenance")
+        for field in ("issue52_receipt_sha256", "issue54_receipt_sha256",
+                      "validation_receipt_sha256", "estimator_input_sha256"):
+            value = provenance[field]
+            if not isinstance(value, str) or len(value) != 64:
+                raise RuntimeError("batch returned malformed production provenance identity")
 
 
 def _cleanup_uncommitted(paths: dict[str, Path]) -> None:
@@ -914,6 +1270,7 @@ def _validate_manifest(
         "schema", "cell_id", "cell_index", "execution_path", "seed_count",
         "records_sha256", "records_bytes", "request_schedule_sha256",
         "producer_identity", "attempted", "emitted", "failed",
+        "producer_source_set_sha256", "producer_binary_sha256",
         "total_wall_micros", "peak_resident_set_bytes",
     }
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
@@ -927,6 +1284,8 @@ def _validate_manifest(
         "records_sha256": records_sha256,
         "records_bytes": records_bytes,
         "producer_identity": identity,
+        "producer_source_set_sha256": identity["source_set_sha256"],
+        "producer_binary_sha256": identity["binary_sha256"],
         "attempted": seed_count,
     }
     if any(manifest.get(field) != value for field, value in expected.items()):
@@ -951,9 +1310,14 @@ def _read_committed_shard(
         raise RuntimeError("committed shard is partial or missing") from error
     commit = json.loads(commit_bytes)
     if not isinstance(commit, dict) or set(commit) != {
-        "schema", "manifest_sha256", "records_sha256"
+        "schema", "manifest_sha256", "records_sha256",
+        "producer_source_set_sha256", "producer_binary_sha256",
     } or commit.get("schema") != SHARD_COMMIT_SCHEMA:
         raise RuntimeError("shard commit schema is malformed")
+    if (
+            commit["producer_source_set_sha256"] != identity["source_set_sha256"]
+            or commit["producer_binary_sha256"] != identity["binary_sha256"]):
+        raise RuntimeError("shard commit producer identity is stale or malformed")
     if hashlib.sha256(manifest_bytes).hexdigest() != commit.get("manifest_sha256"):
         raise RuntimeError("shard manifest hash is stale or tampered")
     manifest = json.loads(manifest_bytes)
@@ -1078,6 +1442,8 @@ def execute_or_resume_shard(
         "records_bytes": records_bytes,
         "request_schedule_sha256": schedule_digest.hexdigest(),
         "producer_identity": identity,
+        "producer_source_set_sha256": identity["source_set_sha256"],
+        "producer_binary_sha256": identity["binary_sha256"],
         "attempted": attempted,
         "emitted": emitted,
         "failed": failed,
@@ -1091,6 +1457,8 @@ def execute_or_resume_shard(
         "schema": SHARD_COMMIT_SCHEMA,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "records_sha256": records_digest.hexdigest(),
+        "producer_source_set_sha256": identity["source_set_sha256"],
+        "producer_binary_sha256": identity["binary_sha256"],
     }
     os.link(partial_records, paths["records"], follow_symlinks=False)
     partial_records.unlink()
@@ -1106,7 +1474,7 @@ def execute_or_resume_shard(
 def _result_receipt(
         preregistration: dict, seed_count: int, processed: int, emitted: int,
         failed: int, total_wall: int, peak_rss: int, scores: dict,
-        records: list[dict], exact_denominator: bool) -> dict:
+        records: list[dict], exact_denominator: bool, identity: dict) -> dict:
     expected_attempts = (
         len(cells(preregistration)) * seed_count * len(preregistration["execution_paths"])
     )
@@ -1141,6 +1509,7 @@ def _result_receipt(
         "records": records,
         "scores": scores,
         "execution_paths": preregistration["execution_paths"],
+        "producer_identity": identity,
         "corrected_inferential_sigma_emission": False,
         "execution_complete": complete_execution,
         "exact_seed_denominator_complete": exact_denominator,
@@ -1166,7 +1535,8 @@ def _result_receipt(
 
 
 def _run_probe(
-        preregistration: dict, seed_count: int, limit: int, binary: Path) -> dict:
+        preregistration: dict, seed_count: int, limit: int, binary: Path,
+        identity: dict) -> dict:
     if limit > MAX_PROBE_RECORDS:
         raise RuntimeError("probe record count exceeds its retained bound")
     selected = itertools.islice(iter_requests(preregistration, seed_count), limit)
@@ -1219,7 +1589,7 @@ def _run_probe(
     scores = scorer.finalize(require_complete=False)
     return _result_receipt(
         preregistration, seed_count, len(records), emitted, failed,
-        total_wall, peak_rss, scores, records, False,
+        total_wall, peak_rss, scores, records, False, identity,
     )
 
 
@@ -1263,13 +1633,13 @@ def run(
             "--example", "temporal_covariance_batch",
         ], cwd=root, check=True)
         binary = root / "target/release/examples/temporal_covariance_batch"
+    identity = producer_identity(preregistration, binary)
     if limit is not None:
-        return _run_probe(preregistration, seed_count, limit, binary)
+        return _run_probe(preregistration, seed_count, limit, binary, identity)
     if seed_count != preregistration["outer_seeds_per_supported_cell"]:
         raise RuntimeError("resumable execution requires the exact frozen seed denominator")
     if run_root is None:
         raise RuntimeError("resumable execution requires a run root")
-    identity = producer_identity(preregistration, binary)
     shards = initialize_run_root(run_root, identity)
     for cell in frozen_cells:
         for execution_path in preregistration["execution_paths"]:
@@ -1303,7 +1673,7 @@ def run(
     scores = scorer.finalize(require_complete=True)
     receipt = _result_receipt(
         preregistration, seed_count, processed, emitted, failed,
-        total_wall, peak_rss, scores, [], True,
+        total_wall, peak_rss, scores, [], True, identity,
     )
     retained_bytes = sum(
         path.stat().st_size

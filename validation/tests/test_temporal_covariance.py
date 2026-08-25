@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).parents[2]
@@ -54,8 +55,43 @@ def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path
         counter = pathlib.Path({str(counter)!r})
         count = int(counter.read_text()) if counter.exists() else 0
         counter.write_text(str(count + 1))
+        methods = [
+            "ols", "oracle_gls", "legacy_intercept_slope_wls_non_comparable",
+            "lag_one_scalar_effective_n", "plugin_gls_reml",
+            "reml_covariance_parameter_adjusted_scalar",
+            "slope_profile_likelihood_ml", "complete_refit_bootstrap",
+        ]
+        def comparator(status):
+            return {{
+                "point_estimate": None, "standard_error_diagnostic": None,
+                "interval_68": None, "interval_90": None, "interval_95": None,
+                "width_68": None, "width_90": None, "width_95": None,
+                "status": status, "attempted_replicates": 0,
+                "successful_replicates": 0,
+            }}
+        def failed_fit():
+            status = "InsufficientDates"
+            diagnostic = comparator(status)
+            return {{
+                "status": status, "ols_slope": None, "oracle_gls_slope": None,
+                "plugin_gls_slope": None, "adjusted_profile_slope": None,
+                "bootstrap_slope": None, "bootstrap_interval": None,
+                "fitted_rho": None, "fitted_process_variance": None,
+                "raw_correlation": {{"rho": None, "pair_count": 0,
+                    "minimum_gap_days": None, "median_gap_days": None,
+                    "maximum_gap_days": None}},
+                "valid_date_count": 0, "rank": 0, "degrees_of_freedom": 0,
+                "covariance_condition_number": None,
+                "ols": diagnostic, "oracle_gls": diagnostic,
+                "conditional_wls": diagnostic, "scalar_effective_n": diagnostic,
+                "plugin_gls": diagnostic, "adjusted_scalar": diagnostic,
+                "adjusted_profile": diagnostic,
+                "complete_refit_bootstrap": diagnostic,
+                "bootstrap_attempts": 0, "bootstrap_successes": 0,
+            }}
         for line in sys.stdin:
             request = json.loads(line)
+            fixed = request["execution_path"] == "fixed_factor"
             response = {{
                 "schema": {batch_schema!r},
                 "execution_path": request["execution_path"],
@@ -64,13 +100,13 @@ def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path
                 "outer_seed_index": request["outer_seed_index"],
                 "seed_sha256": request["seed_sha256"],
                 "seed": request["seed"],
-                "fixed_factor_status": None,
-                "production_path_status": "estimator_failed",
-                "comparator_methods": [],
+                "fixed_factor_status": "InsufficientDates" if fixed else None,
+                "production_path_status": None if fixed else "raw_complex_invalid",
+                "comparator_methods": methods,
                 "attempted": True,
                 "emitted": False,
                 "failed": True,
-                "fit": None,
+                "fit": failed_fit() if fixed else None,
                 "provenance": None,
                 "production_receipts": None,
                 "resource": {{
@@ -704,6 +740,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             identity = {
                 "schema": module.RUN_IDENTITY_SCHEMA,
                 "batch_schema": self.prereg["schemas"]["batch"],
+                "source_set_sha256": "11" * 32,
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "source_correlation_model": module.SOURCE_CORRELATION_MODEL,
                 "source_correlation_distance_scale_pixels": (
@@ -741,6 +778,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             identity = {
                 "schema": module.RUN_IDENTITY_SCHEMA,
                 "batch_schema": self.prereg["schemas"]["batch"],
+                "source_set_sha256": "11" * 32,
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "seed_count": 2,
             }
@@ -764,6 +802,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 "schema": module.SHARD_COMMIT_SCHEMA,
                 "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                 "records_sha256": hashlib.sha256(payload).hexdigest(),
+                "producer_source_set_sha256": manifest[
+                    "producer_source_set_sha256"
+                ],
+                "producer_binary_sha256": manifest["producer_binary_sha256"],
             }
             paths["commit"].write_bytes(module.canonical_json_bytes(commit) + b"\n")
 
@@ -792,6 +834,70 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                             shards, binary, identity,
                         )
 
+    def test_rehashed_semantic_response_tamper_fails_closed(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+
+        def committed(directory, execution_path, binary):
+            identity = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "source_set_sha256": "11" * 32,
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "seed_count": 1,
+            }
+            shards = module.initialize_run_root(directory / "run", identity)
+            module.execute_or_resume_shard(
+                self.prereg, cell, execution_path, 1, shards, binary, identity
+            )
+            return identity, shards, module._shard_paths(shards, cell, execution_path)
+
+        def rebind(paths, record):
+            payload = module.canonical_json_bytes(record) + b"\n"
+            paths["records"].write_bytes(payload)
+            manifest = json.loads(paths["manifest"].read_bytes())
+            manifest["records_sha256"] = hashlib.sha256(payload).hexdigest()
+            manifest["records_bytes"] = len(payload)
+            manifest_bytes = module.canonical_json_bytes(manifest) + b"\n"
+            paths["manifest"].write_bytes(manifest_bytes)
+            commit = json.loads(paths["commit"].read_bytes())
+            commit["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+            commit["records_sha256"] = hashlib.sha256(payload).hexdigest()
+            paths["commit"].write_bytes(module.canonical_json_bytes(commit) + b"\n")
+
+        cases = {
+            "fabricated evaluated fit": ("fixed_factor", lambda record: (
+                record.update({"fixed_factor_status": "Evaluated", "emitted": True,
+                               "failed": False}),
+                record["fit"].update({"status": "Evaluated"}),
+            )),
+            "nonfinite comparator": ("fixed_factor", lambda record:
+                record["fit"]["ols"].update({"point_estimate": "nan"})),
+            "omitted production receipts": ("production_path", lambda record:
+                record.update({"production_receipts": None})),
+            "invalid production provenance": ("production_path", lambda record:
+                record.update({"provenance": {"schema": "forged"}})),
+            "unknown production status": ("production_path", lambda record:
+                record.update({"production_path_status": "fabricated_fail_closed"})),
+        }
+        for label, (execution_path, mutate) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                binary = (
+                    write_fake_batch(root, self.prereg["schemas"]["batch"])
+                    if execution_path == "fixed_factor"
+                    else ROOT / "target/release/examples/temporal_covariance_batch"
+                )
+                identity, shards, paths = committed(root, execution_path, binary)
+                record = json.loads(paths["records"].read_bytes())
+                mutate(record)
+                rebind(paths, record)
+                with self.assertRaisesRegex(RuntimeError, "batch returned"):
+                    module.execute_or_resume_shard(
+                        self.prereg, cell, execution_path, 1,
+                        shards, binary, identity,
+                    )
+
     def test_resumable_run_rejects_stale_binary_and_partial_commit(self):
         module = load_generator()
         cell = module.cells(self.prereg)[0]
@@ -801,6 +907,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             identity = {
                 "schema": module.RUN_IDENTITY_SCHEMA,
                 "batch_schema": self.prereg["schemas"]["batch"],
+                "source_set_sha256": "11" * 32,
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "seed_count": 2,
             }
@@ -840,9 +947,17 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             root = pathlib.Path(directory)
             binary = write_fake_batch(root, self.prereg["schemas"]["batch"])
             run_root = root / "run"
-            first = module.run(
-                preregistration, 1, None, run_root=run_root, binary=binary
-            )
+            identity = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "source_set_sha256": "11" * 32,
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "seed_count": 1,
+            }
+            with mock.patch.object(module, "producer_identity", return_value=identity):
+                first = module.run(
+                    preregistration, 1, None, run_root=run_root, binary=binary
+                )
             self.assertEqual(first["batch_attempted_cells"], 48)
             self.assertTrue(first["exact_seed_denominator_complete"])
             self.assertFalse(first["promotion_eligible"])
@@ -853,9 +968,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 preregistration["resource_limits"]["retained_bound_bytes"],
             )
             self.assertTrue(first["resource_gates"]["retained_bound"])
-            second = module.run(
-                preregistration, 1, None, run_root=run_root, binary=binary
-            )
+            with mock.patch.object(module, "producer_identity", return_value=identity):
+                second = module.run(
+                    preregistration, 1, None, run_root=run_root, binary=binary
+                )
             self.assertEqual(second, first)
             self.assertEqual((root / "fake_temporal_batch.count").read_text(), "48")
 
@@ -924,6 +1040,52 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 hashlib.sha256(path.read_bytes()).hexdigest(),
                 self.prereg["file_hashes"][identity],
             )
+
+    def test_canonical_source_closure_detects_pr84_and_temporal_mutations(self):
+        module = load_generator()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            files = set(module.FROZEN_SOURCE_SET_FILES)
+            files.add("crates/dolphin-workflows/src/sequential_covariance.rs")
+            for relative in files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = f"fixture:{relative}\n"
+                if relative == "validation/temporal_covariance_simulation.py":
+                    content += 'FROZEN_SOURCE_SET_SHA256 = "fixture"\n'
+                path.write_text(content)
+            baseline = module.canonical_source_set_sha256(root)
+            for relative in (
+                "crates/dolphin-workflows/src/sequential_covariance.rs",
+                "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs",
+                "validation/temporal_covariance_simulation.py",
+                "crates/dolphin-timeseries/src/temporal_covariance.rs",
+            ):
+                with self.subTest(relative=relative):
+                    path = root / relative
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"mutation\n")
+                    self.assertNotEqual(module.canonical_source_set_sha256(root), baseline)
+                    path.write_bytes(original)
+
+    def test_producer_identity_requires_frozen_release_binary_and_source_set(self):
+        module = load_generator()
+        release = ROOT / "target/release/examples/temporal_covariance_batch"
+        identity = module.producer_identity(self.prereg, release)
+        self.assertEqual(
+            identity["source_set_sha256"],
+            self.prereg["producer_identity"]["source_set_sha256"],
+        )
+        self.assertEqual(
+            identity["binary_sha256"],
+            self.prereg["producer_identity"]["binary_sha256"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            copied = pathlib.Path(directory) / "temporal_covariance_batch"
+            copied.write_bytes(release.read_bytes())
+            copied.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "exact prebuilt release executable"):
+                module.producer_identity(self.prereg, copied)
 
 
 if __name__ == "__main__":
