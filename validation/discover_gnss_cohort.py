@@ -34,6 +34,71 @@ class Station:
     solution_count: int
 
 
+@dataclass(frozen=True)
+class Exclusions:
+    station_ids: frozenset[str]
+    burst_ids: frozenset[str]
+    site_ids: frozenset[str]
+
+
+def load_exclusions(path: Path) -> Exclusions:
+    payload = json.loads(path.read_text())
+    values = payload.get("exclusions")
+    if not isinstance(values, dict):
+        raise ValueError("held-out preregistration is missing exclusions")
+
+    def identifiers(field: str) -> frozenset[str]:
+        entries = values.get(field)
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, str) and entry for entry in entries
+        ):
+            raise ValueError(f"held-out exclusions.{field} is invalid")
+        return frozenset(entries)
+
+    return Exclusions(
+        station_ids=identifiers("station_ids"),
+        burst_ids=identifiers("burst_ids"),
+        site_ids=identifiers("site_ids"),
+    )
+
+
+def exclude_stations(
+    stations: Sequence[Station], exclusions: Exclusions
+) -> list[Station]:
+    return [
+        station
+        for station in stations
+        if station.station_id not in exclusions.station_ids
+    ]
+
+
+def cohort_site_id(
+    burst_id: str, first_station_id: str, second_station_id: str
+) -> str:
+    return (
+        f"{burst_id.lower()}_{first_station_id.lower()}_"
+        f"{second_station_id.lower()}"
+    )
+
+
+def select_shared_burst(
+    shared: Sequence[tuple[str, list[str]]],
+    used_bursts: set[str],
+    first_station_id: str,
+    second_station_id: str,
+    exclusions: Exclusions,
+) -> tuple[str, list[str]] | tuple[None, None]:
+    for burst, dates in shared:
+        site_id = cohort_site_id(burst, first_station_id, second_station_id)
+        if (
+            burst not in used_bursts
+            and burst not in exclusions.burst_ids
+            and site_id not in exclusions.site_ids
+        ):
+            return burst, dates
+    return None, None
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -189,9 +254,10 @@ def aligned_fraction(station: Station, dates: Sequence[str], max_gap_days: int) 
 
 
 def discover(args: argparse.Namespace) -> dict[str, Any]:
+    exclusions = load_exclusions(args.preregistration)
     response = requests.get(HOLDINGS_URL, timeout=60)
     response.raise_for_status()
-    stations = parse_holdings(response.text)
+    stations = exclude_stations(parse_holdings(response.text), exclusions)
     start_date = dt.date.fromisoformat(args.start)
     end_date = dt.date.fromisoformat(args.end)
     pairs = candidate_pairs(
@@ -218,12 +284,21 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "stations": [first.station_id, second.station_id],
             "distance_km": distance,
             "eligible_bursts": [burst for burst, _ in shared],
+            "excluded_bursts": [
+                burst for burst, _ in shared if burst in exclusions.burst_ids
+            ],
         }
         examined.append(examined_entry)
         if not shared:
             continue
         shared.sort(key=lambda item: (-len(item[1]), item[0]))
-        burst, dates = next(((burst, dates) for burst, dates in shared if burst not in used_bursts), (None, None))
+        burst, dates = select_shared_burst(
+            shared,
+            used_bursts,
+            first.station_id,
+            second.station_id,
+            exclusions,
+        )
         if burst is None or dates is None:
             continue
         first_fraction, first_source = aligned_fraction(first, dates, args.max_gap_days)
@@ -242,7 +317,7 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             continue
         results = [first_bursts[burst][date] for date in dates]
         estimated_bytes = sum(result_hdf5_bytes(result) or 0 for result in results)
-        site_id = f"{burst.lower()}_{first.station_id.lower()}_{second.station_id.lower()}"
+        site_id = cohort_site_id(burst, first.station_id, second.station_id)
         selected.append(
             {
                 "site_id": site_id,
@@ -285,6 +360,15 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         "schema": "dolphinrust-gnss-cohort-feasibility/1",
         "status": "eligible" if len(selected) == args.target_sites else "not_evaluable",
         "selection_blinded_to_insar_outcomes": True,
+        "preregistration": {
+            "path": str(args.preregistration),
+            "sha256": hashlib.sha256(args.preregistration.read_bytes()).hexdigest(),
+        },
+        "exclusions": {
+            "station_ids": sorted(exclusions.station_ids),
+            "burst_ids": sorted(exclusions.burst_ids),
+            "site_ids": sorted(exclusions.site_ids),
+        },
         "criteria": {
             "target_sites": args.target_sites,
             "minimum_epochs": args.min_epochs,
@@ -325,6 +409,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--south", type=float, default=5.0)
     parser.add_argument("--east", type=float, default=-50.0)
     parser.add_argument("--north", type=float, default=75.0)
+    parser.add_argument(
+        "--preregistration",
+        type=Path,
+        default=Path(__file__).with_name(
+            "temporal_covariance_heldout_preregistration.json"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 

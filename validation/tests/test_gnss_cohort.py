@@ -37,6 +37,32 @@ class CohortContract(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual({pairs[0][0].station_id, pairs[0][1].station_id}, {"AAAA", "BBBB"})
 
+    def test_preregistered_exclusions_are_applied_before_cohort_freeze(self) -> None:
+        stations = discovery.parse_holdings(HOLDINGS)
+        exclusions = discovery.Exclusions(
+            station_ids=frozenset({"AAAA"}),
+            burst_ids=frozenset({"T001_000001_IW1"}),
+            site_ids=frozenset({"t002_000002_iw1_bbbb_cccc"}),
+        )
+        eligible = discovery.exclude_stations(stations, exclusions)
+        self.assertEqual(
+            [station.station_id for station in eligible],
+            ["BBBB", "CCCC", "DDDD"],
+        )
+        shared = [
+            ("T001_000001_IW1", ["2023-01-01"]),
+            ("T002_000002_IW1", ["2023-01-01"]),
+            ("T003_000003_IW1", ["2023-01-01"]),
+        ]
+        selected = discovery.select_shared_burst(
+            shared,
+            used_bursts=set(),
+            first_station_id="BBBB",
+            second_station_id="CCCC",
+            exclusions=exclusions,
+        )
+        self.assertEqual(selected, ("T003_000003_IW1", ["2023-01-01"]))
+
     def test_interval_score_abstains_on_invalid_sigma(self) -> None:
         metrics = scorer.interval_metrics(
             np.array([0.0, 1.0, 2.0]), np.array([0.0, 1.0, np.nan])
