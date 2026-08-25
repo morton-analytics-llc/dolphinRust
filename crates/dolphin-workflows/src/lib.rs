@@ -34,10 +34,11 @@ pub use covariance_artifact::{
 };
 pub use crop::{BoundsError, ProcessingBoundsProvenance};
 pub use cslc_covariance_source::{
-    empirical_factor_config, CslcCovarianceManifest, CslcCovarianceResolverMetrics,
-    CslcCovarianceSourceResolver, CslcCovarianceValidityReader, CslcManifestResourceEstimate,
-    CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
-    CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+    empirical_factor_config, CslcCovarianceGenerationResolverBundle, CslcCovarianceManifest,
+    CslcCovarianceResolverMetrics, CslcCovarianceSourceResolver, CslcCovarianceValidityReader,
+    CslcManifestResourceEstimate, CSLC_COVARIANCE_SOURCE_MODEL,
+    CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
+    CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 pub use displacement::{
     run_displacement, run_displacement_resumable, run_displacement_with_output_policy,
@@ -52,11 +53,22 @@ pub use provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
-    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    plan_sequential_covariance_capture, plan_sequential_covariance_update,
+    plan_sequential_masked_covariance_capture, run_sequential, run_sequential_masked,
+    run_sequential_masked_with_covariance_capture,
     run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
-    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
+    run_sequential_resumable_masked, run_sequential_resumable_masked_with_covariance_capture,
+    run_sequential_resumable_masked_with_covariance_capture_and_source_factors,
+    run_sequential_resumable_with_covariance_capture,
+    run_sequential_resumable_with_covariance_capture_and_source_factors,
+    run_sequential_with_covariance_capture,
     run_sequential_with_covariance_capture_and_source_factors, update_sequential,
-    update_sequential_masked, SequentialConfig, SequentialOutput, SequentialState,
+    update_sequential_masked, update_sequential_masked_with_covariance_capture,
+    update_sequential_masked_with_covariance_capture_and_source_factors,
+    update_sequential_with_covariance_capture,
+    update_sequential_with_covariance_capture_and_source_factors, SequentialConfig,
+    SequentialCovarianceCapturePlan, SequentialCovarianceRevision, SequentialCovarianceState,
+    SequentialOutput, SequentialState,
 };
 pub use sequential_covariance::{
     empirical_source_factor_receipt_digest,
