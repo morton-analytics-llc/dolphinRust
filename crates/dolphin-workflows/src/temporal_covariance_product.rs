@@ -62,7 +62,12 @@ const JSON_CAP: u64 = 64 * 1024 * 1024;
 const PRODUCT_SCHEMA: &str = "dolphinrust-temporal-inference-product/1";
 const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/1";
 const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
-const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/5";
+const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/7";
+const TEMPORAL_BATCH_SCHEMA: &str = "dolphinrust-temporal-covariance-batch/6";
+const TEMPORAL_PRODUCER_IDENTITY_SCHEMA: &str =
+    "dolphinrust-temporal-covariance-run-identity/1";
+const TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA: &str =
+    "dolphinrust.canonical-producer-source-set/2";
 const HELDOUT_SCORE_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_score";
 const HELDOUT_RECEIPT_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_receipt";
 const LAYER_COUNT: usize = 14;
@@ -77,13 +82,13 @@ const TRANSACTION_STAGE_CLEANUP_PREFIX: &str = ".temporal-inference-stage-cleanu
 const CLEANUP_QUARANTINE_MARKER_SCHEMA: &str = "dolphinrust-temporal-cleanup-quarantine/1";
 const HELDOUT_COHORT_ID: &str = "f53-06-outer-nonfresno-v1";
 const HELDOUT_PREREGISTRATION_FILE_SHA256: &str =
-    "5fa4bb8935a6edda9c1005e7a041d659d2ff9bf2b1e5cde21ecbd20ef1b00981";
+    "4e960161f149330c57561b15afa2525e6cb608ce9e9b820816c3733749f41d4e";
 const HELDOUT_MANIFEST_FILE_SHA256: &str =
-    "662f0fd6e370eb66bfccc116b370199cd9b7aa672cbc85bf77e0edab8ae65fdd";
+    "016230fca1f3e4381d24effdd14e1839b603a71d6da3696ff561edc433a1970e";
 const HELDOUT_MANIFEST_CANONICAL_SHA256: &str =
-    "934ce89104f1746ff59f46c5b31115203613683ab2dd9872ee9b9c4d553b9438";
+    "2b9208eaf1f54f10f971544062df348062d4a9b9eb518dd1b373bd8ebe561050";
 const HELDOUT_FREEZE_FILE_SHA256: &str =
-    "d3779697cd5d6a7b0d81a17573a4ec845794a8c68c677713b05ec4a749a8fdfd";
+    "a10505a0e7ba3afd370c44eb9747e2021265626eb80aced72433096ce51c873e";
 const HELDOUT_RECEIPT_SCORER_SHA256: &str =
     "942bda853ce55b28b7f92698f28ba9982cce370adfedde42da9e0b0e14426671";
 const HELDOUT_REVIEW_SCORER_SHA256: &str =
@@ -93,6 +98,8 @@ static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
 const TEMPORAL_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_preregistration.json");
+const GENERATOR_SOURCE_BYTES: &[u8] =
+    include_bytes!("../../../validation/temporal_covariance_simulation.py");
 const HELDOUT_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_heldout_preregistration.json");
 const ESTIMATOR_SOURCE_BYTES: &[u8] =
@@ -287,6 +294,26 @@ struct SyntheticScores {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyntheticProducerIdentity {
+    schema: String,
+    preregistration_sha256: String,
+    generator_sha256: String,
+    batch_source_sha256: String,
+    estimator_source_sha256: String,
+    source_set_schema: String,
+    source_set_sha256: String,
+    binary_path: String,
+    binary_sha256: String,
+    binary_bytes: u64,
+    batch_schema: String,
+    generator_schema: String,
+    source_correlation_model: String,
+    source_correlation_distance_scale_pixels: f64,
+    seed_count: u64,
+}
+
+#[derive(Deserialize)]
 struct SyntheticResult {
     schema: String,
     attempted_cells: u64,
@@ -299,6 +326,7 @@ struct SyntheticResult {
     promotion_status: String,
     scores: SyntheticScores,
     resource_gates: BTreeMap<String, bool>,
+    producer_identity: SyntheticProducerIdentity,
 }
 
 #[derive(Deserialize)]
@@ -655,7 +683,7 @@ fn expected_heldout_implementation_source_hashes() -> BTreeMap<String, String> {
         ),
         (
             "runner_sha256",
-            "1682c4facdba834098c4ee3af235d81ffa1553498d9585fce68fadc9202a6945",
+            "ae8ffa1cd31e97f1ccccc3dd31b66aa36a4859c8d0347d5187fb827cb1920e71",
         ),
         (
             "scorer_sha256",
@@ -1467,6 +1495,8 @@ fn validate_heldout_accounting(receipt: &HeldoutReceipt, manifest: &Value) -> Re
 }
 
 fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
+    let preregistration: Value = serde_json::from_slice(TEMPORAL_PREREGISTRATION_BYTES)?;
+    let producer = &result.producer_identity;
     ensure!(
         result.schema == SYNTHETIC_SCHEMA,
         "unsupported synthetic result schema"
@@ -1481,10 +1511,34 @@ fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
         "synthetic temporal-covariance result is incomplete or failed"
     );
     ensure!(
-        result.seed_count == 5_000
-            && result.attempted_cells == 240_000
+        result.seed_count == 1_050
+            && result.attempted_cells == 50_400
             && result.batch_attempted_cells == result.attempted_cells,
         "synthetic temporal-covariance denominator is not the exact frozen matrix"
+    );
+    ensure!(
+        producer.schema == TEMPORAL_PRODUCER_IDENTITY_SCHEMA
+            && producer.preregistration_sha256
+                == canonical_json_sha256(TEMPORAL_PREREGISTRATION_BYTES)?
+            && producer.generator_sha256 == sha256(GENERATOR_SOURCE_BYTES)
+            && producer.batch_source_sha256 == sha256(BATCH_SOURCE_BYTES)
+            && producer.estimator_source_sha256 == sha256(ESTIMATOR_SOURCE_BYTES)
+            && producer.source_set_schema == TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA
+            && preregistration["producer_identity"]["source_set_schema"].as_str()
+                == Some(producer.source_set_schema.as_str())
+            && preregistration["producer_identity"]["source_set_sha256"].as_str()
+                == Some(producer.source_set_sha256.as_str())
+            && preregistration["producer_identity"]["binary_path"].as_str()
+                == Some(producer.binary_path.as_str())
+            && producer.binary_path == "target/release/examples/temporal_covariance_batch"
+            && is_sha256(&producer.binary_sha256)
+            && producer.binary_bytes > 0
+            && producer.batch_schema == TEMPORAL_BATCH_SCHEMA
+            && producer.generator_schema == SYNTHETIC_SCHEMA
+            && producer.source_correlation_model == "exponential_euclidean_v1"
+            && producer.source_correlation_distance_scale_pixels == 1.5
+            && producer.seed_count == result.seed_count,
+        "synthetic temporal-covariance producer identity is stale or malformed"
     );
     ensure!(
         !result.resource_gates.is_empty() && result.resource_gates.values().all(|passed| *passed),
@@ -5555,11 +5609,36 @@ mod tests {
             }
         }
 
-        let synthetic = SyntheticResult {
+        let preregistration: Value =
+            serde_json::from_slice(super::TEMPORAL_PREREGISTRATION_BYTES).unwrap();
+        let producer_identity = super::SyntheticProducerIdentity {
+            schema: super::TEMPORAL_PRODUCER_IDENTITY_SCHEMA.to_owned(),
+            preregistration_sha256: super::canonical_json_sha256(
+                super::TEMPORAL_PREREGISTRATION_BYTES,
+            )
+            .unwrap(),
+            generator_sha256: super::sha256(super::GENERATOR_SOURCE_BYTES),
+            batch_source_sha256: super::sha256(super::BATCH_SOURCE_BYTES),
+            estimator_source_sha256: super::sha256(super::ESTIMATOR_SOURCE_BYTES),
+            source_set_schema: super::TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA.to_owned(),
+            source_set_sha256: preregistration["producer_identity"]["source_set_sha256"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            binary_path: "target/release/examples/temporal_covariance_batch".to_owned(),
+            binary_sha256: "ab".repeat(32),
+            binary_bytes: 1,
+            batch_schema: super::TEMPORAL_BATCH_SCHEMA.to_owned(),
+            generator_schema: SYNTHETIC_SCHEMA.to_owned(),
+            source_correlation_model: "exponential_euclidean_v1".to_owned(),
+            source_correlation_distance_scale_pixels: 1.5,
+            seed_count: 1_050,
+        };
+        let mut synthetic = SyntheticResult {
             schema: SYNTHETIC_SCHEMA.to_owned(),
-            attempted_cells: 240_000,
-            batch_attempted_cells: 240_000,
-            seed_count: 5_000,
+            attempted_cells: 50_400,
+            batch_attempted_cells: 50_400,
+            seed_count: 1_050,
             execution_complete: true,
             exact_seed_denominator_complete: true,
             corrected_inferential_sigma_emission: false,
@@ -5569,8 +5648,24 @@ mod tests {
                 all_methods_pass: true,
             },
             resource_gates: BTreeMap::from([("rss".to_owned(), true)]),
+            producer_identity,
         };
         validate_synthetic_result(&synthetic).unwrap();
+        synthetic.seed_count = 5_000;
+        synthetic.attempted_cells = 240_000;
+        synthetic.batch_attempted_cells = 240_000;
+        assert!(validate_synthetic_result(&synthetic).is_err());
+        synthetic.seed_count = 1_050;
+        synthetic.attempted_cells = 50_400;
+        synthetic.batch_attempted_cells = 50_400;
+        synthetic.producer_identity.seed_count = 1_050;
+        synthetic.producer_identity.source_set_sha256 = "cd".repeat(32);
+        assert!(validate_synthetic_result(&synthetic).is_err());
+        synthetic.producer_identity.source_set_sha256 = preregistration["producer_identity"]
+            ["source_set_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let heldout_identity = HeldoutReceiptIdentity {
             receipt_sha256: "aa".repeat(32),
             manifest_file_sha256:
