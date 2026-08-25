@@ -24,31 +24,33 @@ STATUSES = {PASS, FAIL, NOT_EVALUABLE}
 ATTEMPT_STATUSES = {"valid", "masked_target", "tied_eigenvalue"}
 HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 5000
-FROZEN_CELL_COUNT = 89100
-FROZEN_ATTEMPT_COUNT = 445500000
+FROZEN_DETERMINISTIC_SEED_COUNT = 1
+FROZEN_CELL_COUNT = 353
+FROZEN_ATTEMPT_COUNT = 440265
 FROZEN_MAX_CELLS_PER_SHARD = 100
-FROZEN_SHARD_COUNT = 891
+FROZEN_SHARD_COUNT = 4
 FROZEN_MAX_SHARD_BYTES = 100 * 8192
 FROZEN_MAX_RECORD_BYTES = 262144
 FROZEN_MAX_CELL_SUMMARY_BYTES = 8192
 FROZEN_MAX_SHARD_MANIFEST_BYTES = 16384
 FROZEN_MAX_RUN_MANIFEST_BYTES = 16777216
+FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
-FROZEN_RETAINED_SIZE_BOUND_BYTES = 761282560
+FROZEN_RETAINED_SIZE_BOUND_BYTES = 19734528
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "222355a893286969429707c4429124e8c344bb4832b66abdebd58859c34abea8"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "eaa2c6e33159e00e47aa52ab27eaaf00c45b8dcae429d9b2d04d5d4336a59133"
-FROZEN_EXECUTION_SHA256 = "0f66072a4926e96a21f2e97c47226a6890cfaf4ae1e5724b386287ba38f09fd8"
-FROZEN_REDUCERS_SHA256 = "65e45eb254d65a9efd04c379581296f2396ee9166fdae6dad1be4058dad7eb5c"
-FROZEN_MATRIX_SHA256 = "9133bbac234fe511df7cce8e154bdf9134a1d2af699b8127c34522135cb50939"
-FROZEN_RECEIPT_SHA256 = "57699344b794b6148abc76817d5674b635d3f21ea321e5dfa6dc8a1a60ae25d3"
-FROZEN_HASH_FIELDS_SHA256 = "bc4a53c9803ad5c4def667280417e3210d1dac0b6bc02d4a6402ba7ac437f6c8"
+FROZEN_GENERATOR_SHA256 = "a017a15f48755f9dbaceb5842709aa74fe214d9025021eeb7665215da969c74e"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "38a11589430b5f78add22ed7ad9cb96cddca1af098211e899bc306f4a3a61f0f"
+FROZEN_EXECUTION_SHA256 = "6299045b34ce6e9e6c6c6ce87502fe0028cc7d1ae0d0ec4f5f3305e10cf706c6"
+FROZEN_REDUCERS_SHA256 = "2dbe430d050e79388bc1484e1f270435dba3031468f4b4abb93315e2ed48cf53"
+FROZEN_MATRIX_SHA256 = "eb079cb384196d28bfc3b957697769d186cd1c8fc04155282fb258a99eff2ac0"
+FROZEN_RECEIPT_SHA256 = "931f90ef3fa0c97c16926ad96a4ea6661f1d73f7310a22e2351059cf64b02ca1"
+FROZEN_HASH_FIELDS_SHA256 = "c9ffda0f207a373e94e4125f81a792c043ffa40cba3a945f9013741eebacade9"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "75309d564a3ad7f4fb8765b89af7696a9b995dd2a6a4c65bf8f792ee8ec9847c"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
-FROZEN_CELL_POLICY_SHA256 = "f3e8f63462ae82c5dc43cebeecd49f0236b4e0804460ada79cf24c12e8096c90"
+FROZEN_CELL_POLICY_SHA256 = "2c58266788cc16eadc487ea21bcf90aed9dd0ffe4ccf83807743f30a7d1d448e"
 FROZEN_V3_PREREGISTRATION_SHA256 = "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184"
-FROZEN_DETERMINISM_SHA256 = "ad6904d88f04c5d91a7e7168351c10a06a41e4253ae1324e2391eab7ef1443bd"
-FROZEN_NUMERIC_SHA256 = "01dc8b496a40b385fb3eef548df053b32f75f2239d484ddb615769d8b5b02d52"
+FROZEN_DETERMINISM_SHA256 = "145cd8d79f58a9290c2e8669b45edd5bcd387f3b4d99e3ac92286f248437bdda"
+FROZEN_NUMERIC_SHA256 = "f534593ef3027eb41c15bc40163c030c6eadeab131bfd06922bcb43fbc3e3811"
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -91,13 +93,15 @@ ATTEMPT_KEYS = {
     "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error",
     "contrast_variance_reference", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width",
     "operator_matrix", "truth_matrix", "contrast_weights", "estimate_value", "truth_value",
-    "raw_input_values",
+    "raw_input_shape", "raw_input_value_count", "target_raw_input_sha256", "reference_raw_input_sha256",
+    "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
 }
 INPUT_KEYS = {"schema", "cell_id", "cell_ordinal", "seed_index", "seed_sha256", *DIMENSION_NAMES}
 ATTEMPT_HASH_FIELDS = (
     "seed_sha256", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash",
     "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_support_sha256",
-    "reference_support_sha256",
+    "reference_support_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
+    "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
 )
 CELL_SUMMARY_KEYS = {
     "schema", "cell_id", "cell_ordinal", "status", "attempted_seeds", "emitted_seeds",
@@ -145,18 +149,19 @@ class ShardSpec:
     cell_ordinal_start: int
     cell_ordinal_end_exclusive: int
     cell_ids: tuple[str, ...]
+    seed_counts: tuple[int, ...] = ()
 
     @property
     def expected_attempts(self) -> int:
-        return len(self.cell_ids) * FROZEN_SEED_COUNT
+        return sum(self.seed_counts) if self.seed_counts else len(self.cell_ids) * FROZEN_SEED_COUNT
 
 
 def load_preregistration(path: Path) -> Dict[str, Any]:
-    path = Path(path)
-    if path.stat().st_size > 4 * 1024 * 1024:
-        raise SchemaError("preregistration exceeds its frozen byte cap before read")
-    with path.open(encoding="utf-8") as handle:
-        value = json.load(handle)
+    raw = _read_bounded_bytes(Path(path), 4 * 1024 * 1024, "preregistration")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("preregistration is malformed JSON") from exc
     if not isinstance(value, dict):
         raise SchemaError("preregistration root must be an object")
     return value
@@ -188,29 +193,58 @@ def sha256_file(path: Path, byte_limit: int | None = None) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _read_single_json_record(path: Path, byte_limit: int, label: str) -> tuple[dict[str, Any], bytes]:
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_bounded_bytes(path: Path, byte_limit: int, label: str) -> bytes:
     path = Path(path)
-    metadata = path.stat()
-    if not stat.S_ISREG(metadata.st_mode):
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
         raise SchemaError(f"{label} is not a regular file")
-    if metadata.st_size > byte_limit:
+    if before.st_size > byte_limit:
         raise SchemaError(f"{label} exceeds its frozen byte cap before read")
+    chunks: list[bytes] = []
+    byte_count = 0
     with path.open("rb") as handle:
-        raw = handle.readline(byte_limit + 1)
-        if not raw:
-            raise SchemaError(f"{label} is empty")
-        if len(raw) > byte_limit or not raw.endswith(b"\n"):
-            raise SchemaError(f"{label} exceeds its frozen byte cap or lacks newline framing")
-        if handle.read(1):
-            raise SchemaError(f"{label} must contain exactly one JSON record")
+        opened = os.fstat(handle.fileno())
+        if _file_identity(opened) != _file_identity(before):
+            raise SchemaError(f"{label} changed before it was opened")
+        while True:
+            chunk = handle.read(min(65536, byte_limit + 1 - byte_count))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            byte_count += len(chunk)
+            if byte_count > byte_limit:
+                raise SchemaError(f"{label} exceeds its frozen byte cap during read")
+        after = os.fstat(handle.fileno())
+    path_after = path.stat()
+    if _file_identity(after) != _file_identity(before) or _file_identity(path_after) != _file_identity(before) or byte_count != before.st_size:
+        raise SchemaError(f"{label} changed while it was being read")
+    return b"".join(chunks)
+
+
+def _read_single_json_record(path: Path, byte_limit: int, label: str) -> tuple[dict[str, Any], bytes]:
+    raw = _read_bounded_bytes(Path(path), byte_limit, label)
+    if not raw:
+        raise SchemaError(f"{label} is empty")
+    if not raw.endswith(b"\n"):
+        raise SchemaError(f"{label} lacks newline framing")
+    if b"\n" in raw[:-1]:
+        raise SchemaError(f"{label} must contain exactly one JSON record")
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SchemaError(f"{label} is malformed JSON") from exc
     if not isinstance(value, dict):
         raise SchemaError(f"{label} is not an object")
-    if len(raw) != metadata.st_size:
-        raise SchemaError(f"{label} changed while it was being read")
     return value, raw
 
 
@@ -265,8 +299,23 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
     if not isinstance(generator, dict):
         return
     raw = generator.get("raw_proper_complex", {})
-    if raw.get("covariance_shape") != "N_by_N_per_topology" or "C_ab" not in raw.get("covariance_formula", "") or raw.get("sampler") != "Z=mu+L*(U+iV)/sqrt(2), U,V iid N(0,I), C=L L^H lower_hermitian_cholesky":
-        errors.append("raw generator must define the frozen proper-complex covariance and sampler")
+    if (
+        raw.get("model") != "production_shaped_proper_complex_ar1_v2"
+        or raw.get("source_shape") != "realized_support_union_by_acquisition"
+        or raw.get("component_order") != ["real", "imag"]
+        or "AR(1)" not in raw.get("temporal_signal", "")
+        or raw.get("pseudo_covariance") != "E[Z Z^T]=0"
+    ):
+        errors.append("raw generator must define the frozen full proper-complex source-by-acquisition process")
+    replay = generator.get("full_replay_dgp", {})
+    if (
+        replay.get("native_tile_shape") != [256, 256]
+        or replay.get("raw_shape") != "realized support union count by complete topology acquisition count by real/imag"
+        or "every expected ministack" not in replay.get("support_generation", "")
+        or "2N_by_2N" not in replay.get("truth", "")
+        or "exact zero" not in replay.get("coincident", "")
+    ):
+        errors.append("full replay DGP must bind raw shape, direct joint truth, and coincident zero")
     source = generator.get("source_centered_empirical", {})
     if source.get("covariance_definition") != "E[Z Z*]/n" or source.get("mean") != "zero; no sample-mean subtraction" or source.get("floor_application") != "after_zero_mean_covariance_and_shrinkage":
         errors.append("source model must be zero-mean E[Z Z*]/n with post-shrinkage floor")
@@ -311,12 +360,18 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
             if _dimension_values(preregistration, name) != FROZEN_DIMENSION_IDS[name]:
                 errors.append(f"dimension {name} does not match the frozen matrix")
     schedule = preregistration.get("seed_schedule")
-    if not isinstance(schedule, dict) or not _integer(schedule.get("attempted_seeds_per_cell")) or schedule.get("attempted_seeds_per_cell") != FROZEN_SEED_COUNT or schedule.get("no_top_up") is not True:
-        errors.append("seed schedule must freeze 5000 attempts and prohibit top-up")
+    if (
+        not isinstance(schedule, dict)
+        or schedule.get("supported_monte_carlo_seeds") != FROZEN_SEED_COUNT
+        or schedule.get("deterministic_contract_seeds") != FROZEN_DETERMINISTIC_SEED_COUNT
+        or schedule.get("no_top_up") is not True
+        or schedule.get("selection_rule") != "one seed for masked, tied, non-interior, coincident, and disjoint cells; 5000 fixed seeds otherwise"
+    ):
+        errors.append("seed schedule must freeze supported and deterministic counts without top-up")
     if preregistration.get("thresholds") != FROZEN_THRESHOLDS:
         errors.append("thresholds differ from immutable F54-07 thresholds")
     for field_name, frozen_hash, message in (
-        ("matrix_contract", FROZEN_MATRIX_SHA256, "matrix contract must freeze 89100 cells and 445500000 attempts including source_process"),
+        ("matrix_contract", FROZEN_MATRIX_SHA256, "matrix contract must freeze the exact pairwise risk design and attempt count"),
         ("execution_protocol", FROZEN_EXECUTION_SHA256, "execution protocol differs from the frozen v4 compact contract"),
         ("cell_reducers", FROZEN_REDUCERS_SHA256, "cell reducers or denominators differ from the frozen v3 contract"),
         ("receipt_contract", FROZEN_RECEIPT_SHA256, "receipt contract differs from the frozen v3 contract"),
@@ -353,11 +408,38 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
 def iter_expected_cell_ids(preregistration: Mapping[str, Any]) -> Iterator[str]:
     validate_preregistration(preregistration)
     values = [_dimension_values(preregistration, name) for name in DIMENSION_NAMES]
-    return ("|".join(labels) for labels in itertools.product(*values))
+    defaults = [dimension[0] for dimension in values]
+    cells: set[tuple[str, ...]] = set()
+    for first, second in itertools.combinations(range(len(DIMENSION_NAMES)), 2):
+        for first_value in values[first]:
+            for second_value in values[second]:
+                labels = defaults.copy()
+                labels[first] = first_value
+                labels[second] = second_value
+                cells.add(tuple(labels))
+    for cell_id in preregistration["matrix_contract"]["risk_cells"]:
+        labels = tuple(cell_id.split("|"))
+        if len(labels) != len(DIMENSION_NAMES) or any(labels[index] not in values[index] for index in range(len(labels))):
+            raise SchemaError("risk cell is outside the frozen dimensions")
+        cells.add(labels)
+    if len(cells) != FROZEN_CELL_COUNT:
+        raise SchemaError("pairwise risk design does not contain its exact frozen cell count")
+    return ("|".join(labels) for labels in sorted(cells))
 
 
 def expected_cell_ids(preregistration: Mapping[str, Any]) -> List[str]:
     return list(iter_expected_cell_ids(preregistration))
+
+
+def expected_seed_count(cell_id: str) -> int:
+    labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+    deterministic = (
+        labels.get("position") != "interior"
+        or labels.get("eigen_stress") == "tied_eigenvalue"
+        or labels.get("pair_geometry") == "coincident"
+        or labels.get("pair_geometry") in DISJOINT_GEOMETRIES
+    )
+    return FROZEN_DETERMINISTIC_SEED_COUNT if deterministic else FROZEN_SEED_COUNT
 
 
 def iter_shard_specs(preregistration: Mapping[str, Any]) -> Iterator[ShardSpec]:
@@ -368,10 +450,16 @@ def iter_shard_specs(preregistration: Mapping[str, Any]) -> Iterator[ShardSpec]:
         if not cell_ids:
             raise SchemaError("frozen shard count exceeds the matrix")
         end = ordinal + len(cell_ids)
-        yield ShardSpec(shard_index, ordinal, end, cell_ids)
+        yield ShardSpec(
+            shard_index,
+            ordinal,
+            end,
+            cell_ids,
+            tuple(expected_seed_count(cell_id) for cell_id in cell_ids),
+        )
         ordinal = end
     if next(cells, None) is not None or ordinal != FROZEN_CELL_COUNT:
-        raise SchemaError("frozen shards do not cover exactly 89100 cells")
+        raise SchemaError("frozen shards do not cover exactly 353 cells")
 
 
 def _expected_seed_hash(preregistration: Mapping[str, Any], cell_id: str, index: int) -> str:
@@ -536,55 +624,340 @@ def _expected_coordinates(preregistration: Mapping[str, Any], cell_id: str) -> t
     return target, [target[0] + delta[0], target[1] + delta[1]]
 
 
+def _candidate_support(
+    center: Sequence[int], half_window: Sequence[int], native_tile_shape: Sequence[int]
+) -> list[tuple[int, int]]:
+    window_shape = [2 * half_window[0] + 1, 2 * half_window[1] + 1]
+    tile_origin = [
+        (center[axis] // native_tile_shape[axis]) * native_tile_shape[axis]
+        for axis in range(2)
+    ]
+    start = [
+        min(
+            max(tile_origin[axis], center[axis] - half_window[axis]),
+            tile_origin[axis] + native_tile_shape[axis] - window_shape[axis],
+        )
+        for axis in range(2)
+    ]
+    return [
+        (start[0] + row, start[1] + column)
+        for row in range(window_shape[0])
+        for column in range(window_shape[1])
+    ]
+
+
+def _generate_complex_source(
+    preregistration: Mapping[str, Any],
+    cell_id: str,
+    seed_index: int,
+    coordinate: tuple[int, int],
+    date_count: int,
+    global_normals: Sequence[float],
+    spatial: bool,
+    eigen_stress: str,
+) -> list[complex]:
+    raw = preregistration["generator"]["raw_proper_complex"]
+    seed = hashlib.sha256(
+        f"{preregistration['seed_schedule']['validation_seed']}||{cell_id}||{seed_index}||{coordinate[0]},{coordinate[1]}".encode("utf-8")
+    ).hexdigest()
+    local = deterministic_normals(seed, 4 * date_count)
+    spatial_weight = math.sqrt(0.5) if spatial else 0.0
+    local_weight = math.sqrt(1.0 - spatial_weight * spatial_weight)
+    temporal_rho = math.exp(-preregistration["generator"]["acquisition"]["cadence_days"] / raw["correlation_days"])
+    innovation_weight = math.sqrt(1.0 - temporal_rho * temporal_rho)
+    signal_real = 0.0
+    signal_imag = 0.0
+    values: list[complex] = []
+    for acquisition in range(date_count):
+        offset = 4 * acquisition
+        innovation_real = local_weight * local[offset] + spatial_weight * global_normals[offset]
+        innovation_imag = local_weight * local[offset + 1] + spatial_weight * global_normals[offset + 1]
+        if acquisition == 0:
+            signal_real, signal_imag = innovation_real, innovation_imag
+        else:
+            signal_real = temporal_rho * signal_real + innovation_weight * innovation_real
+            signal_imag = temporal_rho * signal_imag + innovation_weight * innovation_imag
+        stress_scale = {
+            "well_separated": 1.0 + 0.15 * math.cos(acquisition + 1.0),
+            "near_tie": 1.0 + (2.0**-24 if acquisition % 2 else 0.0),
+            "tied_eigenvalue": 1.0,
+        }[eigen_stress]
+        amplitude = raw["signal_amplitude"] * stress_scale * (
+            1.0 + 0.05 * math.sin((coordinate[0] + 3.0 * coordinate[1]) / 7.0)
+        )
+        phase = (
+            raw["phase0_rad"]
+            + raw["slope_rad_per_day"] * preregistration["generator"]["acquisition"]["cadence_days"] * acquisition
+            + 0.125 * math.cos((2.0 * coordinate[0] - coordinate[1]) / 11.0)
+        )
+        rotation = complex(math.cos(phase), math.sin(phase))
+        signal = amplitude * complex(signal_real, signal_imag) * rotation / math.sqrt(2.0)
+        noise = math.sqrt(raw["noise_variance"] / 2.0) * complex(local[offset + 2], local[offset + 3])
+        value = signal + noise
+        values.append(complex(
+            struct.unpack(">f", struct.pack(">f", value.real))[0],
+            struct.unpack(">f", struct.pack(">f", value.imag))[0],
+        ))
+    return values
+
+
+def _select_support(
+    method: str,
+    candidates: Sequence[tuple[int, int]],
+    center: Sequence[int],
+    raw_by_source: Mapping[tuple[int, int], Sequence[complex]],
+) -> list[tuple[int, int]]:
+    center_key = (center[0], center[1])
+    if method == "rect":
+        return list(candidates)
+    center_magnitudes = [abs(value) for value in raw_by_source[center_key]]
+    selected: list[tuple[int, int]] = []
+    for coordinate in candidates:
+        if coordinate == center_key:
+            continue
+        magnitudes = [abs(value) for value in raw_by_source[coordinate]]
+        if method == "glrt_frozen":
+            mean = sum(magnitudes) / len(magnitudes)
+            variance = sum((value - mean) ** 2 for value in magnitudes) / len(magnitudes)
+            center_mean = sum(center_magnitudes) / len(center_magnitudes)
+            center_variance = sum((value - center_mean) ** 2 for value in center_magnitudes) / len(center_magnitudes)
+            center_scale = (center_variance + center_mean * center_mean) / 2.0
+            scale = (variance + mean * mean) / 2.0
+            pooled = (center_scale + scale) / 2.0
+            statistic = len(magnitudes) * (2.0 * math.log(pooled) - math.log(center_scale) - math.log(scale))
+            keep = statistic < 10.827566170662733
+        else:
+            first = sorted(center_magnitudes)
+            second = sorted(magnitudes)
+            index_first = index_second = output = 0
+            cdf_first = cdf_second = distance = 0.0
+            step = 1.0 / len(first)
+            while output < 2 * len(first):
+                if index_first == len(first):
+                    cdf_second += step
+                    index_second += 1
+                elif index_second == len(second) or first[index_first] < second[index_second]:
+                    cdf_first += step
+                    index_first += 1
+                elif first[index_first] > second[index_second]:
+                    cdf_second += step
+                    index_second += 1
+                else:
+                    cdf_first += step
+                    cdf_second += step
+                    index_first += 1
+                    index_second += 1
+                    output += 1
+                output += 1
+                distance = max(distance, abs(cdf_first - cdf_second))
+            sqrt_n = math.sqrt(len(first) / 2.0)
+            cutoff = 0.01
+            while cutoff <= 1.0:
+                value = cutoff * (sqrt_n + 0.12 + 0.11 / sqrt_n)
+                pvalue = min(1.0, max(0.0, 2.0 * sum((-1.0) ** (term - 1) * math.exp(-2.0 * value * value * term * term) for term in range(1, 101))))
+                if pvalue <= 0.001:
+                    break
+                cutoff += 0.001
+            keep = distance < (cutoff if cutoff <= 1.0 else 0.1)
+        if keep:
+            selected.append(coordinate)
+    return selected
+
+
+def _raw_source_digest(
+    domain: str,
+    support: Sequence[tuple[int, int]],
+    raw_by_source: Mapping[tuple[int, int], Sequence[complex]],
+) -> str:
+    digest = hashlib.sha256(domain.encode("utf-8"))
+    digest.update(len(support).to_bytes(8, "big"))
+    for coordinate in support:
+        digest.update(struct.pack(">qq", coordinate[0], coordinate[1]))
+        values = raw_by_source[coordinate]
+        digest.update(len(values).to_bytes(8, "big"))
+        for value in values:
+            digest.update(struct.pack(">dd", 0.0 if value.real == 0.0 else value.real, 0.0 if value.imag == 0.0 else value.imag))
+    return digest.hexdigest()
+
+
+def _sequential_phase(values: Sequence[complex], blocks: Sequence[Mapping[str, int]]) -> list[float]:
+    raw_phase = [math.atan2((value * values[0].conjugate()).imag, (value * values[0].conjugate()).real) for value in values]
+    result = [0.0] * len(values)
+    for block in blocks:
+        start = block["real_start"]
+        parent = 0.0 if start == 0 else result[start - 1]
+        local_reference = raw_phase[start]
+        for acquisition in range(start, start + block["num_real"]):
+            delta = math.atan2(math.sin(raw_phase[acquisition] - local_reference), math.cos(raw_phase[acquisition] - local_reference))
+            result[acquisition] = parent + delta
+    result[0] = 0.0
+    return result
+
+
+def _support_by_date(
+    supports: Sequence[Sequence[tuple[int, int]]],
+    blocks: Sequence[Mapping[str, int]],
+    date_count: int,
+) -> list[set[tuple[int, int]]]:
+    result = [set() for _ in range(date_count)]
+    for support, block in zip(supports, blocks):
+        for acquisition in range(block["real_start"], block["real_start"] + block["num_real"]):
+            result[acquisition] = set(support)
+    return result
+
+
+def _direct_phase_covariance(
+    row_supports: Sequence[set[tuple[int, int]]],
+    column_supports: Sequence[set[tuple[int, int]]],
+    row_phases: Mapping[tuple[int, int], Sequence[float]],
+    column_phases: Mapping[tuple[int, int], Sequence[float]],
+    orientation: float = 1.0,
+) -> list[list[float]]:
+    date_count = len(row_supports)
+    result = [[0.0] * date_count for _ in range(date_count)]
+    for row in range(date_count):
+        for column in range(date_count):
+            shared = row_supports[row] & column_supports[column]
+            scale = orientation / math.sqrt(len(row_supports[row]) * len(column_supports[column]))
+            result[row][column] = scale * sum(
+                row_phases[coordinate][row] * column_phases[coordinate][column]
+                for coordinate in shared
+            )
+    return result
+
+
+def _effective_looks_fraction(support: Sequence[tuple[int, int]], spatial: bool) -> float:
+    if not spatial:
+        return 1.0
+    denominator = sum(
+        math.exp(-math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5)
+        for first in support
+        for second in support
+    )
+    return len(support) / denominator
+
+
 def regenerate_frozen_attempt_inputs(
     preregistration: Mapping[str, Any], cell_id: str, seed_index: int
 ) -> dict[str, Any]:
-    if not _integer(seed_index) or seed_index < 0 or seed_index >= FROZEN_SEED_COUNT:
+    if not _integer(seed_index) or seed_index < 0 or seed_index >= expected_seed_count(cell_id):
         raise SchemaError("frozen DGP seed index is outside the preregistered schedule")
     labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
     if set(labels) != set(DIMENSION_NAMES):
         raise SchemaError("frozen DGP cell identity is malformed")
-    target, _ = _expected_coordinates(preregistration, cell_id)
-    seed_preimage = (
-        f"{preregistration['seed_schedule']['validation_seed']}||{cell_id}||{seed_index}||"
-        f"{target[0]},{target[1]}"
-    )
-    raw_values = deterministic_normals(hashlib.sha256(seed_preimage.encode("utf-8")).hexdigest(), 8)
-    dgp = preregistration["generator"]["scorer_replay_dgp"]
-    target_energy = (
-        ((raw_values[0] * raw_values[0] + raw_values[1] * raw_values[1])
-         + (raw_values[2] * raw_values[2] + raw_values[3] * raw_values[3]))
-        * 0.25
-        + dgp["noise_variance"]
-    )
-    reference_energy = (
-        ((raw_values[4] * raw_values[4] + raw_values[5] * raw_values[5])
-         + (raw_values[6] * raw_values[6] + raw_values[7] * raw_values[7]))
-        * 0.25
-        + dgp["noise_variance"]
-    )
-    stress = labels["eigen_stress"]
-    if stress == "well_separated":
-        correlation = dgp["pair_correlation"][labels["pair_geometry"]]
-        cross = correlation * math.sqrt(target_energy * reference_energy)
-        truth_matrix = [
-            [target_energy + dgp["well_separated_diagonal"][0], cross],
-            [cross, reference_energy + dgp["well_separated_diagonal"][1]],
-        ]
+    target, reference = _expected_coordinates(preregistration, cell_id)
+    window = preregistration["generator"]["coordinates"]["window_stride"][f"{labels['half_window']}|{labels['stride']}"]
+    native_tile_shape = preregistration["generator"]["full_replay_dgp"]["native_tile_shape"]
+    target_candidates = _candidate_support(target, window["half_window"], native_tile_shape)
+    reference_candidates = _candidate_support(reference, window["half_window"], native_tile_shape)
+    candidate_union = sorted(set(target_candidates) | set(reference_candidates))
+    topology = preregistration["generator"]["acquisition"]["topologies"][labels["block_topology"]]
+    date_count = topology["acquisition_count"]
+    global_seed = hashlib.sha256(
+        f"{preregistration['seed_schedule']['validation_seed']}||{cell_id}||{seed_index}||global-source-process".encode("utf-8")
+    ).hexdigest()
+    global_normals = deterministic_normals(global_seed, 4 * date_count)
+    spatial = labels["source_process"] == "spatial_correlation_stress"
+    raw_by_source = {
+        coordinate: _generate_complex_source(
+            preregistration, cell_id, seed_index, coordinate, date_count,
+            global_normals, spatial, labels["eigen_stress"],
+        )
+        for coordinate in candidate_union
+    }
+    target_supports = []
+    reference_supports = []
+    for block in topology["expected_blocks"]:
+        block_dates = range(block["real_start"], block["real_start"] + block["num_real"])
+        block_raw = {
+            coordinate: [raw_by_source[coordinate][acquisition] for acquisition in block_dates]
+            for coordinate in candidate_union
+        }
+        target_supports.append(_select_support(labels["support"], target_candidates, target, block_raw))
+        reference_supports.append(_select_support(labels["support"], reference_candidates, reference, block_raw))
+    target_support = sorted(set().union(*map(set, target_supports)))
+    reference_support = sorted(set().union(*map(set, reference_supports)))
+    union_support = sorted(set(target_support) | set(reference_support))
+    target_phases = {coordinate: _sequential_phase(raw_by_source[coordinate], topology["expected_blocks"]) for coordinate in target_support}
+    reference_phases = {coordinate: _sequential_phase(raw_by_source[coordinate], topology["expected_blocks"]) for coordinate in reference_support}
+    target_by_date = _support_by_date(target_supports, topology["expected_blocks"], date_count)
+    reference_by_date = _support_by_date(reference_supports, topology["expected_blocks"], date_count)
+    target_covariance = _direct_phase_covariance(target_by_date, target_by_date, target_phases, target_phases)
+    reference_covariance = target_covariance if target_supports == reference_supports else _direct_phase_covariance(reference_by_date, reference_by_date, reference_phases, reference_phases)
+    shared = sorted(set(target_support) & set(reference_support))
+    orientation = -1.0 if labels["pair_geometry"].endswith("_negative") else 1.0
+    if target_supports == reference_supports:
+        cross_covariance = target_covariance
     else:
-        leading = 1.0
-        trailing = 1.0 if stress == "tied_eigenvalue" else 1.0 - 2.0**-24
-        cosine = dgp["fixed_rotation"]["cosine"]
-        sine = dgp["fixed_rotation"]["sine"]
-        truth_matrix = [
-            [cosine * cosine * leading + sine * sine * trailing, cosine * sine * (leading - trailing)],
-            [cosine * sine * (leading - trailing), sine * sine * leading + cosine * cosine * trailing],
-        ]
-    weights = [1.0, -1.0]
-    truth_value = raw_values[0] / math.sqrt(2.0)
+        cross_covariance = _direct_phase_covariance(
+            target_by_date, reference_by_date, target_phases, reference_phases, orientation
+        )
+    effective_looks = _effective_looks_fraction(union_support, spatial)
+    target_covariance = [[value / effective_looks for value in row] for row in target_covariance]
+    reference_covariance = [[value / effective_looks for value in row] for row in reference_covariance]
+    cross_covariance = [[value / effective_looks for value in row] for row in cross_covariance]
+    truth_matrix = [
+        target_covariance[row] + cross_covariance[row]
+        for row in range(date_count)
+    ] + [
+        [cross_covariance[column][row] for column in range(date_count)] + reference_covariance[row]
+        for row in range(date_count)
+    ]
+    weights = [0.0] * (2 * date_count)
+    weights[date_count - 1] = 1.0
+    weights[2 * date_count - 1] = -1.0
+    if target_supports == reference_supports:
+        truth_value = 0.0
+    else:
+        truth_value = (
+            sum(vector[-1] for vector in target_phases.values()) / len(target_phases)
+            - orientation * sum(vector[-1] for vector in reference_phases.values()) / len(reference_phases)
+        )
+    target_support_receipt = [
+        {"block_id": block["block_id"], "sources": support}
+        for block, support in zip(topology["expected_blocks"], target_supports)
+    ]
+    reference_support_receipt = [
+        {"block_id": block["block_id"], "sources": support}
+        for block, support in zip(topology["expected_blocks"], reference_supports)
+    ]
+    target_support_sha256 = sha256_json(target_support_receipt)
+    reference_support_sha256 = sha256_json(reference_support_receipt)
+    ancestry = {
+        "date_axis": topology["date_axis"],
+        "expected_blocks": topology["expected_blocks"],
+        "max_num_compressed": topology["max_num_compressed"],
+        "partial_tail_count": topology["partial_tail_count"],
+    }
+    sequential_ancestry_sha256 = sha256_json(ancestry)
+    raw_identity = {
+        "cell_id": cell_id,
+        "seed_index": seed_index,
+        "shape": [len(union_support), date_count, 2],
+        "target_coordinate": target,
+        "reference_coordinate": reference,
+        "target_support_sha256": target_support_sha256,
+        "reference_support_sha256": reference_support_sha256,
+        "sequential_ancestry_sha256": sequential_ancestry_sha256,
+        "estimator": labels["estimator"],
+        "eigen_stress": labels["eigen_stress"],
+        "source_process": labels["source_process"],
+    }
     return {
-        "raw_input_values": raw_values,
-        "raw_input_sha256": numeric_digest("raw-input-v4", raw_values),
+        "raw_input_shape": [len(union_support), date_count, 2],
+        "raw_input_value_count": 2 * len(union_support) * date_count,
+        "raw_input_sha256": _raw_source_digest("raw-input-v4", union_support, raw_by_source),
+        "target_raw_input_sha256": _raw_source_digest("source-raw-input-v4", target_support, raw_by_source),
+        "reference_raw_input_sha256": _raw_source_digest("source-raw-input-v4", reference_support, raw_by_source),
+        "target_support_sha256": target_support_sha256,
+        "reference_support_sha256": reference_support_sha256,
+        "sequential_ancestry_sha256": sequential_ancestry_sha256,
+        "raw_dgp_identity_sha256": sha256_json(raw_identity),
+        "target_source_count": len(target_support),
+        "reference_source_count": len(reference_support),
+        "intersection_source_count": len(shared),
+        "union_source_count": len(union_support),
+        "effective_looks_fraction": effective_looks,
         "truth_matrix": truth_matrix,
         "truth_sha256": numeric_digest("truth-v4", itertools.chain.from_iterable(truth_matrix)),
         "contrast_weights": weights,
@@ -612,7 +985,7 @@ class CellAccumulator:
     preregistration: Mapping[str, Any]
     cell_id: str
     cell_ordinal: int
-    expected_seed_count: int = FROZEN_SEED_COUNT
+    expected_seed_count: int | None = None
     code_sha256: str = "0" * 64
     binary_sha256: str = "0" * 64
     next_seed_index: int = 0
@@ -634,6 +1007,10 @@ class CellAccumulator:
     field_digests: dict[str, Any] = field(default_factory=lambda: {name: hashlib.sha256() for name in ("operator_hash", "variance_hash", "emission_hash", "truth_sha256")})
     request_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:requests:v4\0"))
     attempt_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:attempts:v4\0"))
+
+    def __post_init__(self) -> None:
+        if self.expected_seed_count is None:
+            self.expected_seed_count = expected_seed_count(self.cell_id)
 
     def add(self, attempt: Any) -> None:
         if not isinstance(attempt, dict) or set(attempt) != ATTEMPT_KEYS:
@@ -699,14 +1076,15 @@ class CellAccumulator:
         expected = regenerate_frozen_attempt_inputs(
             self.preregistration, self.cell_id, self.next_seed_index
         )
-        raw_values = attempt.get("raw_input_values")
-        if (
-            not isinstance(raw_values, list)
-            or len(raw_values) != len(expected["raw_input_values"])
-            or any(not _number(value) for value in raw_values)
-            or raw_values != expected["raw_input_values"]
-            or attempt.get("raw_input_sha256") != expected["raw_input_sha256"]
-        ):
+        raw_fields = (
+            "raw_input_shape", "raw_input_value_count", "raw_input_sha256",
+            "target_raw_input_sha256", "reference_raw_input_sha256",
+            "target_support_sha256", "reference_support_sha256",
+            "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
+            "target_source_count", "reference_source_count", "intersection_source_count",
+            "union_source_count", "effective_looks_fraction",
+        )
+        if any(attempt.get(field_name) != expected[field_name] for field_name in raw_fields):
             raise SchemaError(f"cell {self.cell_id} raw DGP does not match deterministic regeneration")
         if attempt.get("truth_sha256") != expected["truth_sha256"]:
             raise SchemaError(f"cell {self.cell_id} frozen truth digest does not match regeneration")
@@ -843,14 +1221,14 @@ class CellAccumulator:
         if self.max_operator_error is None or self.min_psd_eigenvalue is None or self.coverage_denominator != self.emitted:
             return FAIL
         thresholds = self.preregistration["thresholds"]
-        deterministic = labels["pair_geometry"] in {"coincident", *DISJOINT_GEOMETRIES}
+        deterministic = self.expected_seed_count == FROZEN_DETERMINISTIC_SEED_COUNT
         operator_limit = thresholds["deterministic_operator_relative_error_max"] if deterministic else thresholds["stochastic_operator_relative_error_max"]
         coverage = self.covered / self.coverage_denominator if self.coverage_denominator else math.nan
         passes = (
             self.max_operator_error <= operator_limit
             and (self.max_variance_error is None or self.max_variance_error <= thresholds["contrast_variance_relative_error_max"])
             and self.min_psd_eigenvalue >= thresholds["psd_min_eigenvalue_min"]
-            and abs(coverage - thresholds["coverage_probability"]) <= thresholds["coverage_absolute_error_max"]
+            and (deterministic or abs(coverage - thresholds["coverage_probability"]) <= thresholds["coverage_absolute_error_max"])
             and self.emitted / self.expected_seed_count >= thresholds["emission_rate_min"]
         )
         return PASS if passes else FAIL
@@ -1000,6 +1378,7 @@ def validate_cell_summary(
     code_sha256: str,
     binary_sha256: str,
 ) -> None:
+    seed_count = expected_seed_count(cell_id)
     if not isinstance(summary, dict) or set(summary) != CELL_SUMMARY_KEYS:
         raise SchemaError(f"cell {cell_id} compact summary has unknown or missing fields")
     if len(_canonical_bytes(summary)) + 1 > FROZEN_MAX_CELL_SUMMARY_BYTES:
@@ -1008,7 +1387,7 @@ def validate_cell_summary(
         "schema": "dolphinrust.spatial-covariance.cell-summary/4",
         "cell_id": cell_id,
         "cell_ordinal": cell_ordinal,
-        "attempted_seeds": FROZEN_SEED_COUNT,
+        "attempted_seeds": seed_count,
         "code_sha256": code_sha256,
         "binary_sha256": binary_sha256,
         "preregistration_sha256": preregistration_digest(preregistration),
@@ -1018,7 +1397,7 @@ def validate_cell_summary(
     if any(not _is_sha256(summary.get(name)) for name in ("request_digest", "attempt_digest", "operator_digest", "variance_digest", "truth_digest", "emission_digest", "code_sha256", "binary_sha256", "preregistration_sha256")):
         raise SchemaError(f"cell {cell_id} compact summary has an invalid digest")
     statuses = summary.get("status_histogram")
-    if not isinstance(statuses, dict) or set(statuses) != ATTEMPT_STATUSES or any(not _integer(value) or value < 0 for value in statuses.values()) or sum(statuses.values()) != FROZEN_SEED_COUNT:
+    if not isinstance(statuses, dict) or set(statuses) != ATTEMPT_STATUSES or any(not _integer(value) or value < 0 for value in statuses.values()) or sum(statuses.values()) != seed_count:
         raise SchemaError(f"cell {cell_id} compact status histogram is incomplete")
     if not isinstance(summary.get("failure_histogram"), dict) or any(not isinstance(key, str) or not _integer(value) or value < 0 for key, value in summary["failure_histogram"].items()):
         raise SchemaError(f"cell {cell_id} compact failure histogram is malformed")
@@ -1027,20 +1406,20 @@ def validate_cell_summary(
     if labels["eigen_stress"] == "tied_eigenvalue" and labels["position"] != "masked":
         expected_status = NOT_EVALUABLE
     if labels["position"] == "masked":
-        valid_histogram = statuses["masked_target"] == FROZEN_SEED_COUNT and summary["emitted_seeds"] == 0
+        valid_histogram = statuses["masked_target"] == seed_count and summary["emitted_seeds"] == 0
     elif expected_status == NOT_EVALUABLE:
-        valid_histogram = statuses["tied_eigenvalue"] == FROZEN_SEED_COUNT
+        valid_histogram = statuses["tied_eigenvalue"] == seed_count
     else:
-        valid_histogram = statuses["valid"] == FROZEN_SEED_COUNT
-        deterministic = labels["pair_geometry"] in {"coincident", *DISJOINT_GEOMETRIES}
+        valid_histogram = statuses["valid"] == seed_count
+        deterministic = seed_count == FROZEN_DETERMINISTIC_SEED_COUNT
         operator_limit = preregistration["thresholds"]["deterministic_operator_relative_error_max" if deterministic else "stochastic_operator_relative_error_max"]
         coverage = summary.get("coverage_95")
         passes = (
             _number(summary.get("operator_relative_error")) and summary["operator_relative_error"] <= operator_limit
             and (summary.get("contrast_variance_relative_error") is None or (_number(summary["contrast_variance_relative_error"]) and summary["contrast_variance_relative_error"] <= preregistration["thresholds"]["contrast_variance_relative_error_max"]))
             and _number(summary.get("psd_min_eigenvalue")) and summary["psd_min_eigenvalue"] >= preregistration["thresholds"]["psd_min_eigenvalue_min"]
-            and _number(coverage) and abs(coverage - preregistration["thresholds"]["coverage_probability"]) <= preregistration["thresholds"]["coverage_absolute_error_max"]
-            and summary["emitted_seeds"] / FROZEN_SEED_COUNT >= preregistration["thresholds"]["emission_rate_min"]
+            and _number(coverage) and (deterministic or abs(coverage - preregistration["thresholds"]["coverage_probability"]) <= preregistration["thresholds"]["coverage_absolute_error_max"])
+            and summary["emitted_seeds"] / seed_count >= preregistration["thresholds"]["emission_rate_min"]
         )
         expected_status = PASS if passes else FAIL
     if not valid_histogram or summary.get("status") != expected_status:

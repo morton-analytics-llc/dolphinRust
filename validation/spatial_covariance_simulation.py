@@ -17,6 +17,7 @@ try:
         INPUT_KEYS,
         CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
+        FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
@@ -25,11 +26,13 @@ try:
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _read_bounded_bytes,
         _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
         expected_cell_ids,
+        expected_seed_count,
         load_preregistration,
         preregistration_digest,
         resolve_below_run_root,
@@ -47,6 +50,7 @@ except ModuleNotFoundError:
         INPUT_KEYS,
         CellAccumulator,
         FROZEN_MAX_RECORD_BYTES,
+        FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
@@ -55,11 +59,13 @@ except ModuleNotFoundError:
         SchemaError,
         ShardSpec,
         _expected_seed_hash,
+        _read_bounded_bytes,
         _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
         iter_shard_specs,
         expected_cell_ids,
+        expected_seed_count,
         load_preregistration,
         preregistration_digest,
         resolve_below_run_root,
@@ -78,18 +84,18 @@ def compact_json_line(value: Mapping[str, Any]) -> bytes:
 
 
 def _load_bounded_json(path: Path, byte_limit: int, label: str) -> Any:
-    path = Path(path)
-    if path.stat().st_size > byte_limit:
-        raise SchemaError(f"{label} exceeds its byte cap before read")
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+    raw = _read_bounded_bytes(Path(path), byte_limit, label)
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError(f"{label} is malformed JSON") from exc
 
 
 def iter_attempt_requests(preregistration: Mapping[str, Any], spec: ShardSpec) -> Iterator[dict[str, Any]]:
     validate_preregistration(preregistration)
     for cell_offset, cell_id in enumerate(spec.cell_ids):
         dimensions = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
-        for seed_index in range(FROZEN_SEED_COUNT):
+        for seed_index in range(expected_seed_count(cell_id)):
             yield {
                 "schema": "dolphinrust.spatial-covariance.attempt/4",
                 "cell_id": cell_id,
@@ -421,7 +427,7 @@ def prepare_input_shard(preregistration: Mapping[str, Any], spec: ShardSpec, des
         "cell_ordinal_start": spec.cell_ordinal_start,
         "cell_ordinal_end_exclusive": spec.cell_ordinal_end_exclusive,
         "cell_ids": list(spec.cell_ids),
-        "attempts_per_cell": FROZEN_SEED_COUNT,
+        "seed_counts": list(spec.seed_counts),
         "expected_attempts": spec.expected_attempts,
         "preregistration_sha256": preregistration_digest(preregistration),
         "request_digest": _request_digest(preregistration, spec),
@@ -438,14 +444,15 @@ def commit_cell_transport(
     destination: Path,
     code_sha256: str,
     binary_sha256: str,
-    expected_seed_count: int = FROZEN_SEED_COUNT,
+    expected_seed_count_override: int | None = None,
 ) -> dict[str, Any]:
     if not _is_digest(code_sha256) or not _is_digest(binary_sha256):
         raise SchemaError("cell commit code/binary identity is invalid")
     transport_path = Path(transport_path)
-    accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal, expected_seed_count, code_sha256, binary_sha256)
+    seed_count = expected_seed_count_override if expected_seed_count_override is not None else expected_seed_count(cell_id)
+    accumulator = CellAccumulator(preregistration, cell_id, cell_ordinal, seed_count, code_sha256, binary_sha256)
     with transport_path.open("rb") as handle:
-        for line_number in range(expected_seed_count):
+        for line_number in range(seed_count):
             raw = handle.readline(FROZEN_MAX_RECORD_BYTES + 2)
             if not raw or len(raw) > FROZEN_MAX_RECORD_BYTES or not raw.endswith(b"\n"):
                 raise SchemaError("ephemeral attempt transport is incomplete or oversized")
@@ -490,7 +497,7 @@ def _summary_root(
         validate_cell_summary(preregistration, summary, cell_id, cell_ordinal, code_sha256, binary_sha256)
         if attempt_regenerator is not None:
             accumulator = CellAccumulator(
-                preregistration, cell_id, cell_ordinal, FROZEN_SEED_COUNT, code_sha256, binary_sha256
+                preregistration, cell_id, cell_ordinal, expected_seed_count(cell_id), code_sha256, binary_sha256
             )
             for attempt in attempt_regenerator(cell_id, cell_ordinal):
                 accumulator.add(attempt)
@@ -689,8 +696,8 @@ def main() -> None:
         if args.destination.parent.resolve() != run_root:
             raise SchemaError("run-manifest destination parent must equal the run root")
         manifest_paths = [args.shard_manifest_directory / f"manifest-{index:05d}.jsonl" for index in range(FROZEN_SHARD_COUNT)]
-        performance_probe = _load_bounded_json(args.performance_probe, 1 << 20, "performance probe")
-        resources = _load_bounded_json(args.resources, 1 << 20, "resource receipts")
+        performance_probe = _load_bounded_json(args.performance_probe, FROZEN_MAX_RESOURCE_RECEIPT_BYTES, "performance probe")
+        resources = _load_bounded_json(args.resources, FROZEN_MAX_RESOURCE_RECEIPT_BYTES, "resource receipts")
         run_manifest = build_run_manifest(
             preregistration, run_root, manifest_paths, args.code_sha256, args.binary_sha256,
             performance_probe, resources,

@@ -1,10 +1,12 @@
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from validation.score_spatial_covariance import (
     ATTEMPT_KEYS,
@@ -12,6 +14,9 @@ from validation.score_spatial_covariance import (
     FROZEN_CELL_COUNT,
     FROZEN_CELL_SUMMARY_COMPONENT_BYTES,
     FROZEN_MAX_SHARD_BYTES,
+    FROZEN_MAX_RUN_MANIFEST_BYTES,
+    FROZEN_MAX_RECORD_BYTES,
+    FROZEN_MAX_SHARD_MANIFEST_BYTES,
     FROZEN_RETAINED_SIZE_BOUND_BYTES,
     FROZEN_SEED_COUNT,
     FROZEN_SHARD_COUNT,
@@ -26,6 +31,7 @@ from validation.score_spatial_covariance import (
     _validate_resources,
     deterministic_normals,
     expected_cell_ids,
+    expected_seed_count,
     independently_recompute_metrics,
     load_preregistration,
     numeric_digest,
@@ -35,6 +41,7 @@ from validation.score_spatial_covariance import (
     validate_preregistration,
 )
 from validation.spatial_covariance_simulation import (
+    _load_bounded_json,
     build_run_manifest,
     commit_cell_transport,
     commit_output_shard,
@@ -50,6 +57,8 @@ PREREGISTRATION = VALIDATION / "spatial_covariance_preregistration.json"
 CODE = "a" * 64
 BINARY = "b" * 64
 CELL = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
+SUPPORTED_CELL = "hw_1x1|stride_1|rect|interior|shared_75_positive|one_block|emi|well_separated|independent_complex_looks"
+RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|near_tie|spatial_correlation_stress"
 MASKED_CELL = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
 
 
@@ -65,6 +74,14 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         target = window["target_by_position"][labels["position"]]
         delta = window["reference_delta_by_pair_geometry"][labels["pair_geometry"]]
         frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
+        sign = "zero"
+        influence = 0.0
+        if labels["pair_geometry"].endswith("_positive"):
+            sign, influence = "positive", 0.1
+        elif labels["pair_geometry"].endswith("_negative"):
+            sign, influence = "negative", -0.1
+        elif labels["pair_geometry"].startswith("disjoint_"):
+            sign = "none"
         attempt = {
             "schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
             "cell_id": cell_id,
@@ -74,8 +91,13 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "status": "masked_target" if masked else "valid",
             "emitted": not masked,
             "factor_emitted": not masked,
-            "raw_input_values": frozen["raw_input_values"],
+            "raw_input_shape": frozen["raw_input_shape"],
+            "raw_input_value_count": frozen["raw_input_value_count"],
             "raw_input_sha256": frozen["raw_input_sha256"],
+            "target_raw_input_sha256": frozen["target_raw_input_sha256"],
+            "reference_raw_input_sha256": frozen["reference_raw_input_sha256"],
+            "sequential_ancestry_sha256": frozen["sequential_ancestry_sha256"],
+            "raw_dgp_identity_sha256": frozen["raw_dgp_identity_sha256"],
             "truth_sha256": frozen["truth_sha256"],
             "operator_hash": "3" * 64,
             "variance_hash": "4" * 64,
@@ -86,16 +108,16 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "source_model_hash": sha256_json(generator["source_centered_empirical"]),
             "target_coordinate": target,
             "reference_coordinate": [target[0] + delta[0], target[1] + delta[1]],
-            "target_support_sha256": "6" * 64,
-            "reference_support_sha256": "6" * 64,
-            "target_source_count": 4,
-            "reference_source_count": 4,
-            "intersection_source_count": 4,
-            "union_source_count": 4,
-            "realized_overlap_jaccard": 1.0,
-            "signed_cross_influence": None if masked else 0.0,
-            "signed_influence_sign": "zero",
-            "effective_looks_fraction": 1.0,
+            "target_support_sha256": frozen["target_support_sha256"],
+            "reference_support_sha256": frozen["reference_support_sha256"],
+            "target_source_count": frozen["target_source_count"],
+            "reference_source_count": frozen["reference_source_count"],
+            "intersection_source_count": frozen["intersection_source_count"],
+            "union_source_count": frozen["union_source_count"],
+            "realized_overlap_jaccard": frozen["intersection_source_count"] / frozen["union_source_count"],
+            "signed_cross_influence": None if masked else influence,
+            "signed_influence_sign": sign,
+            "effective_looks_fraction": frozen["effective_looks_fraction"],
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
             "operator_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
             "truth_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
@@ -151,8 +173,19 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(self.preregistration["supersedes"]["schema_version"], 3)
         self.assertFalse(self.preregistration["outcomes_present"])
         self.assertEqual(len(expected_cell_ids(self.preregistration)), FROZEN_CELL_COUNT)
-        self.assertEqual(FROZEN_ATTEMPT_COUNT, 445_500_000)
-        self.assertEqual(FROZEN_SHARD_COUNT, 891)
+        self.assertEqual(FROZEN_ATTEMPT_COUNT, 440_265)
+        self.assertEqual(FROZEN_SHARD_COUNT, 4)
+
+    def test_compact_design_covers_every_pairwise_level_combination(self):
+        cells = [cell_id.split("|") for cell_id in expected_cell_ids(self.preregistration)]
+        dimensions = self.preregistration["matrix_contract"]["dimension_order"]
+        values = [[item["id"] for item in self.preregistration["dimensions"][name]] for name in dimensions]
+        for first in range(len(dimensions)):
+            for second in range(first + 1, len(dimensions)):
+                observed = {(cell[first], cell[second]) for cell in cells}
+                expected = {(left, right) for left in values[first] for right in values[second]}
+                self.assertTrue(expected <= observed, (dimensions[first], dimensions[second]))
+        self.assertEqual(sum(expected_seed_count("|".join(cell)) for cell in cells), FROZEN_ATTEMPT_COUNT)
 
     def test_retained_bound_is_derived_and_below_32_gib(self):
         execution = self.preregistration["execution_protocol"]
@@ -163,8 +196,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertFalse(execution["request_files_retained"])
 
     def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
-        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 729_907_200)
-        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 761_282_560)
+        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 2_891_776)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 19_734_528)
         encoded = compact_json_line({"cell": 1})
         with tempfile.TemporaryDirectory() as directory:
             exact = _CellSummarySink(Path(directory) / "exact.jsonl")
@@ -183,7 +216,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(FROZEN_MAX_SHARD_BYTES, 819_200)
 
     def test_exact_request_regeneration_is_ordered_and_stable(self):
-        spec = ShardSpec(0, 0, 1, (CELL,))
+        spec = ShardSpec(0, 0, 1, (SUPPORTED_CELL,), (expected_seed_count(SUPPORTED_CELL),))
         generator = iter_attempt_requests(self.preregistration, spec)
         first = [next(generator), next(generator)]
         repeated_generator = iter_attempt_requests(self.preregistration, spec)
@@ -203,7 +236,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             numeric_digest("truth-v4", [float("nan")])
 
     def test_python_independently_recomputes_all_numeric_claims(self):
-        computed = independently_recompute_metrics(self._attempt(CELL, 0, 0))
+        computed = independently_recompute_metrics(self._attempt(SUPPORTED_CELL, 0, 0))
         self.assertEqual(computed["operator_relative_error"], 0.0)
         self.assertGreater(computed["contrast_variance_reference"], 0.0)
         self.assertTrue(computed["covered_95"])
@@ -219,8 +252,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
 
     def test_producer_replaced_raw_input_or_truth_fails_regeneration(self):
         raw = self._attempt(CELL, 0, 0)
-        raw["raw_input_values"][0] += 1.0
-        raw["raw_input_sha256"] = numeric_digest("raw-input-v4", raw["raw_input_values"])
+        raw["raw_input_sha256"] = "f" * 64
         with self.assertRaisesRegex(SchemaError, "raw DGP"):
             CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(raw)
         truth = self._attempt(CELL, 0, 0)
@@ -229,6 +261,46 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         truth.update(independently_recompute_metrics(truth))
         with self.assertRaisesRegex(SchemaError, "frozen truth"):
             CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(truth)
+
+    def test_full_production_shaped_dgp_binds_support_ancestry_and_raw_content(self):
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, RISK_CELL, 0)
+        dates = len(self.preregistration["generator"]["acquisition"]["topologies"]["four_blocks"]["date_axis"])
+        self.assertEqual(frozen["raw_input_shape"], [frozen["union_source_count"], dates, 2])
+        self.assertEqual(frozen["raw_input_value_count"], 2 * dates * frozen["union_source_count"])
+        self.assertGreater(frozen["raw_input_value_count"], 10_000)
+        self.assertEqual(len(frozen["truth_matrix"]), 2 * dates)
+        self.assertEqual(len(frozen["contrast_weights"]), 2 * dates)
+        self.assertLessEqual(len(compact_json_line(self._attempt(RISK_CELL, 0, 0))), FROZEN_MAX_RECORD_BYTES)
+        for name in (
+            "raw_input_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
+            "target_support_sha256", "reference_support_sha256", "sequential_ancestry_sha256",
+            "raw_dgp_identity_sha256",
+        ):
+            self.assertEqual(len(frozen[name]), 64)
+
+        attempt = self._attempt(CELL, 0, 0)
+        attempt["sequential_ancestry_sha256"] = "f" * 64
+        attempt["raw_dgp_identity_sha256"] = "e" * 64
+        attempt["target_support_sha256"] = "d" * 64
+        attempt["reference_support_sha256"] = "d" * 64
+        with self.assertRaisesRegex(SchemaError, "raw DGP|support|ancestry"):
+            CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(attempt)
+
+    def test_coincident_pair_is_the_same_source_and_exact_zero_contrast(self):
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
+        self.assertEqual(frozen["target_support_sha256"], frozen["reference_support_sha256"])
+        self.assertEqual(frozen["target_raw_input_sha256"], frozen["reference_raw_input_sha256"])
+        self.assertEqual(frozen["truth_value"], 0.0)
+        self.assertEqual(
+            independently_recompute_metrics({
+                "operator_matrix": frozen["truth_matrix"],
+                "truth_matrix": frozen["truth_matrix"],
+                "contrast_weights": frozen["contrast_weights"],
+                "estimate_value": 0.0,
+                "truth_value": 0.0,
+            })["contrast_variance_reference"],
+            0.0,
+        )
 
     def test_cell_summary_binds_attempt_digest_and_scope(self):
         accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
@@ -241,7 +313,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transport = root / "attempts.jsonl"
-            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(FROZEN_SEED_COUNT)))
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(expected_seed_count(MASKED_CELL))))
             destination = root / "cell-00000.jsonl"
             commit_cell_transport(self.preregistration, MASKED_CELL, 0, transport, destination, CODE, BINARY)
             self.assertFalse(transport.exists())
@@ -266,12 +338,12 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             cells = root / "cells"
             cells.mkdir()
             transport = root / "attempts.jsonl"
-            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(FROZEN_SEED_COUNT)))
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(expected_seed_count(MASKED_CELL))))
             commit_cell_transport(self.preregistration, MASKED_CELL, 0, transport, cells / "cell-00000.jsonl", CODE, BINARY)
-            spec = ShardSpec(0, 0, 1, (MASKED_CELL,))
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
             manifest = root / "manifest.jsonl"
             commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
-            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(FROZEN_SEED_COUNT))
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(expected_seed_count(cell_id)))
             self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             cells.joinpath("cell-00000.jsonl").write_text("{}\n")
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
@@ -282,28 +354,29 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             cells = root / "cells"
             cells.mkdir()
             transport = root / "attempts.jsonl"
-            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(FROZEN_SEED_COUNT)))
+            transport.write_bytes(b"".join(compact_json_line(self._attempt(MASKED_CELL, 0, seed, masked=True)) for seed in range(expected_seed_count(MASKED_CELL))))
             cell_path = cells / "cell-00000.jsonl"
             commit_cell_transport(self.preregistration, MASKED_CELL, 0, transport, cell_path, CODE, BINARY)
             summary = json.loads(cell_path.read_text())
             summary["effective_looks_fraction"] = 0.5
             cell_path.write_bytes(compact_json_line(summary))
-            spec = ShardSpec(0, 0, 1, (MASKED_CELL,))
+            spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
             manifest = root / "manifest.jsonl"
             commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
-            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(FROZEN_SEED_COUNT))
+            replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True) for seed in range(expected_seed_count(cell_id)))
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY))
 
     def test_prepare_retains_one_descriptor_not_attempt_lines(self):
         with tempfile.TemporaryDirectory() as directory:
-            spec = ShardSpec(0, 0, 1, (CELL,))
+            spec = ShardSpec(0, 0, 1, (CELL,), (expected_seed_count(CELL),))
             destination = Path(directory) / "descriptor.jsonl"
             receipt = prepare_input_shard(self.preregistration, spec, destination)
             self.assertEqual(receipt["records"], 1)
             descriptor = json.loads(destination.read_text())
             self.assertFalse(descriptor["retained"])
-            self.assertEqual(descriptor["expected_attempts"], FROZEN_SEED_COUNT)
+            self.assertEqual(descriptor["expected_attempts"], expected_seed_count(CELL))
+            self.assertEqual(descriptor["seed_counts"], [expected_seed_count(CELL)])
 
     def test_area_and_date_sweeps_are_independently_identifiable(self):
         matrix = self.preregistration["resource_matrix"]
@@ -322,6 +395,23 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
             _validate_resources(self.preregistration, resources, BINARY)
 
+    def test_raw_resource_measurement_accepts_exact_bound_and_rejects_one_byte_over(self):
+        resources = self._resource_receipts()
+        sampling = self.preregistration["resource_sampling"]
+        raw = resources[0]["growth_observation"][0]["raw_measurement"]
+        encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        raw["tool_versions"]["uname"] += "x" * (sampling["max_encoded_raw_measurement_bytes"] - len(encoded(raw)))
+        observation = resources[0]["growth_observation"][0]
+        observation["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        self.assertEqual(len(encoded(raw)), sampling["max_encoded_raw_measurement_bytes"])
+        self.assertEqual(_validate_resources(self.preregistration, resources, BINARY), [PASS] * 5)
+        raw["tool_versions"]["uname"] += "x"
+        observation["raw_measurement_sha256"] = sha256_json(raw)
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
     def test_untrusted_single_record_is_sized_before_read(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "oversized.jsonl"
@@ -329,6 +419,43 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 handle.truncate(129)
             with self.assertRaisesRegex(SchemaError, "before read"):
                 _read_single_json_record(path, 128, "test manifest")
+
+    def test_bounded_json_readers_accept_exact_bound_and_reject_one_byte_over(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            label = "raw resource"
+            limit = self.preregistration["resource_sampling"]["max_encoded_raw_measurement_bytes"]
+            exact = root / "raw-resource-exact.json"
+            exact.write_bytes(b'{"value":1}' + b" " * (limit - len(b'{"value":1}')))
+            self.assertEqual(_load_bounded_json(exact, limit, label), {"value": 1})
+            over = root / "raw-resource-over.json"
+            over.write_bytes(exact.read_bytes() + b" ")
+            with self.assertRaisesRegex(SchemaError, "byte cap"):
+                _load_bounded_json(over, limit, label)
+            for label, limit in (("shard manifest", FROZEN_MAX_SHARD_MANIFEST_BYTES), ("run manifest", FROZEN_MAX_RUN_MANIFEST_BYTES)):
+                exact = root / f"{label.replace(' ', '-')}-exact.json"
+                exact.write_bytes(b'{"value":1}' + b" " * (limit - len(b'{"value":1}') - 1) + b"\n")
+                self.assertEqual(_read_single_json_record(exact, limit, label)[0], {"value": 1})
+                over = root / f"{label.replace(' ', '-')}-over.json"
+                over.write_bytes(exact.read_bytes() + b"\n")
+                with self.assertRaisesRegex(SchemaError, "byte cap"):
+                    _read_single_json_record(over, limit, label)
+
+    def test_bounded_json_rejects_path_replacement_between_stat_and_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            replacement = Path(directory) / "replacement.json"
+            path.write_text('{"value":1}')
+            replacement.write_text('{"value":2}')
+            original_open = Path.open
+
+            def replace_then_open(open_path, *args, **kwargs):
+                if open_path == path:
+                    os.replace(replacement, path)
+                return original_open(open_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", replace_then_open), self.assertRaisesRegex(SchemaError, "changed before"):
+                _load_bounded_json(path, 128, "receipt")
 
     def test_preregistration_drift_fails_closed(self):
         for section, field, value in (("thresholds", "coverage_absolute_error_max", 0.03), ("determinism", "prng", "unspecified"), ("numeric_contract", "operator_relative_error", "trust Rust"), ("execution_protocol", "retained_attempt_records", True)):
