@@ -7,6 +7,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use anyhow::{ensure, Context, Result};
 use dolphin_core::config::{TemporalUncertaintyMethod, TemporalUncertaintyOptions};
@@ -18,9 +19,10 @@ use dolphin_io::{
 };
 use dolphin_timeseries::{
     complete_refit_bootstrap_estimate, fit_temporal_covariance,
-    CompleteRefitBootstrapCadenceStatus, CompleteRefitBootstrapEstimate,
-    CompleteRefitBootstrapEstimateStatus, TemporalCovarianceOptions, TemporalInferenceStatus,
-    COMPLETE_REFIT_BOOTSTRAP_METHOD, COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+    temporal_covariance_workspace_composition, CompleteRefitBootstrapCadenceStatus,
+    CompleteRefitBootstrapEstimate, CompleteRefitBootstrapEstimateStatus,
+    TemporalCovarianceOptions, TemporalInferenceStatus, COMPLETE_REFIT_BOOTSTRAP_METHOD,
+    COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -56,6 +58,7 @@ const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
 const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.json";
 const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
 static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
+static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
 const TEMPORAL_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_preregistration.json");
@@ -602,10 +605,11 @@ fn write_product_transaction_with_validator(
     let stage = create_stage_directory(output_directory)?;
     let transaction = (|| {
         let admission = admit_combined_working_set(config, acquisition_days.len())?;
+        let gdal_cache = ScopedGdalCacheLimit::acquire(admission.gdal_cache_budget_bytes)?;
         let mut working_set = WorkingSetMonitor::new(admission);
         let mut layers =
             create_layer_writers(&stage, &scope.velocity_header, &transaction.ownership_token)?;
-        working_set.observe_gdal_cache()?;
+        working_set.observe_gdal_cache(&gdal_cache)?;
         process_factor_blocks(
             &scope.factor_path,
             displacement_rasters,
@@ -614,8 +618,9 @@ fn write_product_transaction_with_validator(
             scope.factor_metadata.full_grid,
             &mut layers,
             &mut working_set,
+            &gdal_cache,
         )?;
-        finalize_layers(&stage, &mut layers, &mut working_set)?;
+        finalize_layers(&stage, &mut layers, &mut working_set, &gdal_cache)?;
         ensure!(
             input_raster_receipts(displacement_rasters)? == scope.input_receipts,
             "displacement rasters changed during temporal inference"
@@ -724,6 +729,7 @@ fn prepare_product_scope(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_factor_blocks(
     factor_path: &Path,
     displacement_rasters: &[PathBuf],
@@ -732,6 +738,7 @@ fn process_factor_blocks(
     full_grid: dolphin_io::CovarianceOperatorGrid,
     layers: &mut [ProductLayer],
     working_set: &mut WorkingSetMonitor,
+    gdal_cache: &ScopedGdalCacheLimit,
 ) -> Result<()> {
     let block_ids =
         read_spatial_reference_covariance_block_ids(factor_path, config.block_id_read_cap_bytes)?;
@@ -768,7 +775,7 @@ fn process_factor_blocks(
                 .context("product writer already finalized")?
                 .write_window(output_window, value.view())?;
         }
-        working_set.observe_gdal_cache()?;
+        working_set.observe_gdal_cache(gdal_cache)?;
     }
     Ok(())
 }
@@ -782,7 +789,7 @@ struct WorkingSetAdmission {
     output_write_copy_bytes: u64,
     writer_bookkeeping_bytes: u64,
     temporal_solver_workspace_bytes: u64,
-    observed_gdal_cache_bytes: u64,
+    gdal_cache_budget_bytes: u64,
     total_bytes: u64,
 }
 
@@ -794,12 +801,13 @@ struct WorkingSetMonitor {
 impl WorkingSetMonitor {
     fn new(admission: WorkingSetAdmission) -> Self {
         Self {
-            observed_gdal_cache_high_water_bytes: admission.observed_gdal_cache_bytes,
+            observed_gdal_cache_high_water_bytes: 0,
             admission,
         }
     }
 
-    fn observe_gdal_cache(&mut self) -> Result<()> {
+    fn observe_gdal_cache(&mut self, cache: &ScopedGdalCacheLimit) -> Result<()> {
+        cache.validate()?;
         let observed = observed_gdal_cache_bytes()?;
         validate_working_set_high_water(&self.admission, observed)?;
         self.observed_gdal_cache_high_water_bytes =
@@ -812,13 +820,12 @@ fn admit_combined_working_set(
     config: &TemporalUncertaintyOptions,
     acquisition_count: usize,
 ) -> Result<WorkingSetAdmission> {
-    compose_working_set_admission(config, acquisition_count, observed_gdal_cache_bytes()?)
+    compose_working_set_admission(config, acquisition_count)
 }
 
 fn compose_working_set_admission(
     config: &TemporalUncertaintyOptions,
     acquisition_count: usize,
-    observed_gdal_cache_bytes: u64,
 ) -> Result<WorkingSetAdmission> {
     let targets = u64::try_from(config.maximum_targets_per_block)?;
     let dates = u64::try_from(acquisition_count)?;
@@ -833,12 +840,12 @@ fn compose_working_set_admission(
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
         .context("output-window working-set size overflow")?;
-    let temporal_solver_workspace_bytes =
-        dolphin_timeseries::spatial_covariance::fixed_l2_difference_workspace_composition(
-            acquisition_count,
-        )
-        .map_err(anyhow::Error::new)?
-        .total_bytes;
+    let temporal_solver_workspace_bytes = temporal_covariance_workspace_composition(
+        acquisition_count,
+        TemporalCovarianceOptions::default().bootstrap_replicates,
+    )
+    .context("temporal-fit workspace composition overflow")?
+    .total_bytes;
     let output_write_copy_bytes = output_windows;
     let maximum_block_ids = config
         .block_id_read_cap_bytes
@@ -848,7 +855,7 @@ fn compose_working_set_admission(
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<BlockIndices>() as u64))
         .context("COG writer bookkeeping size overflow")?;
-    let combined = config
+    let non_gdal = config
         .factor_block_read_cap_bytes
         .checked_add(config.block_id_read_cap_bytes)
         .and_then(|value| value.checked_add(displacement_windows))
@@ -856,11 +863,13 @@ fn compose_working_set_admission(
         .and_then(|value| value.checked_add(output_write_copy_bytes))
         .and_then(|value| value.checked_add(writer_bookkeeping_bytes))
         .and_then(|value| value.checked_add(temporal_solver_workspace_bytes))
-        .and_then(|value| value.checked_add(observed_gdal_cache_bytes))
         .context("combined temporal working-set size overflow")?;
+    let gdal_cache_budget_bytes = COMBINED_WORKING_SET_CAP_BYTES
+        .checked_sub(non_gdal)
+        .context("non-GDAL temporal working set exceeds the combined cap")?;
     ensure!(
-        combined <= COMBINED_WORKING_SET_CAP_BYTES,
-        "combined temporal working set {combined} exceeds cap {COMBINED_WORKING_SET_CAP_BYTES}"
+        gdal_cache_budget_bytes > 0,
+        "temporal working set leaves no GDAL cache budget"
     );
     Ok(WorkingSetAdmission {
         factor_block_bytes: config.factor_block_read_cap_bytes,
@@ -870,9 +879,60 @@ fn compose_working_set_admission(
         output_write_copy_bytes,
         writer_bookkeeping_bytes,
         temporal_solver_workspace_bytes,
-        observed_gdal_cache_bytes,
-        total_bytes: combined,
+        gdal_cache_budget_bytes,
+        total_bytes: COMBINED_WORKING_SET_CAP_BYTES,
     })
+}
+
+struct ScopedGdalCacheLimit {
+    _lock: MutexGuard<'static, ()>,
+    previous_max_bytes: i64,
+    configured_max_bytes: i64,
+}
+
+impl ScopedGdalCacheLimit {
+    fn acquire(max_bytes: u64) -> Result<Self> {
+        let lock = match GDAL_CACHE_LIMIT_LOCK.try_lock() {
+            Ok(lock) => lock,
+            Err(TryLockError::WouldBlock) => {
+                anyhow::bail!("another temporal product owns the process-global GDAL cache limit")
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                anyhow::bail!("process-global GDAL cache limit lock is poisoned")
+            }
+        };
+        let configured_max_bytes = i64::try_from(max_bytes)?;
+        ensure!(configured_max_bytes > 0, "GDAL cache budget is zero");
+        // SAFETY: the process-global mutation is serialized by `GDAL_CACHE_LIMIT_LOCK`.
+        let previous_max_bytes = unsafe { gdal_sys::GDALGetCacheMax64() };
+        // SAFETY: the positive limit is representable by GDAL's signed byte API.
+        unsafe { gdal_sys::GDALSetCacheMax64(configured_max_bytes) };
+        let result = Self {
+            _lock: lock,
+            previous_max_bytes,
+            configured_max_bytes,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    fn validate(&self) -> Result<()> {
+        // SAFETY: these are read-only process-global cache counters.
+        let configured = unsafe { gdal_sys::GDALGetCacheMax64() };
+        let used = unsafe { gdal_sys::GDALGetCacheUsed64() };
+        ensure!(
+            configured == self.configured_max_bytes && used >= 0 && used <= configured,
+            "GDAL cache limit changed or current usage exceeds its temporal-product budget"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ScopedGdalCacheLimit {
+    fn drop(&mut self) {
+        // SAFETY: this guard still owns the process-global cache-limit lock.
+        unsafe { gdal_sys::GDALSetCacheMax64(self.previous_max_bytes) };
+    }
 }
 
 fn observed_gdal_cache_bytes() -> Result<u64> {
@@ -888,13 +948,14 @@ fn validate_working_set_high_water(
 ) -> Result<()> {
     let non_gdal = admission
         .total_bytes
-        .checked_sub(admission.observed_gdal_cache_bytes)
+        .checked_sub(admission.gdal_cache_budget_bytes)
         .context("working-set admission GDAL composition underflow")?;
     let observed = non_gdal
         .checked_add(observed_gdal_cache_bytes)
         .context("observed temporal working-set size overflow")?;
     ensure!(
-        observed <= COMBINED_WORKING_SET_CAP_BYTES,
+        observed_gdal_cache_bytes <= admission.gdal_cache_budget_bytes
+            && observed <= COMBINED_WORKING_SET_CAP_BYTES,
         "observed temporal working set {observed} exceeds cap {COMBINED_WORKING_SET_CAP_BYTES}"
     );
     Ok(())
@@ -1488,6 +1549,7 @@ fn finalize_layers(
     stage: &Path,
     layers: &mut [ProductLayer],
     working_set: &mut WorkingSetMonitor,
+    gdal_cache: &ScopedGdalCacheLimit,
 ) -> Result<()> {
     for layer in layers {
         let writer = layer
@@ -1495,7 +1557,7 @@ fn finalize_layers(
             .take()
             .context("product writer already finalized")?;
         writer.finalize(&stage.join(layer.name))?;
-        working_set.observe_gdal_cache()?;
+        working_set.observe_gdal_cache(gdal_cache)?;
     }
     Ok(())
 }
@@ -2410,8 +2472,8 @@ mod tests {
         validate_working_set_high_water, write_product_transaction_with_validator, EvidenceDigests,
         HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
         TemporalProductTransaction, TemporalPromotionManifest, TemporalReviewReceipt,
-        COMBINED_WORKING_SET_CAP_BYTES, PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA,
-        ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
+        PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME,
+        SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -2483,7 +2545,38 @@ mod tests {
     #[test]
     fn combined_working_set_rejects_large_date_stacks_before_block_read() {
         let config = TemporalUncertaintyOptions::default();
-        let admitted = admit_combined_working_set(&config, 12).unwrap();
+        let days: Vec<f64> = (0..13).map(|index| index as f64 * 12.0).collect();
+        let mut observations: Vec<f64> = days
+            .iter()
+            .enumerate()
+            .map(|(index, day)| 0.01 * day + (index as f64 * 0.7).sin() * 2.0)
+            .collect();
+        observations[0] = 0.0;
+        let mut covariance = vec![vec![0.0; days.len()]; days.len()];
+        for (index, row) in covariance.iter_mut().enumerate().skip(1) {
+            row[index] = 1.0;
+        }
+        let temporal_options = dolphin_timeseries::TemporalCovarianceOptions::default();
+        let fit = dolphin_timeseries::fit_temporal_covariance(
+            &days,
+            &observations,
+            &covariance,
+            &temporal_options,
+        );
+        assert_eq!(
+            fit.bootstrap_attempts,
+            temporal_options.bootstrap_replicates
+        );
+        let admitted = admit_combined_working_set(&config, days.len()).unwrap();
+        let composition = dolphin_timeseries::temporal_covariance_workspace_composition(
+            days.len(),
+            temporal_options.bootstrap_replicates,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.temporal_solver_workspace_bytes,
+            composition.total_bytes
+        );
         assert!(admitted.temporal_solver_workspace_bytes > 12 * 12 * 8);
         assert_eq!(
             admitted.total_bytes,
@@ -2494,14 +2587,33 @@ mod tests {
                 + admitted.output_write_copy_bytes
                 + admitted.writer_bookkeeping_bytes
                 + admitted.temporal_solver_workspace_bytes
-                + admitted.observed_gdal_cache_bytes
+                + admitted.gdal_cache_budget_bytes
         );
         assert!(admitted.total_bytes <= super::COMBINED_WORKING_SET_CAP_BYTES);
         assert!(admit_combined_working_set(&config, 100_000).is_err());
-        let boundary = compose_working_set_admission(&config, 12, 0).unwrap();
-        let remaining = COMBINED_WORKING_SET_CAP_BYTES - boundary.total_bytes;
-        assert!(validate_working_set_high_water(&boundary, remaining).is_ok());
-        assert!(validate_working_set_high_water(&boundary, remaining + 1).is_err());
+        let boundary = compose_working_set_admission(&config, days.len()).unwrap();
+        assert!(
+            validate_working_set_high_water(&boundary, boundary.gdal_cache_budget_bytes).is_ok()
+        );
+        assert!(
+            validate_working_set_high_water(&boundary, boundary.gdal_cache_budget_bytes + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_gdal_cache_limit_is_exclusive_and_restored_on_error() {
+        // SAFETY: the test only reads GDAL's process-global configured limit.
+        let previous = unsafe { gdal_sys::GDALGetCacheMax64() };
+        let result: anyhow::Result<()> = (|| {
+            let guard = super::ScopedGdalCacheLimit::acquire(8 * 1024 * 1024)?;
+            guard.validate()?;
+            assert!(super::ScopedGdalCacheLimit::acquire(8 * 1024 * 1024).is_err());
+            anyhow::bail!("exercise restoration through the error path")
+        })();
+        assert!(result.is_err());
+        // SAFETY: the scoped guard has restored GDAL's process-global limit.
+        assert_eq!(unsafe { gdal_sys::GDALGetCacheMax64() }, previous);
     }
 
     #[test]

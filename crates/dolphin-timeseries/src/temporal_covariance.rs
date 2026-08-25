@@ -6,7 +6,8 @@
 //! is exposed here.  The public result contains point estimates, diagnostics,
 //! and validation intervals, but no corrected inferential standard error.
 
-use faer::{Mat, Side};
+use faer::linalg::evd::{compute_hermitian_evd_req, ComputeVectors};
+use faer::{get_global_parallelism, Mat, Side};
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ChiSquared, ContinuousCDF, Normal, StudentsT};
 
@@ -15,6 +16,128 @@ const SYMMETRY_TOLERANCE: f64 = 1e-10;
 
 /// Frozen complete-refit bootstrap attempt count from the #53 preregistration.
 pub const COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS: usize = 200;
+
+/// Conservative peak allocation composition for one complete temporal fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemporalCovarianceWorkspaceComposition {
+    /// Caller-owned observation vector and dense difference covariance.
+    pub input_bytes: u64,
+    /// Selected inputs plus retained oracle and plug-in fits.
+    pub retained_fit_bytes: u64,
+    /// Largest profile-optimizer allocation above the retained fit.
+    pub profile_optimizer_peak_bytes: u64,
+    /// Complete-refit bootstrap driver and nested profile-fit peak.
+    pub bootstrap_peak_bytes: u64,
+    /// Linked Faer matrix, eigenvalue output, and queried EVD scratch.
+    pub faer_condition_peak_bytes: u64,
+    /// Conservative simultaneous peak of the complete production call.
+    pub total_bytes: u64,
+}
+
+/// Derive the complete temporal-fit allocation bound from the linked Faer EVD
+/// implementation and the actual optimizer/bootstrap lifetimes.
+#[must_use]
+pub fn temporal_covariance_workspace_composition(
+    acquisition_count: usize,
+    bootstrap_replicates: usize,
+) -> Option<TemporalCovarianceWorkspaceComposition> {
+    if acquisition_count < 2 {
+        return None;
+    }
+    let matrix = nested_f64_matrix_bytes(acquisition_count)?;
+    let vector = f64_vector_bytes(acquisition_count)?;
+    let input_bytes = checked_sum(&[matrix, vector])?;
+
+    // Selected covariance/days/observations/diagonal, oracle covariance, and
+    // the retained plug-in covariance coexist through the bootstrap.
+    let retained_fit_bytes = checked_sum(&[matrix, matrix, matrix, vector, vector, vector])?;
+
+    // A retained best candidate coexists with an active candidate. During GLS,
+    // the active candidate owns the outer Cholesky plus the inverse routine's
+    // Cholesky and inverse; its three solve vectors are the larger vector phase.
+    let inverse_peak = checked_sum(&[matrix, matrix, matrix, vector, vector, vector])?;
+    let transformed_peak = checked_sum(&[matrix, matrix, vector, vector, vector, vector])?;
+    let profile_optimizer_peak_bytes =
+        checked_sum(&[matrix, matrix, inverse_peak.max(transformed_peak)])?;
+
+    let faer_condition = faer_condition_workspace_bytes(acquisition_count)?;
+    // The previous best covariance remains live while the final candidate is
+    // conditioned, so both matrices precede the linked Faer workspace.
+    let faer_condition_peak_bytes = checked_sum(&[matrix, matrix, faer_condition])?;
+
+    // Bootstrap retains its Cholesky, simulated vectors, and slope reservoir
+    // while a nested profile fit executes.
+    let bootstrap_driver = checked_sum(&[
+        matrix,
+        vector,
+        vector,
+        vector,
+        u64::try_from(bootstrap_replicates)
+            .ok()?
+            .checked_mul(std::mem::size_of::<f64>() as u64)?,
+    ])?;
+    let bootstrap_peak_bytes = bootstrap_driver
+        .checked_add(profile_optimizer_peak_bytes.max(faer_condition_peak_bytes))?;
+    let active_peak = profile_optimizer_peak_bytes
+        .max(bootstrap_peak_bytes)
+        .max(faer_condition_peak_bytes);
+    let total_bytes = input_bytes
+        .checked_add(retained_fit_bytes)?
+        .checked_add(active_peak)?;
+    Some(TemporalCovarianceWorkspaceComposition {
+        input_bytes,
+        retained_fit_bytes,
+        profile_optimizer_peak_bytes,
+        bootstrap_peak_bytes,
+        faer_condition_peak_bytes,
+        total_bytes,
+    })
+}
+
+fn nested_f64_matrix_bytes(dimension: usize) -> Option<u64> {
+    let rows = u64::try_from(dimension).ok()?;
+    let values = rows
+        .checked_mul(rows)?
+        .checked_mul(std::mem::size_of::<f64>() as u64)?;
+    let row_headers = rows.checked_mul(std::mem::size_of::<Vec<f64>>() as u64)?;
+    values.checked_add(row_headers)
+}
+
+fn f64_vector_bytes(length: usize) -> Option<u64> {
+    u64::try_from(length)
+        .ok()?
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+}
+
+fn checked_sum(values: &[u64]) -> Option<u64> {
+    values
+        .iter()
+        .try_fold(0_u64, |total, value| total.checked_add(*value))
+}
+
+fn faer_condition_workspace_bytes(dimension: usize) -> Option<u64> {
+    let mut probe = Mat::<f64>::new();
+    probe.reserve_exact(1, 0);
+    let alignment = u64::try_from(probe.row_capacity()).ok()?.max(1);
+    let rows = u64::try_from(dimension).ok()?;
+    let padded_rows = rows.checked_add(alignment - 1)? / alignment * alignment;
+    let matrix = padded_rows
+        .checked_mul(rows)?
+        .checked_mul(std::mem::size_of::<f64>() as u64)?;
+    let eigenvalues = f64_vector_bytes(dimension)?;
+    let scratch = u64::try_from(
+        compute_hermitian_evd_req::<f64>(
+            dimension,
+            ComputeVectors::No,
+            get_global_parallelism(),
+            Default::default(),
+        )
+        .ok()?
+        .size_bytes(),
+    )
+    .ok()?;
+    checked_sum(&[matrix, eigenvalues, scratch])
+}
 /// Frozen minimum successful bootstrap count from the #53 preregistration.
 pub const COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES: usize = 198;
 /// Stable identity of the preregistered #53 estimate candidate.
