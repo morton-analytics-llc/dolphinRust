@@ -6,7 +6,10 @@
 //! them directly. (GDAL complex types aren't exposed by the `gdal` crate;
 //! complex SLCs are persisted via HDF5 or 2-band f32 — see STATUS.md.)
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dolphin_core::BlockIndices;
 use gdal::raster::{Buffer, GdalType, RasterCreationOptions};
@@ -93,6 +96,203 @@ pub struct RasterData<T> {
     pub geotransform: [f64; 6],
     /// EPSG code of the CRS, if the raster carried one.
     pub epsg: Option<u32>,
+}
+
+/// Grid and root-domain metadata read without allocating raster pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterHeader {
+    /// Raster dimensions as `(rows, cols)`.
+    pub shape: (usize, usize),
+    /// GDAL affine geotransform.
+    pub geotransform: [f64; 6],
+    /// EPSG code of the CRS, if present.
+    pub epsg: Option<u32>,
+    /// Band-1 nodata value, if present.
+    pub nodata: Option<f64>,
+    /// Dataset metadata in GDAL's root domain.
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Single-band tiled GeoTIFF writer that accepts bounded raster windows and
+/// publishes a COG only when [`Self::finalize`] succeeds.
+pub struct BoundedCogWriter<T: GdalType + Copy> {
+    dataset: Dataset,
+    scratch_path: PathBuf,
+    shape: (usize, usize),
+    value_type: PhantomData<T>,
+}
+
+impl<T: GdalType + Copy> BoundedCogWriter<T> {
+    /// Create a tiled scratch GeoTIFF. `scratch_path` must not already exist.
+    /// Unwritten cells are initialized to `nodata` when one is supplied.
+    pub fn create(
+        scratch_path: &Path,
+        shape: (usize, usize),
+        geotransform: [f64; 6],
+        epsg: Option<u32>,
+        nodata: Option<f64>,
+        metadata: &[(&str, &str)],
+    ) -> Result<Self> {
+        if shape.0 == 0 || shape.1 == 0 {
+            return Err(IoError::Shape(
+                "bounded GeoTIFF shape must be non-zero".into(),
+            ));
+        }
+        if scratch_path.exists() {
+            return Err(IoError::Geo(format!(
+                "bounded GeoTIFF scratch path already exists: {}",
+                scratch_path.display()
+            )));
+        }
+        let driver = DriverManager::get_driver_by_name("GTiff")?;
+        let options = RasterCreationOptions::from_iter([
+            "TILED=YES",
+            "BLOCKXSIZE=256",
+            "BLOCKYSIZE=256",
+            "COMPRESS=DEFLATE",
+            "BIGTIFF=IF_SAFER",
+        ]);
+        let mut dataset = driver.create_with_band_type_with_options::<T, _>(
+            scratch_path,
+            shape.1,
+            shape.0,
+            1,
+            &options,
+        )?;
+        dataset.set_geo_transform(&geotransform)?;
+        if let Some(code) = epsg {
+            dataset.set_spatial_ref(&SpatialRef::from_epsg(code)?)?;
+        }
+        for (key, value) in metadata {
+            dataset.set_metadata_item(key, value, "")?;
+        }
+        if let Some(value) = nodata {
+            let mut band = dataset.rasterband(1)?;
+            band.set_no_data_value(Some(value))?;
+            band.fill(value, None)?;
+        }
+        Ok(Self {
+            dataset,
+            scratch_path: scratch_path.to_path_buf(),
+            shape,
+            value_type: PhantomData,
+        })
+    }
+
+    /// Write one exact-size window. The temporary allocation is proportional
+    /// only to this window, never to the full raster.
+    pub fn write_window(&mut self, block: BlockIndices, values: ArrayView2<T>) -> Result<()> {
+        if block.row_stop <= block.row_start || block.col_stop <= block.col_start {
+            return Err(IoError::Shape(
+                "bounded GeoTIFF window must be non-empty".into(),
+            ));
+        }
+        if block.row_stop > self.shape.0 || block.col_stop > self.shape.1 {
+            return Err(IoError::Shape(format!(
+                "bounded GeoTIFF window {:?} exceeds raster shape {:?}",
+                block, self.shape
+            )));
+        }
+        let expected = (block.height(), block.width());
+        if values.dim() != expected {
+            return Err(IoError::Shape(format!(
+                "bounded GeoTIFF window values have shape {:?}, expected {:?}",
+                values.dim(),
+                expected
+            )));
+        }
+        let mut buffer = Buffer::new(
+            (block.width(), block.height()),
+            values.iter().copied().collect(),
+        );
+        self.dataset.rasterband(1)?.write(
+            (block.col_start as isize, block.row_start as isize),
+            (block.width(), block.height()),
+            &mut buffer,
+        )?;
+        Ok(())
+    }
+
+    /// Convert the scratch dataset to a COG and atomically publish it at
+    /// `destination`. The destination must not already exist and is never used
+    /// as a work path.
+    pub fn finalize(mut self, destination: &Path) -> Result<()> {
+        if destination == self.scratch_path {
+            return Err(IoError::Geo(
+                "bounded GeoTIFF scratch and destination paths must differ".into(),
+            ));
+        }
+        if destination.exists() {
+            return Err(IoError::Geo(format!(
+                "bounded GeoTIFF destination already exists: {}",
+                destination.display()
+            )));
+        }
+        self.dataset.flush_cache()?;
+        let partial = partial_cog_path(destination);
+        let cog = DriverManager::get_driver_by_name("COG")?;
+        let options = RasterCreationOptions::from_iter([
+            "COMPRESS=DEFLATE",
+            "BLOCKSIZE=256",
+            "OVERVIEWS=AUTO",
+            "BIGTIFF=IF_SAFER",
+        ]);
+        let mut completed = match self.dataset.create_copy(&cog, &partial, &options) {
+            Ok(dataset) => dataset,
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error.into());
+            }
+        };
+        completed.flush_cache()?;
+        completed.close()?;
+        self.dataset.close()?;
+        if let Err(error) = std::fs::rename(&partial, destination) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(IoError::Geo(format!(
+                "could not publish bounded COG {}: {error}",
+                destination.display()
+            )));
+        }
+        let _ = std::fs::remove_file(&self.scratch_path);
+        Ok(())
+    }
+}
+
+fn partial_cog_path(destination: &Path) -> PathBuf {
+    static NEXT_PARTIAL_ID: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_PARTIAL_ID.fetch_add(1, Ordering::Relaxed);
+    let file_name = destination
+        .file_name()
+        .map_or_else(|| "cog".into(), |name| name.to_string_lossy());
+    destination.with_file_name(format!(
+        ".{file_name}.partial-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+/// Read raster shape, georeferencing, nodata, and root-domain metadata without
+/// reading or allocating band pixels.
+pub fn read_raster_header(path: &Path) -> Result<RasterHeader> {
+    let dataset = Dataset::open(path)?;
+    let (cols, rows) = dataset.raster_size();
+    let metadata = dataset
+        .metadata()
+        .filter(|entry| entry.domain.is_empty())
+        .map(|entry| (entry.key, entry.value))
+        .collect();
+    let epsg = dataset
+        .spatial_ref()
+        .ok()
+        .and_then(|reference| reference.auth_code().ok())
+        .map(|code| code as u32);
+    Ok(RasterHeader {
+        shape: (rows, cols),
+        geotransform: dataset.geo_transform()?,
+        epsg,
+        nodata: dataset.rasterband(1)?.no_data_value(),
+        metadata,
+    })
 }
 
 /// Write a single-band Cloud-Optimized GeoTIFF with the given geotransform, CRS,
