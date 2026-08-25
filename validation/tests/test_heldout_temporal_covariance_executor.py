@@ -43,6 +43,10 @@ from validation.heldout_temporal_covariance.runner import (
     run_production_temporal_estimator,
     validate_product_run_plan,
 )
+from validation.run_temporal_covariance_holdout_cluster import (
+    IMPLEMENTATION_SOURCE_HASH_FIELDS,
+    implementation_source_hashes,
+)
 
 
 VALIDATION = Path(__file__).parents[1]
@@ -408,6 +412,35 @@ class HeldoutTemporalCovarianceExecutorContract(unittest.TestCase):
                     {"cluster-a": first, "cluster-b": moved}, PREREGISTRATION
                 ),
             )
+
+    def test_source_identity_matches_pr82_exact_seven_entry_contract(self) -> None:
+        expected_paths = {
+            "executor_sha256": VALIDATION
+            / "heldout_temporal_covariance"
+            / "executor.py",
+            "runner_sha256": VALIDATION
+            / "heldout_temporal_covariance"
+            / "runner.py",
+            "scorer_sha256": VALIDATION
+            / "heldout_temporal_covariance"
+            / "scorer.py",
+            "runner_cli_sha256": VALIDATION
+            / "run_temporal_covariance_holdout_cluster.py",
+            "scorer_cli_sha256": VALIDATION
+            / "score_temporal_covariance_holdout.py",
+            "cohort_sha256": VALIDATION
+            / "heldout_temporal_covariance"
+            / "cohort.py",
+            "gps_ground_truth_sha256": VALIDATION / "gps_ground_truth.py",
+        }
+        self.assertEqual(IMPLEMENTATION_SOURCE_HASH_FIELDS, set(expected_paths))
+        self.assertEqual(
+            implementation_source_hashes(),
+            {
+                name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for name, path in expected_paths.items()
+            },
+        )
 
     def test_attrited_surplus_is_retained_and_next_lexical_surplus_fills(self) -> None:
         manifest = frozen_manifest()

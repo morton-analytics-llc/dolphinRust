@@ -28,6 +28,15 @@ else:
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parent
 RUN_PLAN_CAP = 4 * 1024 * 1024
+IMPLEMENTATION_SOURCE_HASH_FIELDS = {
+    "executor_sha256",
+    "runner_sha256",
+    "scorer_sha256",
+    "runner_cli_sha256",
+    "scorer_cli_sha256",
+    "cohort_sha256",
+    "gps_ground_truth_sha256",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -100,7 +109,11 @@ def implementation_source_hashes() -> dict[str, str]:
         "scorer_sha256": ROOT / "heldout_temporal_covariance" / "scorer.py",
         "runner_cli_sha256": Path(__file__).resolve(),
         "scorer_cli_sha256": ROOT / "score_temporal_covariance_holdout.py",
+        "cohort_sha256": ROOT / "heldout_temporal_covariance" / "cohort.py",
+        "gps_ground_truth_sha256": ROOT / "gps_ground_truth.py",
     }
+    if set(paths) != IMPLEMENTATION_SOURCE_HASH_FIELDS:
+        raise ValueError("held-out implementation source identity fields differ")
     return {name: sha256_file(path) for name, path in paths.items()}
 
 
