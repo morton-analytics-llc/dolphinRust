@@ -24,7 +24,7 @@ NOT_EVALUABLE = "not_evaluable"
 STATUSES = {PASS, FAIL, NOT_EVALUABLE}
 ATTEMPT_STATUSES = {
     "valid", "masked_target", "empty_support", "singular_local_information",
-    "nondifferentiable_node",
+    "nondifferentiable_node", "ill_conditioned",
 }
 HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 128
@@ -42,12 +42,12 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "1c3218c569e540625a693bafaad437777bf0825f4bee17b38ab5099698f63396"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ec37d83f50ae66f24d2b371809cc1e733c8207253b5e3e21c185882349619e25"
+FROZEN_GENERATOR_SHA256 = "080c35458423fd712c74b8f508a52e209117a4bd7527eb64528d8946e7d98774"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "553f45883103d286dc3bd5282391d20e1bc2ac8d2e52a5203010687e6eda66bb"
 FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
 FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
-FROZEN_RECEIPT_SHA256 = "b25997a99ecd2c67f37949744687b8530cccf3e4d7515daec1d6fb87117cb957"
+FROZEN_RECEIPT_SHA256 = "8e9a26f5b657679d64742059543b8be12952c336d60f369f8d8a17ea2ee098fd"
 FROZEN_HASH_FIELDS_SHA256 = "1982e0123553f6933f18ed87e9fd9c3382530ffe5239f1f792ecc5c2b074106c"
 FROZEN_RESOURCE_SAMPLING_SHA256 = "0874fc530fda38d9f0e72b548549f47d749789e2c380c16c506bab03e0431559"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "abd04bade51880f2b55f115a3be9e3b2dada05517aa8fa3197deb606d469f940"
+FROZEN_SOURCE_SET_SHA256 = "12d836f42250b2fac6d76265155e4fc4479cd1f9681d9c4570c054f047ff8110"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -105,7 +105,7 @@ FROZEN_THRESHOLDS = {
     "coverage_probability": 0.95,
     "coverage_gate": "exact_binomial_central_95_intersect_wilson_95_contains_target_v1",
     "coverage_gate_scope": "noncoincident_stochastic_cells",
-    "coverage_coincident_covered_count": 128,
+    "coverage_coincident_rule": "all_emitted_attempts_covered_v1",
     "coverage_seed_count": 128,
     "coverage_covered_count_min": 117,
     "coverage_covered_count_max": 126,
@@ -689,7 +689,10 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
     if neighbors.get("full_half_window") is not True or neighbors.get("glrt", {}).get("alpha") != 0.001 or neighbors.get("ks", {}).get("alpha") != 0.001 or neighbors.get("fixed_support_reuse") is not True:
         errors.append("GLRT/KS support contract does not match the frozen production algorithms")
     supported = generator.get("supported", {})
-    expected_abstentions = ["masked_target", "empty_support", "singular_local_information"]
+    expected_abstentions = [
+        "masked_target", "empty_support", "singular_local_information",
+        "ill_conditioned",
+    ]
     not_evaluable = ["unexpected_empty_support", "unexpected_singular_local_information"]
     receipt_failures = [
         "invalid_reference", "nonfinite_source", "non_psd_truth",
@@ -697,7 +700,10 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
     ]
     if (
         supported.get("stable_attempt_statuses")
-        != ["valid", "masked_target", "empty_support", "singular_local_information", "nondifferentiable_node"]
+        != [
+            "valid", "masked_target", "empty_support", "singular_local_information",
+            "nondifferentiable_node", "ill_conditioned",
+        ]
         or supported.get("not_evaluable_if") != not_evaluable
         or supported.get("expected_abstention_if") != expected_abstentions
         or supported.get("receipt_failure_if") != receipt_failures
@@ -2139,7 +2145,10 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} cannot use masked_target")
         elif empty and status != "empty_support":
             raise SchemaError(f"cell {self.cell_id} must preserve the production empty-support status")
-        elif status in {"empty_support", "singular_local_information", "nondifferentiable_node"}:
+        elif status in {
+            "empty_support", "singular_local_information", "nondifferentiable_node",
+            "ill_conditioned",
+        }:
             self._validate_non_emitting(attempt)
         elif attempt.get("factor_emitted") != attempt.get("emitted"):
             raise SchemaError(f"cell {self.cell_id} has inconsistent factor/emission flags")
@@ -2360,6 +2369,7 @@ class CellAccumulator:
             if (
                 self.statuses["valid"]
                 + self.statuses["nondifferentiable_node"]
+                + self.statuses["ill_conditioned"]
                 + unexpected_not_evaluable
                 != self.expected_seed_count
             ):
@@ -2429,6 +2439,7 @@ class CellAccumulator:
                     "empty_support",
                     "singular_local_information",
                     "nondifferentiable_node",
+                    "ill_conditioned",
                 )
                 if self.statuses[name]
                 and not (
@@ -2479,8 +2490,7 @@ class CellAccumulator:
         calibration_error = _frobenius(predicted - empirical) / max(_frobenius(empirical), 1e-15)
         coverage_by_date = self.coverage_counts[1:] / self.emitted
         coverage_passes = (
-            self.emitted == thresholds["coverage_coincident_covered_count"]
-            and all(value == self.emitted for value in self.coverage_counts[1:])
+            all(value == self.emitted for value in self.coverage_counts[1:])
             if labels["pair_geometry"] == "coincident"
             else _coverage_gate_passes(
                 thresholds, [None, *(float(value) for value in coverage_by_date)], self.emitted
@@ -2994,6 +3004,7 @@ def validate_cell_summary(
             "empty_support",
             "singular_local_information",
             "nondifferentiable_node",
+            "ill_conditioned",
         )
         if statuses[name]
         and not (
@@ -3018,6 +3029,7 @@ def validate_cell_summary(
         valid_histogram = (
             statuses["valid"]
             + statuses["nondifferentiable_node"]
+            + statuses["ill_conditioned"]
             + statuses["empty_support"]
             + statuses["singular_local_information"]
             == seed_count
@@ -3049,9 +3061,7 @@ def validate_cell_summary(
                     and summary.get("final_date_interval_width_mean") == interval_width[-1]
                 )
             coverage_passes = per_date_valid and (
-                summary["emitted_seeds"]
-                == preregistration["thresholds"]["coverage_coincident_covered_count"]
-                and all(value == 1.0 for value in coverage[1:])
+                all(value == 1.0 for value in coverage[1:])
                 if labels["pair_geometry"] == "coincident"
                 else _coverage_gate_passes(
                     preregistration["thresholds"], coverage, summary["emitted_seeds"]

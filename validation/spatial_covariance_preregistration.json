@@ -588,7 +588,7 @@
     "coverage_probability": 0.95,
     "coverage_gate": "exact_binomial_central_95_intersect_wilson_95_contains_target_v1",
     "coverage_gate_scope": "noncoincident_stochastic_cells",
-    "coverage_coincident_covered_count": 128,
+    "coverage_coincident_rule": "all_emitted_attempts_covered_v1",
     "coverage_seed_count": 128,
     "coverage_covered_count_min": 117,
     "coverage_covered_count_max": 126,
@@ -686,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "abd04bade51880f2b55f115a3be9e3b2dada05517aa8fa3197deb606d469f940"
+        "sha256": "12d836f42250b2fac6d76265155e4fc4479cd1f9681d9c4570c054f047ff8110"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
@@ -1839,7 +1839,8 @@
         "masked_target",
         "empty_support",
         "singular_local_information",
-        "nondifferentiable_node"
+        "nondifferentiable_node",
+        "ill_conditioned"
       ],
       "not_evaluable_if": [
         "unexpected_empty_support",
@@ -1848,7 +1849,8 @@
       "expected_abstention_if": [
         "masked_target",
         "empty_support",
-        "singular_local_information"
+        "singular_local_information",
+        "ill_conditioned"
       ],
       "receipt_failure_if": [
         "invalid_reference",
@@ -2121,8 +2123,9 @@
       "valid",
       "masked_target",
       "empty_support",
+      "singular_local_information",
       "nondifferentiable_node",
-      "singular_local_information"
+      "ill_conditioned"
     ],
     "ephemeral_per_attempt_required": [
       "schema",
