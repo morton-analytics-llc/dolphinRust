@@ -30,7 +30,9 @@ use dolphin_workflows::{
     SequentialConfig, SequentialCovarianceCaptureRequest, SequentialPrimitiveSourceResolver,
     SequentialReplayBlock, SequentialReplayError, SequentialReplayTopology,
     SequentialSourceProviderIdentity, SequentialSourceReplayProvider, SequentialTileReplayProvider,
+    SourceCorrelationModel,
 };
+use faer::{Mat, Side};
 use ndarray::{s, Array1, Array2, Array3};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,6 +59,10 @@ struct Request {
     options: TemporalCovarianceOptions,
     fixed_factor: Option<FixedFactorInput>,
     production_path: Option<ProductionPathInput>,
+    #[serde(default)]
+    retain_dense_evidence: bool,
+    #[serde(default)]
+    conditional_oracle_replicates: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,8 +80,10 @@ struct ProductionPathInput {
     raw_complex_stack: Vec<Vec<[f64; 2]>>,
     carrier_stack: Vec<Vec<[f64; 2]>>,
     intended_difference_variance: Vec<f64>,
-    effective_looks_model: String,
-    effective_looks_distance_scale_pixels: f64,
+    source_correlation_model: String,
+    source_correlation_distance_scale_pixels: f64,
+    outer_coverage_dgp: String,
+    conditional_covariance_oracle: String,
     validity: Vec<bool>,
     reference: TemporalReferenceProvenance,
     scope: TemporalValidationScope,
@@ -94,14 +102,27 @@ struct ProductionReceipts {
     fixed_l2_map_sha256: Sha256Digest,
     issue52_receipt_sha256: Sha256Digest,
     issue54_receipt_sha256: Sha256Digest,
-    fixed_l2_difference_covariance: Vec<Vec<f64>>,
-    fixed_l2_difference_variance: Vec<f64>,
-    carrier_difference_history: Vec<f64>,
-    linked_difference_history: Vec<f64>,
-    effective_looks_model: &'static str,
-    effective_looks_distance_scale_pixels: f64,
+    numeric_evidence_sha256: Sha256Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_l2_difference_covariance: Option<Vec<Vec<f64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_l2_difference_variance: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carrier_difference_history: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linked_difference_history: Option<Vec<f64>>,
+    source_correlation_model: &'static str,
+    source_correlation_distance_scale_pixels: f64,
+    source_correlation_support_union_count: usize,
     effective_looks_fraction: f64,
-    effective_looks_receipt_sha256: Sha256Digest,
+    source_correlation_receipt_sha256: Sha256Digest,
+    outer_coverage_dgp: &'static str,
+    conditional_covariance_oracle: &'static str,
+    conditional_oracle_replicates: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conditional_oracle_covariance: Option<Vec<Vec<f64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conditional_oracle_receipt_sha256: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,13 +156,14 @@ struct ResourceReceipt {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
+    let mut input = stdin.lock();
     let mut output = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut line = Vec::new();
+    while read_bounded_line(&mut input, &mut line, MAX_REQUEST_LINE_BYTES)? {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let request: Request = serde_json::from_str(&line)?;
+        let request: Request = serde_json::from_slice(&line)?;
         let rss_before = resident_set_bytes();
         let started = Instant::now();
         let (fixed_factor_status, production_path_status, fit, provenance, production_receipts) =
@@ -151,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .is_some_and(|value| value.status == TemporalInferenceStatus::Evaluated);
         let response = Response {
-            schema: "dolphinrust-temporal-covariance-batch/4",
+            schema: "dolphinrust-temporal-covariance-batch/6",
             execution_path: request.execution_path,
             cell_id: request.cell_id,
             cell_index: request.cell_index,
@@ -182,10 +204,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resident_set_bytes_after: rss_after,
             },
         };
-        serde_json::to_writer(&mut output, &response)?;
+        let encoded = serde_json::to_vec(&response)?;
+        if encoded.len() > MAX_RESPONSE_LINE_BYTES {
+            return Err("temporal covariance response exceeds its line cap".into());
+        }
+        output.write_all(&encoded)?;
         output.write_all(b"\n")?;
+        output.flush()?;
     }
     Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<bool> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if line.len().saturating_add(take) > cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "temporal covariance request exceeds its line cap",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
 }
 
 type Evaluation = (
@@ -229,8 +283,13 @@ fn evaluate_production(request: &Request) -> Evaluation {
     }
     if input.scope != TemporalValidationScope::SyntheticValidation
         || input.selected_method != "complete_refit_bootstrap"
-        || input.effective_looks_model != EFFECTIVE_LOOKS_MODEL
-        || input.effective_looks_distance_scale_pixels != EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+        || input.source_correlation_model != SOURCE_CORRELATION_MODEL
+        || input.source_correlation_distance_scale_pixels
+            != SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
+        || input.outer_coverage_dgp != OUTER_COVERAGE_DGP
+        || input.conditional_covariance_oracle != CONDITIONAL_COVARIANCE_ORACLE
+        || request.conditional_oracle_replicates == 1
+        || request.conditional_oracle_replicates > MAX_CONDITIONAL_ORACLE_REPLICATES
     {
         return (None, Some("production_contract_mismatch"), None, None, None);
     }
@@ -296,12 +355,17 @@ fn evaluate_production(request: &Request) -> Evaluation {
             input.reference_pixel[1] as u64,
         ),
         &input.reference,
+        (request.conditional_oracle_replicates > 0)
+            .then_some((request.conditional_oracle_replicates, request.seed)),
     ) {
         Ok(value) => value,
         Err(status) => return (None, Some(status), None, None, None),
     };
-    if evd.effective_looks_model != input.effective_looks_model {
-        return (None, Some("effective_looks_mismatch"), None, None, None);
+    if evd.source_correlation_model != input.source_correlation_model
+        || evd.source_correlation_distance_scale_pixels
+            != input.source_correlation_distance_scale_pixels
+    {
+        return (None, Some("source_correlation_mismatch"), None, None, None);
     }
     let linked_difference_history = evd.difference_history.clone();
     let mut observations = linked_difference_history.clone();
@@ -325,9 +389,10 @@ fn evaluate_production(request: &Request) -> Evaluation {
         evd.replay_source_factor_receipt.as_str(),
         evd.replay_support_receipt.as_str(),
         evd.reference_signature.as_str(),
-        input.effective_looks_model.as_str(),
-        input.effective_looks_distance_scale_pixels,
-        evd.effective_looks_receipt.as_str(),
+        input.source_correlation_model.as_str(),
+        input.source_correlation_distance_scale_pixels,
+        evd.source_correlation_support_union_count,
+        evd.source_correlation_receipt.as_str(),
         PHASELINK_SOURCE_JVP_METHOD,
         PHASELINK_SOURCE_JVP_CONTRACT,
         PHASELINK_SPATIAL_JVP_CONTRACT,
@@ -346,6 +411,14 @@ fn evaluate_production(request: &Request) -> Evaluation {
         .enumerate()
         .map(|(index, row)| row[index])
         .collect();
+    let numeric_evidence_sha256 = digest_json(&(
+        &fixed_l2_difference_covariance,
+        &fixed_l2_difference_variance,
+        &carrier_difference_history,
+        &linked_difference_history,
+        &evd.conditional_oracle_covariance,
+    ));
+    let retain_dense = request.retain_dense_evidence;
     let provenance = temporal_covariance_provenance(
         &fit,
         TemporalCovarianceProvenanceInputs {
@@ -363,6 +436,22 @@ fn evaluate_production(request: &Request) -> Evaluation {
             selected_method: input.selected_method.clone(),
         },
     );
+    let conditional_oracle_receipt_sha256 =
+        evd.conditional_oracle_covariance
+            .as_ref()
+            .map(|covariance| {
+                digest_json(&(
+                    CONDITIONAL_COVARIANCE_ORACLE,
+                    request.conditional_oracle_replicates,
+                    source_model.config_digest(),
+                    evd.operator_receipt.as_str(),
+                    evd.source_factor_receipt.as_str(),
+                    evd.replay_source_factor_receipt.as_str(),
+                    evd.fixed_l2_map_receipt.as_str(),
+                    evd.source_correlation_receipt.as_str(),
+                    covariance,
+                ))
+            });
     let receipts = ProductionReceipts {
         capture_scope_sha256: capture_scope,
         source_manifest_sha256: digest_bytes(source_manifest),
@@ -372,14 +461,21 @@ fn evaluate_production(request: &Request) -> Evaluation {
         fixed_l2_map_sha256: evd.fixed_l2_map_receipt,
         issue52_receipt_sha256: issue52_receipt,
         issue54_receipt_sha256: issue54_receipt,
-        fixed_l2_difference_covariance,
-        fixed_l2_difference_variance,
-        carrier_difference_history,
-        linked_difference_history,
-        effective_looks_model: evd.effective_looks_model,
-        effective_looks_distance_scale_pixels: input.effective_looks_distance_scale_pixels,
+        numeric_evidence_sha256,
+        fixed_l2_difference_covariance: retain_dense.then_some(fixed_l2_difference_covariance),
+        fixed_l2_difference_variance: retain_dense.then_some(fixed_l2_difference_variance),
+        carrier_difference_history: retain_dense.then_some(carrier_difference_history),
+        linked_difference_history: retain_dense.then_some(linked_difference_history),
+        source_correlation_model: evd.source_correlation_model,
+        source_correlation_distance_scale_pixels: evd.source_correlation_distance_scale_pixels,
+        source_correlation_support_union_count: evd.source_correlation_support_union_count,
         effective_looks_fraction: evd.effective_looks_fraction,
-        effective_looks_receipt_sha256: evd.effective_looks_receipt,
+        source_correlation_receipt_sha256: evd.source_correlation_receipt,
+        outer_coverage_dgp: OUTER_COVERAGE_DGP,
+        conditional_covariance_oracle: CONDITIONAL_COVARIANCE_ORACLE,
+        conditional_oracle_replicates: request.conditional_oracle_replicates,
+        conditional_oracle_covariance: evd.conditional_oracle_covariance,
+        conditional_oracle_receipt_sha256,
     };
     let status = if fit.status == TemporalInferenceStatus::Evaluated {
         "evaluated"
@@ -423,10 +519,16 @@ const SOURCE_PROVIDER: &str = "temporal-covariance-validation-memory";
 const SOURCE_PROVIDER_VERSION: &str = "1";
 const SOURCE_MODEL: &str = "source_centered_empirical_proper_complex_v1";
 const SOURCE_MODEL_VERSION: &str = "1";
+const SOURCE_MODEL_SHRINKAGE_ALPHA: f64 = 0.1;
 const BRANCH_TOLERANCE: f64 = 1e-10;
 const REPLAY_BYTE_CAP: u64 = 1 << 30;
-const EFFECTIVE_LOOKS_MODEL: &str = "source_factor_declared_v1";
-const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
+const SOURCE_CORRELATION_MODEL: &str = "exponential_euclidean_v1";
+const SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS: f64 = 1.5;
+const OUTER_COVERAGE_DGP: &str = "physical_raw_space_v1";
+const CONDITIONAL_COVARIANCE_ORACLE: &str = "fixed_capture_common_factor_monte_carlo_v1";
+const MAX_CONDITIONAL_ORACLE_REPLICATES: usize = 16_384;
+const MAX_REQUEST_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const PHASELINK_SOURCE_JVP_METHOD: &str = "raw_complex_to_phase_source_jvp_v1";
 const PHASELINK_SOURCE_JVP_CONTRACT: &str =
     "dolphin_phaselink::source_influence_contract::evd_phase_source_jvp_matches_raw_complex_difference";
@@ -442,9 +544,12 @@ struct ProductionBranch {
     replay_source_factor_receipt: Sha256Digest,
     replay_support_receipt: Sha256Digest,
     reference_signature: Sha256Digest,
-    effective_looks_model: &'static str,
+    source_correlation_model: &'static str,
+    source_correlation_distance_scale_pixels: f64,
+    source_correlation_support_union_count: usize,
     effective_looks_fraction: f64,
-    effective_looks_receipt: Sha256Digest,
+    source_correlation_receipt: Sha256Digest,
+    conditional_oracle_covariance: Option<Vec<Vec<f64>>>,
     reference: TemporalReferenceProvenance,
 }
 
@@ -625,6 +730,7 @@ fn run_production_branch(
     target: (u64, u64),
     reference: (u64, u64),
     claimed_reference: &TemporalReferenceProvenance,
+    conditional_oracle: Option<(usize, u64)>,
 ) -> Result<ProductionBranch, &'static str> {
     let mut config = sequential_config();
     config.use_evd = true;
@@ -725,6 +831,9 @@ fn run_production_branch(
         reference,
         ordered_dates: &ordered_dates,
         source_rank,
+        source_correlation: SourceCorrelationModel::ExponentialEuclidean {
+            distance_scale_pixels: SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS,
+        },
         byte_cap: REPLAY_BYTE_CAP,
         branch_tolerance: BRANCH_TOLERANCE,
     };
@@ -753,9 +862,11 @@ fn run_production_branch(
         .effective_looks
         .as_ref()
         .ok_or("production replay omitted effective looks")?;
-    let effective_looks_model = effective_looks.model;
+    let source_correlation_model = effective_looks.model;
+    let source_correlation_distance_scale_pixels = effective_looks.distance_scale_pixels;
+    let source_correlation_support_union_count = effective_looks.support_union_count;
     let effective_looks_fraction = effective_looks.fraction;
-    let effective_looks_receipt = digest_bytes(effective_looks.receipt);
+    let source_correlation_receipt = digest_bytes(effective_looks.receipt);
     let target_history = phase_history(&output.cpx_phase, (target.0 as usize, target.1 as usize));
     let reference_history = phase_history(
         &output.cpx_phase,
@@ -790,6 +901,16 @@ fn run_production_branch(
         SpatialL2Branch::FixedL2,
     )
     .map_err(|_| "fixed-L2 covariance propagation failed")?;
+    let conditional_oracle_covariance = conditional_oracle
+        .map(|(replicates, seed)| {
+            conditional_common_factor_covariance(
+                replay.joint_phase_covariance.view(),
+                propagated.propagation_map.view(),
+                replicates,
+                seed,
+            )
+        })
+        .transpose()?;
     let fixed_l2_map_receipt = fixed_l2_map_receipt(target, &target_map, reference, &reference_map);
     let realized_reference = realized_reference_provenance(
         columns,
@@ -821,11 +942,79 @@ fn run_production_branch(
         replay_source_factor_receipt: digest_bytes(replay.replay.source_factor_receipt),
         replay_support_receipt: digest_bytes(replay.replay.support_receipt),
         reference_signature: digest_bytes(replay.replay.reference_signature),
-        effective_looks_model,
+        source_correlation_model,
+        source_correlation_distance_scale_pixels,
+        source_correlation_support_union_count,
         effective_looks_fraction,
-        effective_looks_receipt,
+        source_correlation_receipt,
+        conditional_oracle_covariance,
         reference: realized_reference,
     })
+}
+
+fn conditional_common_factor_covariance(
+    covariance: ndarray::ArrayView2<'_, f64>,
+    propagation: ndarray::ArrayView2<'_, f64>,
+    replicates: usize,
+    seed: u64,
+) -> Result<Vec<Vec<f64>>, &'static str> {
+    if !(2..=MAX_CONDITIONAL_ORACLE_REPLICATES).contains(&replicates)
+        || covariance.nrows() != covariance.ncols()
+        || covariance.ncols() != propagation.ncols()
+        || covariance.iter().any(|value| !value.is_finite())
+        || propagation.iter().any(|value| !value.is_finite())
+    {
+        return Err("conditional common-factor oracle input is invalid");
+    }
+    let size = covariance.nrows();
+    let symmetric = Mat::from_fn(size, size, |row, column| {
+        0.5 * (covariance[(row, column)] + covariance[(column, row)])
+    });
+    let eigen = symmetric.selfadjoint_eigendecomposition(Side::Lower);
+    let values = (0..size)
+        .map(|index| eigen.s().column_vector()[index])
+        .collect::<Vec<_>>();
+    let scale = values.iter().copied().map(f64::abs).fold(0.0, f64::max);
+    let tolerance = scale * 1.0e-10;
+    if !scale.is_finite() || scale == 0.0 || values.iter().any(|value| *value < -tolerance) {
+        return Err("conditional common-factor covariance is not positive semidefinite");
+    }
+    let vectors = eigen.u();
+    let factor = Array2::from_shape_fn((size, size), |(row, column)| {
+        vectors[(row, column)] * values[column].max(0.0).sqrt()
+    });
+    let output = propagation.nrows();
+    let mut mean = Array1::<f64>::zeros(output);
+    let mut sum_products = Array2::<f64>::zeros((output, output));
+    let mut state = seed ^ 0x434f_4d4d_4f4e_4654;
+    for replicate in 0..replicates {
+        let normal = Array1::from_shape_fn(size, |_| {
+            state = splitmix64(state);
+            let uniform_one = ((state >> 11) as f64 / (1_u64 << 53) as f64).max(1.0e-15);
+            state = splitmix64(state);
+            let uniform_two = (state >> 11) as f64 / (1_u64 << 53) as f64;
+            (-2.0 * uniform_one.ln()).sqrt() * (std::f64::consts::TAU * uniform_two).cos()
+        });
+        let value = propagation.dot(&factor.dot(&normal));
+        let count = (replicate + 1) as f64;
+        let delta = &value - &mean;
+        mean.scaled_add(count.recip(), &delta);
+        let updated = &value - &mean;
+        for row in 0..output {
+            for column in 0..output {
+                sum_products[(row, column)] += delta[row] * updated[column];
+            }
+        }
+    }
+    let empirical = sum_products.mapv(|value| value / (replicates - 1) as f64);
+    Ok(matrix_rows(&empirical))
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn matrix_rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
@@ -887,8 +1076,10 @@ fn capture_scope_digest(request: &Request, input: &ProductionPathInput) -> Sha25
         "scope": input.scope,
         "source_seed": input.source_seed,
         "target": input.target,
-        "effective_looks_model": input.effective_looks_model,
-        "effective_looks_distance_scale_pixels": input.effective_looks_distance_scale_pixels,
+        "source_correlation_model": input.source_correlation_model,
+        "source_correlation_distance_scale_pixels": input.source_correlation_distance_scale_pixels,
+        "outer_coverage_dgp": input.outer_coverage_dgp,
+        "conditional_covariance_oracle": input.conditional_covariance_oracle,
     }))
 }
 
@@ -900,10 +1091,11 @@ fn source_manifest_digest(
     let mut digest = Sha256::new();
     digest.update(b"dolphinrust:temporal-validation-raw-source-manifest:v1");
     digest.update(input.source_seed.to_le_bytes());
-    digest.update(input.effective_looks_model.as_bytes());
+    digest.update(input.source_correlation_model.as_bytes());
+    digest.update(input.outer_coverage_dgp.as_bytes());
     digest.update(
         input
-            .effective_looks_distance_scale_pixels
+            .source_correlation_distance_scale_pixels
             .to_bits()
             .to_le_bytes(),
     );
@@ -924,7 +1116,7 @@ fn source_manifest_digest(
 fn source_model_config(
 ) -> Result<EmpiricalProperComplexConfig, dolphin_phaselink::EmpiricalSourceModelError> {
     let model_identity = Sha256::digest(b"dolphinrust:temporal-validation-source-model:v1").into();
-    EmpiricalProperComplexConfig::new(0, 1, 0.1, 1e-8, model_identity)
+    EmpiricalProperComplexConfig::new(0, 1, SOURCE_MODEL_SHRINKAGE_ALPHA, 1e-8, model_identity)
 }
 
 fn operator_receipt(blocks: &[CovarianceOperatorBlock], use_evd: bool) -> Sha256Digest {
@@ -1075,4 +1267,22 @@ fn resident_set_bytes() -> u64 {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map_or(0, |kibibytes| kibibytes.saturating_mul(1024))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn bounded_line_accepts_exact_cap_and_rejects_one_byte_over() {
+        let mut exact = Cursor::new(b"abcd\n".to_vec());
+        let mut line = Vec::new();
+        assert!(read_bounded_line(&mut exact, &mut line, 4).unwrap());
+        assert_eq!(line, b"abcd");
+
+        let mut over = Cursor::new(b"abcde\n".to_vec());
+        let error = read_bounded_line(&mut over, &mut line, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }

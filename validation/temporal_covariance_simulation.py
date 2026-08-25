@@ -8,6 +8,8 @@ import hashlib
 import itertools
 import json
 import math
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -173,8 +175,20 @@ def normal_noise(state: int) -> tuple[int, float]:
 
 
 PROPER_COMPLEX_MOMENT_SEEDS = 4096
-EFFECTIVE_LOOKS_MODEL = "source_factor_declared_v1"
-EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS = 1.5
+SOURCE_CORRELATION_MODEL = "exponential_euclidean_v1"
+SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS = 1.5
+OUTER_COVERAGE_DGP = "physical_raw_space_v1"
+CONDITIONAL_COVARIANCE_ORACLE = "fixed_capture_common_factor_monte_carlo_v1"
+MAX_REQUEST_LINE_BYTES = 4 * 1024 * 1024
+MAX_RESPONSE_LINE_BYTES = 4 * 1024 * 1024
+MAX_SHARD_RECORD_BYTES = 16 * 1024 * 1024
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_COMMIT_BYTES = 64 * 1024
+MAX_FINAL_RECEIPT_BYTES = 1024 * 1024
+MAX_PROBE_RECORDS = 16
+RUN_IDENTITY_SCHEMA = "dolphinrust-temporal-covariance-run-identity/1"
+SHARD_MANIFEST_SCHEMA = "dolphinrust-temporal-covariance-shard-manifest/1"
+SHARD_COMMIT_SCHEMA = "dolphinrust-temporal-covariance-shard-commit/1"
 
 
 def _proper_complex_draw(
@@ -204,7 +218,7 @@ def proper_complex_innovation(
 
 def spatial_correlation(left: int, right: int) -> float:
     return math.exp(
-        -abs(left - right) / EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+        -abs(left - right) / SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
     )
 
 
@@ -338,16 +352,20 @@ def capture_scope_sha256(request: dict) -> str:
         "scope": production["scope"],
         "source_seed": production["source_seed"],
         "target": production["target"],
-        "effective_looks_model": production["effective_looks_model"],
-        "effective_looks_distance_scale_pixels": production[
-            "effective_looks_distance_scale_pixels"
+        "source_correlation_model": production["source_correlation_model"],
+        "source_correlation_distance_scale_pixels": production[
+            "source_correlation_distance_scale_pixels"
         ],
+        "outer_coverage_dgp": production["outer_coverage_dgp"],
+        "conditional_covariance_oracle": production["conditional_covariance_oracle"],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execution_path: str) -> dict:
+def request_for(
+        cell: dict, outer_seed_index: int, preregistration: dict,
+        execution_path: str, retain_dense_evidence: bool = False) -> dict:
     seed, seed_sha256 = seed_identity(preregistration, cell["cell_index"], outer_seed_index)
     days = days_for(cell)
     missing = missing_indices(cell, seed, len(days) - 1)
@@ -399,7 +417,9 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
     request = {"execution_path": execution_path, "cell_id": cell["cell_id"],
                "cell_index": cell["cell_index"], "outer_seed_index": outer_seed_index,
                "seed_sha256": seed_sha256, "seed": seed, "days": days,
-               "options": options, "fixed_factor": None, "production_path": None}
+               "options": options, "fixed_factor": None, "production_path": None,
+               "retain_dense_evidence": retain_dense_evidence,
+               "conditional_oracle_replicates": 0}
     if execution_path == "fixed_factor":
         request["fixed_factor"] = {"observations": observations,
                                    "difference_covariance": covariance}
@@ -457,8 +477,10 @@ def request_for(cell: dict, outer_seed_index: int, preregistration: dict, execut
             "raw_complex_stack": raw_complex_stack,
             "carrier_stack": carrier_stack,
             "intended_difference_variance": [0.0] + diagonal[1:],
-            "effective_looks_model": EFFECTIVE_LOOKS_MODEL,
-            "effective_looks_distance_scale_pixels": EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+            "source_correlation_model": SOURCE_CORRELATION_MODEL,
+            "source_correlation_distance_scale_pixels": SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS,
+            "outer_coverage_dgp": OUTER_COVERAGE_DGP,
+            "conditional_covariance_oracle": CONDITIONAL_COVARIANCE_ORACLE,
             "validity": [value is not None for value in observations],
             "reference": reference,
             "scope": "synthetic_validation",
@@ -626,7 +648,7 @@ class StreamingScores:
                     "methods": methods,
                 })
         return {
-            "schema": "coverage_bias_interval_score/3",
+            "schema": self.preregistration["schemas"]["scorer"],
             "truth_slope_per_year": self.truth,
             "methods": global_methods,
             "cell_summaries": summaries,
@@ -654,76 +676,445 @@ def iter_requests(preregistration: dict, seed_count: int):
                 )
 
 
-def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
-    frozen_cells = cells(preregistration)
-    if cell_hash(frozen_cells) != preregistration["supported_cell_sha256"]:
-        raise RuntimeError("supported cell construction does not match preregistration hash")
-    expected_attempts = len(frozen_cells) * seed_count * len(preregistration["execution_paths"])
-    selected = iter_requests(preregistration, seed_count)
-    if limit is not None:
-        selected = itertools.islice(selected, limit)
+def canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+
+
+def _open_bounded_regular(path: Path, byte_cap: int):
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise RuntimeError("descriptor-bound validation requires O_NOFOLLOW")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except OSError as error:
+        raise RuntimeError(f"{path.name} is not an openable regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{path.name} is not a regular file")
+        if metadata.st_size > byte_cap:
+            raise RuntimeError(f"{path.name} exceeds its retained byte cap")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_bounded_regular(path: Path, byte_cap: int) -> bytes:
+    with _open_bounded_regular(path, byte_cap) as handle:
+        payload = handle.read(byte_cap + 1)
+    if len(payload) > byte_cap:
+        raise RuntimeError(f"{path.name} exceeds its retained byte cap")
+    return payload
+
+
+def sha256_file(path: Path, byte_cap: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with _open_bounded_regular(path, byte_cap) as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            if size > byte_cap:
+                raise RuntimeError(f"{path.name} exceeds its retained byte cap")
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _remove_owned_regular(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if not _regular_file(path):
+        raise RuntimeError(f"refusing to remove non-regular run artifact {path.name}")
+    path.unlink()
+
+
+def atomic_write_no_replace(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    _remove_owned_regular(partial)
+    with partial.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.link(partial, path, follow_symlinks=False)
+    finally:
+        partial.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
+
+
+def producer_identity(preregistration: dict, binary: Path) -> dict:
     root = Path(__file__).parents[1]
-    subprocess.run(
-        ["cargo", "build", "--release", "-p", "dolphin-timeseries", "--example", "temporal_covariance_batch"],
-        cwd=root,
-        check=True,
+    paths = {
+        "generator_sha256": Path(__file__),
+        "batch_source_sha256": (
+            root / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs"
+        ),
+        "estimator_source_sha256": (
+            root / "crates/dolphin-timeseries/src/temporal_covariance.rs"
+        ),
+    }
+    actual_hashes = {
+        identity: sha256_file(path, 16 * 1024 * 1024)[0]
+        for identity, path in paths.items()
+    }
+    if actual_hashes != preregistration["file_hashes"]:
+        raise RuntimeError("frozen temporal covariance source hashes do not match the run")
+    binary_sha256, binary_bytes = sha256_file(binary, 1024 * 1024 * 1024)
+    return {
+        "schema": RUN_IDENTITY_SCHEMA,
+        "preregistration_sha256": hashlib.sha256(
+            canonical_json_bytes(preregistration)
+        ).hexdigest(),
+        **actual_hashes,
+        "binary_sha256": binary_sha256,
+        "binary_bytes": binary_bytes,
+        "batch_schema": preregistration["schemas"]["batch"],
+        "generator_schema": preregistration["schemas"]["generator"],
+        "source_correlation_model": SOURCE_CORRELATION_MODEL,
+        "source_correlation_distance_scale_pixels": (
+            SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
+        ),
+        "seed_count": preregistration["outer_seeds_per_supported_cell"],
+    }
+
+
+def initialize_run_root(run_root: Path, identity: dict) -> Path:
+    if run_root.exists() and (run_root.is_symlink() or not run_root.is_dir()):
+        raise RuntimeError("run root must be a real directory")
+    run_root.mkdir(parents=True, exist_ok=True)
+    identity_path = run_root / "run_identity.json"
+    expected = canonical_json_bytes(identity) + b"\n"
+    if len(expected) > MAX_COMMIT_BYTES:
+        raise RuntimeError("run identity exceeds its retained byte cap")
+    if identity_path.exists():
+        if _read_bounded_regular(identity_path, MAX_COMMIT_BYTES) != expected:
+            raise RuntimeError("run root identity is stale or malformed")
+    else:
+        atomic_write_no_replace(identity_path, expected)
+    shards = run_root / "shards"
+    if shards.exists() and (shards.is_symlink() or not shards.is_dir()):
+        raise RuntimeError("run shard root must be a real directory")
+    shards.mkdir(exist_ok=True)
+    return shards
+
+
+def _shard_paths(shards: Path, cell: dict, execution_path: str) -> dict[str, Path]:
+    stem = f"{cell['cell_index']:05d}.{execution_path}"
+    return {
+        "records": shards / f"{stem}.jsonl",
+        "manifest": shards / f"{stem}.manifest.json",
+        "commit": shards / f"{stem}.commit.json",
+    }
+
+
+def _read_bounded_line(handle, cap: int) -> bytes:
+    line = handle.readline(cap + 1)
+    if len(line) > cap:
+        raise RuntimeError("temporal covariance batch line exceeds its byte cap")
+    if line and not line.endswith(b"\n"):
+        raise RuntimeError("temporal covariance batch returned a partial line")
+    return line
+
+
+def _validate_compact_record(record: dict, request: dict, batch_schema: str) -> None:
+    identity = (
+        "execution_path", "cell_id", "cell_index", "outer_seed_index",
+        "seed_sha256", "seed",
     )
+    if not isinstance(record, dict) or record.get("schema") != batch_schema:
+        raise RuntimeError("batch returned a malformed schema")
+    if any(record.get(field) != request[field] for field in identity):
+        raise RuntimeError("batch returned a stale or mismatched attempt identity")
+    if record.get("attempted") is not True:
+        raise RuntimeError("batch omitted the attempted disposition")
+    if type(record.get("emitted")) is not bool or type(record.get("failed")) is not bool:
+        raise RuntimeError("batch returned a malformed emission disposition")
+    if record["emitted"] == record["failed"]:
+        raise RuntimeError("batch emission and failure dispositions are inconsistent")
+    resource = record.get("resource")
+    if not isinstance(resource, dict) or any(
+            type(resource.get(field)) is not int or resource[field] < 0
+            for field in (
+                "wall_micros", "resident_set_bytes_before", "resident_set_bytes_after"
+            )):
+        raise RuntimeError("batch returned a malformed resource receipt")
+    receipts = record.get("production_receipts")
+    if request["execution_path"] == "production_path" and receipts is not None:
+        if (
+            receipts.get("source_correlation_model") != SOURCE_CORRELATION_MODEL
+            or receipts.get("source_correlation_distance_scale_pixels")
+            != SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
+            or type(receipts.get("source_correlation_support_union_count")) is not int
+            or receipts["source_correlation_support_union_count"] <= 0
+            or receipts.get("outer_coverage_dgp") != OUTER_COVERAGE_DGP
+            or receipts.get("conditional_covariance_oracle")
+            != CONDITIONAL_COVARIANCE_ORACLE
+        ):
+            raise RuntimeError("batch returned stale source-correlation provenance")
+        if any(field in receipts for field in (
+            "fixed_l2_difference_covariance", "fixed_l2_difference_variance",
+            "carrier_difference_history", "linked_difference_history",
+        )):
+            raise RuntimeError("batch retained dense per-attempt evidence")
+        for field in ("numeric_evidence_sha256", "source_correlation_receipt_sha256"):
+            value = receipts.get(field)
+            if not isinstance(value, str) or len(value) != 64:
+                raise RuntimeError("batch omitted compact numeric evidence identity")
+        oracle_replicates = request.get("conditional_oracle_replicates", 0)
+        if receipts.get("conditional_oracle_replicates") != oracle_replicates:
+            raise RuntimeError("batch returned stale conditional-oracle provenance")
+        oracle_fields = (
+            "conditional_oracle_covariance", "conditional_oracle_receipt_sha256"
+        )
+        if oracle_replicates == 0 and any(field in receipts for field in oracle_fields):
+            raise RuntimeError("batch retained an unrequested conditional oracle")
+        if oracle_replicates > 0:
+            covariance = receipts.get("conditional_oracle_covariance")
+            receipt = receipts.get("conditional_oracle_receipt_sha256")
+            if (
+                    not isinstance(covariance, list)
+                    or len(covariance) != len(request["days"])
+                    or any(not isinstance(row, list) or len(row) != len(covariance)
+                           for row in covariance)
+                    or not isinstance(receipt, str)
+                    or len(receipt) != 64):
+                raise RuntimeError("batch returned a malformed conditional oracle")
+
+
+def _cleanup_uncommitted(paths: dict[str, Path]) -> None:
+    if paths["commit"].exists() or paths["commit"].is_symlink():
+        return
+    for path in paths.values():
+        _remove_owned_regular(path)
+        _remove_owned_regular(path.with_name(path.name + ".partial"))
+
+
+def _validate_manifest(
+        manifest: dict, identity: dict, cell: dict, execution_path: str,
+        seed_count: int, records_sha256: str, records_bytes: int) -> None:
+    expected_keys = {
+        "schema", "cell_id", "cell_index", "execution_path", "seed_count",
+        "records_sha256", "records_bytes", "request_schedule_sha256",
+        "producer_identity", "attempted", "emitted", "failed",
+        "total_wall_micros", "peak_resident_set_bytes",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RuntimeError("shard manifest schema is malformed")
+    expected = {
+        "schema": SHARD_MANIFEST_SCHEMA,
+        "cell_id": cell["cell_id"],
+        "cell_index": cell["cell_index"],
+        "execution_path": execution_path,
+        "seed_count": seed_count,
+        "records_sha256": records_sha256,
+        "records_bytes": records_bytes,
+        "producer_identity": identity,
+        "attempted": seed_count,
+    }
+    if any(manifest.get(field) != value for field, value in expected.items()):
+        raise RuntimeError("shard manifest identity is stale or malformed")
+    for field in ("emitted", "failed", "total_wall_micros", "peak_resident_set_bytes"):
+        if type(manifest.get(field)) is not int or manifest[field] < 0:
+            raise RuntimeError("shard manifest counters are malformed")
+    if manifest["emitted"] + manifest["failed"] != seed_count:
+        raise RuntimeError("shard manifest dispositions do not equal the seed denominator")
+    schedule = manifest.get("request_schedule_sha256")
+    if not isinstance(schedule, str) or len(schedule) != 64:
+        raise RuntimeError("shard manifest request schedule is malformed")
+
+
+def _read_committed_shard(
+        preregistration: dict, cell: dict, execution_path: str, seed_count: int,
+        paths: dict[str, Path], identity: dict, scorer: StreamingScores | None) -> dict:
+    try:
+        commit_bytes = _read_bounded_regular(paths["commit"], MAX_COMMIT_BYTES)
+        manifest_bytes = _read_bounded_regular(paths["manifest"], MAX_MANIFEST_BYTES)
+    except RuntimeError as error:
+        raise RuntimeError("committed shard is partial or missing") from error
+    commit = json.loads(commit_bytes)
+    if not isinstance(commit, dict) or set(commit) != {
+        "schema", "manifest_sha256", "records_sha256"
+    } or commit.get("schema") != SHARD_COMMIT_SCHEMA:
+        raise RuntimeError("shard commit schema is malformed")
+    if hashlib.sha256(manifest_bytes).hexdigest() != commit.get("manifest_sha256"):
+        raise RuntimeError("shard manifest hash is stale or tampered")
+    manifest = json.loads(manifest_bytes)
+    schedule = hashlib.sha256()
+    count = 0
+    try:
+        records = _open_bounded_regular(paths["records"], MAX_SHARD_RECORD_BYTES)
+    except RuntimeError as error:
+        raise RuntimeError("committed shard is partial or missing") from error
+    with records:
+        records_digest = hashlib.sha256()
+        records_bytes = 0
+        while chunk := records.read(1024 * 1024):
+            records_digest.update(chunk)
+            records_bytes += len(chunk)
+        records_sha256 = records_digest.hexdigest()
+        if records_sha256 != commit.get("records_sha256"):
+            raise RuntimeError("shard record hash is stale or tampered")
+        _validate_manifest(
+            manifest, identity, cell, execution_path, seed_count,
+            records_sha256, records_bytes,
+        )
+        records.seek(0)
+        while line := _read_bounded_line(records, MAX_RESPONSE_LINE_BYTES):
+            if not line.strip():
+                raise RuntimeError("shard contains an empty record")
+            request = request_for(
+                cell, count, preregistration, execution_path,
+                retain_dense_evidence=False,
+            )
+            encoded_request = canonical_json_bytes(request) + b"\n"
+            schedule.update(encoded_request)
+            record = json.loads(line)
+            _validate_compact_record(record, request, identity["batch_schema"])
+            if scorer is not None:
+                scorer.update(record)
+            count += 1
+            if count > seed_count:
+                raise RuntimeError("shard contains a top-up attempt")
+    if count != seed_count or schedule.hexdigest() != manifest["request_schedule_sha256"]:
+        raise RuntimeError("shard seed schedule is missing, duplicated, or reordered")
+    return manifest
+
+
+def execute_or_resume_shard(
+        preregistration: dict, cell: dict, execution_path: str, seed_count: int,
+        shards: Path, binary: Path, identity: dict) -> tuple[dict, bool]:
+    paths = _shard_paths(shards, cell, execution_path)
+    if paths["commit"].exists() or paths["commit"].is_symlink():
+        return (
+            _read_committed_shard(
+                preregistration, cell, execution_path, seed_count, paths, identity, None
+            ),
+            True,
+        )
+    _cleanup_uncommitted(paths)
+    partial_records = paths["records"].with_name(paths["records"].name + ".partial")
     process = subprocess.Popen(
-        [root / "target/release/examples/temporal_covariance_batch"],
-        cwd=root,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
     )
     if process.stdin is None or process.stdout is None:
         process.kill()
         raise RuntimeError("temporal covariance batch pipes are unavailable")
-    scorer = StreamingScores(preregistration)
-    records: list[dict] = []
-    processed = 0
-    emitted = 0
-    failed = 0
-    total_wall = 0
-    peak_rss = 0
+    records_digest = hashlib.sha256()
+    schedule_digest = hashlib.sha256()
+    attempted = emitted = failed = total_wall = peak_rss = records_bytes = 0
     try:
-        for request in selected:
-            process.stdin.write(json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n")
-            process.stdin.flush()
-            line = process.stdout.readline()
-            if not line:
-                raise RuntimeError("temporal covariance batch ended before returning every request")
-            record = json.loads(line)
-            scorer.update(record)
-            processed += 1
-            emitted += bool(record["emitted"])
-            failed += bool(record["failed"])
-            total_wall += record["resource"]["wall_micros"]
-            peak_rss = max(
-                peak_rss,
-                record["resource"]["resident_set_bytes_before"],
-                record["resource"]["resident_set_bytes_after"],
-            )
-            if limit is not None and limit <= 1024:
-                records.append(record)
-        process.stdin.close()
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError(f"temporal covariance batch exited with status {return_code}")
+        with partial_records.open("xb") as retained:
+            for seed_index in range(seed_count):
+                request = request_for(
+                    cell, seed_index, preregistration, execution_path,
+                    retain_dense_evidence=False,
+                )
+                encoded = canonical_json_bytes(request) + b"\n"
+                if len(encoded) > MAX_REQUEST_LINE_BYTES:
+                    raise RuntimeError("temporal covariance request exceeds its line cap")
+                schedule_digest.update(encoded)
+                process.stdin.write(encoded)
+                process.stdin.flush()
+                line = _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES)
+                if not line:
+                    raise RuntimeError("temporal covariance batch ended before its shard")
+                record = json.loads(line)
+                _validate_compact_record(record, request, identity["batch_schema"])
+                records_bytes += len(line)
+                if records_bytes > MAX_SHARD_RECORD_BYTES:
+                    raise RuntimeError("temporal covariance shard exceeds its byte cap")
+                retained.write(line)
+                records_digest.update(line)
+                attempted += 1
+                emitted += int(record["emitted"])
+                failed += int(record["failed"])
+                resource = record["resource"]
+                total_wall += resource["wall_micros"]
+                peak_rss = max(
+                    peak_rss,
+                    resource["resident_set_bytes_before"],
+                    resource["resident_set_bytes_after"],
+                )
+            process.stdin.close()
+            if _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES):
+                raise RuntimeError("temporal covariance batch returned a top-up record")
+            if process.wait() != 0:
+                raise RuntimeError("temporal covariance batch exited unsuccessfully")
+            retained.flush()
+            os.fsync(retained.fileno())
     except BaseException:
         process.kill()
         process.wait()
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
         raise
-    exact_denominator = (
-        limit is None
-        and seed_count == preregistration["outer_seeds_per_supported_cell"]
-        and processed == expected_attempts
+    process.stdout.close()
+    manifest = {
+        "schema": SHARD_MANIFEST_SCHEMA,
+        "cell_id": cell["cell_id"],
+        "cell_index": cell["cell_index"],
+        "execution_path": execution_path,
+        "seed_count": seed_count,
+        "records_sha256": records_digest.hexdigest(),
+        "records_bytes": records_bytes,
+        "request_schedule_sha256": schedule_digest.hexdigest(),
+        "producer_identity": identity,
+        "attempted": attempted,
+        "emitted": emitted,
+        "failed": failed,
+        "total_wall_micros": total_wall,
+        "peak_resident_set_bytes": peak_rss,
+    }
+    manifest_bytes = canonical_json_bytes(manifest) + b"\n"
+    if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+        raise RuntimeError("shard manifest exceeds its byte cap")
+    commit = {
+        "schema": SHARD_COMMIT_SCHEMA,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "records_sha256": records_digest.hexdigest(),
+    }
+    os.link(partial_records, paths["records"], follow_symlinks=False)
+    partial_records.unlink()
+    atomic_write_no_replace(paths["manifest"], manifest_bytes)
+    atomic_write_no_replace(paths["commit"], canonical_json_bytes(commit) + b"\n")
+    _fsync_directory(shards)
+    _read_committed_shard(
+        preregistration, cell, execution_path, seed_count, paths, identity, None
     )
-    scores = scorer.finalize(require_complete=exact_denominator)
-    complete_execution = limit is None and processed == expected_attempts
-    result_payload = json.dumps({"scores": scores}, separators=(",", ":"), sort_keys=True).encode()
-    projected_full_minutes = ((total_wall / processed) * expected_attempts / 60_000_000
-                              if processed else float("inf"))
+    return manifest, False
+
+
+def _result_receipt(
+        preregistration: dict, seed_count: int, processed: int, emitted: int,
+        failed: int, total_wall: int, peak_rss: int, scores: dict,
+        records: list[dict], exact_denominator: bool) -> dict:
+    expected_attempts = (
+        len(cells(preregistration)) * seed_count * len(preregistration["execution_paths"])
+    )
+    result_payload = canonical_json_bytes({"scores": scores})
+    projected_full_minutes = (
+        (total_wall / processed) * expected_attempts / 60_000_000
+        if processed else float("inf")
+    )
     resource_gates = {
         "rss": peak_rss <= preregistration["resource_limits"]["rss_limit_bytes"],
         "artifact_size": len(result_payload)
@@ -731,19 +1122,23 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         "projected_wall": projected_full_minutes
             <= preregistration["resource_limits"]["projected_full_scene_minutes"],
     }
+    complete_execution = processed == expected_attempts
     return {
-        "schema": "dolphinrust-temporal-covariance-simulation/5",
+        "schema": preregistration["schemas"]["generator"],
         "preregistration_schema": preregistration["schema"],
         "pre_outcome_status": preregistration["status"],
         "supported_cell_sha256": preregistration["supported_cell_sha256"],
-        "attempted_cells": expected_attempts, "batch_attempted_cells": processed,
+        "attempted_cells": expected_attempts,
+        "batch_attempted_cells": processed,
         "emitted_cells": emitted,
         "failed_cells": failed,
-        "skipped_contract_cells": expected_attempts - processed, "seed_count": seed_count,
+        "skipped_contract_cells": expected_attempts - processed,
+        "seed_count": seed_count,
         "unsupported_cell_count": len(unsupported_cells(preregistration)),
         "unsupported_cell_sha256": preregistration["unsupported_cell_sha256"],
         "unsupported_cells": unsupported_cells(preregistration),
-        "methods": preregistration["methods"], "records": records,
+        "methods": preregistration["methods"],
+        "records": records,
         "scores": scores,
         "execution_paths": preregistration["execution_paths"],
         "corrected_inferential_sigma_emission": False,
@@ -752,31 +1147,220 @@ def run(preregistration: dict, seed_count: int, limit: int | None) -> dict:
         "result_records_sha256": hashlib.sha256(result_payload).hexdigest(),
         "result_records_bytes": len(result_payload),
         "promotion_eligible": exact_denominator and scores["all_methods_pass"]
-                              and all(resource_gates.values()),
-        "promotion_status": ("eligible_for_external_field_review" if exact_denominator
-                             and scores["all_methods_pass"] and all(resource_gates.values()) else
-                             "blocked_pending_complete_passing_synthetic_execution"),
-        "resource": {"total_wall_micros": total_wall, "peak_resident_set_bytes": peak_rss,
-                     "result_artifact_bytes": len(result_payload),
-                     "projected_full_minutes": projected_full_minutes},
+            and all(resource_gates.values()),
+        "promotion_status": (
+            "eligible_for_external_field_review"
+            if exact_denominator and scores["all_methods_pass"]
+            and all(resource_gates.values())
+            else "blocked_pending_complete_passing_synthetic_execution"
+        ),
+        "resource": {
+            "total_wall_micros": total_wall,
+            "peak_resident_set_bytes": peak_rss,
+            "result_artifact_bytes": len(result_payload),
+            "projected_full_minutes": projected_full_minutes,
+        },
         "resource_gates": resource_gates,
         "resource_limits": preregistration["resource_limits"],
     }
+
+
+def _run_probe(
+        preregistration: dict, seed_count: int, limit: int, binary: Path) -> dict:
+    if limit > MAX_PROBE_RECORDS:
+        raise RuntimeError("probe record count exceeds its retained bound")
+    selected = itertools.islice(iter_requests(preregistration, seed_count), limit)
+    process = subprocess.Popen(
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RuntimeError("temporal covariance batch pipes are unavailable")
+    scorer = StreamingScores(preregistration)
+    records = []
+    emitted = failed = total_wall = peak_rss = 0
+    try:
+        for request in selected:
+            encoded = canonical_json_bytes(request) + b"\n"
+            if len(encoded) > MAX_REQUEST_LINE_BYTES:
+                raise RuntimeError("temporal covariance request exceeds its line cap")
+            process.stdin.write(encoded)
+            process.stdin.flush()
+            line = _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES)
+            if not line:
+                raise RuntimeError("temporal covariance batch ended before its probe")
+            record = json.loads(line)
+            _validate_compact_record(
+                record, request, preregistration["schemas"]["batch"]
+            )
+            scorer.update(record)
+            records.append(record)
+            emitted += int(record["emitted"])
+            failed += int(record["failed"])
+            total_wall += record["resource"]["wall_micros"]
+            peak_rss = max(
+                peak_rss,
+                record["resource"]["resident_set_bytes_before"],
+                record["resource"]["resident_set_bytes_after"],
+            )
+        process.stdin.close()
+        if _read_bounded_line(process.stdout, MAX_RESPONSE_LINE_BYTES):
+            raise RuntimeError("temporal covariance batch returned a top-up record")
+        if process.wait() != 0:
+            raise RuntimeError("temporal covariance batch exited unsuccessfully")
+    except BaseException:
+        process.kill()
+        process.wait()
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
+        raise
+    process.stdout.close()
+    scores = scorer.finalize(require_complete=False)
+    return _result_receipt(
+        preregistration, seed_count, len(records), emitted, failed,
+        total_wall, peak_rss, scores, records, False,
+    )
+
+
+def run(
+        preregistration: dict, seed_count: int, limit: int | None,
+        run_root: Path | None = None, binary: Path | None = None) -> dict:
+    frozen_cells = cells(preregistration)
+    if cell_hash(frozen_cells) != preregistration["supported_cell_sha256"]:
+        raise RuntimeError("supported cell construction does not match preregistration hash")
+    expected_limits = {
+        "request_line_limit_bytes": MAX_REQUEST_LINE_BYTES,
+        "response_line_limit_bytes": MAX_RESPONSE_LINE_BYTES,
+        "shard_record_limit_bytes": MAX_SHARD_RECORD_BYTES,
+        "manifest_limit_bytes": MAX_MANIFEST_BYTES,
+        "commit_limit_bytes": MAX_COMMIT_BYTES,
+        "final_receipt_limit_bytes": MAX_FINAL_RECEIPT_BYTES,
+    }
+    if any(
+            preregistration["resource_limits"].get(field) != value
+            for field, value in expected_limits.items()):
+        raise RuntimeError("preregistered resource limits do not match the driver")
+    shard_count = len(frozen_cells) * len(preregistration["execution_paths"])
+    if preregistration["execution_protocol"]["shard_count"] != shard_count:
+        raise RuntimeError("preregistered shard count does not match the frozen scope")
+    expected_retained_bound = (
+        shard_count * (
+            MAX_SHARD_RECORD_BYTES + MAX_MANIFEST_BYTES + MAX_COMMIT_BYTES
+        )
+        + MAX_COMMIT_BYTES
+        + MAX_FINAL_RECEIPT_BYTES
+    )
+    resource_limits = preregistration["resource_limits"]
+    if (
+            resource_limits.get("retained_bound_bytes") != expected_retained_bound
+            or expected_retained_bound > resource_limits["artifact_size_limit_bytes"]):
+        raise RuntimeError("preregistered retained-resource bound is stale")
+    root = Path(__file__).parents[1]
+    if binary is None:
+        subprocess.run([
+            "cargo", "build", "--release", "-p", "dolphin-timeseries",
+            "--example", "temporal_covariance_batch",
+        ], cwd=root, check=True)
+        binary = root / "target/release/examples/temporal_covariance_batch"
+    if limit is not None:
+        return _run_probe(preregistration, seed_count, limit, binary)
+    if seed_count != preregistration["outer_seeds_per_supported_cell"]:
+        raise RuntimeError("resumable execution requires the exact frozen seed denominator")
+    if run_root is None:
+        raise RuntimeError("resumable execution requires a run root")
+    identity = producer_identity(preregistration, binary)
+    shards = initialize_run_root(run_root, identity)
+    for cell in frozen_cells:
+        for execution_path in preregistration["execution_paths"]:
+            execute_or_resume_shard(
+                preregistration, cell, execution_path, seed_count,
+                shards, binary, identity,
+            )
+    expected_names = set()
+    for cell in frozen_cells:
+        for execution_path in preregistration["execution_paths"]:
+            expected_names.update(
+                path.name
+                for path in _shard_paths(shards, cell, execution_path).values()
+            )
+    if {path.name for path in shards.iterdir()} != expected_names:
+        raise RuntimeError("run root contains partial, missing, or out-of-scope shard artifacts")
+    scorer = StreamingScores(preregistration)
+    processed = emitted = failed = total_wall = peak_rss = 0
+    for cell in frozen_cells:
+        for execution_path in preregistration["execution_paths"]:
+            paths = _shard_paths(shards, cell, execution_path)
+            manifest = _read_committed_shard(
+                preregistration, cell, execution_path, seed_count,
+                paths, identity, scorer,
+            )
+            processed += manifest["attempted"]
+            emitted += manifest["emitted"]
+            failed += manifest["failed"]
+            total_wall += manifest["total_wall_micros"]
+            peak_rss = max(peak_rss, manifest["peak_resident_set_bytes"])
+    scores = scorer.finalize(require_complete=True)
+    receipt = _result_receipt(
+        preregistration, seed_count, processed, emitted, failed,
+        total_wall, peak_rss, scores, [], True,
+    )
+    retained_bytes = sum(
+        path.stat().st_size
+        for path in shards.iterdir()
+        if _regular_file(path)
+    )
+    retained_bytes += (run_root / "run_identity.json").stat().st_size
+    receipt["retained_shard_bytes"] = retained_bytes
+    while True:
+        final_bytes = len(canonical_json_bytes(receipt)) + 1
+        retained_total = retained_bytes + final_bytes
+        if receipt["resource"]["result_artifact_bytes"] == retained_total:
+            break
+        receipt["resource"]["result_artifact_bytes"] = retained_total
+    if final_bytes > MAX_FINAL_RECEIPT_BYTES:
+        raise RuntimeError("final temporal covariance receipt exceeds its byte cap")
+    retained_total = receipt["resource"]["result_artifact_bytes"]
+    artifact_limit = resource_limits["artifact_size_limit_bytes"]
+    receipt["resource_gates"]["artifact_size"] = retained_total <= artifact_limit
+    receipt["resource_gates"]["retained_bound"] = (
+        retained_total <= resource_limits["retained_bound_bytes"]
+    )
+    receipt["promotion_eligible"] = (
+        receipt["exact_seed_denominator_complete"]
+        and receipt["scores"]["all_methods_pass"]
+        and all(receipt["resource_gates"].values())
+    )
+    receipt["promotion_status"] = (
+        "eligible_for_external_field_review"
+        if receipt["promotion_eligible"]
+        else "blocked_pending_complete_passing_synthetic_execution"
+    )
+    if not receipt["resource_gates"]["artifact_size"]:
+        raise RuntimeError("retained temporal covariance shards exceed their artifact cap")
+    if not receipt["resource_gates"]["retained_bound"]:
+        raise RuntimeError("retained temporal covariance shards exceed their frozen bound")
+    return receipt
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prereg", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path)
     parser.add_argument("--seeds", type=int, default=1)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
     if args.seeds <= 0 or (args.limit is not None and args.limit <= 0):
         parser.error("--seeds and --limit must be positive")
     preregistration = json.loads(args.prereg.read_text())
-    receipt = run(preregistration, args.seeds, args.limit)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    receipt = run(preregistration, args.seeds, args.limit, args.run_root)
+    encoded = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False).encode() + b"\n"
+    if len(encoded) > min(
+            MAX_FINAL_RECEIPT_BYTES,
+            preregistration["resource_limits"]["artifact_size_limit_bytes"]):
+        raise RuntimeError("final temporal covariance receipt exceeds its artifact cap")
+    atomic_write_no_replace(args.output, encoded)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,18 @@
 """Schema tests for the frozen #53 preregistration.
 
 These tests validate the contract only; they intentionally do not run the
-5,000-seed experiment or acquire external GNSS data.
+frozen scientific outcome experiment or acquire external GNSS data.
 """
 
 import json
 import importlib.util
 import hashlib
+import io
 import math
 import pathlib
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 
@@ -38,6 +40,49 @@ def run_production_batch(request):
     )
     records = [json.loads(line) for line in result.stdout.splitlines()]
     return records if isinstance(request, list) else records[0]
+
+
+def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path:
+    path = directory / "fake_temporal_batch.py"
+    counter = directory / "fake_temporal_batch.count"
+    path.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        import sys
+
+        counter = pathlib.Path({str(counter)!r})
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count + 1))
+        for line in sys.stdin:
+            request = json.loads(line)
+            response = {{
+                "schema": {batch_schema!r},
+                "execution_path": request["execution_path"],
+                "cell_id": request["cell_id"],
+                "cell_index": request["cell_index"],
+                "outer_seed_index": request["outer_seed_index"],
+                "seed_sha256": request["seed_sha256"],
+                "seed": request["seed"],
+                "fixed_factor_status": None,
+                "production_path_status": "estimator_failed",
+                "comparator_methods": [],
+                "attempted": True,
+                "emitted": False,
+                "failed": True,
+                "fit": None,
+                "provenance": None,
+                "production_receipts": None,
+                "resource": {{
+                    "wall_micros": 1,
+                    "resident_set_bytes_before": 1024,
+                    "resident_set_bytes_after": 1024,
+                }},
+            }}
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+        """))
+    path.chmod(0o755)
+    return path
 
 
 class TemporalCovariancePreregistrationTests(unittest.TestCase):
@@ -83,6 +128,22 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(self.prereg["bootstrap"]["interval_levels"], [0.68, 0.9, 0.95])
         self.assertEqual(self.prereg["bootstrap"]["count"], 200)
         self.assertEqual(self.prereg["bootstrap"]["minimum_successes"], 198)
+        self.assertEqual(self.prereg["outer_seeds_per_supported_cell"], 1050)
+        self.assertEqual(self.prereg["execution_protocol"]["shard_count"], 48)
+        self.assertFalse(self.prereg["execution_protocol"]["top_up_allowed"])
+        self.assertFalse(
+            self.prereg["execution_protocol"]["dense_attempt_evidence_retained"]
+        )
+
+    def test_reduced_denominator_has_exact_wilson_margin_at_emission_floor(self):
+        justification = self.prereg["seed_count_justification"]
+        self.assertEqual(justification["minimum_scored_attempts"], 1040)
+        for nominal, tolerance in self.prereg["coverage_tolerances"].items():
+            lower, upper = justification["coverage_intervals"][nominal]
+            target = float(nominal)
+            self.assertGreaterEqual(lower, target - tolerance)
+            self.assertLessEqual(upper, target + tolerance)
+        self.assertTrue(justification["frozen_tolerances_unchanged"])
 
     def test_supported_cell_identities_match_frozen_hash(self):
         path = ROOT / "validation/temporal_covariance_simulation.py"
@@ -132,12 +193,14 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             self.assertEqual(production["production_path_status"], "estimator_failed")
             self.assertEqual(fixed["fit"]["valid_date_count"], 12)
             self.assertEqual(production["fit"]["status"], "RhoUpperBoundary")
-            self.assertEqual(production["fit"]["valid_date_count"], 0)
+            self.assertEqual(production["fit"]["valid_date_count"], 12)
             self.assertEqual(len(fixed["comparator_methods"]), 8)
             self.assertIsNone(production["provenance"])
             self.assertIsNotNone(production["production_receipts"])
-            self.assertEqual(receipt["scores"]["schema"], "coverage_bias_interval_score/3")
-            self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 1)
+            self.assertEqual(
+                receipt["scores"]["schema"], self.prereg["schemas"]["scorer"]
+            )
+            self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 2)
             self.assertEqual(len(receipt["scores"]["cell_summaries"]), 48)
             self.assertFalse(receipt["exact_seed_denominator_complete"])
             self.assertIn("resource", fixed)
@@ -178,6 +241,11 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(len(production["raw_complex_stack"]), len(module.days_for(cell)))
         self.assertTrue(all(len(row) == 7 for row in production["raw_complex_stack"]))
         self.assertEqual(len(production["capture_scope_sha256"]), 64)
+        self.assertEqual(production["outer_coverage_dgp"], module.OUTER_COVERAGE_DGP)
+        self.assertEqual(
+            production["conditional_covariance_oracle"],
+            module.CONDITIONAL_COVARIANCE_ORACLE,
+        )
 
     def test_production_batch_uses_actual_capture_replay_and_fixed_l2(self):
         source = (ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs").read_text()
@@ -186,6 +254,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertIn("run_sequential_with_covariance_capture_and_source_factors", source)
         self.assertIn("replay_global_reference_difference_covariance_from_provider_bundle", source)
         self.assertIn("propagate_fixed_l2_difference_covariance", source)
+        self.assertIn("SourceCorrelationModel::ExponentialEuclidean", source)
+        self.assertIn("source_correlation_support_union_count", source)
+        self.assertIn("conditional_common_factor_covariance", source)
+        self.assertNotIn('"source_factor_declared_v1"', source)
 
     def test_production_raw_ensemble_has_proper_complex_support_moments(self):
         module = load_generator()
@@ -319,92 +391,143 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 self.assertAlmostEqual(truth[0], carrier.real, places=12)
                 self.assertAlmostEqual(truth[1], carrier.imag, places=12)
 
-    def test_actual_evd_fixed_l2_covariance_matches_raw_ensemble_moment(self):
+    def test_raw_outer_dgp_is_not_the_common_factor_conditional_oracle(self):
         module = load_generator()
         base_cell = module.cells(self.prereg)[0]
-        seed_count = 64
-        contexts = {
-            "near_exact": (0.5, 1),
-            "mid_exact": (0.2, 2),
-            "far_exact": (0.0, 4),
-        }
+        cell = dict(
+            base_cell,
+            cell_id="raw-space-whitening-diagnostic",
+            reference_context="near_exact",
+            overlap_fraction=0.5,
+            distance_pixels=1,
+        )
+        fixed = module.request_for(cell, 0, self.prereg, "production_path")
+        fixed_stack = fixed["production_path"]["raw_complex_stack"]
+        dates = len(fixed_stack)
+
+        def cholesky(covariance):
+            lower = [[0j for _ in range(dates)] for _ in range(dates)]
+            for row in range(dates):
+                for column in range(row + 1):
+                    residual = covariance[row][column] - sum(
+                        lower[row][inner] * lower[column][inner].conjugate()
+                        for inner in range(column)
+                    )
+                    lower[row][column] = (
+                        complex(math.sqrt(residual.real), 0.0)
+                        if row == column else residual / lower[column][column].real
+                    )
+            return lower
+
+        def source_factor(column):
+            support = module.support_columns(column, 7)
+            covariance = [[0j for _ in range(dates)] for _ in range(dates)]
+            for left in range(dates):
+                for right in range(dates):
+                    covariance[left][right] = sum(
+                        complex(*fixed_stack[left][pixel])
+                        * complex(*fixed_stack[right][pixel]).conjugate()
+                        for pixel in support
+                    ) / len(support)
+                    if left != right:
+                        covariance[left][right] *= 0.9
+            return cholesky(covariance)
+
+        def invert_lower(lower):
+            inverse = [[0j for _ in range(dates)] for _ in range(dates)]
+            for column in range(dates):
+                for row in range(column, dates):
+                    residual = complex(row == column, 0.0) - sum(
+                        lower[row][inner] * inverse[inner][column]
+                        for inner in range(column, row)
+                    )
+                    inverse[row][column] = residual / lower[row][row].real
+            return inverse
+
+        def multiply(left, right):
+            return [[sum(left[row][inner] * right[inner][column]
+                         for inner in range(dates))
+                     for column in range(dates)] for row in range(dates)]
+
+        def conjugate_transpose(matrix):
+            return [[matrix[column][row].conjugate() for column in range(dates)]
+                    for row in range(dates)]
+
+        ensemble = [
+            module.request_for(cell, seed, self.prereg, "production_path")
+            ["production_path"]["raw_complex_stack"]
+            for seed in range(512)
+        ]
+        cross = [[0j for _ in range(dates)] for _ in range(dates)]
+        for left in range(dates):
+            for right in range(dates):
+                left_values = [complex(*stack[left][1]) for stack in ensemble]
+                right_values = [complex(*stack[right][2]) for stack in ensemble]
+                left_mean = sum(left_values) / len(left_values)
+                right_mean = sum(right_values) / len(right_values)
+                cross[left][right] = sum(
+                    (left_value - left_mean) * (right_value - right_mean).conjugate()
+                    for left_value, right_value in zip(left_values, right_values)
+                ) / (len(ensemble) - 1)
+        whitened = multiply(
+            multiply(invert_lower(source_factor(1)), cross),
+            conjugate_transpose(invert_lower(source_factor(2))),
+        )
+        expected = module.spatial_correlation(1, 2)
+        maximum_gap = max(
+            abs(whitened[row][column] - (expected if row == column else 0.0))
+            for row in range(dates) for column in range(dates)
+        )
+        self.assertGreater(maximum_gap, 0.25)
+
+    def test_conditional_common_factor_oracle_matches_fixed_capture_prediction(self):
+        module = load_generator()
+        base_cell = module.cells(self.prereg)[0]
+        replicates = 8192
         requests = []
-        for context, (jaccard, distance) in contexts.items():
+        for context, (jaccard, distance) in {
+                "near_exact": (0.5, 1),
+                "mid_exact": (0.2, 2),
+                "far_exact": (0.0, 4),
+        }.items():
             cell = dict(
                 base_cell,
+                cell_id=f"conditional-{context}",
                 reference_context=context,
                 overlap_fraction=jaccard,
                 distance_pixels=distance,
             )
-            for outer_seed in range(seed_count):
-                request = module.request_for(cell, outer_seed, self.prereg, "production_path")
-                request["options"]["bootstrap_replicates"] = 0
-                request["options"]["bootstrap_minimum_successes"] = 0
-                requests.append(request)
-        records = run_production_batch(requests)
-        by_context = {context: [] for context in contexts}
-        for context_index, context in enumerate(contexts):
-            start = context_index * seed_count
-            for request, record in zip(
-                    requests[start:start + seed_count], records[start:start + seed_count]):
-                self.assertIsNotNone(record["production_receipts"])
-                receipts = record["production_receipts"]
-                error = [
-                    linked - truth
-                    for linked, truth in zip(
-                        receipts["linked_difference_history"],
-                        receipts["carrier_difference_history"],
-                    )
-                ]
-                by_context[context].append((
-                    receipts["fixed_l2_difference_covariance"], error
-                ))
-        for context, realizations in by_context.items():
-            self.assertEqual(len(realizations), seed_count, context)
-            covariance_size = len(realizations[0][0])
-            error_means = [
-                sum(value[1][date] for value in realizations) / seed_count
-                for date in range(covariance_size)
-            ]
-            for left in range(covariance_size):
-                for right in range(covariance_size):
-                    predicted = [value[0][left][right] for value in realizations]
-                    predicted_mean = sum(predicted) / seed_count
+            request = module.request_for(cell, 0, self.prereg, "production_path")
+            request["retain_dense_evidence"] = True
+            request["conditional_oracle_replicates"] = replicates
+            request["options"]["bootstrap_replicates"] = 0
+            request["options"]["bootstrap_minimum_successes"] = 0
+            requests.append(request)
+        for request, record in zip(requests, run_production_batch(requests)):
+            receipts = record["production_receipts"]
+            self.assertEqual(
+                receipts["outer_coverage_dgp"], "physical_raw_space_v1"
+            )
+            self.assertEqual(
+                receipts["conditional_covariance_oracle"],
+                "fixed_capture_common_factor_monte_carlo_v1",
+            )
+            self.assertEqual(receipts["conditional_oracle_replicates"], replicates)
+            predicted = receipts["fixed_l2_difference_covariance"]
+            empirical = receipts["conditional_oracle_covariance"]
+            for left in range(len(predicted)):
+                for right in range(len(predicted)):
                     if left == 0 or right == 0:
-                        self.assertEqual(predicted_mean, 0.0)
+                        self.assertEqual(empirical[left][right], 0.0)
                         continue
-                    empirical_covariance = sum(
-                        (value[1][left] - error_means[left])
-                        * (value[1][right] - error_means[right])
-                        for value in realizations
-                    ) / (seed_count - 1)
-                    left_variance = sum(
-                        (value[1][left] - error_means[left]) ** 2
-                        for value in realizations
-                    ) / (seed_count - 1)
-                    right_variance = sum(
-                        (value[1][right] - error_means[right]) ** 2
-                        for value in realizations
-                    ) / (seed_count - 1)
-                    predicted_variance = sum(
-                        (value - predicted_mean) ** 2 for value in predicted
-                    ) / (seed_count - 1)
                     standard_error = math.sqrt(
-                        (left_variance * right_variance + empirical_covariance ** 2)
-                        / (seed_count - 1)
-                        + predicted_variance / seed_count
+                        (predicted[left][left] * predicted[right][right]
+                         + predicted[left][right] ** 2) / (replicates - 1)
                     )
                     self.assertLessEqual(
-                        abs(empirical_covariance - predicted_mean),
+                        abs(empirical[left][right] - predicted[left][right]),
                         4.0 * standard_error + 1e-12,
-                        (
-                            context,
-                            left,
-                            right,
-                            empirical_covariance,
-                            predicted_mean,
-                            4.0 * standard_error,
-                        ),
+                        (request["cell_id"], left, right),
                     )
 
     def test_stationary_irregular_ar_generator_matches_oracle_covariance(self):
@@ -476,8 +599,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         mutations = [
             ("selected_method", "plugin_gls"),
             ("scope", "field_validation"),
-            ("effective_looks_model", "caller_claimed_model"),
-            ("effective_looks_distance_scale_pixels", 3.0),
+            ("source_correlation_model", "caller_claimed_model"),
+            ("source_correlation_distance_scale_pixels", 3.0),
+            ("outer_coverage_dgp", "caller_claimed_dgp"),
+            ("conditional_covariance_oracle", "caller_claimed_oracle"),
         ]
         for field, value in mutations:
             with self.subTest(field=field):
@@ -488,6 +613,12 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                                  "production_contract_mismatch")
                 self.assertFalse(record["emitted"])
                 self.assertIsNone(record["fit"])
+        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request["conditional_oracle_replicates"] = 16_385
+        record = run_production_batch(request)
+        self.assertEqual(record["production_path_status"], "production_contract_mismatch")
+        self.assertFalse(record["emitted"])
+        self.assertIsNone(record["fit"])
 
     def test_production_path_rejects_self_consistent_claimed_geometry(self):
         module = load_generator()
@@ -522,10 +653,11 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             value = receipts[field]
             self.assertRegex(value, r"^[0-9a-f]{64}$")
             self.assertNotEqual(value, "0" * 64)
-        self.assertEqual(receipts["effective_looks_model"],
-                         module.EFFECTIVE_LOOKS_MODEL)
-        self.assertEqual(receipts["effective_looks_distance_scale_pixels"],
-                         module.EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS)
+        self.assertEqual(receipts["source_correlation_model"],
+                         module.SOURCE_CORRELATION_MODEL)
+        self.assertEqual(receipts["source_correlation_distance_scale_pixels"],
+                         module.SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS)
+        self.assertGreater(receipts["source_correlation_support_union_count"], 0)
         self.assertGreater(receipts["effective_looks_fraction"], 0.0)
         self.assertLessEqual(receipts["effective_looks_fraction"], 1.0)
 
@@ -562,6 +694,212 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "duplicate, missing, or reordered"):
             scorer.update(stale)
+
+    def test_resumable_shard_cleans_partial_and_reuses_exact_commit(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = write_fake_batch(root, self.prereg["schemas"]["batch"])
+            identity = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "source_correlation_model": module.SOURCE_CORRELATION_MODEL,
+                "source_correlation_distance_scale_pixels": (
+                    module.SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
+                ),
+                "seed_count": 2,
+            }
+            shards = module.initialize_run_root(root / "run", identity)
+            paths = module._shard_paths(shards, cell, "fixed_factor")
+            partial = paths["records"].with_name(paths["records"].name + ".partial")
+            partial.write_bytes(b"owned interrupted bytes")
+            manifest, reused = module.execute_or_resume_shard(
+                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+            )
+            self.assertFalse(reused)
+            self.assertEqual(manifest["attempted"], 2)
+            self.assertFalse(partial.exists())
+            committed = paths["records"].read_bytes().splitlines()
+            self.assertEqual(len(committed), 2)
+            self.assertTrue(all(b"fixed_l2_difference_covariance" not in line
+                                for line in committed))
+            resumed, reused = module.execute_or_resume_shard(
+                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+            )
+            self.assertTrue(reused)
+            self.assertEqual(resumed, manifest)
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "1")
+
+    def test_resumable_shard_rejects_tamper_missing_duplicate_and_reorder(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+
+        def committed(directory: pathlib.Path):
+            binary = write_fake_batch(directory, self.prereg["schemas"]["batch"])
+            identity = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "seed_count": 2,
+            }
+            shards = module.initialize_run_root(directory / "run", identity)
+            module.execute_or_resume_shard(
+                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+            )
+            return binary, identity, shards, module._shard_paths(
+                shards, cell, "fixed_factor"
+            )
+
+        def rebind(paths, lines):
+            payload = b"".join(line.rstrip(b"\n") + b"\n" for line in lines)
+            paths["records"].write_bytes(payload)
+            manifest = json.loads(paths["manifest"].read_bytes())
+            manifest["records_sha256"] = hashlib.sha256(payload).hexdigest()
+            manifest["records_bytes"] = len(payload)
+            manifest_bytes = module.canonical_json_bytes(manifest) + b"\n"
+            paths["manifest"].write_bytes(manifest_bytes)
+            commit = {
+                "schema": module.SHARD_COMMIT_SCHEMA,
+                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "records_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            paths["commit"].write_bytes(module.canonical_json_bytes(commit) + b"\n")
+
+        with self.subTest("same-byte tamper"):
+            with tempfile.TemporaryDirectory() as directory:
+                binary, identity, shards, paths = committed(pathlib.Path(directory))
+                paths["records"].write_bytes(paths["records"].read_bytes() + b" ")
+                with self.assertRaisesRegex(RuntimeError, "hash is stale or tampered"):
+                    module.execute_or_resume_shard(
+                        self.prereg, cell, "fixed_factor", 2,
+                        shards, binary, identity,
+                    )
+        for label, mutate, pattern in (
+            ("missing", lambda lines: lines[:1], "missing, duplicated, or reordered"),
+            ("duplicate", lambda lines: [lines[0], lines[0]], "attempt identity"),
+            ("reorder", lambda lines: list(reversed(lines)), "attempt identity"),
+        ):
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as directory:
+                    binary, identity, shards, paths = committed(pathlib.Path(directory))
+                    lines = paths["records"].read_bytes().splitlines()
+                    rebind(paths, mutate(lines))
+                    with self.assertRaisesRegex(RuntimeError, pattern):
+                        module.execute_or_resume_shard(
+                            self.prereg, cell, "fixed_factor", 2,
+                            shards, binary, identity,
+                        )
+
+    def test_resumable_run_rejects_stale_binary_and_partial_commit(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = write_fake_batch(root, self.prereg["schemas"]["batch"])
+            identity = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "seed_count": 2,
+            }
+            run_root = root / "run"
+            shards = module.initialize_run_root(run_root, identity)
+            module.execute_or_resume_shard(
+                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+            )
+            stale = dict(identity, binary_sha256="ff" * 32)
+            with self.assertRaisesRegex(RuntimeError, "identity is stale"):
+                module.initialize_run_root(run_root, stale)
+            paths = module._shard_paths(shards, cell, "fixed_factor")
+            paths["manifest"].unlink()
+            with self.assertRaisesRegex(RuntimeError, "partial or missing"):
+                module.execute_or_resume_shard(
+                    self.prereg, cell, "fixed_factor", 2,
+                    shards, binary, identity,
+                )
+
+    def test_full_48_shard_run_is_bounded_atomic_and_exactly_resumable(self):
+        module = load_generator()
+        preregistration = json.loads(json.dumps(self.prereg))
+        preregistration["outer_seeds_per_supported_cell"] = 1
+        preregistration["file_hashes"] = {
+            "generator_sha256": hashlib.sha256(
+                (ROOT / "validation/temporal_covariance_simulation.py").read_bytes()
+            ).hexdigest(),
+            "batch_source_sha256": hashlib.sha256(
+                (ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs")
+                .read_bytes()
+            ).hexdigest(),
+            "estimator_source_sha256": hashlib.sha256(
+                (ROOT / "crates/dolphin-timeseries/src/temporal_covariance.rs").read_bytes()
+            ).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = write_fake_batch(root, self.prereg["schemas"]["batch"])
+            run_root = root / "run"
+            first = module.run(
+                preregistration, 1, None, run_root=run_root, binary=binary
+            )
+            self.assertEqual(first["batch_attempted_cells"], 48)
+            self.assertTrue(first["exact_seed_denominator_complete"])
+            self.assertFalse(first["promotion_eligible"])
+            self.assertEqual(first["records"], [])
+            self.assertEqual(len(list((run_root / "shards").iterdir())), 144)
+            self.assertLessEqual(
+                first["resource"]["result_artifact_bytes"],
+                preregistration["resource_limits"]["retained_bound_bytes"],
+            )
+            self.assertTrue(first["resource_gates"]["retained_bound"])
+            second = module.run(
+                preregistration, 1, None, run_root=run_root, binary=binary
+            )
+            self.assertEqual(second, first)
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "48")
+
+    def test_retained_bound_matches_exact_48_shard_composition(self):
+        module = load_generator()
+        expected = 48 * (
+            module.MAX_SHARD_RECORD_BYTES
+            + module.MAX_MANIFEST_BYTES
+            + module.MAX_COMMIT_BYTES
+        ) + module.MAX_COMMIT_BYTES + module.MAX_FINAL_RECEIPT_BYTES
+        self.assertEqual(
+            self.prereg["resource_limits"]["retained_bound_bytes"], expected
+        )
+        self.assertLessEqual(
+            expected, self.prereg["resource_limits"]["artifact_size_limit_bytes"]
+        )
+
+    def test_line_and_atomic_output_caps_fail_closed(self):
+        module = load_generator()
+        with self.assertRaisesRegex(RuntimeError, "line exceeds"):
+            module._read_bounded_line(
+                io.BytesIO(b"x" * (module.MAX_RESPONSE_LINE_BYTES + 1)),
+                module.MAX_RESPONSE_LINE_BYTES,
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            bounded = root / "bounded.json"
+            bounded.write_bytes(b"x" * module.MAX_COMMIT_BYTES)
+            self.assertEqual(
+                len(module._read_bounded_regular(bounded, module.MAX_COMMIT_BYTES)),
+                module.MAX_COMMIT_BYTES,
+            )
+            bounded.write_bytes(b"x" * (module.MAX_COMMIT_BYTES + 1))
+            with self.assertRaisesRegex(RuntimeError, "exceeds its retained byte cap"):
+                module._read_bounded_regular(bounded, module.MAX_COMMIT_BYTES)
+            link = root / "bounded-link.json"
+            link.symlink_to(bounded)
+            with self.assertRaisesRegex(RuntimeError, "not an openable regular file"):
+                module._read_bounded_regular(link, module.MAX_COMMIT_BYTES)
+            output = root / "receipt.json"
+            module.atomic_write_no_replace(output, b"first\n")
+            with self.assertRaises(FileExistsError):
+                module.atomic_write_no_replace(output, b"second\n")
+            self.assertEqual(output.read_bytes(), b"first\n")
 
     def test_coverage_tolerances_are_explicit(self):
         self.assertEqual(self.prereg["coverage_tolerances"], {
