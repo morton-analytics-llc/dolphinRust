@@ -1,21 +1,21 @@
 {
   "schema": "dolphinrust.spatial_covariance.preregistration",
-  "schema_version": 4,
+  "schema_version": 5,
   "validation_id": "F54-07-spatial-covariance-approximation",
   "status": "preregistered",
   "outcomes_present": false,
   "supersedes": {
-    "schema_version": 3,
-    "canonical_preregistration_sha256": "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184",
+    "schema_version": 4,
+    "canonical_preregistration_sha256": "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35",
     "outcomes_present": false,
-    "reason": "v3 retained every request and attempt, left numeric conventions underspecified, trusted self-attested metrics, and could not identify area scaling; no outcomes existed"
+    "reason": "v4 froze 353 cells and 665220 attempts before execution. Exact pre-outcome timing observed 32 hw_7x14 GLRT attempts require about 91 wall seconds with 12 ordered workers, while the 128-attempt run remained active beyond 615 wall seconds; projected full execution was measured in weeks, and the required KS 32/128 probe contradicted v4's one-seed KS selector. No outcomes existed. v5 retains scientific acceptance axes and moves engineering behaviors to deterministic contracts."
   },
-  "design": "compact-pairwise-risk-matrix-deterministically-regenerated-ephemeral-attempts-online-cell-sufficient-statistics",
+  "design": "explicit-acceptance-axis-matrix-with-deterministic-engineering-contracts",
   "seed_schedule": {
-    "supported_monte_carlo_seeds": 5000,
+    "supported_monte_carlo_seeds": 128,
     "deterministic_contract_seeds": 1,
-    "selection_rule": "one seed for masked, tied, non-interior, coincident, and intrinsically empty KS-ministack cells; 5000 fixed seeds for every otherwise-supported interior cell including disjoint geometries",
-    "precision": "at p=0.95, binomial standard error is 0.00308 and the frozen absolute tolerance 0.02 is 6.49 standard errors",
+    "selection_rule": "exactly the 24 listed stochastic cells receive 128 seeds; every listed deterministic contract cell receives one seed; no label-based inference and no top-up",
+    "precision": "for n=128 and target coverage 0.95, accept covered counts 117 through 126 inclusive: the intersection of the central exact-binomial 95 percent acceptance region and counts whose two-sided Wilson 95 percent interval contains 0.95",
     "seed_derivation": "sha256(validation_seed||cell_id||seed_index)",
     "validation_seed": "spatial-covariance-f54-07-v2",
     "no_top_up": true
@@ -32,27 +32,92 @@
       "eigen_stress",
       "source_process"
     ],
-    "expected_cell_count": 353,
-    "expected_attempt_count": 665220,
-    "supported_monte_carlo_cell_count": 133,
-    "deterministic_contract_cell_count": 220,
-    "required_design": "all_two_axis_level_combinations_with_other_axes_at_frozen_first_level_plus_named_high_risk_cells",
-    "pairwise_axis_count": 36,
-    "pairwise_level_coverage": "every level combination for every pair of the nine axes appears at least once",
+    "expected_cell_count": 40,
+    "expected_attempt_count": 3088,
+    "supported_monte_carlo_cell_count": 24,
+    "deterministic_contract_cell_count": 16,
+    "required_design": "three_window_sizes_by_four_distance_regimes_by_two_estimators_plus_explicit_deterministic_acceptance_contracts",
     "cell_pruning_allowed": false,
     "source_process_axis_required": true,
-    "risk_cells": [
-      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|near_tie|spatial_correlation_stress",
-      "hw_7x14|stride_4|ks_frozen|interior|shared_75_negative|four_blocks|evd|near_tie|spatial_correlation_stress",
-      "hw_7x14|stride_4|glrt_frozen|tile_edge|shared_50_positive|two_blocks_cap_eviction|evd|well_separated|spatial_correlation_stress",
-      "hw_7x14|stride_4|ks_frozen|bounded_halo|shared_25_negative|four_blocks_partial_final|emi|well_separated|spatial_correlation_stress",
-      "hw_7x14|stride_1|rect|interior|disjoint_after_depth_4|four_blocks|evd|near_tie|independent_complex_looks",
-      "hw_3x6|stride_2|glrt_frozen|interior|shared_50_negative|two_blocks|emi|well_separated|independent_complex_looks",
-      "hw_3x6|stride_2|ks_frozen|interior|shared_25_positive|two_blocks|evd|well_separated|spatial_correlation_stress"
-    ]
+    "stochastic_axes": {
+      "half_window": ["hw_1x1", "hw_3x6", "hw_7x14"],
+      "distance_regime": {
+        "coincident": "coincident",
+        "near": "shared_75_positive",
+        "mid": "shared_25_positive",
+        "disjoint": "disjoint_immediate"
+      },
+      "estimator": ["emi", "evd"],
+      "representative": {
+        "stride": "stride_4",
+        "support": "glrt_frozen",
+        "position": "interior",
+        "block_topology": "four_blocks",
+        "eigen_stress": "well_separated",
+        "source_process": "spatial_correlation_stress"
+      }
+    },
+    "stochastic_cells": [
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress"
+    ],
+    "deterministic_contract_cells": [
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|border_clamped|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|tile_edge|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|bounded_halo|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|one_block|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks_cap_eviction|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks_partial_final|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_1|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|ks_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+    ],
+    "deterministic_behavior_evidence": {
+      "independent": "deterministic source_process cell",
+      "positive": "stochastic near cells",
+      "negative": "deterministic shared_75_negative cell",
+      "coincident": "stochastic coincident cells and exact-zero contracts",
+      "invalid_reference": "production parity InvalidReference contract",
+      "mask": "deterministic masked cell",
+      "boundary": "border_clamped, tile_edge, and bounded_halo cells",
+      "tie": "tied_eigenvalue and near_tie cells",
+      "topology": "one, two, four, capped-eviction, and partial-final block cells",
+      "stride": "stride 1, 2, and representative 4 cells",
+      "provenance": "whole and bounded HDF5 semantic parity fixtures",
+      "resource": "five exact benchmark receipts"
+    }
   },
   "execution_protocol": {
-    "protocol_version": 4,
+    "protocol_version": 5,
     "request_schema": "dolphinrust.spatial-covariance.attempt/4",
     "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
     "cell_summary_schema": "dolphinrust.spatial-covariance.cell-summary/4",
@@ -67,13 +132,13 @@
     "record_order": "cell_ordinal_ascending_then_seed_index_ascending",
     "resume_boundary": "completed_cell",
     "max_cells_per_shard": 100,
-    "shard_count": 4,
-    "full_shard_count": 3,
-    "final_shard_cell_count": 53,
+    "shard_count": 1,
+    "full_shard_count": 0,
+    "final_shard_cell_count": 40,
     "max_encoded_cell_summary_bytes": 8192,
     "max_encoded_shard_manifest_bytes": 16384,
     "max_encoded_run_manifest_bytes": 16777216,
-    "retained_size_bound_bytes": 23928832,
+    "retained_size_bound_bytes": 21315584,
     "process_rss_bytes_max": 25769803776,
     "partial_suffix": ".partial",
     "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
@@ -89,32 +154,55 @@
         128
       ],
       "required_cell_classes": [
-        "hw_7x14_glrt_four_blocks_evd_near_tie_spatial",
-        "hw_7x14_ks_four_blocks_evd_near_tie_spatial",
-        "masked_fast_path",
-        "tied_eigenvalue_path"
+        "hw_7x14_near_emi_spatial",
+        "hw_7x14_near_evd_spatial"
       ],
+      "cell_bindings": {
+        "hw_7x14_near_emi_spatial": "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+        "hw_7x14_near_evd_spatial": "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress"
+      },
       "measurement_order": "cell_class_then_seed_count",
+      "execution": "the fresh measurement parent starts its timer before child launch and retains only ordered seed-range descriptors; each child independently regenerates and serializes its assigned at-most-three exact seed requests, runs the exact target/release/examples/spatial_covariance_batch process, and emits one ordered chunk; waves contain at most twelve children; the parent validates every output record and ordered concatenation before stopping the timer, then discards all attempt output",
+      "parallel_worker_count": 12,
+      "max_requests_per_child": 3,
+      "worker_rss_admission_bytes": 2147483648,
+      "aggregate_rss_cap_bytes": 25769803776,
+      "aggregate_rss_sampler": "sum ps rss bytes across each live Python generator child and its exact Rust batch descendant every 50 milliseconds",
       "measurement_fields": [
         "cell_class",
         "seed_count",
         "attempt_count",
         "elapsed_seconds",
         "peak_rss_bytes",
+        "worker_count",
+        "max_requests_per_child",
+        "child_invocation_count",
+        "wave_count",
+        "worker_rss_admission_bytes",
+        "aggregate_rss_cap_bytes",
+        "output_records",
+        "ordered_output_sha256",
         "outcomes_persisted"
       ],
       "derived_rate": "sum(attempt_count)/sum(elapsed_seconds)",
       "derived_peak_rss": "max(measurement.peak_rss_bytes)",
       "derived_concurrency_receipt_required": true,
+      "maximum_normalized_128_to_32_wall_ratio": 1.5,
       "reserve_fraction": 0.25,
       "total_wall_seconds_max": null
+    },
+    "matched_pair_cohort": {
+      "positive_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "negative_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "seed_count": 512,
+      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's marginal source/support/latent/orientation identity before reducing predicted and empirical traces; independent is derived only from the paired marginal target/reference traces"
     },
     "max_production_sidecar_bytes": 1048576
   },
   "determinism": {
     "text_encoding": "UTF-8",
-    "dgp_generator_identity_sha256": "01e37bafdb852875b2c435597ee1c945dfc3d4fcd6824a7e39d8bf676a48bf18",
-    "dgp_generator_identity_definition": "frozen v4 counter-generator version identity; cell ordinal, seed, coordinate, date, and stream are separate counter-key fields, while exact portable-table bytes and coordinate coverage are bound by their own hashes without globally rekeying unchanged source histories; receipt, scorer, status, resource, and coverage-only table extensions are excluded",
+    "dgp_generator_identity_sha256": "7589a2bba764e66b99bf7cfffbd6f979df94a00ca0ca5e179b5aabae4903a49e",
+    "dgp_generator_identity_definition": "frozen v5 explicit-acceptance-matrix counter-generator identity; cell ordinal, seed, coordinate, date, and stream are separate counter-key fields; v4 outcomes never existed and v5 intentionally rekeys the smaller exact cell order",
     "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le matched_cohort_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
     "counter_domain": "dolphinrust:spatial-covariance-dgp:v1\\0",
     "matched_cell_ordinal": "negative signed geometries use the otherwise-identical positive geometry cell ordinal so matched marginals share draws",
@@ -130,7 +218,7 @@
   "numeric_contract": {
     "raw_dgp": "regenerate every complex look over the complete transitive sequential replay dependency halo through every expected block, including the final source-factor window; negative loading conjugates the latent-frame stochastic base before the common phasor so matched signs preserve magnitudes; compare exact shape, scalar count, full raw-cube and target/reference factor-halo content hashes, primitive support hashes, ancestry hash, DGP identity, and target/reference loading means before scoring",
     "latent_truth": "regenerate noiseless target and reference phase histories from slope_rad_per_day plus fixed positive 0.0002*sin((2*row-column)/11) radians/day, cadence, coordinates, and exact acquisition-zero gauge; coincident coordinates share one identical history; matched positive and negative cells share the same latent histories",
-    "dense_joint_oracle": "Python derives the exact dense 2N phase-joint covariance only for deterministic fixtures from the frozen source/influence formulas; stochastic cells are calibrated against bounded online empirical estimator-error covariance",
+    "dense_joint_oracle": "Python independently reconstructs the coordinate-keyed primitive source union, signed target/reference influence matrix A, and source correlation matrix R, then derives the full dense 2N phase-joint covariance from noise_variance times A-prime R A and the gauged temporal covariance only for deterministic fixtures; stochastic cells are calibrated against bounded online empirical estimator-error covariance",
     "estimator_evidence": "Rust emits actual EMI or EVD target/reference date histories, predicted production target-minus-reference date covariance, bounded 2N by 2N production phase-joint operator, and exact final-date target-minus-reference contrast weights; estimator_branch must equal the cell estimator",
     "difference_covariance": "Python independently computes the full-date fixed-L2 E C E-prime map from the pre-factor production 2N replay joint operator, symmetrizes, applies the frozen 1e-10 rank threshold, eigenvalue clipping and factor reconstruction, then compares production F F-prime under eps*date_count*256*max(1,max_abs(reconstruction)); actual covariance and replay-operator canonical digests remain exact",
     "operator_error": "deterministic: Frobenius(production_operator-python_derived_dense_oracle)/max(Frobenius(python_derived_dense_oracle),1e-15); stochastic: Frobenius(mean_production_operator-online_empirical_joint_estimator_error_covariance)/max(Frobenius(empirical),1e-15); maxima 1e-10 and 0.10",
@@ -164,7 +252,7 @@
     "canonical_hashes": "SHA-256 over frozen streaming raw encoding and numeric encodings with domain tags raw-input-v4, source-raw-input-v4, latent-phase-history-v4, estimate-history-v4, predicted-difference-covariance-v4, production-operator-v4, dense-oracle-v4, mean-predicted-covariance-v4, empirical-error-covariance-v4"
   },
   "cell_reducers": {
-    "attempted_seeds": "exactly the preregistered per-cell fixed count: one deterministic edge seed or 5000 supported Monte Carlo seeds",
+    "attempted_seeds": "exactly 128 for each of the 24 explicit stochastic cells and one for every explicit deterministic contract cell",
     "emitted_seeds": "count(emitted_true)",
     "top_up_seeds": "exactly_zero",
     "error_sum": "bounded date vector sum over emitted valid difference errors",
@@ -179,7 +267,7 @@
     "matched_independent_trace": "one half the sum of target and reference marginal covariance traces across matched positive and negative summaries",
     "covariance_calibration_relative_error": "Frobenius(mean_predicted-empirical)/max(Frobenius(empirical),1e-15)",
     "psd_min_eigenvalue": "minimum over emitted predicted covariance attempts",
-    "coverage_95_by_date": "bounded count vector divided by emitted attempts; every non-gauge date independently must be within 0.02 of 0.95; acquisition zero is null",
+    "coverage_95_by_date": "for each 128-seed stochastic cell, every non-gauge date must have 117 through 126 covered attempts inclusive and the Wilson 95 percent interval must contain 0.95; acquisition zero is null",
     "final_date_coverage_95": "explicit last element of coverage_95_by_date and independently gated",
     "interval_score_mean_by_date": "bounded per-date sums divided by emitted attempts; acquisition zero is null",
     "interval_width_mean_by_date": "bounded per-date sums divided by emitted attempts; acquisition zero is null",
@@ -411,12 +499,11 @@
     ]
   },
   "cell_policy": {
-    "required_design": "pairwise_all_levels_plus_named_high_risk_cells",
+    "required_design": "explicit_3_by_4_by_2_scientific_axes_plus_deterministic_behavior_contracts",
     "deterministic_contract_if": [
-      "position_is_not_interior",
-      "pair_geometry_is_coincident",
-      "eigen_stress_is_tied_eigenvalue"
+      "cell_is_listed_in_matrix_contract.deterministic_contract_cells"
     ],
+    "coincident_stochastic_required": true,
     "supported_interior_disjoint_monte_carlo": true,
     "allowed_not_evaluable": [
       "singular_local_information"
@@ -443,7 +530,13 @@
     "covariance_calibration_relative_error_max": 0.1,
     "psd_min_eigenvalue_min": -1e-10,
     "coverage_probability": 0.95,
-    "coverage_absolute_error_max": 0.02,
+    "coverage_gate": "exact_binomial_central_95_intersect_wilson_95_contains_target_v1",
+    "coverage_gate_scope": "noncoincident_stochastic_cells",
+    "coverage_coincident_covered_count": 128,
+    "coverage_seed_count": 128,
+    "coverage_covered_count_min": 117,
+    "coverage_covered_count_max": 126,
+    "coverage_wilson_z": 1.959963984540054,
     "emission_rate_min": 0.99,
     "resource_rss_bytes_max": 25769803776,
     "resource_growth": "area_or_dates_linear; no quadratic area axis",
@@ -511,20 +604,30 @@
       "package": "dolphin-workflows",
       "target": "example:spatial_covariance_batch",
       "release_invocation_template": [
-        "cargo",
-        "run",
-        "--release",
-        "-p",
-        "dolphin-workflows",
-        "--example",
-        "spatial_covariance_batch",
-        "--",
+        "target/release/examples/spatial_covariance_batch",
         "--preregistration",
         "{preregistration}",
         "--cell-id",
         "{cell_id}",
         "--ephemeral-evidence-stdout"
       ],
+      "source_identity": {
+        "schema": "dolphinrust.canonical-rust-source-set/1",
+        "roots": [
+          "crates"
+        ],
+        "files": [
+          "Cargo.lock",
+          "Cargo.toml"
+        ],
+          "sha256": "15543bf0b9e8c349aa2bf7337fb865bffa1676d258ffe6495c19670a2835c7e6"
+      },
+      "producer_binary_identity": {
+        "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
+        "batch_path": "target/release/examples/spatial_covariance_batch",
+        "benchmark_path": "target/release/examples/spatial_covariance_bench",
+        "binary_sha256_definition": "SHA-256 of canonical JSON containing the exact streamed SHA-256 and byte count of both prebuilt release executables"
+      },
       "request_schema": "dolphinrust.spatial-covariance.attempt/4",
       "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
       "request_source": "deterministic internal regeneration",
@@ -1675,7 +1778,6 @@
       ],
       "receipt_failure_if": [
         "invalid_reference",
-        "empty_support",
         "nonfinite_source",
         "non_psd_truth",
         "missing_attempt_record",
@@ -1902,14 +2004,7 @@
       "uname -a"
     ],
     "command_template": [
-      "cargo",
-      "run",
-      "--release",
-      "-p",
-      "dolphin-workflows",
-      "--example",
-      "spatial_covariance_bench",
-      "--",
+      "target/release/examples/spatial_covariance_bench",
       "--tile-pixels",
       "{tile_pixels}",
       "--dates",
@@ -2055,6 +2150,7 @@
       "HDF5 schema v4",
       "manifest schema v3",
       "separate in-memory and persisted factor digests",
+      "complete capped-read HDF5 header and every-block semantics for whole and bounded artifacts",
       "reference provenance",
       "estimator branch"
     ],
@@ -2069,10 +2165,10 @@
   "portable_dgp_asset": {
     "schema": "dolphinrust.spatial-covariance.portable-dgp-asset/1",
     "path": "spatial_covariance_portable_tables.json",
-    "byte_count": 3124967,
-    "sha256": "f2295c1448d93a061032699039e1096abbfb16d96e99b68a0fb07b340b269018",
+    "byte_count": 3140431,
+    "sha256": "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
-    "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
-    "table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff"
+    "coefficient_sha256": "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3",
+    "table_sha256": "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
   }
 }

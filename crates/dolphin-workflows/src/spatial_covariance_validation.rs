@@ -5,7 +5,7 @@
 //! factor block, and optionally round-trips that block through the production
 //! HDF5 writer and capped reader.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::path::Path;
 
@@ -19,9 +19,10 @@ use dolphin_io::{
     read_spatial_reference_covariance_block, read_spatial_reference_covariance_header,
     CovarianceOperatorBlock, CovarianceOperatorGrid, CovarianceOperatorMetadata,
     CovarianceOperatorStatus, CovarianceOperatorWriter, CovarianceReplayStatus,
-    DownstreamInferenceStatus, SourceReplayIdentity, SpatialReferenceCovarianceStatus,
-    SpatialReferenceRuntimeResourceReceipt, StitchedCovarianceStatus,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
+    DownstreamInferenceStatus, SourceReplayIdentity, SpatialReferenceCovarianceMetadata,
+    SpatialReferenceCovarianceStatus, SpatialReferenceRuntimeResourceReceipt,
+    StitchedCovarianceStatus, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY, SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
 };
 use dolphin_phaselink::source_model::{
     estimate_empirical_proper_complex_factor, EmpiricalProperComplexConfig,
@@ -217,35 +218,29 @@ fn expected_cell_ids_from_preregistration(preregistration: &Value) -> Result<Vec
         anyhow::ensure!(!values.is_empty(), "frozen dimension has no levels");
         levels.push(values);
     }
-    let defaults = levels
-        .iter()
-        .map(|values| values[0].clone())
-        .collect::<Vec<_>>();
     let mut cells = std::collections::BTreeSet::new();
-    for left in 0..levels.len() {
-        for right in left + 1..levels.len() {
-            for left_value in &levels[left] {
-                for right_value in &levels[right] {
-                    let mut labels = defaults.clone();
-                    labels[left] = left_value.clone();
-                    labels[right] = right_value.clone();
-                    cells.insert(labels);
-                }
-            }
-        }
-    }
-    for cell in matrix
-        .get("risk_cells")
-        .and_then(Value::as_array)
-        .context("matrix contract omits risk cells")?
-    {
-        cells.insert(
-            cell.as_str()
-                .context("risk cell is not a string")?
+    for field in ["stochastic_cells", "deterministic_contract_cells"] {
+        for cell in matrix
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| format!("matrix contract omits {field}"))?
+        {
+            let labels = cell
+                .as_str()
+                .with_context(|| format!("{field} cell is not a string"))?
                 .split('|')
                 .map(str::to_owned)
-                .collect::<Vec<_>>(),
-        );
+                .collect::<Vec<_>>();
+            anyhow::ensure!(labels.len() == levels.len(), "{field} cell width differs");
+            anyhow::ensure!(
+                labels
+                    .iter()
+                    .enumerate()
+                    .all(|(index, label)| levels[index].contains(label)),
+                "{field} cell is outside the frozen levels"
+            );
+            anyhow::ensure!(cells.insert(labels), "duplicate explicit matrix cell");
+        }
     }
     let expected = matrix
         .get("expected_cell_count")
@@ -1652,6 +1647,7 @@ pub fn run_frozen_attempt(
         );
         object.insert("emitted".to_owned(), Value::Bool(false));
         object.insert("factor_emitted".to_owned(), Value::Bool(false));
+        object.insert("effective_looks_fraction".to_owned(), Value::Null);
         for name in [
             "signed_cross_influence",
             "target_estimate_history",
@@ -2378,6 +2374,94 @@ pub enum ValidationCoupling {
     Invalid,
 }
 
+/// Exact persisted semantics for one production HDF5 factor block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedCovarianceBlockSemantics {
+    /// Stable production block identifier.
+    pub block_id: u64,
+    /// Global row/column origin, shape, and stride read through `dolphin-io`.
+    pub target_grid: [u64; 6],
+    /// Stable per-target disposition names in target-major order.
+    pub statuses: Vec<String>,
+    /// Persisted per-target source-burst registry indices.
+    pub source_burst_indices: Vec<u32>,
+    /// Digest binding the exact primitive source factors represented by this block.
+    pub source_factor_digest: String,
+    /// Per-target exact effective-look/source-support receipt digests.
+    pub effective_looks_receipts: Vec<String>,
+    /// Per-target production replay resource bounds.
+    pub resource_high_water_bytes: Vec<u64>,
+    /// Realized factor rank for each target.
+    pub rank_by_target: Vec<u32>,
+    /// Realized target/reference support union size for each target.
+    pub support_union_count: Vec<u64>,
+}
+
+/// HDF5 header and complete block semantics independently re-read by `dolphin-io`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedCovarianceArtifactSemantics {
+    /// HDF5 schema version.
+    pub schema_version: u16,
+    /// Frozen factor method.
+    pub method: String,
+    /// Numeric method version.
+    pub method_version: u16,
+    /// Source burst selected by the reference.
+    pub burst_id: String,
+    /// Exact output CRS.
+    pub crs: String,
+    /// Exact factor units.
+    pub units: String,
+    /// Exact affine output transform.
+    pub geotransform: [f64; 6],
+    /// Global row/column origin, shape, and stride of the complete artifact.
+    pub full_grid: [u64; 6],
+    /// Global selected-reference coordinate after any crop relocation.
+    pub reference_coordinate: [u64; 2],
+    /// Exact temporal gauge date index.
+    pub gauge_date_index: u32,
+    /// Ordered acquisition indices including the gauge.
+    pub ordered_date_indices: Vec<u32>,
+    /// Acquisition coordinates relative to acquisition zero.
+    pub acquisition_days: Vec<f64>,
+    /// Native/output mask identity.
+    pub mask_digest: String,
+    /// Persisted replay/operator identity.
+    pub source_replay_digest: String,
+    /// Fixed-valid-observation L2 map identity.
+    pub l2_map_digest: String,
+    /// Selected reference and exact output-grid signature.
+    pub reference_signature_digest: String,
+    /// Frozen approximation receipt.
+    pub approximation_receipt_digest: String,
+    /// Frozen admission/resource receipt.
+    pub resource_receipt_digest: String,
+    /// Exact observed runtime resource receipt identity.
+    pub runtime_resource_receipt_digest: String,
+    /// Machine-readable observed runtime receipt.
+    pub runtime_resource_receipt: BenchmarkRuntimeResourceReceipt,
+    /// Proper-complex primitive source-model receipt.
+    pub source_model_digest: String,
+    /// Realized effective-look receipt over all factor blocks.
+    pub effective_looks_digest: String,
+    /// Realized support method.
+    pub support_method: String,
+    /// Realized support receipt.
+    pub support_digest: String,
+    /// Corrections-before-reference ordering receipt.
+    pub correction_order_digest: String,
+    /// Fixed unwrap/phase-estimator branch receipt.
+    pub unwrap_branch_digest: String,
+    /// Source-burst ownership and seam-leveling receipt.
+    pub burst_ownership_digest: String,
+    /// Complete persisted ownership registry.
+    pub source_burst_ids: Vec<String>,
+    /// Selected reference owner in the ownership registry.
+    pub reference_source_burst_index: u32,
+    /// Exact per-block semantics covering the complete grid.
+    pub blocks: Vec<PersistedCovarianceBlockSemantics>,
+}
+
 /// Numeric evidence emitted by the validation runner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpatialCovarianceValidationResult {
@@ -2439,6 +2523,10 @@ pub struct SpatialCovarianceValidationResult {
     pub hdf5_schema_version: u16,
     /// Production artifact-manifest schema version.
     pub manifest_schema_version: u16,
+    /// Complete whole-frame HDF5 semantics re-read through `dolphin-io`.
+    pub whole_artifact_semantics: Option<PersistedCovarianceArtifactSemantics>,
+    /// Complete bounded-frame HDF5 semantics re-read through `dolphin-io`.
+    pub bounded_artifact_semantics: Option<PersistedCovarianceArtifactSemantics>,
 }
 
 /// Resource evidence produced by the actual replay and production admission code.
@@ -2479,7 +2567,7 @@ pub struct SpatialCovarianceBenchmarkEvidence {
 }
 
 /// Serializable mirror of the exact production runtime receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkRuntimeResourceReceipt {
     /// Production aggregate working-set cap.
     pub working_set_byte_cap: u64,
@@ -3068,6 +3156,8 @@ pub fn run_validation_case(
         bounded_runtime_resource_receipt_digest: String::new(),
         hdf5_schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
         manifest_schema_version: 3,
+        whole_artifact_semantics: None,
+        bounded_artifact_semantics: None,
     })
 }
 
@@ -3111,6 +3201,8 @@ pub fn write_validation_fixture(
     result.bounded_runtime_resource_receipt_digest = bounded.runtime_resource_receipt_digest;
     result.hdf5_schema_version = whole.hdf5_schema_version;
     result.manifest_schema_version = whole.manifest_schema_version;
+    result.whole_artifact_semantics = Some(whole.semantics);
+    result.bounded_artifact_semantics = Some(bounded.semantics);
     Ok(result)
 }
 
@@ -3122,6 +3214,7 @@ struct EmittedProductionFixture {
     runtime_resource_receipt_digest: String,
     hdf5_schema_version: u16,
     manifest_schema_version: u16,
+    semantics: PersistedCovarianceArtifactSemantics,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3149,6 +3242,8 @@ fn emit_actual_production_fixture(
         let value = Cf64::from_polar(1.0 + 0.02 * row as f64, phase);
         Cf32::new(value.re as f32, value.im as f32)
     };
+    let mut validity = Array2::from_elem(shape, true);
+    validity[(2, 2)] = false;
     for (date, path) in paths.iter().enumerate() {
         let values = Array2::from_shape_fn(shape, |(row, column)| source_value(date, row, column));
         let file = hdf5::File::create(path)?;
@@ -3212,8 +3307,9 @@ fn emit_actual_production_fixture(
         branch_tolerance: 1e-10,
     };
     let mut blocks = Vec::new();
-    run_sequential_with_covariance_capture_and_source_factors(
+    run_sequential_masked_with_covariance_capture_and_source_factors(
         stack.view(),
+        validity.view(),
         &config,
         &ComputeEngine::new(ComputeBackend::Cpu),
         &request,
@@ -3228,7 +3324,7 @@ fn emit_actual_production_fixture(
         shape,
         shape,
         1,
-        Array2::from_elem(shape, true).view(),
+        validity.view(),
         &config,
         validation_scope(),
         ReplayIdNamespace {
@@ -3290,7 +3386,15 @@ fn emit_actual_production_fixture(
         }),
         Some(Array3::from_elem((2, shape.0, shape.1), 1.0)),
     )?;
-    let validity = Array2::from_elem(shape, true);
+    let mut ownership = Array3::from_elem((VALIDATION_DATES, shape.0, shape.1), 0);
+    ownership.slice_mut(s![.., 2, 2]).fill(1);
+    let seam_rotations = vec![
+        (0, vec![Cf64::new(1.0, 0.0), Cf64::from_polar(1.0, 0.031)]),
+        (
+            1,
+            vec![Cf64::from_polar(1.0, -0.017), Cf64::from_polar(1.0, 0.023)],
+        ),
+    ];
     let mut state = ProductionCovarianceState {
         replay_context: Some(ProductionCovarianceReplayContext {
             source_manifest,
@@ -3307,15 +3411,26 @@ fn emit_actual_production_fixture(
             operator_block_byte_cap: 16 << 20,
         }),
         fixed_l2_inputs: Some(fixed_l2_inputs),
-        ownership: Array3::from_elem((VALIDATION_DATES, shape.0, shape.1), 0),
-        seam_rotations: vec![(0, vec![Cf64::new(1.0, 0.0); VALIDATION_DATES])],
-        source_burst_ids: vec![request.burst_id.clone()],
-        burst_output_mappings: vec![BurstOutputMapping {
-            owner: 0,
-            frame_origin: (0, 0),
-            output_origin: (0, 0),
-            shape,
-        }],
+        ownership,
+        seam_rotations,
+        source_burst_ids: vec![
+            request.burst_id.clone(),
+            "spatial-covariance-validation-seam-neighbor".to_owned(),
+        ],
+        burst_output_mappings: vec![
+            BurstOutputMapping {
+                owner: 0,
+                frame_origin: (0, 0),
+                output_origin: (0, 0),
+                shape,
+            },
+            BurstOutputMapping {
+                owner: 1,
+                frame_origin: (0, 0),
+                output_origin: (0, 0),
+                shape,
+            },
+        ],
         analysis_origin: (0, 0),
         correction_order_digest: correction_order_digest(
             &dolphin_core::config::CorrectionOptions::default(),
@@ -3372,8 +3487,18 @@ fn emit_actual_production_fixture(
     )?;
     let manifest = read_spatial_reference_covariance_artifact_manifest(directory)?;
     let hdf5 = directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
-    let header = read_spatial_reference_covariance_header(&hdf5, VALIDATION_BYTE_CAP)?;
     let persisted = read_spatial_reference_covariance_block(&hdf5, 0, VALIDATION_BYTE_CAP)?;
+    let semantics = read_persisted_artifact_semantics(&hdf5)?;
+    anyhow::ensure!(
+        manifest.reference_signature_digest == semantics.reference_signature_digest
+            && manifest.mask_digest == semantics.mask_digest
+            && manifest.source_replay_digest == semantics.source_replay_digest
+            && manifest.source_model_digest == semantics.source_model_digest
+            && manifest.resource_receipt_digest == semantics.resource_receipt_digest
+            && manifest.runtime_resource_receipt_digest
+                == semantics.runtime_resource_receipt_digest,
+        "production sidecar and capped HDF5 semantics differ"
+    );
     let emitted = EmittedProductionFixture {
         factor_digest: factor_digest(&persisted.block.difference_factor),
         hdf5_bytes: manifest.hdf5_bytes,
@@ -3382,8 +3507,9 @@ fn emit_actual_production_fixture(
             &directory.join(SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME),
         )?,
         runtime_resource_receipt_digest: manifest.runtime_resource_receipt_digest,
-        hdf5_schema_version: header.schema_version,
+        hdf5_schema_version: semantics.schema_version,
         manifest_schema_version: manifest.schema_version,
+        semantics,
     };
     for path in paths.into_iter().chain([
         directory.join(crate::covariance_artifact::COVARIANCE_OPERATOR_FILENAME),
@@ -3396,6 +3522,153 @@ fn emit_actual_production_fixture(
         }
     }
     Ok(emitted)
+}
+
+fn read_persisted_artifact_semantics(hdf5: &Path) -> Result<PersistedCovarianceArtifactSemantics> {
+    let header = read_spatial_reference_covariance_header(hdf5, VALIDATION_BYTE_CAP)?;
+    let blocks = read_persisted_block_semantics(hdf5, &header)?;
+    let runtime_resource_receipt = header
+        .runtime_resource_receipt
+        .context("persisted runtime resource receipt is absent")?
+        .into();
+    Ok(PersistedCovarianceArtifactSemantics {
+        schema_version: header.schema_version,
+        method: header.method,
+        method_version: header.method_version,
+        burst_id: header.burst_id,
+        crs: header.crs,
+        units: header.units,
+        geotransform: header
+            .geotransform
+            .context("persisted affine transform is absent")?,
+        full_grid: grid_semantics(header.full_grid),
+        reference_coordinate: [header.reference_row, header.reference_col],
+        gauge_date_index: header.gauge_date_index,
+        ordered_date_indices: header.ordered_date_indices,
+        acquisition_days: header
+            .acquisition_days
+            .context("persisted acquisition days are absent")?,
+        mask_digest: header.mask_digest,
+        source_replay_digest: header.source_replay_digest,
+        l2_map_digest: header.l2_map_digest,
+        reference_signature_digest: header.reference_signature_digest,
+        approximation_receipt_digest: header.approximation_receipt_digest,
+        resource_receipt_digest: header.resource_receipt_digest,
+        runtime_resource_receipt_digest: header.runtime_resource_receipt_digest,
+        runtime_resource_receipt,
+        source_model_digest: header.source_model_digest,
+        effective_looks_digest: header.effective_looks_digest,
+        support_method: header.support_method,
+        support_digest: header.support_digest,
+        correction_order_digest: header.correction_order_digest,
+        unwrap_branch_digest: header.unwrap_branch_digest,
+        burst_ownership_digest: header.burst_ownership_digest,
+        source_burst_ids: header.source_burst_ids,
+        reference_source_burst_index: header.reference_source_burst_index,
+        blocks,
+    })
+}
+
+fn read_persisted_block_semantics(
+    hdf5: &Path,
+    header: &SpatialReferenceCovarianceMetadata,
+) -> Result<Vec<PersistedCovarianceBlockSemantics>> {
+    let target_count = u64::from(header.full_grid.rows)
+        .checked_mul(u64::from(header.full_grid.cols))
+        .context("persisted factor grid area overflows u64")?;
+    let mut covered_targets = BTreeSet::new();
+    let mut blocks = Vec::new();
+    for block_id in 0..target_count {
+        if u64::try_from(covered_targets.len())? == target_count {
+            break;
+        }
+        let persisted =
+            read_spatial_reference_covariance_block(hdf5, block_id, VALIDATION_BYTE_CAP)?;
+        let block = persisted.block;
+        anyhow::ensure!(
+            block.target_grid.stride_y == header.full_grid.stride_y
+                && block.target_grid.stride_x == header.full_grid.stride_x,
+            "persisted factor block stride differs from the header"
+        );
+        for row in 0..u64::from(block.target_grid.rows) {
+            for column in 0..u64::from(block.target_grid.cols) {
+                let coordinate = (
+                    block
+                        .target_grid
+                        .row_start
+                        .checked_add(row)
+                        .context("persisted factor block row overflows")?,
+                    block
+                        .target_grid
+                        .col_start
+                        .checked_add(column)
+                        .context("persisted factor block column overflows")?,
+                );
+                anyhow::ensure!(
+                    covered_targets.insert(coordinate),
+                    "persisted factor blocks overlap"
+                );
+            }
+        }
+        let receipts = block
+            .effective_looks_receipt
+            .as_deref()
+            .context("persisted effective-look/source receipts are absent")?;
+        let mut receipt_chunks = receipts.chunks_exact(32);
+        let effective_looks_receipts = receipt_chunks
+            .by_ref()
+            .map(|receipt| format!("sha256:{}", hex_bytes(receipt)))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            receipt_chunks.remainder().is_empty()
+                && effective_looks_receipts.len() == block.status.len(),
+            "persisted effective-look/source receipt shape differs"
+        );
+        let statuses = block
+            .status
+            .iter()
+            .map(|status| persisted_status_name(*status).map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?;
+        blocks.push(PersistedCovarianceBlockSemantics {
+            block_id: block.block_id,
+            target_grid: grid_semantics(block.target_grid),
+            statuses,
+            source_burst_indices: block.source_burst_index_by_target,
+            source_factor_digest: block.source_factor_digest,
+            effective_looks_receipts,
+            resource_high_water_bytes: block
+                .resource_high_water_bytes
+                .context("persisted per-target resource receipts are absent")?,
+            rank_by_target: block.rank_by_target,
+            support_union_count: block
+                .support_union_count
+                .context("persisted support-union receipts are absent")?,
+        });
+    }
+    anyhow::ensure!(
+        u64::try_from(covered_targets.len())? == target_count,
+        "persisted factor blocks do not cover the complete header grid"
+    );
+    Ok(blocks)
+}
+
+fn grid_semantics(grid: CovarianceOperatorGrid) -> [u64; 6] {
+    [
+        grid.row_start,
+        grid.col_start,
+        u64::from(grid.rows),
+        u64::from(grid.cols),
+        u64::from(grid.stride_y),
+        u64::from(grid.stride_x),
+    ]
+}
+
+fn persisted_status_name(status: SpatialReferenceCovarianceStatus) -> Result<&'static str> {
+    SPATIAL_REFERENCE_COVARIANCE_STATUS_REGISTRY
+        .iter()
+        .find(|entry| entry.code == status as u16)
+        .map(|entry| entry.name)
+        .context("persisted factor status is absent from the stable registry")
 }
 
 fn validation_block(
@@ -3790,6 +4063,50 @@ mod tests {
         }
     }
 
+    fn assert_complete_artifact_semantics(artifact: &PersistedCovarianceArtifactSemantics) {
+        assert_eq!(artifact.schema_version, 4);
+        assert_eq!(artifact.method, "reference_specific_influence_v1");
+        assert!(artifact.mask_digest.starts_with("sha256:"));
+        assert!(artifact.source_replay_digest.starts_with("sha256:"));
+        assert!(artifact.source_model_digest.starts_with("sha256:"));
+        assert!(artifact.resource_receipt_digest.starts_with("sha256:"));
+        assert!(artifact
+            .runtime_resource_receipt_digest
+            .starts_with("sha256:"));
+        assert!(
+            artifact
+                .runtime_resource_receipt
+                .production_provider_open_count
+                > 0
+        );
+        assert!(artifact.runtime_resource_receipt.operator_block_reads > 0);
+        assert!(artifact.runtime_resource_receipt.source_resolutions > 0);
+        assert_eq!(
+            artifact
+                .blocks
+                .iter()
+                .map(|block| block.target_grid[2] * block.target_grid[3])
+                .sum::<u64>(),
+            artifact.full_grid[2] * artifact.full_grid[3]
+        );
+        assert!(artifact.blocks.iter().all(|block| {
+            block.source_factor_digest.starts_with("sha256:")
+                && block.statuses.len() == block.source_burst_indices.len()
+                && block.statuses.len() == block.effective_looks_receipts.len()
+                && block.statuses.len() == block.resource_high_water_bytes.len()
+        }));
+        assert!(artifact
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statuses)
+            .any(|status| status == "valid"));
+        assert!(artifact
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statuses)
+            .any(|status| status == "masked_target"));
+    }
+
     #[test]
     fn full_cell_runner_executes_actual_emi_and_evd_production_paths() {
         for use_evd in [false, true] {
@@ -3932,7 +4249,7 @@ mod tests {
         )))
         .unwrap();
         let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
-        let cell_id = "hw_1x1|stride_1|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|independent_complex_looks";
+        let cell_id = "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress";
         let seed_sha256 = format!(
             "{:x}",
             Sha256::digest(format!("spatial-covariance-f54-07-v2||{cell_id}||0"))
@@ -3943,18 +4260,18 @@ mod tests {
             &FrozenAttemptRequest {
                 schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
                 cell_id: cell_id.to_owned(),
-                cell_ordinal: 2,
+                cell_ordinal: 4,
                 seed_index: 0,
                 seed_sha256,
                 half_window: "hw_1x1".to_owned(),
-                stride: "stride_1".to_owned(),
+                stride: "stride_4".to_owned(),
                 support: "glrt_frozen".to_owned(),
                 position: "interior".to_owned(),
                 pair_geometry: "coincident".to_owned(),
                 block_topology: "four_blocks".to_owned(),
                 estimator: "emi".to_owned(),
                 eigen_stress: "well_separated".to_owned(),
-                source_process: "independent_complex_looks".to_owned(),
+                source_process: "spatial_correlation_stress".to_owned(),
             },
         )
         .unwrap();
@@ -3975,14 +4292,14 @@ mod tests {
         )))
         .unwrap();
         let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
-        let cell_id = "hw_1x1|stride_2|rect|interior|coincident|four_blocks|emi|well_separated|independent_complex_looks";
+        let cell_id = "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress";
         let evidence = run_frozen_attempt(
             &preregistration,
             &tables,
             &FrozenAttemptRequest {
                 schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
                 cell_id: cell_id.to_owned(),
-                cell_ordinal: 246,
+                cell_ordinal: 1,
                 seed_index: 0,
                 seed_sha256: format!(
                     "{:x}",
@@ -3992,11 +4309,11 @@ mod tests {
                 stride: "stride_2".to_owned(),
                 support: "rect".to_owned(),
                 position: "interior".to_owned(),
-                pair_geometry: "coincident".to_owned(),
+                pair_geometry: "shared_75_positive".to_owned(),
                 block_topology: "four_blocks".to_owned(),
                 estimator: "emi".to_owned(),
                 eigen_stress: "well_separated".to_owned(),
-                source_process: "independent_complex_looks".to_owned(),
+                source_process: "spatial_correlation_stress".to_owned(),
             },
         )
         .unwrap();
@@ -4004,24 +4321,24 @@ mod tests {
         assert_eq!(evidence["target_coordinate"], serde_json::json!([129, 129]));
         assert_eq!(
             evidence["reference_coordinate"],
-            serde_json::json!([129, 129])
+            serde_json::json!([129, 131])
         );
         assert_eq!(
             evidence["raw_input_sha256"],
-            "88e93e0373beab04e191ca341d712b817e61a7b806ea2f337de9572748cbbedd"
+            "5411bda5c0d4ebde3d52afc504e07872e6d5104d5b15d3f3d4474358036163ff"
         );
         assert_eq!(
             evidence["target_support_sha256"],
             "aab85c3a2f14eb18c03116971c1b58658132b1c0ab14c932e48f6fd8c9b10a79"
         );
         assert_eq!(
-            evidence["target_support_sha256"],
-            evidence["reference_support_sha256"]
+            evidence["reference_support_sha256"],
+            "a425266fa800fcdba19711d529742c69004b401925d5a63deb7978564d1acb18"
         );
     }
 
     #[test]
-    fn stochastic_nondifferentiable_attempt_is_retained_without_exempting_the_cell() {
+    fn stochastic_attempts_are_emitted_with_stable_scope() {
         let preregistration: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../validation/spatial_covariance_preregistration.json"
@@ -4033,11 +4350,11 @@ mod tests {
         )))
         .unwrap();
         let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
-        let cell_id = "hw_1x1|stride_1|rect|interior|shared_50_negative|four_blocks|emi|well_separated|independent_complex_looks";
+        let cell_id = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress";
         let request = |seed_index| FrozenAttemptRequest {
             schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
             cell_id: cell_id.to_owned(),
-            cell_ordinal: 168,
+            cell_ordinal: 14,
             seed_index,
             seed_sha256: format!(
                 "{:x}",
@@ -4046,24 +4363,23 @@ mod tests {
                 ))
             ),
             half_window: "hw_1x1".to_owned(),
-            stride: "stride_1".to_owned(),
-            support: "rect".to_owned(),
+            stride: "stride_4".to_owned(),
+            support: "glrt_frozen".to_owned(),
             position: "interior".to_owned(),
-            pair_geometry: "shared_50_negative".to_owned(),
+            pair_geometry: "shared_75_positive".to_owned(),
             block_topology: "four_blocks".to_owned(),
             estimator: "emi".to_owned(),
             eigen_stress: "well_separated".to_owned(),
-            source_process: "independent_complex_looks".to_owned(),
+            source_process: "spatial_correlation_stress".to_owned(),
         };
-        let failed = run_frozen_attempt(&preregistration, &tables, &request(0)).unwrap();
-        assert_eq!(failed["status"], "nondifferentiable_node");
-        assert_eq!(failed["emitted"], false);
-        assert_eq!(failed["factor_emitted"], false);
-        assert!(failed["target_estimate_history"].is_null());
+        let first = run_frozen_attempt(&preregistration, &tables, &request(0)).unwrap();
+        assert_eq!(first["status"], "valid");
+        assert_eq!(first["emitted"], true);
+        assert_eq!(first["factor_emitted"], true);
         let emitted = run_frozen_attempt(&preregistration, &tables, &request(1)).unwrap();
         assert_eq!(emitted["status"], "valid");
         assert_eq!(emitted["emitted"], true);
-        assert_eq!(failed["raw_input_shape"], emitted["raw_input_shape"]);
+        assert_eq!(first["raw_input_shape"], emitted["raw_input_shape"]);
     }
 
     #[test]
@@ -4079,28 +4395,28 @@ mod tests {
         )))
         .unwrap();
         let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
-        let cell_id = "hw_1x1|stride_1|glrt_frozen|bounded_halo|coincident|one_block|emi|well_separated|independent_complex_looks";
+        let cell_id = "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress";
         let evidence = run_frozen_attempt(
             &preregistration,
             &tables,
             &FrozenAttemptRequest {
                 schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
                 cell_id: cell_id.to_owned(),
-                cell_ordinal: 1,
+                cell_ordinal: 4,
                 seed_index: 0,
                 seed_sha256: format!(
                     "{:x}",
                     Sha256::digest(format!("spatial-covariance-f54-07-v2||{cell_id}||0"))
                 ),
                 half_window: "hw_1x1".to_owned(),
-                stride: "stride_1".to_owned(),
+                stride: "stride_4".to_owned(),
                 support: "glrt_frozen".to_owned(),
-                position: "bounded_halo".to_owned(),
+                position: "interior".to_owned(),
                 pair_geometry: "coincident".to_owned(),
-                block_topology: "one_block".to_owned(),
+                block_topology: "four_blocks".to_owned(),
                 estimator: "emi".to_owned(),
                 eigen_stress: "well_separated".to_owned(),
-                source_process: "independent_complex_looks".to_owned(),
+                source_process: "spatial_correlation_stress".to_owned(),
             },
         )
         .unwrap();
@@ -4137,39 +4453,39 @@ mod tests {
         )))
         .unwrap();
         let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
-        let cell_id = "hw_1x1|stride_1|rect|tile_edge|disjoint_after_depth_1|one_block|emi|well_separated|independent_complex_looks";
+        let cell_id = "hw_1x1|stride_4|glrt_frozen|tile_edge|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress";
         let evidence = run_frozen_attempt(
             &preregistration,
             &tables,
             &FrozenAttemptRequest {
                 schema: "dolphinrust.spatial-covariance.attempt/4".to_owned(),
                 cell_id: cell_id.to_owned(),
-                cell_ordinal: 232,
+                cell_ordinal: 21,
                 seed_index: 0,
                 seed_sha256: format!(
                     "{:x}",
                     Sha256::digest(format!("spatial-covariance-f54-07-v2||{cell_id}||0"))
                 ),
                 half_window: "hw_1x1".to_owned(),
-                stride: "stride_1".to_owned(),
-                support: "rect".to_owned(),
+                stride: "stride_4".to_owned(),
+                support: "glrt_frozen".to_owned(),
                 position: "tile_edge".to_owned(),
-                pair_geometry: "disjoint_after_depth_1".to_owned(),
-                block_topology: "one_block".to_owned(),
+                pair_geometry: "shared_75_positive".to_owned(),
+                block_topology: "four_blocks".to_owned(),
                 estimator: "emi".to_owned(),
                 eigen_stress: "well_separated".to_owned(),
-                source_process: "independent_complex_looks".to_owned(),
+                source_process: "spatial_correlation_stress".to_owned(),
             },
         )
         .unwrap();
         assert_eq!(evidence["status"], "valid");
-        assert_eq!(evidence["target_coordinate"], serde_json::json!([128, 254]));
+        assert_eq!(evidence["target_coordinate"], serde_json::json!([130, 250]));
         assert_eq!(
             evidence["reference_coordinate"],
-            serde_json::json!([128, 259])
+            serde_json::json!([130, 254])
         );
-        assert_eq!(evidence["target_source_count"], 9);
-        assert_eq!(evidence["reference_source_count"], 9);
+        assert_eq!(evidence["target_source_count"], 8);
+        assert_eq!(evidence["reference_source_count"], 8);
         assert_eq!(evidence["intersection_source_count"], 0);
     }
 
@@ -4214,5 +4530,40 @@ mod tests {
             assert_eq!(result.manifest_schema_version, 3);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn persisted_fixtures_bind_complete_artifact_semantics() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphinrust-spatial-covariance-semantics-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let result =
+            write_validation_fixture(&directory, ValidationCoupling::Independent, 17).unwrap();
+        let whole = result.whole_artifact_semantics.unwrap();
+        let bounded = result.bounded_artifact_semantics.unwrap();
+
+        assert_eq!(whole.full_grid, [0, 0, 3, 3, 1, 1]);
+        assert_eq!(bounded.full_grid, [1, 1, 2, 2, 1, 1]);
+        assert_eq!(whole.reference_coordinate, [1, 0]);
+        assert_eq!(bounded.reference_coordinate, [1, 1]);
+        assert_ne!(
+            whole.reference_signature_digest,
+            bounded.reference_signature_digest
+        );
+        assert_eq!(whole.gauge_date_index, 0);
+        assert_eq!(whole.ordered_date_indices, [0, 1]);
+        assert_eq!(whole.acquisition_days, [0.0, 12.0]);
+        assert_eq!(whole.crs, "EPSG:32611");
+        assert_eq!(whole.units, "radians");
+        assert_eq!(whole.source_burst_ids.len(), 2);
+        assert_ne!(whole.mask_digest, bounded.mask_digest);
+        assert_ne!(whole.burst_ownership_digest, bounded.burst_ownership_digest);
+
+        assert_complete_artifact_semantics(&whole);
+        assert_complete_artifact_semantics(&bounded);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

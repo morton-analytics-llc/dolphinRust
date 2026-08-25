@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -37,6 +38,7 @@ from validation.score_spatial_covariance import (
     _raw_source_digest,
     _read_hashed_json_record,
     _read_single_json_record,
+    _validate_performance_probe,
     _validate_resources,
     derive_dense_joint_oracle,
     expected_cell_ids,
@@ -50,23 +52,36 @@ from validation.score_spatial_covariance import (
     portable_normal,
     portable_table_coverage,
     preregistration_digest,
+    producer_identities,
     regenerate_frozen_attempt_inputs,
     sha256_json,
     validate_cell_summary,
     validate_direct_pair_variance_order,
+    validate_matched_pair_cohorts,
     validate_production_parity_fixture,
     validate_preregistration,
+    validate_producer_identities,
 )
 from validation.spatial_covariance_simulation import (
     _load_bounded_json,
+    _iter_cell_requests,
+    PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD,
     build_run_manifest,
     commit_cell_transport,
     commit_output_shard,
     committed_shard_matches,
     compact_json_line,
     capture_benchmark_stdout,
+    generate_matched_pair_cohorts,
+    generate_performance_probe,
+    generate_preoutcome_receipts,
+    generate_resource_receipts,
     iter_attempt_requests,
     prepare_input_shard,
+    rust_attempt_regenerator,
+    run_parallel_batch,
+    run_outcomes,
+    validate_preoutcome_receipts,
 )
 
 
@@ -74,13 +89,15 @@ VALIDATION = Path(__file__).parents[1]
 PREREGISTRATION = VALIDATION / "spatial_covariance_preregistration.json"
 CODE = "a" * 64
 BINARY = "b" * 64
-CELL = "hw_1x1|stride_1|rect|interior|coincident|one_block|emi|well_separated|independent_complex_looks"
-SUPPORTED_CELL = "hw_1x1|stride_1|rect|interior|shared_75_positive|one_block|emi|well_separated|independent_complex_looks"
-RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|near_tie|spatial_correlation_stress"
-MASKED_CELL = "hw_1x1|stride_1|rect|masked|coincident|one_block|emi|well_separated|independent_complex_looks"
+CELL = "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress"
+INDEPENDENT_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|independent_complex_looks"
+SUPPORTED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress"
+MASKED_CELL = "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+TIED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks"
 
 
-class SpatialCovarianceValidationV4Tests(unittest.TestCase):
+class SpatialCovarianceValidationV5Tests(unittest.TestCase):
     benchmark_stdout_by_scope = {}
     @classmethod
     def setUpClass(cls):
@@ -154,7 +171,10 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             ),
             "signed_cross_influence": None if masked or tied or empty else influence,
             "signed_influence_sign": sign,
-            "effective_looks_fraction": frozen["effective_looks_fraction"],
+            "effective_looks_fraction": (
+                None if labels["position"] == "masked"
+                else frozen["effective_looks_fraction"]
+            ),
             "effective_looks_application": "source_influence_joint_contraction_v1",
             "source_correlation_model": frozen["source_correlation_model"],
             "source_correlation_distance_scale_pixels": frozen[
@@ -259,7 +279,13 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 "model": "production-runtime-resource-receipt-v1",
                 "source": "spatial_covariance_bench captured stdout",
             }
-            command = ["cargo", "run", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_bench", "--", "--tile-pixels", str(tile_pixels), "--dates", str(date_count)]
+            benchmark = Path("target/release/examples/spatial_covariance_bench")
+            if not benchmark.exists():
+                subprocess.run(
+                    ["cargo", "build", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_bench"],
+                    check=True,
+                )
+            command = [str(benchmark), "--tile-pixels", str(tile_pixels), "--dates", str(date_count)]
             scope = (tile_pixels, date_count)
             if scope not in self.benchmark_stdout_by_scope:
                 completed = subprocess.run(
@@ -302,41 +328,64 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             result.append(item)
         return result
 
-    def test_v4_supersedes_v3_outcome_free_without_changing_matrix(self):
+    def test_v5_supersedes_infeasible_v4_before_outcomes(self):
         validate_preregistration(self.preregistration)
-        self.assertEqual(self.preregistration["schema_version"], 4)
-        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 3)
+        self.assertEqual(self.preregistration["schema_version"], 5)
+        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 4)
         self.assertFalse(self.preregistration["outcomes_present"])
         self.assertEqual(len(expected_cell_ids(self.preregistration)), FROZEN_CELL_COUNT)
-        self.assertEqual(FROZEN_ATTEMPT_COUNT, 665_220)
+        self.assertEqual(FROZEN_ATTEMPT_COUNT, 3_088)
         counts = [expected_seed_count(cell_id) for cell_id in expected_cell_ids(self.preregistration)]
-        self.assertEqual(counts.count(FROZEN_SEED_COUNT), 133)
-        self.assertEqual(counts.count(1), 220)
-        self.assertEqual(FROZEN_SHARD_COUNT, 4)
+        self.assertEqual(counts.count(FROZEN_SEED_COUNT), 24)
+        self.assertEqual(counts.count(1), 16)
+        self.assertEqual(FROZEN_SHARD_COUNT, 1)
 
-    def test_compact_design_covers_every_pairwise_level_combination(self):
-        cells = [cell_id.split("|") for cell_id in expected_cell_ids(self.preregistration)]
+    def test_stochastic_design_is_exact_acceptance_axis_product(self):
         dimensions = self.preregistration["matrix_contract"]["dimension_order"]
-        values = [[item["id"] for item in self.preregistration["dimensions"][name]] for name in dimensions]
-        for first in range(len(dimensions)):
-            for second in range(first + 1, len(dimensions)):
-                observed = {(cell[first], cell[second]) for cell in cells}
-                expected = {(left, right) for left in values[first] for right in values[second]}
-                self.assertTrue(expected <= observed, (dimensions[first], dimensions[second]))
-        self.assertEqual(sum(expected_seed_count("|".join(cell)) for cell in cells), FROZEN_ATTEMPT_COUNT)
+        stochastic = self.preregistration["matrix_contract"]["stochastic_cells"]
+        labels = [dict(zip(dimensions, cell_id.split("|"))) for cell_id in stochastic]
+        observed = {
+            (item["half_window"], item["pair_geometry"], item["estimator"])
+            for item in labels
+        }
+        expected = {
+            (window, geometry, estimator)
+            for window in ("hw_1x1", "hw_3x6", "hw_7x14")
+            for geometry in (
+                "coincident", "shared_75_positive", "shared_25_positive",
+                "disjoint_immediate",
+            )
+            for estimator in ("emi", "evd")
+        }
+        self.assertEqual(observed, expected)
+        for item in labels:
+            self.assertEqual(
+                {key: item[key] for key in (
+                    "stride", "support", "position", "block_topology",
+                    "eigen_stress", "source_process",
+                )},
+                {
+                    "stride": "stride_4", "support": "glrt_frozen",
+                    "position": "interior", "block_topology": "four_blocks",
+                    "eigen_stress": "well_separated",
+                    "source_process": "spatial_correlation_stress",
+                },
+            )
 
-    def test_supported_interior_disjoint_cells_retain_5000_seeds_except_empty_ks(self):
-        for cell_id in expected_cell_ids(self.preregistration):
-            labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
-            if (
-                labels["position"] == "interior"
-                and labels["eigen_stress"] != "tied_eigenvalue"
-                and labels["pair_geometry"].startswith("disjoint_")
-            ):
-                self.assertEqual(
-                    expected_seed_count(cell_id),
-                    1 if expected_empty_support(cell_id) else FROZEN_SEED_COUNT,
-                )
+    def test_seed_schedule_is_explicit_for_stochastic_and_contract_cells(self):
+        matrix = self.preregistration["matrix_contract"]
+        self.assertTrue(all(
+            expected_seed_count(cell_id) == FROZEN_SEED_COUNT
+            for cell_id in matrix["stochastic_cells"]
+        ))
+        self.assertTrue(all(
+            expected_seed_count(cell_id) == 1
+            for cell_id in matrix["deterministic_contract_cells"]
+        ))
+        self.assertEqual(
+            sum(expected_seed_count(cell_id) for cell_id in expected_cell_ids(self.preregistration)),
+            FROZEN_ATTEMPT_COUNT,
+        )
 
     def test_ephemeral_evidence_is_estimator_history_not_realized_truth(self):
         attempt = self._attempt(SUPPORTED_CELL, 0, 0)
@@ -393,8 +442,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertFalse(execution["request_files_retained"])
 
     def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
-        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 2_891_776)
-        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 23_928_832)
+        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 327_680)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 21_315_584)
         encoded = compact_json_line({"cell": 1})
         with tempfile.TemporaryDirectory() as directory:
             exact = _CellSummarySink(Path(directory) / "exact.jsonl")
@@ -429,8 +478,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         value = portable_normal(
             self.preregistration, 17, 23, -4, 19, 7, "local-signal-real", 3
         )
-        self.assertEqual(key, "b2abe5cf7624b7311597354b1be7db9934d145cd2cc42f9706eb42a44bb61a7d")
-        self.assertEqual(value.hex(), "-0x1.b995f4321d0dep-1")
+        self.assertEqual(key, "26464e43dd4060cbc04f8002374dae9eeb5e920751c4b25cfa8d294dd426552b")
+        self.assertEqual(value.hex(), "0x1.a50889ba90345p-1")
 
     def test_portable_complex_source_has_frozen_cross_language_golden(self):
         values = _generate_complex_source(
@@ -439,15 +488,15 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(
             [(value.real.hex(), value.imag.hex()) for value in values],
             [
-                ("-0x1.108cd80000000p-1", "0x1.48532a0000000p-2"),
-                ("-0x1.fa28d00000000p-2", "0x1.7a341a0000000p-6"),
-                ("-0x1.160ec80000000p-3", "0x1.1d79fe0000000p-1"),
-                ("0x1.c2563c0000000p-4", "0x1.4821f00000000p-1"),
+                ("-0x1.16ea600000000p-2", "-0x1.de3d4c0000000p-6"),
+                ("0x1.5175860000000p-3", "0x1.0e40ac0000000p-3"),
+                ("0x1.e045be0000000p-1", "-0x1.8b08520000000p-2"),
+                ("0x1.7c4a440000000p+0", "0x1.88467e0000000p-3"),
             ],
         )
         self.assertEqual(
             _raw_source_digest("portable-golden-v1", [(-4, 19)], {(-4, 19): values}),
-            "ba3bdd27980b5e4848b1988aeb6080b0363a0bd7d1340121c424e7948ae5fe1d",
+            "5f5ed14ea6b620fc818d35823206776f738d17da38806861b2e84ac2de748176",
         )
 
     def test_signed_pair_uses_positive_cell_ordinal_for_matched_draws(self):
@@ -468,9 +517,9 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
     def test_portable_tables_cover_every_frozen_coordinate_and_date(self):
         coverage = portable_table_coverage(self.preregistration)
         self.assertEqual(coverage["cell_count"], FROZEN_CELL_COUNT)
-        self.assertEqual(coverage["coordinate_count"], 29243)
-        self.assertEqual(coverage["amplitude_argument_count"], 1106)
-        self.assertEqual(coverage["slope_argument_count"], 399)
+        self.assertEqual(coverage["coordinate_count"], 18577)
+        self.assertEqual(coverage["amplitude_argument_count"], 923)
+        self.assertEqual(coverage["slope_argument_count"], 397)
         self.assertEqual(coverage["date_count"], 20)
 
     def test_portable_table_asset_is_relative_bounded_and_exact_byte_bound(self):
@@ -693,14 +742,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         accumulator.add(masked)
         self.assertIsNone(accumulator.finalize()["coverage_95_by_date"])
 
-        masked_ks = MASKED_CELL.replace("rect", "ks_frozen")
-        masked_attempt = self._attempt(masked_ks, 0, 0, masked=True)
-        masked_accumulator = self._accumulator(masked_ks)
-        masked_accumulator.add(masked_attempt)
-        self.assertEqual(masked_accumulator.finalize()["status"], "pass")
-
     def test_tied_eigen_stress_binds_actual_singular_production_probe(self):
-        tied = CELL.replace("well_separated", "tied_eigenvalue")
+        tied = TIED_CELL
         frozen = regenerate_frozen_attempt_inputs(self.preregistration, tied, 0)
         self.assertEqual(frozen["raw_input_shape"], [9, 3, 2])
         self.assertEqual(
@@ -731,7 +774,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(summary["status_histogram"]["empty_support"], 1)
 
     def test_unexpected_production_abstention_forces_not_evaluable(self):
-        attempt = self._attempt(CELL, 0, 0)
+        cell_ordinal = expected_cell_ids(self.preregistration).index(INDEPENDENT_CELL)
+        attempt = self._attempt(INDEPENDENT_CELL, cell_ordinal, 0)
         attempt["status"] = "singular_local_information"
         attempt["emitted"] = False
         attempt["factor_emitted"] = False
@@ -746,12 +790,15 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             attempt[name] = None
         for name in ("estimate_sha256", "predicted_covariance_sha256", "operator_sha256"):
             attempt[name] = "0" * 64
-        accumulator = self._accumulator(CELL)
+        accumulator = self._accumulator(INDEPENDENT_CELL, ordinal=cell_ordinal)
         accumulator.add(attempt)
         summary = accumulator.finalize()
         self.assertEqual(summary["status"], "not_evaluable")
-        self.assertEqual(summary["failure_histogram"], {"singular_local_information": 1})
-        validate_cell_summary(self.preregistration, summary, CELL, 0, CODE, BINARY)
+        self.assertEqual(summary["failure_histogram"], {"unexpected_singular_local_information": 1})
+        validate_cell_summary(
+            self.preregistration, summary, INDEPENDENT_CELL,
+            cell_ordinal, CODE, BINARY,
+        )
 
     def test_negative_pair_dgp_has_negative_target_reference_error_loading(self):
         negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative").replace(
@@ -772,10 +819,10 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         )
 
     def test_source_process_selects_identity_or_exponential_correlation(self):
-        independent = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
+        independent = regenerate_frozen_attempt_inputs(self.preregistration, INDEPENDENT_CELL, 0)
         spatial = regenerate_frozen_attempt_inputs(
             self.preregistration,
-            CELL.replace("independent_complex_looks", "spatial_correlation_stress"),
+            SUPPORTED_CELL,
             0,
         )
         self.assertEqual(independent["source_correlation_model"], "identity_v1")
@@ -860,6 +907,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 "bounded_sidecar_sha256": evidence["bounded_sidecar_sha256"],
                 "runtime_resource_receipt_digest": evidence["runtime_resource_receipt_digest"],
                 "bounded_runtime_resource_receipt_digest": evidence["bounded_runtime_resource_receipt_digest"],
+                "whole_artifact_semantics": evidence["whole_artifact_semantics"],
+                "bounded_artifact_semantics": evidence["bounded_artifact_semantics"],
             }
             validate_production_parity_fixture(
                 self.preregistration, Path(directory), binding, sha256_json(binding)
@@ -902,11 +951,56 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                     "factor_digest", "persisted_factor_digest", "bounded_hdf5_path",
                     "bounded_sidecar_path", "bounded_hdf5_sha256", "bounded_sidecar_sha256",
                     "runtime_resource_receipt_digest", "bounded_runtime_resource_receipt_digest",
+                    "whole_artifact_semantics", "bounded_artifact_semantics",
                 )},
                 "estimator_branch": evidence["estimator"],
             }
-            (Path(directory) / binding["bounded_sidecar_path"]).write_text("{}")
+            sidecar_path = Path(directory) / binding["bounded_sidecar_path"]
+            sidecar_path.write_text("{}")
+            binding["bounded_sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
             with self.assertRaisesRegex(SchemaError, "production parity"):
+                validate_production_parity_fixture(
+                    self.preregistration, Path(directory), binding, sha256_json(binding)
+                )
+
+    def test_production_parity_rejects_semantic_corruption_with_recomputed_enclosing_hash(self):
+        request = {
+            "schema": "dolphinrust.spatial-covariance.attempt/4",
+            "cell_id": CELL,
+            "cell_ordinal": 0,
+            "seed_index": 0,
+            "seed_sha256": "0" * 64,
+            **dict(zip(self.preregistration["matrix_contract"]["dimension_order"], CELL.split("|"))),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                [
+                    "cargo", "run", "--quiet", "-p", "dolphin-workflows",
+                    "--no-default-features", "--features", "no-gpu", "--example",
+                    "spatial_covariance_batch", "--", "--parity-fixture",
+                    "--artifact-directory", directory,
+                ],
+                input=json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n",
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).parents[2],
+            )
+            evidence = json.loads(completed.stdout)
+            binding = {
+                "schema": "dolphinrust.spatial-covariance.production-parity-fixture/4",
+                **{name: evidence[name] for name in (
+                    "hdf5_path", "sidecar_path", "hdf5_sha256", "sidecar_sha256",
+                    "hdf5_schema_version", "manifest_schema_version", "coupling", "seed_index",
+                    "factor_digest", "persisted_factor_digest", "bounded_hdf5_path",
+                    "bounded_sidecar_path", "bounded_hdf5_sha256", "bounded_sidecar_sha256",
+                    "runtime_resource_receipt_digest", "bounded_runtime_resource_receipt_digest",
+                    "whole_artifact_semantics", "bounded_artifact_semantics",
+                )},
+                "estimator_branch": evidence["estimator"],
+            }
+            binding["whole_artifact_semantics"]["blocks"][0]["source_burst_indices"][0] = 99
+            with self.assertRaisesRegex(SchemaError, "persisted block receipt"):
                 validate_production_parity_fixture(
                     self.preregistration, Path(directory), binding, sha256_json(binding)
                 )
@@ -978,6 +1072,41 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             frozen["dense_oracle_sha256"],
         )
 
+    def test_python_reconstructs_coordinate_keyed_a_transpose_r_a(self):
+        regenerated = {
+            "target_support": [[0, 0], [0, 1]],
+            "reference_support": [[0, 1], [0, 2]],
+            "source_loadings": [
+                [[0, 0], 1.0],
+                [[0, 1], -0.5],
+                [[0, 2], 2.0],
+            ],
+            "source_correlation_model": "exponential_euclidean_v1",
+            "source_correlation_distance_scale_pixels": 1.5,
+        }
+        actual = derive_dense_joint_oracle(self.preregistration, SUPPORTED_CELL, regenerated)
+        coordinates = [(0, 0), (0, 1), (0, 2)]
+        influence = np.asarray([[0.5, 0.0], [0.5, 0.5], [0.0, 0.5]])
+        correlation = np.asarray([
+            [math.exp(-math.hypot(left[0] - right[0], left[1] - right[1]) / 1.5)
+             for right in coordinates]
+            for left in coordinates
+        ])
+        spatial = 0.25 * influence.T @ correlation @ influence
+        rho = math.exp(-12.0 / 36.0)
+        dates = self.preregistration["generator"]["acquisition"]["topologies"]["four_blocks"]["acquisition_count"]
+        temporal = np.fromfunction(
+            lambda row, column: rho ** np.abs(row - column),
+            (dates, dates),
+            dtype=float,
+        )
+        temporal = temporal - temporal[:, [0]] - temporal[[0], :] + temporal[0, 0]
+        expected = np.block([
+            [spatial[0, 0] * temporal, spatial[0, 1] * temporal],
+            [spatial[1, 0] * temporal, spatial[1, 1] * temporal],
+        ])
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-15)
+
     def test_matched_signed_pair_differs_only_by_coupling(self):
         positive = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
         negative = regenerate_frozen_attempt_inputs(
@@ -1046,11 +1175,108 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             )
             spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
             manifest = root / "manifest.jsonl"
-            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
             replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True, artifact_root=root) for seed in range(expected_seed_count(cell_id)))
+            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000, replay)
             self.assertTrue(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
             cells.joinpath("cell-00000.jsonl").write_text("{}\n")
             self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
+
+    def test_high_level_outcome_runner_commits_resumes_and_rejects_tamper(self):
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/release/examples/spatial_covariance_batch"
+        benchmark = source_root / "target/release/examples/spatial_covariance_bench"
+        if not batch.exists() or not benchmark.exists():
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-workflows",
+                    "--example", "spatial_covariance_batch",
+                    "--example", "spatial_covariance_bench",
+                ],
+                check=True,
+                cwd=source_root,
+            )
+        code_sha256, binary_sha256 = producer_identities(source_root, batch, benchmark)
+        preregistration = copy.deepcopy(self.preregistration)
+        preregistration["generator"]["binary"]["source_identity"]["sha256"] = code_sha256
+        spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (1,))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+
+            def attempt(cell_id, ordinal):
+                return iter((self._attempt(
+                    cell_id, ordinal, 0, masked=True, artifact_root=root
+                ),))
+
+            def execute(*args, **kwargs):
+                destination = Path(args[4])
+                destination.write_bytes(compact_json_line(next(attempt(MASKED_CELL, 0))))
+                return {"peak_rss_bytes": 1024}
+
+            with (
+                mock.patch(
+                    "validation.spatial_covariance_simulation.validate_preoutcome_receipts"
+                ),
+                mock.patch(
+                    "validation.spatial_covariance_simulation.run_parallel_batch",
+                    side_effect=execute,
+                ),
+            ):
+                first = run_outcomes(
+                    preregistration, PREREGISTRATION, source_root, batch, benchmark,
+                    Path(directory) / "preoutcome", root, 0, spec, attempt,
+                )
+                self.assertFalse(first["reusable"])
+                self.assertEqual(first["generated_cells"], 1)
+                second = run_outcomes(
+                    preregistration, PREREGISTRATION, source_root, batch, benchmark,
+                    Path(directory) / "preoutcome", root, 0, spec, attempt,
+                )
+                self.assertTrue(second["reusable"])
+                summary = root / "cells/shard-00000/cell-00000.jsonl"
+                summary.write_text("{}\n")
+                with self.assertRaisesRegex(SchemaError, "resume validation"):
+                    run_outcomes(
+                        preregistration, PREREGISTRATION, source_root, batch, benchmark,
+                        Path(directory) / "preoutcome", root, 0, spec, attempt,
+                    )
+
+    def test_outcome_runner_preflight_binds_every_preoutcome_receipt_byte(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipts = {}
+            for name, value in (
+                ("performance.json", {}),
+                ("resources.json", []),
+                ("matched-pair-cohorts.json", []),
+            ):
+                raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+                (root / name).write_bytes(raw)
+                receipts[name] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+            manifest = {
+                "schema": "dolphinrust.spatial-covariance.preoutcome-receipts/1",
+                "code_sha256": CODE,
+                "binary_sha256": BINARY,
+                "config_sha256": sha256_json(self.preregistration["generator"]),
+                "preregistration_sha256": preregistration_digest(self.preregistration),
+                "receipts": receipts,
+            }
+            (root / "manifest.json").write_bytes(compact_json_line(manifest))
+            with (
+                mock.patch(
+                    "validation.spatial_covariance_simulation._validate_performance_probe"
+                ),
+                mock.patch(
+                    "validation.spatial_covariance_simulation._validate_resources",
+                    return_value=["pass"] * 5,
+                ),
+                mock.patch(
+                    "validation.spatial_covariance_simulation.validate_matched_pair_cohorts"
+                ),
+            ):
+                validate_preoutcome_receipts(self.preregistration, root, CODE, BINARY)
+                (root / "performance.json").write_bytes(b"{} \n")
+                with self.assertRaisesRegex(SchemaError, "differs from its manifest"):
+                    validate_preoutcome_receipts(self.preregistration, root, CODE, BINARY)
 
     def test_resume_rejects_self_consistent_replaced_summary_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1069,10 +1295,13 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             cell_path.write_bytes(compact_json_line(summary))
             spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (expected_seed_count(MASKED_CELL),))
             manifest = root / "manifest.jsonl"
-            commit_output_shard(self.preregistration, spec, root, cells, manifest, CODE, BINARY, 1.0, 1_000_000)
             replay = lambda cell_id, ordinal: (self._attempt(cell_id, ordinal, seed, masked=True, artifact_root=root) for seed in range(expected_seed_count(cell_id)))
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY, replay))
-            self.assertFalse(committed_shard_matches(self.preregistration, spec, root, manifest, CODE, BINARY))
+            with self.assertRaisesRegex(SchemaError, "deterministic replay"):
+                commit_output_shard(
+                    self.preregistration, spec, root, cells, manifest,
+                    CODE, BINARY, 1.0, 1_000_000, replay,
+                )
+            self.assertFalse(manifest.exists())
 
     def test_prepare_retains_one_descriptor_not_attempt_lines(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1103,6 +1332,10 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             commit_output_shard(
                 self.preregistration, spec, root, cells, root / "manifest.jsonl",
                 CODE, BINARY, 1.0, 1_000_000,
+                lambda cell_id, ordinal: (
+                    self._attempt(cell_id, ordinal, seed, masked=True, artifact_root=root)
+                    for seed in range(expected_seed_count(cell_id))
+                ),
             )
             self.assertFalse(descriptor.exists())
 
@@ -1273,16 +1506,314 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 _load_bounded_json(path, 128, "receipt")
 
     def test_preregistration_drift_fails_closed(self):
-        for section, field, value in (("thresholds", "coverage_absolute_error_max", 0.03), ("determinism", "prng", "unspecified"), ("numeric_contract", "operator_relative_error", "trust Rust"), ("execution_protocol", "retained_attempt_records", True)):
+        for section, field, value in (("thresholds", "coverage_covered_count_min", 116), ("determinism", "prng", "unspecified"), ("numeric_contract", "operator_relative_error", "trust Rust"), ("execution_protocol", "retained_attempt_records", True)):
             changed = copy.deepcopy(self.preregistration)
             changed[section][field] = value
             with self.subTest(section=section), self.assertRaises(SchemaError):
                 validate_preregistration(changed)
 
+    def test_expected_abstention_cannot_also_be_a_receipt_failure(self):
+        for contradiction in ("empty_support", "unexpected_empty_support"):
+            changed = copy.deepcopy(self.preregistration)
+            changed["generator"]["supported"]["receipt_failure_if"].append(contradiction)
+            with self.subTest(contradiction=contradiction), self.assertRaisesRegex(SchemaError, "status policy"):
+                validate_preregistration(changed)
+
+    def test_producer_identity_is_independently_derived_from_source_and_both_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "crates" / "producer" / "src").mkdir(parents=True)
+            (root / "target" / "release" / "examples").mkdir(parents=True)
+            (root / "Cargo.toml").write_text("[workspace]\nmembers=[]\n")
+            (root / "Cargo.lock").write_text("version = 3\n")
+            source = root / "crates" / "producer" / "src" / "lib.rs"
+            source.write_text("pub fn produce() {}\n")
+            (root / "crates" / "producer" / "Cargo.toml").write_text("[package]\nname='producer'\nversion='0.1.0'\n")
+            batch = root / "target" / "release" / "examples" / "spatial_covariance_batch"
+            benchmark = root / "target" / "release" / "examples" / "spatial_covariance_bench"
+            batch.write_bytes(b"batch-v1")
+            benchmark.write_bytes(b"benchmark-v1")
+            batch.chmod(0o755)
+            benchmark.chmod(0o755)
+            code_sha256, binary_sha256 = producer_identities(root, batch, benchmark)
+            preregistration = copy.deepcopy(self.preregistration)
+            preregistration["generator"]["binary"]["source_identity"]["sha256"] = code_sha256
+            validate_producer_identities(
+                preregistration, code_sha256, binary_sha256, root, batch, benchmark
+            )
+            source.write_text("pub fn produce() { panic!() }\n")
+            with self.assertRaisesRegex(SchemaError, "source set"):
+                validate_producer_identities(
+                    preregistration, code_sha256, binary_sha256, root, batch, benchmark
+                )
+            source.write_text("pub fn produce() {}\n")
+            benchmark.write_bytes(b"benchmark-v2")
+            with self.assertRaisesRegex(SchemaError, "producer identities"):
+                validate_producer_identities(
+                    preregistration, code_sha256, binary_sha256, root, batch, benchmark
+                )
+
+    @unittest.skipUnless(
+        os.environ.get("DOLPHIN_RUN_FULL_PREOUTCOME") == "1",
+        "full 512-seed pre-outcome receipt generation is opt-in",
+    )
+    def test_real_receipt_generators_execute_release_producers_and_reject_tamper(self):
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/release/examples/spatial_covariance_batch"
+        benchmark = source_root / "target/release/examples/spatial_covariance_bench"
+        if not batch.exists() or not benchmark.exists():
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-workflows",
+                    "--example", "spatial_covariance_batch",
+                    "--example", "spatial_covariance_bench",
+                ],
+                check=True,
+                cwd=source_root,
+            )
+        code_sha256, binary_sha256 = producer_identities(
+            source_root, batch, benchmark
+        )
+        self.assertEqual(
+            code_sha256,
+            self.preregistration["generator"]["binary"]["source_identity"]["sha256"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "preoutcome"
+            generated = generate_preoutcome_receipts(
+                self.preregistration, PREREGISTRATION, source_root,
+                batch, benchmark, 3600.0, destination,
+            )
+            self.assertEqual(generated["code_sha256"], code_sha256)
+            performance = json.loads((destination / "performance.json").read_bytes())
+            resources = json.loads((destination / "resources.json").read_bytes())
+            cohorts = json.loads((destination / "matched-pair-cohorts.json").read_bytes())
+            manifest = json.loads((destination / "manifest.json").read_bytes())
+            self.assertEqual(set(manifest["receipts"]), {
+                "performance.json", "resources.json", "matched-pair-cohorts.json",
+            })
+        _validate_performance_probe(
+            self.preregistration, performance, code_sha256, binary_sha256
+        )
+        changed_performance = copy.deepcopy(performance)
+        changed_performance["measurements"][0]["elapsed_seconds"] *= 2
+        with self.assertRaisesRegex(SchemaError, "rate"):
+            _validate_performance_probe(
+                self.preregistration, changed_performance, code_sha256, binary_sha256
+            )
+
+        self.assertEqual(
+            _validate_resources(self.preregistration, resources, binary_sha256),
+            [PASS] * 5,
+        )
+        changed_resources = copy.deepcopy(resources)
+        changed_resources[0]["growth_observation"][0]["raw_measurement"]["stdout_json"] += " "
+        with self.assertRaisesRegex(SchemaError, "raw resource measurement|stdout hash"):
+            _validate_resources(self.preregistration, changed_resources, binary_sha256)
+
+        validate_matched_pair_cohorts(cohorts)
+        changed_cohorts = copy.deepcopy(cohorts)
+        changed_cohorts[1]["predicted_covariance_trace"] = (
+            changed_cohorts[0]["predicted_covariance_trace"]
+        )
+        with self.assertRaisesRegex(SchemaError, "positive < independent < negative"):
+            validate_matched_pair_cohorts(changed_cohorts)
+
+    def test_parallel_batch_is_byte_exact_ordered_and_rss_bounded(self):
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/release/examples/spatial_covariance_batch"
+        if not batch.exists():
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-workflows",
+                    "--example", "spatial_covariance_batch",
+                ],
+                check=True,
+                cwd=source_root,
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests = root / "requests.jsonl"
+            requests.write_bytes(b"".join(
+                compact_json_line(request)
+                for request in _iter_cell_requests(self.preregistration, SUPPORTED_CELL, 12)
+            ))
+            sequential = root / "sequential.jsonl"
+            with requests.open("rb") as stdin, sequential.open("wb") as stdout:
+                subprocess.run(
+                    [
+                        str(batch), "--preregistration", str(PREREGISTRATION),
+                        "--cell-id", SUPPORTED_CELL, "--ephemeral-evidence-stdout",
+                    ],
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    cwd=source_root,
+                )
+            parallel = root / "parallel.jsonl"
+            receipt = run_parallel_batch(
+                source_root, PREREGISTRATION, requests, SUPPORTED_CELL, parallel
+            )
+            self.assertEqual(parallel.read_bytes(), sequential.read_bytes())
+            self.assertEqual(receipt["worker_count"], 4)
+            self.assertEqual(receipt["max_requests_per_child"], 3)
+            self.assertEqual(receipt["child_invocation_count"], 4)
+            self.assertEqual(receipt["wave_count"], 1)
+            self.assertEqual(receipt["output_records"], 12)
+            self.assertLessEqual(receipt["peak_rss_bytes"], 24 << 30)
+            self.assertEqual(
+                [json.loads(line)["seed_index"] for line in parallel.read_text().splitlines()],
+                list(range(12)),
+            )
+
+    def test_parallel_batch_bounds_128_attempts_to_43_children_and_four_waves(self):
+        performance = self.preregistration["execution_protocol"]["performance_probe"]
+        child_invocations = math.ceil(
+            128 / performance["max_requests_per_child"]
+        )
+        self.assertEqual(PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD, 3)
+        self.assertEqual(child_invocations, 43)
+        self.assertEqual(
+            math.ceil(child_invocations / performance["parallel_worker_count"]), 4
+        )
+
+    def test_parallel_batch_children_generate_seed_descriptors_in_parallel_and_time_them(self):
+        source_root = Path(__file__).parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            passthrough = Path(directory) / "passthrough"
+            passthrough.write_text("#!/bin/sh\ncat\n")
+            passthrough.chmod(0o755)
+            with mock.patch(
+                "validation.spatial_covariance_simulation._cell_request_at",
+                side_effect=AssertionError("parent generated a request"),
+            ):
+                receipt = run_parallel_batch(
+                    source_root,
+                    PREREGISTRATION,
+                    None,
+                    SUPPORTED_CELL,
+                    seed_count=12,
+                    batch_binary=passthrough,
+                    generation_delay_seconds=0.2,
+                )
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 0.6)
+        self.assertLess(receipt["elapsed_seconds"], 1.8)
+        self.assertEqual(receipt["child_invocation_count"], 4)
+        self.assertEqual(receipt["output_records"], 12)
+
+    def test_performance_probe_rejects_superlinear_32_to_128_wall_scaling(self):
+        frozen = self.preregistration["execution_protocol"]["performance_probe"]
+        measurements = []
+        for cell_class in frozen["required_cell_classes"]:
+            for seed_count in frozen["seed_counts"]:
+                invocations = math.ceil(seed_count / frozen["max_requests_per_child"])
+                measurements.append({
+                    "cell_class": cell_class,
+                    "seed_count": seed_count,
+                    "attempt_count": seed_count,
+                    "elapsed_seconds": 1.0 if seed_count == 32 else 4.0,
+                    "peak_rss_bytes": 1,
+                    "worker_count": min(frozen["parallel_worker_count"], invocations),
+                    "max_requests_per_child": frozen["max_requests_per_child"],
+                    "child_invocation_count": invocations,
+                    "wave_count": math.ceil(invocations / frozen["parallel_worker_count"]),
+                    "worker_rss_admission_bytes": frozen["worker_rss_admission_bytes"],
+                    "aggregate_rss_cap_bytes": frozen["aggregate_rss_cap_bytes"],
+                    "output_records": seed_count,
+                    "ordered_output_sha256": "c" * 64,
+                    "outcomes_persisted": False,
+                })
+        attempts = sum(item["attempt_count"] for item in measurements)
+        elapsed = sum(item["elapsed_seconds"] for item in measurements)
+        rate = attempts / elapsed
+        projected = FROZEN_ATTEMPT_COUNT / rate
+        receipt = {
+            "schema": "dolphinrust.spatial-covariance.performance-probe",
+            "schema_version": 1,
+            "outcomes_persisted": False,
+            "seed_counts": list(frozen["seed_counts"]),
+            "cell_classes": list(frozen["required_cell_classes"]),
+            "measurements": measurements,
+            "attempts_per_second": rate,
+            "peak_rss_bytes": 1,
+            "target_wall_seconds": 3600.0,
+            "reserve_fraction": frozen["reserve_fraction"],
+            "projected_serial_seconds": projected,
+            "derived_concurrency": math.ceil(
+                projected / (3600.0 * (1.0 - frozen["reserve_fraction"]))
+            ),
+            "code_sha256": CODE,
+            "binary_sha256": BINARY,
+            "config_sha256": sha256_json(self.preregistration["generator"]),
+        }
+        _validate_performance_probe(self.preregistration, receipt, CODE, BINARY)
+        changed = copy.deepcopy(receipt)
+        changed["measurements"][1]["elapsed_seconds"] = 6.1
+        elapsed = sum(item["elapsed_seconds"] for item in changed["measurements"])
+        changed["attempts_per_second"] = attempts / elapsed
+        changed["projected_serial_seconds"] = (
+            FROZEN_ATTEMPT_COUNT / changed["attempts_per_second"]
+        )
+        changed["derived_concurrency"] = math.ceil(
+            changed["projected_serial_seconds"]
+            / (3600.0 * (1.0 - frozen["reserve_fraction"]))
+        )
+        with self.assertRaisesRegex(SchemaError, "superlinear"):
+            _validate_performance_probe(
+                self.preregistration, changed, CODE, BINARY
+            )
+
+    def test_matched_cohort_generator_rejects_nonfrozen_seed_count_before_execution(self):
+        with self.assertRaisesRegex(SchemaError, "seed count"):
+            generate_matched_pair_cohorts(
+                self.preregistration, PREREGISTRATION, Path("missing-batch"),
+                CODE, BINARY, 32,
+            )
+
     def test_cli_exposes_compact_lifecycle(self):
         completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
-        for command in ("capture-resource", "prepare", "reduce-cell", "commit", "resume", "assemble"):
+        for command in (
+            "capture-resource", "prepare", "reduce-cell", "commit", "resume", "assemble",
+            "generate-performance", "generate-resources", "generate-matched-cohorts",
+            "generate-preoutcome", "run-outcomes",
+        ):
             self.assertIn(command, completed.stdout)
+        for command in (
+            "reduce-cell", "commit", "resume", "assemble",
+            "generate-performance", "generate-resources", "generate-matched-cohorts",
+            "generate-preoutcome", "run-outcomes",
+        ):
+            identity_help = subprocess.run(
+                [sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), command, "--help"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            for option in ("--source-root", "--batch-binary", "--benchmark-binary"):
+                self.assertIn(option, identity_help)
+            self.assertNotIn("--code-sha256", identity_help)
+            self.assertNotIn("--binary-sha256", identity_help)
+
+    def test_prebuilt_batch_regenerator_streams_one_exact_cell(self):
+        batch = Path("target/release/examples/spatial_covariance_batch")
+        if not batch.exists():
+            subprocess.run(
+                ["cargo", "build", "--release", "-p", "dolphin-workflows", "--example", "spatial_covariance_batch"],
+                check=True,
+            )
+        replay = rust_attempt_regenerator(self.preregistration, PREREGISTRATION, batch)
+        cell_ordinal = expected_cell_ids(self.preregistration).index(MASKED_CELL)
+        attempts = list(replay(MASKED_CELL, cell_ordinal))
+        self.assertEqual(len(attempts), expected_seed_count(MASKED_CELL))
+        accumulator = CellAccumulator(
+            self.preregistration, MASKED_CELL, cell_ordinal,
+            expected_seed_count(MASKED_CELL), CODE, BINARY,
+            artifact_root=self.artifact_root,
+        )
+        for attempt in attempts:
+            accumulator.add(attempt)
+        self.assertEqual(accumulator.finalize()["status"], PASS)
 
     def test_assembly_fails_closed_until_rust_replay_executable_is_available(self):
         with self.assertRaisesRegex(SchemaError, "Rust spatial_covariance_batch replay executable"):
