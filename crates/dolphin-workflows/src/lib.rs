@@ -53,8 +53,9 @@ pub use provenance::{
     INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
-    plan_sequential_covariance_capture, plan_sequential_masked_covariance_capture, run_sequential,
-    run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    plan_sequential_covariance_capture, plan_sequential_covariance_update,
+    plan_sequential_masked_covariance_capture, run_sequential, run_sequential_masked,
+    run_sequential_masked_with_covariance_capture,
     run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
     run_sequential_resumable_masked, run_sequential_resumable_masked_with_covariance_capture,
     run_sequential_resumable_masked_with_covariance_capture_and_source_factors,

@@ -387,10 +387,8 @@ impl CslcCovarianceManifest {
         )
     }
 
-    /// Build a resolver over the full burst-local `member_indices` whose replay
-    /// namespace is the exact `generation_member_indices` receipt while retaining
-    /// the complete revision identity. Keeping the full burst-local member list
-    /// preserves global acquisition offsets for later generations.
+    /// Build a resolver over one exact generation while retaining the complete
+    /// revision identity separately from the generation replay namespace.
     ///
     /// # Errors
     /// Returns an error for an invalid generation receipt, member, grid, or
@@ -438,11 +436,14 @@ impl CslcCovarianceManifest {
                 .all(|pair| pair[1] == pair[0] + 1),
             "generation members must be one contiguous date range in the resolver member list"
         );
+        let generation_date_start = *generation_member_positions
+            .first()
+            .context("generation member list is empty")?;
         self.resolver_with_manifest_digest(
-            member_indices,
+            generation_member_indices,
             burst_id,
             generation_digest,
-            Some((generation, generation_member_positions)),
+            Some((generation, generation_date_start)),
             processed_origin,
             processed_shape,
             tile_grid,
@@ -589,7 +590,7 @@ impl CslcCovarianceManifest {
         member_indices: &[usize],
         burst_id: String,
         source_manifest_digest: [u8; 32],
-        generation_scope: Option<(u32, Vec<usize>)>,
+        generation_scope: Option<(u32, usize)>,
         processed_origin: (usize, usize),
         processed_shape: (usize, usize),
         tile_grid: CovarianceOperatorGrid,
@@ -691,7 +692,7 @@ pub struct CslcCovarianceSourceResolver<'a> {
     factor_config: EmpiricalProperComplexConfig,
     identity: SequentialSourceProviderIdentity,
     full_revision_manifest_digest: [u8; 32],
-    generation_scope: Option<(u32, Vec<usize>)>,
+    generation_scope: Option<(u32, usize)>,
     validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
     tile_cache: Option<CslcSourceTileCache>,
     metrics: CslcCovarianceResolverMetrics,
@@ -982,33 +983,32 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
         block: &SequentialReplayBlock,
         native_index: usize,
     ) -> Result<ResolvedPrimitiveSource, SequentialReplayError> {
-        let start = usize::try_from(block.real_date_start.get())
+        let global_start = usize::try_from(block.real_date_start.get())
             .map_err(|_| SequentialReplayError::Invalid("source date exceeds usize"))?;
-        let stop =
-            start
-                .checked_add(block.num_real_dates)
-                .ok_or(SequentialReplayError::Invalid(
-                    "source date range overflows usize",
-                ))?;
-        if stop > self.members.len() {
-            return Err(Self::provider_error(
-                ReplayStatus::SourceIdentityMismatch,
-                "replay block dates differ from the ordered CSLC source members",
-            ));
-        }
-        if let Some((generation, member_positions)) = &self.generation_scope {
-            let exact_range = block.generation == *generation
-                && member_positions.len() == block.num_real_dates
-                && member_positions
-                    .iter()
-                    .enumerate()
-                    .all(|(offset, position)| *position == start + offset);
-            if !exact_range {
+        let global_stop = global_start.checked_add(block.num_real_dates).ok_or(
+            SequentialReplayError::Invalid("source date range overflows usize"),
+        )?;
+        let (start, stop) = match self.generation_scope {
+            Some((generation, generation_date_start))
+                if block.generation == generation
+                    && global_start == generation_date_start
+                    && block.num_real_dates == self.members.len() =>
+            {
+                (0, self.members.len())
+            }
+            Some(_) => {
                 return Err(Self::provider_error(
                     ReplayStatus::SourceIdentityMismatch,
                     "replay block generation or dates differ from the generation source receipt",
                 ));
             }
+            None => (global_start, global_stop),
+        };
+        if stop > self.members.len() {
+            return Err(Self::provider_error(
+                ReplayStatus::SourceIdentityMismatch,
+                "replay block dates differ from the ordered CSLC source members",
+            ));
         }
         let source_pixel = self.source_pixel(native_index)?;
         let window = self.canonical_window(source_pixel)?;
@@ -1061,7 +1061,7 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
             covariance_content_bound_source_id(locator, &content_digest)
                 .map_err(|_| SequentialReplayError::Invalid("binding source content failed"))?,
         );
-        let component_ids = (start..stop)
+        let component_ids = (global_start..global_stop)
             .map(|index| {
                 u64::try_from(index)
                     .map_err(|_| SequentialReplayError::Invalid("component index exceeds u64"))
@@ -1071,7 +1071,7 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
         data_identity.update(b"dolphinrust:cslc_source_block_identity:v1");
         data_identity.update(self.identity.source_manifest_digest);
         data_identity.update((members.len() as u64).to_le_bytes());
-        for (index, member) in (start..stop).zip(members) {
+        for (index, member) in (global_start..global_stop).zip(members) {
             data_identity.update((index as u64).to_le_bytes());
             data_identity.update(member.content_digest);
         }

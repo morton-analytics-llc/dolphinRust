@@ -2833,6 +2833,30 @@ impl CovarianceOperatorWriter {
         self.generation_registry.as_ref()
     }
 
+    /// Prove this untouched writer was created from one exact NRT update plan.
+    ///
+    /// # Errors
+    /// Returns when metadata, source namespace, topology, generation identity,
+    /// or prior destination mutation differs from the expected update plan.
+    pub fn validate_empty_nrt_destination(
+        &self,
+        plan: &CovarianceOperatorPlan,
+        registry: &CovarianceGenerationRegistry,
+    ) -> Result<()> {
+        plan.validate(&self.metadata)?;
+        registry.validate(&self.metadata, Some(plan))?;
+        ensure_valid(
+            self.block_count == 0
+                && self.current_chain.blocks.is_empty()
+                && self.generation_registry.as_ref() == Some(registry)
+                && self.source_manifest_digest == plan.source_manifest_digest
+                && self.source_model_version_digest == plan.source_model_version_digest
+                && self.expected_generations == plan.expected_generations()?
+                && self.expected_tiles == plan.expected_tiles(),
+            "covariance destination differs from the exact untouched NRT update plan",
+        )
+    }
+
     fn write_block_inner(&mut self, block: &CovarianceOperatorBlock) -> Result<()> {
         block.validate(self.metadata.gauge_date_index)?;
         let topology = CovarianceBlockTopology::from(block);

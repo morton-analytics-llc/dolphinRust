@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -17,7 +16,7 @@ use dolphin_io::{
 };
 use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{
-    empirical_factor_config, plan_sequential_covariance_capture,
+    empirical_factor_config, plan_sequential_covariance_capture, plan_sequential_covariance_update,
     run_sequential_resumable_with_covariance_capture_and_source_factors,
     sequential_replay_config_digest, sequential_replay_kernel_digest,
     sequential_source_model_identity_digest,
@@ -203,6 +202,134 @@ fn generation_bundle_routes_exact_empirical_receipts_and_rejects_mixed_identity(
         error.to_string().contains("generation source manifest"),
         "{error}"
     );
+    for path in member_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn long_history_bundle_reads_and_caches_only_one_generation() {
+    let _hdf5 = HDF5_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = std::env::temp_dir().join(format!(
+        "dolphin-cslc-nrt-long-history-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let member_paths = paths(&root, 21);
+    for (date, path) in member_paths.iter().enumerate() {
+        write_member(path, date, false);
+    }
+    let manifest =
+        CslcCovarianceManifest::capture(InputType::OperaCslc, "/data", &member_paths).unwrap();
+    let options = EmpiricalSourceFactorOptions {
+        half_window: HalfWindow { y: 1, x: 1 },
+        shrinkage_alpha: 0.2,
+        relative_diagonal_floor: 1e-8,
+    };
+    let model_version = sequential_source_model_identity_digest(
+        CSLC_COVARIANCE_SOURCE_PROVIDER,
+        CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+        CSLC_COVARIANCE_SOURCE_MODEL,
+        CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+    );
+    let model_receipt = *empirical_factor_config(&options).unwrap().config_digest();
+    let member_indices = (0..21).collect::<Vec<_>>();
+    let generations = member_indices
+        .chunks(5)
+        .enumerate()
+        .map(|(generation, members)| CovarianceGenerationIdentity {
+            burst_id: "burst".to_owned(),
+            generation: generation as u32,
+            source_date_indices: members.iter().map(|date| *date as u32).collect(),
+            source_member_manifest_digest: manifest
+                .generation_member_manifest_digest(members, "burst", generation as u32)
+                .unwrap(),
+            source_model_version_digest: model_version,
+            source_model_receipt_digest: model_receipt,
+            normalized_config_digest: [1; 32],
+            kernel_digest: [2; 32],
+            mask_digest: [3; 32],
+            blocks: vec![CovarianceGenerationBlockIdentity {
+                block_id: generation as u64 + 1,
+                block_sha256: [4; 32],
+            }],
+            sealed: members.len() == 5,
+        })
+        .collect();
+    let registry = CovarianceGenerationRegistry {
+        schema_version: COVARIANCE_GENERATION_REGISTRY_SCHEMA_VERSION,
+        full_source_manifest_digest: manifest.digest(),
+        generations,
+    };
+    let grid = CovarianceOperatorGrid {
+        row_start: 0,
+        col_start: 0,
+        rows: 3,
+        cols: 4,
+        stride_y: 1,
+        stride_x: 1,
+    };
+    let mut bundle = manifest
+        .resolver_bundle(
+            &member_indices,
+            &registry,
+            "burst",
+            (0, 0),
+            (3, 4),
+            grid,
+            &options,
+            model_version,
+            None,
+        )
+        .unwrap();
+    let full_history = manifest
+        .resolver(
+            &member_indices,
+            "burst",
+            (0, 0),
+            (3, 4),
+            grid,
+            &options,
+            model_version,
+            None,
+        )
+        .unwrap();
+    assert!(bundle.maximum_resident_bytes() < full_history.maximum_resident_bytes());
+
+    let tail = SequentialReplayBlock {
+        id: GlobalBlockId::new(5),
+        generation: 4,
+        real_date_start: GlobalDateId::new(20),
+        num_real_dates: 1,
+        carried_parent_ids: Vec::new(),
+        phase_dimension: 1,
+    };
+    let tail_source = bundle.resolve_source(&tail, 0).unwrap();
+    assert_ne!(bundle.factor_receipt_digest(&tail_source).unwrap(), [0; 32]);
+    assert_eq!(bundle.metrics().member_window_reads, 1);
+    assert_eq!(bundle.metrics().tile_cache_loads, 1);
+
+    let first = SequentialReplayBlock {
+        id: GlobalBlockId::new(1),
+        generation: 0,
+        real_date_start: GlobalDateId::new(0),
+        num_real_dates: 5,
+        carried_parent_ids: Vec::new(),
+        phase_dimension: 1,
+    };
+    let first_source = bundle.resolve_source(&first, 0).unwrap();
+    assert_ne!(
+        bundle.factor_receipt_digest(&first_source).unwrap(),
+        [0; 32]
+    );
+    assert_eq!(bundle.metrics().member_window_reads, 6);
+    assert_eq!(bundle.metrics().tile_cache_loads, 2);
+    assert_eq!(bundle.active_generation(), Some(0));
+
     for path in member_paths {
         let _ = std::fs::remove_file(path);
     }
@@ -415,7 +542,25 @@ fn resumable_capture_persists_empirical_receipts_and_leaves_only_tail_open() {
         let value = Cf32::new(1.0 + 3.0 * 0.2 + row as f32 * 0.01, 0.5 + col as f32 * 0.03);
         Cf64::new(f64::from(value.re), f64::from(value.im))
     });
-    let incremental_blocks = RefCell::new(Vec::new());
+    let extended_path = root.join("extended.scratch");
+    let update_plan = plan_sequential_covariance_update(
+        &state,
+        1,
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    )
+    .unwrap();
+    let mut extended_metadata = metadata.clone();
+    extended_metadata.source.manifest_digest = Some(encode(extended.digest()));
+    let mut extended_writer = CovarianceOperatorWriter::create_with_generation_registry(
+        &extended_path,
+        &extended_metadata,
+        update_plan.operator_plan(),
+        update_plan.generation_registry(),
+    )
+    .unwrap();
     let (_, extended_state) = update_sequential_with_covariance_capture_and_source_factors(
         &state,
         fourth_stack.view(),
@@ -426,21 +571,23 @@ fn resumable_capture_persists_empirical_receipts_and_leaves_only_tail_open() {
         &parent_reader,
         copy_cap,
         &mut extended_bundle,
-        |block_id| {
-            incremental_blocks.borrow_mut().push(
-                parent_reader
-                    .read_block_with_receipt(block_id, copy_cap)?
-                    .block,
-            );
-            Ok(())
-        },
-        |block| {
-            incremental_blocks.borrow_mut().push(block);
-            Ok(())
-        },
+        &mut extended_writer,
     )
     .unwrap();
-    let mut incremental_blocks = incremental_blocks.into_inner();
+    extended_writer.finish().unwrap();
+    let extended_reader =
+        dolphin_io::CovarianceOperatorBlockReader::open(&extended_path, u64::MAX).unwrap();
+    let mut incremental_blocks = extended_state
+        .generation_registry()
+        .generations
+        .iter()
+        .map(|identity| {
+            extended_reader
+                .read_block_with_receipt(identity.blocks[0].block_id, u64::MAX)
+                .unwrap()
+                .block
+        })
+        .collect::<Vec<_>>();
     incremental_blocks.sort_by_key(|block| block.generation);
     assert_eq!(incremental_blocks.len(), 2);
     assert_eq!(incremental_blocks[0], blocks[0]);
@@ -456,7 +603,9 @@ fn resumable_capture_persists_empirical_receipts_and_leaves_only_tail_open() {
     assert_eq!(extended_state.open_real_slcs().dim().0, 0);
     assert_eq!(extended_bundle.active_generation(), Some(1));
     drop(parent_reader);
+    drop(extended_reader);
     let _ = std::fs::remove_file(parent_path);
+    let _ = std::fs::remove_file(extended_path);
     for path in extended_paths {
         let _ = std::fs::remove_file(path);
     }

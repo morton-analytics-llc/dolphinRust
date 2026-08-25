@@ -1,18 +1,19 @@
-use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_io::{
-    covariance_source_model_identity_digest, CovarianceCalibrationStatus, CovarianceOperatorBlock,
-    CovarianceOperatorBlockReader, CovarianceOperatorGrid, CovarianceOperatorMetadata,
-    CovarianceOperatorWriter, CovarianceReplayStatus, DownstreamInferenceStatus,
-    SourceReplayIdentity, StitchedCovarianceStatus,
+    covariance_source_model_identity_digest, recover_incomplete_covariance_operator,
+    CovarianceCalibrationStatus, CovarianceOperatorBlock, CovarianceOperatorBlockReader,
+    CovarianceOperatorGrid, CovarianceOperatorMetadata, CovarianceOperatorWriter,
+    CovarianceReplayStatus, DownstreamInferenceStatus, SourceReplayIdentity,
+    StitchedCovarianceStatus,
 };
 use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{
-    plan_sequential_covariance_capture, run_sequential_resumable_masked_with_covariance_capture,
+    plan_sequential_covariance_capture, plan_sequential_covariance_update,
+    run_sequential_resumable_masked_with_covariance_capture,
     run_sequential_resumable_with_covariance_capture, sequential_replay_config_digest,
     sequential_replay_kernel_digest, update_sequential_masked_with_covariance_capture,
     update_sequential_with_covariance_capture, SequentialConfig, SequentialCovarianceRevision,
@@ -162,6 +163,54 @@ fn artifact_path(label: &str) -> PathBuf {
     ))
 }
 
+fn scratch_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "dolphin-nrt-covariance-{label}-{}.scratch",
+        std::process::id()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_update_writer(
+    path: &Path,
+    state: &SequentialCovarianceState,
+    new_dates: usize,
+    cfg: &SequentialConfig,
+    engine: &ComputeEngine,
+    request: &dolphin_workflows::SequentialCovarianceCaptureRequest,
+    revision: &SequentialCovarianceRevision,
+) -> CovarianceOperatorWriter {
+    recover_incomplete_covariance_operator(path).unwrap();
+    let plan = plan_sequential_covariance_update(state, new_dates, cfg, engine, request, revision)
+        .unwrap();
+    CovarianceOperatorWriter::create_with_generation_registry(
+        path,
+        &metadata(cfg, request, revision),
+        plan.operator_plan(),
+        plan.generation_registry(),
+    )
+    .unwrap()
+}
+
+fn read_generation_blocks(path: &Path) -> Vec<CovarianceOperatorBlock> {
+    let reader = CovarianceOperatorBlockReader::open(path, u64::MAX).unwrap();
+    let mut blocks = reader
+        .generation_registry()
+        .unwrap()
+        .generations
+        .iter()
+        .flat_map(|identity| identity.blocks.iter())
+        .map(|identity| {
+            reader
+                .read_block_with_receipt(identity.block_id, u64::MAX)
+                .unwrap()
+                .block
+        })
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|block| block.generation);
+    blocks
+}
+
 fn write_artifact(
     path: &Path,
     cfg: &SequentialConfig,
@@ -252,8 +301,16 @@ fn nrt_capture_reuses_only_sealed_generations_and_matches_fresh_bytes() {
         .maximum_block_read_bytes;
     let extended_revision = revision_13(Some(initial_revision.full_source_manifest_digest));
     let extended_request = request(extended_revision.full_source_manifest_digest);
-    let mut copies = 0;
-    let mut captures = 0;
+    let below_path = scratch_path("below-copy-cap");
+    let mut below_writer = create_update_writer(
+        &below_path,
+        &state_9,
+        4,
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    );
     let error = match update_sequential_with_covariance_capture(
         &state_9,
         values.slice(s![9.., .., ..]),
@@ -263,22 +320,90 @@ fn nrt_capture_reuses_only_sealed_generations_and_matches_fresh_bytes() {
         &extended_revision,
         &parent,
         exact_cap - 1,
-        |_| {
-            copies += 1;
-            Ok(())
-        },
-        |_| {
-            captures += 1;
-            Ok(())
-        },
+        &mut below_writer,
     ) {
         Err(error) => error,
         Ok(_) => panic!("one-byte-below sealed copy cap must fail"),
     };
     assert!(error.to_string().contains("byte cap"), "{error}");
-    assert_eq!((copies, captures), (0, 0));
+    assert_eq!(below_writer.retained_topology_block_count(), 0);
+    drop(below_writer);
+    recover_incomplete_covariance_operator(&below_path).unwrap();
 
-    let incremental_blocks = RefCell::new(Vec::new());
+    let no_op_path = scratch_path("no-op-destination");
+    let no_op_writer = create_update_writer(
+        &no_op_path,
+        &state_9,
+        4,
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    );
+    assert!(no_op_writer.finish().is_err());
+    recover_incomplete_covariance_operator(&no_op_path).unwrap();
+
+    let partial_path = scratch_path("partial-destination");
+    let mut partial_writer = create_update_writer(
+        &partial_path,
+        &state_9,
+        4,
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    );
+    let sealed_block_id = state_9.generation_registry().generations[0].blocks[0].block_id;
+    partial_writer
+        .copy_validated_sealed_block(&parent, sealed_block_id, exact_cap)
+        .unwrap();
+    assert!(partial_writer.finish().is_err());
+    recover_incomplete_covariance_operator(&partial_path).unwrap();
+
+    let wrong_destination_path = scratch_path("wrong-destination-plan");
+    recover_incomplete_covariance_operator(&wrong_destination_path).unwrap();
+    let wrong_plan = plan_sequential_covariance_capture(
+        13,
+        (4, 4),
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    )
+    .unwrap();
+    let mut wrong_destination = CovarianceOperatorWriter::create_with_generation_registry(
+        &wrong_destination_path,
+        &metadata(&cfg, &extended_request, &extended_revision),
+        wrong_plan.operator_plan(),
+        wrong_plan.generation_registry(),
+    )
+    .unwrap();
+    assert!(update_sequential_with_covariance_capture(
+        &state_9,
+        values.slice(s![9.., .., ..]),
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+        &parent,
+        exact_cap,
+        &mut wrong_destination,
+    )
+    .is_err());
+    assert_eq!(wrong_destination.retained_topology_block_count(), 0);
+    drop(wrong_destination);
+    recover_incomplete_covariance_operator(&wrong_destination_path).unwrap();
+
+    let incremental_path = scratch_path("incremental");
+    let mut incremental_writer = create_update_writer(
+        &incremental_path,
+        &state_9,
+        4,
+        &cfg,
+        &engine,
+        &extended_request,
+        &extended_revision,
+    );
     let (incremental_output, state_13) = update_sequential_with_covariance_capture(
         &state_9,
         values.slice(s![9.., .., ..]),
@@ -288,18 +413,10 @@ fn nrt_capture_reuses_only_sealed_generations_and_matches_fresh_bytes() {
         &extended_revision,
         &parent,
         exact_cap,
-        |block_id| {
-            incremental_blocks
-                .borrow_mut()
-                .push(parent.read_block_with_receipt(block_id, exact_cap)?.block);
-            Ok(())
-        },
-        |block| {
-            incremental_blocks.borrow_mut().push(block);
-            Ok(())
-        },
+        &mut incremental_writer,
     )
     .unwrap();
+    incremental_writer.finish().unwrap();
     let mut fresh_blocks = Vec::new();
     let fresh_revision = revision_13(None);
     let (fresh_output, fresh_state) = run_sequential_resumable_with_covariance_capture(
@@ -314,8 +431,7 @@ fn nrt_capture_reuses_only_sealed_generations_and_matches_fresh_bytes() {
         },
     )
     .unwrap();
-    let mut incremental_blocks = incremental_blocks.into_inner();
-    incremental_blocks.sort_by_key(|block| block.generation);
+    let incremental_blocks = read_generation_blocks(&incremental_path);
     fresh_blocks.sort_by_key(|block| block.generation);
     assert_eq!(incremental_blocks.len(), fresh_blocks.len());
     for (incremental, fresh) in incremental_blocks.iter().zip(&fresh_blocks) {
@@ -340,6 +456,7 @@ fn nrt_capture_reuses_only_sealed_generations_and_matches_fresh_bytes() {
         .all(|(left, right)| left.re.to_bits() == right.re.to_bits()
             && left.im.to_bits() == right.im.to_bits()));
     let _ = std::fs::remove_file(parent_path);
+    let _ = std::fs::remove_file(incremental_path);
 }
 
 #[test]
@@ -383,7 +500,16 @@ fn one_at_a_time_extensions_complete_the_same_registry_as_fresh_capture() {
             .maximum_block_read_bytes;
         let next_revision = revision(count, Some(prior_revision.full_source_manifest_digest));
         let next_request = request(next_revision.full_source_manifest_digest);
-        let next_blocks = RefCell::new(Vec::new());
+        let next_path = scratch_path(&format!("stream-{count}"));
+        let mut next_writer = create_update_writer(
+            &next_path,
+            &state,
+            1,
+            &cfg,
+            &engine,
+            &next_request,
+            &next_revision,
+        );
         let (_, next_state) = update_sequential_with_covariance_capture(
             &state,
             values.slice(s![count - 1..count, .., ..]),
@@ -393,28 +519,11 @@ fn one_at_a_time_extensions_complete_the_same_registry_as_fresh_capture() {
             &next_revision,
             &parent,
             cap,
-            |block_id| {
-                next_blocks
-                    .borrow_mut()
-                    .push(parent.read_block_with_receipt(block_id, cap)?.block);
-                Ok(())
-            },
-            |block| {
-                next_blocks.borrow_mut().push(block);
-                Ok(())
-            },
+            &mut next_writer,
         )
         .unwrap();
+        next_writer.finish().unwrap();
         drop(parent);
-        let next_path = artifact_path(&format!("stream-{count}"));
-        write_artifact(
-            &next_path,
-            &cfg,
-            &next_request,
-            &next_revision,
-            &next_state,
-            &next_blocks.into_inner(),
-        );
         let _ = std::fs::remove_file(parent_path);
         parent_path = next_path;
         prior_revision = next_revision;
@@ -482,7 +591,16 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
             "generation" => changed.generation_source_manifest_digests[0] = [8; 32],
             _ => unreachable!(),
         }
-        let touched = Cell::new(0);
+        let destination_path = scratch_path(&format!("tamper-{label}"));
+        let mut destination = create_update_writer(
+            &destination_path,
+            &state,
+            4,
+            &cfg,
+            &engine,
+            &request_13,
+            &base,
+        );
         assert!(update_sequential_with_covariance_capture(
             &state,
             values.slice(s![9.., .., ..]),
@@ -492,22 +610,26 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
             &changed,
             &parent,
             u64::MAX,
-            |_| {
-                touched.set(touched.get() + 1);
-                Ok(())
-            },
-            |_| {
-                touched.set(touched.get() + 1);
-                Ok(())
-            },
+            &mut destination,
         )
         .is_err());
-        assert_eq!(touched.get(), 0, "{label}");
+        assert_eq!(destination.retained_topology_block_count(), 0, "{label}");
+        drop(destination);
+        recover_incomplete_covariance_operator(destination_path).unwrap();
     }
 
     let mut changed_cfg = cfg;
     changed_cfg.beta = 0.25;
-    let touched = Cell::new(0);
+    let changed_cfg_path = scratch_path("tamper-config");
+    let mut changed_cfg_destination = create_update_writer(
+        &changed_cfg_path,
+        &state,
+        4,
+        &cfg,
+        &engine,
+        &request_13,
+        &base,
+    );
     assert!(update_sequential_with_covariance_capture(
         &state,
         values.slice(s![9.., .., ..]),
@@ -517,17 +639,12 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
         &base,
         &parent,
         u64::MAX,
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
+        &mut changed_cfg_destination,
     )
     .is_err());
-    assert_eq!(touched.get(), 0);
+    assert_eq!(changed_cfg_destination.retained_topology_block_count(), 0);
+    drop(changed_cfg_destination);
+    recover_incomplete_covariance_operator(changed_cfg_path).unwrap();
 
     let valid = Array2::from_elem((4, 4), true);
     let mut masked_blocks = Vec::new();
@@ -554,7 +671,16 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
         &masked_blocks,
     );
     let masked_parent = CovarianceOperatorBlockReader::open(&masked_path, u64::MAX).unwrap();
-    let touched = Cell::new(0);
+    let mismatched_parent_path = scratch_path("tamper-parent-registry");
+    let mut mismatched_parent_destination = create_update_writer(
+        &mismatched_parent_path,
+        &state,
+        4,
+        &cfg,
+        &engine,
+        &request_13,
+        &base,
+    );
     assert!(update_sequential_with_covariance_capture(
         &state,
         values.slice(s![9.., .., ..]),
@@ -564,20 +690,28 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
         &base,
         &masked_parent,
         u64::MAX,
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
+        &mut mismatched_parent_destination,
     )
     .is_err());
-    assert_eq!(touched.get(), 0, "mismatched parent registry");
+    assert_eq!(
+        mismatched_parent_destination.retained_topology_block_count(),
+        0,
+        "mismatched parent registry"
+    );
+    drop(mismatched_parent_destination);
+    recover_incomplete_covariance_operator(mismatched_parent_path).unwrap();
     let mut changed_mask = valid;
     changed_mask[(0, 0)] = false;
-    let touched = Cell::new(0);
+    let changed_mask_path = scratch_path("tamper-mask");
+    let mut changed_mask_destination = create_update_writer(
+        &changed_mask_path,
+        &masked_state,
+        4,
+        &cfg,
+        &engine,
+        &request_13,
+        &base,
+    );
     assert!(update_sequential_masked_with_covariance_capture(
         &masked_state,
         values.slice(s![9.., .., ..]),
@@ -588,17 +722,12 @@ fn update_identity_tamper_fails_before_copy_or_capture() {
         &base,
         &masked_parent,
         u64::MAX,
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
-        |_| {
-            touched.set(touched.get() + 1);
-            Ok(())
-        },
+        &mut changed_mask_destination,
     )
     .is_err());
-    assert_eq!(touched.get(), 0);
+    assert_eq!(changed_mask_destination.retained_topology_block_count(), 0);
+    drop(changed_mask_destination);
+    recover_incomplete_covariance_operator(changed_mask_path).unwrap();
     let _ = std::fs::remove_file(parent_path);
     let _ = std::fs::remove_file(masked_path);
 }
