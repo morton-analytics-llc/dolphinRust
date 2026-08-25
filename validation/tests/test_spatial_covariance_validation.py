@@ -2459,6 +2459,36 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             BINARY,
         ).add(attempt)
 
+    def test_rect_stride_baselines_bind_exact_transitive_effective_support(self):
+        expected_receipts = (
+            (90, "f25cd176365711ff2c98fe892cfaedcb2eb645a6472ba19e904bbc2cf1dfcadd", 0.10674633888542963),
+            (63, "d520aded0bd2a20c3706ddb0c6d67aab16ed8ca8888974c34458b3d85370844d", 0.11699914509079769),
+        )
+        for cell_ordinal, expected in enumerate(expected_receipts):
+            cell_id = expected_cell_ids(self.preregistration)[cell_ordinal]
+            labels = dict(zip(DIMENSION_NAMES, cell_id.split("|")))
+            request = _cell_request_at(
+                self.preregistration, cell_id, cell_ordinal, labels, 0
+            )
+            completed = subprocess.run(
+                [
+                    str(Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch"),
+                    "--preregistration", str(PREREGISTRATION),
+                    "--cell-id", cell_id,
+                    "--ephemeral-evidence-stdout",
+                ],
+                input=compact_json_line(request),
+                check=True,
+                capture_output=True,
+            )
+            attempt = json.loads(completed.stdout)
+            self.assertEqual(attempt["effective_support_union_count"], expected[0])
+            self.assertEqual(attempt["source_correlation_receipt_sha256"], expected[1])
+            self.assertEqual(attempt["effective_looks_fraction"], expected[2])
+            CellAccumulator(
+                self.preregistration, cell_id, cell_ordinal, 1, CODE, BINARY
+            ).add(attempt)
+
     def test_near_tie_attempt_binds_exact_dependency_cone_support(self):
         labels = dict(zip(DIMENSION_NAMES, NEAR_TIE_CELL.split("|")))
         cell_ordinal = expected_cell_ids(self.preregistration).index(NEAR_TIE_CELL)
