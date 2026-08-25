@@ -307,6 +307,41 @@ FFFF 35.3000 -120.0000 13 0 0 0 2020-01-01 2025-01-01 2025-01-02 700
             discovery.canonical_digest(second.entries),
         )
 
+    def test_global_runtime_bounds_and_both_query_digests_are_bound(self) -> None:
+        bounds = discovery.validate_runtime_bounds(
+            (-180.0, -80.0, 180.0, 80.0), self.preregistration
+        )
+        self.assertEqual(bounds, (-180.0, -80.0, 180.0, 80.0))
+        with self.assertRaisesRegex(ValueError, "WGS84"):
+            discovery.validate_runtime_bounds(
+                (-181.0, -80.0, 180.0, 80.0), self.preregistration
+            )
+        runtime = discovery.runtime_query(
+            SimpleNamespace(
+                target_sites=300,
+                min_epochs=24,
+                min_span_days=330,
+                min_distance_km=1.0,
+                max_distance_km=30.0,
+                start="2023-01-01",
+                end="2024-01-01",
+                west=bounds[0],
+                south=bounds[1],
+                east=bounds[2],
+                north=bounds[3],
+                max_pairs=25346,
+            ),
+            self.preregistration,
+        )
+        self.assertEqual(
+            runtime["candidate_query_digest"],
+            self.preregistration["candidate_query"]["query_digest"],
+        )
+        self.assertEqual(runtime["criteria"]["geographic_bounds"], list(bounds))
+        self.assertEqual(
+            discovery.canonical_digest(runtime), discovery.runtime_query_digest(runtime)
+        )
+
     def test_freeze_is_exact_lexical_disjoint_reconstruction(self) -> None:
         query_digest = self.preregistration["candidate_query"]["query_digest"]
         records = []

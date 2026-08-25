@@ -572,8 +572,53 @@ def catalog_candidate(
     return candidate
 
 
+def validate_runtime_bounds(
+    bounds: tuple[float, float, float, float],
+    preregistration: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    west, south, east, north = bounds
+    if not (-180.0 <= west < east <= 180.0 and -90.0 <= south < north <= 90.0):
+        raise ValueError("runtime geographic bounds must be an increasing WGS84 extent")
+    frozen_query = preregistration["candidate_query"]["query"]
+    allowed = frozen_query.get("geographic_bounds", [-180.0, -90.0, 180.0, 90.0])
+    if (
+        not isinstance(allowed, list)
+        or len(allowed) != 4
+        or not all(isinstance(value, (int, float)) for value in allowed)
+    ):
+        raise ValueError("preregistered geographic bounds are invalid")
+    allowed_west, allowed_south, allowed_east, allowed_north = map(float, allowed)
+    if west < allowed_west or south < allowed_south or east > allowed_east or north > allowed_north:
+        raise ValueError("runtime geographic bounds exceed the preregistered geography")
+    return bounds
+
+
+def runtime_query(args: argparse.Namespace, preregistration: dict[str, Any]) -> dict[str, Any]:
+    bounds = validate_runtime_bounds(
+        (args.west, args.south, args.east, args.north), preregistration
+    )
+    return {
+        "criteria": {
+            "target_sites": args.target_sites,
+            "minimum_epochs": args.min_epochs,
+            "minimum_span_days": args.min_span_days,
+            "station_pair_distance_km": [args.min_distance_km, args.max_distance_km],
+            "date_window": [args.start, args.end],
+            "geographic_bounds": list(bounds),
+            "maximum_pairs_examined": args.max_pairs,
+        },
+        "candidate_query_digest": preregistration["candidate_query"]["query_digest"],
+    }
+
+
+def runtime_query_digest(query: dict[str, Any]) -> str:
+    return canonical_digest(query)
+
+
 def discover(args: argparse.Namespace) -> dict[str, Any]:
     preregistration = json.loads(args.preregistration.read_text(encoding="utf-8"))
+    runtime = runtime_query(args, preregistration)
+    bounds = tuple(runtime["criteria"]["geographic_bounds"])
     exclusions = load_exclusions(args.preregistration)
     response = requests.get(HOLDINGS_URL, timeout=60)
     response.raise_for_status()
@@ -586,7 +631,7 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         end_date,
         args.min_distance_km,
         args.max_distance_km,
-        (args.west, args.south, args.east, args.north),
+        bounds,
     )
     selected: list[dict[str, Any]] = []
     examined: list[dict[str, Any]] = []
@@ -665,34 +710,14 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "burst_ids": sorted(exclusions.burst_ids),
             "site_ids": sorted(exclusions.site_ids),
         },
-        "criteria": {
-            "target_sites": args.target_sites,
-            "minimum_epochs": args.min_epochs,
-            "minimum_span_days": args.min_span_days,
-            "station_pair_distance_km": [args.min_distance_km, args.max_distance_km],
-            "date_window": [args.start, args.end],
-            "geographic_bounds": [args.west, args.south, args.east, args.north],
-            "maximum_pairs_examined": args.max_pairs,
-        },
+        "criteria": runtime["criteria"],
         "holdings_source": {
             "url": HOLDINGS_URL,
             "sha256": sha256_text(response.text),
             "bytes": len(response.content),
         },
-        "runtime_query_digest": canonical_digest(
-            {
-                "criteria": {
-                    "target_sites": args.target_sites,
-                    "minimum_epochs": args.min_epochs,
-                    "minimum_span_days": args.min_span_days,
-                    "station_pair_distance_km": [args.min_distance_km, args.max_distance_km],
-                    "date_window": [args.start, args.end],
-                    "geographic_bounds": [args.west, args.south, args.east, args.north],
-                    "maximum_pairs_examined": args.max_pairs,
-                },
-                "candidate_query_digest": preregistration["candidate_query"]["query_digest"],
-            }
-        ),
+        "runtime_query": runtime,
+        "runtime_query_digest": runtime_query_digest(runtime),
         "candidates": selected,
         "rejected": [],
         "examined_pairs": examined,
