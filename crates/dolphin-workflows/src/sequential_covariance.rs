@@ -1394,6 +1394,12 @@ struct SpatialQueryCone {
     selected_dates: Vec<BTreeSet<(GlobalDateId, usize)>>,
 }
 
+struct ReferenceDifferenceQueryPlan {
+    selection: Vec<(GlobalDateId, usize)>,
+    cone: SpatialQueryCone,
+    estimate: DependencyConeEstimate,
+}
+
 struct StreamingAdjoints {
     phase: Vec<BTreeMap<usize, Array2<f64>>>,
     compressed: Vec<BTreeMap<usize, Array2<f64>>>,
@@ -2449,6 +2455,42 @@ impl SequentialReplayTopology {
         )
     }
 
+    fn plan_reference_difference_query(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        reference_selection: &[(GlobalDateId, usize)],
+        query: DependencyConeQuery,
+    ) -> Result<ReferenceDifferenceQueryPlan, SequentialReplayError> {
+        let selection = target_selection
+            .iter()
+            .chain(reference_selection)
+            .copied()
+            .collect::<Vec<_>>();
+        let cone = self.spatial_query_cone(&selection, query.microbatch, 2)?;
+        let mut estimate =
+            self.estimate_dependency_cone_for_spatial_query(&selection, query.source_rank, &cone)?;
+        let dates = target_selection.len() as u64;
+        let output_matrices = checked_mul(checked_mul(checked_mul(4, dates)?, dates)?, 8)?;
+        estimate.covariance_bytes = checked_add(estimate.covariance_bytes, output_matrices)?;
+        estimate.total_bytes = checked_add(estimate.total_bytes, output_matrices)?;
+        let selection_bytes = checked_mul(
+            selection.capacity() as u64,
+            size_of::<(GlobalDateId, usize)>() as u64,
+        )?;
+        estimate.operator_bytes = checked_add(estimate.operator_bytes, selection_bytes)?;
+        estimate.total_bytes = checked_add(estimate.total_bytes, selection_bytes)?;
+        if selection.iter().any(|(date, _)| date.get() != 0) {
+            let effective_support_bytes = self.effective_support_reservation_bytes(&cone)?;
+            estimate.support_bytes = checked_add(estimate.support_bytes, effective_support_bytes)?;
+            estimate.total_bytes = checked_add(estimate.total_bytes, effective_support_bytes)?;
+        }
+        Ok(ReferenceDifferenceQueryPlan {
+            selection,
+            cone,
+            estimate,
+        })
+    }
+
     /// Enforce the dependency-cone byte cap before numeric replay.
     ///
     /// # Errors
@@ -2829,14 +2871,11 @@ impl SequentialReplayTopology {
             ));
         }
 
-        let selection = target_selection
-            .iter()
-            .chain(reference_selection)
-            .copied()
-            .collect::<Vec<_>>();
-        let cone = self.spatial_query_cone(&selection, query.microbatch, 2)?;
-        let mut dependency_cone =
-            self.estimate_dependency_cone_for_spatial_query(&selection, query.source_rank, &cone)?;
+        let ReferenceDifferenceQueryPlan {
+            selection,
+            cone,
+            estimate: mut dependency_cone,
+        } = self.plan_reference_difference_query(target_selection, reference_selection, query)?;
         if dependency_cone.total_bytes > query.byte_cap {
             return Err(SequentialReplayError::Budget(dependency_cone));
         }
@@ -2862,11 +2901,6 @@ impl SequentialReplayTopology {
                 reference_disposition: ReplayStatus::Valid,
             });
         }
-        let effective_support_bytes = self.effective_support_reservation_bytes(&cone)?;
-        dependency_cone.support_bytes =
-            checked_add(dependency_cone.support_bytes, effective_support_bytes)?;
-        dependency_cone.total_bytes =
-            checked_add(dependency_cone.total_bytes, effective_support_bytes)?;
         self.validate_provider_identity(provider.identity())?;
         let expected_rank = dependency_cone
             .block_ids
@@ -3041,17 +3075,46 @@ impl SequentialReplayTopology {
         self.validate_cross_topology(reference_topology)?;
         self.validate_cross_reference_selections(target_selection, reference_selection, query)?;
         if self.same_replay_graph(reference_topology) {
-            let target_replay = self.replay_reference_difference_covariance_from_provider(
+            let ReferenceDifferenceQueryPlan {
+                estimate: mut aggregate,
+                ..
+            } =
+                self.plan_reference_difference_query(target_selection, reference_selection, query)?;
+            let dates = target_selection.len() as u64;
+            let retained_output_bytes =
+                checked_mul(checked_mul(checked_mul(4, dates)?, dates)?, 8)?;
+            aggregate.covariance_bytes =
+                checked_add(aggregate.covariance_bytes, retained_output_bytes)?;
+            aggregate.total_bytes = checked_add(aggregate.total_bytes, retained_output_bytes)?;
+            let retained_block_ids = checked_mul(
+                aggregate.block_ids.capacity() as u64,
+                size_of::<GlobalBlockId>() as u64,
+            )?;
+            aggregate.operator_bytes = checked_add(aggregate.operator_bytes, retained_block_ids)?;
+            aggregate.total_bytes = checked_add(aggregate.total_bytes, retained_block_ids)?;
+            aggregate.provider_bytes = checked_add(
+                target_provider.maximum_resident_bytes(),
+                reference_provider.maximum_resident_bytes(),
+            )?;
+            aggregate.total_bytes = checked_add(aggregate.total_bytes, aggregate.provider_bytes)?;
+            if aggregate.total_bytes > query.byte_cap {
+                return Err(SequentialReplayError::Budget(aggregate));
+            }
+            let replay_query = DependencyConeQuery {
+                byte_cap: aggregate.total_bytes,
+                ..query
+            };
+            let mut target_replay = self.replay_reference_difference_covariance_from_provider(
                 target_selection,
                 reference_selection,
-                query,
+                replay_query,
                 branch_tolerance,
                 target_provider,
             )?;
             let reference_replay = self.replay_reference_difference_covariance_from_provider(
                 target_selection,
                 reference_selection,
-                query,
+                replay_query,
                 branch_tolerance,
                 reference_provider,
             )?;
@@ -3072,6 +3135,7 @@ impl SequentialReplayTopology {
                     "same-topology providers do not have exact replay artifact receipts",
                 ));
             }
+            target_replay.dependency_cone = aggregate;
             return Ok(target_replay);
         }
         if !branch_tolerance.is_finite() || branch_tolerance <= 0.0 {

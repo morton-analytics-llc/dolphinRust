@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -1841,7 +1842,6 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
     assert!(shared.source_cache_peak_bytes <= shared.dependency_cone.source_window_bytes);
     assert_eq!(shared.dependency_cone.provider_bytes, 256);
     assert_ne!(shared.reference_signature, [0; 32]);
-
     let provider_for_same_topology = || CapturedProvider {
         identity: provider.identity.clone(),
         blocks: provider.blocks.clone(),
@@ -1850,6 +1850,45 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         fail_source_model: false,
         dishonest_samples: false,
     };
+    let pair_output_bytes = 4 * joint_selection.len() * joint_selection.len() * size_of::<f64>();
+    let joint_bytes = 4 * joint_selection.len() * joint_selection.len() * size_of::<f64>();
+    assert_eq!(
+        shared.dependency_cone.covariance_bytes,
+        (joint_bytes + pair_output_bytes) as u64
+    );
+    let single_provider_bound = shared.dependency_cone.total_bytes;
+    let mut bounded_provider = provider_for_same_topology();
+    let error = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: single_provider_bound - 1,
+            },
+            request.branch_tolerance,
+            &mut bounded_provider,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::DependencyConeExceedsBudget);
+    assert_eq!(bounded_provider.source_reads, 0);
+    let mut exact_provider = provider_for_same_topology();
+    let exact = topology
+        .replay_reference_difference_covariance_from_provider(
+            &joint_selection,
+            &shared_reference,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: single_provider_bound,
+            },
+            request.branch_tolerance,
+            &mut exact_provider,
+        )
+        .unwrap();
+    assert_eq!(exact.dependency_cone.total_bytes, single_provider_bound);
+
     let mut target_provider = provider_for_same_topology();
     let mut reference_provider = provider_for_same_topology();
     let cross_api_same_topology = topology
@@ -1891,6 +1930,51 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         cross_api_same_topology.effective_looks,
         shared.effective_looks
     );
+    assert_eq!(cross_api_same_topology.dependency_cone.provider_bytes, 512);
+    assert_eq!(
+        cross_api_same_topology.dependency_cone.covariance_bytes,
+        shared.dependency_cone.covariance_bytes + pair_output_bytes as u64
+    );
+    let two_provider_bound = cross_api_same_topology.dependency_cone.total_bytes;
+    assert!(two_provider_bound > single_provider_bound);
+    let mut target_provider = provider_for_same_topology();
+    let mut reference_provider = provider_for_same_topology();
+    let error = topology
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &joint_selection,
+            &mut target_provider,
+            &topology,
+            &shared_reference,
+            &mut reference_provider,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: two_provider_bound - 1,
+            },
+            request.branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::DependencyConeExceedsBudget);
+    assert_eq!(target_provider.source_reads, 0);
+    assert_eq!(reference_provider.source_reads, 0);
+    let mut target_provider = provider_for_same_topology();
+    let mut reference_provider = provider_for_same_topology();
+    let exact = topology
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &joint_selection,
+            &mut target_provider,
+            &topology,
+            &shared_reference,
+            &mut reference_provider,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: two_provider_bound,
+            },
+            request.branch_tolerance,
+        )
+        .unwrap();
+    assert_eq!(exact.dependency_cone.total_bytes, two_provider_bound);
 
     let mut target_provider = provider_for_same_topology();
     let mut tampered_reference_provider = provider_for_same_topology();
