@@ -42,8 +42,8 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "080c35458423fd712c74b8f508a52e209117a4bd7527eb64528d8946e7d98774"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "553f45883103d286dc3bd5282391d20e1bc2ac8d2e52a5203010687e6eda66bb"
+FROZEN_GENERATOR_SHA256 = "da1e2043f4698e59418a2613f41c646fd2ace7b1d5fc7a37398a2fb5f165c183"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "47d76bebd40f9f350c21a9f5d4c1e446ad5a73b976b698e4b866e5cdc46c5601"
 FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
 FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "12d836f42250b2fac6d76265155e4fc4479cd1f9681d9c4570c054f047ff8110"
+FROZEN_SOURCE_SET_SHA256 = "9a4341f64155946400e3d705fbe62fae4e35da39d3fdcb8bedd7f9680316b93b"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -1183,6 +1183,13 @@ def _frozen_roundoff_matches(actual: float, expected: float) -> bool:
     return abs(actual - expected) <= 1e-12 * max(1.0, abs(expected))
 
 
+def _effective_looks_roundoff_matches(
+    actual: float, expected: float, support_count: int
+) -> bool:
+    tolerance = max(1e-12, 4.0 * math.ulp(1.0) * support_count)
+    return abs(actual - expected) <= tolerance * max(1.0, abs(expected))
+
+
 def _independent_fixed_l2_psd_covariance(operator: np.ndarray) -> np.ndarray:
     covariance = _difference_covariance_from_joint(operator)
     scale = float(np.max(np.abs(covariance)))
@@ -1328,24 +1335,128 @@ def _source_factor_support(
 def _effective_replay_support(
     cell_id: str,
     candidate_union: Iterable[tuple[int, int]],
-    half_window: Sequence[int],
+    target: Sequence[int],
+    reference: Sequence[int],
+    window: Mapping[str, Any],
     native_tile_shape: Sequence[int],
+    topology: Mapping[str, Any],
+    method: str,
+    raw_cube_support: Sequence[tuple[int, int]],
+    raw_by_source: Mapping[tuple[int, int], Sequence[complex]],
 ) -> set[tuple[int, int]]:
     support = set(candidate_union)
     replay = FROZEN_RECT_TRANSITIVE_SUPPORT.get(cell_id)
-    if replay is None:
+    if replay is not None:
+        expansion_count, production_center_offset = replay
+        for _ in range(expansion_count):
+            support = set(
+                _source_factor_support(
+                    support, window["half_window"], native_tile_shape
+                )
+            )
+        if production_center_offset:
+            support = {
+                (row + production_center_offset, column + production_center_offset)
+                for row, column in support
+            }
         return support
-    expansion_count, production_center_offset = replay
-    for _ in range(expansion_count):
-        support = set(
-            _source_factor_support(support, half_window, native_tile_shape)
+
+    half_window = window["half_window"]
+    stride = window["stride"]
+    raw_support = set(raw_cube_support)
+    minimum = [min(coordinate[axis] for coordinate in raw_support) for axis in range(2)]
+    maximum = [max(coordinate[axis] for coordinate in raw_support) for axis in range(2)]
+    crop_start = [
+        (minimum[axis] // stride[axis]) * stride[axis]
+        for axis in range(2)
+    ]
+    crop_stop = [
+        ((maximum[axis] + 1 + stride[axis] - 1) // stride[axis]) * stride[axis]
+        for axis in range(2)
+    ]
+    crop_shape = [crop_stop[axis] - crop_start[axis] for axis in range(2)]
+    output_shape = [crop_shape[axis] // stride[axis] for axis in range(2)]
+
+    def local_output(center: Sequence[int]) -> tuple[int, int]:
+        output = []
+        for axis in range(2):
+            relative = center[axis] - stride[axis] // 2
+            if relative < 0 or relative % stride[axis]:
+                raise SchemaError("frozen center is not congruent with its output stride")
+            output.append(relative // stride[axis] - crop_start[axis] // stride[axis])
+        return output[0], output[1]
+
+    def nearest_output(coordinate: tuple[int, int]) -> tuple[int, int]:
+        return tuple(
+            min(
+                (coordinate[axis] - crop_start[axis]) // stride[axis],
+                output_shape[axis] - 1,
+            )
+            for axis in range(2)
         )
-    if production_center_offset:
-        support = {
-            (row + production_center_offset, column + production_center_offset)
-            for row, column in support
-        }
-    return support
+
+    def output_center(output: tuple[int, int]) -> tuple[int, int]:
+        return tuple(
+            crop_start[axis] + stride[axis] // 2 + output[axis] * stride[axis]
+            for axis in range(2)
+        )
+
+    def fixed_support(output: tuple[int, int]) -> list[tuple[int, int]]:
+        center_local = [
+            stride[axis] // 2 + output[axis] * stride[axis]
+            for axis in range(2)
+        ]
+        window_shape = [2 * half_window[axis] + 1 for axis in range(2)]
+        start = [
+            min(
+                max(0, center_local[axis] - half_window[axis]),
+                crop_shape[axis] - window_shape[axis],
+            )
+            for axis in range(2)
+        ]
+        return [
+            coordinate
+            for row in range(window_shape[0])
+            for column in range(window_shape[1])
+            if (
+                coordinate := (
+                    crop_start[0] + start[0] + row,
+                    crop_start[1] + start[1] + column,
+                )
+            ) in raw_support
+        ]
+
+    blocks = topology["expected_blocks"]
+    block_index = {block["block_id"]: index for index, block in enumerate(blocks)}
+    requested_outputs = {local_output(target), local_output(reference)}
+    active_outputs = [set(requested_outputs) for _ in blocks]
+    required_compressed = [set() for _ in blocks]
+    effective_support: set[tuple[int, int]] = set()
+    for index in range(len(blocks) - 1, -1, -1):
+        block = blocks[index]
+        active_outputs[index].update(
+            nearest_output(coordinate) for coordinate in required_compressed[index]
+        )
+        effective_support.update(required_compressed[index])
+        block_dates = range(
+            block["real_start"], block["real_start"] + block["num_real"]
+        )
+        for output in sorted(active_outputs[index]):
+            candidates = fixed_support(output)
+            block_raw = {
+                coordinate: [
+                    raw_by_source[coordinate][acquisition]
+                    for acquisition in block_dates
+                ]
+                for coordinate in candidates
+            }
+            effective_support.update(
+                _select_support(method, candidates, output_center(output), block_raw)
+            )
+            first_parent = block["block_id"] - block["num_compressed"]
+            for parent_id in range(first_parent, block["block_id"]):
+                required_compressed[block_index[parent_id]].update(candidates)
+    return effective_support
 
 
 def _generate_complex_source(
@@ -1797,12 +1908,17 @@ def regenerate_frozen_attempt_inputs(
         for coordinate in raw_cube_support
     }
     effective_support = (
-        (
-            set(union_support)
-            if len(topology["expected_blocks"]) == 1
-            else _effective_replay_support(
-                cell_id, candidate_union, window["half_window"], native_tile_shape
-            )
+        _effective_replay_support(
+            cell_id,
+            candidate_union,
+            target,
+            reference,
+            window,
+            native_tile_shape,
+            topology,
+            labels["support"],
+            raw_cube_support,
+            raw_by_source,
         )
         if union_support and labels["position"] != "masked"
         else set()
@@ -2163,11 +2279,43 @@ class CellAccumulator:
             "target_support_sha256", "reference_support_sha256",
             "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
             "target_source_count", "reference_source_count", "intersection_source_count",
-            "union_source_count", "effective_support_union_count",
-            "source_correlation_receipt_sha256",
+            "union_source_count",
             "source_correlation_model", "source_correlation_distance_scale_pixels",
         )
-        if any(attempt.get(field_name) != expected[field_name] for field_name in raw_fields):
+        expected_effective_count = expected["effective_support_union_count"]
+        expected_effective_receipt = expected["source_correlation_receipt_sha256"]
+        expected_effective_fraction = expected["effective_looks_fraction"]
+        if attempt.get("status") in {"nondifferentiable_node", "ill_conditioned"}:
+            labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
+            target, reference = _expected_coordinates(self.preregistration, self.cell_id)
+            window = self.preregistration["generator"]["coordinates"]["window_stride"][
+                f"{labels['half_window']}|{labels['stride']}"
+            ]
+            native_tile_shape = self.preregistration["generator"]["full_replay_dgp"][
+                "native_tile_shape"
+            ]
+            abstention_support = set(
+                _candidate_support(target, window["half_window"], native_tile_shape)
+            ) | set(
+                _candidate_support(reference, window["half_window"], native_tile_shape)
+            )
+            expected_effective_count = len(abstention_support)
+            expected_effective_receipt = _source_correlation_receipt_sha256(
+                expected["source_correlation_model"],
+                expected["source_correlation_distance_scale_pixels"],
+                abstention_support,
+            )
+            expected_effective_fraction = (
+                1.0
+                if expected["source_correlation_model"] == "identity_v1"
+                else _effective_looks_fraction(sorted(abstention_support))
+            )
+        if (
+            any(attempt.get(field_name) != expected[field_name] for field_name in raw_fields)
+            or attempt.get("effective_support_union_count") != expected_effective_count
+            or attempt.get("source_correlation_receipt_sha256")
+            != expected_effective_receipt
+        ):
             raise SchemaError(f"cell {self.cell_id} raw DGP does not match deterministic regeneration")
         labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
         if (
@@ -2175,13 +2323,15 @@ class CellAccumulator:
             and attempt.get("effective_looks_fraction") is not None
         ) or (
             labels["position"] != "masked"
-            and expected["effective_looks_fraction"] is None
+            and expected_effective_fraction is None
             and attempt.get("effective_looks_fraction") is not None
         ) or (
             labels["position"] != "masked"
-            and expected["effective_looks_fraction"] is not None
-            and not _frozen_roundoff_matches(
-                attempt["effective_looks_fraction"], expected["effective_looks_fraction"]
+            and expected_effective_fraction is not None
+            and not _effective_looks_roundoff_matches(
+                attempt["effective_looks_fraction"],
+                expected_effective_fraction,
+                expected_effective_count,
             )
         ):
             raise SchemaError(f"cell {self.cell_id} effective-look realization differs from independent recomputation")

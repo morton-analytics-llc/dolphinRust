@@ -112,6 +112,7 @@ RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_block
 MASKED_CELL = "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
 TIED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks"
 NEAR_TIE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress"
+LARGE_WINDOW_COINCIDENT_CELL = "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress"
 
 
 class SpatialCovarianceValidationV6Tests(unittest.TestCase):
@@ -628,6 +629,14 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         above["effective_looks_fraction"] += 1.01e-12 * max(1.0, abs(expected))
         with self.assertRaisesRegex(SchemaError, "effective-look realization differs"):
             self._accumulator(SUPPORTED_CELL).add(above)
+
+    def test_large_support_effective_looks_allows_only_accumulated_libm_roundoff(self):
+        from validation.score_spatial_covariance import _effective_looks_roundoff_matches
+
+        expected = 0.07319490872631518
+        actual = 0.07319490873464103
+        self.assertTrue(_effective_looks_roundoff_matches(actual, expected, 14_238))
+        self.assertFalse(_effective_looks_roundoff_matches(expected + 2e-11, expected, 14_238))
 
     def test_source_correlation_support_count_and_receipt_are_exact(self):
         for field in (
@@ -2578,6 +2587,60 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             CellAccumulator(
                 self.preregistration, cell_id, cell_ordinal, 1, CODE, BINARY
             ).add(attempt)
+
+    def test_large_window_coincident_cohort_binds_replay_and_abstention_support(self):
+        cell_ordinal = expected_cell_ids(self.preregistration).index(
+            LARGE_WINDOW_COINCIDENT_CELL
+        )
+        batch = Path(__file__).parents[2] / "target/release/examples/spatial_covariance_batch"
+        if not batch.exists():
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-workflows",
+                    "--example", "spatial_covariance_batch",
+                ],
+                check=True,
+            )
+        replay = rust_attempt_regenerator(
+            self.preregistration,
+            PREREGISTRATION,
+            batch,
+        )
+        accumulator = CellAccumulator(
+            self.preregistration,
+            LARGE_WINDOW_COINCIDENT_CELL,
+            cell_ordinal,
+            FROZEN_SEED_COUNT,
+            CODE,
+            BINARY,
+        )
+        observed = {}
+        for attempt in replay(LARGE_WINDOW_COINCIDENT_CELL, cell_ordinal):
+            if attempt["seed_index"] in {0, FROZEN_SEED_COUNT - 1}:
+                observed[attempt["seed_index"]] = attempt
+            accumulator.add(attempt)
+        summary = accumulator.finalize()
+
+        self.assertEqual(summary["attempted_seeds"], FROZEN_SEED_COUNT)
+        self.assertEqual(observed[0]["status"], "valid")
+        self.assertEqual(observed[0]["effective_support_union_count"], 1519)
+        self.assertEqual(
+            observed[0]["source_correlation_receipt_sha256"],
+            "b46a72853152399d62e18a7f8a3a43a73a210865de2c77b4a321634bc43118ed",
+        )
+        self.assertEqual(observed[0]["effective_looks_fraction"], 0.07732435622036812)
+        self.assertEqual(observed[FROZEN_SEED_COUNT - 1]["status"], "ill_conditioned")
+        self.assertEqual(
+            observed[FROZEN_SEED_COUNT - 1]["effective_support_union_count"], 91
+        )
+        self.assertEqual(
+            observed[FROZEN_SEED_COUNT - 1]["source_correlation_receipt_sha256"],
+            "e5631412aa67b52f0625fa8160500410f74576a567fed09fd8041fc24ffb18ca",
+        )
+        self.assertEqual(
+            observed[FROZEN_SEED_COUNT - 1]["effective_looks_fraction"],
+            0.10912939346879827,
+        )
 
     def test_near_tie_attempt_binds_exact_dependency_cone_support(self):
         labels = dict(zip(DIMENSION_NAMES, NEAR_TIE_CELL.split("|")))
