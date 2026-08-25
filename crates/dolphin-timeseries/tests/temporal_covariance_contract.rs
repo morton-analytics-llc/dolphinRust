@@ -114,7 +114,7 @@ fn complete_refit_bootstrap_candidate_requires_frozen_evaluated_evidence() {
     );
     assert_eq!(
         serde_json::to_value(TemporalInferenceStatus::OptimizerNonconverged).unwrap(),
-        "optimizer_nonconverged"
+        "OptimizerNonconverged"
     );
 }
 

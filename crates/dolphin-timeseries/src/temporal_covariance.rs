@@ -26,7 +26,6 @@ type SubsetSeries = (Vec<f64>, Vec<f64>, Vec<Vec<f64>>);
 
 /// Stable failure/status codes for temporal covariance fitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TemporalInferenceStatus {
     /// All requested point-estimate and validation computations completed.
     Evaluated,
