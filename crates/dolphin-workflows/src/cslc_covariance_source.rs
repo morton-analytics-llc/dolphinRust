@@ -321,6 +321,7 @@ impl CslcCovarianceManifest {
             member_indices,
             burst_id.into(),
             self.digest,
+            None,
             processed_origin,
             processed_shape,
             tile_grid,
@@ -358,10 +359,34 @@ impl CslcCovarianceManifest {
             &burst_id,
             generation,
         )?;
+        let generation_member_positions = generation_member_indices
+            .iter()
+            .map(|generation_member| {
+                let positions = member_indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, member)| {
+                        (member == generation_member).then_some(position)
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    positions.len() == 1,
+                    "generation member {generation_member} must occur exactly once in the resolver member list"
+                );
+                Ok(positions[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            generation_member_positions
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1),
+            "generation members must be one contiguous date range in the resolver member list"
+        );
         self.resolver_with_manifest_digest(
             member_indices,
             burst_id,
             generation_digest,
+            Some((generation, generation_member_positions)),
             processed_origin,
             processed_shape,
             tile_grid,
@@ -377,6 +402,7 @@ impl CslcCovarianceManifest {
         member_indices: &[usize],
         burst_id: String,
         source_manifest_digest: [u8; 32],
+        generation_scope: Option<(u32, Vec<usize>)>,
         processed_origin: (usize, usize),
         processed_shape: (usize, usize),
         tile_grid: CovarianceOperatorGrid,
@@ -436,6 +462,7 @@ impl CslcCovarianceManifest {
             factor_config,
             identity,
             full_revision_manifest_digest: self.digest,
+            generation_scope,
             validity_reader,
             tile_cache: None,
             metrics: CslcCovarianceResolverMetrics::default(),
@@ -477,6 +504,7 @@ pub struct CslcCovarianceSourceResolver<'a> {
     factor_config: EmpiricalProperComplexConfig,
     identity: SequentialSourceProviderIdentity,
     full_revision_manifest_digest: [u8; 32],
+    generation_scope: Option<(u32, Vec<usize>)>,
     validity_reader: Option<&'a dyn CslcCovarianceValidityReader>,
     tile_cache: Option<CslcSourceTileCache>,
     metrics: CslcCovarianceResolverMetrics,
@@ -776,6 +804,20 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceSourceResolver<'_> {
                 ReplayStatus::SourceIdentityMismatch,
                 "replay block dates differ from the ordered CSLC source members",
             ));
+        }
+        if let Some((generation, member_positions)) = &self.generation_scope {
+            let exact_range = block.generation == *generation
+                && member_positions.len() == block.num_real_dates
+                && member_positions
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, position)| *position == start + offset);
+            if !exact_range {
+                return Err(Self::provider_error(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "replay block generation or dates differ from the generation source receipt",
+                ));
+            }
         }
         let source_pixel = self.source_pixel(native_index)?;
         let window = self.canonical_window(source_pixel)?;

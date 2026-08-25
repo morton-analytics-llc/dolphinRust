@@ -5,9 +5,10 @@ use dolphin_core::config::{EmpiricalSourceFactorOptions, InputType};
 use dolphin_core::{Cf32, HalfWindow};
 use dolphin_io::CovarianceOperatorGrid;
 use dolphin_workflows::{
-    sequential_source_model_identity_digest, CslcCovarianceManifest, CSLC_COVARIANCE_SOURCE_MODEL,
-    CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
-    CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+    sequential_source_model_identity_digest, CslcCovarianceManifest, GlobalBlockId, GlobalDateId,
+    ReplayStatus, SequentialPrimitiveSourceResolver, SequentialReplayBlock, SequentialReplayError,
+    CSLC_COVARIANCE_SOURCE_MODEL, CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+    CSLC_COVARIANCE_SOURCE_PROVIDER, CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 use ndarray::Array2;
 
@@ -40,6 +41,7 @@ fn paths(root: &Path, count: usize) -> Vec<PathBuf> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn verified_prefix_extension_preserves_generation_receipt_and_binds_resolver() {
     let _hdf5 = HDF5_LOCK
         .lock()
@@ -100,7 +102,7 @@ fn verified_prefix_extension_preserves_generation_receipt_and_binds_resolver() {
     let tail_receipt = extended
         .generation_member_manifest_digest(&[2], "burst", 1)
         .unwrap();
-    let tail = extended
+    let mut tail = extended
         .resolver_for_generation(
             &[0, 1, 2],
             &[2],
@@ -127,6 +129,43 @@ fn verified_prefix_extension_preserves_generation_receipt_and_binds_resolver() {
         .unwrap();
     assert_eq!(tail.generation_manifest_digest(), tail_receipt);
     assert_eq!(tail.full_revision_manifest_digest(), extended.digest());
+    let wrong_generation = SequentialReplayBlock {
+        id: GlobalBlockId::new(1),
+        generation: 0,
+        real_date_start: GlobalDateId::new(0),
+        num_real_dates: 2,
+        carried_parent_ids: Vec::new(),
+        phase_dimension: 1,
+    };
+    assert!(matches!(
+        tail.resolve_source(&wrong_generation, 0),
+        Err(SequentialReplayError::Provider(
+            ReplayStatus::SourceIdentityMismatch,
+            _
+        ))
+    ));
+    let wrong_dates = SequentialReplayBlock {
+        generation: 1,
+        ..wrong_generation.clone()
+    };
+    assert!(matches!(
+        tail.resolve_source(&wrong_dates, 0),
+        Err(SequentialReplayError::Provider(
+            ReplayStatus::SourceIdentityMismatch,
+            _
+        ))
+    ));
+    assert_eq!(tail.metrics().member_window_reads, 0);
+    let matching_generation = SequentialReplayBlock {
+        id: GlobalBlockId::new(2),
+        generation: 1,
+        real_date_start: GlobalDateId::new(2),
+        num_real_dates: 1,
+        carried_parent_ids: Vec::new(),
+        phase_dimension: 0,
+    };
+    tail.resolve_source(&matching_generation, 0).unwrap();
+    assert!(tail.metrics().member_window_reads > 0);
     for path in all_paths {
         let _ = std::fs::remove_file(path);
     }
