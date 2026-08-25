@@ -67,10 +67,10 @@
   },
   "hashes": {
     "discovery_file_sha256": "ec33913c50dca1d7f518ecdd317159c49fb8af54dd39b13a48ab13623f4c8c2e",
-    "manifest_file_sha256": "75ce4e149aa8ed49ddb22cfedcac8056201a18c75af73ebb4fa22e7f9290ab1d",
-    "manifest_canonical_sha256": "534b9c534255404a71d3e2f53cc55cccc41ef4ef372bc18bb16e3a842826ee7e",
-    "preregistration_file_sha256": "79931328f82524563b3bfcd5069abbf31416a19b7aa34032e59e6c44389187ae",
-    "preregistration_canonical_sha256": "44cada30a3160e6a194c2df0a5e0fb4828f12a2de088ecce3fb3cc52221dce10",
+    "manifest_file_sha256": "662f0fd6e370eb66bfccc116b370199cd9b7aa672cbc85bf77e0edab8ae65fdd",
+    "manifest_canonical_sha256": "934ce89104f1746ff59f46c5b31115203613683ab2dd9872ee9b9c4d553b9438",
+    "preregistration_file_sha256": "5fa4bb8935a6edda9c1005e7a041d659d2ff9bf2b1e5cde21ecbd20ef1b00981",
+    "preregistration_canonical_sha256": "c794b8317845611805797140d9fc4d89b13ada49194a73fd113d594979ef9c40",
     "metadata_cache_entry_set_sha256": "b36069265fd00c97986c706d3709728f53262dc4a287312869ee0f9c978e3d36"
   }
 }

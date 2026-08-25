@@ -4,7 +4,7 @@
   "cohort_id": "f53-06-outer-nonfresno-v1",
   "status": "frozen_metadata_only",
   "outcomes_present": false,
-  "preregistration_sha256": "44cada30a3160e6a194c2df0a5e0fb4828f12a2de088ecce3fb3cc52221dce10",
+  "preregistration_sha256": "c794b8317845611805797140d9fc4d89b13ada49194a73fd113d594979ef9c40",
   "candidate_query_digest": "dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b",
   "selection_algorithm": "lexical_candidate_id_greedy_independent_burst_site_v2",
   "selection_outcome_blind": true,

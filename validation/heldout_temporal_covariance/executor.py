@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import struct
 import tempfile
 from pathlib import Path
 from statistics import median
@@ -15,32 +16,28 @@ from typing import Any, Mapping, Sequence
 import h5py
 import numpy as np
 import requests
+import rasterio
 from pyproj import Transformer
 
 if __package__ and __package__.startswith("validation."):
-    from validation.crop_real import Window
     from validation.gps_ground_truth import (
         AlignedRecord,
         Tenv3Record,
         gnss_los_covariance_series,
         gnss_los_series,
-        interpolate_grid,
         parse_tenv3,
     )
-    from validation.remote_hdf5_crop import RemoteCropError, crop_remote_hdf5
 else:
-    from crop_real import Window
     from gps_ground_truth import (
         AlignedRecord,
         Tenv3Record,
         gnss_los_covariance_series,
         gnss_los_series,
-        interpolate_grid,
         parse_tenv3,
     )
-    from remote_hdf5_crop import RemoteCropError, crop_remote_hdf5
 
 from .cohort import canonical_digest, validate_manifest
+from .runner import run_production_temporal_estimator
 
 
 class Attrition(RuntimeError):
@@ -57,6 +54,19 @@ NGL_BYTE_CAP = 64 * 1024 * 1024
 JSON_BYTE_CAP = 1024 * 1024
 FACTOR_BYTE_CAP = 1024 * 1024 * 1024
 FACTOR_SLICE_BYTE_CAP = 64 * 1024 * 1024
+RASTER_BYTE_CAP = 4 * 1024 * 1024 * 1024
+FACTOR_EVIDENCE_FILES = {
+    "approximation_receipt_digest": "referenced_displacement_covariance_approximation_receipt.json",
+    "resource_receipt_digest": "referenced_displacement_covariance_resource_receipt.json",
+    "review_receipt_digest": "referenced_displacement_covariance_review_receipt.json",
+    "method_manifest_digest": "referenced_displacement_covariance_method_manifest.json",
+}
+FACTOR_REQUIRED_EVIDENCE = (
+    "referenced_displacement_covariance_approximation_result.json",
+    "referenced_displacement_covariance_preregistration.json",
+    "referenced_displacement_covariance_design.md",
+    "referenced_displacement_covariance_producer_binary",
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -65,6 +75,35 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _descriptor_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
+def _hash_open_file(source: Any) -> str:
+    source.seek(0)
+    digest = hashlib.sha256()
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(block)
+    source.seek(0)
+    return digest.hexdigest()
+
+
+def _open_snapshot(path: Path, byte_cap: int) -> tuple[Any, os.stat_result, str]:
+    try:
+        source = path.open("rb")
+        before = os.fstat(source.fileno())
+        if before.st_size <= 0 or before.st_size > byte_cap:
+            source.close()
+            raise ValueError("artifact size is outside its byte cap")
+        digest = _hash_open_file(source)
+        if _descriptor_identity(before) != _descriptor_identity(os.fstat(source.fileno())):
+            source.close()
+            raise ValueError("artifact changed while it was hashed")
+        return source, before, digest
+    except OSError as error:
+        raise ValueError("artifact cannot be opened") from error
 
 
 def _hdf5_text(group: h5py.Group, name: str) -> str:
@@ -175,6 +214,55 @@ def fit_slope_with_covariance(
     }
 
 
+def fit_origin_anchored_gls(
+    dates: Sequence[dt.date],
+    values: Sequence[float] | np.ndarray,
+    covariance: np.ndarray,
+) -> dict[str, Any]:
+    """Fit the preregistered post-gauge station-pair slope by GLS."""
+
+    observed = np.asarray(values, dtype=float)
+    matrix = np.asarray(covariance, dtype=float)
+    if (
+        len(dates) < 2
+        or list(dates) != sorted(set(dates))
+        or observed.shape != (len(dates),)
+        or matrix.shape != (len(dates), len(dates))
+        or not np.all(np.isfinite(observed))
+        or not np.all(np.isfinite(matrix))
+    ):
+        raise ValueError("origin-anchored GLS inputs are invalid")
+    if observed[0] != 0.0 or np.any(matrix[0] != 0.0) or np.any(matrix[:, 0] != 0.0):
+        raise ValueError("origin-anchored GLS gauge row is not exact zero")
+    post = matrix[1:, 1:]
+    if not np.allclose(post, post.T, rtol=0.0, atol=1e-10):
+        raise ValueError("origin-anchored GLS covariance is not symmetric")
+    scale = max(1.0, float(np.max(np.abs(post))))
+    eigenvalues = np.linalg.eigvalsh(post)
+    if eigenvalues[0] <= scale * 1e-12:
+        raise ValueError("origin-anchored GLS covariance is not positive definite")
+    years = np.array(
+        [(date - dates[0]).days / 365.25 for date in dates[1:]], dtype=float
+    )
+    solved_design = np.linalg.solve(post, years)
+    denominator = float(years @ solved_design)
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise ValueError("origin-anchored GLS information is not positive")
+    slope = float(solved_design @ observed[1:] / denominator)
+    return {
+        "slope": slope,
+        "intercept": 0.0,
+        "variance": 1.0 / denominator,
+        "design_sha256": canonical_digest(
+            {
+                "dates": [date.isoformat() for date in dates],
+                "years_from_epoch_zero": [0.0, *years.tolist()],
+                "method": "origin_anchored_gls_full_covariance_v1",
+            }
+        ),
+    }
+
+
 def station_pair_gnss_observation(
     first_records: Sequence[Tenv3Record],
     second_records: Sequence[Tenv3Record],
@@ -195,7 +283,7 @@ def station_pair_gnss_observation(
         covariance = gnss_los_covariance_series(
             aligned[0], first_los
         ) + gnss_los_covariance_series(aligned[1], second_los)
-        fitted = fit_slope_with_covariance(dates, difference, covariance)
+        fitted = fit_origin_anchored_gls(dates, difference, covariance)
     except ValueError as error:
         raise Attrition("gnss_covariance_missing", str(error)) from error
     return {
@@ -255,34 +343,250 @@ def fetch_ngl_pair(
     return records_by_station, sources
 
 
-def los_at_static_crop(static_path: Path, record: Tenv3Record) -> np.ndarray:
-    try:
-        with h5py.File(static_path, "r") as product:
-            x = np.asarray(product["/data/x_coordinates"][:], dtype=float)
-            y = np.asarray(product["/data/y_coordinates"][:], dtype=float)
-            projection = int(product["/data/projection"][()])
-            east_data = np.asarray(product["/data/los_east"][:], dtype=float)
-            north_data = np.asarray(product["/data/los_north"][:], dtype=float)
-        projected_x, projected_y = Transformer.from_crs(
-            4326, projection, always_xy=True
-        ).transform(record.longitude, record.latitude)
-        east = interpolate_grid(east_data, x, y, projected_x, projected_y)
-        north = interpolate_grid(north_data, x, y, projected_x, projected_y)
-    except (OSError, KeyError, ValueError) as error:
-        raise Attrition("sourced_los_missing", "STATIC LOS crop cannot be sampled at the GNSS station") from error
-    horizontal = east * east + north * north
-    if not math.isfinite(horizontal) or horizontal <= 0 or horizontal > 1.0 + 1e-10:
-        raise Attrition("sourced_los_invalid", "STATIC LOS horizontal components are invalid")
-    vector = np.array([east, north, math.sqrt(max(0.0, 1.0 - horizontal))])
-    if abs(float(np.linalg.norm(vector)) - 1.0) > 1e-5:
-        raise Attrition("sourced_los_invalid", "STATIC LOS vector is not unit norm")
-    return vector
-
-
 def _grid(group: h5py.Group) -> dict[str, int]:
     return {
         field: int(group.attrs[field])
         for field in ("row_start", "col_start", "rows", "cols", "stride_y", "stride_x")
+    }
+
+
+def station_pixel_from_grid(
+    longitude: float,
+    latitude: float,
+    crs: str,
+    geotransform: Sequence[float],
+    rows: int,
+    cols: int,
+) -> tuple[int, int]:
+    """Map one GNSS coordinate to the exact production raster pixel."""
+
+    if len(geotransform) != 6 or rows <= 0 or cols <= 0:
+        raise Attrition("factor_identity_mismatch", "production grid identity is invalid")
+    try:
+        x, y = Transformer.from_crs(4326, crs, always_xy=True).transform(
+            longitude, latitude
+        )
+    except (ValueError, TypeError) as error:
+        raise Attrition("factor_identity_mismatch", "production CRS is invalid") from error
+    x0, a, b, y0, d, e = [float(value) for value in geotransform]
+    determinant = a * e - b * d
+    if not all(math.isfinite(value) for value in (x, y, x0, a, b, y0, d, e)) or determinant == 0.0:
+        raise Attrition("factor_identity_mismatch", "production affine is invalid")
+    col_value = (e * (x - x0) - b * (y - y0)) / determinant
+    row_value = (-d * (x - x0) + a * (y - y0)) / determinant
+    row, col = math.floor(row_value), math.floor(col_value)
+    if row < 0 or col < 0 or row >= rows or col >= cols:
+        raise Attrition("difference_covariance_unavailable", "GNSS station lies outside the production factor grid")
+    return row, col
+
+
+def _bounded_json(path: Path, byte_cap: int = JSON_BYTE_CAP) -> tuple[dict[str, Any], bytes]:
+    try:
+        source, before, _ = _open_snapshot(path, byte_cap)
+        with source:
+            payload = source.read(byte_cap + 1)
+            after = os.fstat(source.fileno())
+        if len(payload) > byte_cap or _descriptor_identity(before) != _descriptor_identity(after):
+            raise ValueError("JSON changed while it was read")
+        value = json.loads(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise Attrition("factor_identity_mismatch", f"bounded JSON is invalid: {path.name}") from error
+    if not isinstance(value, dict):
+        raise Attrition("factor_identity_mismatch", f"bounded JSON is not an object: {path.name}")
+    return value, payload
+
+
+def _validate_factor_evidence(directory: Path, metadata: h5py.Group) -> None:
+    for digest_name, file_name in FACTOR_EVIDENCE_FILES.items():
+        value, payload = _bounded_json(directory / file_name)
+        del value
+        expected = _bare_digest(_hdf5_text(metadata, digest_name), digest_name)
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise Attrition("difference_covariance_uncalibrated", f"factor evidence hash differs: {file_name}")
+    for file_name in FACTOR_REQUIRED_EVIDENCE:
+        path = directory / file_name
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            raise Attrition("difference_covariance_uncalibrated", f"factor evidence is missing: {file_name}") from error
+        cap = 512 * 1024 * 1024 if file_name.endswith("producer_binary") else JSON_BYTE_CAP
+        if size <= 0 or size > cap:
+            raise Attrition("difference_covariance_uncalibrated", f"factor evidence size is invalid: {file_name}")
+
+
+def _raster_sample(
+    path: Path,
+    pixel: tuple[int, int],
+    *,
+    rows: int,
+    cols: int,
+    crs: str,
+    geotransform: Sequence[float],
+) -> tuple[float, str]:
+    try:
+        source, before, digest = _open_snapshot(path, RASTER_BYTE_CAP)
+        with source:
+            with rasterio.open(source) as dataset:
+                if (
+                    dataset.count != 1
+                    or dataset.height != rows
+                    or dataset.width != cols
+                    or dataset.crs is None
+                    or dataset.crs.to_string() != rasterio.crs.CRS.from_string(crs).to_string()
+                    or tuple(dataset.transform.to_gdal()) != tuple(float(value) for value in geotransform)
+                ):
+                    raise Attrition("factor_identity_mismatch", "production raster grid differs from the factor")
+                row, col = pixel
+                value = float(dataset.read(1, window=((row, row + 1), (col, col + 1)))[0, 0])
+            after = os.fstat(source.fileno())
+        if _descriptor_identity(before) != _descriptor_identity(after):
+            raise Attrition("factor_identity_mismatch", "production raster changed while it was read")
+    except Attrition:
+        raise
+    except (OSError, ValueError, rasterio.errors.RasterioError) as error:
+        raise Attrition("difference_covariance_unavailable", "production raster is unreadable") from error
+    if not math.isfinite(value):
+        raise Attrition("difference_covariance_unavailable", "production raster sample is non-finite")
+    return value, digest
+
+
+def derive_product_observations(
+    product_directory: Path,
+    candidate: Mapping[str, Any],
+    records_by_station: Mapping[str, Sequence[Tenv3Record]],
+    factor_header: Mapping[str, Any],
+    preregistration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive pixels, LOS, and station-pair displacement from production bytes."""
+
+    receipt, receipt_bytes = _bounded_json(product_directory / "fixed_cube_receipt.json")
+    acquisition_days = [float(value) for value in factor_header["acquisition_days"]]
+    rows = int(factor_header["full_grid"]["rows"])
+    cols = int(factor_header["full_grid"]["cols"])
+    geotransform = [float(value) for value in factor_header["geotransform"]]
+    crs = str(factor_header["crs"])
+    epsg = rasterio.crs.CRS.from_string(crs).to_epsg()
+    fixed = preregistration["fixed_cube_binding"]
+    required_receipt = {
+        "contract_version": fixed["contract_version"],
+        "acquisition_days": acquisition_days,
+        "rows": rows,
+        "cols": cols,
+        "geotransform": geotransform,
+        "epsg": epsg,
+        "geometry_source": fixed["geometry_source"],
+        "los_rasters": ["los_east.tif", "los_north.tif", "los_up.tif"],
+        "acquisition_days_sha256": "sha256:"
+        + hashlib.sha256(
+            b"".join(struct.pack("<d", value) for value in acquisition_days)
+        ).hexdigest(),
+        "velocity_estimator": fixed["velocity_estimator"],
+        "inference_status": fixed["inference_status"],
+        "corrected_velocity_raster": None,
+        "corrected_sigma_raster": None,
+        "validity_mask_raster": fixed["validity_mask_raster"],
+        "geometry_provenance": fixed["geometry_provenance"],
+    }
+    if any(receipt.get(field) != value for field, value in required_receipt.items()):
+        raise Attrition("factor_identity_mismatch", "fixed-cube receipt differs from factor scope")
+    if factor_header["units"] != fixed["displacement_units"]:
+        raise Attrition(
+            "factor_identity_mismatch",
+            "factor units differ from the frozen fixed-cube displacement units",
+        )
+    station_pixels: dict[str, tuple[int, int]] = {}
+    station_los: dict[str, np.ndarray] = {}
+    raster_hashes: dict[str, str] = {
+        "fixed_cube_receipt.json": hashlib.sha256(receipt_bytes).hexdigest()
+    }
+    _, geometry_bytes = _bounded_json(product_directory / receipt["geometry_provenance"])
+    raster_hashes[receipt["geometry_provenance"]] = hashlib.sha256(
+        geometry_bytes
+    ).hexdigest()
+    for station_id in candidate["station_ids"]:
+        records = records_by_station.get(station_id)
+        if not records:
+            raise Attrition("gnss_solution_missing", "GNSS station solution is empty")
+        record = records[0]
+        pixel = station_pixel_from_grid(
+            record.longitude,
+            record.latitude,
+            crs,
+            geotransform,
+            rows,
+            cols,
+        )
+        station_pixels[station_id] = pixel
+        validity, validity_digest = _raster_sample(
+            product_directory / receipt["validity_mask_raster"],
+            pixel,
+            rows=rows,
+            cols=cols,
+            crs=crs,
+            geotransform=geotransform,
+        )
+        if validity != 1.0:
+            raise Attrition(
+                "difference_covariance_unavailable",
+                "GNSS station lies outside the fixed-cube validity mask",
+            )
+        raster_hashes[receipt["validity_mask_raster"]] = validity_digest
+        components = []
+        for name in receipt["los_rasters"]:
+            value, digest = _raster_sample(
+                product_directory / name,
+                pixel,
+                rows=rows,
+                cols=cols,
+                crs=crs,
+                geotransform=geotransform,
+            )
+            components.append(value)
+            raster_hashes[name] = digest
+        vector = np.asarray(components, dtype=float)
+        if abs(float(np.linalg.norm(vector)) - 1.0) > 1e-5:
+            raise Attrition("sourced_los_invalid", "fixed-cube LOS vector is not unit norm")
+        station_los[station_id] = vector
+    if receipt.get("reference_point") != list(
+        station_pixels[candidate["station_ids"][1]]
+    ):
+        raise Attrition(
+            "factor_identity_mismatch",
+            "fixed-cube reference point is not the derived control station pixel",
+        )
+    displacement_paths = sorted(product_directory.glob("displacement_[0-9][0-9].tif"))
+    if len(displacement_paths) != len(acquisition_days) - 1:
+        raise Attrition("factor_identity_mismatch", "fixed-cube displacement count differs from acquisition dates")
+    first_id, second_id = candidate["station_ids"]
+    difference = [0.0]
+    for path in displacement_paths:
+        first, digest = _raster_sample(
+            path,
+            station_pixels[first_id],
+            rows=rows,
+            cols=cols,
+            crs=crs,
+            geotransform=geotransform,
+        )
+        second, second_digest = _raster_sample(
+            path,
+            station_pixels[second_id],
+            rows=rows,
+            cols=cols,
+            crs=crs,
+            geotransform=geotransform,
+        )
+        if digest != second_digest:
+            raise Attrition("factor_identity_mismatch", "production raster changed between station reads")
+        raster_hashes[path.name] = digest
+        difference.append((first - second) * 1000.0)
+    return {
+        "acquisition_days": acquisition_days,
+        "station_pixels": station_pixels,
+        "station_los": station_los,
+        "insar_difference_mm": difference,
+        "source_sha256": canonical_digest(raster_hashes),
+        "raster_hashes": raster_hashes,
     }
 
 
@@ -323,6 +627,75 @@ def _block_factor(
     raise Attrition("difference_covariance_unavailable", "station pixel is absent from production factor blocks")
 
 
+def read_production_factor_header(
+    product_directory: Path,
+    candidate: Mapping[str, Any],
+    preregistration: Mapping[str, Any],
+) -> dict[str, Any]:
+    factor_path = product_directory / preregistration["factor_binding"]["output_factor"]["artifact_hdf5"]
+    manifest_path = product_directory / preregistration["factor_binding"]["output_factor"]["artifact_manifest"]
+    manifest, manifest_bytes = _bounded_json(manifest_path)
+    try:
+        source, before, factor_sha256 = _open_snapshot(factor_path, FACTOR_BYTE_CAP)
+        with source, h5py.File(source, "r") as factor:
+            required = preregistration["factor_binding"]["output_factor"]
+            if (
+                manifest.get("schema_version") != 3
+                or manifest.get("method") != required["method"]
+                or manifest.get("method_version") != required["method_version"]
+                or manifest.get("hdf5_file") != factor_path.name
+                or manifest.get("hdf5_bytes") != before.st_size
+                or manifest.get("hdf5_sha256") != factor_sha256
+                or manifest.get("burst_id") != candidate["burst_id"]
+                or manifest.get("calibration_scope") != required["calibration_status"]
+                or int(factor.attrs.get("schema_version", -1)) != required["schema_version"]
+                or int(factor.attrs.get("method_version", -1)) != required["method_version"]
+                or int(factor.attrs.get("gauge_date_index", -1)) != 0
+                or int(factor.attrs.get("calibration_scope", -1)) != 1
+                or int(factor.attrs.get("complete", 0)) != 1
+            ):
+                raise Attrition("factor_identity_mismatch", "factor header/manifest differs from frozen scope")
+            metadata = factor["metadata"]
+            _validate_factor_evidence(product_directory, metadata)
+            acquisition_days = np.asarray(metadata["acquisition_days"][:], dtype=float)
+            geotransform = np.asarray(metadata["geotransform"][:], dtype=float)
+            full_grid = _grid(factor["full_grid"])
+            header = {
+                "acquisition_days": acquisition_days.tolist(),
+                "geotransform": geotransform.tolist(),
+                "crs": _hdf5_text(metadata, "crs"),
+                "units": _hdf5_text(metadata, "units"),
+                "full_grid": full_grid,
+                "reference_pixel": [
+                    int(metadata.attrs.get("reference_row", -1)),
+                    int(metadata.attrs.get("reference_col", -1)),
+                ],
+                "factor_sha256": factor_sha256,
+                "factor_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            }
+            opened = os.fstat(source.fileno())
+    except Attrition:
+        raise
+    except (OSError, KeyError, ValueError, TypeError) as error:
+        raise Attrition("difference_covariance_invalid", "production factor header is unreadable") from error
+    if _descriptor_identity(before) != _descriptor_identity(opened):
+        raise Attrition("factor_identity_mismatch", "factor changed while it was opened")
+    days = header["acquisition_days"]
+    if (
+        not days
+        or days[0] != 0.0
+        or days != sorted(set(days))
+        or not all(math.isfinite(value) for value in days)
+        or len(header["geotransform"]) != 6
+        or not header["crs"]
+        or header["units"] not in {"meters", "millimeters"}
+        or header["full_grid"]["row_start"] != 0
+        or header["full_grid"]["col_start"] != 0
+    ):
+        raise Attrition("factor_identity_mismatch", "factor grid/date identity is invalid")
+    return header
+
+
 def read_production_difference_factor(
     factor_path: Path,
     factor_manifest_path: Path,
@@ -334,26 +707,25 @@ def read_production_difference_factor(
     operator_path: Path | None = None,
     operator_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
+    factor_manifest, factor_manifest_bytes = _bounded_json(factor_manifest_path)
     try:
-        if factor_path.stat().st_size > FACTOR_BYTE_CAP or factor_manifest_path.stat().st_size > JSON_BYTE_CAP:
-            raise Attrition("difference_covariance_unavailable", "factor artifact exceeds its byte cap")
-    except OSError as error:
-        raise Attrition("difference_covariance_unavailable", "factor artifact is missing") from error
-    try:
-        factor_manifest_bytes = factor_manifest_path.read_bytes()
-        factor_manifest = json.loads(factor_manifest_bytes)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise Attrition("difference_covariance_unavailable", "factor provenance is unreadable") from error
-    factor_sha256 = _sha256_file(factor_path)
+        factor_source, factor_stat, factor_sha256 = _open_snapshot(
+            factor_path, FACTOR_BYTE_CAP
+        )
+    except ValueError as error:
+        raise Attrition(
+            "difference_covariance_unavailable", "factor artifact is unavailable"
+        ) from error
     required_output = preregistration["factor_binding"]["output_factor"]
     if factor_path.name != required_output["artifact_hdf5"] or factor_manifest_path.name != required_output["artifact_manifest"]:
+        factor_source.close()
         raise Attrition("factor_identity_mismatch", "production factor filenames differ from frozen scope")
     required_manifest = {
         "schema_version": 3,
         "method": required_output["method"],
         "method_version": required_output["method_version"],
         "hdf5_file": required_output["artifact_hdf5"],
-        "hdf5_bytes": factor_path.stat().st_size,
+        "hdf5_bytes": factor_stat.st_size,
         "hdf5_sha256": factor_sha256,
         "burst_id": candidate["burst_id"],
         "calibration_scope": required_output["calibration_status"],
@@ -361,6 +733,7 @@ def read_production_difference_factor(
     if not isinstance(factor_manifest, Mapping) or any(
         factor_manifest.get(field) != value for field, value in required_manifest.items()
     ):
+        factor_source.close()
         raise Attrition("factor_identity_mismatch", "production factor provenance differs from frozen scope")
     if operator_path is None or operator_manifest_path is None:
         operator_sha256 = _bare_digest(factor_manifest.get("operator_sha256"), "operator_sha256")
@@ -370,35 +743,48 @@ def read_production_difference_factor(
     else:
         required_operator = preregistration["factor_binding"]["input_operator"]
         if operator_path.name != required_operator["artifact_hdf5"] or operator_manifest_path.name != required_operator["artifact_manifest"]:
+            factor_source.close()
             raise Attrition("factor_identity_mismatch", "operator filenames differ from frozen scope")
         try:
-            if operator_manifest_path.stat().st_size > JSON_BYTE_CAP:
-                raise Attrition("factor_identity_mismatch", "operator provenance exceeds its byte cap")
-        except OSError as error:
-            raise Attrition("factor_identity_mismatch", "operator artifact is missing") from error
-        operator_sha256 = _sha256_file(operator_path)
-        operator_manifest_sha256 = _sha256_file(operator_manifest_path)
+            operator_manifest, operator_manifest_bytes = _bounded_json(
+                operator_manifest_path
+            )
+        except Attrition:
+            factor_source.close()
+            raise
         try:
-            operator_manifest = json.loads(operator_manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise Attrition("factor_identity_mismatch", "operator provenance is unreadable") from error
+            operator_source, operator_stat, operator_sha256 = _open_snapshot(
+                operator_path, FACTOR_BYTE_CAP
+            )
+        except ValueError as error:
+            factor_source.close()
+            raise Attrition(
+                "factor_identity_mismatch", "operator artifact is missing"
+            ) from error
+        with operator_source:
+            operator_after = os.fstat(operator_source.fileno())
+        if _descriptor_identity(operator_stat) != _descriptor_identity(operator_after):
+            factor_source.close()
+            raise Attrition("factor_identity_mismatch", "operator changed while read")
+        operator_manifest_sha256 = hashlib.sha256(operator_manifest_bytes).hexdigest()
         operator_required = {
             "schema_version": 1,
             "method": required_operator["method"],
             "method_version": required_operator["method_version"],
             "gauge_date_index": 0,
             "hdf5_file": required_operator["artifact_hdf5"],
-            "hdf5_bytes": operator_path.stat().st_size,
+            "hdf5_bytes": operator_stat.st_size,
             "hdf5_sha256": operator_sha256,
         }
         if not isinstance(operator_manifest, Mapping) or any(
             operator_manifest.get(field) != value
             for field, value in operator_required.items()
         ):
+            factor_source.close()
             raise Attrition("factor_identity_mismatch", "operator provenance differs from frozen scope")
 
     try:
-        with h5py.File(factor_path, "r") as factor:
+        with factor_source, h5py.File(factor_source, "r") as factor:
             if (
                 int(factor.attrs.get("schema_version", -1)) != required_output["schema_version"]
                 or int(factor.attrs.get("method_version", -1)) != required_output["method_version"]
@@ -408,6 +794,7 @@ def read_production_difference_factor(
             ):
                 raise Attrition("difference_covariance_uncalibrated", "factor header is not complete calibrated schema v4")
             metadata = factor["metadata"]
+            _validate_factor_evidence(factor_path.parent, metadata)
             if (
                 _hdf5_text(metadata, "method") != required_output["method"]
                 or _hdf5_text(metadata, "burst_id") != candidate["burst_id"]
@@ -424,6 +811,9 @@ def read_production_difference_factor(
             units = _hdf5_text(metadata, "units")
             if units not in {"meters", "millimeters"}:
                 raise Attrition("difference_covariance_invalid", "factor units are unsupported")
+            crs = _hdf5_text(metadata, "crs")
+            if not crs:
+                raise Attrition("factor_identity_mismatch", "factor CRS identity is missing")
             acquisition_days = np.asarray(metadata["acquisition_days"][:], dtype=float)
             if (
                 acquisition_days.ndim != 1
@@ -470,6 +860,8 @@ def read_production_difference_factor(
                 raise Attrition("difference_covariance_invalid", "factor covariance is non-finite")
             geotransform = np.asarray(metadata["geotransform"][:], dtype=float).tolist()
             full_grid = _grid(factor["full_grid"])
+            if full_grid["row_start"] != 0 or full_grid["col_start"] != 0:
+                raise Attrition("factor_identity_mismatch", "factor full grid is not origin based")
             digest_fields = {
                 "reference_signature_sha256": "reference_signature_digest",
                 "source_replay_sha256": "source_replay_digest",
@@ -482,15 +874,23 @@ def read_production_difference_factor(
                 "unwrap_branch_sha256": "unwrap_branch_digest",
                 "burst_ownership_sha256": "burst_ownership_digest",
                 "runtime_resource_receipt_sha256": "runtime_resource_receipt_digest",
+                "approximation_receipt_sha256": "approximation_receipt_digest",
+                "resource_receipt_sha256": "resource_receipt_digest",
+                "review_receipt_sha256": "review_receipt_digest",
+                "method_manifest_sha256": "method_manifest_digest",
+                "calibration_scope_sha256": "calibration_scope_digest",
             }
             scope_hashes = {
                 output: _bare_digest(_hdf5_text(metadata, source), source)
                 for output, source in digest_fields.items()
             }
+            factor_after = os.fstat(factor_source.fileno())
     except Attrition:
         raise
     except (OSError, KeyError, ValueError, TypeError) as error:
         raise Attrition("difference_covariance_invalid", "production factor is unreadable") from error
+    if _descriptor_identity(factor_stat) != _descriptor_identity(factor_after):
+        raise Attrition("factor_identity_mismatch", "factor changed while it was read")
     if any(
         condition is not None and (not math.isfinite(condition) or condition > 1.0e8)
         for condition in (target_condition,)
@@ -544,6 +944,13 @@ def read_production_difference_factor(
         "covariance": covariance,
         "binding": binding,
         "target_rank": target_rank,
+        "header": {
+            "acquisition_days": acquisition_days.tolist(),
+            "geotransform": geotransform,
+            "crs": crs,
+            "units": units,
+            "full_grid": full_grid,
+        },
     }
 
 
@@ -552,6 +959,8 @@ def _base_fragment(
     manifest: Mapping[str, Any],
     preregistration: Mapping[str, Any],
     freeze_receipt_sha256: str,
+    run_identity_sha256: str,
+    product_identity_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema": "dolphinrust.temporal_covariance.heldout_cluster_fragment",
@@ -562,6 +971,12 @@ def _base_fragment(
         "preregistration_sha256": canonical_digest(preregistration),
         "manifest_sha256": canonical_digest(manifest),
         "freeze_receipt_sha256": freeze_receipt_sha256,
+        "run_identity_sha256": _bare_digest(
+            run_identity_sha256, "run_identity_sha256"
+        ),
+        "product_identity_sha256": _bare_digest(
+            product_identity_sha256, "product_identity_sha256"
+        ),
         "cluster_id": candidate["candidate_id"],
         "station_ids": candidate["station_ids"],
         "burst_id": candidate["burst_id"],
@@ -575,12 +990,19 @@ def _attrition_fragment(
     preregistration: Mapping[str, Any],
     attrition: Attrition,
     freeze_receipt_sha256: str,
+    run_identity_sha256: str,
+    product_identity_sha256: str,
 ) -> dict[str, Any]:
     if attrition.code not in preregistration["attrition"]["allowed_codes"]:
         raise ValueError(f"executor produced an unregistered attrition code: {attrition.code}")
     return {
         **_base_fragment(
-            candidate, manifest, preregistration, freeze_receipt_sha256
+            candidate,
+            manifest,
+            preregistration,
+            freeze_receipt_sha256,
+            run_identity_sha256,
+            product_identity_sha256,
         ),
         "status": "not_evaluable",
         "reason_code": attrition.code,
@@ -588,257 +1010,169 @@ def _attrition_fragment(
     }
 
 
-def run_one_cluster(
+def run_product_cluster(
     manifest: Mapping[str, Any],
     preregistration: Mapping[str, Any],
-    input_spec: Mapping[str, Any],
-    output_path: Path,
-    aggregate_output_path: Path,
+    cluster_id: str,
+    product_directory: Path,
+    rust_batch_path: Path,
     *,
-    allow_one_shot_unblinding: bool,
     freeze_receipt_sha256: str,
-    static_session: requests.Session,
+    run_identity_sha256: str,
+    product_identity_sha256: str,
     ngl_session: requests.Session | None = None,
     ngl_base_url: str = NGL_TENV3_BASE_URL,
 ) -> dict[str, Any]:
-    if output_path.exists():
-        raise FileExistsError(f"one-shot output already exists: {output_path}")
-    if aggregate_output_path.exists():
-        raise FileExistsError(
-            f"aggregate outcome artifact already exists: {aggregate_output_path}"
-        )
-    if not allow_one_shot_unblinding:
-        raise PermissionError("explicit one-shot unblinding authorization is required")
-    expected_fields = {
-        "schema",
-        "schema_version",
-        "cluster_id",
-        "acquisition_dates",
-        "station_pixels",
-        "insar_difference_mm",
-        "baseline_sigma",
-        "static_source",
-        "factor",
-        "manifest_sha256",
-        "freeze_receipt_sha256",
-        "insar_source_sha256",
-        "estimator_receipt_sha256",
-    }
-    if set(input_spec) != expected_fields or input_spec.get("schema") != "dolphinrust.temporal_covariance.heldout_cluster_input" or input_spec.get("schema_version") != 1:
-        raise ValueError("held-out cluster input fields/schema do not match version 1")
-    candidate = select_manifest_cluster(
-        manifest, preregistration, str(input_spec["cluster_id"])
-    )
-    if input_spec["manifest_sha256"] != canonical_digest(manifest):
-        raise ValueError("cluster input manifest identity mismatch")
-    if input_spec["freeze_receipt_sha256"] != freeze_receipt_sha256:
-        raise ValueError("cluster input freeze receipt identity mismatch")
-    _bare_digest(freeze_receipt_sha256, "freeze_receipt_sha256")
-    insar_source_sha256 = _bare_digest(
-        input_spec["insar_source_sha256"], "insar_source_sha256"
-    )
-    estimator_receipt_sha256 = _bare_digest(
-        input_spec["estimator_receipt_sha256"], "estimator_receipt_sha256"
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        acquisition_dates = [
-            dt.date.fromisoformat(value) for value in input_spec["acquisition_dates"]
-        ]
-    except (TypeError, ValueError) as error:
-        raise ValueError("cluster acquisition_dates must be ISO dates") from error
-    station_pixels = input_spec["station_pixels"]
-    if not isinstance(station_pixels, Mapping) or set(station_pixels) != set(candidate["station_ids"]):
-        raise ValueError("station pixels must exactly match the frozen station pair")
-    parsed_pixels: dict[str, tuple[int, int]] = {}
-    for station_id, value in station_pixels.items():
-        if not isinstance(value, list) or len(value) != 2 or any(not isinstance(item, int) or item < 0 for item in value):
-            raise ValueError("station pixels must contain nonnegative row/column integers")
-        parsed_pixels[station_id] = (value[0], value[1])
-    static = input_spec["static_source"]
-    if not isinstance(static, Mapping) or set(static) != {
-        "url",
-        "file_name",
-        "windows",
-        "maximum_transfer_bytes_per_station",
-    }:
-        raise ValueError("STATIC source fields do not match the bounded crop schema")
-    maximum_transfer = static["maximum_transfer_bytes_per_station"]
-    if not isinstance(maximum_transfer, int) or not 0 < maximum_transfer <= 64 * 1024 * 1024:
-        raise ValueError("STATIC crop transfer cap must be between 1 and 67108864 bytes")
-    windows = static["windows"]
-    if not isinstance(windows, Mapping) or set(windows) != set(candidate["station_ids"]):
-        raise ValueError("STATIC crop windows must exactly match the station pair")
-    factor_spec = input_spec["factor"]
-    if not isinstance(factor_spec, Mapping) or set(factor_spec) != {
-        "hdf5_path",
-        "manifest_path",
-        "operator_path",
-        "operator_manifest_path",
-    }:
-        raise ValueError("production factor input fields are incomplete")
+    """Execute one frozen cluster from production artifacts and live GNSS bytes."""
 
+    candidate = select_manifest_cluster(manifest, preregistration, cluster_id)
     try:
         records_by_station, ngl_sources = fetch_ngl_pair(
             candidate, ngl_session, ngl_base_url
         )
+        factor_header = read_production_factor_header(
+            product_directory, candidate, preregistration
+        )
+        start = dt.date.fromisoformat(candidate["date_start"])
+        acquisition_dates = [
+            start + dt.timedelta(days=float(day))
+            for day in factor_header["acquisition_days"]
+        ]
         common_dates = exact_common_dates(
             candidate, acquisition_dates, records_by_station, preregistration
         )
-        with tempfile.TemporaryDirectory(
-            prefix="dolphinrust-heldout-cluster-", dir=output_path.parent
-        ) as directory:
-            temporary_root = Path(directory)
-            station_los: dict[str, np.ndarray] = {}
-            crop_receipts: dict[str, Any] = {}
-            for station_id in candidate["station_ids"]:
-                window_value = windows[station_id]
-                if not isinstance(window_value, Mapping) or set(window_value) != {
-                    "row0",
-                    "col0",
-                    "height",
-                    "width",
-                }:
-                    raise ValueError("STATIC crop window fields are invalid")
-                try:
-                    window = Window(**{field: int(window_value[field]) for field in window_value})
-                    crop_path = temporary_root / f"{station_id}.static.h5"
-                    crop_receipt_path = temporary_root / f"{station_id}.static.receipt.json"
-                    crop_receipts[station_id] = crop_remote_hdf5(
-                        url=str(static["url"]),
-                        expected_file_name=str(static["file_name"]),
-                        destination=crop_path,
-                        receipt_path=crop_receipt_path,
-                        product_type="static",
-                        window=window,
-                        source_catalog_sha256=candidate["metadata_hashes"]["burst_metadata_sha256"],
-                        session=static_session,
-                        max_transfer_bytes=maximum_transfer,
-                    )
-                except (RemoteCropError, TypeError, ValueError) as error:
-                    raise Attrition("sourced_los_missing", f"bounded STATIC crop failed for {station_id}") from error
-                station_record = next(
-                    record
-                    for record in records_by_station[station_id]
-                    if record.date == common_dates[0]
-                )
-                station_los[station_id] = los_at_static_crop(crop_path, station_record)
-
-            first_id, second_id = candidate["station_ids"]
-            gnss = station_pair_gnss_observation(
-                records_by_station[first_id],
-                records_by_station[second_id],
-                common_dates,
-                station_los[first_id],
-                station_los[second_id],
+        product = derive_product_observations(
+            product_directory,
+            candidate,
+            records_by_station,
+            factor_header,
+            preregistration,
+        )
+        first_id, second_id = candidate["station_ids"]
+        if factor_header["reference_pixel"] != list(product["station_pixels"][second_id]):
+            raise Attrition(
+                "factor_identity_mismatch",
+                "production factor reference is not the derived control station pixel",
             )
-            factor = read_production_difference_factor(
-                Path(factor_spec["hdf5_path"]),
-                Path(factor_spec["manifest_path"]),
-                candidate,
-                parsed_pixels[first_id],
-                parsed_pixels[second_id],
-                common_dates,
+        factor_spec = preregistration["factor_binding"]
+        factor = read_production_difference_factor(
+            product_directory / factor_spec["output_factor"]["artifact_hdf5"],
+            product_directory / factor_spec["output_factor"]["artifact_manifest"],
+            candidate,
+            product["station_pixels"][first_id],
+            product["station_pixels"][second_id],
+            common_dates,
+            preregistration,
+            product_directory / factor_spec["input_operator"]["artifact_hdf5"],
+            product_directory / factor_spec["input_operator"]["artifact_manifest"],
+        )
+        if factor["header"] != {
+            key: factor_header[key]
+            for key in ("acquisition_days", "geotransform", "crs", "units", "full_grid")
+        }:
+            raise Attrition("factor_identity_mismatch", "factor header changed between validated reads")
+        common_indices = [acquisition_dates.index(date) for date in common_dates]
+        try:
+            temporal = run_production_temporal_estimator(
+                rust_batch_path,
+                cluster_id,
+                [factor_header["acquisition_days"][index] for index in common_indices],
+                [product["insar_difference_mm"][index] for index in common_indices],
+                factor["covariance"],
                 preregistration,
-                Path(factor_spec["operator_path"]),
-                Path(factor_spec["operator_manifest_path"]),
             )
-            insar_series = np.asarray(input_spec["insar_difference_mm"], dtype=float)
-            if insar_series.shape != (len(acquisition_dates),):
-                raise ValueError("InSAR difference series must match all acquisition dates")
-            common_indices = [acquisition_dates.index(date) for date in common_dates]
-            try:
-                insar = fit_slope_with_covariance(
-                    common_dates,
-                    insar_series[common_indices],
-                    factor["covariance"],
-                )
-            except ValueError as error:
-                raise Attrition("total_covariance_not_positive_definite", str(error)) from error
-            baseline_sigma = input_spec["baseline_sigma"]
-            if not isinstance(baseline_sigma, Mapping) or set(baseline_sigma) != {"68", "90", "95"} or any(
-                not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0
-                for value in baseline_sigma.values()
-            ):
-                raise ValueError("baseline_sigma must contain positive finite 68/90/95 values")
-            combined = insar["variance"] + gnss["slope_variance"]
-            if not math.isfinite(combined) or combined <= 0:
-                raise Attrition("total_covariance_not_positive_definite", "combined station-pair slope variance is not positive")
-            solution_sha256 = canonical_digest(
-                {station_id: source["sha256"] for station_id, source in ngl_sources.items()}
+        except ValueError as error:
+            raise Attrition("temporal_estimator_abstained", str(error)) from error
+        gnss = station_pair_gnss_observation(
+            records_by_station[first_id],
+            records_by_station[second_id],
+            common_dates,
+            product["station_los"][first_id],
+            product["station_los"][second_id],
+        )
+        combined = temporal["slope_variance"] + gnss["slope_variance"]
+        if not math.isfinite(combined) or combined <= 0:
+            raise Attrition(
+                "total_covariance_not_positive_definite",
+                "combined station-pair slope variance is not positive",
             )
-            los_sha256 = canonical_digest(
-                {
-                    station_id: crop_receipts[station_id]["output"]["sha256"]
-                    for station_id in candidate["station_ids"]
-                }
-            )
-            fragment = {
-                **_base_fragment(
-                    candidate,
-                    manifest,
-                    preregistration,
-                    freeze_receipt_sha256,
-                ),
-                "status": "evaluable",
-                "common_dates": [date.isoformat() for date in common_dates],
-                "common_dates_sha256": canonical_digest(
-                    [date.isoformat() for date in common_dates]
-                ),
-                "station_pair_provenance": {
-                    "solution_sources": ngl_sources,
-                    "solution_sha256": solution_sha256,
-                    "coordinate_frame": "ENU",
-                    "los_source": "run_specific_sourced_los_components",
-                    "los_sha256": los_sha256,
-                    "station_los_vectors": {
-                        station_id: station_los[station_id].tolist()
-                        for station_id in candidate["station_ids"]
-                    },
-                    "los_crop_receipts": crop_receipts,
-                    "projection_convention": "signed_ground_to_sensor_los_dot_enu",
-                    "epoch_zero_reference_sha256": canonical_digest(
-                        {
-                            "date": common_dates[0].isoformat(),
-                            "stations": candidate["station_ids"],
-                        }
-                    ),
-                    "covariance_projection": "u_transpose_C_u",
-                },
-                "difference_covariance": factor["binding"],
-                "estimator": {
-                    "method": "unweighted_ols_with_full_covariance_propagation_v1",
-                    "estimator_receipt_sha256": estimator_receipt_sha256,
-                    "insar_source_sha256": insar_source_sha256,
-                    "insar_difference_series_sha256": canonical_digest(
-                        insar_series.tolist()
-                    ),
-                    "insar_design_sha256": insar["design_sha256"],
-                    "gnss_design_sha256": gnss["design_sha256"],
-                },
-                "observation": {
-                    "insar_slope_difference": insar["slope"],
-                    "gnss_slope_difference": gnss["slope_mm_year"],
-                    "insar_difference_variance": insar["variance"],
-                    "gnss_slope_variance": gnss["slope_variance"],
-                    "sensor_cross_covariance": 0.0,
-                    "baseline_sigma": dict(baseline_sigma),
-                },
+        solution_sha256 = canonical_digest(
+            {station_id: source["sha256"] for station_id, source in ngl_sources.items()}
+        )
+        los_sha256 = canonical_digest(
+            {
+                station_id: product["station_los"][station_id].tolist()
+                for station_id in candidate["station_ids"]
             }
+        )
+        return {
+            **_base_fragment(
+                candidate,
+                manifest,
+                preregistration,
+                freeze_receipt_sha256,
+                run_identity_sha256,
+                product_identity_sha256,
+            ),
+            "status": "pass",
+            "common_dates": [date.isoformat() for date in common_dates],
+            "common_dates_sha256": canonical_digest(
+                [date.isoformat() for date in common_dates]
+            ),
+            "gnss_provenance": {
+                "solution_sources": ngl_sources,
+                "solution_sha256": solution_sha256,
+                "coordinate_frame": "ENU",
+                "los_source": "run_specific_sourced_los_components",
+                "los_sha256": los_sha256,
+                "station_los_vectors": {
+                    station_id: product["station_los"][station_id].tolist()
+                    for station_id in candidate["station_ids"]
+                },
+                "projection_convention": "signed_ground_to_sensor_los_dot_enu",
+                "epoch_zero_reference_sha256": canonical_digest(
+                    {"date": common_dates[0].isoformat(), "stations": candidate["station_ids"]}
+                ),
+                "covariance_projection": "u_transpose_C_u",
+            },
+            "difference_covariance": factor["binding"],
+            "estimator": {
+                "method": temporal["method"],
+                "method_version": temporal["method_version"],
+                "binary_sha256": temporal["binary_sha256"],
+                "request_sha256": temporal["request_sha256"],
+                "response_sha256": temporal["response_sha256"],
+                "insar_source_sha256": product["source_sha256"],
+                "insar_design_sha256": canonical_digest(
+                    [factor_header["acquisition_days"][index] for index in common_indices]
+                ),
+                "gnss_design_sha256": gnss["design_sha256"],
+                "resource": temporal["resource"],
+            },
+            "observation": {
+                "insar_slope_difference": temporal["slope_mm_year"],
+                "gnss_slope_difference": gnss["slope_mm_year"],
+                "insar_difference_variance": temporal["slope_variance"],
+                "gnss_slope_variance": gnss["slope_variance"],
+                "sensor_cross_covariance": 0.0,
+                "baseline_sigma": {
+                    level: math.sqrt(
+                        temporal["baseline_sigma"] ** 2 + gnss["slope_variance"]
+                    )
+                    for level in ("68", "90", "95")
+                },
+            },
+        }
     except Attrition as attrition:
-        fragment = _attrition_fragment(
+        return _attrition_fragment(
             candidate,
             manifest,
             preregistration,
             attrition,
             freeze_receipt_sha256,
+            run_identity_sha256,
+            product_identity_sha256,
         )
-    if aggregate_output_path.exists():
-        raise FileExistsError(
-            f"aggregate outcome artifact already exists: {aggregate_output_path}"
-        )
-    write_one_shot(output_path, fragment)
-    return fragment
 
 
 def write_one_shot(path: Path, payload: Mapping[str, Any]) -> None:
@@ -857,5 +1191,10 @@ def write_one_shot(path: Path, payload: Mapping[str, Any]) -> None:
             os.link(temporary_path, path)
         except FileExistsError as error:
             raise FileExistsError(f"one-shot output already exists: {path}") from error
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         temporary_path.unlink(missing_ok=True)
