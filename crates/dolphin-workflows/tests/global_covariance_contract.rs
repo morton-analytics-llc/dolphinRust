@@ -1,7 +1,7 @@
 //! Issue #52 unconditional workflow contract for `sequential_source_dag_v1`.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -1630,6 +1630,31 @@ fn adaptive_replay_uses_persisted_support_and_rejects_a_changed_mask() {
         .unwrap();
     assert!(replay.covariance.iter().all(|value| value.is_finite()));
 
+    let reference_selection = [(GlobalDateId::new(0), 1), (GlobalDateId::new(1), 1)];
+    let mut provider = provider_for(captured.clone());
+    let pair = topology
+        .replay_reference_difference_covariance_from_provider(
+            &selection,
+            &reference_selection,
+            query,
+            request.branch_tolerance,
+            &mut provider,
+        )
+        .unwrap();
+    let mut expected_union = BTreeSet::new();
+    for (output, column_start) in [(0, 0_u64), (1, 1_u64)] {
+        let packed = &captured[0].support_bits[output * 2..output * 2 + 2];
+        for slot in 0..9 {
+            if packed[slot / 8] & (1 << (slot % 8)) != 0 {
+                expected_union.insert(((slot / 3) as u64, column_start + (slot % 3) as u64));
+            }
+        }
+    }
+    assert_eq!(
+        pair.effective_looks.as_ref().unwrap().support_union_count,
+        expected_union.len()
+    );
+
     let mut changed = captured;
     changed[0].support_bits[0] = 1;
     changed[0].support_bits[1] = 0;
@@ -1862,6 +1887,56 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
         cross_api_same_topology.reference_signature,
         shared.reference_signature
     );
+    assert_eq!(
+        cross_api_same_topology.effective_looks,
+        shared.effective_looks
+    );
+
+    let mut target_provider = provider_for_same_topology();
+    let mut tampered_reference_provider = provider_for_same_topology();
+    tampered_reference_provider.dishonest_samples = true;
+    let error = topology
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &joint_selection,
+            &mut target_provider,
+            &topology,
+            &shared_reference,
+            &mut tampered_reference_provider,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), ReplayStatus::SourceIdentityMismatch);
+    assert!(tampered_reference_provider.source_reads > 0);
+
+    let mut target_provider = provider_for_same_topology();
+    let mut tampered_reference_provider = provider_for_same_topology();
+    for block in tampered_reference_provider.blocks.values_mut() {
+        block.support_bits[0] ^= 1;
+    }
+    let error = topology
+        .replay_cross_topology_reference_difference_covariance_from_providers(
+            &joint_selection,
+            &mut target_provider,
+            &topology,
+            &shared_reference,
+            &mut tampered_reference_provider,
+            DependencyConeQuery {
+                source_rank: 6,
+                microbatch: 1,
+                byte_cap: u64::MAX,
+            },
+            request.branch_tolerance,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.status(),
+        ReplayStatus::ReplayStateMismatch | ReplayStatus::SourceIdentityMismatch
+    ));
 
     let mut disjoint_cfg = cfg;
     disjoint_cfg.half_window = dolphin_core::HalfWindow { y: 0, x: 0 };
@@ -2004,11 +2079,12 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
             &mut provider,
         )
         .unwrap();
+    let effective_fraction = shared.effective_looks.as_ref().unwrap().fraction;
     for row in 0..4 {
         for column in 0..4 {
             assert!(
                 (shared.target_covariance[(row, column)]
-                    - target_marginal.covariance[(row, column)])
+                    - target_marginal.covariance[(row, column)] / effective_fraction)
                     .abs()
                     < 1.0e-10
             );
@@ -2930,6 +3006,41 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
     );
     assert!(replay.source_cache_peak_bytes <= replay.dependency_cone.source_window_bytes);
     assert_eq!(replay.dependency_cone.provider_bytes, 512);
+    let expected_support = (0_u64..3)
+        .flat_map(|row| (0_u64..5).map(move |column| (row, column)))
+        .collect::<Vec<_>>();
+    let expected_denominator = expected_support
+        .iter()
+        .flat_map(|left| {
+            expected_support.iter().map(move |right| {
+                let row = left.0.abs_diff(right.0) as f64;
+                let column = left.1.abs_diff(right.1) as f64;
+                (-(row.hypot(column)) / 1.5).exp()
+            })
+        })
+        .sum::<f64>();
+    let expected_fraction = expected_support.len() as f64 / expected_denominator;
+    let effective_looks = replay.effective_looks.as_ref().unwrap();
+    assert_eq!(effective_looks.model, "source_factor_declared_v1");
+    assert_eq!(effective_looks.distance_scale_pixels, 1.5);
+    assert_eq!(effective_looks.support_union_count, expected_support.len());
+    assert!((effective_looks.fraction - expected_fraction).abs() < 1e-15);
+    assert_ne!(effective_looks.receipt, [0; 32]);
+    let mut expected_receipt = Sha256::new();
+    expected_receipt.update(b"dolphinrust:effective-looks-realization:v1");
+    expected_receipt.update(b"source_factor_declared_v1");
+    expected_receipt.update(1.5_f64.to_bits().to_le_bytes());
+    expected_receipt.update((expected_support.len() as u64).to_le_bytes());
+    for &(row, column) in &expected_support {
+        expected_receipt.update(row.to_le_bytes());
+        expected_receipt.update(column.to_le_bytes());
+    }
+    expected_receipt.update(expected_fraction.to_bits().to_le_bytes());
+    expected_receipt.update(replay.source_factor_receipt);
+    expected_receipt.update(replay.support_receipt);
+    assert_eq!(effective_looks.receipt, expected_receipt.finalize()[..]);
+    let config_only_receipt = Sha256::digest(b"source_factor_declared_v1:1.5");
+    assert_ne!(effective_looks.receipt, config_only_receipt[..]);
 
     let epsilon = 1e-4;
     let sigma = 0.02 * std::f64::consts::FRAC_1_SQRT_2;
@@ -2978,7 +3089,8 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
     actual
         .slice_mut(ndarray::s![3.., ..3])
         .assign(&replay.target_reference_covariance.t());
-    for ((row, col), expected) in oracle.indexed_iter() {
+    for ((row, col), unscaled) in oracle.indexed_iter() {
+        let expected = unscaled / expected_fraction;
         let tolerance = 5e-9 + 5e-5 * expected.abs();
         assert!(
             (actual[(row, col)] - expected).abs() <= tolerance,
@@ -3024,6 +3136,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         replay.source_factor_receipt
     );
     assert_eq!(global.replay.support_receipt, replay.support_receipt);
+    assert_eq!(global.replay.effective_looks, replay.effective_looks);
     assert_ne!(global.replay.source_factor_receipt, [0; 32]);
     assert_ne!(global.replay.support_receipt, [0; 32]);
     assert_eq!(global.replay.target_disposition, ReplayStatus::Valid);
@@ -3064,6 +3177,10 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
     assert_eq!(
         reversed.replay.support_receipt,
         global.replay.support_receipt
+    );
+    assert_eq!(
+        reversed.replay.effective_looks,
+        global.replay.effective_looks
     );
 
     let mut bounded_left = provider_for(&left_provider);

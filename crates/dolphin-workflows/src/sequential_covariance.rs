@@ -28,7 +28,7 @@ use dolphin_phaselink::{
     CompressionReplayGrid, CompressionReplayStatus, CovarianceReplayError, EstimatorJvpError,
     FixedBranchStatus, FixedEstimatorBranch, InfluenceDag, InfluenceError, NativeSourcePixel,
     NodeId, PhaseReplayGrid, ProperComplexFactor, RectPixelReplay, RectReplayDescriptor, SourceId,
-    TemporalCoordinate,
+    TemporalCoordinate, EFFECTIVE_LOOKS_MODEL,
 };
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
@@ -1317,10 +1317,27 @@ pub struct ReferenceDifferenceCovarianceReplay {
     pub source_factor_receipt: [u8; 32],
     /// Digest of every exact realized phase support resolved by the query.
     pub support_receipt: [u8; 32],
+    /// Exact support-union effective-look scaling applied by production replay.
+    pub effective_looks: Option<EffectiveLooksReplay>,
     /// Successful target replay disposition.
     pub target_disposition: ReplayStatus,
     /// Successful reference replay disposition.
     pub reference_disposition: ReplayStatus,
+}
+
+/// Exact effective-look realization applied to one target/reference pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveLooksReplay {
+    /// Frozen source-factor scaling model.
+    pub model: &'static str,
+    /// Frozen exponential spatial-correlation distance scale in pixels.
+    pub distance_scale_pixels: f64,
+    /// Number of unique global native source coordinates in the pair union.
+    pub support_union_count: usize,
+    /// `n / (1^T R 1)` for the exact sorted support union.
+    pub fraction: f64,
+    /// Strong receipt over the model, scale, exact coordinates, and fraction.
+    pub receipt: [u8; 32],
 }
 
 /// Global production query routed across captured phase-link tile topologies.
@@ -1442,6 +1459,88 @@ fn combined_query_receipt(domain: &[u8], left: [u8; 32], right: [u8; 32]) -> [u8
     digest.update(left);
     digest.update(right);
     digest.finalize().into()
+}
+
+const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
+
+fn apply_effective_looks_scaling(
+    replay: &mut ReferenceDifferenceCovarianceReplay,
+    support_union: &BTreeSet<(u64, u64)>,
+) -> Result<(), SequentialReplayError> {
+    if support_union.is_empty() {
+        return Err(SequentialReplayError::Provider(
+            ReplayStatus::ReplayStateMismatch,
+            "effective-look scaling requires a nonempty realized support union",
+        ));
+    }
+    let denominator = support_union
+        .iter()
+        .flat_map(|left| {
+            support_union.iter().map(move |right| {
+                let row = left.0.abs_diff(right.0) as f64;
+                let column = left.1.abs_diff(right.1) as f64;
+                (-(row.hypot(column)) / EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS).exp()
+            })
+        })
+        .sum::<f64>();
+    let fraction = support_union.len() as f64 / denominator;
+    if !denominator.is_finite()
+        || denominator <= 0.0
+        || !fraction.is_finite()
+        || fraction <= 0.0
+        || fraction > 1.0 + 16.0 * f64::EPSILON
+    {
+        return Err(SequentialReplayError::Provider(
+            ReplayStatus::NonFiniteReplayState,
+            "effective-look support correlation is invalid",
+        ));
+    }
+    let mut receipt = Sha256::new();
+    receipt.update(b"dolphinrust:effective-looks-realization:v1");
+    receipt.update(EFFECTIVE_LOOKS_MODEL.as_bytes());
+    receipt.update(
+        EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
+            .to_bits()
+            .to_le_bytes(),
+    );
+    receipt.update((support_union.len() as u64).to_le_bytes());
+    for &(row, column) in support_union {
+        receipt.update(row.to_le_bytes());
+        receipt.update(column.to_le_bytes());
+    }
+    receipt.update(fraction.to_bits().to_le_bytes());
+    receipt.update(replay.source_factor_receipt);
+    receipt.update(replay.support_receipt);
+    let covariance_scale = fraction.recip();
+    for covariance in [
+        &mut replay.target_covariance,
+        &mut replay.reference_covariance,
+        &mut replay.target_reference_covariance,
+        &mut replay.difference_covariance,
+    ] {
+        covariance.mapv_inplace(|value| value * covariance_scale);
+    }
+    if replay
+        .target_covariance
+        .iter()
+        .chain(replay.reference_covariance.iter())
+        .chain(replay.target_reference_covariance.iter())
+        .chain(replay.difference_covariance.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(SequentialReplayError::Provider(
+            ReplayStatus::NonFiniteReplayState,
+            "effective-look-scaled covariance is non-finite",
+        ));
+    }
+    replay.effective_looks = Some(EffectiveLooksReplay {
+        model: EFFECTIVE_LOOKS_MODEL,
+        distance_scale_pixels: EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+        support_union_count: support_union.len(),
+        fraction,
+        receipt: receipt.finalize().into(),
+    });
+    Ok(())
 }
 
 fn global_reference_selection_signature(query: GlobalReferenceCovarianceQuery<'_>) -> [u8; 32] {
@@ -2330,6 +2429,26 @@ impl SequentialReplayTopology {
         })
     }
 
+    fn effective_support_reservation_bytes(
+        &self,
+        cone: &SpatialQueryCone,
+    ) -> Result<u64, SequentialReplayError> {
+        let records = cone
+            .active_sources
+            .iter()
+            .zip(&cone.required_compressed)
+            .try_fold(0_u64, |total, (sources, compressed)| {
+                checked_add(
+                    total,
+                    checked_add(sources.len() as u64, compressed.len() as u64)?,
+                )
+            })?;
+        checked_add(
+            size_of::<BTreeSet<(u64, u64)>>() as u64,
+            checked_mul(records, btree_record_reservation_bytes::<(u64, u64), ()>())?,
+        )
+    }
+
     /// Enforce the dependency-cone byte cap before numeric replay.
     ///
     /// # Errors
@@ -2495,6 +2614,7 @@ impl SequentialReplayTopology {
             source_cache_peak_bytes: 0,
             source_factor_receipt: [0; 32],
             support_receipt: [0; 32],
+            effective_looks: None,
             target_disposition: ReplayStatus::Valid,
             reference_disposition: ReplayStatus::Valid,
         })
@@ -2737,10 +2857,16 @@ impl SequentialReplayTopology {
                     b"dolphinrust:empty-source-factor-query:v1",
                 ),
                 support_receipt: empty_query_receipt(b"dolphinrust:empty-support-query:v1"),
+                effective_looks: None,
                 target_disposition: ReplayStatus::Valid,
                 reference_disposition: ReplayStatus::Valid,
             });
         }
+        let effective_support_bytes = self.effective_support_reservation_bytes(&cone)?;
+        dependency_cone.support_bytes =
+            checked_add(dependency_cone.support_bytes, effective_support_bytes)?;
+        dependency_cone.total_bytes =
+            checked_add(dependency_cone.total_bytes, effective_support_bytes)?;
         self.validate_provider_identity(provider.identity())?;
         let expected_rank = dependency_cone
             .block_ids
@@ -2791,6 +2917,7 @@ impl SequentialReplayTopology {
         }
 
         let mut covariance = Array2::<f64>::zeros((selected, selected));
+        let mut effective_support = BTreeSet::new();
         for block_index in (0..self.blocks.len()).rev() {
             let block = &self.blocks[block_index];
             let mut source_adjoints: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
@@ -2833,6 +2960,9 @@ impl SequentialReplayTopology {
                     }
                 }
             }
+            for &native in source_adjoints.keys() {
+                effective_support.insert(self.global_native_coordinate(native)?);
+            }
             provider.clear_block();
         }
         if covariance.iter().any(|value| !value.is_finite()) {
@@ -2853,7 +2983,7 @@ impl SequentialReplayTopology {
                 - &target_reference_covariance
                 - target_reference_covariance.t()
         };
-        Ok(ReferenceDifferenceCovarianceReplay {
+        let mut replay = ReferenceDifferenceCovarianceReplay {
             target_covariance,
             reference_covariance,
             target_reference_covariance,
@@ -2866,9 +2996,12 @@ impl SequentialReplayTopology {
             source_cache_peak_bytes: provider.peak_payload_bytes(),
             source_factor_receipt: provider.source_factor_receipt(),
             support_receipt: provider.support_receipt(),
+            effective_looks: None,
             target_disposition: ReplayStatus::Valid,
             reference_disposition: ReplayStatus::Valid,
-        })
+        };
+        apply_effective_looks_scaling(&mut replay, &effective_support)?;
+        Ok(replay)
     }
 
     /// Jointly replay one target/reference pair captured in separate tile topologies.
@@ -2908,13 +3041,38 @@ impl SequentialReplayTopology {
         self.validate_cross_topology(reference_topology)?;
         self.validate_cross_reference_selections(target_selection, reference_selection, query)?;
         if self.same_replay_graph(reference_topology) {
-            return self.replay_reference_difference_covariance_from_provider(
+            let target_replay = self.replay_reference_difference_covariance_from_provider(
                 target_selection,
                 reference_selection,
                 query,
                 branch_tolerance,
                 target_provider,
-            );
+            )?;
+            let reference_replay = self.replay_reference_difference_covariance_from_provider(
+                target_selection,
+                reference_selection,
+                query,
+                branch_tolerance,
+                reference_provider,
+            )?;
+            if target_replay.target_covariance != reference_replay.target_covariance
+                || target_replay.reference_covariance != reference_replay.reference_covariance
+                || target_replay.target_reference_covariance
+                    != reference_replay.target_reference_covariance
+                || target_replay.difference_covariance != reference_replay.difference_covariance
+                || target_replay.reference_signature != reference_replay.reference_signature
+                || target_replay.source_factor_receipt != reference_replay.source_factor_receipt
+                || target_replay.support_receipt != reference_replay.support_receipt
+                || target_replay.effective_looks != reference_replay.effective_looks
+                || target_replay.target_disposition != reference_replay.target_disposition
+                || target_replay.reference_disposition != reference_replay.reference_disposition
+            {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::SourceIdentityMismatch,
+                    "same-topology providers do not have exact replay artifact receipts",
+                ));
+            }
+            return Ok(target_replay);
         }
         if !branch_tolerance.is_finite() || branch_tolerance <= 0.0 {
             return Err(SequentialReplayError::Invalid(
@@ -2963,6 +3121,24 @@ impl SequentialReplayTopology {
                 checked_add(doubled_frontier, joint_covariance_bytes)?,
             )?;
         }
+        let target_effective_support_bytes =
+            self.effective_support_reservation_bytes(&target_cone)?;
+        target_estimate.support_bytes = checked_add(
+            target_estimate.support_bytes,
+            target_effective_support_bytes,
+        )?;
+        target_estimate.total_bytes =
+            checked_add(target_estimate.total_bytes, target_effective_support_bytes)?;
+        let reference_effective_support_bytes =
+            reference_topology.effective_support_reservation_bytes(&reference_cone)?;
+        reference_estimate.support_bytes = checked_add(
+            reference_estimate.support_bytes,
+            reference_effective_support_bytes,
+        )?;
+        reference_estimate.total_bytes = checked_add(
+            reference_estimate.total_bytes,
+            reference_effective_support_bytes,
+        )?;
         let mut block_ids = target_estimate.block_ids.clone();
         block_ids.extend(reference_estimate.block_ids.iter().copied());
         block_ids.sort_unstable_by_key(|block| block.get());
@@ -3060,6 +3236,7 @@ impl SequentialReplayTopology {
                     b"dolphinrust:empty-cross-source-factor-query:v1",
                 ),
                 support_receipt: empty_query_receipt(b"dolphinrust:empty-cross-support-query:v1"),
+                effective_looks: None,
                 target_disposition: ReplayStatus::Valid,
                 reference_disposition: ReplayStatus::Valid,
             });
@@ -3084,6 +3261,7 @@ impl SequentialReplayTopology {
         let mut reference_provider = QuerySourceCache::new(reference_provider);
         let mut covariance = Array2::<f64>::zeros((selected, selected));
         let mut source_cache_peak_bytes = 0_u64;
+        let mut effective_support = BTreeSet::new();
         for block_index in (0..self.blocks.len()).rev() {
             let target_block = &self.blocks[block_index];
             let reference_block = &reference_topology.blocks[block_index];
@@ -3216,6 +3394,12 @@ impl SequentialReplayTopology {
                     }
                 }
             }
+            for &native in target_roots.keys() {
+                effective_support.insert(self.global_native_coordinate(native)?);
+            }
+            for &native in reference_roots.keys() {
+                effective_support.insert(reference_topology.global_native_coordinate(native)?);
+            }
             source_cache_peak_bytes = source_cache_peak_bytes.max(checked_add(
                 target_provider.current_payload_bytes(),
                 reference_provider.current_payload_bytes(),
@@ -3260,7 +3444,7 @@ impl SequentialReplayTopology {
                 - &target_reference_covariance
                 - target_reference_covariance.t()
         };
-        Ok(ReferenceDifferenceCovarianceReplay {
+        let mut replay = ReferenceDifferenceCovarianceReplay {
             target_covariance,
             reference_covariance,
             target_reference_covariance,
@@ -3278,9 +3462,12 @@ impl SequentialReplayTopology {
                 target_provider.support_receipt(),
                 reference_provider.support_receipt(),
             ),
+            effective_looks: None,
             target_disposition: ReplayStatus::Valid,
             reference_disposition: ReplayStatus::Valid,
-        })
+        };
+        apply_effective_looks_scaling(&mut replay, &effective_support)?;
+        Ok(replay)
     }
 
     fn same_replay_graph(&self, other: &Self) -> bool {
