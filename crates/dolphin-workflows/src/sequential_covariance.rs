@@ -639,6 +639,10 @@ where
         }
     }
 
+    pub(crate) const fn source_resolver(&self) -> &R {
+        &self.source_resolver
+    }
+
     fn read_block(
         &mut self,
         block: &SequentialReplayBlock,
@@ -1385,6 +1389,17 @@ pub struct GlobalReferenceDifferenceCovarianceReplay {
     pub replay: ReferenceDifferenceCovarianceReplay,
     /// Conservative query high-water including routing and joint-result allocations.
     pub resource_high_water_bytes: u64,
+}
+
+/// Pure global routing/dependency resource estimate produced before source reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalReferenceCovarianceResourceEstimate {
+    /// Topology, operator, source-cache, covariance, and provider reservation.
+    pub replay_bytes: u64,
+    /// Global routing selections and returned joint covariance allocation.
+    pub wrapper_bytes: u64,
+    /// Exact conservative sum admitted by the global replay entry point.
+    pub total_bytes: u64,
 }
 
 struct SpatialQueryCone {
@@ -4775,32 +4790,7 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
             "global reference replay query is empty or invalid",
         ));
     }
-    let selected =
-        query
-            .ordered_dates
-            .len()
-            .checked_mul(2)
-            .ok_or(SequentialReplayError::Invalid(
-                "global reference selection size overflows usize",
-            ))?;
-    let selection_bytes = checked_mul(
-        u64::try_from(selected).map_err(|_| {
-            SequentialReplayError::Invalid("global reference selection size exceeds u64")
-        })?,
-        size_of::<(GlobalDateId, usize)>() as u64,
-    )?;
-    let joint_bytes = checked_mul(
-        checked_mul(
-            u64::try_from(selected).map_err(|_| {
-                SequentialReplayError::Invalid("global joint covariance size exceeds u64")
-            })?,
-            u64::try_from(selected).map_err(|_| {
-                SequentialReplayError::Invalid("global joint covariance size exceeds u64")
-            })?,
-        )?,
-        8,
-    )?;
-    let wrapper_bytes = checked_add(selection_bytes, joint_bytes)?;
+    let (selected, wrapper_bytes, joint_bytes) = global_reference_wrapper_bytes(query)?;
     if wrapper_bytes > query.byte_cap {
         return Err(SequentialReplayError::Budget(DependencyConeEstimate {
             block_ids: Vec::new(),
@@ -4950,6 +4940,72 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
         replay,
         resource_high_water_bytes,
     })
+}
+
+/// Estimate the exact conservative global replay reservation without numeric
+/// primitive-source reads.
+///
+/// The existing replay preflight is invoked with zero bytes remaining after
+/// the wrapper reservation, so every non-empty dependency cone returns its
+/// complete provider-inclusive estimate before source resolution. A gauge-only
+/// query may complete with zero source reads and returns its normal bound.
+///
+/// # Errors
+/// Returns the same routing, identity, and topology errors as global replay.
+pub fn estimate_global_reference_difference_covariance_from_provider_bundle(
+    tiles: &mut [SequentialTileReplayProvider<'_>],
+    query: GlobalReferenceCovarianceQuery<'_>,
+) -> Result<GlobalReferenceCovarianceResourceEstimate, SequentialReplayError> {
+    let (_, wrapper_bytes, _) = global_reference_wrapper_bytes(query)?;
+    let preflight_query = GlobalReferenceCovarianceQuery {
+        byte_cap: wrapper_bytes,
+        ..query
+    };
+    match replay_global_reference_difference_covariance_from_provider_bundle(tiles, preflight_query)
+    {
+        Err(SequentialReplayError::Budget(estimate)) => {
+            let total_bytes = checked_add(estimate.total_bytes, wrapper_bytes)?;
+            Ok(GlobalReferenceCovarianceResourceEstimate {
+                replay_bytes: estimate.total_bytes,
+                wrapper_bytes,
+                total_bytes,
+            })
+        }
+        Ok(replay) => Ok(GlobalReferenceCovarianceResourceEstimate {
+            replay_bytes: replay
+                .resource_high_water_bytes
+                .checked_sub(wrapper_bytes)
+                .ok_or(SequentialReplayError::Invalid(
+                    "global replay resource receipt underflows its wrapper",
+                ))?,
+            wrapper_bytes,
+            total_bytes: replay.resource_high_water_bytes,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn global_reference_wrapper_bytes(
+    query: GlobalReferenceCovarianceQuery<'_>,
+) -> Result<(usize, u64, u64), SequentialReplayError> {
+    let selected =
+        query
+            .ordered_dates
+            .len()
+            .checked_mul(2)
+            .ok_or(SequentialReplayError::Invalid(
+                "global reference selection size overflows usize",
+            ))?;
+    let selected_u64 = u64::try_from(selected).map_err(|_| {
+        SequentialReplayError::Invalid("global reference selection size exceeds u64")
+    })?;
+    let selection_bytes = checked_mul(selected_u64, size_of::<(GlobalDateId, usize)>() as u64)?;
+    let joint_bytes = checked_mul(checked_mul(selected_u64, selected_u64)?, 8)?;
+    Ok((
+        selected,
+        checked_add(selection_bytes, joint_bytes)?,
+        joint_bytes,
+    ))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
