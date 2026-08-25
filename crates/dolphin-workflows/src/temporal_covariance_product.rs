@@ -52,11 +52,6 @@ const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
 const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/5";
 const LAYER_COUNT: usize = 14;
 const COMBINED_WORKING_SET_CAP_BYTES: u64 = 512 * 1024 * 1024;
-// Full, selected, oracle, plugin, bootstrap, optimizer candidate, correlation,
-// covariance, inverse, both Cholesky copies, and Faer condition workspaces coexist.
-const TEMPORAL_SQUARE_MATRIX_COPIES: u64 = 16;
-const TEMPORAL_VECTOR_COPIES: u64 = 64;
-const WORKING_SET_FIXED_OVERHEAD_BYTES: u64 = 1024 * 1024;
 const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
 const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.json";
 const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
@@ -123,6 +118,13 @@ struct ProductGridReceipt {
     epsg: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProductRollbackState {
+    Active,
+    BlockedUnownedCollision,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProductRollbackJournal {
     schema: String,
@@ -138,6 +140,8 @@ struct ProductRollbackJournal {
     stage_directory: String,
     expected_provenance_sha256: Option<String>,
     expected_fixed_receipt_sha256: Option<String>,
+    rollback_state: ProductRollbackState,
+    collision_artifacts: Vec<String>,
 }
 
 impl TemporalProductTransaction {
@@ -160,6 +164,7 @@ impl TemporalProductTransaction {
             _lock: lock,
         };
         recover_incomplete_product(&transaction.directory)?;
+        cleanup_orphan_transaction_files(&transaction.directory)?;
         Ok(transaction)
     }
 
@@ -596,9 +601,11 @@ fn write_product_transaction_with_validator(
     )?;
     let stage = create_stage_directory(output_directory)?;
     let transaction = (|| {
-        admit_combined_working_set(config, acquisition_days.len())?;
+        let admission = admit_combined_working_set(config, acquisition_days.len())?;
+        let mut working_set = WorkingSetMonitor::new(admission);
         let mut layers =
             create_layer_writers(&stage, &scope.velocity_header, &transaction.ownership_token)?;
+        working_set.observe_gdal_cache()?;
         process_factor_blocks(
             &scope.factor_path,
             displacement_rasters,
@@ -606,8 +613,9 @@ fn write_product_transaction_with_validator(
             config,
             scope.factor_metadata.full_grid,
             &mut layers,
+            &mut working_set,
         )?;
-        finalize_layers(&stage, &mut layers)?;
+        finalize_layers(&stage, &mut layers, &mut working_set)?;
         ensure!(
             input_raster_receipts(displacement_rasters)? == scope.input_receipts,
             "displacement rasters changed during temporal inference"
@@ -723,6 +731,7 @@ fn process_factor_blocks(
     config: &TemporalUncertaintyOptions,
     full_grid: dolphin_io::CovarianceOperatorGrid,
     layers: &mut [ProductLayer],
+    working_set: &mut WorkingSetMonitor,
 ) -> Result<()> {
     let block_ids =
         read_spatial_reference_covariance_block_ids(factor_path, config.block_id_read_cap_bytes)?;
@@ -759,6 +768,7 @@ fn process_factor_blocks(
                 .context("product writer already finalized")?
                 .write_window(output_window, value.view())?;
         }
+        working_set.observe_gdal_cache()?;
     }
     Ok(())
 }
@@ -770,17 +780,45 @@ struct WorkingSetAdmission {
     displacement_window_bytes: u64,
     output_window_bytes: u64,
     output_write_copy_bytes: u64,
-    writer_tile_bytes: u64,
-    temporal_matrix_bytes: u64,
-    temporal_matrix_row_overhead_bytes: u64,
-    temporal_vector_bytes: u64,
-    fixed_overhead_bytes: u64,
+    writer_bookkeeping_bytes: u64,
+    temporal_solver_workspace_bytes: u64,
+    observed_gdal_cache_bytes: u64,
     total_bytes: u64,
+}
+
+struct WorkingSetMonitor {
+    admission: WorkingSetAdmission,
+    observed_gdal_cache_high_water_bytes: u64,
+}
+
+impl WorkingSetMonitor {
+    fn new(admission: WorkingSetAdmission) -> Self {
+        Self {
+            observed_gdal_cache_high_water_bytes: admission.observed_gdal_cache_bytes,
+            admission,
+        }
+    }
+
+    fn observe_gdal_cache(&mut self) -> Result<()> {
+        let observed = observed_gdal_cache_bytes()?;
+        validate_working_set_high_water(&self.admission, observed)?;
+        self.observed_gdal_cache_high_water_bytes =
+            self.observed_gdal_cache_high_water_bytes.max(observed);
+        Ok(())
+    }
 }
 
 fn admit_combined_working_set(
     config: &TemporalUncertaintyOptions,
     acquisition_count: usize,
+) -> Result<WorkingSetAdmission> {
+    compose_working_set_admission(config, acquisition_count, observed_gdal_cache_bytes()?)
+}
+
+fn compose_working_set_admission(
+    config: &TemporalUncertaintyOptions,
+    acquisition_count: usize,
+    observed_gdal_cache_bytes: u64,
 ) -> Result<WorkingSetAdmission> {
     let targets = u64::try_from(config.maximum_targets_per_block)?;
     let dates = u64::try_from(acquisition_count)?;
@@ -795,37 +833,30 @@ fn admit_combined_working_set(
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
         .context("output-window working-set size overflow")?;
-    let one_temporal_matrix = dates
-        .checked_mul(dates)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>() as u64))
-        .context("temporal matrix working-set size overflow")?;
-    let temporal_matrix_bytes = one_temporal_matrix
-        .checked_mul(TEMPORAL_SQUARE_MATRIX_COPIES)
-        .context("simultaneous temporal matrix working-set size overflow")?;
-    let temporal_matrix_row_overhead_bytes = dates
-        .checked_mul(std::mem::size_of::<Vec<f64>>() as u64)
-        .and_then(|value| value.checked_mul(TEMPORAL_SQUARE_MATRIX_COPIES))
-        .context("temporal matrix row-allocation overhead overflow")?;
-    let temporal_vector_bytes = dates
-        .checked_mul(std::mem::size_of::<f64>() as u64)
-        .and_then(|value| value.checked_mul(TEMPORAL_VECTOR_COPIES))
-        .context("temporal vector working-set size overflow")?;
+    let temporal_solver_workspace_bytes =
+        dolphin_timeseries::spatial_covariance::fixed_l2_difference_workspace_composition(
+            acquisition_count,
+        )
+        .map_err(anyhow::Error::new)?
+        .total_bytes;
     let output_write_copy_bytes = output_windows;
-    let writer_tile_bytes = (LAYER_COUNT as u64)
-        .checked_mul(256 * 256)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-        .context("COG writer tile working-set size overflow")?;
+    let maximum_block_ids = config
+        .block_id_read_cap_bytes
+        .checked_div(std::mem::size_of::<u64>() as u64)
+        .context("block-ID element size is zero")?;
+    let writer_bookkeeping_bytes = maximum_block_ids
+        .checked_mul(LAYER_COUNT as u64)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<BlockIndices>() as u64))
+        .context("COG writer bookkeeping size overflow")?;
     let combined = config
         .factor_block_read_cap_bytes
         .checked_add(config.block_id_read_cap_bytes)
         .and_then(|value| value.checked_add(displacement_windows))
         .and_then(|value| value.checked_add(output_windows))
         .and_then(|value| value.checked_add(output_write_copy_bytes))
-        .and_then(|value| value.checked_add(writer_tile_bytes))
-        .and_then(|value| value.checked_add(temporal_matrix_bytes))
-        .and_then(|value| value.checked_add(temporal_matrix_row_overhead_bytes))
-        .and_then(|value| value.checked_add(temporal_vector_bytes))
-        .and_then(|value| value.checked_add(WORKING_SET_FIXED_OVERHEAD_BYTES))
+        .and_then(|value| value.checked_add(writer_bookkeeping_bytes))
+        .and_then(|value| value.checked_add(temporal_solver_workspace_bytes))
+        .and_then(|value| value.checked_add(observed_gdal_cache_bytes))
         .context("combined temporal working-set size overflow")?;
     ensure!(
         combined <= COMBINED_WORKING_SET_CAP_BYTES,
@@ -837,13 +868,36 @@ fn admit_combined_working_set(
         displacement_window_bytes: displacement_windows,
         output_window_bytes: output_windows,
         output_write_copy_bytes,
-        writer_tile_bytes,
-        temporal_matrix_bytes,
-        temporal_matrix_row_overhead_bytes,
-        temporal_vector_bytes,
-        fixed_overhead_bytes: WORKING_SET_FIXED_OVERHEAD_BYTES,
+        writer_bookkeeping_bytes,
+        temporal_solver_workspace_bytes,
+        observed_gdal_cache_bytes,
         total_bytes: combined,
     })
+}
+
+fn observed_gdal_cache_bytes() -> Result<u64> {
+    // SAFETY: GDAL exposes this as a read-only process-global cache counter.
+    let bytes = unsafe { gdal_sys::GDALGetCacheUsed64() };
+    ensure!(bytes >= 0, "GDAL reported a negative cache byte count");
+    Ok(u64::try_from(bytes)?)
+}
+
+fn validate_working_set_high_water(
+    admission: &WorkingSetAdmission,
+    observed_gdal_cache_bytes: u64,
+) -> Result<()> {
+    let non_gdal = admission
+        .total_bytes
+        .checked_sub(admission.observed_gdal_cache_bytes)
+        .context("working-set admission GDAL composition underflow")?;
+    let observed = non_gdal
+        .checked_add(observed_gdal_cache_bytes)
+        .context("observed temporal working-set size overflow")?;
+    ensure!(
+        observed <= COMBINED_WORKING_SET_CAP_BYTES,
+        "observed temporal working set {observed} exceeds cap {COMBINED_WORKING_SET_CAP_BYTES}"
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -888,6 +942,8 @@ fn publish_product_receipt(
             .into_owned(),
         expected_provenance_sha256: None,
         expected_fixed_receipt_sha256: None,
+        rollback_state: ProductRollbackState::Active,
+        collision_artifacts: Vec::new(),
     };
     persist_rollback_journal(output_directory, &journal, true)?;
     publish_layers_no_replace(output_directory, stage, &mut journal)?;
@@ -1224,6 +1280,12 @@ fn validate_geometry_provenance(
         .rows
         .checked_mul(receipt.cols)
         .context("fixed-cube output-pixel count overflow")?;
+    validate_input_coverage(
+        coverage,
+        receipt.acquisition_days.len(),
+        output_pixels,
+        receipt.valid_pixels,
+    )?;
     ensure!(
         provenance.schema == "dolphinrust-geometry-provenance/4"
             && provenance.method_version == "4.0.0"
@@ -1234,33 +1296,6 @@ fn validate_geometry_provenance(
                 .is_some_and(|direction| matches!(direction, "ascending" | "descending"))
             && provenance.heading_deg.is_some_and(f64::is_finite)
             && provenance.incidence_angle_deg.is_some_and(f64::is_finite)
-            && coverage.policy_version == crate::provenance::INPUT_COVERAGE_POLICY_VERSION
-            && coverage.output_pixels == output_pixels
-            && coverage.valid_pixels == receipt.valid_pixels
-            && coverage.total_tiles == coverage.linked_tiles + coverage.nodata_tiles
-            && coverage.bursts.iter().all(|burst| burst.acquisition_count
-                == receipt.acquisition_days.len()
-                && burst.total_tiles == burst.linked_tiles + burst.nodata_tiles)
-            && coverage
-                .bursts
-                .iter()
-                .map(|burst| burst.total_tiles)
-                .sum::<usize>()
-                == coverage.total_tiles
-            && coverage
-                .bursts
-                .iter()
-                .map(|burst| burst.linked_tiles)
-                .sum::<usize>()
-                == coverage.linked_tiles
-            && coverage
-                .bursts
-                .iter()
-                .map(|burst| burst.nodata_tiles)
-                .sum::<usize>()
-                == coverage.nodata_tiles
-            && (coverage.valid_fraction - receipt.valid_pixels as f64 / output_pixels as f64).abs()
-                <= f64::EPSILON
             && !orbit_files.is_empty()
             && orbit_keys
                 .iter()
@@ -1275,6 +1310,63 @@ fn validate_geometry_provenance(
             && incidence_method.contains("los_up")
             && provenance.geometry_provenance.method_version == provenance.method_version,
         "geometry provenance is incomplete, unsourced, or fallback-derived"
+    );
+    Ok(())
+}
+
+fn validate_input_coverage(
+    coverage: &crate::provenance::InputCoverageProvenance,
+    acquisition_count: usize,
+    output_pixels: usize,
+    valid_pixels: usize,
+) -> Result<()> {
+    ensure!(
+        output_pixels > 0
+            && valid_pixels <= output_pixels
+            && coverage.policy_version == crate::provenance::INPUT_COVERAGE_POLICY_VERSION
+            && coverage.output_pixels == output_pixels
+            && coverage.valid_pixels == valid_pixels
+            && !coverage.bursts.is_empty(),
+        "fixed-cube input coverage is empty or scope-mismatched"
+    );
+    let mut total_tiles = 0usize;
+    let mut linked_tiles = 0usize;
+    let mut nodata_tiles = 0usize;
+    for (expected_ordinal, burst) in coverage.bursts.iter().enumerate() {
+        let burst_total = burst
+            .linked_tiles
+            .checked_add(burst.nodata_tiles)
+            .context("fixed-cube burst tile count overflow")?;
+        ensure!(
+            burst.burst_index == expected_ordinal
+                && burst.acquisition_count == acquisition_count
+                && burst.total_tiles == burst_total,
+            "fixed-cube burst coverage is not ordinal-complete or internally consistent"
+        );
+        total_tiles = total_tiles
+            .checked_add(burst.total_tiles)
+            .context("fixed-cube total tile count overflow")?;
+        linked_tiles = linked_tiles
+            .checked_add(burst.linked_tiles)
+            .context("fixed-cube linked tile count overflow")?;
+        nodata_tiles = nodata_tiles
+            .checked_add(burst.nodata_tiles)
+            .context("fixed-cube nodata tile count overflow")?;
+    }
+    let declared_total = coverage
+        .linked_tiles
+        .checked_add(coverage.nodata_tiles)
+        .context("fixed-cube aggregate tile count overflow")?;
+    ensure!(
+        coverage.total_tiles > 0
+            && coverage.linked_tiles > 0
+            && coverage.total_tiles == declared_total
+            && total_tiles == coverage.total_tiles
+            && linked_tiles == coverage.linked_tiles
+            && nodata_tiles == coverage.nodata_tiles
+            && (coverage.valid_fraction - valid_pixels as f64 / output_pixels as f64).abs()
+                <= f64::EPSILON,
+        "fixed-cube input coverage totals are invalid"
     );
     Ok(())
 }
@@ -1392,13 +1484,18 @@ fn create_layer_writers(
         .collect()
 }
 
-fn finalize_layers(stage: &Path, layers: &mut [ProductLayer]) -> Result<()> {
+fn finalize_layers(
+    stage: &Path,
+    layers: &mut [ProductLayer],
+    working_set: &mut WorkingSetMonitor,
+) -> Result<()> {
     for layer in layers {
         let writer = layer
             .writer
             .take()
             .context("product writer already finalized")?;
         writer.finalize(&stage.join(layer.name))?;
+        working_set.observe_gdal_cache()?;
     }
     Ok(())
 }
@@ -1950,7 +2047,13 @@ fn read_rollback_journal(directory: &Path) -> Result<ProductRollbackJournal> {
                 .starts_with(".temporal-inference-stage-")
             && Path::new(&journal.stage_directory)
                 .file_name()
-                .is_some_and(|name| { name.to_string_lossy() == journal.stage_directory }),
+                .is_some_and(|name| { name.to_string_lossy() == journal.stage_directory })
+            && match journal.rollback_state {
+                ProductRollbackState::Active => journal.collision_artifacts.is_empty(),
+                ProductRollbackState::BlockedUnownedCollision => {
+                    !journal.collision_artifacts.is_empty()
+                }
+            },
         "temporal product rollback journal is malformed or unsupported"
     );
     Ok(journal)
@@ -1977,6 +2080,27 @@ fn recover_incomplete_product(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && name.starts_with(".temporal-inference-stage-") {
+            std::fs::remove_dir_all(entry.path())?;
+        } else if file_type.is_file()
+            && (name.starts_with(".temporal-product-journal-")
+                || name.starts_with(".fixed-cube-receipt-rollback-"))
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn rollback_incomplete_product(directory: &Path) -> Result<()> {
     let journal = read_rollback_journal(directory)?;
     rollback_incomplete_product_with_journal(directory, &journal)
@@ -1986,12 +2110,14 @@ fn rollback_incomplete_product_with_journal(
     directory: &Path,
     journal: &ProductRollbackJournal,
 ) -> Result<()> {
+    let mut collisions = Vec::new();
     for artifact in journal.installed_artifacts.iter().rev() {
         let path = directory.join(&artifact.name);
         if path.exists() {
             if installed_artifact_is_owned(&path, artifact, &journal.ownership_token)? {
                 std::fs::remove_file(&path)?;
             } else {
+                collisions.push(artifact.name.clone());
                 tracing::warn!(
                     path = %path.display(),
                     "preserving unowned artifact encountered during temporal rollback"
@@ -2004,8 +2130,20 @@ fn rollback_incomplete_product_with_journal(
     if stage.is_dir() {
         std::fs::remove_dir_all(stage)?;
     }
-    remove_rollback_journal(directory)?;
     File::open(directory)?.sync_all()?;
+    if !collisions.is_empty() {
+        collisions.sort();
+        collisions.dedup();
+        let mut blocked = journal.clone();
+        blocked.rollback_state = ProductRollbackState::BlockedUnownedCollision;
+        blocked.collision_artifacts = collisions.clone();
+        persist_rollback_journal(directory, &blocked, false)?;
+        anyhow::bail!(
+            "temporal rollback is blocked by unowned artifacts: {}",
+            collisions.join(", ")
+        );
+    }
+    remove_rollback_journal(directory)?;
     Ok(())
 }
 
@@ -2266,13 +2404,14 @@ mod tests {
 
     use super::{
         admit_combined_working_set, complete_publication_after_legacy_check,
-        ensure_same_run_factor_directory, install_no_replace, output_window,
-        reconstruct_covariance, validate_heldout_result, validate_manifest, validate_review,
-        validate_synthetic_result, write_product_transaction_with_validator, EvidenceDigests,
+        compose_working_set_admission, ensure_same_run_factor_directory, install_no_replace,
+        output_window, reconstruct_covariance, validate_heldout_result, validate_input_coverage,
+        validate_manifest, validate_review, validate_synthetic_result,
+        validate_working_set_high_water, write_product_transaction_with_validator, EvidenceDigests,
         HeldoutLevel, HeldoutResult, SyntheticResult, SyntheticScores, TemporalCovariancePromotion,
         TemporalProductTransaction, TemporalPromotionManifest, TemporalReviewReceipt,
-        PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME,
-        SYNTHETIC_SCHEMA,
+        COMBINED_WORKING_SET_CAP_BYTES, PRODUCT_LAYERS, PROMOTION_SCHEMA, REVIEW_SCHEMA,
+        ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -2345,11 +2484,7 @@ mod tests {
     fn combined_working_set_rejects_large_date_stacks_before_block_read() {
         let config = TemporalUncertaintyOptions::default();
         let admitted = admit_combined_working_set(&config, 12).unwrap();
-        assert_eq!(admitted.temporal_matrix_bytes, 16 * 12 * 12 * 8);
-        assert_eq!(
-            admitted.temporal_matrix_row_overhead_bytes,
-            16 * 12 * std::mem::size_of::<Vec<f64>>() as u64
-        );
+        assert!(admitted.temporal_solver_workspace_bytes > 12 * 12 * 8);
         assert_eq!(
             admitted.total_bytes,
             admitted.factor_block_bytes
@@ -2357,14 +2492,78 @@ mod tests {
                 + admitted.displacement_window_bytes
                 + admitted.output_window_bytes
                 + admitted.output_write_copy_bytes
-                + admitted.writer_tile_bytes
-                + admitted.temporal_matrix_bytes
-                + admitted.temporal_matrix_row_overhead_bytes
-                + admitted.temporal_vector_bytes
-                + admitted.fixed_overhead_bytes
+                + admitted.writer_bookkeeping_bytes
+                + admitted.temporal_solver_workspace_bytes
+                + admitted.observed_gdal_cache_bytes
         );
         assert!(admitted.total_bytes <= super::COMBINED_WORKING_SET_CAP_BYTES);
         assert!(admit_combined_working_set(&config, 100_000).is_err());
+        let boundary = compose_working_set_admission(&config, 12, 0).unwrap();
+        let remaining = COMBINED_WORKING_SET_CAP_BYTES - boundary.total_bytes;
+        assert!(validate_working_set_high_water(&boundary, remaining).is_ok());
+        assert!(validate_working_set_high_water(&boundary, remaining + 1).is_err());
+    }
+
+    #[test]
+    fn startup_removes_prejournal_orphan_stages() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_orphan_stage_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let orphan = directory.join(".temporal-inference-stage-orphan");
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("partial.tif"), b"partial").unwrap();
+        let scratch = directory.join(".temporal-product-journal-orphan");
+        std::fs::write(&scratch, b"partial journal").unwrap();
+        let transaction = TemporalProductTransaction::acquire(&directory).unwrap();
+        assert!(!orphan.exists());
+        assert!(!scratch.exists());
+        drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fixed_cube_coverage_requires_checked_ordinal_complete_bursts() {
+        let mut coverage = crate::provenance::InputCoverageProvenance {
+            policy_version: crate::provenance::INPUT_COVERAGE_POLICY_VERSION.to_owned(),
+            total_tiles: 0,
+            linked_tiles: 0,
+            nodata_tiles: 0,
+            bursts: Vec::new(),
+            output_pixels: 2,
+            valid_pixels: 2,
+            valid_fraction: 1.0,
+        };
+        assert!(validate_input_coverage(&coverage, 12, 2, 2).is_err());
+        coverage.bursts = vec![
+            crate::provenance::BurstCoverageProvenance {
+                burst_index: 1,
+                acquisition_count: 12,
+                total_tiles: 1,
+                linked_tiles: 1,
+                nodata_tiles: 0,
+            },
+            crate::provenance::BurstCoverageProvenance {
+                burst_index: 1,
+                acquisition_count: 12,
+                total_tiles: 1,
+                linked_tiles: 1,
+                nodata_tiles: 0,
+            },
+        ];
+        coverage.total_tiles = 2;
+        coverage.linked_tiles = 2;
+        assert!(validate_input_coverage(&coverage, 12, 2, 2).is_err());
+        coverage.bursts[0].burst_index = 0;
+        assert!(validate_input_coverage(&coverage, 12, 2, 2).is_ok());
+        coverage.bursts[0].total_tiles = usize::MAX;
+        coverage.bursts[0].linked_tiles = usize::MAX;
+        coverage.total_tiles = usize::MAX;
+        coverage.linked_tiles = usize::MAX;
+        coverage.nodata_tiles = 0;
+        assert!(validate_input_coverage(&coverage, 12, 2, 2).is_err());
     }
 
     #[test]
@@ -2486,6 +2685,8 @@ mod tests {
                 stage_directory: stage_name,
                 expected_provenance_sha256: Some(marker_receipt.sha256.clone()),
                 expected_fixed_receipt_sha256: None,
+                rollback_state: super::ProductRollbackState::Active,
+                collision_artifacts: Vec::new(),
             };
             super::persist_rollback_journal(&directory, &journal, true).unwrap();
             let transaction = TemporalProductTransaction::acquire(&directory).unwrap();
@@ -2943,8 +3144,15 @@ mod tests {
             std::fs::read(&foreign_collision).unwrap(),
             b"foreign product"
         );
-        assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
+        let blocked = super::read_rollback_journal(&directory).unwrap();
+        assert_eq!(
+            blocked.rollback_state,
+            super::ProductRollbackState::BlockedUnownedCollision
+        );
+        assert_eq!(blocked.collision_artifacts, vec![PRODUCT_LAYERS[0].0]);
         std::fs::remove_file(foreign_collision).unwrap();
+        super::rollback_incomplete_product(&directory).unwrap();
+        assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
         let mut changed_promotion = promotion.clone();
         changed_promotion.spatial_factor_sha256 = "77".repeat(32);
         assert!(write_product_transaction_with_validator(
@@ -3059,7 +3267,14 @@ mod tests {
         .unwrap();
         std::fs::write(directory.join(PRODUCT_LAYERS[0].0), b"tampered product").unwrap();
         drop(product_transaction);
-        let product_transaction = TemporalProductTransaction::acquire(&directory).unwrap();
+        assert!(TemporalProductTransaction::acquire(&directory).is_err());
+        let blocked = super::read_rollback_journal(&directory).unwrap();
+        assert_eq!(
+            blocked.rollback_state,
+            super::ProductRollbackState::BlockedUnownedCollision
+        );
+        assert_eq!(blocked.collision_artifacts, vec![PRODUCT_LAYERS[0].0]);
+        assert!(directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
         assert_eq!(
             std::fs::read(directory.join(PRODUCT_LAYERS[0].0)).unwrap(),
             b"tampered product"
@@ -3073,6 +3288,8 @@ mod tests {
             fixed_cube_receipt_before
         );
         std::fs::remove_file(directory.join(PRODUCT_LAYERS[0].0)).unwrap();
+        let product_transaction = TemporalProductTransaction::acquire(&directory).unwrap();
+        assert!(!directory.join(ROLLBACK_JOURNAL_FILENAME).exists());
         let _ = write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
