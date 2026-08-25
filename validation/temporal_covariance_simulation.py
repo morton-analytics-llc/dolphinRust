@@ -180,7 +180,7 @@ SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS = 1.5
 OUTER_COVERAGE_DGP = "physical_raw_space_v1"
 CONDITIONAL_COVARIANCE_ORACLE = "fixed_capture_common_factor_monte_carlo_v1"
 FROZEN_SOURCE_SET_SCHEMA = "dolphinrust.canonical-producer-source-set/2"
-FROZEN_SOURCE_SET_SHA256 = "d4358eaf1e3ca6d65da78c61df7058835e2978390edf1e55f2faf8b25c842b55"
+FROZEN_SOURCE_SET_SHA256 = "70a609c32e6b631f6d615ff7badf81f46468c9053b1e0a30f02cb29d1031cbdd"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -863,6 +863,10 @@ def atomic_write_no_replace(path: Path, payload: bytes) -> None:
     _fsync_directory(path.parent)
 
 
+def _runtime_binary_identity(binary: Path) -> tuple[str, int]:
+    return sha256_file(binary, 1024 * 1024 * 1024)
+
+
 def producer_identity(preregistration: dict, binary: Path) -> dict:
     root = Path(__file__).parents[1]
     expected_binary = root / "target/release/examples/temporal_covariance_batch"
@@ -893,18 +897,16 @@ def producer_identity(preregistration: dict, binary: Path) -> dict:
     if actual_hashes != preregistration["file_hashes"]:
         raise RuntimeError("frozen temporal covariance source hashes do not match the run")
     source_set_sha256 = canonical_source_set_sha256(root)
-    binary_sha256, binary_bytes = sha256_file(resolved_binary, 1024 * 1024 * 1024)
+    binary_sha256, binary_bytes = _runtime_binary_identity(resolved_binary)
     frozen_identity = preregistration.get("producer_identity")
     expected_identity = {
-        "schema": "dolphinrust.temporal-covariance.producer-identity/1",
+        "schema": "dolphinrust.temporal-covariance.producer-identity/2",
         "source_set_schema": FROZEN_SOURCE_SET_SCHEMA,
         "source_set_sha256": source_set_sha256,
         "binary_path": "target/release/examples/temporal_covariance_batch",
-        "binary_sha256": binary_sha256,
-        "binary_bytes": binary_bytes,
     }
     if frozen_identity != expected_identity or source_set_sha256 != FROZEN_SOURCE_SET_SHA256:
-        raise RuntimeError("frozen temporal producer source/binary identity does not match the run")
+        raise RuntimeError("frozen temporal producer source identity does not match the run")
     return {
         "schema": RUN_IDENTITY_SCHEMA,
         "preregistration_sha256": hashlib.sha256(
@@ -1332,7 +1334,7 @@ def _response_semantic_bytes(record: dict) -> bytes:
 
 
 def _require_binary_identity(binary: Path, identity: dict) -> None:
-    digest, byte_count = sha256_file(binary, 1024 * 1024 * 1024)
+    digest, byte_count = _runtime_binary_identity(binary)
     if digest != identity["binary_sha256"] or (
             "binary_bytes" in identity and byte_count != identity["binary_bytes"]):
         raise RuntimeError("temporal covariance batch binary identity is stale")

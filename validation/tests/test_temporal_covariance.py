@@ -943,6 +943,14 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             stale = dict(identity, binary_sha256="ff" * 32)
             with self.assertRaisesRegex(RuntimeError, "identity is stale"):
                 module.initialize_run_root(run_root, stale)
+            original_binary = binary.read_bytes()
+            binary.write_bytes(original_binary + b"\n# changed after commit\n")
+            with self.assertRaisesRegex(RuntimeError, "batch binary identity is stale"):
+                module.execute_or_resume_shard(
+                    self.prereg, cell, "fixed_factor", 2,
+                    shards, binary, identity,
+                )
+            binary.write_bytes(original_binary)
             paths = module._shard_paths(shards, cell, "fixed_factor")
             paths["manifest"].unlink()
             with self.assertRaisesRegex(RuntimeError, "partial or missing"):
@@ -1100,10 +1108,14 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             identity["source_set_sha256"],
             self.prereg["producer_identity"]["source_set_sha256"],
         )
-        self.assertEqual(
-            identity["binary_sha256"],
-            self.prereg["producer_identity"]["binary_sha256"],
-        )
+        self.assertNotIn("binary_sha256", self.prereg["producer_identity"])
+        self.assertNotIn("binary_bytes", self.prereg["producer_identity"])
+        with mock.patch.object(
+                module, "_runtime_binary_identity", return_value=("ab" * 32, 1234567)):
+            alternate = module.producer_identity(self.prereg, release)
+        self.assertEqual(alternate["binary_sha256"], "ab" * 32)
+        self.assertEqual(alternate["binary_bytes"], 1234567)
+        self.assertEqual(alternate["source_set_sha256"], identity["source_set_sha256"])
         with tempfile.TemporaryDirectory() as directory:
             copied = pathlib.Path(directory) / "temporal_covariance_batch"
             copied.write_bytes(release.read_bytes())
