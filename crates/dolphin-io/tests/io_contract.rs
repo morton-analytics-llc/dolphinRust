@@ -7,9 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-use dolphin_core::Cf32;
-use dolphin_io::{read_cslc, read_cslc_stack, read_raster, write_raster, RasterData};
-use ndarray::{Array2, Array3};
+use dolphin_core::{BlockIndices, Cf32};
+use dolphin_io::{
+    read_cslc, read_cslc_stack, read_raster, read_raster_header, write_raster, BoundedCogWriter,
+    RasterData,
+};
+use gdal::Metadata;
+use ndarray::{s, Array2, Array3};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
@@ -44,6 +48,138 @@ fn geotiff_u8_round_trips() {
     let back = read_raster::<u8>(&dir).unwrap().data;
     assert_eq!(back, data, "uint8 PS mask round-trips");
     let _ = std::fs::remove_file(&dir);
+}
+
+#[test]
+fn bounded_cog_is_published_only_after_all_window_writes() {
+    let root = std::env::temp_dir().join(format!("dolphinrust_bounded_cog_{}", std::process::id()));
+    let scratch = root.with_extension("scratch.tif");
+    let destination = root.with_extension("tif");
+    let _ = std::fs::remove_file(&scratch);
+    let _ = std::fs::remove_file(&destination);
+    let expected = Array2::from_shape_fn((5, 7), |(row, col)| (row * 7 + col) as f32);
+    let metadata = [("units", "millimeters/year"), ("estimator", "gls-v1")];
+
+    let mut writer = BoundedCogWriter::<f32>::create(
+        &scratch,
+        (5, 7),
+        GT,
+        Some(32611),
+        Some(-9999.0),
+        &metadata,
+    )
+    .unwrap();
+    writer
+        .write_window(
+            BlockIndices {
+                row_start: 0,
+                row_stop: 2,
+                col_start: 0,
+                col_stop: 7,
+            },
+            expected.slice(s![0..2, ..]),
+        )
+        .unwrap();
+    assert!(scratch.exists());
+    assert!(!destination.exists());
+    writer
+        .write_window(
+            BlockIndices {
+                row_start: 2,
+                row_stop: 5,
+                col_start: 0,
+                col_stop: 7,
+            },
+            expected.slice(s![2..5, ..]),
+        )
+        .unwrap();
+    writer.finalize(&destination).unwrap();
+
+    assert_eq!(read_raster::<f32>(&destination).unwrap().data, expected);
+    let header = read_raster_header(&destination).unwrap();
+    assert_eq!(header.shape, (5, 7));
+    assert_eq!(header.geotransform, GT);
+    assert_eq!(header.epsg, Some(32611));
+    assert_eq!(header.nodata, Some(-9999.0));
+    assert_eq!(
+        header.metadata.get("units").map(String::as_str),
+        Some("millimeters/year")
+    );
+    assert_eq!(
+        header.metadata.get("estimator").map(String::as_str),
+        Some("gls-v1")
+    );
+    let dataset = gdal::Dataset::open(&destination).unwrap();
+    assert_eq!(dataset.driver().short_name(), "GTiff");
+    assert_eq!(
+        dataset
+            .metadata_item("LAYOUT", "IMAGE_STRUCTURE")
+            .as_deref(),
+        Some("COG")
+    );
+    let _ = std::fs::remove_file(&scratch);
+    let _ = std::fs::remove_file(&destination);
+}
+
+#[test]
+fn dropping_incomplete_bounded_writer_never_creates_destination() {
+    let root =
+        std::env::temp_dir().join(format!("dolphinrust_incomplete_cog_{}", std::process::id()));
+    let scratch = root.with_extension("scratch.tif");
+    let destination = root.with_extension("tif");
+    let _ = std::fs::remove_file(&scratch);
+    let _ = std::fs::remove_file(&destination);
+    {
+        let mut writer =
+            BoundedCogWriter::<u8>::create(&scratch, (8, 8), GT, Some(32611), Some(255.0), &[])
+                .unwrap();
+        let values = Array2::from_elem((2, 2), 1_u8);
+        writer
+            .write_window(
+                BlockIndices {
+                    row_start: 0,
+                    row_stop: 2,
+                    col_start: 0,
+                    col_stop: 2,
+                },
+                values.view(),
+            )
+            .unwrap();
+    }
+    assert!(scratch.exists());
+    assert!(!destination.exists());
+    let _ = std::fs::remove_file(&scratch);
+}
+
+#[test]
+fn bounded_writer_rejects_window_shape_and_bounds_mismatches() {
+    let scratch =
+        std::env::temp_dir().join(format!("dolphinrust_bad_window_{}.tif", std::process::id()));
+    let _ = std::fs::remove_file(&scratch);
+    let mut writer =
+        BoundedCogWriter::<f32>::create(&scratch, (4, 4), GT, Some(32611), None, &[]).unwrap();
+    let values = Array2::zeros((2, 2));
+    let wrong_shape = writer.write_window(
+        BlockIndices {
+            row_start: 0,
+            row_stop: 3,
+            col_start: 0,
+            col_stop: 2,
+        },
+        values.view(),
+    );
+    assert!(wrong_shape.is_err());
+    let out_of_bounds = writer.write_window(
+        BlockIndices {
+            row_start: 3,
+            row_stop: 5,
+            col_start: 0,
+            col_stop: 2,
+        },
+        values.view(),
+    );
+    assert!(out_of_bounds.is_err());
+    let _ = std::fs::remove_file(&scratch);
 }
 
 // ------------------------------- oracle (secondary) ---------------------------
