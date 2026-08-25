@@ -62,17 +62,20 @@ pub use sequential::{
     SequentialCovarianceRevision, SequentialCovarianceState, SequentialOutput, SequentialState,
 };
 pub use sequential_covariance::{
-    empirical_source_factor_receipt_digest, sequential_replay_config_digest,
-    sequential_replay_kernel_digest, sequential_source_model_identity_digest,
-    CovarianceArtifactReplayMetrics, CovarianceArtifactReplayProvider, DependencyConeEstimate,
-    DependencyConeQuery, GlobalBlockId, GlobalDateId, ReferenceDifferenceCovarianceReplay,
+    empirical_source_factor_receipt_digest,
+    replay_global_reference_difference_covariance_from_provider_bundle,
+    sequential_replay_config_digest, sequential_replay_kernel_digest,
+    sequential_source_model_identity_digest, CovarianceArtifactReplayMetrics,
+    CovarianceArtifactReplayProvider, DependencyConeEstimate, DependencyConeQuery,
+    EffectiveLooksReplay, GlobalBlockId, GlobalDateId, GlobalReferenceCovarianceQuery,
+    GlobalReferenceDifferenceCovarianceReplay, ReferenceDifferenceCovarianceReplay,
     ReferenceSpecificExecutionMode, ReferenceSpecificReplayScope, ReplayBackend,
     ReplayExecutionScope, ReplayIdNamespace, ReplayStatus, ResolvedCompressionReplay,
     ResolvedPhaseReplay, ResolvedPrimitiveSource, SequentialCovarianceCaptureRequest,
     SequentialPrimitiveSourceResolver, SequentialReplayBlock, SequentialReplayBuildIdentity,
     SequentialReplayError, SequentialReplayTopology, SequentialSourceProviderIdentity,
-    SequentialSourceReplayProvider, SpatialCovarianceStatus, TemporalCovarianceReplay,
-    SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
+    SequentialSourceReplayProvider, SequentialTileReplayProvider, SpatialCovarianceStatus,
+    TemporalCovarianceReplay, SEQUENTIAL_SOURCE_DAG_KERNEL_ID, SEQUENTIAL_SOURCE_DAG_METHOD,
 };
 pub use spatial_covariance_artifact::{
     finalize_spatial_reference_covariance_artifact,
