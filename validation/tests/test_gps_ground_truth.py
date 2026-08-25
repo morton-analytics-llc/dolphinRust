@@ -17,7 +17,7 @@ import gps_ground_truth as gps
 import score_pairs
 
 
-LINE = "MMX1 23JAN04 2023.0082 59948 2243 3 -99.1 3319 0.500000 2149449 0.250000 2236 -0.100000 0.0000 0.001 0.001 0.004 0 0 0 19.4316533 -99.0683894 2235.9"
+LINE = "MMX1 23JAN04 2023.0082 59948 2243 3 -99.1 3319 0.500000 2149449 0.250000 2236 -0.100000 0.0000 0.001 0.001 0.004 0.25 -0.1 0.2 19.4316533 -99.0683894 2235.9"
 GRID_TRANSFORM = from_origin(-1.0, 2.0, 1.0, 1.0)
 
 
@@ -83,6 +83,10 @@ class GroundTruthContract(unittest.TestCase):
         self.assertAlmostEqual(record.north_m, 2149449.25)
         self.assertAlmostEqual(record.up_m, 2235.9)
         self.assertAlmostEqual(record.latitude, 19.4316533)
+        covariance = gps.enu_covariance(record)
+        self.assertAlmostEqual(covariance[0, 1], 0.25e-6)
+        self.assertAlmostEqual(covariance[0, 2], -0.4e-6)
+        self.assertAlmostEqual(covariance[1, 2], 0.8e-6)
         with self.assertRaisesRegex(ValueError, "23 columns"):
             gps.parse_tenv3("MMX1 23JAN04 bad")
         with self.assertRaisesRegex(ValueError, "duplicate"):

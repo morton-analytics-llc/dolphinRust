@@ -18,8 +18,12 @@ import fsspec
 import h5py
 import requests
 
-from crop_real import Window, validate_window
-from fetch_real import authenticated_session, sha256_file
+if __package__:
+    from .crop_real import Window, validate_window
+    from .fetch_real import authenticated_session, sha256_file
+else:
+    from crop_real import Window, validate_window
+    from fetch_real import authenticated_session, sha256_file
 
 
 CONTENT_RANGE = re.compile(r"bytes 0-0/(\d+)")

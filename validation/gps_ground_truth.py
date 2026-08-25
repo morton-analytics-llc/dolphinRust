@@ -35,6 +35,9 @@ class Tenv3Record:
     sigma_e_m: float
     sigma_n_m: float
     sigma_u_m: float
+    corr_en: float
+    corr_eu: float
+    corr_nu: float
     latitude: float
     longitude: float
     height_m: float
@@ -104,6 +107,9 @@ def parse_tenv3(text: str) -> list[Tenv3Record]:
                 sigma_e_m=float(columns[14]),
                 sigma_n_m=float(columns[15]),
                 sigma_u_m=float(columns[16]),
+                corr_en=float(columns[17]),
+                corr_eu=float(columns[18]),
+                corr_nu=float(columns[19]),
                 latitude=float(columns[20]),
                 longitude=float(columns[21]),
                 height_m=float(columns[22]),
@@ -133,6 +139,9 @@ def interpolate_record(before: Tenv3Record, after: Tenv3Record, date: dt.date) -
         sigma_e_m=lerp(before.sigma_e_m, after.sigma_e_m),
         sigma_n_m=lerp(before.sigma_n_m, after.sigma_n_m),
         sigma_u_m=lerp(before.sigma_u_m, after.sigma_u_m),
+        corr_en=lerp(before.corr_en, after.corr_en),
+        corr_eu=lerp(before.corr_eu, after.corr_eu),
+        corr_nu=lerp(before.corr_nu, after.corr_nu),
         latitude=lerp(before.latitude, after.latitude),
         longitude=lerp(before.longitude, after.longitude),
         height_m=lerp(before.height_m, after.height_m),
@@ -186,6 +195,24 @@ def project_enu(enu_m: np.ndarray, los: np.ndarray) -> float:
     if abs(norm - 1.0) > 1e-5:
         raise ValueError(f"LOS vector is not unit norm: {norm}")
     return float(np.dot(enu, vector))
+
+
+def enu_covariance(record: Tenv3Record) -> np.ndarray:
+    """Return the full NGL ENU covariance matrix in square meters."""
+    sigma = np.array([record.sigma_e_m, record.sigma_n_m, record.sigma_u_m])
+    correlations = np.array([record.corr_en, record.corr_eu, record.corr_nu])
+    if not np.all(np.isfinite(sigma)) or np.any(sigma < 0):
+        raise ValueError("NGL ENU standard errors are invalid")
+    if not np.all(np.isfinite(correlations)) or np.any(np.abs(correlations) > 1):
+        raise ValueError("NGL ENU correlations are invalid")
+    covariance = np.diag(sigma**2)
+    covariance[0, 1] = covariance[1, 0] = record.corr_en * sigma[0] * sigma[1]
+    covariance[0, 2] = covariance[2, 0] = record.corr_eu * sigma[0] * sigma[2]
+    covariance[1, 2] = covariance[2, 1] = record.corr_nu * sigma[1] * sigma[2]
+    tolerance = max(1.0, float(np.max(np.diag(covariance)))) * 1e-12
+    if float(np.min(np.linalg.eigvalsh(covariance))) < -tolerance:
+        raise ValueError("NGL ENU covariance is not positive semidefinite")
+    return covariance
 
 
 def spatial_difference(primary: np.ndarray, control: np.ndarray) -> np.ndarray:
@@ -445,20 +472,28 @@ def gnss_los_series(aligned: Sequence[AlignedRecord], los: np.ndarray) -> np.nda
 
 
 def gnss_los_sigma_series(aligned: Sequence[AlignedRecord], los: np.ndarray) -> np.ndarray:
-    """Project independent ENU one-sigma errors into referenced LOS millimeters."""
-    component_sigma = np.array(
-        [
-            math.sqrt(
-                (item.record.sigma_e_m * los[0]) ** 2
-                + (item.record.sigma_n_m * los[1]) ** 2
-                + (item.record.sigma_u_m * los[2]) ** 2
-            )
-            for item in aligned
-        ]
-    )
-    relative = np.sqrt(component_sigma**2 + component_sigma[0] ** 2) * 1000.0
-    relative[0] = 0.0
-    return relative
+    """Project full ENU covariance into referenced LOS millimeters."""
+    return np.sqrt(np.maximum(np.diag(gnss_los_covariance_series(aligned, los)), 0.0))
+
+
+def gnss_los_covariance_series(
+    aligned: Sequence[AlignedRecord], los: np.ndarray
+) -> np.ndarray:
+    """Project full NGL ENU covariance and apply the epoch-zero reference."""
+    vector = np.asarray(los, dtype=float)
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+        raise ValueError("LOS vector must contain finite east, north, up components")
+    norm = float(np.linalg.norm(vector))
+    if abs(norm - 1.0) > 1e-5:
+        raise ValueError(f"LOS vector is not unit norm: {norm}")
+    variances = np.array(
+        [float(vector @ enu_covariance(item.record) @ vector) for item in aligned]
+    ) * 1_000_000.0
+    covariance = np.zeros((len(aligned), len(aligned)), dtype=float)
+    if len(aligned) > 1:
+        covariance[1:, 1:] = variances[0]
+        covariance[np.arange(1, len(aligned)), np.arange(1, len(aligned))] += variances[1:]
+    return covariance
 
 
 def sample_cube(
