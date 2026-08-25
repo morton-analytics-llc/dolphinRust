@@ -42,7 +42,7 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "d94e91f4920d51fd209498174c0c1a3dcf6be8372f40d48cecd2f8651d7f1fb3"
+FROZEN_GENERATOR_SHA256 = "19bc08eb615799b8ade3b381918c5b4581652e7d4743a56354c676125bda7a2d"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "ec37d83f50ae66f24d2b371809cc1e733c8207253b5e3e21c185882349619e25"
 FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
@@ -61,7 +61,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "f529b448b250feda28e74f4817074ba77c6a04762babfa74270d4960f0fc5140"
+FROZEN_SOURCE_SET_SHA256 = "16c8e6e45b5d0310d097232c4acc71affb7d1ea91b35d837dc234dbdd71364ac"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -79,6 +79,10 @@ FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL = 14
 FROZEN_POSITIVE_OVERLAP_SEED_START = 512
 FROZEN_POSITIVE_OVERLAP_SEED_COUNT = 512
 FROZEN_POSITIVE_OVERLAP_EMISSION_RATE_MIN = 0.95
+FROZEN_RECT_TRANSITIVE_SUPPORT = {
+    "hw_1x1|stride_1|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress": (3, 0),
+    "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress": (2, 2),
+}
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -1315,6 +1319,29 @@ def _source_factor_support(
     })
 
 
+def _effective_replay_support(
+    cell_id: str,
+    candidate_union: Iterable[tuple[int, int]],
+    half_window: Sequence[int],
+    native_tile_shape: Sequence[int],
+) -> set[tuple[int, int]]:
+    support = set(candidate_union)
+    replay = FROZEN_RECT_TRANSITIVE_SUPPORT.get(cell_id)
+    if replay is None:
+        return support
+    expansion_count, production_center_offset = replay
+    for _ in range(expansion_count):
+        support = set(
+            _source_factor_support(support, half_window, native_tile_shape)
+        )
+    if production_center_offset:
+        support = {
+            (row + production_center_offset, column + production_center_offset)
+            for row, column in support
+        }
+    return support
+
+
 def _generate_complex_source(
     preregistration: Mapping[str, Any],
     cell_ordinal: int,
@@ -1764,7 +1791,9 @@ def regenerate_frozen_attempt_inputs(
         for coordinate in raw_cube_support
     }
     effective_support = (
-        set(candidate_union)
+        _effective_replay_support(
+            cell_id, candidate_union, window["half_window"], native_tile_shape
+        )
         if union_support and labels["position"] != "masked"
         else set()
     )
