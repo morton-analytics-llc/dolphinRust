@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ from validation.score_spatial_covariance import (
     FROZEN_MAX_RUN_MANIFEST_BYTES,
     FROZEN_MAX_RECORD_BYTES,
     FROZEN_MAX_SHARD_MANIFEST_BYTES,
-    FROZEN_MATCHED_POSITIVE_CELL,
+    FROZEN_POSITIVE_OVERLAP_CELL,
     FROZEN_RETAINED_SIZE_BOUND_BYTES,
     FROZEN_SEED_COUNT,
     FROZEN_SHARD_COUNT,
@@ -44,6 +45,7 @@ from validation.score_spatial_covariance import (
     _read_hashed_json_record,
     _read_single_json_record,
     _source_correlation_receipt_sha256,
+    _validate_positive_overlap_execution_replay,
     _validate_performance_probe,
     _validate_resources,
     derive_dense_joint_oracle,
@@ -64,7 +66,8 @@ from validation.score_spatial_covariance import (
     score_attempt_shard,
     validate_cell_summary,
     validate_direct_pair_variance_order,
-    validate_matched_pair_cohorts,
+    validate_positive_overlap_cohort,
+    validate_positive_overlap_run_binding,
     validate_production_parity_fixture,
     validate_preregistration,
     validate_producer_identities,
@@ -72,15 +75,20 @@ from validation.score_spatial_covariance import (
 from validation.spatial_covariance_simulation import (
     _cell_request_at,
     _load_bounded_json,
+    _BoundedPositiveOverlapProducer,
+    _positive_overlap_identity,
     _iter_cell_requests,
     PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD,
+    POSITIVE_OVERLAP_STDERR_BYTES_MAX,
+    POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS,
+    POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS,
     build_run_manifest,
     commit_cell_transport,
     commit_output_shard,
     committed_shard_matches,
     compact_json_line,
     capture_benchmark_stdout,
-    generate_matched_pair_cohorts,
+    generate_positive_overlap_cohort,
     generate_performance_probe,
     generate_preoutcome_receipts,
     generate_resource_receipts,
@@ -106,7 +114,7 @@ TIED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks
 NEAR_TIE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress"
 
 
-class SpatialCovarianceValidationV5Tests(unittest.TestCase):
+class SpatialCovarianceValidationV6Tests(unittest.TestCase):
     benchmark_stdout_by_scope = {}
     @classmethod
     def setUpClass(cls):
@@ -121,11 +129,24 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             artifact_root=self.artifact_root,
         )
 
-    def _attempt(self, cell_id, ordinal, seed_index, masked=False, artifact_root=None):
+    def _attempt(
+        self,
+        cell_id,
+        ordinal,
+        seed_index,
+        masked=False,
+        artifact_root=None,
+        positive_overlap_replay=False,
+    ):
         artifact_root = self.artifact_root if artifact_root is None else Path(artifact_root)
         labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
         generator = self.preregistration["generator"]
-        frozen = regenerate_frozen_attempt_inputs(self.preregistration, cell_id, seed_index)
+        frozen = regenerate_frozen_attempt_inputs(
+            self.preregistration,
+            cell_id,
+            seed_index,
+            positive_overlap_replay=positive_overlap_replay,
+        )
         tied = labels["eigen_stress"] == "tied_eigenvalue" and labels["position"] != "masked"
         empty = expected_empty_support(cell_id)
         emitted = not masked and not tied and not empty
@@ -350,16 +371,17 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             result.append(item)
         return result
 
-    def test_v5_supersedes_infeasible_v4_before_outcomes(self):
+    def test_v6_supersedes_v5_diagnostics_before_accepted_outcomes(self):
         validate_preregistration(self.preregistration)
-        self.assertEqual(self.preregistration["schema_version"], 5)
-        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 4)
+        self.assertEqual(self.preregistration["schema_version"], 6)
+        self.assertEqual(self.preregistration["supersedes"]["schema_version"], 5)
+        self.assertTrue(self.preregistration["supersedes"]["diagnostics_excluded"])
         self.assertFalse(self.preregistration["outcomes_present"])
         self.assertEqual(len(expected_cell_ids(self.preregistration)), FROZEN_CELL_COUNT)
-        self.assertEqual(FROZEN_ATTEMPT_COUNT, 3_088)
+        self.assertEqual(FROZEN_ATTEMPT_COUNT, 3_087)
         counts = [expected_seed_count(cell_id) for cell_id in expected_cell_ids(self.preregistration)]
         self.assertEqual(counts.count(FROZEN_SEED_COUNT), 24)
-        self.assertEqual(counts.count(1), 16)
+        self.assertEqual(counts.count(1), 15)
         self.assertEqual(FROZEN_SHARD_COUNT, 1)
 
     def test_stochastic_design_is_exact_acceptance_axis_product(self):
@@ -464,8 +486,8 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         self.assertFalse(execution["request_files_retained"])
 
     def test_final_summary_sink_accepts_exact_full_component_and_rejects_one_byte_over(self):
-        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 327_680)
-        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 21_315_584)
+        self.assertEqual(FROZEN_CELL_SUMMARY_COMPONENT_BYTES, 319_488)
+        self.assertEqual(FROZEN_RETAINED_SIZE_BOUND_BYTES, 21_307_392)
         encoded = compact_json_line({"cell": 1})
         with tempfile.TemporaryDirectory() as directory:
             exact = _CellSummarySink(Path(directory) / "exact.jsonl")
@@ -520,21 +542,6 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             _raw_source_digest("portable-golden-v1", [(-4, 19)], {(-4, 19): values}),
             "5f5ed14ea6b620fc818d35823206776f738d17da38806861b2e84ac2de748176",
         )
-
-    def test_signed_pair_uses_positive_cell_ordinal_for_matched_draws(self):
-        negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative")
-        self.assertEqual(
-            _dgp_cell_ordinal(self.preregistration, SUPPORTED_CELL),
-            _dgp_cell_ordinal(self.preregistration, negative),
-        )
-
-    def test_adaptive_signed_pair_selects_identical_support_from_signed_stack(self):
-        positive_cell = SUPPORTED_CELL.replace("rect", "glrt_frozen")
-        negative_cell = positive_cell.replace("shared_75_positive", "shared_75_negative")
-        positive = regenerate_frozen_attempt_inputs(self.preregistration, positive_cell, 0)
-        negative = regenerate_frozen_attempt_inputs(self.preregistration, negative_cell, 0)
-        self.assertEqual(positive["target_support_sha256"], negative["target_support_sha256"])
-        self.assertEqual(positive["reference_support_sha256"], negative["reference_support_sha256"])
 
     def test_portable_tables_cover_every_frozen_coordinate_and_date(self):
         coverage = portable_table_coverage(self.preregistration)
@@ -759,10 +766,9 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         self.assertEqual(summary["final_date_coverage_95"], 1.0)
         self.assertEqual(summary["status"], "fail")
 
-    def test_deterministic_signed_and_invalid_contracts_are_separate_from_coverage(self):
+    def test_deterministic_pair_and_invalid_contracts_are_separate_from_coverage(self):
         for geometry, expected_sign in (
             ("shared_75_positive", "positive"),
-            ("shared_75_negative", "negative"),
             ("disjoint_immediate", "none"),
             ("coincident", "zero"),
         ):
@@ -834,24 +840,6 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         validate_cell_summary(
             self.preregistration, summary, INDEPENDENT_CELL,
             cell_ordinal, CODE, BINARY,
-        )
-
-    def test_negative_pair_dgp_has_negative_target_reference_error_loading(self):
-        negative = SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative").replace(
-            "independent_complex_looks", "spatial_correlation_stress"
-        )
-        positive = negative.replace("shared_75_negative", "shared_75_positive")
-        negative_dgp = regenerate_frozen_attempt_inputs(self.preregistration, negative, 0)
-        positive_dgp = regenerate_frozen_attempt_inputs(self.preregistration, positive, 0)
-        self.assertLess(
-            negative_dgp["target_global_loading_mean"]
-            * negative_dgp["reference_global_loading_mean"],
-            0.0,
-        )
-        self.assertGreater(
-            positive_dgp["target_global_loading_mean"]
-            * positive_dgp["reference_global_loading_mean"],
-            0.0,
         )
 
     def test_source_process_selects_identity_or_exponential_correlation(self):
@@ -1156,28 +1144,6 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         ])
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-15)
 
-    def test_matched_signed_pair_differs_only_by_coupling(self):
-        positive = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
-        negative = regenerate_frozen_attempt_inputs(
-            self.preregistration,
-            SUPPORTED_CELL.replace("shared_75_positive", "shared_75_negative"),
-            0,
-        )
-        for field in (
-            "target_support_sha256", "reference_support_sha256",
-            "latent_target_history", "latent_reference_history",
-            "target_marginal_oracle_sha256", "reference_marginal_oracle_sha256",
-        ):
-            self.assertEqual(positive[field], negative[field])
-        self.assertLess(
-            positive["oracle_difference_covariance_trace"],
-            positive["oracle_independent_covariance_trace"],
-        )
-        self.assertLess(
-            positive["oracle_independent_covariance_trace"],
-            negative["oracle_difference_covariance_trace"],
-        )
-
     def test_cell_summary_binds_attempt_digest_and_scope(self):
         accumulator = self._accumulator(CELL)
         accumulator.add(self._attempt(CELL, 0, 0))
@@ -1435,7 +1401,7 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             for name, value in (
                 ("performance.json", {}),
                 ("resources.json", []),
-                ("matched-pair-cohorts.json", []),
+                ("positive-overlap-cohort.json", {}),
             ):
                 raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
                 (root / name).write_bytes(raw)
@@ -1458,13 +1424,209 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                     return_value=["pass"] * 5,
                 ),
                 mock.patch(
-                    "validation.spatial_covariance_simulation.validate_matched_pair_cohorts"
+                    "validation.spatial_covariance_simulation.validate_positive_overlap_cohort"
                 ),
             ):
                 validate_preoutcome_receipts(self.preregistration, root, CODE, BINARY)
                 (root / "performance.json").write_bytes(b"{} \n")
                 with self.assertRaisesRegex(SchemaError, "differs from its manifest"):
                     validate_preoutcome_receipts(self.preregistration, root, CODE, BINARY)
+
+    def test_run_manifest_rejects_substituted_or_standalone_positive_receipt(self):
+        cohort = {
+            "schema": "dolphinrust.spatial-covariance.positive-overlap-cohort/1",
+            "cell_id": FROZEN_POSITIVE_OVERLAP_CELL,
+            "marginal_dgp_digest": "c" * 64,
+            "target_support_digest": "c" * 64,
+            "reference_support_digest": "c" * 64,
+            "latent_history_digest": "c" * 64,
+            "phase_orientation_digest": "c" * 64,
+            "predicted_covariance_trace": 1.0,
+            "predicted_marginal_covariance_trace": 2.0,
+            "empirical_error_covariance_trace": 1.0,
+            "empirical_marginal_covariance_trace": 2.0,
+            "seed_start": 512,
+            "seed_end_exclusive": 1024,
+            "attempted_seed_count": 512,
+            "emitted_seed_count": 512,
+            "emitted_seed_digest": "c" * 64,
+            "abstained_seed_count": 0,
+            "abstained_seed_digest": "c" * 64,
+            "attempt_digest": "c" * 64,
+            "code_sha256": CODE,
+            "binary_sha256": BINARY,
+            "config_sha256": sha256_json(self.preregistration["generator"]),
+        }
+        performance = {}
+        resources = []
+        receipts = {
+            name: {
+                "sha256": hashlib.sha256(compact_json_line(value)).hexdigest(),
+                "bytes": len(compact_json_line(value)),
+            }
+            for name, value in (
+                ("performance.json", performance),
+                ("resources.json", resources),
+                ("positive-overlap-cohort.json", cohort),
+            )
+        }
+        preoutcome_manifest = {
+            "schema": "dolphinrust.spatial-covariance.preoutcome-receipts/1",
+            "code_sha256": CODE,
+            "binary_sha256": BINARY,
+            "config_sha256": sha256_json(self.preregistration["generator"]),
+            "preregistration_sha256": preregistration_digest(self.preregistration),
+            "receipts": receipts,
+        }
+        binding = {
+            "preregistration_sha256": preregistration_digest(self.preregistration),
+            "performance_probe": performance,
+            "resources": resources,
+            "preoutcome_manifest": preoutcome_manifest,
+            "preoutcome_manifest_sha256": hashlib.sha256(
+                compact_json_line(preoutcome_manifest)
+            ).hexdigest(),
+            "positive_overlap_cohort_sha256": receipts[
+                "positive-overlap-cohort.json"
+            ]["sha256"],
+            "positive_overlap_cohort": cohort,
+        }
+        validate_positive_overlap_run_binding(
+            binding,
+            CODE,
+            BINARY,
+            sha256_json(self.preregistration["generator"]),
+        )
+        changed = copy.deepcopy(binding)
+        changed["positive_overlap_cohort"]["predicted_covariance_trace"] = 0.5
+        with self.assertRaisesRegex(SchemaError, "differs from its manifest"):
+            validate_positive_overlap_run_binding(
+                changed,
+                CODE,
+                BINARY,
+                sha256_json(self.preregistration["generator"]),
+            )
+        changed = copy.deepcopy(binding)
+        changed["preoutcome_manifest"]["receipts"][
+            "positive-overlap-cohort.json"
+        ]["bytes"] += 1
+        changed["preoutcome_manifest_sha256"] = hashlib.sha256(
+            compact_json_line(changed["preoutcome_manifest"])
+        ).hexdigest()
+        with self.assertRaisesRegex(SchemaError, "differs from its manifest"):
+            validate_positive_overlap_run_binding(
+                changed,
+                CODE,
+                BINARY,
+                sha256_json(self.preregistration["generator"]),
+            )
+        changed = copy.deepcopy(binding)
+        changed["preoutcome_manifest_sha256"] = "e" * 64
+        with self.assertRaisesRegex(SchemaError, "differs from its bound hash"):
+            validate_positive_overlap_run_binding(
+                changed,
+                CODE,
+                BINARY,
+                sha256_json(self.preregistration["generator"]),
+            )
+
+        replayed = copy.deepcopy(cohort)
+        replayed["predicted_covariance_trace"] = 0.75
+        with (
+            mock.patch(
+                "validation.score_spatial_covariance._replay_positive_overlap_cohort",
+                return_value=replayed,
+            ),
+            self.assertRaisesRegex(SchemaError, "exact Rust execution replay"),
+        ):
+            _validate_positive_overlap_execution_replay(
+                self.preregistration,
+                binding,
+                PREREGISTRATION,
+                Path("batch"),
+                CODE,
+                BINARY,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            standalone = Path(directory) / "standalone"
+            standalone.mkdir()
+            (standalone / "positive-overlap-cohort.json").write_bytes(
+                compact_json_line(cohort)
+            )
+            with self.assertRaises(FileNotFoundError):
+                build_run_manifest(
+                    self.preregistration,
+                    Path(directory),
+                    (),
+                    CODE,
+                    BINARY,
+                    {},
+                    self._resource_receipts(),
+                    standalone,
+                    attempt_regenerator=lambda *_: iter(()),
+                    production_parity_fixture={},
+                )
+
+    def test_direct_file_scorer_translates_foreign_replay_exception_to_fail_json(self):
+        namespace = runpy.run_path(
+            str(VALIDATION / "score_spatial_covariance.py"),
+            run_name="direct_score_spatial_covariance",
+        )
+        self.assertIsNot(namespace["SchemaError"], SchemaError)
+        run_manifest = {
+            name: None for name in namespace["RUN_MANIFEST_KEYS"]
+        }
+        run_manifest.update({
+            "schema": "dolphinrust.spatial-covariance.run-manifest/5",
+            "schema_version": 5,
+            "preregistration_sha256": preregistration_digest(self.preregistration),
+            "code_sha256": CODE,
+            "binary_sha256": BINARY,
+            "generator_protocol_sha256": sha256_json(
+                self.preregistration["execution_protocol"]
+            ),
+            "performance_probe": {},
+            "resources": [],
+            "production_parity_fixture": {},
+            "production_parity_fixture_sha256": "c" * 64,
+            "preoutcome_manifest_sha256": "d" * 64,
+            "positive_overlap_cohort_sha256": "e" * 64,
+        })
+        score_run = namespace["score_run_manifest"]
+        replacements = {
+            "validate_preregistration": lambda *_: None,
+            "_read_hashed_json_record": lambda *_: (run_manifest, b"", "f" * 64),
+            "validate_producer_identities": lambda *_: None,
+            "_validate_performance_probe": lambda *_: None,
+            "_validate_resources": lambda *_: [],
+            "validate_production_parity_fixture": lambda *_: None,
+            "validate_positive_overlap_run_binding": lambda *_: None,
+        }
+        with (
+            mock.patch.dict(score_run.__globals__, replacements),
+            mock.patch(
+                "validation.spatial_covariance_simulation.generate_positive_overlap_cohort",
+                side_effect=SchemaError("foreign generator failure"),
+            ),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            manifest_path = Path(directory) / "run-manifest.jsonl"
+            manifest_path.write_bytes(b"{}\n")
+            result = score_run(
+                self.preregistration,
+                manifest_path,
+                source_root=Path("."),
+                batch_binary=Path("batch"),
+                benchmark_binary=Path("benchmark"),
+                preregistration_path=PREREGISTRATION,
+            )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(
+            result["errors"],
+            ["positive-overlap execution replay failed: foreign generator failure"],
+        )
+        self.assertIsInstance(json.dumps(result), str)
 
     def test_resume_rejects_self_consistent_replaced_summary_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1801,10 +1963,10 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             self.assertEqual(generated["code_sha256"], code_sha256)
             performance = json.loads((destination / "performance.json").read_bytes())
             resources = json.loads((destination / "resources.json").read_bytes())
-            cohorts = json.loads((destination / "matched-pair-cohorts.json").read_bytes())
+            cohort = json.loads((destination / "positive-overlap-cohort.json").read_bytes())
             manifest = json.loads((destination / "manifest.json").read_bytes())
             self.assertEqual(set(manifest["receipts"]), {
-                "performance.json", "resources.json", "matched-pair-cohorts.json",
+                "performance.json", "resources.json", "positive-overlap-cohort.json",
             })
         _validate_performance_probe(
             self.preregistration, performance, code_sha256, binary_sha256
@@ -1825,13 +1987,13 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         with self.assertRaisesRegex(SchemaError, "raw resource measurement|stdout hash"):
             _validate_resources(self.preregistration, changed_resources, binary_sha256)
 
-        validate_matched_pair_cohorts(cohorts)
-        changed_cohorts = copy.deepcopy(cohorts)
-        changed_cohorts[1]["predicted_covariance_trace"] = (
-            changed_cohorts[0]["predicted_covariance_trace"]
-        )
-        with self.assertRaisesRegex(SchemaError, "positive < independent < negative"):
-            validate_matched_pair_cohorts(changed_cohorts)
+        validate_positive_overlap_cohort(cohort)
+        changed_cohort = copy.deepcopy(cohort)
+        changed_cohort["predicted_covariance_trace"] = changed_cohort[
+            "predicted_marginal_covariance_trace"
+        ]
+        with self.assertRaisesRegex(SchemaError, "predicted covariance trace"):
+            validate_positive_overlap_cohort(changed_cohort)
 
     def test_parallel_batch_is_byte_exact_ordered_and_rss_bounded(self):
         source_root = Path(__file__).parents[2]
@@ -1978,25 +2140,264 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 self.preregistration, changed, CODE, BINARY
             )
 
-    def test_matched_cohort_generator_rejects_nonfrozen_seed_count_before_execution(self):
+    def test_positive_overlap_generator_rejects_nonfrozen_seed_count_before_execution(self):
         with self.assertRaisesRegex(SchemaError, "seed count"):
-            generate_matched_pair_cohorts(
+            generate_positive_overlap_cohort(
                 self.preregistration, PREREGISTRATION, Path("missing-batch"),
                 CODE, BINARY, 32,
             )
 
-    def test_matched_cohort_generator_admits_frozen_512_before_execution(self):
+    def test_positive_overlap_generator_admits_frozen_512_before_execution(self):
         with self.assertRaises(FileNotFoundError):
-            generate_matched_pair_cohorts(
+            generate_positive_overlap_cohort(
                 self.preregistration, PREREGISTRATION, Path("missing-batch"),
                 CODE, BINARY, 512,
             )
 
-    def test_matched_seed_zero_effective_looks_matches_exact_candidate_adjoint_union(self):
-        target, reference = _expected_coordinates(
-            self.preregistration, FROZEN_MATCHED_POSITIVE_CELL
+    def test_positive_overlap_replay_schedule_does_not_widen_outcomes(self):
+        for seed_index in (512, 1023):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration,
+                FROZEN_POSITIVE_OVERLAP_CELL,
+                seed_index,
+                positive_overlap_replay=True,
+            )
+        with self.assertRaisesRegex(SchemaError, "schedule"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration,
+                FROZEN_POSITIVE_OVERLAP_CELL,
+                1024,
+                positive_overlap_replay=True,
+            )
+        with self.assertRaisesRegex(SchemaError, "schedule"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration,
+                FROZEN_POSITIVE_OVERLAP_CELL,
+                511,
+                positive_overlap_replay=True,
+            )
+        with self.assertRaisesRegex(SchemaError, "schedule"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration, FROZEN_POSITIVE_OVERLAP_CELL, 128
+            )
+        with self.assertRaisesRegex(SchemaError, "positive-overlap"):
+            regenerate_frozen_attempt_inputs(
+                self.preregistration,
+                CELL,
+                128,
+                positive_overlap_replay=True,
+            )
+
+        cell_ordinal = expected_cell_ids(self.preregistration).index(
+            FROZEN_POSITIVE_OVERLAP_CELL
         )
-        labels = dict(zip(DIMENSION_NAMES, FROZEN_MATCHED_POSITIVE_CELL.split("|")))
+        ordinary = CellAccumulator(
+            self.preregistration,
+            FROZEN_POSITIVE_OVERLAP_CELL,
+            cell_ordinal,
+            128,
+            CODE,
+            BINARY,
+        )
+        top_up = self._attempt(
+            FROZEN_POSITIVE_OVERLAP_CELL,
+            cell_ordinal,
+            512,
+            positive_overlap_replay=True,
+        )
+        with self.assertRaisesRegex(SchemaError, "top-up"):
+            ordinary.add(top_up)
+
+        extended = CellAccumulator(
+            self.preregistration,
+            FROZEN_POSITIVE_OVERLAP_CELL,
+            cell_ordinal,
+            512,
+            CODE,
+            BINARY,
+            positive_overlap_replay=True,
+        )
+        extended.add(top_up)
+
+    @unittest.skipUnless(
+        os.environ.get("DOLPHIN_RUN_FULL_POSITIVE_OVERLAP") == "1",
+        "full 512-seed positive-overlap stream is opt-in",
+    )
+    def test_complete_frozen_positive_overlap_stream_and_exact_replay_are_byte_identical(self):
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/release/examples/spatial_covariance_batch"
+        benchmark = source_root / "target/release/examples/spatial_covariance_bench"
+        if not batch.exists() or not benchmark.exists():
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-workflows",
+                    "--example", "spatial_covariance_batch",
+                    "--example", "spatial_covariance_bench",
+                ],
+                check=True,
+            )
+        code_sha256, binary_sha256 = producer_identities(
+            source_root, batch, benchmark
+        )
+        receipt = generate_positive_overlap_cohort(
+            self.preregistration,
+            PREREGISTRATION,
+            batch,
+            code_sha256,
+            binary_sha256,
+            512,
+        )
+        validate_positive_overlap_cohort(
+            receipt,
+            code_sha256,
+            binary_sha256,
+            sha256_json(self.preregistration["generator"]),
+        )
+        _validate_positive_overlap_execution_replay(
+            self.preregistration,
+            {"positive_overlap_cohort": receipt},
+            PREREGISTRATION,
+            batch,
+            code_sha256,
+            binary_sha256,
+        )
+        self.assertEqual(receipt["attempted_seed_count"], 512)
+        self.assertEqual(receipt["seed_start"], 512)
+        self.assertEqual(receipt["seed_end_exclusive"], 1024)
+        self.assertGreaterEqual(receipt["emitted_seed_count"], 487)
+        self.assertEqual(
+            receipt["emitted_seed_count"] + receipt["abstained_seed_count"], 512
+        )
+        self.assertLess(
+            receipt["predicted_covariance_trace"],
+            receipt["predicted_marginal_covariance_trace"],
+        )
+        self.assertLess(
+            receipt["empirical_error_covariance_trace"],
+            receipt["empirical_marginal_covariance_trace"],
+        )
+        changed = copy.deepcopy(receipt)
+        changed["emitted_seed_count"] = 486
+        changed["abstained_seed_count"] = 26
+        with self.assertRaisesRegex(SchemaError, "malformed"):
+            validate_positive_overlap_cohort(changed)
+
+    def test_positive_overlap_supervisor_bounds_both_pipes_and_deadlines(self):
+        self.assertEqual(POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS, 30.0)
+        self.assertEqual(POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS, 10.0)
+
+        def supervised(script):
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            return process, _BoundedPositiveOverlapProducer(
+                process, POSITIVE_OVERLAP_STDERR_BYTES_MAX
+            )
+
+        process, supervisor = supervised(
+            "import os; chunk=b'x'*4096\nwhile True: os.write(2,chunk)"
+        )
+        try:
+            with self.assertRaisesRegex(SchemaError, "stderr exceeds"):
+                supervisor.read_record(FROZEN_POSITIVE_OVERLAP_CELL, 512, 1.0)
+            self.assertIsNotNone(process.poll())
+            self.assertLessEqual(len(supervisor.stderr), POSITIVE_OVERLAP_STDERR_BYTES_MAX)
+        finally:
+            supervisor.close()
+
+        for script, reason in (
+            ("import time; time.sleep(5)", "per-record deadline"),
+            ("import os,time; os.write(1,b'{partial'); time.sleep(5)", "per-record deadline"),
+        ):
+            process, supervisor = supervised(script)
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(SchemaError, reason):
+                    supervisor.read_record(FROZEN_POSITIVE_OVERLAP_CELL, 512, 0.1)
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertIsNotNone(process.poll())
+            finally:
+                supervisor.close()
+
+        process, supervisor = supervised("import os; os.write(1,b'{}\\n')")
+        try:
+            self.assertEqual(
+                supervisor.read_record(FROZEN_POSITIVE_OVERLAP_CELL, 512, 1.0),
+                b"{}\n",
+            )
+            supervisor.finish(FROZEN_POSITIVE_OVERLAP_CELL, 1024, 1.0)
+        finally:
+            supervisor.close()
+
+        process, supervisor = supervised(
+            "import os,time; os.write(1,b'{}\\n'); time.sleep(5)"
+        )
+        try:
+            self.assertEqual(
+                supervisor.read_record(FROZEN_POSITIVE_OVERLAP_CELL, 512, 1.0),
+                b"{}\n",
+            )
+            with self.assertRaisesRegex(SchemaError, "final-exit deadline"):
+                supervisor.finish(FROZEN_POSITIVE_OVERLAP_CELL, 1024, 0.1)
+        finally:
+            supervisor.close()
+
+        process, supervisor = supervised("import os; os.write(1,b'{}\\n{}\\n')")
+        try:
+            with self.assertRaisesRegex(SchemaError, "top-up"):
+                supervisor.read_record(FROZEN_POSITIVE_OVERLAP_CELL, 512, 1.0)
+        finally:
+            supervisor.close()
+
+    def test_negative_stochastic_dgp_is_outside_the_frozen_matrix(self):
+        negative_cell = FROZEN_POSITIVE_OVERLAP_CELL.replace(
+            "shared_75_positive", "shared_75_negative"
+        )
+        self.assertNotIn(negative_cell, expected_cell_ids(self.preregistration))
+        dgp_order = self.preregistration["determinism"]["dgp_cell_order"]
+        self.assertEqual(
+            self.preregistration["determinism"]["positive_overlap_scheduled_cell_ordinal"],
+            13,
+        )
+        self.assertEqual(
+            self.preregistration["determinism"]["positive_overlap_dgp_cell_ordinal"],
+            14,
+        )
+        self.assertEqual(len(dgp_order), 40)
+        self.assertEqual(dgp_order[10], negative_cell)
+        for cell_id in expected_cell_ids(self.preregistration):
+            self.assertEqual(_dgp_cell_ordinal(self.preregistration, cell_id), dgp_order.index(cell_id))
+        self.assertEqual(_dgp_cell_ordinal(self.preregistration, FROZEN_POSITIVE_OVERLAP_CELL), 14)
+        with self.assertRaisesRegex(SchemaError, "outside the preregistered matrix"):
+            regenerate_frozen_attempt_inputs(self.preregistration, negative_cell, 0)
+
+    def test_positive_overlap_identity_excludes_joint_raw_digest(self):
+        positive = regenerate_frozen_attempt_inputs(
+            self.preregistration, FROZEN_POSITIVE_OVERLAP_CELL, 0
+        )
+        identity = _positive_overlap_identity(positive)
+        self.assertEqual(set(identity), {
+            "schema", "target_support_sha256", "reference_support_sha256",
+            "sequential_ancestry_sha256", "latent_history_sha256",
+            "target_marginal_oracle_sha256", "reference_marginal_oracle_sha256",
+            "source_correlation_receipt_sha256", "target_coordinate",
+            "reference_coordinate", "date_axis_sha256", "raw_input_shape",
+            "raw_input_value_count", "target_source_count",
+            "reference_source_count", "intersection_source_count",
+            "union_source_count", "effective_support_union_count",
+            "effective_looks_fraction", "source_correlation_model",
+            "source_correlation_distance_scale_pixels",
+        })
+        self.assertNotIn("raw_dgp_identity_sha256", identity)
+
+    def test_positive_overlap_seed_zero_effective_looks_matches_exact_candidate_union(self):
+        target, reference = _expected_coordinates(
+            self.preregistration, FROZEN_POSITIVE_OVERLAP_CELL
+        )
+        labels = dict(zip(DIMENSION_NAMES, FROZEN_POSITIVE_OVERLAP_CELL.split("|")))
         window = self.preregistration["generator"]["coordinates"]["window_stride"][
             f"{labels['half_window']}|{labels['stride']}"
         ]
@@ -2011,7 +2412,7 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         expected_fraction = _effective_looks_fraction(effective_support)
         self.assertAlmostEqual(expected_fraction, 0.21680743563593532, places=15)
         regenerated = regenerate_frozen_attempt_inputs(
-            self.preregistration, FROZEN_MATCHED_POSITIVE_CELL, 0
+            self.preregistration, FROZEN_POSITIVE_OVERLAP_CELL, 0
         )
         self.assertEqual(regenerated["effective_looks_fraction"], expected_fraction)
         self.assertEqual(regenerated["effective_support_union_count"], 18)
@@ -2026,15 +2427,15 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         batch = source_root / "target/debug/examples/spatial_covariance_batch"
         request = _cell_request_at(
             self.preregistration,
-            FROZEN_MATCHED_POSITIVE_CELL,
-            expected_cell_ids(self.preregistration).index(FROZEN_MATCHED_POSITIVE_CELL),
+            FROZEN_POSITIVE_OVERLAP_CELL,
+            expected_cell_ids(self.preregistration).index(FROZEN_POSITIVE_OVERLAP_CELL),
             labels,
             0,
         )
         completed = subprocess.run(
             [
                 str(batch), "--preregistration", str(PREREGISTRATION),
-                "--cell-id", FROZEN_MATCHED_POSITIVE_CELL,
+                "--cell-id", FROZEN_POSITIVE_OVERLAP_CELL,
                 "--ephemeral-evidence-stdout",
             ],
             input=compact_json_line(request),
@@ -2051,8 +2452,8 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         )
         CellAccumulator(
             self.preregistration,
-            FROZEN_MATCHED_POSITIVE_CELL,
-            expected_cell_ids(self.preregistration).index(FROZEN_MATCHED_POSITIVE_CELL),
+            FROZEN_POSITIVE_OVERLAP_CELL,
+            expected_cell_ids(self.preregistration).index(FROZEN_POSITIVE_OVERLAP_CELL),
             1,
             CODE,
             BINARY,
@@ -2092,13 +2493,13 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
         for command in (
             "capture-resource", "prepare", "reduce-cell", "commit", "resume", "assemble",
-            "generate-performance", "generate-resources", "generate-matched-cohorts",
+            "generate-performance", "generate-resources", "generate-positive-overlap",
             "generate-preoutcome", "run-outcomes",
         ):
             self.assertIn(command, completed.stdout)
         for command in (
             "reduce-cell", "commit", "resume", "assemble",
-            "generate-performance", "generate-resources", "generate-matched-cohorts",
+            "generate-performance", "generate-resources", "generate-positive-overlap",
             "generate-preoutcome", "run-outcomes",
         ):
             identity_help = subprocess.run(
@@ -2111,6 +2512,9 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 self.assertIn(option, identity_help)
             self.assertNotIn("--code-sha256", identity_help)
             self.assertNotIn("--binary-sha256", identity_help)
+            if command == "assemble":
+                self.assertIn("--preoutcome-directory", identity_help)
+                self.assertNotIn("--positive-overlap-cohort", identity_help)
 
     def test_prebuilt_batch_regenerator_streams_one_exact_cell(self):
         batch = Path("target/release/examples/spatial_covariance_batch")
@@ -2135,7 +2539,8 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
     def test_assembly_fails_closed_until_rust_replay_executable_is_available(self):
         with self.assertRaisesRegex(SchemaError, "Rust spatial_covariance_batch replay executable"):
             build_run_manifest(
-                self.preregistration, Path.cwd(), (), CODE, BINARY, {}, self._resource_receipts()
+                self.preregistration, Path.cwd(), (), CODE, BINARY, {},
+                self._resource_receipts(), Path("missing-preoutcome"),
             )
 
 

@@ -1,14 +1,15 @@
 {
   "schema": "dolphinrust.spatial_covariance.preregistration",
-  "schema_version": 5,
+  "schema_version": 6,
   "validation_id": "F54-07-spatial-covariance-approximation",
   "status": "preregistered",
   "outcomes_present": false,
   "supersedes": {
-    "schema_version": 4,
-    "canonical_preregistration_sha256": "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35",
+    "schema_version": 5,
+    "canonical_preregistration_sha256": "568e2f713c5468b5ad76a3b82aa61b8b2959c415beeca6fec252b11a9376907c",
     "outcomes_present": false,
-    "reason": "v4 froze 353 cells and 665220 attempts before execution. Exact pre-outcome timing observed 32 hw_7x14 GLRT attempts require about 91 wall seconds with 12 ordered workers, while the 128-attempt run remained active beyond 615 wall seconds; projected full execution was measured in weeks, and the required KS 32/128 probe contradicted v4's one-seed KS selector. No outcomes existed. v5 retains scientific acceptance axes and moves engineering behaviors to deterministic contracts."
+    "diagnostics_excluded": true,
+    "reason": "v5 signed-conjugate diagnostics, including observed status counts and numeric traces, were excluded before any accepted scientific outcome because the stochastic negative branch was outside the production Hermitian positive-kernel source-correlation model. v6 keeps the representable proper-complex positive-overlap model, retains the exact analytic ValidationCoupling::Negative DAG/source-factor oracle, and prospectively evaluates the unchanged 0.95 emission gate on fresh seed indices 512 through 1023."
   },
   "design": "explicit-acceptance-axis-matrix-with-deterministic-engineering-contracts",
   "seed_schedule": {
@@ -32,10 +33,10 @@
       "eigen_stress",
       "source_process"
     ],
-    "expected_cell_count": 40,
-    "expected_attempt_count": 3088,
+    "expected_cell_count": 39,
+    "expected_attempt_count": 3087,
     "supported_monte_carlo_cell_count": 24,
-    "deterministic_contract_cell_count": 16,
+    "deterministic_contract_cell_count": 15,
     "required_design": "three_window_sizes_by_four_distance_regimes_by_two_estimators_plus_explicit_deterministic_acceptance_contracts",
     "cell_pruning_allowed": false,
     "source_process_axis_required": true,
@@ -84,7 +85,6 @@
       "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress"
     ],
     "deterministic_contract_cells": [
-      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
       "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|independent_complex_looks",
       "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
       "hw_1x1|stride_4|glrt_frozen|border_clamped|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
@@ -104,7 +104,7 @@
     "deterministic_behavior_evidence": {
       "independent": "deterministic source_process cell",
       "positive": "stochastic near cells",
-      "negative": "deterministic shared_75_negative cell",
+      "negative": "exact ValidationCoupling::Negative production DAG/source-factor oracle",
       "coincident": "stochastic coincident cells and exact-zero contracts",
       "invalid_reference": "production parity InvalidReference contract",
       "mask": "deterministic masked cell",
@@ -117,12 +117,12 @@
     }
   },
   "execution_protocol": {
-    "protocol_version": 5,
+    "protocol_version": 6,
     "request_schema": "dolphinrust.spatial-covariance.attempt/4",
     "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
     "cell_summary_schema": "dolphinrust.spatial-covariance.cell-summary/4",
     "shard_manifest_schema": "dolphinrust.spatial-covariance.shard-manifest/4",
-    "run_manifest_schema": "dolphinrust.spatial-covariance.run-manifest/4",
+    "run_manifest_schema": "dolphinrust.spatial-covariance.run-manifest/5",
     "production_hdf5_schema_version": 4,
     "max_production_hdf5_bytes": 1048576,
     "attempt_transport": "ephemeral_pipe_or_delete_after_verified_cell_commit",
@@ -134,11 +134,11 @@
     "max_cells_per_shard": 100,
     "shard_count": 1,
     "full_shard_count": 0,
-    "final_shard_cell_count": 40,
+    "final_shard_cell_count": 39,
     "max_encoded_cell_summary_bytes": 8192,
     "max_encoded_shard_manifest_bytes": 16384,
     "max_encoded_run_manifest_bytes": 16777216,
-    "retained_size_bound_bytes": 21315584,
+    "retained_size_bound_bytes": 21307392,
     "process_rss_bytes_max": 25769803776,
     "partial_suffix": ".partial",
     "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
@@ -191,40 +191,96 @@
       "reserve_fraction": 0.25,
       "total_wall_seconds_max": null
     },
-    "matched_pair_cohort": {
-      "positive_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
-      "negative_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+    "positive_overlap_cohort": {
+      "cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "scheduled_cell_ordinal": 13,
+      "dgp_cell_ordinal": 14,
+      "seed_start": 512,
       "seed_count": 512,
-      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's marginal source/support/latent/orientation identity before reducing predicted and empirical traces; independent is derived only from the paired marginal target/reference traces"
+      "seed_end_exclusive": 1024,
+      "stderr_bytes_max": 16384,
+      "record_deadline_seconds": 30.0,
+      "final_exit_deadline_seconds": 10.0,
+      "emission_rate_min": 0.95,
+      "execution": "stream exactly 512 attempts for the frozen positive-overlap cell at scheduled/request ordinal 13 and preserved DGP ordinal 14 through the exact prebuilt spatial_covariance_batch under an explicit extended replay and accumulator context that does not widen the ordinary 128-seed outcome schedule; a bounded supervisor concurrently drains stdout and stderr, kills and waits on stderr above 16 KiB, bounds stdout to one capped record, and enforces the frozen per-record and final-exit deadlines so missing, partial, stalled, or top-up output fails closed; Python independently regenerates each seed's support, ancestry, latent truth, marginal oracle, correlation receipt, coordinates, shape, counts, and source process; all attempt identities are retained and exact emitted and abstained seed counts/digests are persisted; predicted and empirical numeric traces are reduced only over emitted attempts subject to the frozen minimum emission rate, with no top-ups or fabricated values; the final scorer must rerun all 512 attempts through the exact bound Rust producer and require byte-identical canonical cohort evidence before scoring any shard; the positive-overlap difference trace must be below its own target-plus-reference marginal trace for both predicted and empirical evidence; negative coupling is not represented by this stochastic proper-complex production model and remains covered only by the exact ValidationCoupling::Negative production DAG/source-factor oracle"
     },
     "max_production_sidecar_bytes": 1048576
   },
   "determinism": {
     "text_encoding": "UTF-8",
     "dgp_generator_identity_sha256": "7589a2bba764e66b99bf7cfffbd6f979df94a00ca0ca5e179b5aabae4903a49e",
-    "dgp_generator_identity_definition": "frozen v5 explicit-acceptance-matrix counter-generator identity; cell ordinal, seed, coordinate, date, and stream are separate counter-key fields; v4 outcomes never existed and v5 intentionally rekeys the smaller exact cell order",
-    "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le matched_cohort_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
+    "dgp_generator_identity_definition": "frozen v6 counter-generator identity over the exact preserved 40-entry DGP order with one nonexecutable tombstone; DGP cell ordinal, seed, coordinate, date, and stream are separate counter-key fields",
+    "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le dgp_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
     "counter_domain": "dolphinrust:spatial-covariance-dgp:v1\\0",
-    "matched_cell_ordinal": "negative signed geometries use the otherwise-identical positive geometry cell ordinal so matched marginals share draws",
+    "positive_overlap_scheduled_cell_ordinal": 13,
+    "positive_overlap_dgp_cell_ordinal": 14,
+    "dgp_cell_order": [
+      "hw_1x1|stride_1|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|border_clamped|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|bounded_halo|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks_partial_final|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|one_block|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks_cap_eviction|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|tile_edge|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|ks_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress"
+    ],
+    "dgp_cell_order_tombstone": {
+      "cell_id": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "dgp_cell_ordinal": 10,
+      "executable": false,
+      "reason": "unsupported stochastic improper signed-source model removed before outcomes"
+    },
     "normal_transform": "first uint64_le word of the counter digest; index=word>>(64-index_bits); exact IEEE754 binary64 value loaded from the frozen midpoint inverse-normal LUT; no runtime logarithm, square root, sine, or cosine",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
     "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
     "portable_table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff",
-    "complex_normal": "four independent named local streams and four matched-cell global streams per source-factor halo coordinate/date; signed coupling conjugates only the negative-loading latent-frame stochastic base before the common frozen phasor",
-    "complex_storage": "fixed scalar operation order, fused multiply-add prohibited, final real and imaginary components rounded to IEEE754 binary32; negative loading negates only latent-base imaginary binary64 before rotation",
+    "complex_normal": "four independent named local streams and four cell-global streams per source-factor halo coordinate/date",
+    "complex_storage": "fixed scalar operation order, fused multiply-add prohibited, final real and imaginary components rounded to IEEE754 binary32 before the common frozen phasor",
     "matrix_order": "source coordinates row-major, acquisition ascending, component real then imag; estimate histories target then reference; covariance and online reductions row-major",
     "numeric_encoding": "raw source hashes use canonical little-endian counts, coordinates, and IEEE754 binary32 complex components; negative zero canonicalized positive; NaN and infinity prohibited"
   },
   "numeric_contract": {
-    "raw_dgp": "regenerate every complex look over the complete transitive sequential replay dependency halo through every expected block, including the final source-factor window; negative loading conjugates the latent-frame stochastic base before the common phasor so matched signs preserve magnitudes; compare exact shape, scalar count, full raw-cube and target/reference factor-halo content hashes, primitive support hashes, ancestry hash, DGP identity, and target/reference loading means before scoring",
-    "latent_truth": "regenerate noiseless target and reference phase histories from slope_rad_per_day plus fixed positive 0.0002*sin((2*row-column)/11) radians/day, cadence, coordinates, and exact acquisition-zero gauge; coincident coordinates share one identical history; matched positive and negative cells share the same latent histories",
+    "raw_dgp": "regenerate every complex look over the complete transitive sequential replay dependency halo through every expected block, including the final source-factor window; compare exact shape, scalar count, full raw-cube and target/reference factor-halo content hashes, primitive support hashes, ancestry hash, DGP identity, and target/reference loading means before scoring",
+    "latent_truth": "regenerate noiseless target and reference phase histories from slope_rad_per_day plus fixed positive 0.0002*sin((2*row-column)/11) radians/day, cadence, coordinates, and exact acquisition-zero gauge; coincident coordinates share one identical history",
     "dense_joint_oracle": "Python independently reconstructs the coordinate-keyed primitive source union, signed target/reference influence matrix A, and source correlation matrix R, then derives the full dense 2N phase-joint covariance from noise_variance times A-prime R A and the gauged temporal covariance only for deterministic fixtures; stochastic cells are calibrated against bounded online empirical estimator-error covariance",
     "estimator_evidence": "Rust emits actual EMI or EVD target/reference date histories, predicted production target-minus-reference date covariance, bounded 2N by 2N production phase-joint operator, and exact final-date target-minus-reference contrast weights; estimator_branch must equal the cell estimator",
     "difference_covariance": "Python independently computes the full-date fixed-L2 E C E-prime map from the pre-factor production 2N replay joint operator, symmetrizes, applies the frozen 1e-10 rank threshold, eigenvalue clipping and factor reconstruction, then compares production F F-prime under eps*date_count*256*max(1,max_abs(reconstruction)); actual covariance and replay-operator canonical digests remain exact",
     "operator_error": "deterministic: Frobenius(production_operator-python_derived_dense_oracle)/max(Frobenius(python_derived_dense_oracle),1e-15); stochastic: Frobenius(mean_production_operator-online_empirical_joint_estimator_error_covariance)/max(Frobenius(empirical),1e-15); maxima 1e-10 and 0.10",
     "contrast_variance_error": "same deterministic or stochastic operator pair projected by exact final-date target-minus-reference weights; maximum relative error 0.10",
     "empirical_covariance": "population covariance sum(error outer error)/n - mean(error) outer mean(error), where error=(estimated_target-estimated_reference)-(latent_target-latent_reference); target and reference marginal error outer products and cross products are also reduced",
-    "predicted_covariance": "mean per-attempt production target-minus-reference covariance is compared with online empirical difference-error covariance; an explicit matched positive, independent, and negative cohort sharing marginal DGP/support/latent/orientation requires positive < independent < negative for predicted and empirical traces",
+    "predicted_covariance": "mean per-attempt production target-minus-reference covariance is compared with online empirical difference-error covariance; the positive-overlap cohort requires predicted and empirical difference traces below their own target-plus-reference marginal traces",
     "coincident": "identical support, raw source content, latent histories, estimated histories, and exact-zero predicted target-minus-reference covariance",
     "psd": "minimum diagonal after independent cyclic Jacobi eigensolver on (M+M^T)/2; sweep p ascending then q ascending; tolerance 1e-14*max(1,max_abs_diagonal); at most 100*n*n sweeps; fail if not converged; compare to -1e-10",
     "interval_score": "per non-gauge date, width+(2/0.05)*(absolute_error-half_width) when absolute_error exceeds half_width",
@@ -264,7 +320,7 @@
     "empirical_error_covariance": "error_outer_sum/n-(error_sum/n)(error_sum/n)^T with population denominator n",
     "target_reference_error_covariance": "target_reference_outer_sum/n-(target_error_sum/n)(reference_error_sum/n)^T with population denominator n",
     "predicted_covariance": "predicted_covariance_sum/n",
-    "matched_independent_trace": "one half the sum of target and reference marginal covariance traces across matched positive and negative summaries",
+    "positive_overlap_marginal_trace": "sum of target and reference marginal covariance traces over the exact emitted positive-overlap attempts",
     "covariance_calibration_relative_error": "Frobenius(mean_predicted-empirical)/max(Frobenius(empirical),1e-15)",
     "psd_min_eigenvalue": "minimum over emitted predicted covariance attempts",
     "coverage_95_by_date": "for each 128-seed stochastic cell, every non-gauge date must have 117 through 126 covered attempts inclusive and the Wilson 95 percent interval must contain 0.95; acquisition zero is null",
@@ -550,7 +606,10 @@
       "binary_sha256",
       "generator_protocol_sha256",
       "result_root_sha256",
-      "production_parity_fixture_sha256"
+      "production_parity_fixture_sha256",
+      "preoutcome_manifest",
+      "preoutcome_manifest_sha256",
+      "positive_overlap_cohort_sha256"
     ],
     "shard_manifest_required": [
       "summary_sha256",
@@ -627,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "dbbc22031ba14269c0be09c1b43263197e1d8efa3487ebcb887c2cfce16c20c3"
+        "sha256": "f529b448b250feda28e74f4817074ba77c6a04762babfa74270d4960f0fc5140"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
@@ -868,8 +927,8 @@
         "imag"
       ],
       "temporal_signal": "proper-complex AR(1) using frozen binary64 rho and innovation-weight coefficients in fixed scalar order",
-      "spatial_stress": "signal and measurement-noise local/global proper-complex innovations mixed with weights sqrt(0.5); matched positive and negative pairs share draws and marginal parameters; negative-loading sources conjugate the complete latent-frame stochastic base before the common frozen phasor",
-      "phase_formula": "frozen common phasor and latent-phase IEEE754 bit tables indexed by (2*row-column,date_index); signed loading never changes the latent phasor",
+      "spatial_stress": "signal and measurement-noise local/global proper-complex innovations mixed with weights sqrt(0.5)",
+      "phase_formula": "frozen common phasor and latent-phase IEEE754 bit tables indexed by (2*row-column,date_index); positive-overlap loading never changes the latent phasor",
       "amplitude_formula": "frozen signal-scale IEEE754 bit table indexed by (row+3*column,eigen_stress,date_index)",
       "signal_amplitude": 1.0,
       "phase0_rad": 0.25,
@@ -877,7 +936,7 @@
       "correlation_days": 36.0,
       "noise_variance": 0.25,
       "pseudo_covariance": "E[Z Z^T]=0",
-      "sampler_seed": "portable SHA-256 counter key bound to the frozen DGP generator identity, matched cohort cell ordinal, seed, coordinate, date, named stream, and counter; support selection reads this same signed stack",
+      "sampler_seed": "portable SHA-256 counter key bound to the frozen DGP generator identity, positive-overlap cell ordinal, seed, coordinate, date, named stream, and counter; support selection reads this same stack",
       "date_axis_input": "acquisition.topologies[block_topology].date_axis"
     },
     "full_replay_dgp": {
@@ -907,7 +966,7 @@
         "effective_support_union_count",
         "source_correlation_receipt_sha256"
       ],
-      "support_generation": "run the frozen Rect, GLRT, or KS selector on the signed production stack separately for every expected ministack real-acquisition slice; hashes bind ordered block_id and row-major realized sources",
+      "support_generation": "run the frozen Rect, GLRT, or KS selector on the positive-overlap production stack separately for every expected ministack real-acquisition slice; hashes bind ordered block_id and row-major realized sources",
       "ancestry": "bind every expected ministack block, carried parent identity, complete date axis, acquisition-zero gauge, cap eviction, and partial tail",
       "latent_history": "noiseless target/reference coordinate phase histories from the frozen phase formula, date cadence, pair orientation, and exact acquisition-zero gauge",
       "rust_output": "actual EMI or EVD target/reference estimated histories plus predicted production target-minus-reference date covariance",
@@ -1750,13 +1809,13 @@
         }
       }
     },
-    "signed_spatial_field": {
-      "field": "one matched-pair cell-global proper-complex innovation with sqrt(0.5) magnitude",
-      "pair_perturbation": "positive and negative cells share identical local/global normal streams, support-selection stream, marginal parameters, and latent phase orientation; positive loads both sides +1, while negative loads target-nearest sources +1 and reference-nearest sources -1 with target winning exact distance ties",
+    "positive_overlap_spatial_field": {
+      "field": "one positive-overlap cell-global proper-complex innovation with sqrt(0.5) magnitude",
+      "pair_loading": "the representable positive-overlap cell loads shared primitive sources with the same orientation on both sides",
       "zero": "coincident exact zero",
       "none": "disjoint source-key cross term exact zero",
-      "sign_field_identity": "matched support and latent-history digests plus independently reduced target/reference marginal and cross estimator-error covariance",
-      "persist": "signed_cross_influence, sign, target/reference loading means, marginal covariance traces, cross-error covariance trace, and matched support/latent digests"
+      "sign_field_identity": "positive-overlap support and latent-history digests plus independently reduced target/reference marginal and cross estimator-error covariance",
+      "persist": "positive signed_cross_influence, target/reference loading means, marginal covariance traces, cross-error covariance trace, and positive-overlap support/latent digests"
     },
     "truth": {
       "latent": "frozen noiseless target/reference phase histories regenerated independently from the DGP",
