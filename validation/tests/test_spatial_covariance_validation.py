@@ -1,5 +1,7 @@
 import copy
+import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -27,6 +29,7 @@ from validation.score_spatial_covariance import (
     _CellSummarySink,
     _expected_seed_hash,
     _growth_exponent,
+    _read_hashed_json_record,
     _read_single_json_record,
     _validate_resources,
     deterministic_normals,
@@ -98,10 +101,9 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "reference_raw_input_sha256": frozen["reference_raw_input_sha256"],
             "sequential_ancestry_sha256": frozen["sequential_ancestry_sha256"],
             "raw_dgp_identity_sha256": frozen["raw_dgp_identity_sha256"],
-            "truth_sha256": frozen["truth_sha256"],
-            "operator_hash": "3" * 64,
-            "variance_hash": "4" * 64,
-            "emission_hash": "5" * 64,
+            "latent_history_sha256": frozen["latent_history_sha256"],
+            "estimate_sha256": "0" * 64,
+            "predicted_covariance_sha256": "0" * 64,
             "date_axis_sha256": sha256_json(generator["acquisition"]["topologies"][labels["block_topology"]]["date_axis"]),
             "generator_hash": sha256_json(generator),
             "config_hash": sha256_json(generator),
@@ -119,21 +121,26 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             "signed_influence_sign": sign,
             "effective_looks_fraction": frozen["effective_looks_fraction"],
             "effective_looks_application": "source_factor_divided_by_sqrt_fraction",
-            "operator_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
-            "truth_matrix": None if masked else copy.deepcopy(frozen["truth_matrix"]),
-            "contrast_weights": None if masked else frozen["contrast_weights"],
-            "estimate_value": None if masked else 0.0,
-            "truth_value": None if masked else frozen["truth_value"],
-            "operator_relative_error": None,
-            "contrast_variance_reference": None,
-            "contrast_variance_relative_error": None,
-            "psd_min_eigenvalue": None,
-            "covered_95": None,
-            "interval_score": None,
-            "interval_width": None,
+            "estimator_branch": labels["estimator"],
+            "target_estimate_history": None if masked else copy.deepcopy(frozen["latent_target_history"]),
+            "reference_estimate_history": None if masked else copy.deepcopy(frozen["latent_reference_history"]),
+            "predicted_difference_covariance": None,
         }
         if not masked:
-            attempt.update(independently_recompute_metrics(attempt))
+            dates = len(frozen["latent_target_history"])
+            covariance = [[0.0] * dates for _ in range(dates)]
+            if labels["pair_geometry"] != "coincident":
+                for index in range(1, dates):
+                    covariance[index][index] = 1.0
+            attempt["predicted_difference_covariance"] = covariance
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
+            attempt["predicted_covariance_sha256"] = numeric_digest(
+                "predicted-difference-covariance-v4",
+                [value for row in covariance for value in row],
+            )
         self.assertEqual(set(attempt), ATTEMPT_KEYS)
         return attempt
 
@@ -147,6 +154,33 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         sampling = self.preregistration["resource_sampling"]
         result = []
         for name in matrix:
+            tile_pixels = matrix[name]["tile_pixels"]
+            date_count = matrix[name]["dates"]
+            microbatch_pixels = min(tile_pixels, 4096)
+            allocation_model = {"model": "named-allocation-components-v1", "area_axis": "tile_pixels", "date_axis": "date_count", "forbid_multiple_area_scaled_axes": True}
+            dependency_cone = {"model": "spatial-query-cone-v1", "tile_pixels": tile_pixels, "date_count": date_count, "maximum_sources": tile_pixels}
+            microbatch = {"model": "bounded-microbatch-v1", "microbatch_pixels": microbatch_pixels, "batch_count": (tile_pixels + microbatch_pixels - 1) // microbatch_pixels}
+            component_specs = (
+                ("source_cache", 16, [("tile_pixels", tile_pixels, True), ("date_count", date_count, False)]),
+                ("reverse_adjoint", 8, [("tile_pixels", tile_pixels, True), ("date_count", date_count, False)]),
+                ("joint_covariance", 8, [("date_count", date_count, False), ("date_count", date_count, False)]),
+                ("difference_covariance", 8, [("date_count", date_count, False), ("date_count", date_count, False)]),
+                ("microbatch_workspace", 16, [("microbatch_pixels", microbatch_pixels, True), ("date_count", date_count, False)]),
+            )
+            components = []
+            for component_name, coefficient, axes in component_specs:
+                component = {
+                    "name": component_name,
+                    "coefficient_bytes": coefficient,
+                    "axis_factors": [
+                        {"axis": axis, "extent": extent, "area_scaled": area_scaled}
+                        for axis, extent, area_scaled in axes
+                    ],
+                    "bytes": coefficient * math.prod(extent for _, extent, _ in axes),
+                    "component_sha256": "",
+                }
+                component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+                components.append(component)
             observations = []
             for repetition in range(3):
                 raw_measurement = {
@@ -162,7 +196,7 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                     "tool_versions": {"rustc": "rustc test", "cargo": "cargo test", "uname": "Darwin test"},
                 }
                 observations.append({"repetition": repetition, "tile_pixels": matrix[name]["tile_pixels"], "date_count": matrix[name]["dates"], "peak_rss_bytes": peaks[name] - 2 + repetition, "wall_seconds": 1.0, "raw_measurement": raw_measurement, "raw_measurement_sha256": sha256_json(raw_measurement)})
-            item = {"resource_id": name, "status": PASS, "rss_bytes": peaks[name], "growth_class": "linear", "resource_hash": "", "config_hash": sha256_json(self.preregistration["generator"]), "binary_hash": BINARY, "os": sampling["os"], "hardware_class": sampling["hardware_class"], "ram_bytes": sampling["ram_bytes"], "rss_sampler": sampling["rss_sampler"], "rss_field": sampling["rss_field"], "warmup_runs": sampling["warmup_runs"], "measured_repetitions": sampling["measured_repetitions"], "tool_versions": sampling["tool_versions"], "growth_observation": observations, "area_growth_exponent": area, "date_growth_exponent": dates, "acceptance": sampling["acceptance"]}
+            item = {"resource_id": name, "status": PASS, "rss_bytes": peaks[name], "growth_class": "linear", "resource_hash": "", "config_hash": sha256_json(self.preregistration["generator"]), "binary_hash": BINARY, "os": sampling["os"], "hardware_class": sampling["hardware_class"], "ram_bytes": sampling["ram_bytes"], "rss_sampler": sampling["rss_sampler"], "rss_field": sampling["rss_field"], "warmup_runs": sampling["warmup_runs"], "measured_repetitions": sampling["measured_repetitions"], "tool_versions": sampling["tool_versions"], "growth_observation": observations, "area_growth_exponent": area, "date_growth_exponent": dates, "acceptance": sampling["acceptance"], "allocation_model": allocation_model, "allocation_model_sha256": sha256_json(allocation_model), "dependency_cone": dependency_cone, "dependency_cone_sha256": sha256_json(dependency_cone), "microbatch": microbatch, "microbatch_sha256": sha256_json(microbatch), "allocation_components": components}
             item["resource_hash"] = sha256_json({key: value for key, value in item.items() if key != "resource_hash"})
             result.append(item)
         return result
@@ -173,7 +207,10 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(self.preregistration["supersedes"]["schema_version"], 3)
         self.assertFalse(self.preregistration["outcomes_present"])
         self.assertEqual(len(expected_cell_ids(self.preregistration)), FROZEN_CELL_COUNT)
-        self.assertEqual(FROZEN_ATTEMPT_COUNT, 440_265)
+        self.assertEqual(FROZEN_ATTEMPT_COUNT, 725_208)
+        counts = [expected_seed_count(cell_id) for cell_id in expected_cell_ids(self.preregistration)]
+        self.assertEqual(counts.count(FROZEN_SEED_COUNT), 145)
+        self.assertEqual(counts.count(1), 208)
         self.assertEqual(FROZEN_SHARD_COUNT, 4)
 
     def test_compact_design_covers_every_pairwise_level_combination(self):
@@ -186,6 +223,44 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
                 expected = {(left, right) for left in values[first] for right in values[second]}
                 self.assertTrue(expected <= observed, (dimensions[first], dimensions[second]))
         self.assertEqual(sum(expected_seed_count("|".join(cell)) for cell in cells), FROZEN_ATTEMPT_COUNT)
+
+    def test_all_supported_interior_disjoint_cells_retain_5000_seed_coverage(self):
+        for cell_id in expected_cell_ids(self.preregistration):
+            labels = dict(zip(self.preregistration["matrix_contract"]["dimension_order"], cell_id.split("|")))
+            if (
+                labels["position"] == "interior"
+                and labels["eigen_stress"] != "tied_eigenvalue"
+                and labels["pair_geometry"].startswith("disjoint_")
+            ):
+                self.assertEqual(expected_seed_count(cell_id), FROZEN_SEED_COUNT)
+
+    def test_ephemeral_evidence_is_estimator_history_not_realized_truth(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        self.assertEqual(attempt["estimator_branch"], "emi")
+        self.assertIn("target_estimate_history", attempt)
+        self.assertIn("reference_estimate_history", attempt)
+        self.assertIn("predicted_difference_covariance", attempt)
+        self.assertIn("latent_history_sha256", attempt)
+        self.assertNotIn("truth_matrix", ATTEMPT_KEYS)
+        self.assertNotIn("truth_value", ATTEMPT_KEYS)
+
+    def test_estimator_branch_and_latent_history_drift_fail_closed(self):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["estimator_branch"] = "evd"
+        with self.assertRaisesRegex(SchemaError, "estimator"):
+            CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY).add(attempt)
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["latent_history_sha256"] = "f" * 64
+        with self.assertRaisesRegex(SchemaError, "latent"):
+            CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY).add(attempt)
+
+    def test_emi_and_evd_estimator_histories_are_both_exercised_and_bound(self):
+        for cell_id, branch in ((SUPPORTED_CELL, "emi"), (RISK_CELL, "evd")):
+            attempt = self._attempt(cell_id, 0, 0)
+            self.assertEqual(attempt["estimator_branch"], branch)
+            accumulator = CellAccumulator(self.preregistration, cell_id, 0, 1, CODE, BINARY)
+            accumulator.add(attempt)
+            self.assertEqual(accumulator.finalize()["emitted_seeds"], 1)
 
     def test_retained_bound_is_derived_and_below_32_gib(self):
         execution = self.preregistration["execution_protocol"]
@@ -236,31 +311,31 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
             numeric_digest("truth-v4", [float("nan")])
 
     def test_python_independently_recomputes_all_numeric_claims(self):
-        computed = independently_recompute_metrics(self._attempt(SUPPORTED_CELL, 0, 0))
-        self.assertEqual(computed["operator_relative_error"], 0.0)
-        self.assertGreater(computed["contrast_variance_reference"], 0.0)
-        self.assertTrue(computed["covered_95"])
-        self.assertGreater(computed["interval_score"], 0.0)
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        frozen = regenerate_frozen_attempt_inputs(self.preregistration, SUPPORTED_CELL, 0)
+        computed = independently_recompute_metrics(
+            attempt, frozen["latent_target_history"], frozen["latent_reference_history"]
+        )
+        self.assertTrue(all(value == 0.0 for value in computed["error"]))
+        self.assertEqual(int(computed["covered"].sum()), len(frozen["latent_target_history"]) - 1)
+        self.assertGreater(float(computed["interval_score"].sum()), 0.0)
 
     def test_fabricated_zero_and_self_attested_hashes_are_rejected(self):
-        attempt = self._attempt(CELL, 0, 0)
-        attempt["operator_matrix"][0][0] += 0.5
-        attempt["operator_relative_error"] = 0.0
-        accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
-        with self.assertRaisesRegex(SchemaError, "fabricated|digest mismatch"):
+        attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+        attempt["target_estimate_history"][-1] += 0.5
+        accumulator = CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 1, CODE, BINARY)
+        with self.assertRaisesRegex(SchemaError, "digest mismatch"):
             accumulator.add(attempt)
 
-    def test_producer_replaced_raw_input_or_truth_fails_regeneration(self):
+    def test_producer_replaced_raw_input_or_latent_history_fails_regeneration(self):
         raw = self._attempt(CELL, 0, 0)
         raw["raw_input_sha256"] = "f" * 64
         with self.assertRaisesRegex(SchemaError, "raw DGP"):
             CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(raw)
-        truth = self._attempt(CELL, 0, 0)
-        truth["truth_matrix"][0][0] += 0.5
-        truth["operator_matrix"] = copy.deepcopy(truth["truth_matrix"])
-        truth.update(independently_recompute_metrics(truth))
-        with self.assertRaisesRegex(SchemaError, "frozen truth"):
-            CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(truth)
+        latent = self._attempt(CELL, 0, 0)
+        latent["latent_history_sha256"] = "e" * 64
+        with self.assertRaisesRegex(SchemaError, "latent history"):
+            CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY).add(latent)
 
     def test_full_production_shaped_dgp_binds_support_ancestry_and_raw_content(self):
         frozen = regenerate_frozen_attempt_inputs(self.preregistration, RISK_CELL, 0)
@@ -268,8 +343,8 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         self.assertEqual(frozen["raw_input_shape"], [frozen["union_source_count"], dates, 2])
         self.assertEqual(frozen["raw_input_value_count"], 2 * dates * frozen["union_source_count"])
         self.assertGreater(frozen["raw_input_value_count"], 10_000)
-        self.assertEqual(len(frozen["truth_matrix"]), 2 * dates)
-        self.assertEqual(len(frozen["contrast_weights"]), 2 * dates)
+        self.assertEqual(len(frozen["latent_target_history"]), dates)
+        self.assertEqual(len(frozen["latent_reference_history"]), dates)
         self.assertLessEqual(len(compact_json_line(self._attempt(RISK_CELL, 0, 0))), FROZEN_MAX_RECORD_BYTES)
         for name in (
             "raw_input_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
@@ -290,17 +365,79 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         frozen = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
         self.assertEqual(frozen["target_support_sha256"], frozen["reference_support_sha256"])
         self.assertEqual(frozen["target_raw_input_sha256"], frozen["reference_raw_input_sha256"])
-        self.assertEqual(frozen["truth_value"], 0.0)
-        self.assertEqual(
-            independently_recompute_metrics({
-                "operator_matrix": frozen["truth_matrix"],
-                "truth_matrix": frozen["truth_matrix"],
-                "contrast_weights": frozen["contrast_weights"],
-                "estimate_value": 0.0,
-                "truth_value": 0.0,
-            })["contrast_variance_reference"],
-            0.0,
-        )
+        self.assertEqual(frozen["latent_target_history"], frozen["latent_reference_history"])
+        attempt = self._attempt(CELL, 0, 0)
+        self.assertEqual(attempt["target_estimate_history"], attempt["reference_estimate_history"])
+        self.assertTrue(all(value == 0.0 for row in attempt["predicted_difference_covariance"] for value in row))
+
+    def test_online_reducer_uses_latent_estimator_errors_without_retaining_attempts(self):
+        accumulator = CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 2, CODE, BINARY)
+        first = self._attempt(SUPPORTED_CELL, 0, 0)
+        second = self._attempt(SUPPORTED_CELL, 0, 1)
+        first["target_estimate_history"][-1] += 1.0
+        second["target_estimate_history"][-1] -= 1.0
+        for attempt in (first, second):
+            dates = len(attempt["target_estimate_history"])
+            attempt["predicted_difference_covariance"] = [[0.0] * dates for _ in range(dates)]
+            attempt["predicted_difference_covariance"][-1][-1] = 1.0
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
+            attempt["predicted_covariance_sha256"] = numeric_digest(
+                "predicted-difference-covariance-v4",
+                [value for row in attempt["predicted_difference_covariance"] for value in row],
+            )
+            accumulator.add(attempt)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["error_bias_norm"], 0.0)
+        self.assertEqual(summary["covariance_calibration_relative_error"], 0.0)
+        self.assertGreater(summary["empirical_error_covariance_trace"], 0.0)
+        self.assertIn("empirical_error_covariance_digest", summary)
+        self.assertFalse(hasattr(accumulator, "attempts"))
+
+    def test_coverage_is_gated_per_date_and_names_final_date(self):
+        accumulator = CellAccumulator(self.preregistration, SUPPORTED_CELL, 0, 2, CODE, BINARY)
+        for seed_index in range(2):
+            attempt = self._attempt(SUPPORTED_CELL, 0, seed_index)
+            attempt["predicted_difference_covariance"] = [
+                [0.0] * len(attempt["target_estimate_history"])
+                for _ in attempt["target_estimate_history"]
+            ]
+            if seed_index == 0:
+                attempt["target_estimate_history"][1] += 1.0
+            attempt["estimate_sha256"] = numeric_digest(
+                "estimate-history-v4",
+                [*attempt["target_estimate_history"], *attempt["reference_estimate_history"]],
+            )
+            attempt["predicted_covariance_sha256"] = numeric_digest(
+                "predicted-difference-covariance-v4",
+                [value for row in attempt["predicted_difference_covariance"] for value in row],
+            )
+            accumulator.add(attempt)
+        summary = accumulator.finalize()
+        self.assertEqual(summary["coverage_95_by_date"][1], 0.5)
+        self.assertEqual(summary["final_date_coverage_95"], 1.0)
+        self.assertEqual(summary["status"], "fail")
+
+    def test_deterministic_signed_and_invalid_contracts_are_separate_from_coverage(self):
+        for geometry, expected_sign in (
+            ("shared_75_positive", "positive"),
+            ("shared_75_negative", "negative"),
+            ("disjoint_immediate", "none"),
+            ("coincident", "zero"),
+        ):
+            cell_id = CELL.replace("coincident", geometry)
+            attempt = self._attempt(cell_id, 0, 0)
+            self.assertEqual(attempt["signed_influence_sign"], expected_sign)
+            accumulator = CellAccumulator(self.preregistration, cell_id, 0, 1, CODE, BINARY)
+            accumulator.add(attempt)
+            summary = accumulator.finalize()
+            self.assertEqual(summary["attempted_seeds"], 1)
+        masked = self._attempt(MASKED_CELL, 0, 0, masked=True)
+        accumulator = CellAccumulator(self.preregistration, MASKED_CELL, 0, 1, CODE, BINARY)
+        accumulator.add(masked)
+        self.assertIsNone(accumulator.finalize()["coverage_95_by_date"])
 
     def test_cell_summary_binds_attempt_digest_and_scope(self):
         accumulator = CellAccumulator(self.preregistration, CELL, 0, 1, CODE, BINARY)
@@ -394,6 +531,56 @@ class SpatialCovarianceValidationV4Tests(unittest.TestCase):
         resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
         with self.assertRaisesRegex(SchemaError, "raw resource measurement"):
             _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_resource_receipt_rejects_two_area_scaled_axes(self):
+        resources = self._resource_receipts()
+        component = resources[0]["allocation_components"][0]
+        component["axis_factors"][1]["area_scaled"] = True
+        component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "two area-scaled axes"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_resource_receipt_binds_dependency_microbatch_and_named_formulas(self):
+        for field, digest_field in (
+            ("dependency_cone", "dependency_cone_sha256"),
+            ("microbatch", "microbatch_sha256"),
+        ):
+            resources = self._resource_receipts()
+            resources[0][field][next(name for name in resources[0][field] if name.endswith("count") or name.endswith("sources"))] += 1
+            resources[0][digest_field] = sha256_json(resources[0][field])
+            resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+            with self.assertRaisesRegex(SchemaError, "identity mismatch"):
+                _validate_resources(self.preregistration, resources, BINARY)
+        resources = self._resource_receipts()
+        component = resources[0]["allocation_components"][0]
+        component["coefficient_bytes"] += 1
+        component["bytes"] = component["coefficient_bytes"] * math.prod(factor["extent"] for factor in component["axis_factors"])
+        component["component_sha256"] = sha256_json({key: value for key, value in component.items() if key != "component_sha256"})
+        resources[0]["resource_hash"] = sha256_json({key: value for key, value in resources[0].items() if key != "resource_hash"})
+        with self.assertRaisesRegex(SchemaError, "named allocation formula"):
+            _validate_resources(self.preregistration, resources, BINARY)
+
+    def test_manifest_hash_and_parse_use_one_identical_bounded_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.jsonl"
+            raw = b'{"schema":"test"}\n'
+            path.write_bytes(raw)
+            original_open = Path.open
+            opens = 0
+
+            def count_open(open_path, *args, **kwargs):
+                nonlocal opens
+                if open_path == path:
+                    opens += 1
+                return original_open(open_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", count_open):
+                value, accepted, digest = _read_hashed_json_record(path, len(raw), "manifest")
+            self.assertEqual(opens, 1)
+            self.assertEqual(value, {"schema": "test"})
+            self.assertEqual(accepted, raw)
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
 
     def test_raw_resource_measurement_accepts_exact_bound_and_rejects_one_byte_over(self):
         resources = self._resource_receipts()

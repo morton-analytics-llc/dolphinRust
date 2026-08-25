@@ -26,7 +26,7 @@ HASH_RE = set("0123456789abcdef")
 FROZEN_SEED_COUNT = 5000
 FROZEN_DETERMINISTIC_SEED_COUNT = 1
 FROZEN_CELL_COUNT = 353
-FROZEN_ATTEMPT_COUNT = 440265
+FROZEN_ATTEMPT_COUNT = 725208
 FROZEN_MAX_CELLS_PER_SHARD = 100
 FROZEN_SHARD_COUNT = 4
 FROZEN_MAX_SHARD_BYTES = 100 * 8192
@@ -38,19 +38,19 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 19734528
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "a017a15f48755f9dbaceb5842709aa74fe214d9025021eeb7665215da969c74e"
-FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "38a11589430b5f78add22ed7ad9cb96cddca1af098211e899bc306f4a3a61f0f"
-FROZEN_EXECUTION_SHA256 = "6299045b34ce6e9e6c6c6ce87502fe0028cc7d1ae0d0ec4f5f3305e10cf706c6"
-FROZEN_REDUCERS_SHA256 = "2dbe430d050e79388bc1484e1f270435dba3031468f4b4abb93315e2ed48cf53"
-FROZEN_MATRIX_SHA256 = "eb079cb384196d28bfc3b957697769d186cd1c8fc04155282fb258a99eff2ac0"
-FROZEN_RECEIPT_SHA256 = "931f90ef3fa0c97c16926ad96a4ea6661f1d73f7310a22e2351059cf64b02ca1"
-FROZEN_HASH_FIELDS_SHA256 = "c9ffda0f207a373e94e4125f81a792c043ffa40cba3a945f9013741eebacade9"
-FROZEN_RESOURCE_SAMPLING_SHA256 = "75309d564a3ad7f4fb8765b89af7696a9b995dd2a6a4c65bf8f792ee8ec9847c"
+FROZEN_GENERATOR_SHA256 = "fb1cbea57907a9cec9053828e3d47c8d0ad4d66b73e6b41445b81087bd1be974"
+FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "dd2ca8d9fd914e4dfe52221208b6d2ffea3149d085d9a10443f3834bfa83cf85"
+FROZEN_EXECUTION_SHA256 = "b2e2c7e43a8cc697a3412833079f77a4d511be7ffc91413da15f578a34842031"
+FROZEN_REDUCERS_SHA256 = "5b81b4991ee139b997fb1a289c39cf051b32127716d42ea7a65707be5795edc3"
+FROZEN_MATRIX_SHA256 = "24c518e5d5c9df03f2914bdb909a083acbd8bc4d69d0b39ac3b63a709a72d64d"
+FROZEN_RECEIPT_SHA256 = "fb5e63315b229635df612fb33ca3ea8ac6076e708321a3e68f0b4caba5f37871"
+FROZEN_HASH_FIELDS_SHA256 = "ab7836c2e02559c5b55fce9e66a6dbb60899800b4ea8d9bfa4a30d034e92fbf6"
+FROZEN_RESOURCE_SAMPLING_SHA256 = "661d76ea5542d5e5bed7a98b67fbc9345bc240ef7414045dffc81eb88527d767"
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
-FROZEN_CELL_POLICY_SHA256 = "2c58266788cc16eadc487ea21bcf90aed9dd0ffe4ccf83807743f30a7d1d448e"
+FROZEN_CELL_POLICY_SHA256 = "c08c067f3236a4b1aa1b169430cdc2bac87fc9ff05b9458dc93ccc67d7e296cc"
 FROZEN_V3_PREREGISTRATION_SHA256 = "d1b29a1dc63a69c952397af1c713e604142b260be7068d37ee0f1a3158b88184"
-FROZEN_DETERMINISM_SHA256 = "145cd8d79f58a9290c2e8669b45edd5bcd387f3b4d99e3ac92286f248437bdda"
-FROZEN_NUMERIC_SHA256 = "f534593ef3027eb41c15bc40163c030c6eadeab131bfd06922bcb43fbc3e3811"
+FROZEN_DETERMINISM_SHA256 = "217c2266b915782a409b1c822c9ce0ee06c450bdb2f371a82e5b6d7168ba0f96"
+FROZEN_NUMERIC_SHA256 = "5ffae0518440b3c3160e74b0946d39240bbb84d58c99fab1185890bc5b8b7d0a"
 FROZEN_RESOURCE_IDS = ("area_128_dates_26", "area_256_dates_26", "area_512_dates_26", "area_256_dates_13", "area_256_dates_52")
 DIMENSION_NAMES = ("half_window", "stride", "support", "position", "pair_geometry", "block_topology", "estimator", "eigen_stress", "source_process")
 FROZEN_DIMENSION_IDS = {
@@ -65,17 +65,14 @@ FROZEN_DIMENSION_IDS = {
     "source_process": ("independent_complex_looks", "spatial_correlation_stress"),
 }
 FROZEN_THRESHOLDS = {
-    "deterministic_operator_relative_error_max": 1e-10,
-    "stochastic_operator_relative_error_max": 0.1,
-    "contrast_variance_relative_error_max": 0.1,
+    "covariance_calibration_relative_error_max": 0.1,
     "psd_min_eigenvalue_min": -1e-10,
     "coverage_probability": 0.95,
     "coverage_absolute_error_max": 0.02,
     "emission_rate_min": 0.99,
-    "weak_zero_variance_max": 1e-14,
     "resource_rss_bytes_max": FROZEN_PROCESS_RSS_BYTES,
-    "resource_growth": "area_or_dates_linear; no quadratic axis",
-    "resource_buffer_policy": "no_tile_area_times_s_b_times_d_b_squared_buffer",
+    "resource_growth": "area_or_dates_linear; no quadratic area axis",
+    "resource_buffer_policy": "no_allocation_component_with_two_area_scaled_axes",
 }
 PAIR_SIGN = {
     "coincident": "zero", "shared_75_positive": "positive", "shared_75_negative": "negative",
@@ -86,31 +83,33 @@ PAIR_SIGN = {
 DISJOINT_GEOMETRIES = {geometry for geometry, sign in PAIR_SIGN.items() if sign == "none"}
 ATTEMPT_KEYS = {
     "schema", "cell_id", "cell_ordinal", "seed_index", "seed_sha256", "status", "emitted", "factor_emitted",
-    "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash", "date_axis_sha256",
+    "raw_input_sha256", "latent_history_sha256", "estimate_sha256", "predicted_covariance_sha256", "date_axis_sha256",
     "generator_hash", "config_hash", "source_model_hash", "target_coordinate", "reference_coordinate",
     "target_support_sha256", "reference_support_sha256", "target_source_count", "reference_source_count",
     "intersection_source_count", "union_source_count", "realized_overlap_jaccard", "signed_cross_influence",
-    "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "operator_relative_error",
-    "contrast_variance_reference", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width",
-    "operator_matrix", "truth_matrix", "contrast_weights", "estimate_value", "truth_value",
+    "signed_influence_sign", "effective_looks_fraction", "effective_looks_application", "estimator_branch",
+    "target_estimate_history", "reference_estimate_history", "predicted_difference_covariance",
     "raw_input_shape", "raw_input_value_count", "target_raw_input_sha256", "reference_raw_input_sha256",
     "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
 }
 INPUT_KEYS = {"schema", "cell_id", "cell_ordinal", "seed_index", "seed_sha256", *DIMENSION_NAMES}
 ATTEMPT_HASH_FIELDS = (
-    "seed_sha256", "raw_input_sha256", "truth_sha256", "operator_hash", "variance_hash", "emission_hash",
+    "seed_sha256", "raw_input_sha256", "latent_history_sha256", "estimate_sha256", "predicted_covariance_sha256",
     "date_axis_sha256", "generator_hash", "config_hash", "source_model_hash", "target_support_sha256",
     "reference_support_sha256", "target_raw_input_sha256", "reference_raw_input_sha256",
     "sequential_ancestry_sha256", "raw_dgp_identity_sha256",
 )
 CELL_SUMMARY_KEYS = {
     "schema", "cell_id", "cell_ordinal", "status", "attempted_seeds", "emitted_seeds",
-    "status_histogram", "failure_histogram", "request_digest", "attempt_digest", "operator_digest",
-    "truth_digest", "variance_digest", "emission_digest", "target_source_count_total", "reference_source_count_total",
+    "status_histogram", "failure_histogram", "request_digest", "attempt_digest", "estimate_digest",
+    "latent_history_digest", "predicted_covariance_digest", "empirical_error_covariance_digest",
+    "target_source_count_total", "reference_source_count_total",
     "intersection_source_count_total", "union_source_count_total", "realized_overlap_jaccard_mean",
-    "effective_looks_fraction", "operator_relative_error", "contrast_variance_relative_error",
-    "variance_evaluable", "psd_min_eigenvalue", "coverage_95", "interval_score_mean",
-    "interval_width_mean", "code_sha256", "binary_sha256", "preregistration_sha256",
+    "effective_looks_fraction", "covariance_calibration_relative_error", "error_bias_norm",
+    "empirical_error_covariance_trace", "predicted_covariance_trace", "psd_min_eigenvalue",
+    "coverage_95_by_date", "interval_score_mean_by_date", "interval_width_mean_by_date",
+    "final_date_coverage_95", "final_date_interval_score_mean", "final_date_interval_width_mean",
+    "code_sha256", "binary_sha256", "preregistration_sha256",
 }
 SHARD_MANIFEST_KEYS = {
     "schema", "schema_version", "shard_index", "cell_ordinal_start", "cell_ordinal_end_exclusive",
@@ -126,6 +125,8 @@ RESOURCE_KEYS = {
     "resource_id", "status", "rss_bytes", "growth_class", "resource_hash", "config_hash", "binary_hash", "os",
     "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "warmup_runs", "measured_repetitions",
     "tool_versions", "growth_observation", "area_growth_exponent", "date_growth_exponent", "acceptance",
+    "allocation_model", "allocation_model_sha256", "dependency_cone", "dependency_cone_sha256",
+    "microbatch", "microbatch_sha256", "allocation_components",
 }
 PERFORMANCE_MEASUREMENT_KEYS = {
     "cell_class", "seed_count", "attempt_count", "elapsed_seconds", "peak_rss_bytes", "outcomes_persisted",
@@ -136,6 +137,10 @@ RESOURCE_OBSERVATION_KEYS = {
 RESOURCE_RAW_MEASUREMENT_KEYS = {
     "command", "exit_status", "wall_seconds", "max_rss_bytes", "rss_sampler", "rss_field", "os",
     "hardware_class", "ram_bytes", "tool_versions",
+}
+ALLOCATION_COMPONENT_NAMES = {
+    "source_cache", "reverse_adjoint", "joint_covariance", "difference_covariance",
+    "microbatch_workspace",
 }
 
 
@@ -248,6 +253,13 @@ def _read_single_json_record(path: Path, byte_limit: int, label: str) -> tuple[d
     return value, raw
 
 
+def _read_hashed_json_record(
+    path: Path, byte_limit: int, label: str
+) -> tuple[dict[str, Any], bytes, str]:
+    value, raw = _read_single_json_record(path, byte_limit, label)
+    return value, raw, hashlib.sha256(raw).hexdigest()
+
+
 def resolve_below_run_root(run_root: Path, relative_path: Any, label: str) -> Path:
     root = Path(run_root).resolve(strict=True)
     path = Path(relative_path) if isinstance(relative_path, (str, os.PathLike)) else Path()
@@ -312,7 +324,9 @@ def _validate_executable_generator(preregistration: Mapping[str, Any], errors: L
         replay.get("native_tile_shape") != [256, 256]
         or replay.get("raw_shape") != "realized support union count by complete topology acquisition count by real/imag"
         or "every expected ministack" not in replay.get("support_generation", "")
-        or "2N_by_2N" not in replay.get("truth", "")
+        or replay.get("model") != "full_production_shaped_raw_replay_v3"
+        or "noiseless" not in replay.get("latent_history", "")
+        or "EMI or EVD" not in replay.get("rust_output", "")
         or "exact zero" not in replay.get("coincident", "")
     ):
         errors.append("full replay DGP must bind raw shape, direct joint truth, and coincident zero")
@@ -365,7 +379,7 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         or schedule.get("supported_monte_carlo_seeds") != FROZEN_SEED_COUNT
         or schedule.get("deterministic_contract_seeds") != FROZEN_DETERMINISTIC_SEED_COUNT
         or schedule.get("no_top_up") is not True
-        or schedule.get("selection_rule") != "one seed for masked, tied, non-interior, coincident, and disjoint cells; 5000 fixed seeds otherwise"
+        or schedule.get("selection_rule") != "one seed for masked, tied, non-interior, and coincident cells; 5000 fixed seeds for every otherwise-supported interior cell including disjoint geometries"
     ):
         errors.append("seed schedule must freeze supported and deterministic counts without top-up")
     if preregistration.get("thresholds") != FROZEN_THRESHOLDS:
@@ -437,7 +451,6 @@ def expected_seed_count(cell_id: str) -> int:
         labels.get("position") != "interior"
         or labels.get("eigen_stress") == "tied_eigenvalue"
         or labels.get("pair_geometry") == "coincident"
-        or labels.get("pair_geometry") in DISJOINT_GEOMETRIES
     )
     return FROZEN_DETERMINISTIC_SEED_COUNT if deterministic else FROZEN_SEED_COUNT
 
@@ -507,6 +520,13 @@ def numeric_digest(domain: str, values: Iterable[float]) -> str:
 
 
 def _matrix(value: Any, label: str) -> np.ndarray:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(row, list) for row in value)
+        or any(not _number(item) for row in value for item in row)
+    ):
+        raise SchemaError(f"{label} is not a binary64 matrix")
     try:
         matrix = np.asarray(value, dtype=np.float64)
     except (TypeError, ValueError) as exc:
@@ -522,14 +542,6 @@ def _frobenius(matrix: np.ndarray) -> float:
         for column in range(matrix.shape[1]):
             total += float(matrix[row, column]) * float(matrix[row, column])
     return math.sqrt(total)
-
-
-def _quadratic(weights: np.ndarray, matrix: np.ndarray) -> float:
-    total = 0.0
-    for row in range(matrix.shape[0]):
-        for column in range(matrix.shape[1]):
-            total += float(weights[row]) * float(matrix[row, column]) * float(weights[column])
-    return total
 
 
 def _minimum_symmetric_eigenvalue(matrix: np.ndarray) -> float:
@@ -567,53 +579,54 @@ def _minimum_symmetric_eigenvalue(matrix: np.ndarray) -> float:
     raise SchemaError("independent cyclic Jacobi PSD oracle did not converge")
 
 
-def independently_recompute_metrics(attempt: Mapping[str, Any]) -> dict[str, Any]:
-    operator = _matrix(attempt.get("operator_matrix"), "operator matrix")
-    truth = _matrix(attempt.get("truth_matrix"), "truth matrix")
-    weights = np.asarray(attempt.get("contrast_weights"), dtype=np.float64)
-    if operator.shape != truth.shape or weights.shape != (operator.shape[0],) or not np.isfinite(weights).all():
-        raise SchemaError("operator, truth, and contrast dimensions disagree")
-    difference = operator - truth
-    truth_norm = _frobenius(truth)
-    operator_error = _frobenius(difference) / max(truth_norm, 1e-15)
-    operator_variance = _quadratic(weights, operator)
-    truth_variance = _quadratic(weights, truth)
-    variance_error = None if truth_variance <= 1e-14 else abs(operator_variance - truth_variance) / max(abs(truth_variance), 1e-14)
-    psd_minimum = _minimum_symmetric_eigenvalue(operator)
-    estimate = attempt.get("estimate_value")
-    truth_value = attempt.get("truth_value")
-    if not _number(estimate) or not _number(truth_value) or operator_variance < -1e-10:
-        raise SchemaError("coverage sufficient values are invalid")
-    half_width = 1.959963984540054 * math.sqrt(max(operator_variance, 0.0))
-    lower = estimate - half_width
-    upper = estimate + half_width
-    covered = lower <= truth_value <= upper
-    interval_score = upper - lower
-    if truth_value < lower:
-        interval_score += 40.0 * (lower - truth_value)
-    elif truth_value > upper:
-        interval_score += 40.0 * (truth_value - upper)
+def _history(value: Any, date_count: int, label: str) -> np.ndarray:
+    if not isinstance(value, list) or any(not _number(item) for item in value):
+        raise SchemaError(f"{label} is not a binary64 history")
+    try:
+        history = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(f"{label} is not a binary64 history") from exc
+    if history.shape != (date_count,) or not np.isfinite(history).all() or history[0] != 0.0:
+        raise SchemaError(f"{label} must be finite, date ordered, and use the exact acquisition-zero gauge")
+    return history
+
+
+def independently_recompute_metrics(
+    attempt: Mapping[str, Any], latent_target: Sequence[float], latent_reference: Sequence[float]
+) -> dict[str, Any]:
+    date_count = len(latent_target)
+    target = _history(attempt.get("target_estimate_history"), date_count, "target estimate history")
+    reference = _history(attempt.get("reference_estimate_history"), date_count, "reference estimate history")
+    covariance = _matrix(attempt.get("predicted_difference_covariance"), "predicted difference covariance")
+    if covariance.shape != (date_count, date_count) or not np.array_equal(covariance, covariance.T):
+        raise SchemaError("predicted difference covariance has the wrong date shape or is not exactly symmetric")
+    if np.any(covariance[0, :] != 0.0) or np.any(covariance[:, 0] != 0.0):
+        raise SchemaError("predicted difference covariance violates the exact acquisition-zero gauge")
+    minimum = _minimum_symmetric_eigenvalue(covariance)
+    if minimum < -1e-10:
+        raise SchemaError("predicted difference covariance is not PSD")
+    latent_difference = np.asarray(latent_target, dtype=np.float64) - np.asarray(latent_reference, dtype=np.float64)
+    error = target - reference - latent_difference
+    covered = np.zeros(date_count, dtype=np.int64)
+    interval_score = np.zeros(date_count, dtype=np.float64)
+    interval_width = np.zeros(date_count, dtype=np.float64)
+    for index in range(1, date_count):
+        half_width = 1.959963984540054 * math.sqrt(max(float(covariance[index, index]), 0.0))
+        absolute_error = abs(float(error[index]))
+        covered[index] = int(absolute_error <= half_width)
+        width = 2.0 * half_width
+        interval_width[index] = width
+        interval_score[index] = width + (40.0 * (absolute_error - half_width) if absolute_error > half_width else 0.0)
     return {
-        "operator_relative_error": operator_error,
-        "contrast_variance_reference": truth_variance,
-        "contrast_variance_relative_error": variance_error,
-        "psd_min_eigenvalue": psd_minimum,
-        "covered_95": covered,
+        "error": error,
+        "predicted_covariance": covariance,
+        "psd_min_eigenvalue": minimum,
+        "covered": covered,
         "interval_score": interval_score,
-        "interval_width": upper - lower,
-        "operator_hash": numeric_digest("operator-v4", operator.flat),
-        "truth_sha256": numeric_digest("truth-v4", truth.flat),
-        "variance_hash": numeric_digest("variance-v4", [operator_variance, truth_variance, *weights]),
-        "emission_hash": numeric_digest("emission-v4", [estimate, truth_value]),
+        "interval_width": interval_width,
+        "estimate_sha256": numeric_digest("estimate-history-v4", [*target, *reference]),
+        "predicted_covariance_sha256": numeric_digest("predicted-difference-covariance-v4", covariance.flat),
     }
-
-
-def _same_metric(claimed: Any, recomputed: Any) -> bool:
-    if isinstance(recomputed, bool):
-        return type(claimed) is bool and claimed is recomputed
-    if recomputed is None:
-        return claimed is None
-    return _number(claimed) and math.isclose(claimed, recomputed, rel_tol=1e-12, abs_tol=1e-12)
 
 
 def _expected_coordinates(preregistration: Mapping[str, Any], cell_id: str) -> tuple[list[int], list[int]]:
@@ -655,6 +668,7 @@ def _generate_complex_source(
     global_normals: Sequence[float],
     spatial: bool,
     eigen_stress: str,
+    pair_orientation: float,
 ) -> list[complex]:
     raw = preregistration["generator"]["raw_proper_complex"]
     seed = hashlib.sha256(
@@ -685,11 +699,11 @@ def _generate_complex_source(
         amplitude = raw["signal_amplitude"] * stress_scale * (
             1.0 + 0.05 * math.sin((coordinate[0] + 3.0 * coordinate[1]) / 7.0)
         )
-        phase = (
-            raw["phase0_rad"]
-            + raw["slope_rad_per_day"] * preregistration["generator"]["acquisition"]["cadence_days"] * acquisition
-            + 0.125 * math.cos((2.0 * coordinate[0] - coordinate[1]) / 11.0)
-        )
+        date_days = preregistration["generator"]["acquisition"]["cadence_days"] * acquisition
+        spatial_slope = 0.0002 * math.sin((2.0 * coordinate[0] - coordinate[1]) / 11.0)
+        phase = raw["phase0_rad"] + (
+            raw["slope_rad_per_day"] + pair_orientation * spatial_slope
+        ) * date_days
         rotation = complex(math.cos(phase), math.sin(phase))
         signal = amplitude * complex(signal_real, signal_imag) * rotation / math.sqrt(2.0)
         noise = math.sqrt(raw["noise_variance"] / 2.0) * complex(local[offset + 2], local[offset + 3])
@@ -699,6 +713,21 @@ def _generate_complex_source(
             struct.unpack(">f", struct.pack(">f", value.imag))[0],
         ))
     return values
+
+
+def _latent_phase_history(
+    preregistration: Mapping[str, Any],
+    coordinate: Sequence[int],
+    date_count: int,
+    pair_orientation: float,
+) -> list[float]:
+    cadence = preregistration["generator"]["acquisition"]["cadence_days"]
+    slope = preregistration["generator"]["raw_proper_complex"]["slope_rad_per_day"]
+    spatial_slope = 0.0002 * math.sin((2.0 * coordinate[0] - coordinate[1]) / 11.0)
+    return [
+        (slope + pair_orientation * spatial_slope) * cadence * acquisition
+        for acquisition in range(date_count)
+    ]
 
 
 def _select_support(
@@ -780,52 +809,6 @@ def _raw_source_digest(
     return digest.hexdigest()
 
 
-def _sequential_phase(values: Sequence[complex], blocks: Sequence[Mapping[str, int]]) -> list[float]:
-    raw_phase = [math.atan2((value * values[0].conjugate()).imag, (value * values[0].conjugate()).real) for value in values]
-    result = [0.0] * len(values)
-    for block in blocks:
-        start = block["real_start"]
-        parent = 0.0 if start == 0 else result[start - 1]
-        local_reference = raw_phase[start]
-        for acquisition in range(start, start + block["num_real"]):
-            delta = math.atan2(math.sin(raw_phase[acquisition] - local_reference), math.cos(raw_phase[acquisition] - local_reference))
-            result[acquisition] = parent + delta
-    result[0] = 0.0
-    return result
-
-
-def _support_by_date(
-    supports: Sequence[Sequence[tuple[int, int]]],
-    blocks: Sequence[Mapping[str, int]],
-    date_count: int,
-) -> list[set[tuple[int, int]]]:
-    result = [set() for _ in range(date_count)]
-    for support, block in zip(supports, blocks):
-        for acquisition in range(block["real_start"], block["real_start"] + block["num_real"]):
-            result[acquisition] = set(support)
-    return result
-
-
-def _direct_phase_covariance(
-    row_supports: Sequence[set[tuple[int, int]]],
-    column_supports: Sequence[set[tuple[int, int]]],
-    row_phases: Mapping[tuple[int, int], Sequence[float]],
-    column_phases: Mapping[tuple[int, int], Sequence[float]],
-    orientation: float = 1.0,
-) -> list[list[float]]:
-    date_count = len(row_supports)
-    result = [[0.0] * date_count for _ in range(date_count)]
-    for row in range(date_count):
-        for column in range(date_count):
-            shared = row_supports[row] & column_supports[column]
-            scale = orientation / math.sqrt(len(row_supports[row]) * len(column_supports[column]))
-            result[row][column] = scale * sum(
-                row_phases[coordinate][row] * column_phases[coordinate][column]
-                for coordinate in shared
-            )
-    return result
-
-
 def _effective_looks_fraction(support: Sequence[tuple[int, int]], spatial: bool) -> float:
     if not spatial:
         return 1.0
@@ -858,10 +841,11 @@ def regenerate_frozen_attempt_inputs(
     ).hexdigest()
     global_normals = deterministic_normals(global_seed, 4 * date_count)
     spatial = labels["source_process"] == "spatial_correlation_stress"
+    pair_orientation = -1.0 if labels["pair_geometry"].endswith("_negative") else 1.0
     raw_by_source = {
         coordinate: _generate_complex_source(
             preregistration, cell_id, seed_index, coordinate, date_count,
-            global_normals, spatial, labels["eigen_stress"],
+            global_normals, spatial, labels["eigen_stress"], pair_orientation,
         )
         for coordinate in candidate_union
     }
@@ -878,41 +862,16 @@ def regenerate_frozen_attempt_inputs(
     target_support = sorted(set().union(*map(set, target_supports)))
     reference_support = sorted(set().union(*map(set, reference_supports)))
     union_support = sorted(set(target_support) | set(reference_support))
-    target_phases = {coordinate: _sequential_phase(raw_by_source[coordinate], topology["expected_blocks"]) for coordinate in target_support}
-    reference_phases = {coordinate: _sequential_phase(raw_by_source[coordinate], topology["expected_blocks"]) for coordinate in reference_support}
-    target_by_date = _support_by_date(target_supports, topology["expected_blocks"], date_count)
-    reference_by_date = _support_by_date(reference_supports, topology["expected_blocks"], date_count)
-    target_covariance = _direct_phase_covariance(target_by_date, target_by_date, target_phases, target_phases)
-    reference_covariance = target_covariance if target_supports == reference_supports else _direct_phase_covariance(reference_by_date, reference_by_date, reference_phases, reference_phases)
     shared = sorted(set(target_support) & set(reference_support))
-    orientation = -1.0 if labels["pair_geometry"].endswith("_negative") else 1.0
-    if target_supports == reference_supports:
-        cross_covariance = target_covariance
-    else:
-        cross_covariance = _direct_phase_covariance(
-            target_by_date, reference_by_date, target_phases, reference_phases, orientation
-        )
     effective_looks = _effective_looks_fraction(union_support, spatial)
-    target_covariance = [[value / effective_looks for value in row] for row in target_covariance]
-    reference_covariance = [[value / effective_looks for value in row] for row in reference_covariance]
-    cross_covariance = [[value / effective_looks for value in row] for row in cross_covariance]
-    truth_matrix = [
-        target_covariance[row] + cross_covariance[row]
-        for row in range(date_count)
-    ] + [
-        [cross_covariance[column][row] for column in range(date_count)] + reference_covariance[row]
-        for row in range(date_count)
-    ]
-    weights = [0.0] * (2 * date_count)
-    weights[date_count - 1] = 1.0
-    weights[2 * date_count - 1] = -1.0
-    if target_supports == reference_supports:
-        truth_value = 0.0
-    else:
-        truth_value = (
-            sum(vector[-1] for vector in target_phases.values()) / len(target_phases)
-            - orientation * sum(vector[-1] for vector in reference_phases.values()) / len(reference_phases)
-        )
+    latent_target = _latent_phase_history(
+        preregistration, target, date_count, pair_orientation
+    )
+    latent_reference = (
+        latent_target
+        if target == reference
+        else _latent_phase_history(preregistration, reference, date_count, pair_orientation)
+    )
     target_support_receipt = [
         {"block_id": block["block_id"], "sources": support}
         for block, support in zip(topology["expected_blocks"], target_supports)
@@ -958,10 +917,11 @@ def regenerate_frozen_attempt_inputs(
         "intersection_source_count": len(shared),
         "union_source_count": len(union_support),
         "effective_looks_fraction": effective_looks,
-        "truth_matrix": truth_matrix,
-        "truth_sha256": numeric_digest("truth-v4", itertools.chain.from_iterable(truth_matrix)),
-        "contrast_weights": weights,
-        "truth_value": truth_value,
+        "latent_target_history": latent_target,
+        "latent_reference_history": latent_reference,
+        "latent_history_sha256": numeric_digest(
+            "latent-phase-history-v4", [*latent_target, *latent_reference]
+        ),
     }
 
 
@@ -990,21 +950,22 @@ class CellAccumulator:
     binary_sha256: str = "0" * 64
     next_seed_index: int = 0
     emitted: int = 0
-    covered: int = 0
-    coverage_denominator: int = 0
+    date_count: int = 0
     target_total: int = 0
     reference_total: int = 0
     intersection_total: int = 0
     union_total: int = 0
     overlap_total: float = 0.0
     effective_looks_total: float = 0.0
-    max_operator_error: float | None = None
-    max_variance_error: float | None = None
     min_psd_eigenvalue: float | None = None
-    interval_score_total: float = 0.0
-    interval_width_total: float = 0.0
+    coverage_counts: np.ndarray | None = None
+    interval_score_sums: np.ndarray | None = None
+    interval_width_sums: np.ndarray | None = None
     statuses: dict[str, int] = field(default_factory=lambda: {status: 0 for status in ATTEMPT_STATUSES})
-    field_digests: dict[str, Any] = field(default_factory=lambda: {name: hashlib.sha256() for name in ("operator_hash", "variance_hash", "emission_hash", "truth_sha256")})
+    error_sum: np.ndarray | None = None
+    error_outer_sum: np.ndarray | None = None
+    predicted_covariance_sum: np.ndarray | None = None
+    field_digests: dict[str, Any] = field(default_factory=lambda: {name: hashlib.sha256() for name in ("estimate_sha256", "latent_history_sha256")})
     request_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:requests:v4\0"))
     attempt_digest: Any = field(default_factory=lambda: hashlib.sha256(b"dolphinrust:spatial-covariance:attempts:v4\0"))
 
@@ -1050,6 +1011,8 @@ class CellAccumulator:
             raise SchemaError(f"cell {self.cell_id} has a source-model identity mismatch")
         if attempt.get("date_axis_sha256") != sha256_json(topology["date_axis"]):
             raise SchemaError(f"cell {self.cell_id} has a date-axis identity mismatch")
+        if attempt.get("estimator_branch") != labels["estimator"]:
+            raise SchemaError(f"cell {self.cell_id} estimator identity differs from the frozen branch")
         if any(
             not isinstance(attempt.get(field_name), list)
             or len(attempt[field_name]) != 2
@@ -1086,28 +1049,20 @@ class CellAccumulator:
         )
         if any(attempt.get(field_name) != expected[field_name] for field_name in raw_fields):
             raise SchemaError(f"cell {self.cell_id} raw DGP does not match deterministic regeneration")
-        if attempt.get("truth_sha256") != expected["truth_sha256"]:
-            raise SchemaError(f"cell {self.cell_id} frozen truth digest does not match regeneration")
-        if attempt.get("status") == "masked_target":
-            return
-        try:
-            supplied_truth = _matrix(attempt.get("truth_matrix"), "truth matrix")
-        except SchemaError as exc:
-            raise SchemaError(f"cell {self.cell_id} frozen truth matrix is invalid") from exc
-        expected_truth = np.asarray(expected["truth_matrix"], dtype=np.float64)
-        if (
-            not np.array_equal(supplied_truth, expected_truth)
-            or attempt.get("contrast_weights") != expected["contrast_weights"]
-            or attempt.get("truth_value") != expected["truth_value"]
-        ):
-            raise SchemaError(f"cell {self.cell_id} frozen truth sufficient values were replaced")
+        if attempt.get("latent_history_sha256") != expected["latent_history_sha256"]:
+            raise SchemaError(f"cell {self.cell_id} latent history identity does not match regeneration")
 
     def _validate_masked(self, attempt: Mapping[str, Any]) -> None:
         if attempt.get("status") != "masked_target" or attempt.get("emitted") is not False or attempt.get("factor_emitted") is not False:
             raise SchemaError(f"cell {self.cell_id} masked attempt must abstain")
-        metrics = ("operator_relative_error", "contrast_variance_reference", "contrast_variance_relative_error", "psd_min_eigenvalue", "covered_95", "interval_score", "interval_width", "signed_cross_influence", "operator_matrix", "truth_matrix", "contrast_weights", "estimate_value", "truth_value")
+        metrics = (
+            "signed_cross_influence", "target_estimate_history", "reference_estimate_history",
+            "predicted_difference_covariance",
+        )
         if any(attempt.get(metric) is not None for metric in metrics):
             raise SchemaError(f"cell {self.cell_id} masked attempt must use null numeric evidence")
+        if attempt.get("estimate_sha256") != "0" * 64 or attempt.get("predicted_covariance_sha256") != "0" * 64:
+            raise SchemaError(f"cell {self.cell_id} masked attempt must use null estimator digests")
 
     def _accumulate(self, attempt: Mapping[str, Any]) -> None:
         labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
@@ -1134,48 +1089,52 @@ class CellAccumulator:
         self.union_total += attempt["union_source_count"]
         self.overlap_total += overlap
         self.effective_looks_total += attempt["effective_looks_fraction"]
-        if attempt["status"] in {"valid", "tied_eigenvalue"}:
-            self._validate_metric_evidence(attempt)
         if attempt["emitted"] and attempt["status"] == "valid":
             self._accumulate_valid_metrics(attempt)
+        elif attempt["status"] == "tied_eigenvalue":
+            if attempt["emitted"] or any(attempt.get(name) is not None for name in (
+                "target_estimate_history", "reference_estimate_history", "predicted_difference_covariance"
+            )):
+                raise SchemaError(f"cell {self.cell_id} tied eigenvalue must fail closed")
         for field_name, digest in self.field_digests.items():
             _update_field_digest(digest, attempt[field_name])
 
-    def _validate_metric_evidence(self, attempt: Mapping[str, Any]) -> None:
-        recomputed = independently_recompute_metrics(attempt)
-        for field_name, value in recomputed.items():
-            if field_name.endswith("hash") or field_name == "truth_sha256":
-                if attempt.get(field_name) != value:
-                    raise SchemaError(f"cell {self.cell_id} has a {field_name} canonical digest mismatch")
-            elif not _same_metric(attempt.get(field_name), value):
-                raise SchemaError(f"cell {self.cell_id} has a fabricated or drifted {field_name}")
-        if not _number(attempt.get("operator_relative_error")) or attempt["operator_relative_error"] < 0 or not _number(attempt.get("psd_min_eigenvalue")) or not isinstance(attempt.get("covered_95"), bool):
-            raise SchemaError(f"cell {self.cell_id} nonmasked attempt lacks numeric gate evidence")
-        if not _number(attempt.get("interval_score")) or not _number(attempt.get("interval_width")) or attempt["interval_width"] < 0:
-            raise SchemaError(f"cell {self.cell_id} nonmasked attempt lacks interval evidence")
-        variance_reference = attempt.get("contrast_variance_reference")
-        variance_error = attempt.get("contrast_variance_relative_error")
-        if not _number(variance_reference) or variance_reference < 0:
-            raise SchemaError(f"cell {self.cell_id} has invalid contrast-variance reference")
-        weak_zero = variance_reference <= self.preregistration["thresholds"]["weak_zero_variance_max"]
-        if weak_zero and variance_error is not None:
-            raise SchemaError(f"cell {self.cell_id} weak-zero variance attempt must use null relative error")
-        if not weak_zero:
-            if not _number(variance_error) or variance_error < 0:
-                raise SchemaError(f"cell {self.cell_id} evaluable variance attempt lacks relative error")
-
     def _accumulate_valid_metrics(self, attempt: Mapping[str, Any]) -> None:
-        self.max_operator_error = max(self.max_operator_error if self.max_operator_error is not None else -math.inf, attempt["operator_relative_error"])
-        self.min_psd_eigenvalue = min(self.min_psd_eigenvalue if self.min_psd_eigenvalue is not None else math.inf, attempt["psd_min_eigenvalue"])
-        self.covered += int(attempt["covered_95"])
-        self.coverage_denominator += 1
-        self.interval_score_total += attempt["interval_score"]
-        self.interval_width_total += attempt["interval_width"]
-        variance_reference = attempt["contrast_variance_reference"]
-        variance_error = attempt["contrast_variance_relative_error"]
-        weak_zero = variance_reference <= self.preregistration["thresholds"]["weak_zero_variance_max"]
-        if not weak_zero:
-            self.max_variance_error = max(self.max_variance_error if self.max_variance_error is not None else -math.inf, variance_error)
+        expected = regenerate_frozen_attempt_inputs(self.preregistration, self.cell_id, self.next_seed_index)
+        metrics = independently_recompute_metrics(
+            attempt, expected["latent_target_history"], expected["latent_reference_history"]
+        )
+        labels = dict(zip(DIMENSION_NAMES, self.cell_id.split("|")))
+        if labels["pair_geometry"] == "coincident" and (
+            attempt["target_estimate_history"] != attempt["reference_estimate_history"]
+            or np.any(metrics["predicted_covariance"] != 0.0)
+            or np.any(metrics["error"] != 0.0)
+        ):
+            raise SchemaError(f"cell {self.cell_id} coincident replay must be exact zero")
+        for field_name in ("estimate_sha256", "predicted_covariance_sha256"):
+            if attempt.get(field_name) != metrics[field_name]:
+                raise SchemaError(f"cell {self.cell_id} has a {field_name} canonical digest mismatch")
+        error = metrics["error"]
+        covariance = metrics["predicted_covariance"]
+        if self.error_sum is None:
+            self.date_count = len(error)
+            self.error_sum = np.zeros(self.date_count, dtype=np.float64)
+            self.error_outer_sum = np.zeros((self.date_count, self.date_count), dtype=np.float64)
+            self.predicted_covariance_sum = np.zeros((self.date_count, self.date_count), dtype=np.float64)
+            self.coverage_counts = np.zeros(self.date_count, dtype=np.int64)
+            self.interval_score_sums = np.zeros(self.date_count, dtype=np.float64)
+            self.interval_width_sums = np.zeros(self.date_count, dtype=np.float64)
+        self.error_sum += error
+        self.error_outer_sum += np.outer(error, error)
+        self.predicted_covariance_sum += covariance
+        self.min_psd_eigenvalue = min(
+            self.min_psd_eigenvalue if self.min_psd_eigenvalue is not None else math.inf,
+            metrics["psd_min_eigenvalue"],
+        )
+        assert self.coverage_counts is not None and self.interval_score_sums is not None and self.interval_width_sums is not None
+        self.coverage_counts += metrics["covered"]
+        self.interval_score_sums += metrics["interval_score"]
+        self.interval_width_sums += metrics["interval_width"]
 
     def finalize(self) -> dict[str, Any]:
         if self.next_seed_index != self.expected_seed_count:
@@ -1193,7 +1152,33 @@ class CellAccumulator:
             if self.statuses["valid"] != self.expected_seed_count:
                 raise SchemaError(f"cell {self.cell_id} has an unsupported attempt status")
             status = self._numeric_status(labels)
-        coverage = self.covered / self.coverage_denominator if self.coverage_denominator else None
+        empirical = predicted = None
+        calibration_error = bias_norm = empirical_trace = predicted_trace = None
+        coverage_by_date = interval_score_by_date = interval_width_by_date = None
+        final_coverage = final_interval_score = final_interval_width = None
+        if self.emitted:
+            assert self.error_sum is not None and self.error_outer_sum is not None and self.predicted_covariance_sum is not None
+            assert self.coverage_counts is not None and self.interval_score_sums is not None and self.interval_width_sums is not None
+            mean_error = self.error_sum / self.emitted
+            empirical = self.error_outer_sum / self.emitted - np.outer(mean_error, mean_error)
+            predicted = self.predicted_covariance_sum / self.emitted
+            calibration_error = _frobenius(predicted - empirical) / max(_frobenius(empirical), 1e-15)
+            bias_norm = float(np.linalg.norm(mean_error))
+            empirical_trace = float(np.trace(empirical))
+            predicted_trace = float(np.trace(predicted))
+            if self.expected_seed_count != FROZEN_DETERMINISTIC_SEED_COUNT:
+                coverage_by_date = [None] + [
+                    float(value / self.emitted) for value in self.coverage_counts[1:]
+                ]
+                interval_score_by_date = [None] + [
+                    float(value / self.emitted) for value in self.interval_score_sums[1:]
+                ]
+                interval_width_by_date = [None] + [
+                    float(value / self.emitted) for value in self.interval_width_sums[1:]
+                ]
+                final_coverage = coverage_by_date[-1]
+                final_interval_score = interval_score_by_date[-1]
+                final_interval_width = interval_width_by_date[-1]
         return {
             "schema": "dolphinrust.spatial-covariance.cell-summary/4",
             "cell_id": self.cell_id, "cell_ordinal": self.cell_ordinal, "status": status,
@@ -1204,31 +1189,46 @@ class CellAccumulator:
             "intersection_source_count_total": self.intersection_total, "union_source_count_total": self.union_total,
             "realized_overlap_jaccard_mean": self.overlap_total / self.expected_seed_count,
             "effective_looks_fraction": self.effective_looks_total / self.expected_seed_count,
-            "operator_relative_error": self.max_operator_error, "contrast_variance_relative_error": self.max_variance_error,
-            "variance_evaluable": self.max_variance_error is not None, "psd_min_eigenvalue": self.min_psd_eigenvalue,
-            "coverage_95": coverage,
-            "interval_score_mean": self.interval_score_total / self.coverage_denominator if self.coverage_denominator else None,
-            "interval_width_mean": self.interval_width_total / self.coverage_denominator if self.coverage_denominator else None,
-            "operator_digest": self.field_digests["operator_hash"].hexdigest(),
-            "variance_digest": self.field_digests["variance_hash"].hexdigest(),
-            "emission_digest": self.field_digests["emission_hash"].hexdigest(),
-            "truth_digest": self.field_digests["truth_sha256"].hexdigest(),
+            "covariance_calibration_relative_error": calibration_error, "error_bias_norm": bias_norm,
+            "empirical_error_covariance_trace": empirical_trace, "predicted_covariance_trace": predicted_trace,
+            "psd_min_eigenvalue": self.min_psd_eigenvalue,
+            "coverage_95_by_date": coverage_by_date,
+            "interval_score_mean_by_date": interval_score_by_date,
+            "interval_width_mean_by_date": interval_width_by_date,
+            "final_date_coverage_95": final_coverage,
+            "final_date_interval_score_mean": final_interval_score,
+            "final_date_interval_width_mean": final_interval_width,
+            "estimate_digest": self.field_digests["estimate_sha256"].hexdigest(),
+            "latent_history_digest": self.field_digests["latent_history_sha256"].hexdigest(),
+            "predicted_covariance_digest": None if predicted is None else numeric_digest("mean-predicted-covariance-v4", predicted.flat),
+            "empirical_error_covariance_digest": None if empirical is None else numeric_digest("empirical-error-covariance-v4", empirical.flat),
             "code_sha256": self.code_sha256, "binary_sha256": self.binary_sha256,
             "preregistration_sha256": preregistration_digest(self.preregistration),
         }
 
     def _numeric_status(self, labels: Mapping[str, str]) -> str:
-        if self.max_operator_error is None or self.min_psd_eigenvalue is None or self.coverage_denominator != self.emitted:
+        if self.min_psd_eigenvalue is None or self.coverage_counts is None or self.emitted == 0:
             return FAIL
         thresholds = self.preregistration["thresholds"]
         deterministic = self.expected_seed_count == FROZEN_DETERMINISTIC_SEED_COUNT
-        operator_limit = thresholds["deterministic_operator_relative_error_max"] if deterministic else thresholds["stochastic_operator_relative_error_max"]
-        coverage = self.covered / self.coverage_denominator if self.coverage_denominator else math.nan
+        assert self.error_sum is not None and self.error_outer_sum is not None and self.predicted_covariance_sum is not None
+        mean_error = self.error_sum / self.emitted
+        empirical = self.error_outer_sum / self.emitted - np.outer(mean_error, mean_error)
+        predicted = self.predicted_covariance_sum / self.emitted
+        calibration_error = _frobenius(predicted - empirical) / max(_frobenius(empirical), 1e-15)
+        coverage_by_date = self.coverage_counts[1:] / self.emitted
+        coverage_passes = all(
+            abs(float(value) - thresholds["coverage_probability"])
+            <= thresholds["coverage_absolute_error_max"]
+            for value in coverage_by_date
+        )
+        final_date_passes = abs(
+            float(coverage_by_date[-1]) - thresholds["coverage_probability"]
+        ) <= thresholds["coverage_absolute_error_max"]
         passes = (
-            self.max_operator_error <= operator_limit
-            and (self.max_variance_error is None or self.max_variance_error <= thresholds["contrast_variance_relative_error_max"])
-            and self.min_psd_eigenvalue >= thresholds["psd_min_eigenvalue_min"]
-            and (deterministic or abs(coverage - thresholds["coverage_probability"]) <= thresholds["coverage_absolute_error_max"])
+            self.min_psd_eigenvalue >= thresholds["psd_min_eigenvalue_min"]
+            and (deterministic or calibration_error <= thresholds["covariance_calibration_relative_error_max"])
+            and (deterministic or (coverage_passes and final_date_passes))
             and self.emitted / self.expected_seed_count >= thresholds["emission_rate_min"]
         )
         return PASS if passes else FAIL
@@ -1394,7 +1394,10 @@ def validate_cell_summary(
     }
     if any(summary.get(key) != value for key, value in expected.items()):
         raise SchemaError(f"cell {cell_id} compact summary scope/count drifted")
-    if any(not _is_sha256(summary.get(name)) for name in ("request_digest", "attempt_digest", "operator_digest", "variance_digest", "truth_digest", "emission_digest", "code_sha256", "binary_sha256", "preregistration_sha256")):
+    if any(not _is_sha256(summary.get(name)) for name in (
+        "request_digest", "attempt_digest", "estimate_digest", "latent_history_digest",
+        "code_sha256", "binary_sha256", "preregistration_sha256",
+    )):
         raise SchemaError(f"cell {cell_id} compact summary has an invalid digest")
     statuses = summary.get("status_histogram")
     if not isinstance(statuses, dict) or set(statuses) != ATTEMPT_STATUSES or any(not _integer(value) or value < 0 for value in statuses.values()) or sum(statuses.values()) != seed_count:
@@ -1412,13 +1415,46 @@ def validate_cell_summary(
     else:
         valid_histogram = statuses["valid"] == seed_count
         deterministic = seed_count == FROZEN_DETERMINISTIC_SEED_COUNT
-        operator_limit = preregistration["thresholds"]["deterministic_operator_relative_error_max" if deterministic else "stochastic_operator_relative_error_max"]
-        coverage = summary.get("coverage_95")
+        coverage = summary.get("coverage_95_by_date")
+        interval_score = summary.get("interval_score_mean_by_date")
+        interval_width = summary.get("interval_width_mean_by_date")
+        date_count = preregistration["generator"]["acquisition"]["topologies"][labels["block_topology"]]["acquisition_count"]
+        if deterministic:
+            per_date_valid = all(summary.get(name) is None for name in (
+                "coverage_95_by_date", "interval_score_mean_by_date", "interval_width_mean_by_date",
+                "final_date_coverage_95", "final_date_interval_score_mean", "final_date_interval_width_mean",
+            ))
+            coverage_passes = True
+        else:
+            per_date_valid = all(
+                isinstance(values, list)
+                and len(values) == date_count
+                and values[0] is None
+                and all(_number(value) and value >= 0.0 for value in values[1:])
+                for values in (coverage, interval_score, interval_width)
+            )
+            if per_date_valid:
+                per_date_valid = all(0.0 <= value <= 1.0 for value in coverage[1:]) and (
+                    summary.get("final_date_coverage_95") == coverage[-1]
+                    and summary.get("final_date_interval_score_mean") == interval_score[-1]
+                    and summary.get("final_date_interval_width_mean") == interval_width[-1]
+                )
+            coverage_passes = per_date_valid and all(
+                abs(value - preregistration["thresholds"]["coverage_probability"])
+                <= preregistration["thresholds"]["coverage_absolute_error_max"]
+                for value in coverage[1:]
+            ) and abs(
+                summary["final_date_coverage_95"] - preregistration["thresholds"]["coverage_probability"]
+            ) <= preregistration["thresholds"]["coverage_absolute_error_max"]
         passes = (
-            _number(summary.get("operator_relative_error")) and summary["operator_relative_error"] <= operator_limit
-            and (summary.get("contrast_variance_relative_error") is None or (_number(summary["contrast_variance_relative_error"]) and summary["contrast_variance_relative_error"] <= preregistration["thresholds"]["contrast_variance_relative_error_max"]))
+            _is_sha256(summary.get("predicted_covariance_digest"))
+            and _is_sha256(summary.get("empirical_error_covariance_digest"))
+            and _number(summary.get("covariance_calibration_relative_error"))
+            and (deterministic or summary["covariance_calibration_relative_error"] <= preregistration["thresholds"]["covariance_calibration_relative_error_max"])
+            and _number(summary.get("error_bias_norm"))
             and _number(summary.get("psd_min_eigenvalue")) and summary["psd_min_eigenvalue"] >= preregistration["thresholds"]["psd_min_eigenvalue_min"]
-            and _number(coverage) and (deterministic or abs(coverage - preregistration["thresholds"]["coverage_probability"]) <= preregistration["thresholds"]["coverage_absolute_error_max"])
+            and per_date_valid
+            and (deterministic or coverage_passes)
             and summary["emitted_seeds"] / seed_count >= preregistration["thresholds"]["emission_rate_min"]
         )
         expected_status = PASS if passes else FAIL
@@ -1618,6 +1654,78 @@ def _growth_exponent(points: list[tuple[int, int]]) -> float:
     return sum((x_value - x_mean) * (y_value - y_mean) for x_value, y_value in zip(x, y)) / denominator
 
 
+def _validate_allocation_receipt(item: Mapping[str, Any], matrix: Mapping[str, Any]) -> None:
+    allocation_model = item.get("allocation_model")
+    if allocation_model != {
+        "model": "named-allocation-components-v1",
+        "area_axis": "tile_pixels",
+        "date_axis": "date_count",
+        "forbid_multiple_area_scaled_axes": True,
+    } or item.get("allocation_model_sha256") != sha256_json(allocation_model):
+        raise SchemaError(f"resource {item.get('resource_id')} allocation model identity mismatch")
+    dependency_cone = item.get("dependency_cone")
+    if dependency_cone != {
+        "model": "spatial-query-cone-v1",
+        "tile_pixels": matrix["tile_pixels"],
+        "date_count": matrix["dates"],
+        "maximum_sources": matrix["tile_pixels"],
+    } or item.get("dependency_cone_sha256") != sha256_json(dependency_cone):
+        raise SchemaError(f"resource {item.get('resource_id')} dependency-cone identity mismatch")
+    microbatch_pixels = min(matrix["tile_pixels"], 4096)
+    microbatch = item.get("microbatch")
+    if microbatch != {
+        "model": "bounded-microbatch-v1",
+        "microbatch_pixels": microbatch_pixels,
+        "batch_count": math.ceil(matrix["tile_pixels"] / microbatch_pixels),
+    } or item.get("microbatch_sha256") != sha256_json(microbatch):
+        raise SchemaError(f"resource {item.get('resource_id')} microbatch identity mismatch")
+    components = item.get("allocation_components")
+    if not isinstance(components, list) or {component.get("name") for component in components if isinstance(component, dict)} != ALLOCATION_COMPONENT_NAMES or len(components) != len(ALLOCATION_COMPONENT_NAMES):
+        raise SchemaError(f"resource {item.get('resource_id')} lacks exact named allocation components")
+    extents = {
+        "tile_pixels": matrix["tile_pixels"],
+        "date_count": matrix["dates"],
+        "microbatch_pixels": microbatch_pixels,
+    }
+    expected_components = {
+        "source_cache": (16, [("tile_pixels", matrix["tile_pixels"], True), ("date_count", matrix["dates"], False)]),
+        "reverse_adjoint": (8, [("tile_pixels", matrix["tile_pixels"], True), ("date_count", matrix["dates"], False)]),
+        "joint_covariance": (8, [("date_count", matrix["dates"], False), ("date_count", matrix["dates"], False)]),
+        "difference_covariance": (8, [("date_count", matrix["dates"], False), ("date_count", matrix["dates"], False)]),
+        "microbatch_workspace": (16, [("microbatch_pixels", microbatch_pixels, True), ("date_count", matrix["dates"], False)]),
+    }
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {
+            "name", "coefficient_bytes", "axis_factors", "bytes", "component_sha256"
+        }:
+            raise SchemaError(f"resource {item.get('resource_id')} has malformed allocation components")
+        coefficient = component["coefficient_bytes"]
+        factors = component["axis_factors"]
+        if type(coefficient) is not int or coefficient <= 0 or not isinstance(factors, list) or not factors:
+            raise SchemaError(f"resource {item.get('resource_id')} has invalid allocation coefficients")
+        area_scaled = 0
+        expected_bytes = coefficient
+        for factor in factors:
+            if not isinstance(factor, dict) or set(factor) != {"axis", "extent", "area_scaled"}:
+                raise SchemaError(f"resource {item.get('resource_id')} has malformed allocation axes")
+            axis = factor["axis"]
+            if axis not in extents or factor["extent"] != extents[axis] or type(factor["area_scaled"]) is not bool:
+                raise SchemaError(f"resource {item.get('resource_id')} allocation axis scope drifted")
+            area_scaled += int(factor["area_scaled"])
+            expected_bytes *= factor["extent"]
+        if area_scaled > 1:
+            raise SchemaError(f"resource {item.get('resource_id')} allocation has two area-scaled axes")
+        expected_coefficient, expected_factors = expected_components[component["name"]]
+        observed_factors = [
+            (factor["axis"], factor["extent"], factor["area_scaled"])
+            for factor in factors
+        ]
+        if coefficient != expected_coefficient or observed_factors != expected_factors:
+            raise SchemaError(f"resource {item.get('resource_id')} named allocation formula drifted")
+        if component["bytes"] != expected_bytes or component["component_sha256"] != sha256_json({key: value for key, value in component.items() if key != "component_sha256"}):
+            raise SchemaError(f"resource {item.get('resource_id')} allocation formula or component digest mismatch")
+
+
 def _validate_resources(preregistration: Mapping[str, Any], resources: Any, binary_sha256: str) -> list[str]:
     if not isinstance(resources, list):
         raise SchemaError("resources must be a per-resource list")
@@ -1633,6 +1741,7 @@ def _validate_resources(preregistration: Mapping[str, Any], resources: Any, bina
             raise SchemaError(f"resource {resource_id} has unknown or missing fields")
         if item["binary_hash"] != binary_sha256 or item["config_hash"] != sha256_json(preregistration["generator"]):
             raise SchemaError(f"resource {resource_id} identity mismatch")
+        _validate_allocation_receipt(item, matrix[resource_id])
         provenance = ("os", "hardware_class", "ram_bytes", "rss_sampler", "rss_field", "warmup_runs", "measured_repetitions", "tool_versions", "acceptance")
         if any(item.get(name) != sampling[name] for name in provenance):
             raise SchemaError(f"resource {resource_id} sampling provenance mismatch")
@@ -1746,7 +1855,7 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
         manifest_path = Path(manifest_path)
         if manifest_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
             raise SchemaError("partial run manifests are not admissible")
-        run_manifest, _ = _read_single_json_record(
+        run_manifest, _, _ = _read_hashed_json_record(
             manifest_path,
             preregistration["execution_protocol"]["max_encoded_run_manifest_bytes"],
             "run manifest",
@@ -1767,7 +1876,7 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
         sink.open()
         entries = run_manifest["shard_manifests"]
         if not isinstance(entries, list) or len(entries) != FROZEN_SHARD_COUNT:
-            raise SchemaError("run manifest must contain exactly 891 ordered shard manifests")
+            raise SchemaError("run manifest must contain exactly four ordered shard manifests")
         run_root = manifest_path.resolve(strict=True).parent
         manifest_digests = []
         cell_count = 0
@@ -1782,17 +1891,13 @@ def score_run_manifest(preregistration: Mapping[str, Any], manifest_path: Path, 
             if entry_path.is_absolute() or ".." in entry_path.parts or entry_path.name.endswith(preregistration["execution_protocol"]["partial_suffix"]):
                 raise SchemaError(f"shard {spec.index} manifest path escapes the run root")
             resolved_entry = resolve_below_run_root(run_root, entry["path"], f"shard {spec.index} manifest path")
-            digest, _ = sha256_file(
-                resolved_entry,
-                preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
-            )
-            if digest != entry["sha256"]:
-                raise SchemaError(f"shard {spec.index} manifest hash mismatch")
-            shard_manifest, _ = _read_single_json_record(
+            shard_manifest, _, digest = _read_hashed_json_record(
                 resolved_entry,
                 preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
                 f"shard {spec.index} manifest",
             )
+            if digest != entry["sha256"]:
+                raise SchemaError(f"shard {spec.index} manifest hash mismatch")
             if shard_manifest.get("code_sha256") != run_manifest["code_sha256"] or shard_manifest.get("binary_sha256") != run_manifest["binary_sha256"]:
                 raise SchemaError(f"shard {spec.index} code/binary scope differs from the run manifest")
             for summary in score_attempt_shard(preregistration, run_root, shard_manifest, spec):

@@ -27,6 +27,7 @@ try:
         ShardSpec,
         _expected_seed_hash,
         _read_bounded_bytes,
+        _read_hashed_json_record,
         _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
@@ -60,6 +61,7 @@ except ModuleNotFoundError:
         ShardSpec,
         _expected_seed_hash,
         _read_bounded_bytes,
+        _read_hashed_json_record,
         _read_single_json_record,
         _validate_performance_probe,
         _validate_resources,
@@ -559,11 +561,29 @@ def committed_shard_matches(
     try:
         if attempt_regenerator is None:
             return False
-        manifest, _ = _read_single_json_record(
+        manifest, _, _ = _read_hashed_json_record(
             Path(manifest_path),
             preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
             f"shard {spec.index} manifest",
         )
+        return _committed_shard_matches_manifest(
+            preregistration, spec, run_root, manifest, expected_code_sha256,
+            expected_binary_sha256, attempt_regenerator,
+        )
+    except (OSError, ValueError, json.JSONDecodeError, SchemaError):
+        return False
+
+
+def _committed_shard_matches_manifest(
+    preregistration: Mapping[str, Any],
+    spec: ShardSpec,
+    run_root: Path,
+    manifest: Mapping[str, Any],
+    expected_code_sha256: str,
+    expected_binary_sha256: str,
+    attempt_regenerator: AttemptRegenerator,
+) -> bool:
+    try:
         validate_shard_manifest(preregistration, manifest, spec)
         if manifest["code_sha256"] != expected_code_sha256 or manifest["binary_sha256"] != expected_binary_sha256:
             return False
@@ -598,7 +618,7 @@ def build_run_manifest(
         )
     paths = tuple(shard_manifest_paths)
     if len(paths) != FROZEN_SHARD_COUNT:
-        raise SchemaError("run manifest requires exactly 891 compact shards")
+        raise SchemaError("run manifest requires exactly four compact shards")
     _validate_performance_probe(preregistration, performance_probe, code_sha256, binary_sha256)
     _validate_resources(preregistration, resources, binary_sha256)
     root = Path(run_root).resolve(strict=True)
@@ -607,14 +627,16 @@ def build_run_manifest(
     for spec, path in zip(iter_shard_specs(preregistration), paths):
         resolved = Path(path).resolve(strict=True)
         relative = resolved.relative_to(root).as_posix()
-        digest, _ = sha256_file(
-            resolved, preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"]
+        manifest, _, digest = _read_hashed_json_record(
+            resolved,
+            preregistration["execution_protocol"]["max_encoded_shard_manifest_bytes"],
+            f"shard {spec.index} manifest",
         )
-        if not committed_shard_matches(
+        if not _committed_shard_matches_manifest(
             preregistration,
             spec,
             root,
-            resolved,
+            manifest,
             code_sha256,
             binary_sha256,
             attempt_regenerator,
