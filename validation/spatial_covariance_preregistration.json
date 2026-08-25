@@ -686,7 +686,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "f529b448b250feda28e74f4817074ba77c6a04762babfa74270d4960f0fc5140"
+        "sha256": "16c8e6e45b5d0310d097232c4acc71affb7d1ea91b35d837dc234dbdd71364ac"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
