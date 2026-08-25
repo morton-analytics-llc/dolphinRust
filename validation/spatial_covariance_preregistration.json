@@ -1,59 +1,2174 @@
 {
   "schema": "dolphinrust.spatial_covariance.preregistration",
-  "schema_version": 3,
+  "schema_version": 5,
   "validation_id": "F54-07-spatial-covariance-approximation",
   "status": "preregistered",
   "outcomes_present": false,
-  "supersedes": {"schema_version":2,"canonical_preregistration_sha256":"6b897f038176a7ade6a2e27561b64e96885651db836db85207c9ce4c518f00d8","outcomes_present":false,"reason":"v2 monolithic receipt cannot satisfy bounded streaming evidence; scientific design unchanged"},
-  "design": "full-factorial-streaming-sharded-per-attempt-jsonl-receipts",
-  "seed_schedule": {"attempted_seeds_per_cell": 5000, "seed_derivation": "sha256(validation_seed||cell_id||seed_index)", "validation_seed": "spatial-covariance-f54-07-v2", "no_top_up": true},
-  "matrix_contract": {"dimension_order":["half_window","stride","support","position","pair_geometry","block_topology","estimator","eigen_stress","source_process"],"expected_cell_count":89100,"expected_attempt_count":445500000,"required_design":"cartesian_product_of_dimensions","cell_pruning_allowed":false,"source_process_axis_required":true},
-  "execution_protocol": {"protocol_version":3,"input_schema":"dolphinrust.spatial-covariance.attempt/3","output_schema":"dolphinrust.spatial-covariance.attempt-receipt/3","shard_manifest_schema":"dolphinrust.spatial-covariance.shard-manifest/3","run_manifest_schema":"dolphinrust.spatial-covariance.run-manifest/3","one_input_one_output":true,"record_order":"cell_ordinal_ascending_then_seed_index_ascending","max_cells_per_shard":100,"shard_count":891,"full_shard_count":891,"final_shard_cell_count":100,"max_uncompressed_input_bytes":1073741824,"max_uncompressed_output_bytes":1073741824,"max_encoded_output_record_bytes":2048,"process_rss_bytes_max":25769803776,"partial_suffix":".partial","commit_rule":"output_atomic_rename_then_manifest_atomic_rename_after_exact_count_order_hash_byte_rss_schema_validation","resume_rule":"accept_only_exact_committed_hash_valid_scope_code_binary_and_receipt_schema_matched_shard_else_rerun_entire_shard_from_seed_zero","malformed_record_rule":"fail_entire_shard_without_commit","result_root":"sha256_domain_separated_ordered_shard_manifest_digests_v1","performance_probe":{"required_before_outcomes":true,"outcomes_persisted":false,"seed_counts":[100,1000],"required_cell_classes":["hw_7x14_glrt_four_blocks_evd_near_tie_spatial","hw_7x14_ks_four_blocks_evd_near_tie_spatial","masked_fast_path","tied_eigenvalue_path"],"measurement_order":"cell_class_then_seed_count","measurement_fields":["cell_class","seed_count","attempt_count","elapsed_seconds","peak_rss_bytes","outcomes_persisted"],"derived_rate":"sum(attempt_count)/sum(elapsed_seconds)","derived_peak_rss":"max(measurement.peak_rss_bytes)","derived_concurrency_receipt_required":true,"reserve_fraction":0.25,"total_wall_seconds_max":null}},
-  "cell_reducers": {"attempted_seeds":"exactly_5000_seed_indices_0_through_4999","emitted_seeds":"count(emitted_true)","top_up_seeds":"exactly_zero","operator_relative_error":"max_nonnull_over_emitted_valid_attempts","contrast_variance_relative_error":"max_over_emitted_valid_attempts_with_contrast_variance_reference_above_weak_zero_threshold; null_only_if_all_emitted_valid_attempts_are_weak_zero","psd_min_eigenvalue":"min_nonnull_over_emitted_valid_attempts","coverage_95":"count(covered_95_true)/count(emitted_valid_attempts_with_boolean_covered_95)","emission_rate":"count(emitted_true)/5000","support_count_totals":"sum_over_all_5000_attempts","realized_overlap_jaccard_mean":"sum_over_all_5000_attempts/5000","effective_looks_fraction":"mean_over_all_5000_attempts","masked":"all_5000_masked_target; pass; zero_emission; null_numeric_gates","not_evaluable":"only_tied_eigenvalue_cells; all_5000_attempts_tied_eigenvalue","status_precedence":["masked_expected_abstention","tied_eigenvalue_not_evaluable","supported_numeric_gates"]},
+  "supersedes": {
+    "schema_version": 4,
+    "canonical_preregistration_sha256": "b746dede3545312cb318e43913b9d2a76b7ffc4ca8552ef4c59a290d4e252d35",
+    "outcomes_present": false,
+    "reason": "v4 froze 353 cells and 665220 attempts before execution. Exact pre-outcome timing observed 32 hw_7x14 GLRT attempts require about 91 wall seconds with 12 ordered workers, while the 128-attempt run remained active beyond 615 wall seconds; projected full execution was measured in weeks, and the required KS 32/128 probe contradicted v4's one-seed KS selector. No outcomes existed. v5 retains scientific acceptance axes and moves engineering behaviors to deterministic contracts."
+  },
+  "design": "explicit-acceptance-axis-matrix-with-deterministic-engineering-contracts",
+  "seed_schedule": {
+    "supported_monte_carlo_seeds": 128,
+    "deterministic_contract_seeds": 1,
+    "selection_rule": "exactly the 24 listed stochastic cells receive 128 seeds; every listed deterministic contract cell receives one seed; no label-based inference and no top-up",
+    "precision": "for n=128 and target coverage 0.95, accept covered counts 117 through 126 inclusive: the intersection of the central exact-binomial 95 percent acceptance region and counts whose two-sided Wilson 95 percent interval contains 0.95",
+    "seed_derivation": "sha256(validation_seed||cell_id||seed_index)",
+    "validation_seed": "spatial-covariance-f54-07-v2",
+    "no_top_up": true
+  },
+  "matrix_contract": {
+    "dimension_order": [
+      "half_window",
+      "stride",
+      "support",
+      "position",
+      "pair_geometry",
+      "block_topology",
+      "estimator",
+      "eigen_stress",
+      "source_process"
+    ],
+    "expected_cell_count": 40,
+    "expected_attempt_count": 3088,
+    "supported_monte_carlo_cell_count": 24,
+    "deterministic_contract_cell_count": 16,
+    "required_design": "three_window_sizes_by_four_distance_regimes_by_two_estimators_plus_explicit_deterministic_acceptance_contracts",
+    "cell_pruning_allowed": false,
+    "source_process_axis_required": true,
+    "stochastic_axes": {
+      "half_window": ["hw_1x1", "hw_3x6", "hw_7x14"],
+      "distance_regime": {
+        "coincident": "coincident",
+        "near": "shared_75_positive",
+        "mid": "shared_25_positive",
+        "disjoint": "disjoint_immediate"
+      },
+      "estimator": ["emi", "evd"],
+      "representative": {
+        "stride": "stride_4",
+        "support": "glrt_frozen",
+        "position": "interior",
+        "block_topology": "four_blocks",
+        "eigen_stress": "well_separated",
+        "source_process": "spatial_correlation_stress"
+      }
+    },
+    "stochastic_cells": [
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_3x6|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|coincident|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|shared_25_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_7x14|stride_4|glrt_frozen|interior|disjoint_immediate|four_blocks|evd|well_separated|spatial_correlation_stress"
+    ],
+    "deterministic_contract_cells": [
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|border_clamped|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|tile_edge|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|bounded_halo|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|one_block|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|two_blocks_cap_eviction|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks_partial_final|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_1|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_2|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|rect|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "hw_1x1|stride_4|ks_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
+    ],
+    "deterministic_behavior_evidence": {
+      "independent": "deterministic source_process cell",
+      "positive": "stochastic near cells",
+      "negative": "deterministic shared_75_negative cell",
+      "coincident": "stochastic coincident cells and exact-zero contracts",
+      "invalid_reference": "production parity InvalidReference contract",
+      "mask": "deterministic masked cell",
+      "boundary": "border_clamped, tile_edge, and bounded_halo cells",
+      "tie": "tied_eigenvalue and near_tie cells",
+      "topology": "one, two, four, capped-eviction, and partial-final block cells",
+      "stride": "stride 1, 2, and representative 4 cells",
+      "provenance": "whole and bounded HDF5 semantic parity fixtures",
+      "resource": "five exact benchmark receipts"
+    }
+  },
+  "execution_protocol": {
+    "protocol_version": 5,
+    "request_schema": "dolphinrust.spatial-covariance.attempt/4",
+    "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
+    "cell_summary_schema": "dolphinrust.spatial-covariance.cell-summary/4",
+    "shard_manifest_schema": "dolphinrust.spatial-covariance.shard-manifest/4",
+    "run_manifest_schema": "dolphinrust.spatial-covariance.run-manifest/4",
+    "production_hdf5_schema_version": 4,
+    "max_production_hdf5_bytes": 1048576,
+    "attempt_transport": "ephemeral_pipe_or_delete_after_verified_cell_commit",
+    "retained_attempt_records": false,
+    "request_files_retained": false,
+    "regeneration": "derive every request, full raw DGP, latent noiseless target/reference histories, and deterministic-fixture dense 2N phase-joint oracle from the frozen DGP generator identity, cell_id, and seed_index; receipt/scorer metadata cannot change raw bytes",
+    "record_order": "cell_ordinal_ascending_then_seed_index_ascending",
+    "resume_boundary": "completed_cell",
+    "max_cells_per_shard": 100,
+    "shard_count": 1,
+    "full_shard_count": 0,
+    "final_shard_cell_count": 40,
+    "max_encoded_cell_summary_bytes": 8192,
+    "max_encoded_shard_manifest_bytes": 16384,
+    "max_encoded_run_manifest_bytes": 16777216,
+    "retained_size_bound_bytes": 21315584,
+    "process_rss_bytes_max": 25769803776,
+    "partial_suffix": ".partial",
+    "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
+    "resume_rule": "reuse requires Rust spatial_covariance_batch replay from seed zero and exact regenerated attempt digest plus byte-identical independently recomputed summary; without that executable the cell is not reusable",
+    "manifest_read": "read bounded bytes once with pre/open/post identity checks, then hash and parse those same bytes; each whole-frame and bounded run-scope production HDF5 is streamed once under its frozen per-artifact cap",
+    "malformed_record_rule": "fail current cell without commit; previously committed cells remain reusable only after exact replay",
+    "result_root": "sha256_domain_separated_ordered_shard_manifest_digests_v2",
+    "performance_probe": {
+      "required_before_outcomes": true,
+      "outcomes_persisted": false,
+      "seed_counts": [
+        32,
+        128
+      ],
+      "required_cell_classes": [
+        "hw_7x14_near_emi_spatial",
+        "hw_7x14_near_evd_spatial"
+      ],
+      "cell_bindings": {
+        "hw_7x14_near_emi_spatial": "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+        "hw_7x14_near_evd_spatial": "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress"
+      },
+      "measurement_order": "cell_class_then_seed_count",
+      "execution": "the fresh measurement parent starts its timer before child launch and retains only ordered seed-range descriptors; each child independently regenerates and serializes its assigned at-most-three exact seed requests, runs the exact target/release/examples/spatial_covariance_batch process, and emits one ordered chunk; waves contain at most twelve children; the parent validates every output record and ordered concatenation before stopping the timer, then discards all attempt output",
+      "parallel_worker_count": 12,
+      "max_requests_per_child": 3,
+      "worker_rss_admission_bytes": 2147483648,
+      "aggregate_rss_cap_bytes": 25769803776,
+      "aggregate_rss_sampler": "sum ps rss bytes across each live Python generator child and its exact Rust batch descendant every 50 milliseconds",
+      "measurement_fields": [
+        "cell_class",
+        "seed_count",
+        "attempt_count",
+        "elapsed_seconds",
+        "peak_rss_bytes",
+        "worker_count",
+        "max_requests_per_child",
+        "child_invocation_count",
+        "wave_count",
+        "worker_rss_admission_bytes",
+        "aggregate_rss_cap_bytes",
+        "output_records",
+        "ordered_output_sha256",
+        "outcomes_persisted"
+      ],
+      "derived_rate": "sum(attempt_count)/sum(elapsed_seconds)",
+      "derived_peak_rss": "max(measurement.peak_rss_bytes)",
+      "derived_concurrency_receipt_required": true,
+      "maximum_normalized_128_to_32_wall_ratio": 1.5,
+      "reserve_fraction": 0.25,
+      "total_wall_seconds_max": null
+    },
+    "matched_pair_cohort": {
+      "positive_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "negative_cell": "hw_1x1|stride_4|glrt_frozen|interior|shared_75_negative|four_blocks|emi|well_separated|spatial_correlation_stress",
+      "seed_count": 512,
+      "execution": "stream exact prebuilt spatial_covariance_batch attempts for both signed cells; Python regenerates and equality-checks each seed's marginal source/support/latent/orientation identity before reducing predicted and empirical traces; independent is derived only from the paired marginal target/reference traces"
+    },
+    "max_production_sidecar_bytes": 1048576
+  },
+  "determinism": {
+    "text_encoding": "UTF-8",
+    "dgp_generator_identity_sha256": "7589a2bba764e66b99bf7cfffbd6f979df94a00ca0ca5e179b5aabae4903a49e",
+    "dgp_generator_identity_definition": "frozen v5 explicit-acceptance-matrix counter-generator identity; cell ordinal, seed, coordinate, date, and stream are separate counter-key fields; v4 outcomes never existed and v5 intentionally rekeys the smaller exact cell order",
+    "counter_key": "SHA-256(domain || dgp_generator_identity_sha256 bytes || uint64_le matched_cohort_cell_ordinal || uint64_le seed_index || int64_le row || int64_le column || uint32_le date_index || uint16_le stream_byte_count || ASCII stream || uint64_le counter)",
+    "counter_domain": "dolphinrust:spatial-covariance-dgp:v1\\0",
+    "matched_cell_ordinal": "negative signed geometries use the otherwise-identical positive geometry cell ordinal so matched marginals share draws",
+    "normal_transform": "first uint64_le word of the counter digest; index=word>>(64-index_bits); exact IEEE754 binary64 value loaded from the frozen midpoint inverse-normal LUT; no runtime logarithm, square root, sine, or cosine",
+    "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
+    "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
+    "portable_table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff",
+    "complex_normal": "four independent named local streams and four matched-cell global streams per source-factor halo coordinate/date; signed coupling conjugates only the negative-loading latent-frame stochastic base before the common frozen phasor",
+    "complex_storage": "fixed scalar operation order, fused multiply-add prohibited, final real and imaginary components rounded to IEEE754 binary32; negative loading negates only latent-base imaginary binary64 before rotation",
+    "matrix_order": "source coordinates row-major, acquisition ascending, component real then imag; estimate histories target then reference; covariance and online reductions row-major",
+    "numeric_encoding": "raw source hashes use canonical little-endian counts, coordinates, and IEEE754 binary32 complex components; negative zero canonicalized positive; NaN and infinity prohibited"
+  },
+  "numeric_contract": {
+    "raw_dgp": "regenerate every complex look over the complete transitive sequential replay dependency halo through every expected block, including the final source-factor window; negative loading conjugates the latent-frame stochastic base before the common phasor so matched signs preserve magnitudes; compare exact shape, scalar count, full raw-cube and target/reference factor-halo content hashes, primitive support hashes, ancestry hash, DGP identity, and target/reference loading means before scoring",
+    "latent_truth": "regenerate noiseless target and reference phase histories from slope_rad_per_day plus fixed positive 0.0002*sin((2*row-column)/11) radians/day, cadence, coordinates, and exact acquisition-zero gauge; coincident coordinates share one identical history; matched positive and negative cells share the same latent histories",
+    "dense_joint_oracle": "Python independently reconstructs the coordinate-keyed primitive source union, signed target/reference influence matrix A, and source correlation matrix R, then derives the full dense 2N phase-joint covariance from noise_variance times A-prime R A and the gauged temporal covariance only for deterministic fixtures; stochastic cells are calibrated against bounded online empirical estimator-error covariance",
+    "estimator_evidence": "Rust emits actual EMI or EVD target/reference date histories, predicted production target-minus-reference date covariance, bounded 2N by 2N production phase-joint operator, and exact final-date target-minus-reference contrast weights; estimator_branch must equal the cell estimator",
+    "difference_covariance": "Python independently computes the full-date fixed-L2 E C E-prime map from the pre-factor production 2N replay joint operator, symmetrizes, applies the frozen 1e-10 rank threshold, eigenvalue clipping and factor reconstruction, then compares production F F-prime under eps*date_count*256*max(1,max_abs(reconstruction)); actual covariance and replay-operator canonical digests remain exact",
+    "operator_error": "deterministic: Frobenius(production_operator-python_derived_dense_oracle)/max(Frobenius(python_derived_dense_oracle),1e-15); stochastic: Frobenius(mean_production_operator-online_empirical_joint_estimator_error_covariance)/max(Frobenius(empirical),1e-15); maxima 1e-10 and 0.10",
+    "contrast_variance_error": "same deterministic or stochastic operator pair projected by exact final-date target-minus-reference weights; maximum relative error 0.10",
+    "empirical_covariance": "population covariance sum(error outer error)/n - mean(error) outer mean(error), where error=(estimated_target-estimated_reference)-(latent_target-latent_reference); target and reference marginal error outer products and cross products are also reduced",
+    "predicted_covariance": "mean per-attempt production target-minus-reference covariance is compared with online empirical difference-error covariance; an explicit matched positive, independent, and negative cohort sharing marginal DGP/support/latent/orientation requires positive < independent < negative for predicted and empirical traces",
+    "coincident": "identical support, raw source content, latent histories, estimated histories, and exact-zero predicted target-minus-reference covariance",
+    "psd": "minimum diagonal after independent cyclic Jacobi eigensolver on (M+M^T)/2; sweep p ascending then q ascending; tolerance 1e-14*max(1,max_abs_diagonal); at most 100*n*n sweeps; fail if not converged; compare to -1e-10",
+    "interval_score": "per non-gauge date, width+(2/0.05)*(absolute_error-half_width) when absolute_error exceeds half_width",
+    "coverage": "per non-gauge date inclusive abs(estimator_error)<=1.959963984540054*sqrt(max(predicted_covariance_diagonal,0))",
+    "independent_sufficient_values": [
+      "raw_input_shape",
+      "raw_input_value_count",
+      "raw_input_sha256",
+      "target_raw_input_sha256",
+      "reference_raw_input_sha256",
+      "target_support_sha256",
+      "reference_support_sha256",
+      "sequential_ancestry_sha256",
+      "raw_dgp_identity_sha256",
+      "latent_history_sha256",
+      "estimator_branch",
+      "target_estimate_history",
+      "reference_estimate_history",
+      "predicted_difference_covariance",
+      "production_operator_matrix",
+      "contrast_weights"
+    ],
+    "production_artifact_validation": "one whole-frame and one bounded production parity fixture per run are emitted through ProductionCovarianceState, re-read through dolphin-io, stream-hashed with their actual JSON provenance sidecars, and bound separately from the ephemeral attempt stream",
+    "self_attested_metric_policy": "no Rust metric, stochastic oracle, realized noisy truth, nested allocation record, or unattached artifact digest is accepted; Python regenerates raw DGP and latent histories, derives deterministic 2N phase-joint oracles, and derives stochastic operator error from bounded online empirical estimator-error covariance",
+    "canonical_hashes": "SHA-256 over frozen streaming raw encoding and numeric encodings with domain tags raw-input-v4, source-raw-input-v4, latent-phase-history-v4, estimate-history-v4, predicted-difference-covariance-v4, production-operator-v4, dense-oracle-v4, mean-predicted-covariance-v4, empirical-error-covariance-v4"
+  },
+  "cell_reducers": {
+    "attempted_seeds": "exactly 128 for each of the 24 explicit stochastic cells and one for every explicit deterministic contract cell",
+    "emitted_seeds": "count(emitted_true)",
+    "top_up_seeds": "exactly_zero",
+    "error_sum": "bounded date vector sum over emitted valid difference errors",
+    "error_outer_sum": "bounded date-by-date sum of difference-error outer products over emitted valid attempts",
+    "target_reference_error_sums": "bounded target-error and reference-error vectors plus target, reference, and target-by-reference error outer-product matrices",
+    "predicted_covariance_sum": "bounded date-by-date sum over emitted valid attempts plus scalar target/reference marginal operator traces",
+    "operator_relative_error": "maximum independently recomputed per-attempt value",
+    "contrast_variance_relative_error": "maximum independently recomputed per-attempt value",
+    "empirical_error_covariance": "error_outer_sum/n-(error_sum/n)(error_sum/n)^T with population denominator n",
+    "target_reference_error_covariance": "target_reference_outer_sum/n-(target_error_sum/n)(reference_error_sum/n)^T with population denominator n",
+    "predicted_covariance": "predicted_covariance_sum/n",
+    "matched_independent_trace": "one half the sum of target and reference marginal covariance traces across matched positive and negative summaries",
+    "covariance_calibration_relative_error": "Frobenius(mean_predicted-empirical)/max(Frobenius(empirical),1e-15)",
+    "psd_min_eigenvalue": "minimum over emitted predicted covariance attempts",
+    "coverage_95_by_date": "for each 128-seed stochastic cell, every non-gauge date must have 117 through 126 covered attempts inclusive and the Wilson 95 percent interval must contain 0.95; acquisition zero is null",
+    "final_date_coverage_95": "explicit last element of coverage_95_by_date and independently gated",
+    "interval_score_mean_by_date": "bounded per-date sums divided by emitted attempts; acquisition zero is null",
+    "interval_width_mean_by_date": "bounded per-date sums divided by emitted attempts; acquisition zero is null",
+    "final_date_interval_receipts": "explicit last elements of per-date interval score and width",
+    "emission_rate": "count(emitted_true)/preregistered_cell_seed_count",
+    "support_count_totals": "sum_over_preregistered_cell_seed_count",
+    "realized_overlap_jaccard_mean": "sum_over_preregistered_cell_seed_count/preregistered_cell_seed_count",
+    "effective_looks_fraction": "mean_over_preregistered_cell_seed_count",
+    "retention": "only sums, outer products, per-date count vectors, scalar extrema and marginal traces, artifact/factor/support digests, and streaming digests; no attempts",
+    "masked": "one deterministic masked_target contract; pass; zero emission; null estimator, operator, contrast, and covariance evidence",
+    "not_evaluable": "only non-masked tied_eigenvalue cells; one deterministic canonical production probe with singular_local_information attempt status",
+    "status_precedence": [
+      "masked_expected_abstention",
+      "singular_local_information_not_evaluable",
+      "supported_numeric_gates"
+    ]
+  },
   "dimensions": {
-    "half_window": [{"id":"hw_1x1","value":[1,1]},{"id":"hw_3x6","value":[3,6]},{"id":"hw_7x14","value":[7,14]}],
-    "stride": [{"id":"stride_1","value":[1,1]},{"id":"stride_2","value":[2,2]},{"id":"stride_4","value":[4,4]}],
-    "support": [{"id":"rect","mask":"rect"},{"id":"glrt_frozen","mask":"glrt_frozen"},{"id":"ks_frozen","mask":"ks_frozen"}],
-    "position": [{"id":"interior","boundary":"interior"},{"id":"border_clamped","boundary":"border_clamped"},{"id":"tile_edge","boundary":"tile_edge"},{"id":"bounded_halo","boundary":"bounded_halo"},{"id":"masked","boundary":"masked"}],
-    "pair_geometry": [{"id":"coincident","nominal_distance_stratum":"coincident","realized_jaccard_constraint":"exactly_1","signed_influence":"zero"},{"id":"shared_75_positive","nominal_distance_stratum":"shared_75","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"positive"},{"id":"shared_75_negative","nominal_distance_stratum":"shared_75","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"negative"},{"id":"shared_50_positive","nominal_distance_stratum":"shared_50","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"positive"},{"id":"shared_50_negative","nominal_distance_stratum":"shared_50","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"negative"},{"id":"shared_25_positive","nominal_distance_stratum":"shared_25","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"positive"},{"id":"shared_25_negative","nominal_distance_stratum":"shared_25","realized_jaccard_constraint":"measured_per_attempt","signed_influence":"negative"},{"id":"disjoint_immediate","nominal_distance_stratum":"disjoint_immediate","realized_jaccard_constraint":"exactly_0","signed_influence":"none"},{"id":"disjoint_after_depth_1","nominal_distance_stratum":"disjoint_after_depth_1","realized_jaccard_constraint":"exactly_0","signed_influence":"none"},{"id":"disjoint_after_depth_2","nominal_distance_stratum":"disjoint_after_depth_2","realized_jaccard_constraint":"exactly_0","signed_influence":"none"},{"id":"disjoint_after_depth_4","nominal_distance_stratum":"disjoint_after_depth_4","realized_jaccard_constraint":"exactly_0","signed_influence":"none"}],
-    "block_topology": [{"id":"one_block","blocks":1,"edge_case":"none"},{"id":"two_blocks","blocks":2,"edge_case":"none"},{"id":"four_blocks","blocks":4,"edge_case":"none"},{"id":"two_blocks_cap_eviction","blocks":2,"edge_case":"cap_eviction"},{"id":"four_blocks_partial_final","blocks":4,"edge_case":"partial_final"}],
-    "estimator": [{"id":"emi","method":"EMI"},{"id":"evd","method":"EVD"}],
-    "eigen_stress": [{"id":"well_separated","condition":"well_separated"},{"id":"tied_eigenvalue","condition":"tied_eigenvalue"},{"id":"near_tie","condition":"near_tie"}],
-    "source_process": [{"id":"independent_complex_looks","correlation":"independent"},{"id":"spatial_correlation_stress","correlation":"spatial_correlation_stress"}]
+    "half_window": [
+      {
+        "id": "hw_1x1",
+        "value": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "hw_3x6",
+        "value": [
+          3,
+          6
+        ]
+      },
+      {
+        "id": "hw_7x14",
+        "value": [
+          7,
+          14
+        ]
+      }
+    ],
+    "stride": [
+      {
+        "id": "stride_1",
+        "value": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "stride_2",
+        "value": [
+          2,
+          2
+        ]
+      },
+      {
+        "id": "stride_4",
+        "value": [
+          4,
+          4
+        ]
+      }
+    ],
+    "support": [
+      {
+        "id": "rect",
+        "mask": "rect"
+      },
+      {
+        "id": "glrt_frozen",
+        "mask": "glrt_frozen"
+      },
+      {
+        "id": "ks_frozen",
+        "mask": "ks_frozen"
+      }
+    ],
+    "position": [
+      {
+        "id": "interior",
+        "boundary": "interior"
+      },
+      {
+        "id": "border_clamped",
+        "boundary": "border_clamped"
+      },
+      {
+        "id": "tile_edge",
+        "boundary": "tile_edge"
+      },
+      {
+        "id": "bounded_halo",
+        "boundary": "bounded_halo"
+      },
+      {
+        "id": "masked",
+        "boundary": "masked"
+      }
+    ],
+    "pair_geometry": [
+      {
+        "id": "coincident",
+        "nominal_distance_stratum": "coincident",
+        "realized_jaccard_constraint": "exactly_1",
+        "signed_influence": "zero"
+      },
+      {
+        "id": "shared_75_positive",
+        "nominal_distance_stratum": "shared_75",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "positive"
+      },
+      {
+        "id": "shared_75_negative",
+        "nominal_distance_stratum": "shared_75",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "negative"
+      },
+      {
+        "id": "shared_50_positive",
+        "nominal_distance_stratum": "shared_50",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "positive"
+      },
+      {
+        "id": "shared_50_negative",
+        "nominal_distance_stratum": "shared_50",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "negative"
+      },
+      {
+        "id": "shared_25_positive",
+        "nominal_distance_stratum": "shared_25",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "positive"
+      },
+      {
+        "id": "shared_25_negative",
+        "nominal_distance_stratum": "shared_25",
+        "realized_jaccard_constraint": "measured_per_attempt",
+        "signed_influence": "negative"
+      },
+      {
+        "id": "disjoint_immediate",
+        "nominal_distance_stratum": "disjoint_immediate",
+        "realized_jaccard_constraint": "exactly_0",
+        "signed_influence": "none"
+      },
+      {
+        "id": "disjoint_after_depth_1",
+        "nominal_distance_stratum": "disjoint_after_depth_1",
+        "realized_jaccard_constraint": "exactly_0",
+        "signed_influence": "none"
+      },
+      {
+        "id": "disjoint_after_depth_2",
+        "nominal_distance_stratum": "disjoint_after_depth_2",
+        "realized_jaccard_constraint": "exactly_0",
+        "signed_influence": "none"
+      },
+      {
+        "id": "disjoint_after_depth_4",
+        "nominal_distance_stratum": "disjoint_after_depth_4",
+        "realized_jaccard_constraint": "exactly_0",
+        "signed_influence": "none"
+      }
+    ],
+    "block_topology": [
+      {
+        "id": "one_block",
+        "blocks": 1,
+        "edge_case": "none"
+      },
+      {
+        "id": "two_blocks",
+        "blocks": 2,
+        "edge_case": "none"
+      },
+      {
+        "id": "four_blocks",
+        "blocks": 4,
+        "edge_case": "none"
+      },
+      {
+        "id": "two_blocks_cap_eviction",
+        "blocks": 2,
+        "edge_case": "cap_eviction"
+      },
+      {
+        "id": "four_blocks_partial_final",
+        "blocks": 4,
+        "edge_case": "partial_final"
+      }
+    ],
+    "estimator": [
+      {
+        "id": "emi",
+        "method": "EMI"
+      },
+      {
+        "id": "evd",
+        "method": "EVD"
+      }
+    ],
+    "eigen_stress": [
+      {
+        "id": "well_separated",
+        "condition": "well_separated"
+      },
+      {
+        "id": "tied_eigenvalue",
+        "condition": "tied_eigenvalue"
+      },
+      {
+        "id": "near_tie",
+        "condition": "near_tie"
+      }
+    ],
+    "source_process": [
+      {
+        "id": "independent_complex_looks",
+        "correlation": "independent"
+      },
+      {
+        "id": "spatial_correlation_stress",
+        "correlation": "spatial_correlation_stress"
+      }
+    ]
   },
-  "cell_policy": {"required_design":"cartesian_product_of_dimensions","allowed_not_evaluable":["tied_eigenvalue"],"masked_position_status":"masked_target","masked_position_factor_emitted":false,"masked_position_is_expected_abstention":true,"correlated_source_requires_same_gates":true,"aggregate_receipts_allowed":false,"outcome_top_up_allowed":false,"unsupported_conditions":["invalid_reference","empty_support","nonfinite_source","non_psd_truth","missing_attempt_record"]},
-  "thresholds": {"deterministic_operator_relative_error_max":1e-10,"stochastic_operator_relative_error_max":0.1,"contrast_variance_relative_error_max":0.1,"psd_min_eigenvalue_min":-1e-10,"coverage_probability":0.95,"coverage_absolute_error_max":0.02,"emission_rate_min":0.99,"weak_zero_variance_max":1e-14,"resource_rss_bytes_max":25769803776,"resource_growth":"area_or_dates_linear; no quadratic axis","resource_buffer_policy":"no_tile_area_times_s_b_times_d_b_squared_buffer"},
-  "hash_fields": {"algorithm":"sha256","run_manifest_required":["preregistration_sha256","code_sha256","binary_sha256","generator_protocol_sha256","result_root_sha256"],"shard_manifest_required":["input_sha256","output_sha256","preregistration_sha256","code_sha256","binary_sha256","generator_protocol_sha256"],"cell_required":["operator_hash","variance_hash","emission_hash","truth_hash"],"attempt_required":["seed_sha256","raw_input_sha256","truth_sha256","operator_hash","variance_hash","emission_hash","date_axis_sha256","generator_hash","config_hash","source_model_hash","target_support_sha256","reference_support_sha256"],"resource_required":["resource_hash","config_hash","binary_hash"]},
+  "cell_policy": {
+    "required_design": "explicit_3_by_4_by_2_scientific_axes_plus_deterministic_behavior_contracts",
+    "deterministic_contract_if": [
+      "cell_is_listed_in_matrix_contract.deterministic_contract_cells"
+    ],
+    "coincident_stochastic_required": true,
+    "supported_interior_disjoint_monte_carlo": true,
+    "allowed_not_evaluable": [
+      "singular_local_information"
+    ],
+    "masked_position_status": "masked_target",
+    "masked_position_factor_emitted": false,
+    "masked_position_is_expected_abstention": true,
+    "correlated_source_requires_same_gates": true,
+    "aggregate_receipts_allowed": false,
+    "outcome_top_up_allowed": false,
+    "unsupported_conditions": [
+      "invalid_reference",
+      "empty_support",
+      "nonfinite_source",
+      "non_psd_predicted_covariance",
+      "missing_attempt_record"
+    ],
+    "tied_eigen_stress_probe": "canonical_actual_production_singular_local_information"
+  },
+  "thresholds": {
+    "deterministic_operator_relative_error_max": 1e-10,
+    "stochastic_operator_relative_error_max": 0.1,
+    "contrast_variance_relative_error_max": 0.1,
+    "covariance_calibration_relative_error_max": 0.1,
+    "psd_min_eigenvalue_min": -1e-10,
+    "coverage_probability": 0.95,
+    "coverage_gate": "exact_binomial_central_95_intersect_wilson_95_contains_target_v1",
+    "coverage_gate_scope": "noncoincident_stochastic_cells",
+    "coverage_coincident_covered_count": 128,
+    "coverage_seed_count": 128,
+    "coverage_covered_count_min": 117,
+    "coverage_covered_count_max": 126,
+    "coverage_wilson_z": 1.959963984540054,
+    "emission_rate_min": 0.99,
+    "resource_rss_bytes_max": 25769803776,
+    "resource_growth": "area_or_dates_linear; no quadratic area axis",
+    "resource_buffer_policy": "no_allocation_component_with_two_area_scaled_axes"
+  },
+  "hash_fields": {
+    "algorithm": "sha256",
+    "run_manifest_required": [
+      "preregistration_sha256",
+      "code_sha256",
+      "binary_sha256",
+      "generator_protocol_sha256",
+      "result_root_sha256",
+      "production_parity_fixture_sha256"
+    ],
+    "shard_manifest_required": [
+      "summary_sha256",
+      "preregistration_sha256",
+      "code_sha256",
+      "binary_sha256",
+      "generator_protocol_sha256"
+    ],
+    "cell_required": [
+      "request_digest",
+      "attempt_digest",
+      "estimate_digest",
+      "latent_history_digest",
+      "target_support_digest",
+      "reference_support_digest",
+      "predicted_covariance_digest",
+      "empirical_error_covariance_digest"
+    ],
+    "ephemeral_attempt_required": [
+      "seed_sha256",
+      "raw_input_sha256",
+      "target_raw_input_sha256",
+      "reference_raw_input_sha256",
+      "sequential_ancestry_sha256",
+      "raw_dgp_identity_sha256",
+      "latent_history_sha256",
+      "estimate_sha256",
+      "predicted_covariance_sha256",
+      "operator_sha256",
+      "date_axis_sha256",
+      "generator_hash",
+      "config_hash",
+      "source_model_hash",
+      "target_support_sha256",
+      "reference_support_sha256"
+    ],
+    "resource_required": [
+      "resource_hash",
+      "config_hash",
+      "binary_hash",
+      "raw_measurement_sha256",
+      "stdout_sha256",
+      "allocation_model_sha256",
+      "dependency_cone_sha256",
+      "microbatch_sha256",
+      "component_sha256"
+    ]
+  },
   "generator": {
-    "binary": {"package":"dolphin-workflows","target":"example:spatial_covariance_batch","release_invocation_template":["cargo","run","--release","-p","dolphin-workflows","--example","spatial_covariance_batch","--","--contract-jsonl","{input_shard}","--output-jsonl","{output_partial}"],"input_schema":"dolphinrust.spatial-covariance.attempt/3","output_schema":"dolphinrust.spatial-covariance.attempt-receipt/3","one_input_one_output":true,"stdout":"diagnostics_only","stderr":"diagnostics_only","exit_code_zero_only":true},
-    "acquisition": {"date_origin":"2020-01-01","cadence_days":12,"date_axis_order":"ascending_iso8601","planner":{"crate":"dolphin-stack","planner":"MiniStackPlanner::plan","ministack_size":5,"max_num_compressed":2,"output_reference_idx":0,"compressed_slc_plan":"always_first","partial_policy":"min(num_slc-start,ministack_size)"},"topologies":{
-      "one_block":{"acquisition_count":5,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18"],"ministack_size":5,"max_num_compressed":2,"expected_blocks":[{"block_id":0,"num_compressed":0,"real_start":0,"num_real":5}],"partial_tail_count":0,"cap_eviction":false},
-      "two_blocks":{"acquisition_count":10,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18"],"ministack_size":5,"max_num_compressed":2,"expected_blocks":[{"block_id":0,"num_compressed":0,"real_start":0,"num_real":5},{"block_id":1,"num_compressed":1,"real_start":5,"num_real":5}],"partial_tail_count":0,"cap_eviction":false},
-      "four_blocks":{"acquisition_count":20,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18","2020-04-30","2020-05-12","2020-05-24","2020-06-05","2020-06-17","2020-06-29","2020-07-11","2020-07-23","2020-08-04","2020-08-16"],"ministack_size":5,"max_num_compressed":2,"expected_blocks":[{"block_id":0,"num_compressed":0,"real_start":0,"num_real":5},{"block_id":1,"num_compressed":1,"real_start":5,"num_real":5},{"block_id":2,"num_compressed":2,"real_start":10,"num_real":5},{"block_id":3,"num_compressed":2,"real_start":15,"num_real":5}],"partial_tail_count":0,"cap_eviction":false},
-      "two_blocks_cap_eviction":{"acquisition_count":10,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18"],"ministack_size":5,"max_num_compressed":1,"expected_blocks":[{"block_id":0,"num_compressed":0,"real_start":0,"num_real":5},{"block_id":1,"num_compressed":1,"real_start":5,"num_real":5}],"partial_tail_count":0,"cap_eviction":true},
-      "four_blocks_partial_final":{"acquisition_count":17,"date_axis":["2020-01-01","2020-01-13","2020-01-25","2020-02-06","2020-02-18","2020-03-01","2020-03-13","2020-03-25","2020-04-06","2020-04-18","2020-04-30","2020-05-12","2020-05-24","2020-06-05","2020-06-17","2020-06-29","2020-07-11"],"ministack_size":5,"max_num_compressed":2,"expected_blocks":[{"block_id":0,"num_compressed":0,"real_start":0,"num_real":5},{"block_id":1,"num_compressed":1,"real_start":5,"num_real":5},{"block_id":2,"num_compressed":2,"real_start":10,"num_real":5},{"block_id":3,"num_compressed":2,"real_start":15,"num_real":2}],"partial_tail_count":2,"cap_eviction":false}}},
-    "raw_proper_complex": {"model":"proper_complex_gaussian_v1","dtype":"complex64","compute_dtype":"f64","mean":[0.0,0.0],"covariance_convention":"C_ab=E[Z_a conjugate(Z_b)]","covariance_shape":"N_by_N_per_topology","covariance_formula":"C_ab=A_a*A_b*exp(-abs(date_days_a-date_days_b)/correlation_days)*exp(i*(phase_a-phase_b))+noise_variance*delta_ab","hermitian_rule":"C_ba=conjugate(C_ab)","phase_formula":"phase_a=phase0+slope_rad_per_day*date_days_a","signal_amplitude":1.0,"phase0_rad":0.25,"slope_rad_per_day":0.001,"correlation_days":36.0,"noise_variance":0.25,"pseudo_covariance":"E[Z Z^T]=0","sampler":"Z=mu+L*(U+iV)/sqrt(2), U,V iid N(0,I), C=L L^H lower_hermitian_cholesky","sampler_seed":"sha256(validation_seed||cell_id||seed_index||source_key)","date_axis_input":"acquisition.topologies[block_topology].date_axis","spatial_correlation":{"model":"proper_complex_spatial_stress_v1","matrix":"R_ab=exp(-EuclideanDistance(source_a,source_b)/1.5 pixels)","distance_metric":"Euclidean","distance_scale_pixels":1.5,"diagonal":1.0,"support":"realized_target_support_union_reference_support","factorization":"lower_cholesky(R)","application":"L_R*(U+iV)/sqrt(2)"}},
-    "source_centered_empirical": {"model":"source_centered_empirical_proper_complex_v1","support_centering":"source_centered_inward_clamped","covariance_definition":"E[Z Z*]/n","mean":"zero; no sample-mean subtraction","shrinkage_alpha":0.05,"amplitude_floor_relative_to_mean_diagonal":1e-12,"floor_application":"after_zero_mean_covariance_and_shrinkage","component_order":["real","imag"],"date_order":"acquisition_index_then_date","identity_hashes":["source_values_sha256","zero_mean_second_moment_sha256","covariance_sha256","support_mask_sha256"]},
-    "effective_looks": {"model":"source_factor_declared_v1","independent_fraction":1.0,"spatial_fraction":"n/(1^T R 1)","application":"source_factor_divided_by_sqrt_fraction","correlation_matrix":"R_ab=exp(-EuclideanDistance(source_a,source_b)/1.5 pixels)","distance_metric":"Euclidean","distance_scale_pixels":1.5,"diagonal":1.0,"support_union":"realized_target_support_union_reference_support","recompute_per_cell":true},
-    "estimators": {"emi":{"beta":0.0,"zero_correlation_threshold":0.0,"branch":"emi"},"evd":{"branch":"evd","eigenvalue_sort":"descending","eigengap_min":1e-8,"tie_gap":1e-12,"tie_value":1.0}},
-    "neighbor_generation": {"production_crate":"dolphin-shp","full_half_window":true,"offset_order":"neighbor_grid_row_major_from_clamped_start","glrt":{"algorithm":"estimate_neighbors_glrt","alpha":0.001,"threshold":"chi2(df=1).inverse_cdf(1-alpha)","scale":"(var+mean^2)/2","statistic":"N*(2*ln(pooled)-ln(scale1)-ln(scale2))","center_excluded":true,"border":"clamped_window"},"ks":{"algorithm":"estimate_neighbors_ks","alpha":0.001,"cutoff":"ecdf_critical_distance(nslc,alpha)","sort_pixels":true,"center_excluded":true,"border":"full_window_required"},"fixed_support_reuse":true,"support_identity":"target_and_reference_masks_are_independent_realized_masks_and_are_reused_for_truth/operator","selection_seed":"sha256(validation_seed||cell_id||seed_index)","mask_freeze":"same_realized_mask_for_target_reference_and_truth"},
-    "coordinates": {"coordinate_frame":"tile_row_col","rounding":"integer","window_stride_table":"coordinates_by_window_stride_and_position","geometry_labels_are_nominal_distance_strata":true,"realized_overlap":"intersection_source_count/union_source_count (Jaccard) from exact target/reference support keys per attempt","adaptive_supports":"target and reference support hashes and counts vary by seed","window_stride":{
-      "hw_1x1|stride_1":{"half_window":[1,1],"stride":[1,1],"support_shape":[3,3],"target_by_position":{"interior":[128,128],"border_clamped":[1,1],"tile_edge":[128,254],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,1],"shared_75_negative":[0,1],"shared_50_positive":[0,2],"shared_50_negative":[0,2],"shared_25_positive":[0,3],"shared_25_negative":[0,3],"disjoint_immediate":[0,4],"disjoint_after_depth_1":[0,5],"disjoint_after_depth_2":[0,8],"disjoint_after_depth_4":[0,16]}},
-      "hw_1x1|stride_2":{"half_window":[1,1],"stride":[2,2],"support_shape":[3,3],"target_by_position":{"interior":[128,128],"border_clamped":[2,2],"tile_edge":[128,252],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,2],"shared_75_negative":[0,2],"shared_50_positive":[0,4],"shared_50_negative":[0,4],"shared_25_positive":[0,6],"shared_25_negative":[0,6],"disjoint_immediate":[0,8],"disjoint_after_depth_1":[0,10],"disjoint_after_depth_2":[0,16],"disjoint_after_depth_4":[0,32]}},
-      "hw_1x1|stride_4":{"half_window":[1,1],"stride":[4,4],"support_shape":[3,3],"target_by_position":{"interior":[128,128],"border_clamped":[4,4],"tile_edge":[128,248],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,4],"shared_75_negative":[0,4],"shared_50_positive":[0,8],"shared_50_negative":[0,8],"shared_25_positive":[0,12],"shared_25_negative":[0,12],"disjoint_immediate":[0,16],"disjoint_after_depth_1":[0,20],"disjoint_after_depth_2":[0,32],"disjoint_after_depth_4":[0,64]}},
-      "hw_3x6|stride_1":{"half_window":[3,6],"stride":[1,1],"support_shape":[7,13],"target_by_position":{"interior":[128,128],"border_clamped":[3,6],"tile_edge":[128,250],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,1],"shared_75_negative":[0,1],"shared_50_positive":[0,2],"shared_50_negative":[0,2],"shared_25_positive":[0,3],"shared_25_negative":[0,3],"disjoint_immediate":[0,13],"disjoint_after_depth_1":[0,14],"disjoint_after_depth_2":[0,26],"disjoint_after_depth_4":[0,52]}},
-      "hw_3x6|stride_2":{"half_window":[3,6],"stride":[2,2],"support_shape":[7,13],"target_by_position":{"interior":[128,128],"border_clamped":[6,12],"tile_edge":[128,244],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,2],"shared_75_negative":[0,2],"shared_50_positive":[0,4],"shared_50_negative":[0,4],"shared_25_positive":[0,6],"shared_25_negative":[0,6],"disjoint_immediate":[0,26],"disjoint_after_depth_1":[0,28],"disjoint_after_depth_2":[0,52],"disjoint_after_depth_4":[0,104]}},
-      "hw_3x6|stride_4":{"half_window":[3,6],"stride":[4,4],"support_shape":[7,13],"target_by_position":{"interior":[128,128],"border_clamped":[12,24],"tile_edge":[128,232],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,4],"shared_75_negative":[0,4],"shared_50_positive":[0,8],"shared_50_negative":[0,8],"shared_25_positive":[0,12],"shared_25_negative":[0,12],"disjoint_immediate":[0,52],"disjoint_after_depth_1":[0,56],"disjoint_after_depth_2":[0,104],"disjoint_after_depth_4":[0,208]}},
-      "hw_7x14|stride_1":{"half_window":[7,14],"stride":[1,1],"support_shape":[15,29],"target_by_position":{"interior":[128,128],"border_clamped":[7,14],"tile_edge":[128,242],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,1],"shared_75_negative":[0,1],"shared_50_positive":[0,2],"shared_50_negative":[0,2],"shared_25_positive":[0,3],"shared_25_negative":[0,3],"disjoint_immediate":[0,29],"disjoint_after_depth_1":[0,30],"disjoint_after_depth_2":[0,58],"disjoint_after_depth_4":[0,116]}},
-      "hw_7x14|stride_2":{"half_window":[7,14],"stride":[2,2],"support_shape":[15,29],"target_by_position":{"interior":[128,128],"border_clamped":[14,28],"tile_edge":[128,228],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,2],"shared_75_negative":[0,2],"shared_50_positive":[0,4],"shared_50_negative":[0,4],"shared_25_positive":[0,6],"shared_25_negative":[0,6],"disjoint_immediate":[0,58],"disjoint_after_depth_1":[0,60],"disjoint_after_depth_2":[0,116],"disjoint_after_depth_4":[0,232]}},
-      "hw_7x14|stride_4":{"half_window":[7,14],"stride":[4,4],"support_shape":[15,29],"target_by_position":{"interior":[128,128],"border_clamped":[28,56],"tile_edge":[128,200],"bounded_halo":[64,64],"masked":[128,128]},"reference_delta_by_pair_geometry":{"coincident":[0,0],"shared_75_positive":[0,4],"shared_75_negative":[0,4],"shared_50_positive":[0,8],"shared_50_negative":[0,8],"shared_25_positive":[0,12],"shared_25_negative":[0,12],"disjoint_immediate":[0,116],"disjoint_after_depth_1":[0,120],"disjoint_after_depth_2":[0,232],"disjoint_after_depth_4":[0,464]}}
-    }},
-    "signed_spatial_field": {"field":"amplitude(x,y)=1+0.05*sin((x+3*y)/7); phase(x,y)=0.125*cos((2*x-y)/11)","pair_perturbation":"positive=+field(target)-field(reference); negative=-(field(target)-field(reference))","zero":"coincident exact zero","none":"disjoint source-key cross term exact zero","sign_field_identity":"sha256(cell_id||target_coordinate||reference_coordinate||seed_index)","persist":"signed_cross_influence and sign per attempt"},
-    "truth": {"operator":"direct_contrast_from_raw_covariance","variance":"target+reference-2*cross","interval":"estimate +/- 1.959963984540054*sqrt(estimated_variance)","z_95":1.959963984540054,"coverage_event":"truth_interval_contains_truth","attempt_aggregation":"all_attempts_in_cell","emission_aggregation":"sum_emitted_divided_by_5000"},
-    "supported": {"supported_if":["finite_raw_source","proper_complex_pseudocovariance_zero","psd_truth","nonempty_frozen_support","valid_reference"],"stable_attempt_statuses":["valid","masked_target","tied_eigenvalue"],"not_evaluable_if":["tied_eigenvalue"],"expected_abstention_if":["masked_target"],"receipt_failure_if":["invalid_reference","empty_support","nonfinite_source","non_psd_truth","missing_attempt_record","support_identity_mismatch"]},
-    "identity": {"protocol_version":3,"release_only":true,"required_hashes":["binary_sha256","code_sha256","config_sha256","source_model_sha256","generator_protocol_sha256","result_sha256"]}
+    "binary": {
+      "package": "dolphin-workflows",
+      "target": "example:spatial_covariance_batch",
+      "release_invocation_template": [
+        "target/release/examples/spatial_covariance_batch",
+        "--preregistration",
+        "{preregistration}",
+        "--cell-id",
+        "{cell_id}",
+        "--ephemeral-evidence-stdout"
+      ],
+      "source_identity": {
+        "schema": "dolphinrust.canonical-rust-source-set/1",
+        "roots": [
+          "crates"
+        ],
+        "files": [
+          "Cargo.lock",
+          "Cargo.toml"
+        ],
+        "sha256": "7c2bb91c4b5f2d1a7782122d1dbc160c4626b667e33097d0241bbb391e900a99"
+      },
+      "producer_binary_identity": {
+        "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
+        "batch_path": "target/release/examples/spatial_covariance_batch",
+        "benchmark_path": "target/release/examples/spatial_covariance_bench",
+        "binary_sha256_definition": "SHA-256 of canonical JSON containing the exact streamed SHA-256 and byte count of both prebuilt release executables"
+      },
+      "request_schema": "dolphinrust.spatial-covariance.attempt/4",
+      "ephemeral_output_schema": "dolphinrust.spatial-covariance.attempt-evidence/4",
+      "request_source": "deterministic internal regeneration",
+      "one_input_one_output": true,
+      "stdout": "ephemeral attempt evidence only",
+      "stderr": "diagnostics_only",
+      "exit_code_zero_only": true
+    },
+    "acquisition": {
+      "date_origin": "2020-01-01",
+      "cadence_days": 12,
+      "date_axis_order": "ascending_iso8601",
+      "planner": {
+        "crate": "dolphin-stack",
+        "planner": "MiniStackPlanner::plan",
+        "ministack_size": 5,
+        "max_num_compressed": 2,
+        "output_reference_idx": 0,
+        "compressed_slc_plan": "always_first",
+        "partial_policy": "min(num_slc-start,ministack_size)"
+      },
+      "topologies": {
+        "one_block": {
+          "acquisition_count": 5,
+          "date_axis": [
+            "2020-01-01",
+            "2020-01-13",
+            "2020-01-25",
+            "2020-02-06",
+            "2020-02-18"
+          ],
+          "ministack_size": 5,
+          "max_num_compressed": 2,
+          "expected_blocks": [
+            {
+              "block_id": 0,
+              "num_compressed": 0,
+              "real_start": 0,
+              "num_real": 5
+            }
+          ],
+          "partial_tail_count": 0,
+          "cap_eviction": false
+        },
+        "two_blocks": {
+          "acquisition_count": 10,
+          "date_axis": [
+            "2020-01-01",
+            "2020-01-13",
+            "2020-01-25",
+            "2020-02-06",
+            "2020-02-18",
+            "2020-03-01",
+            "2020-03-13",
+            "2020-03-25",
+            "2020-04-06",
+            "2020-04-18"
+          ],
+          "ministack_size": 5,
+          "max_num_compressed": 2,
+          "expected_blocks": [
+            {
+              "block_id": 0,
+              "num_compressed": 0,
+              "real_start": 0,
+              "num_real": 5
+            },
+            {
+              "block_id": 1,
+              "num_compressed": 1,
+              "real_start": 5,
+              "num_real": 5
+            }
+          ],
+          "partial_tail_count": 0,
+          "cap_eviction": false
+        },
+        "four_blocks": {
+          "acquisition_count": 20,
+          "date_axis": [
+            "2020-01-01",
+            "2020-01-13",
+            "2020-01-25",
+            "2020-02-06",
+            "2020-02-18",
+            "2020-03-01",
+            "2020-03-13",
+            "2020-03-25",
+            "2020-04-06",
+            "2020-04-18",
+            "2020-04-30",
+            "2020-05-12",
+            "2020-05-24",
+            "2020-06-05",
+            "2020-06-17",
+            "2020-06-29",
+            "2020-07-11",
+            "2020-07-23",
+            "2020-08-04",
+            "2020-08-16"
+          ],
+          "ministack_size": 5,
+          "max_num_compressed": 2,
+          "expected_blocks": [
+            {
+              "block_id": 0,
+              "num_compressed": 0,
+              "real_start": 0,
+              "num_real": 5
+            },
+            {
+              "block_id": 1,
+              "num_compressed": 1,
+              "real_start": 5,
+              "num_real": 5
+            },
+            {
+              "block_id": 2,
+              "num_compressed": 2,
+              "real_start": 10,
+              "num_real": 5
+            },
+            {
+              "block_id": 3,
+              "num_compressed": 2,
+              "real_start": 15,
+              "num_real": 5
+            }
+          ],
+          "partial_tail_count": 0,
+          "cap_eviction": false
+        },
+        "two_blocks_cap_eviction": {
+          "acquisition_count": 10,
+          "date_axis": [
+            "2020-01-01",
+            "2020-01-13",
+            "2020-01-25",
+            "2020-02-06",
+            "2020-02-18",
+            "2020-03-01",
+            "2020-03-13",
+            "2020-03-25",
+            "2020-04-06",
+            "2020-04-18"
+          ],
+          "ministack_size": 5,
+          "max_num_compressed": 1,
+          "expected_blocks": [
+            {
+              "block_id": 0,
+              "num_compressed": 0,
+              "real_start": 0,
+              "num_real": 5
+            },
+            {
+              "block_id": 1,
+              "num_compressed": 1,
+              "real_start": 5,
+              "num_real": 5
+            }
+          ],
+          "partial_tail_count": 0,
+          "cap_eviction": true
+        },
+        "four_blocks_partial_final": {
+          "acquisition_count": 17,
+          "date_axis": [
+            "2020-01-01",
+            "2020-01-13",
+            "2020-01-25",
+            "2020-02-06",
+            "2020-02-18",
+            "2020-03-01",
+            "2020-03-13",
+            "2020-03-25",
+            "2020-04-06",
+            "2020-04-18",
+            "2020-04-30",
+            "2020-05-12",
+            "2020-05-24",
+            "2020-06-05",
+            "2020-06-17",
+            "2020-06-29",
+            "2020-07-11"
+          ],
+          "ministack_size": 5,
+          "max_num_compressed": 2,
+          "expected_blocks": [
+            {
+              "block_id": 0,
+              "num_compressed": 0,
+              "real_start": 0,
+              "num_real": 5
+            },
+            {
+              "block_id": 1,
+              "num_compressed": 1,
+              "real_start": 5,
+              "num_real": 5
+            },
+            {
+              "block_id": 2,
+              "num_compressed": 2,
+              "real_start": 10,
+              "num_real": 5
+            },
+            {
+              "block_id": 3,
+              "num_compressed": 2,
+              "real_start": 15,
+              "num_real": 2
+            }
+          ],
+          "partial_tail_count": 2,
+          "cap_eviction": false
+        }
+      }
+    },
+    "raw_proper_complex": {
+      "model": "production_shaped_proper_complex_portable_lut_v3",
+      "dtype": "complex64",
+      "compute_dtype": "f64",
+      "mean": [
+        0.0,
+        0.0
+      ],
+      "source_shape": "realized_support_union_by_acquisition",
+      "component_order": [
+        "real",
+        "imag"
+      ],
+      "temporal_signal": "proper-complex AR(1) using frozen binary64 rho and innovation-weight coefficients in fixed scalar order",
+      "spatial_stress": "signal and measurement-noise local/global proper-complex innovations mixed with weights sqrt(0.5); matched positive and negative pairs share draws and marginal parameters; negative-loading sources conjugate the complete latent-frame stochastic base before the common frozen phasor",
+      "phase_formula": "frozen common phasor and latent-phase IEEE754 bit tables indexed by (2*row-column,date_index); signed loading never changes the latent phasor",
+      "amplitude_formula": "frozen signal-scale IEEE754 bit table indexed by (row+3*column,eigen_stress,date_index)",
+      "signal_amplitude": 1.0,
+      "phase0_rad": 0.25,
+      "slope_rad_per_day": 0.001,
+      "correlation_days": 36.0,
+      "noise_variance": 0.25,
+      "pseudo_covariance": "E[Z Z^T]=0",
+      "sampler_seed": "portable SHA-256 counter key bound to the frozen DGP generator identity, matched cohort cell ordinal, seed, coordinate, date, named stream, and counter; support selection reads this same signed stack",
+      "date_axis_input": "acquisition.topologies[block_topology].date_axis"
+    },
+    "full_replay_dgp": {
+      "model": "full_production_shaped_raw_replay_v3",
+      "native_tile_shape": [
+        256,
+        256
+      ],
+      "cross_tile_support": "global non-negative coordinates span adjacent 256 by 256 native tiles; support and the complete transitive dependency halo are cropped only at the validation mosaic origin, never at an internal native-tile edge",
+      "candidate_sources": "complete contiguous row-major phase half-window with production inward clamping inside each 256 by 256 native tile, for target union reference before adaptive selection",
+      "raw_shape": "complete transitive replay dependency halo by complete topology acquisition count by real/imag",
+      "dependency_halo_expansions": "one phase half-window per expected sequential block, including the final source-factor window",
+      "raw_receipts": [
+        "raw_input_shape",
+        "raw_input_value_count",
+        "raw_input_sha256",
+        "target_raw_input_sha256",
+        "reference_raw_input_sha256"
+      ],
+      "support_receipts": [
+        "target_support_sha256",
+        "reference_support_sha256",
+        "target_source_count",
+        "reference_source_count",
+        "intersection_source_count",
+        "union_source_count"
+      ],
+      "support_generation": "run the frozen Rect, GLRT, or KS selector on the signed production stack separately for every expected ministack real-acquisition slice; hashes bind ordered block_id and row-major realized sources",
+      "ancestry": "bind every expected ministack block, carried parent identity, complete date axis, acquisition-zero gauge, cap eviction, and partial tail",
+      "latent_history": "noiseless target/reference coordinate phase histories from the frozen phase formula, date cadence, pair orientation, and exact acquisition-zero gauge",
+      "rust_output": "actual EMI or EVD target/reference estimated histories plus predicted production target-minus-reference date covariance",
+      "coincident": "same realized support and raw source content, identical latent and estimated histories, exact zero predicted contrast covariance",
+      "comparison": "Python regenerates all content/support/ancestry/DGP/latent digests and derives estimator errors, empirical covariance, predicted covariance mean, PSD, intervals, and coverage",
+      "factor_sources": "for every realized primitive phase source, read a second cell half-window with the same production inward clamping; the raw cube also retains each transitive prior-block phase dependency required by sequential compression replay"
+    },
+    "source_centered_empirical": {
+      "model": "source_centered_empirical_proper_complex_v1",
+      "support_centering": "source_centered_inward_clamped",
+      "covariance_definition": "E[Z Z*]/n",
+      "mean": "zero; no sample-mean subtraction",
+      "shrinkage_alpha": 0.05,
+      "amplitude_floor_relative_to_mean_diagonal": 1e-12,
+      "floor_application": "after_zero_mean_covariance_and_shrinkage",
+      "component_order": [
+        "real",
+        "imag"
+      ],
+      "date_order": "acquisition_index_then_date",
+      "identity_hashes": [
+        "source_values_sha256",
+        "zero_mean_second_moment_sha256",
+        "covariance_sha256",
+        "support_mask_sha256"
+      ],
+      "half_window": "cell half_window around every realized primitive source, production inward-clamped inside its 256 by 256 native tile"
+    },
+    "effective_looks": {
+      "model": "source_process_declared_v1",
+      "application": "source_influence_joint_contraction_v1",
+      "covariance_contract": "Cov=sum_{s,t} R(s,t) W_s^T W_t, evaluated per sequential source block in its common factor basis",
+      "identity_model": "R_ab=1 when source_a equals source_b and 0 otherwise",
+      "exponential_model": "R_ab=exp(-EuclideanDistance(source_a,source_b)/1.5 pixels)",
+      "distance_metric": "Euclidean",
+      "distance_scale_pixels": 1.5,
+      "diagonal": 1.0,
+      "support_union": "realized_target_support_union_reference_support",
+      "recompute_per_cell": true,
+      "fraction": "n/(1^T R 1)",
+      "independent_recomputation_tolerance": "abs(actual-expected) <= 1e-12*max(1,abs(expected)); canonical receipt digests remain exact",
+      "source_process_models": {
+        "independent_complex_looks": "identity_v1",
+        "spatial_correlation_stress": "exponential_euclidean_v1"
+      },
+      "fraction_role": "diagnostic n/(1^T R 1); never applied as a final scalar covariance inflation",
+      "bounded_factorization": "query-local per-basis A^T R A with admitted S by S R and two S by selected buffers"
+    },
+    "estimators": {
+      "emi": {
+        "beta": 0.1,
+        "zero_correlation_threshold": 0.0,
+        "branch": "emi"
+      },
+      "evd": {
+        "branch": "evd",
+        "eigenvalue_sort": "descending",
+        "eigengap_min": 1e-08,
+        "tie_gap": 1e-12,
+        "tie_value": 1.0
+      }
+    },
+    "neighbor_generation": {
+      "production_crate": "dolphin-shp",
+      "full_half_window": true,
+      "offset_order": "neighbor_grid_row_major_from_clamped_start",
+      "glrt": {
+        "algorithm": "estimate_neighbors_glrt",
+        "alpha": 0.001,
+        "threshold": "chi2(df=1).inverse_cdf(1-alpha)",
+        "scale": "(var+mean^2)/2",
+        "statistic": "N*(2*ln(pooled)-ln(scale1)-ln(scale2))",
+        "center_excluded": true,
+        "border": "clamped_window"
+      },
+      "ks": {
+        "algorithm": "estimate_neighbors_ks",
+        "alpha": 0.001,
+        "cutoff": "ecdf_critical_distance(nslc,alpha)",
+        "sort_pixels": true,
+        "center_excluded": true,
+        "border": "full_window_required"
+      },
+      "fixed_support_reuse": true,
+      "support_identity": "target_and_reference_masks_are_independent_realized_masks_and_are_reused_for_truth/operator",
+      "selection_seed": "sha256(validation_seed||cell_id||seed_index)",
+      "mask_freeze": "same_realized_mask_for_target_reference_and_truth"
+    },
+    "coordinates": {
+      "coordinate_frame": "tile_row_col",
+      "rounding": "integer",
+      "window_stride_table": "coordinates_by_window_stride_and_position",
+      "geometry_labels_are_nominal_distance_strata": true,
+      "realized_overlap": "intersection_source_count/union_source_count (Jaccard) from exact target/reference support keys per attempt",
+      "adaptive_supports": "target and reference support hashes and counts vary by seed",
+      "window_stride": {
+        "hw_1x1|stride_1": {
+          "half_window": [
+            1,
+            1
+          ],
+          "stride": [
+            1,
+            1
+          ],
+          "support_shape": [
+            3,
+            3
+          ],
+          "target_by_position": {
+            "interior": [
+              128,
+              128
+            ],
+            "border_clamped": [
+              1,
+              1
+            ],
+            "tile_edge": [
+              128,
+              254
+            ],
+            "bounded_halo": [
+              64,
+              64
+            ],
+            "masked": [
+              128,
+              128
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              1
+            ],
+            "shared_75_negative": [
+              0,
+              1
+            ],
+            "shared_50_positive": [
+              0,
+              2
+            ],
+            "shared_50_negative": [
+              0,
+              2
+            ],
+            "shared_25_positive": [
+              0,
+              3
+            ],
+            "shared_25_negative": [
+              0,
+              3
+            ],
+            "disjoint_immediate": [
+              0,
+              4
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              5
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              8
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              16
+            ]
+          }
+        },
+        "hw_1x1|stride_2": {
+          "half_window": [
+            1,
+            1
+          ],
+          "stride": [
+            2,
+            2
+          ],
+          "support_shape": [
+            3,
+            3
+          ],
+          "target_by_position": {
+            "interior": [
+              129,
+              129
+            ],
+            "border_clamped": [
+              3,
+              3
+            ],
+            "tile_edge": [
+              129,
+              253
+            ],
+            "bounded_halo": [
+              65,
+              65
+            ],
+            "masked": [
+              129,
+              129
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              2
+            ],
+            "shared_75_negative": [
+              0,
+              2
+            ],
+            "shared_50_positive": [
+              0,
+              4
+            ],
+            "shared_50_negative": [
+              0,
+              4
+            ],
+            "shared_25_positive": [
+              0,
+              6
+            ],
+            "shared_25_negative": [
+              0,
+              6
+            ],
+            "disjoint_immediate": [
+              0,
+              8
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              10
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              16
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              32
+            ]
+          }
+        },
+        "hw_1x1|stride_4": {
+          "half_window": [
+            1,
+            1
+          ],
+          "stride": [
+            4,
+            4
+          ],
+          "support_shape": [
+            3,
+            3
+          ],
+          "target_by_position": {
+            "interior": [
+              130,
+              130
+            ],
+            "border_clamped": [
+              6,
+              6
+            ],
+            "tile_edge": [
+              130,
+              250
+            ],
+            "bounded_halo": [
+              66,
+              66
+            ],
+            "masked": [
+              130,
+              130
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              4
+            ],
+            "shared_75_negative": [
+              0,
+              4
+            ],
+            "shared_50_positive": [
+              0,
+              8
+            ],
+            "shared_50_negative": [
+              0,
+              8
+            ],
+            "shared_25_positive": [
+              0,
+              12
+            ],
+            "shared_25_negative": [
+              0,
+              12
+            ],
+            "disjoint_immediate": [
+              0,
+              16
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              20
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              32
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              64
+            ]
+          }
+        },
+        "hw_3x6|stride_1": {
+          "half_window": [
+            3,
+            6
+          ],
+          "stride": [
+            1,
+            1
+          ],
+          "support_shape": [
+            7,
+            13
+          ],
+          "target_by_position": {
+            "interior": [
+              128,
+              128
+            ],
+            "border_clamped": [
+              3,
+              6
+            ],
+            "tile_edge": [
+              128,
+              250
+            ],
+            "bounded_halo": [
+              64,
+              64
+            ],
+            "masked": [
+              128,
+              128
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              1
+            ],
+            "shared_75_negative": [
+              0,
+              1
+            ],
+            "shared_50_positive": [
+              0,
+              2
+            ],
+            "shared_50_negative": [
+              0,
+              2
+            ],
+            "shared_25_positive": [
+              0,
+              3
+            ],
+            "shared_25_negative": [
+              0,
+              3
+            ],
+            "disjoint_immediate": [
+              0,
+              13
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              14
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              26
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              52
+            ]
+          }
+        },
+        "hw_3x6|stride_2": {
+          "half_window": [
+            3,
+            6
+          ],
+          "stride": [
+            2,
+            2
+          ],
+          "support_shape": [
+            7,
+            13
+          ],
+          "target_by_position": {
+            "interior": [
+              129,
+              129
+            ],
+            "border_clamped": [
+              7,
+              13
+            ],
+            "tile_edge": [
+              129,
+              245
+            ],
+            "bounded_halo": [
+              65,
+              65
+            ],
+            "masked": [
+              129,
+              129
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              2
+            ],
+            "shared_75_negative": [
+              0,
+              2
+            ],
+            "shared_50_positive": [
+              0,
+              4
+            ],
+            "shared_50_negative": [
+              0,
+              4
+            ],
+            "shared_25_positive": [
+              0,
+              6
+            ],
+            "shared_25_negative": [
+              0,
+              6
+            ],
+            "disjoint_immediate": [
+              0,
+              26
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              28
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              52
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              104
+            ]
+          }
+        },
+        "hw_3x6|stride_4": {
+          "half_window": [
+            3,
+            6
+          ],
+          "stride": [
+            4,
+            4
+          ],
+          "support_shape": [
+            7,
+            13
+          ],
+          "target_by_position": {
+            "interior": [
+              130,
+              130
+            ],
+            "border_clamped": [
+              14,
+              26
+            ],
+            "tile_edge": [
+              130,
+              234
+            ],
+            "bounded_halo": [
+              66,
+              66
+            ],
+            "masked": [
+              130,
+              130
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              4
+            ],
+            "shared_75_negative": [
+              0,
+              4
+            ],
+            "shared_50_positive": [
+              0,
+              8
+            ],
+            "shared_50_negative": [
+              0,
+              8
+            ],
+            "shared_25_positive": [
+              0,
+              12
+            ],
+            "shared_25_negative": [
+              0,
+              12
+            ],
+            "disjoint_immediate": [
+              0,
+              52
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              56
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              104
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              208
+            ]
+          }
+        },
+        "hw_7x14|stride_1": {
+          "half_window": [
+            7,
+            14
+          ],
+          "stride": [
+            1,
+            1
+          ],
+          "support_shape": [
+            15,
+            29
+          ],
+          "target_by_position": {
+            "interior": [
+              128,
+              128
+            ],
+            "border_clamped": [
+              7,
+              14
+            ],
+            "tile_edge": [
+              128,
+              242
+            ],
+            "bounded_halo": [
+              64,
+              64
+            ],
+            "masked": [
+              128,
+              128
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              1
+            ],
+            "shared_75_negative": [
+              0,
+              1
+            ],
+            "shared_50_positive": [
+              0,
+              2
+            ],
+            "shared_50_negative": [
+              0,
+              2
+            ],
+            "shared_25_positive": [
+              0,
+              3
+            ],
+            "shared_25_negative": [
+              0,
+              3
+            ],
+            "disjoint_immediate": [
+              0,
+              29
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              30
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              58
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              116
+            ]
+          }
+        },
+        "hw_7x14|stride_2": {
+          "half_window": [
+            7,
+            14
+          ],
+          "stride": [
+            2,
+            2
+          ],
+          "support_shape": [
+            15,
+            29
+          ],
+          "target_by_position": {
+            "interior": [
+              129,
+              129
+            ],
+            "border_clamped": [
+              15,
+              29
+            ],
+            "tile_edge": [
+              129,
+              229
+            ],
+            "bounded_halo": [
+              65,
+              65
+            ],
+            "masked": [
+              129,
+              129
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              2
+            ],
+            "shared_75_negative": [
+              0,
+              2
+            ],
+            "shared_50_positive": [
+              0,
+              4
+            ],
+            "shared_50_negative": [
+              0,
+              4
+            ],
+            "shared_25_positive": [
+              0,
+              6
+            ],
+            "shared_25_negative": [
+              0,
+              6
+            ],
+            "disjoint_immediate": [
+              0,
+              58
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              60
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              116
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              232
+            ]
+          }
+        },
+        "hw_7x14|stride_4": {
+          "half_window": [
+            7,
+            14
+          ],
+          "stride": [
+            4,
+            4
+          ],
+          "support_shape": [
+            15,
+            29
+          ],
+          "target_by_position": {
+            "interior": [
+              130,
+              130
+            ],
+            "border_clamped": [
+              30,
+              58
+            ],
+            "tile_edge": [
+              130,
+              202
+            ],
+            "bounded_halo": [
+              66,
+              66
+            ],
+            "masked": [
+              130,
+              130
+            ]
+          },
+          "reference_delta_by_pair_geometry": {
+            "coincident": [
+              0,
+              0
+            ],
+            "shared_75_positive": [
+              0,
+              4
+            ],
+            "shared_75_negative": [
+              0,
+              4
+            ],
+            "shared_50_positive": [
+              0,
+              8
+            ],
+            "shared_50_negative": [
+              0,
+              8
+            ],
+            "shared_25_positive": [
+              0,
+              12
+            ],
+            "shared_25_negative": [
+              0,
+              12
+            ],
+            "disjoint_immediate": [
+              0,
+              116
+            ],
+            "disjoint_after_depth_1": [
+              0,
+              120
+            ],
+            "disjoint_after_depth_2": [
+              0,
+              232
+            ],
+            "disjoint_after_depth_4": [
+              0,
+              464
+            ]
+          }
+        }
+      }
+    },
+    "signed_spatial_field": {
+      "field": "one matched-pair cell-global proper-complex innovation with sqrt(0.5) magnitude",
+      "pair_perturbation": "positive and negative cells share identical local/global normal streams, support-selection stream, marginal parameters, and latent phase orientation; positive loads both sides +1, while negative loads target-nearest sources +1 and reference-nearest sources -1 with target winning exact distance ties",
+      "zero": "coincident exact zero",
+      "none": "disjoint source-key cross term exact zero",
+      "sign_field_identity": "matched support and latent-history digests plus independently reduced target/reference marginal and cross estimator-error covariance",
+      "persist": "signed_cross_influence, sign, target/reference loading means, marginal covariance traces, cross-error covariance trace, and matched support/latent digests"
+    },
+    "truth": {
+      "latent": "frozen noiseless target/reference phase histories regenerated independently from the DGP",
+      "estimator_error": "(estimated_target-estimated_reference)-(latent_target-latent_reference)",
+      "predicted_covariance": "production target-minus-reference date covariance emitted by Rust without a noisy realized truth matrix",
+      "interval": "estimated difference +/- 1.959963984540054*sqrt(predicted covariance diagonal)",
+      "z_95": 1.959963984540054,
+      "coverage_event": "latent target-minus-reference history lies inside each non-gauge date interval",
+      "attempt_aggregation": "bounded error sums, error outer-product sums, predicted covariance sums, counts, and digests only"
+    },
+    "supported": {
+      "supported_if": [
+        "finite_raw_source",
+        "proper_complex_pseudocovariance_zero",
+        "psd_truth",
+        "nonempty_frozen_support",
+        "valid_reference"
+      ],
+      "stable_attempt_statuses": [
+        "valid",
+        "masked_target",
+        "empty_support",
+        "singular_local_information",
+        "nondifferentiable_node"
+      ],
+      "not_evaluable_if": [
+        "unexpected_empty_support",
+        "unexpected_singular_local_information"
+      ],
+      "expected_abstention_if": [
+        "masked_target",
+        "empty_support",
+        "singular_local_information"
+      ],
+      "receipt_failure_if": [
+        "invalid_reference",
+        "nonfinite_source",
+        "non_psd_truth",
+        "missing_attempt_record",
+        "support_identity_mismatch"
+      ]
+    },
+    "identity": {
+      "protocol_version": 4,
+      "release_only": true,
+      "required_hashes": [
+        "binary_sha256",
+        "code_sha256",
+        "config_sha256",
+        "source_model_sha256",
+        "generator_protocol_sha256",
+        "result_sha256"
+      ]
+    },
+    "singular_local_information_probe": {
+      "schema": "dolphinrust.spatial-covariance.singular-local-information-probe/1",
+      "source": "crates/dolphin-workflows/tests/global_covariance_contract.rs::singular_fixed_estimator_nodes_are_persisted_as_explicit_statuses",
+      "native_shape": [
+        3,
+        3
+      ],
+      "date_count": 3,
+      "half_window": [
+        1,
+        1
+      ],
+      "stride": [
+        3,
+        3
+      ],
+      "ministack_size": 3,
+      "max_num_compressed": 1,
+      "estimator": "evd",
+      "branch_tolerance": 1e-08,
+      "raw_dtype": "complex128_from_frozen_rust_binary64_phasors",
+      "component_order": [
+        "real",
+        "imag"
+      ],
+      "raw_complex_binary64_bits": [
+        [
+          [
+            "3fee921dd42f09ba",
+            "3fd2e9cd95baba33"
+          ],
+          [
+            "bfe7799ed83d9d37",
+            "3fe5bf2a3a493978"
+          ],
+          [
+            "bfcc61fbefc5b1f8",
+            "bfef341105269690"
+          ]
+        ],
+        [
+          [
+            "3fee921dd42f09ba",
+            "3fd2e9cd95baba33"
+          ],
+          [
+            "bfcc61fbefc5b1f8",
+            "bfef341105269690"
+          ],
+          [
+            "bfe7799ed83d9d37",
+            "3fe5bf2a3a493978"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ],
+        [
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ],
+          [
+            "0000000000000000",
+            "0000000000000000"
+          ]
+        ]
+      ],
+      "expected_production_status": "singular_local_information",
+      "scientific_numeric_axes_executed": false,
+      "date_axis": [
+        0,
+        1,
+        2
+      ]
+    }
   },
-  "resource_matrix": [{"id":"tile_256_dates_13","tile_pixels":65536,"dates":13},{"id":"tile_256_dates_26","tile_pixels":65536,"dates":26},{"id":"tile_256_dates_52","tile_pixels":65536,"dates":52}],
-  "resource_sampling": {"os":"Darwin arm64","hardware_class":"apple-m2-32gb","ram_bytes":34359738368,"rss_sampler":"/usr/bin/time -l","rss_field":"maximum resident set size","sampling_interval_ms":100,"warmup_runs":1,"measured_repetitions":3,"tool_versions":["rustc -Vv","cargo -V","/usr/bin/time -l"],"growth_observations":["tile_pixels","date_count","peak_rss_bytes","wall_seconds"],"growth_regression":"log(peak_rss)=a+b*log(tile_pixels*dates); b<=1.25","acceptance":"all measured repetitions <= rss threshold; linear regression b<=1.25; no quadratic buffer"},
-  "receipt_contract": {"cell_statuses":["pass","fail","not_evaluable"],"attempt_statuses":["valid","masked_target","tied_eigenvalue"],"per_attempt_required":["schema","cell_id","cell_ordinal","seed_index","seed_sha256","status","emitted","factor_emitted","raw_input_sha256","truth_sha256","operator_hash","variance_hash","emission_hash","date_axis_sha256","generator_hash","config_hash","source_model_hash","target_coordinate","reference_coordinate","target_support_sha256","reference_support_sha256","target_source_count","reference_source_count","intersection_source_count","union_source_count","realized_overlap_jaccard","signed_cross_influence","signed_influence_sign","effective_looks_fraction","effective_looks_application","operator_relative_error","contrast_variance_reference","contrast_variance_relative_error","psd_min_eigenvalue","covered_95","interval_score","interval_width"],"cell_overlap_required":["target_source_count_total","reference_source_count_total","intersection_source_count_total","union_source_count_total","realized_overlap_jaccard_mean"],"cell_overlap_aggregate":"mean per-attempt realized_overlap_jaccard plus exact source-count totals","masked_target_metrics":"numeric gate evidence including signed_cross_influence is null with emitted=false and factor_emitted=false","performance_measurement_required":["cell_class","seed_count","attempt_count","elapsed_seconds","peak_rss_bytes","outcomes_persisted"],"performance_aggregates":"attempts_per_second=sum(attempt_count)/sum(elapsed_seconds); peak_rss_bytes=max(measurement.peak_rss_bytes)","resource_required":["resource_id","status","rss_bytes","growth_class","resource_hash","config_hash","binary_hash","os","hardware_class","ram_bytes","rss_sampler","rss_field","sampling_interval_ms","warmup_runs","measured_repetitions","tool_versions","growth_observation","growth_regression","acceptance"],"resource_growth_observation_required":["repetition","tile_pixels","date_count","peak_rss_bytes","wall_seconds"],"resource_aggregates":"rss_bytes=max(repetition.peak_rss_bytes); growth_class and status derived from log-log regression over exact 13/26/52 date cells","resource_hash":"sha256 canonical JSON of the complete resource receipt excluding resource_hash","aggregate_only_rejected":true,"incomplete_attempts_rejected":true,"result_hash_required":true,"attempt_shards_required":true,"cell_summaries_are_reductions_not_evidence":true}
+  "resource_matrix": [
+    {
+      "id": "area_128_dates_26",
+      "tile_pixels": 16384,
+      "dates": 26,
+      "axis": "area"
+    },
+    {
+      "id": "area_256_dates_26",
+      "tile_pixels": 65536,
+      "dates": 26,
+      "axis": "area_date_anchor"
+    },
+    {
+      "id": "area_512_dates_26",
+      "tile_pixels": 262144,
+      "dates": 26,
+      "axis": "area"
+    },
+    {
+      "id": "area_256_dates_13",
+      "tile_pixels": 65536,
+      "dates": 13,
+      "axis": "date"
+    },
+    {
+      "id": "area_256_dates_52",
+      "tile_pixels": 65536,
+      "dates": 52,
+      "axis": "date"
+    }
+  ],
+  "resource_sampling": {
+    "os": "Darwin arm64",
+    "hardware_class": "apple-m2-32gb",
+    "ram_bytes": 34359738368,
+    "rss_sampler": "getrusage(RUSAGE_CHILDREN) from fresh parent process",
+    "rss_field": "ru_maxrss bytes on Darwin",
+    "warmup_runs": 1,
+    "measured_repetitions": 3,
+    "tool_versions": [
+      "rustc -Vv",
+      "cargo -V",
+      "uname -a"
+    ],
+    "command_template": [
+      "target/release/examples/spatial_covariance_bench",
+      "--tile-pixels",
+      "{tile_pixels}",
+      "--dates",
+      "{dates}"
+    ],
+    "max_encoded_raw_measurement_bytes": 8192,
+    "raw_measurement_binding": "benchmark driver executes the exact named Rust command and captures its bounded stdout byte stream; the raw record binds command, exit status, stdout byte count, stdout SHA-256, exact stdout text, wall seconds, max RSS, sampler, tool outputs, OS, and hardware for every repetition",
+    "growth_observations": [
+      "tile_pixels",
+      "date_count",
+      "peak_rss_bytes",
+      "wall_seconds",
+      "raw_measurement",
+      "raw_measurement_sha256",
+      "stdout_bytes",
+      "stdout_sha256",
+      "stdout_json"
+    ],
+    "allocation_model": "parse actual production runtime resource receipt and four named admission components only from captured Rust stdout; caller-fabricated nested allocation records are prohibited",
+    "required_allocation_components": [
+      "factor_block",
+      "serialization",
+      "fixed_l2_workspace",
+      "replay_reservation"
+    ],
+    "dependency_cone_binding": "captured benchmark stdout block count, maximum sources per block, dependency depth, and reference-cone sources must equal the independently retained cone and canonical SHA-256",
+    "microbatch_binding": "canonical bounded-microbatch-v1 values and SHA-256",
+    "area_axis_rule": "production factor block admission is capped before reads; captured area/date sweeps and measured RSS identify growth",
+    "area_growth_regression": "date_count=26; log(peak_rss)=a+b*log(tile_pixels); b<=1.25",
+    "date_growth_regression": "tile_pixels=65536; log(peak_rss)=a+b*log(date_count); b<=1.25",
+    "acceptance": "captured benchmark stdout dependency, persisted, scratch, final, microbatch and named allocation formulas pass; all measured repetitions <= rss threshold; both independently identifiable exponents <=1.25; RSS corroborates the bound"
+  },
+  "receipt_contract": {
+    "cell_statuses": [
+      "pass",
+      "fail",
+      "not_evaluable"
+    ],
+    "attempt_statuses": [
+      "valid",
+      "masked_target",
+      "empty_support",
+      "nondifferentiable_node",
+      "singular_local_information"
+    ],
+    "ephemeral_per_attempt_required": [
+      "schema",
+      "cell_id",
+      "cell_ordinal",
+      "seed_index",
+      "seed_sha256",
+      "status",
+      "emitted",
+      "factor_emitted",
+      "raw_input_shape",
+      "raw_input_value_count",
+      "raw_input_sha256",
+      "target_raw_input_sha256",
+      "reference_raw_input_sha256",
+      "sequential_ancestry_sha256",
+      "raw_dgp_identity_sha256",
+      "latent_history_sha256",
+      "estimate_sha256",
+      "predicted_covariance_sha256",
+      "operator_sha256",
+      "date_axis_sha256",
+      "generator_hash",
+      "config_hash",
+      "source_model_hash",
+      "target_coordinate",
+      "reference_coordinate",
+      "target_support_sha256",
+      "reference_support_sha256",
+      "target_source_count",
+      "reference_source_count",
+      "intersection_source_count",
+      "union_source_count",
+      "realized_overlap_jaccard",
+      "signed_cross_influence",
+      "signed_influence_sign",
+      "effective_looks_fraction",
+      "effective_looks_application",
+      "source_correlation_model",
+      "source_correlation_distance_scale_pixels",
+      "estimator_branch",
+      "target_estimate_history",
+      "reference_estimate_history",
+      "predicted_difference_covariance",
+      "production_operator_matrix",
+      "contrast_weights"
+    ],
+    "retained_cell_required": [
+      "schema",
+      "cell_id",
+      "cell_ordinal",
+      "status",
+      "attempted_seeds",
+      "emitted_seeds",
+      "status_histogram",
+      "failure_histogram",
+      "request_digest",
+      "attempt_digest",
+      "estimate_digest",
+      "latent_history_digest",
+      "target_support_digest",
+      "reference_support_digest",
+      "predicted_covariance_digest",
+      "empirical_error_covariance_digest",
+      "target_source_count_total",
+      "reference_source_count_total",
+      "intersection_source_count_total",
+      "union_source_count_total",
+      "realized_overlap_jaccard_mean",
+      "effective_looks_fraction",
+      "operator_relative_error",
+      "contrast_variance_relative_error",
+      "covariance_calibration_relative_error",
+      "error_bias_norm",
+      "target_reference_error_covariance_trace",
+      "target_predicted_covariance_trace",
+      "reference_predicted_covariance_trace",
+      "target_empirical_error_covariance_trace",
+      "reference_empirical_error_covariance_trace",
+      "empirical_error_covariance_trace",
+      "predicted_covariance_trace",
+      "psd_min_eigenvalue",
+      "coverage_95_by_date",
+      "interval_score_mean_by_date",
+      "interval_width_mean_by_date",
+      "final_date_coverage_95",
+      "final_date_interval_score_mean",
+      "final_date_interval_width_mean",
+      "code_sha256",
+      "binary_sha256",
+      "preregistration_sha256"
+    ],
+    "masked_target_metrics": "signed_cross_influence, estimator histories/covariance, production operator, and contrast weights are null with emitted=false and factor_emitted=false; full raw DGP content/support/ancestry and latent identities remain required",
+    "production_artifact_required": [
+      "one run-root-relative HDF5 path per run",
+      "one run-root-relative JSON provenance sidecar path per run",
+      "streamed HDF5 SHA-256",
+      "same-byte sidecar SHA-256",
+      "HDF5 schema v4",
+      "manifest schema v3",
+      "separate in-memory and persisted factor digests",
+      "complete capped-read HDF5 header and every-block semantics for whole and bounded artifacts",
+      "reference provenance",
+      "estimator branch"
+    ],
+    "retention": "only cell summaries with bounded online sums/counts/per-date vectors/digests, shard manifests, run manifest, whole-frame and bounded production parity HDF5 artifacts plus sidecars, performance probe, bounded captured stdout resource receipts, and resource aggregates; ephemeral attempt transport, production operator inputs, source members, and preparation descriptors are durably deleted after verified commit",
+    "verification": "regenerate full raw DGP and latent histories for every attempt; use exact independent 2N phase-joint oracle only for deterministic fixtures and bounded online empirical estimator-error covariance for stochastic cells; independently derive E C E-prime, operator and contrast errors, signed cross covariance, PSD, intervals, and coverage; read and hash actual whole-frame and bounded production HDF5 v4 artifacts and manifest v3 sidecars via Rust and bind separate factor/reference/estimator provenance; reuse requires exact Rust replay",
+    "manifest_read": "bounded bytes are read once with pre/open/post identity checks, then both hashed and parsed from those exact accepted bytes; HDF5 is stream-hashed once under its cap",
+    "resource_hash": "sha256 canonical JSON of complete resource receipt excluding resource_hash; captured benchmark stdout bytes are hash checked and parsed, then every allocation model, dependency cone, microbatch, and component value and hash is independently recomputed",
+    "aggregate_only_without_attempt_digest_rejected": true,
+    "incomplete_attempts_rejected": true,
+    "result_hash_required": true
+  },
+  "portable_dgp_asset": {
+    "schema": "dolphinrust.spatial-covariance.portable-dgp-asset/1",
+    "path": "spatial_covariance_portable_tables.json",
+    "byte_count": 3140431,
+    "sha256": "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add",
+    "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
+    "coefficient_sha256": "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3",
+    "table_sha256": "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
+  }
 }
