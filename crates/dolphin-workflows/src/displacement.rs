@@ -49,7 +49,7 @@ use crate::burst::{
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::covariance_artifact::{
     finalize_covariance_artifact, preflight_covariance_artifact_disk_with_identity_index,
-    CovarianceArtifactDiskAdmission, CovarianceArtifactTransaction,
+    CovarianceArtifactDiskAdmission, CovarianceArtifactManifest, CovarianceArtifactTransaction,
 };
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
 use crate::cslc_covariance_source::{
@@ -73,6 +73,11 @@ use crate::sequential::{
 };
 use crate::sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
+};
+use crate::spatial_reference_covariance_output::{
+    correction_order_digest, unwrap_branch_digest, BurstOutputMapping, CapturedReplayTile,
+    FixedL2WorkflowInputs, ProductionCovarianceReplayContext, ProductionCovarianceState,
+    NO_BURST_OWNER,
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
@@ -383,10 +388,10 @@ pub fn run_displacement_with_output_policy(
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    if let Some(covariance) = covariance {
-        covariance.finish()?;
-    }
-    finish_displacement(cfg, bursts, crop.as_ref(), output_policy)
+    let covariance_replay = covariance
+        .map(|covariance| covariance.finish(prepared_masks))
+        .transpose()?;
+    finish_displacement(cfg, bursts, crop.as_ref(), output_policy, covariance_replay)
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
@@ -399,13 +404,16 @@ fn finish_displacement(
     bursts: Vec<BurstLink>,
     crop: Option<&BoundedPlan>,
     output_policy: DisplacementOutputPolicy,
+    covariance_replay: Option<ProductionCovarianceReplayContext>,
 ) -> Result<DisplacementOutput> {
     let groups = group_by_burst(&cfg.cslc_file_list);
     let days = bursts
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
-    let stitched = timed("stitch", || stitch_bursts(bursts))?;
+    let stitched = timed("stitch", || {
+        stitch_bursts(bursts, cfg.phase_linking.write_covariance_operator)
+    })?;
     let validity_mask = stitched.validity_mask;
     let burst_coverage = stitched.coverage;
     let mut pl = stitched.pl;
@@ -453,8 +461,13 @@ fn finish_displacement(
             epsg,
         )
     })?;
-    let (mut inversion, loop_closure) =
-        solve_time_series(cfg, unwrap.unwrapped, &pairs, stitched.crlb_sigma.as_ref())?;
+    let (mut inversion, loop_closure) = solve_time_series(
+        cfg,
+        unwrap.unwrapped,
+        &pairs,
+        stitched.crlb_sigma.as_ref(),
+        cfg.phase_linking.write_covariance_operator,
+    )?;
     // Atmospheric corrections subtract per-date delay from the inverted series
     // before the final spatial reference and velocity. Reference selection runs
     // on the corrected series so it cannot choose a high-coherence pixel whose
@@ -495,6 +508,40 @@ fn finish_displacement(
             },
         )
     })?;
+    let production_covariance = if cfg.phase_linking.write_covariance_operator {
+        let backend_config = serde_json::to_vec(&cfg.unwrap_options)
+            .context("serializing production unwrap configuration")?;
+        Some(ProductionCovarianceState {
+            replay_context: covariance_replay,
+            fixed_l2_inputs: inversion.fixed_l2_inputs.take(),
+            ownership: stitched
+                .ownership
+                .context("covariance output requires retained burst ownership")?,
+            seam_rotations: stitched
+                .seam_rotations
+                .context("covariance output requires retained seam rotations")?,
+            source_burst_ids: groups.keys().cloned().collect(),
+            burst_output_mappings: stitched
+                .burst_output_mappings
+                .context("covariance output requires burst coordinate mappings")?,
+            analysis_origin: (0, 0),
+            correction_order_digest: correction_order_digest(
+                &cfg.correction_options,
+                cfg.input_options.wavelength,
+                &corrections,
+            )?,
+            unwrap_branch_digest: unwrap_branch_digest(
+                cfg.unwrap_options.unwrap_method,
+                &backend_config,
+                &pairs,
+                validity_mask.view(),
+                unwrap.connected_components.view(),
+                cfg.timeseries_options.mask_unwrap_loop_errors,
+            ),
+        })
+    } else {
+        None
+    };
     let (velocity_model, fit) = frame_velocity(
         cfg,
         inversion.displacement.view(),
@@ -526,6 +573,7 @@ fn finish_displacement(
         unwrap_connected_components: unwrap.connected_components,
         geotransform,
         reference_point: analysis_reference_point,
+        production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
 }
@@ -577,6 +625,7 @@ fn select_valid_reference_point(
 
 struct InversionProducts {
     displacement: Array3<f64>,
+    fixed_l2_inputs: Option<FixedL2WorkflowInputs>,
     posterior_variance: Option<Array3<f64>>,
     /// L2 SBAS network-inversion misclosure RMS (residual of `A*phi = dphi`) —
     /// how well the interferogram network closed, not how well displacement
@@ -592,6 +641,7 @@ fn invert_time_series(
     dphi: ArrayView3<f64>,
     crlb_sigma: Option<&Array3<f64>>,
     pairs: &[(usize, usize)],
+    retain_fixed_l2_inputs: bool,
 ) -> Result<InversionProducts> {
     anyhow::ensure!(
         !(cfg.timeseries_options.write_posterior_uncertainty
@@ -613,12 +663,13 @@ fn invert_time_series(
     } else {
         None
     };
-    match cfg.timeseries_options.method {
-        TimeseriesMethod::L1 => Ok(InversionProducts {
+    let mut products = match cfg.timeseries_options.method {
+        TimeseriesMethod::L1 => InversionProducts {
             displacement: invert_stack_l1(incidence, dphi, L1Config::default()),
+            fixed_l2_inputs: None,
             posterior_variance: None,
             network_misclosure_rms: None,
-        }),
+        },
         TimeseriesMethod::L2 if cfg.timeseries_options.write_posterior_uncertainty => {
             let output = invert_stack_with_uncertainty(
                 incidence,
@@ -637,18 +688,28 @@ fn invert_time_series(
                     clear_unbounded_uncertainty_2d(&mut band, valid.view());
                 }
             }
-            Ok(InversionProducts {
+            InversionProducts {
                 displacement: output.phase,
+                fixed_l2_inputs: None,
                 posterior_variance: Some(posterior_variance),
                 network_misclosure_rms: Some(output.residual_rms),
-            })
+            }
         }
-        TimeseriesMethod::L2 => Ok(InversionProducts {
+        TimeseriesMethod::L2 => InversionProducts {
             displacement: invert_stack(incidence, dphi, precision.as_ref().map(Array3::view)),
+            fixed_l2_inputs: None,
             posterior_variance: None,
             network_misclosure_rms: None,
-        }),
+        },
+    };
+    if retain_fixed_l2_inputs && cfg.timeseries_options.method == TimeseriesMethod::L2 {
+        products.fixed_l2_inputs = Some(FixedL2WorkflowInputs::new(
+            incidence.to_owned(),
+            dphi.to_owned(),
+            precision,
+        )?);
     }
+    Ok(products)
 }
 
 /// Optional velocity time-function terms, in the same phase units (rad) as the
@@ -792,13 +853,21 @@ fn solve_time_series(
     mut dphi_rad: Array3<f64>,
     pairs: &[(usize, usize)],
     crlb_sigma: Option<&Array3<f64>>,
+    retain_fixed_l2_inputs: bool,
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
         apply_loop_closure_qc(cfg, &mut dphi_rad, pairs)
     });
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
-        invert_time_series(cfg, incidence.view(), dphi_rad.view(), crlb_sigma, pairs)
+        invert_time_series(
+            cfg,
+            incidence.view(),
+            dphi_rad.view(),
+            crlb_sigma,
+            pairs,
+            retain_fixed_l2_inputs,
+        )
     })?;
     Ok((inversion, loop_closure))
 }
@@ -1009,6 +1078,7 @@ struct SpatialProducts {
     velocity_diagnostics: Option<VelocityTemporalDiagnostics>,
     interferogram_pairs: Vec<(usize, usize)>,
     unwrap_connected_components: Array3<u32>,
+    production_covariance: Option<ProductionCovarianceState>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1023,12 +1093,46 @@ fn emit_displacement(
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
+    if let Some(covariance) = spatial.production_covariance.as_mut() {
+        covariance.correction_order_digest = correction_order_digest(
+            &cfg.correction_options,
+            cfg.input_options.wavelength,
+            &spatial.corrections,
+        )?;
+        let backend_config = serde_json::to_vec(&cfg.unwrap_options)
+            .context("serializing final covariance unwrap configuration")?;
+        covariance.unwrap_branch_digest = unwrap_branch_digest(
+            cfg.unwrap_options.unwrap_method,
+            &backend_config,
+            &spatial.interferogram_pairs,
+            spatial.validity_mask.view(),
+            spatial.unwrap_connected_components.view(),
+            cfg.timeseries_options.mask_unwrap_loop_errors,
+        );
+    }
     spatial.apply_validity_mask();
     if let (Some(variance), Some(point)) = (
         spatial.posterior_variance_rad.as_mut(),
         spatial.reference_point,
     ) {
         reference_variance_to_point(variance, point);
+    }
+    if let Some(covariance) = spatial.production_covariance.take() {
+        let reference = spatial
+            .reference_point
+            .context("production spatial covariance requires a final analysis reference")?;
+        let output_epsg = epsg.context("production spatial covariance requires an exact CRS")?;
+        timed("spatial_reference_covariance", || {
+            covariance.emit(
+                cfg,
+                &sequential_config(cfg),
+                spatial.validity_mask.view(),
+                reference,
+                output_epsg,
+                spatial.geotransform,
+                &days,
+            )
+        })?;
     }
     let scaled = scale_outputs(cfg, &spatial);
     let quality = QualityLayers {
@@ -1394,6 +1498,9 @@ impl SpatialProducts {
             qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
         }
         self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
+        if let Some(covariance) = self.production_covariance.as_mut() {
+            covariance.trim(target);
+        }
         trim_corrections(&mut self.corrections, target);
         self.reference_point = trim_reference(self.reference_point, target);
         self.geotransform =
@@ -1420,6 +1527,8 @@ struct BurstLink {
     geo: BurstGeo,
     /// Acquisition decimal-days for this burst's dates.
     days: Vec<f64>,
+    /// Global output-grid origin used by captured replay IDs.
+    covariance_output_origin: Option<(u64, u64)>,
 }
 
 struct CovarianceCaptureArtifact {
@@ -1431,12 +1540,15 @@ struct CovarianceCaptureArtifact {
     source_model_version_digest: [u8; 32],
     source_model_hash: [u8; 32],
     source_manifest: CslcCovarianceManifest,
+    replay_tiles: Vec<CapturedReplayTile>,
+    operator_block_byte_cap: u64,
     transaction: CovarianceArtifactTransaction,
 }
 
 struct CovarianceArtifactProjection {
     hdf5_bytes: u64,
     identity_index_peak_bytes: u64,
+    operator_block_byte_cap: u64,
     plan: CovarianceOperatorPlan,
 }
 
@@ -1532,11 +1644,16 @@ impl CovarianceCaptureArtifact {
             source_model_version_digest,
             source_model_hash,
             source_manifest,
+            replay_tiles: Vec::new(),
+            operator_block_byte_cap: projection.operator_block_byte_cap,
             transaction,
         })
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish(
+        mut self,
+        masks: BTreeMap<String, Option<PreparedBurstMask>>,
+    ) -> Result<ProductionCovarianceReplayContext> {
         self.source_manifest
             .verify_unchanged()
             .context("verifying immutable CSLC members before covariance finalization")?;
@@ -1554,14 +1671,20 @@ impl CovarianceCaptureArtifact {
         self.source_manifest
             .verify_unchanged()
             .context("verifying immutable CSLC members before covariance commit")?;
-        finalize_covariance_artifact(
+        let operator_manifest: CovarianceArtifactManifest = finalize_covariance_artifact(
             &self.transaction,
             &self.scratch_path,
             &self.metadata,
             self.disk_admission,
             &write_receipt,
         )?;
-        Ok(())
+        Ok(ProductionCovarianceReplayContext {
+            source_manifest: self.source_manifest,
+            operator_manifest,
+            tiles: self.replay_tiles,
+            masks,
+            operator_block_byte_cap: self.operator_block_byte_cap,
+        })
     }
 }
 
@@ -1570,7 +1693,10 @@ struct TileCovarianceCapture<'a> {
     source_origin: (usize, usize),
     source_manifest_digest: [u8; 32],
     source_model_version_digest: [u8; 32],
+    member_indices: Vec<usize>,
+    processed_shape: (usize, usize),
     source_resolver: Option<CslcCovarianceSourceResolver<'a>>,
+    replay_tiles: &'a mut Vec<CapturedReplayTile>,
     sink: &'a mut dyn CovarianceBlockSink,
 }
 
@@ -1598,6 +1724,7 @@ impl TileCovarianceCapture<'_> {
         &mut self,
         plan: &TilePlan,
         strides: dolphin_core::Strides,
+        native_validity: Option<ArrayView2<'_, bool>>,
     ) -> Result<SequentialCovarianceCaptureRequest> {
         let grids = covariance_tile_plan(self.source_origin, plan, strides)?;
         let request = SequentialCovarianceCaptureRequest {
@@ -1612,6 +1739,18 @@ impl TileCovarianceCapture<'_> {
         if let Some(resolver) = self.source_resolver.as_mut() {
             resolver.set_tile_grid(request.native_grid);
         }
+        let native_shape = (plan.read.height(), plan.read.width());
+        self.replay_tiles.push(CapturedReplayTile {
+            request: request.clone(),
+            member_indices: self.member_indices.clone(),
+            processed_origin: self.source_origin,
+            processed_shape: self.processed_shape,
+            native_validity: native_validity.map_or_else(
+                || Array2::from_elem(native_shape, true),
+                |mask| mask.to_owned(),
+            ),
+            num_real_dates: self.member_indices.len(),
+        });
         Ok(request)
     }
 }
@@ -1710,6 +1849,7 @@ fn projected_covariance_artifact(
             .context("covariance phase-component count overflow")? as u128;
     let mut projected = 16_u128 * 1024 * 1024;
     let mut identity_records = 0_u128;
+    let mut operator_block_byte_cap = 0_u128;
     let mut burst_plans = Vec::new();
     for (burst_index, (burst_id, indices)) in groups.iter().enumerate() {
         let Some(&first_index) = indices.first() else {
@@ -1799,6 +1939,7 @@ fn projected_covariance_artifact(
                 .checked_mul(2)
                 .and_then(|bytes| bytes.checked_add(256 * 1024))
                 .context("covariance HDF5 block projection overflow")?;
+            operator_block_byte_cap = operator_block_byte_cap.max(projected_block);
             projected = projected
                 .checked_add(
                     (depth as u128)
@@ -1836,6 +1977,8 @@ fn projected_covariance_artifact(
             .context("covariance artifact projection exceeds u64")?,
         identity_index_peak_bytes: covariance_identity_index_peak_bytes(identity_records)
             .context("projecting covariance identity-index peak")?,
+        operator_block_byte_cap: u64::try_from(operator_block_byte_cap)
+            .context("covariance operator block projection exceeds u64")?,
         plan: CovarianceOperatorPlan {
             source_manifest_digest,
             source_model_version_digest,
@@ -1902,7 +2045,10 @@ fn link_one_burst(
                 source_origin: (source.row_start, source.col_start),
                 source_manifest_digest: artifact.source_manifest_digest,
                 source_model_version_digest: artifact.source_model_version_digest,
+                member_indices: idxs.to_vec(),
+                processed_shape: (source.height(), source.width()),
                 source_resolver: Some(source_resolver),
+                replay_tiles: &mut artifact.replay_tiles,
                 sink: artifact
                     .writer
                     .as_mut()
@@ -2112,7 +2258,7 @@ fn phase_link_tiled_impl(
         let valid_mask = tile_mask.as_ref().map(Array2::view);
         let out = match covariance.as_mut() {
             Some(capture) => {
-                let request = capture.request(&plan, cfg.output_options.strides)?;
+                let request = capture.request(&plan, cfg.output_options.strides, valid_mask)?;
                 match (valid_mask, capture.source_resolver.as_mut()) {
                     (Some(mask), Some(resolver)) => {
                         run_sequential_masked_with_covariance_capture_and_source_factors(
@@ -2226,7 +2372,7 @@ struct BurstMaskState {
     effective_dataset_fingerprint: [u8; 32],
 }
 
-struct PreparedBurstMask {
+pub(crate) struct PreparedBurstMask {
     path: PathBuf,
     semantic_fingerprint: [u8; 32],
     reader: BurstMaskReader,
@@ -2832,6 +2978,21 @@ fn burst_link(
         days.len(),
         out.cpx_phase.dim().0
     );
+    let covariance_output_origin = if cfg.phase_linking.write_covariance_operator {
+        let strides = cfg.output_options.strides;
+        anyhow::ensure!(
+            source_offset.0.is_multiple_of(strides.y) && source_offset.1.is_multiple_of(strides.x),
+            "covariance burst origin is not on the output stride lattice"
+        );
+        Some((
+            u64::try_from(source_offset.0 / strides.y)
+                .context("covariance output row origin exceeds u64")?,
+            u64::try_from(source_offset.1 / strides.x)
+                .context("covariance output column origin exceeds u64")?,
+        ))
+    } else {
+        None
+    };
     Ok(BurstLink {
         pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
@@ -2848,6 +3009,7 @@ fn burst_link(
         },
         geo: resolve_burst_geo(cfg, first_file, rows, cols, source_offset)?,
         days,
+        covariance_output_origin,
     })
 }
 
@@ -3197,7 +3359,13 @@ pub fn run_displacement_resumable(
         });
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
+    let output = finish_displacement(
+        cfg,
+        bursts,
+        crop.as_ref(),
+        DisplacementOutputPolicy::Full,
+        None,
+    )?;
     Ok((
         output,
         DisplacementState {
@@ -3258,7 +3426,7 @@ pub fn update_displacement(
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, None, DisplacementOutputPolicy::Full)?;
+    let output = finish_displacement(cfg, bursts, None, DisplacementOutputPolicy::Full, None)?;
     Ok((
         output,
         DisplacementState {
@@ -3369,6 +3537,10 @@ fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
             !cfg.phase_linking.correct_phase_bias,
             "phase_linking.write_covariance_operator requires correct_phase_bias = false"
         );
+        anyhow::ensure!(
+            cfg.timeseries_options.method == TimeseriesMethod::L2,
+            "phase_linking.write_covariance_operator requires timeseries_options.method = l2"
+        );
     }
     Ok(())
 }
@@ -3390,6 +3562,12 @@ struct Stitched {
     /// Per-triplet closure phase (band-major), if enabled.
     closure_phase: Option<Array3<f64>>,
     validity_mask: Array2<bool>,
+    /// Date-wise source-burst owner under the exact finite-overwrite rule.
+    ownership: Option<Array3<u32>>,
+    /// Applied acquisition-wise seam rotations keyed by source-burst index.
+    seam_rotations: Option<Vec<(u32, Vec<Cf64>)>>,
+    /// Mapping from stitched-frame coordinates to captured output coordinates.
+    burst_output_mappings: Option<Vec<BurstOutputMapping>>,
     coverage: Vec<BurstCoverageProvenance>,
     /// Frame grid georeferencing.
     geo: GeoInfo,
@@ -3397,10 +3575,36 @@ struct Stitched {
 
 /// Mosaic the per-burst phase-linking products onto the frame grid. A single
 /// burst is returned as-is (identity path).
-fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
+#[allow(clippy::too_many_lines)]
+fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
         let b = bursts.remove(0);
+        let owner =
+            u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
+        let ownership = retain_covariance_lineage.then(|| {
+            b.pl.mapv(|value| {
+                if value.re.is_finite() && value.im.is_finite() {
+                    owner
+                } else {
+                    NO_BURST_OWNER
+                }
+            })
+        });
+        let seam_rotations = retain_covariance_lineage
+            .then(|| vec![(owner, vec![Cf64::new(1.0, 0.0); b.pl.dim().0])]);
+        let burst_output_mappings = if retain_covariance_lineage {
+            Some(vec![BurstOutputMapping {
+                owner,
+                frame_origin: (0, 0),
+                output_origin: b
+                    .covariance_output_origin
+                    .context("covariance-linked burst lacks a captured output origin")?,
+                shape: (b.pl.dim().1, b.pl.dim().2),
+            }])
+        } else {
+            None
+        };
         return Ok(Stitched {
             pl: b.pl,
             temp_coh: b.temp_coh,
@@ -3408,6 +3612,9 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
             crlb_sigma: b.crlb_sigma,
             closure_phase: b.closure_phase,
             validity_mask: b.validity_mask,
+            ownership,
+            seam_rotations,
+            burst_output_mappings,
             coverage: vec![b.coverage],
             geo: b.geo.geo,
         });
@@ -3421,13 +3628,48 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
     );
     let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
+    let mut ownership = retain_covariance_lineage
+        .then(|| Array3::<u32>::from_elem((nslc, frame.rows, frame.cols), NO_BURST_OWNER));
+    let mut seam_rotations = retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
+    let mut burst_output_mappings =
+        retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
     for (burst_index, b) in bursts.iter_mut().enumerate() {
         anyhow::ensure!(b.pl.dim().0 == nslc, "bursts have differing date counts");
         let off = burst_offset(&frame, &b.geo);
-        if burst_index > 0 {
-            level_burst_offsets(&pl, &temp_coh, &covered, b, off, burst_index)?;
+        let rotations = if burst_index > 0 {
+            level_burst_offsets(
+                &pl,
+                &temp_coh,
+                &covered,
+                b,
+                off,
+                burst_index,
+                retain_covariance_lineage,
+            )?
+        } else {
+            retain_covariance_lineage.then(|| vec![Cf64::new(1.0, 0.0); nslc])
+        };
+        let owner =
+            u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
+        if let (Some(seams), Some(rotations)) = (seam_rotations.as_mut(), rotations) {
+            seams.push((owner, rotations));
         }
-        paste3_finite_complex(&mut pl, &b.pl, off);
+        if let Some(mappings) = burst_output_mappings.as_mut() {
+            mappings.push(BurstOutputMapping {
+                owner,
+                frame_origin: off,
+                output_origin: b
+                    .covariance_output_origin
+                    .context("covariance-linked burst lacks a captured output origin")?,
+                shape: (b.pl.dim().1, b.pl.dim().2),
+            });
+        }
+        match ownership.as_mut() {
+            Some(ownership) => {
+                paste3_finite_complex_with_owner(&mut pl, ownership, &b.pl, off, owner);
+            }
+            None => paste3_finite_complex(&mut pl, &b.pl, off),
+        }
         paste2_finite(&mut temp_coh, &b.temp_coh, off);
         let (rows, cols) = b.temp_coh.dim();
         let mut target = covered.slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols]);
@@ -3446,6 +3688,9 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         crlb_sigma,
         closure_phase,
         validity_mask: covered,
+        ownership,
+        seam_rotations,
+        burst_output_mappings,
         coverage: bursts.iter().map(|burst| burst.coverage.clone()).collect(),
         geo: frame.geo,
     })
@@ -3460,6 +3705,28 @@ fn paste2_finite(frame: &mut Array2<f64>, burst: &Array2<f64>, offset: (usize, u
         .for_each(|dst, &src| {
             if src.is_finite() {
                 *dst = src;
+            }
+        });
+}
+
+fn paste3_finite_complex_with_owner(
+    frame: &mut Array3<Cf64>,
+    ownership: &mut Array3<u32>,
+    burst: &Array3<Cf64>,
+    offset: (usize, usize),
+    owner: u32,
+) {
+    let (row, col) = offset;
+    let (_, rows, cols) = burst.dim();
+    let target = frame.slice_mut(s![.., row..row + rows, col..col + cols]);
+    let owner_target = ownership.slice_mut(s![.., row..row + rows, col..col + cols]);
+    ndarray::Zip::from(target)
+        .and(owner_target)
+        .and(burst)
+        .for_each(|dst, dst_owner, &src| {
+            if src.re.is_finite() && src.im.is_finite() {
+                *dst = src;
+                *dst_owner = owner;
             }
         });
 }
@@ -3487,8 +3754,10 @@ fn level_burst_offsets(
     burst: &mut BurstLink,
     offset: (usize, usize),
     burst_index: usize,
-) -> std::result::Result<(), StitchError> {
+    capture_rotations: bool,
+) -> std::result::Result<Option<Vec<Cf64>>, StitchError> {
     let (_, rows, cols) = burst.pl.dim();
+    let mut rotations = capture_rotations.then(|| Vec::with_capacity(burst.pl.dim().0));
     for acquisition_index in 0..burst.pl.dim().0 {
         let mut sum = Cf64::new(0.0, 0.0);
         let mut support = 0;
@@ -3524,12 +3793,15 @@ fn level_burst_offsets(
             });
         }
         let rotation = Cf64::from_polar(1.0, sum.arg());
+        if let Some(rotations) = rotations.as_mut() {
+            rotations.push(rotation);
+        }
         burst
             .pl
             .index_axis_mut(Axis(0), acquisition_index)
             .mapv_inplace(|value| value * rotation);
     }
-    Ok(())
+    Ok(rotations)
 }
 
 /// Mosaic an optional per-burst 2D layer onto the frame grid.
@@ -4423,6 +4695,7 @@ mod tests {
                 cols: 3,
             },
             days: vec![0.0, 12.0],
+            covariance_output_origin: Some((0, 0)),
         }
     }
 
@@ -4434,7 +4707,7 @@ mod tests {
         let coherence = Array2::from_elem((3, 3), 0.9);
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(0.7, 0.9);
-        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false).unwrap();
         for (actual, expected) in burst.pl.iter().zip(frame.iter()) {
             assert!((*actual - *expected).norm() < 1e-12);
         }
@@ -4446,8 +4719,8 @@ mod tests {
         let coherence = Array2::from_elem((3, 3), 0.9);
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(0.7, 0.1);
-        let error =
-            level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap_err();
+        let error = level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false)
+            .unwrap_err();
         assert!(matches!(
             error,
             StitchError::InsufficientOffsetSupport { support: 0, .. }
@@ -4464,7 +4737,7 @@ mod tests {
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(-0.4, 0.9);
         burst.pl[(1, 0, 1)] = Cf64::new(0.0, 0.0);
-        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false).unwrap();
         assert!((burst.pl[(0, 1, 1)] - frame[(0, 1, 1)]).norm() < 1e-12);
         assert!((burst.pl[(1, 1, 1)] - frame[(1, 1, 1)]).norm() < 1e-12);
     }
@@ -4478,10 +4751,48 @@ mod tests {
         second.temp_coh[(0, 0)] = f64::NAN;
         second.validity_mask[(0, 0)] = false;
         second.coverage.burst_index = 1;
-        let stitched = stitch_bursts(vec![first, second]).unwrap();
+        let stitched = stitch_bursts(vec![first, second], true).unwrap();
         assert_eq!(stitched.pl[(0, 0, 0)], expected);
         assert!(stitched.temp_coh[(0, 0)].is_finite());
         assert!(stitched.validity_mask[(0, 0)]);
+        let ownership = stitched.ownership.unwrap();
+        assert_eq!(ownership[(0, 0, 0)], 0);
+        assert_eq!(ownership[(1, 0, 0)], 1);
+        assert_eq!(stitched.seam_rotations.unwrap().len(), 2);
+        assert_eq!(
+            crate::spatial_reference_covariance_output::same_constant_owner(
+                ownership.view(),
+                (0, 0),
+                (0, 1),
+            ),
+            None,
+            "date-varying overlap ownership must abstain"
+        );
+    }
+
+    #[test]
+    fn disabled_covariance_capture_does_not_retain_frame_lineage() {
+        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false).unwrap();
+        assert!(stitched.ownership.is_none());
+        assert!(stitched.seam_rotations.is_none());
+    }
+
+    #[test]
+    fn covariance_retains_the_exact_post_loop_qc_l2_observation_branch() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
+        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true).unwrap();
+        assert!(qc.is_some());
+        let retained = inversion.fixed_l2_inputs.unwrap();
+        assert!(retained.pixel_map((0, 0)).is_ok());
+        assert_eq!(
+            retained.pixel_map((0, 1)).unwrap_err().status,
+            dolphin_timeseries::inversion::PixelL2MapStatus::InsufficientObservations
+        );
     }
     #[test]
     fn proc_status_memory_parser_is_bounded_and_path_free() {
@@ -4584,6 +4895,7 @@ mod tests {
             }),
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::from_elem((2, 2, 2), 1),
+            production_covariance: None,
         };
 
         products.apply_validity_mask();
@@ -4697,6 +5009,7 @@ mod tests {
             velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 6, 8)),
+            production_covariance: None,
         };
         let target = BlockIndices {
             row_start: 2,
@@ -4758,6 +5071,7 @@ mod tests {
             velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
+            production_covariance: None,
         };
         let error = products
             .trim(
@@ -4946,11 +5260,12 @@ mod tests {
         cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.write_posterior_uncertainty = true;
-        let output = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
-            .expect("unweighted posterior");
+        let output =
+            invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)], false)
+                .expect("unweighted posterior");
         assert!(output.posterior_variance.is_some());
         cfg.timeseries_options.method = TimeseriesMethod::L1;
-        let error = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
+        let error = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)], false)
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
@@ -5037,8 +5352,9 @@ mod tests {
         cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.write_posterior_uncertainty = true;
-        let inversion = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &pairs)
-            .expect("redundant, well-conditioned network");
+        let inversion =
+            invert_time_series(&cfg, incidence.view(), dphi.view(), None, &pairs, false)
+                .expect("redundant, well-conditioned network");
         let misclosure = inversion
             .network_misclosure_rms
             .as_ref()
@@ -5489,6 +5805,7 @@ mod tests {
         let source_manifest_digest = [3; 32];
         let source_model_version_digest = [4; 32];
         let mut blocks = Vec::new();
+        let mut replay_tiles = Vec::new();
         let captured = phase_link_tiled_impl(
             &cfg,
             dims,
@@ -5501,7 +5818,10 @@ mod tests {
                 source_origin: (0, 0),
                 source_manifest_digest,
                 source_model_version_digest,
+                member_indices: (0..6).collect(),
+                processed_shape: dims,
                 source_resolver: None,
+                replay_tiles: &mut replay_tiles,
                 sink: &mut blocks,
             }),
         )
@@ -5514,6 +5834,10 @@ mod tests {
         );
         let tile_count = plan_tiles(dims, strides, half, 2, (2, 2)).len();
         assert_eq!(blocks.len(), tile_count * 2);
+        assert_eq!(replay_tiles.len(), tile_count);
+        assert!(replay_tiles.iter().all(
+            |tile| tile.num_real_dates == 6 && tile.native_validity.iter().all(|valid| *valid)
+        ));
         assert!(blocks.iter().all(|block| {
             block.burst_id == "fixture-burst"
                 && block.owned_output_grid.rows > 0
@@ -5622,6 +5946,7 @@ mod tests {
             .unwrap();
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let mut blocks = Vec::new();
+        let mut replay_tiles = Vec::new();
         let captured = phase_link_tiled_impl(
             &cfg,
             dims,
@@ -5638,7 +5963,10 @@ mod tests {
                 source_origin: (0, 0),
                 source_manifest_digest: manifest.digest(),
                 source_model_version_digest,
+                member_indices: vec![0, 1, 2, 3],
+                processed_shape: dims,
                 source_resolver: Some(source_resolver),
+                replay_tiles: &mut replay_tiles,
                 sink: &mut blocks,
             }),
         )
@@ -5646,6 +5974,9 @@ mod tests {
 
         assert!(captured.validity_mask.iter().any(|valid| !*valid));
         assert!(captured.validity_mask.iter().any(|valid| *valid));
+        assert!(replay_tiles
+            .iter()
+            .any(|tile| tile.native_validity.iter().any(|valid| !*valid)));
         assert!(blocks.iter().any(|block| {
             block
                 .status
@@ -6215,6 +6546,7 @@ mod tests {
             velocity_diagnostics: None,
             interferogram_pairs: vec![(0, 1)],
             unwrap_connected_components: Array3::zeros((0, 2, 2)),
+            production_covariance: None,
         };
         let scaled = scale_outputs(&cfg, &spatial);
         write_outputs(
@@ -6354,6 +6686,7 @@ mod tests {
     fn covariance_operator_rejects_unsupported_producer_scope_before_io() {
         let mut cfg = DisplacementWorkflow::default();
         cfg.phase_linking.write_covariance_operator = true;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.phase_linking.shp_method = ShpMethod::Rect;
         for method in [ShpMethod::Rect, ShpMethod::Glrt, ShpMethod::Ks] {
             cfg.phase_linking.shp_method = method;
@@ -6394,6 +6727,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("correct_phase_bias = false"));
+        cfg.phase_linking.correct_phase_bias = false;
+
+        cfg.timeseries_options.method = TimeseriesMethod::L1;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("timeseries_options.method = l2"));
     }
 
     #[test]
@@ -6438,7 +6778,11 @@ mod tests {
             .unwrap();
         drop(file);
 
-        let error = artifact.finish().unwrap_err().to_string();
+        let error = artifact
+            .finish(BTreeMap::new())
+            .err()
+            .expect("manifest mutation must fail")
+            .to_string();
         assert!(error.contains("immutable CSLC members"), "{error}");
         assert!(!cfg
             .work_directory
@@ -6463,6 +6807,7 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.phase_linking.write_covariance_operator = true;
         cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.cslc_file_list = vec![PathBuf::from("definitely-missing-covariance-source.h5")];
 
         let error =
@@ -7138,6 +7483,7 @@ mod tests {
             velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
+            production_covariance: None,
         };
         let target = BlockIndices {
             row_start: 1,

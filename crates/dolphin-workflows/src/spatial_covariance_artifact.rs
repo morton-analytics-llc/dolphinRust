@@ -54,7 +54,7 @@ pub const SPATIAL_REFERENCE_COVARIANCE_DESIGN_FILENAME: &str =
 /// Exact producer executable copied or linked into the artifact evidence directory.
 pub const SPATIAL_REFERENCE_COVARIANCE_PRODUCER_BINARY_FILENAME: &str =
     "referenced_displacement_covariance_producer_binary";
-const MANIFEST_SCHEMA_VERSION: u16 = 2;
+const MANIFEST_SCHEMA_VERSION: u16 = 3;
 const METADATA_READ_CAP: u64 = 1024 * 1024;
 const BINARY_READ_CAP: u64 = 512 * 1024 * 1024;
 const PREREGISTRATION_BYTES: &[u8] =
@@ -126,12 +126,14 @@ struct SpatialCovarianceResourceReceipt {
     maximum_block_bytes: u64,
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct SpatialCovarianceResultScope {
     burst_id: String,
     crs: String,
     units: String,
+    geotransform: Option<[f64; 6]>,
+    acquisition_days: Option<Vec<f64>>,
     grid_row_start: u64,
     grid_col_start: u64,
     grid_rows: u32,
@@ -206,7 +208,7 @@ enum EvidenceValidationMode {
 }
 
 /// Durable receipt binding factor bytes to every scope identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpatialReferenceCovarianceArtifactManifest {
     /// Manifest schema version.
     pub schema_version: u16,
@@ -230,6 +232,10 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub crs: String,
     /// Factor units.
     pub units: String,
+    /// Exact GDAL affine geotransform of the factor grid.
+    pub geotransform: Option<[f64; 6]>,
+    /// Exact acquisition day coordinates relative to the gauge acquisition.
+    pub acquisition_days: Option<Vec<f64>>,
     /// Selected reference/grid signature.
     pub reference_signature_digest: String,
     /// Native/output mask identity.
@@ -242,6 +248,44 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub approximation_receipt_digest: String,
     /// Frozen resource receipt identity.
     pub resource_receipt_digest: String,
+    /// Exact runtime incremental covariance working-set receipt identity.
+    pub runtime_resource_receipt_digest: String,
+    /// Cap for the incremental #54 covariance working set.
+    pub working_set_byte_cap: u64,
+    /// Largest resident in-progress factor block.
+    pub factor_block_high_water_bytes: u64,
+    /// Largest HDF5 serialization reservation.
+    pub serialization_high_water_bytes: u64,
+    /// Dynamically projected fixed-L2 workspace admission.
+    pub fixed_l2_workspace_admission_bytes: u64,
+    /// Fixed-L2 workspace used by an executed propagation.
+    pub fixed_l2_workspace_observed_high_water_bytes: u64,
+    /// Largest admitted replay reservation.
+    pub replay_admission_high_water_bytes: u64,
+    /// Largest high-water reported by an executed replay.
+    pub replay_observed_high_water_bytes: u64,
+    /// Observed maximum simultaneously live replay providers.
+    pub provider_peak_count: u64,
+    /// Observed maximum resident bytes held by live replay providers.
+    pub provider_peak_bytes: u64,
+    /// Providers opened by resource-only preflight.
+    pub preflight_provider_open_count: u64,
+    /// Providers opened by numeric production replay.
+    pub production_provider_open_count: u64,
+    /// Operator HDF5 block reads during numeric replay.
+    pub operator_block_reads: u64,
+    /// Operator block cache hits during numeric replay.
+    pub operator_block_cache_hits: u64,
+    /// Source member-window reads during numeric replay.
+    pub source_member_window_reads: u64,
+    /// Source tile-cache loads during numeric replay.
+    pub source_tile_cache_loads: u64,
+    /// Source factor resolutions during numeric replay.
+    pub source_resolutions: u64,
+    /// Sum of admitted incremental covariance components.
+    pub working_set_admission_high_water_bytes: u64,
+    /// Sum of observed incremental covariance components.
+    pub working_set_observed_high_water_bytes: u64,
     /// Independent-review receipt identity.
     pub review_receipt_digest: String,
     /// Immutable reviewed method-manifest identity.
@@ -252,6 +296,18 @@ pub struct SpatialReferenceCovarianceArtifactManifest {
     pub source_model_digest: String,
     /// Effective-look rule identity.
     pub effective_looks_digest: String,
+    /// HDF5 block dataset containing per-target effective-look fractions.
+    pub effective_looks_fraction_dataset: String,
+    /// HDF5 block dataset containing per-target support-union counts.
+    pub support_union_count_dataset: String,
+    /// HDF5 block dataset containing per-target exact effective-look receipts.
+    pub effective_looks_receipt_dataset: String,
+    /// HDF5 block dataset containing per-target replay resource high-water bounds.
+    pub resource_high_water_bytes_dataset: String,
+    /// HDF5 block dataset containing per-target realized factor rank.
+    pub rank_by_target_dataset: String,
+    /// HDF5 block dataset containing per-target retained condition number.
+    pub condition_number_dataset: String,
     /// Realized fixed-support method.
     pub support_method: String,
     /// Realized fixed-support identity.
@@ -868,6 +924,8 @@ fn result_scope(metadata: &SpatialReferenceCovarianceMetadata) -> SpatialCovaria
         burst_id: metadata.burst_id.clone(),
         crs: metadata.crs.clone(),
         units: metadata.units.clone(),
+        geotransform: metadata.geotransform,
+        acquisition_days: metadata.acquisition_days.clone(),
         grid_row_start: metadata.full_grid.row_start,
         grid_col_start: metadata.full_grid.col_start,
         grid_rows: metadata.full_grid.rows,
@@ -948,6 +1006,9 @@ fn manifest(
     hdf5_sha256: String,
     hdf5_bytes: u64,
 ) -> SpatialReferenceCovarianceArtifactManifest {
+    let resource = metadata
+        .runtime_resource_receipt
+        .expect("current artifact metadata requires a runtime resource receipt");
     let calibration_scope = match metadata.calibration_scope {
         SpatialReferenceCalibrationScope::Uncalibrated => "uncalibrated",
         SpatialReferenceCalibrationScope::CalibratedScopeMatch => "calibrated_scope_match",
@@ -964,17 +1025,47 @@ fn manifest(
         burst_id: metadata.burst_id.clone(),
         crs: metadata.crs.clone(),
         units: metadata.units.clone(),
+        geotransform: metadata.geotransform,
+        acquisition_days: metadata.acquisition_days.clone(),
         reference_signature_digest: metadata.reference_signature_digest.clone(),
         mask_digest: metadata.mask_digest.clone(),
         source_replay_digest: metadata.source_replay_digest.clone(),
         l2_map_digest: metadata.l2_map_digest.clone(),
         approximation_receipt_digest: metadata.approximation_receipt_digest.clone(),
         resource_receipt_digest: metadata.resource_receipt_digest.clone(),
+        runtime_resource_receipt_digest: metadata.runtime_resource_receipt_digest.clone(),
+        working_set_byte_cap: resource.working_set_byte_cap,
+        factor_block_high_water_bytes: resource.factor_block_high_water_bytes,
+        serialization_high_water_bytes: resource.serialization_high_water_bytes,
+        fixed_l2_workspace_admission_bytes: resource.fixed_l2_workspace_admission_bytes,
+        fixed_l2_workspace_observed_high_water_bytes: resource
+            .fixed_l2_workspace_observed_high_water_bytes,
+        replay_admission_high_water_bytes: resource.replay_admission_high_water_bytes,
+        replay_observed_high_water_bytes: resource.replay_observed_high_water_bytes,
+        provider_peak_count: resource.provider_peak_count,
+        provider_peak_bytes: resource.provider_peak_bytes,
+        preflight_provider_open_count: resource.preflight_provider_open_count,
+        production_provider_open_count: resource.production_provider_open_count,
+        operator_block_reads: resource.operator_block_reads,
+        operator_block_cache_hits: resource.operator_block_cache_hits,
+        source_member_window_reads: resource.source_member_window_reads,
+        source_tile_cache_loads: resource.source_tile_cache_loads,
+        source_resolutions: resource.source_resolutions,
+        working_set_admission_high_water_bytes: resource.working_set_admission_high_water_bytes,
+        working_set_observed_high_water_bytes: resource.working_set_observed_high_water_bytes,
         review_receipt_digest: metadata.review_receipt_digest.clone(),
         method_manifest_digest: metadata.method_manifest_digest.clone(),
         calibration_scope_digest: metadata.calibration_scope_digest.clone(),
         source_model_digest: metadata.source_model_digest.clone(),
         effective_looks_digest: metadata.effective_looks_digest.clone(),
+        effective_looks_fraction_dataset: "blocks/{block_id:020}/effective_looks_fraction"
+            .to_owned(),
+        support_union_count_dataset: "blocks/{block_id:020}/support_union_count".to_owned(),
+        effective_looks_receipt_dataset: "blocks/{block_id:020}/effective_looks_receipt".to_owned(),
+        resource_high_water_bytes_dataset: "blocks/{block_id:020}/resource_high_water_bytes"
+            .to_owned(),
+        rank_by_target_dataset: "blocks/{block_id:020}/rank_by_target".to_owned(),
+        condition_number_dataset: "blocks/{block_id:020}/condition_number".to_owned(),
         support_method: metadata.support_method.clone(),
         support_digest: metadata.support_digest.clone(),
         correction_order_digest: metadata.correction_order_digest.clone(),

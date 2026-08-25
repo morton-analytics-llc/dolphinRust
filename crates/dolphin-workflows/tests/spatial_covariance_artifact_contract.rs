@@ -1,9 +1,10 @@
 use dolphin_io::{
-    spatial_reference_calibration_scope_digest, write_spatial_reference_covariance,
+    spatial_reference_calibration_scope_digest, spatial_reference_effective_looks_digest,
+    spatial_reference_runtime_resource_receipt_digest, write_spatial_reference_covariance,
     CovarianceOperatorGrid, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceBlock,
     SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
-    SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE, SPATIAL_REFERENCE_COVARIANCE_METHOD,
-    SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
+    SpatialReferenceRuntimeResourceReceipt, SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE,
+    SPATIAL_REFERENCE_COVARIANCE_METHOD, SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
 };
 use dolphin_workflows::spatial_covariance_artifact::{
     spatial_reference_covariance_code_digest, spatial_reference_covariance_design_digest,
@@ -32,7 +33,27 @@ fn digest(byte: u8) -> String {
 }
 
 fn metadata() -> SpatialReferenceCovarianceMetadata {
-    SpatialReferenceCovarianceMetadata {
+    let runtime_resource_receipt = SpatialReferenceRuntimeResourceReceipt {
+        working_set_byte_cap: 1024,
+        factor_block_high_water_bytes: 128,
+        serialization_high_water_bytes: 128,
+        fixed_l2_workspace_admission_bytes: 256,
+        fixed_l2_workspace_observed_high_water_bytes: 256,
+        replay_admission_high_water_bytes: 512,
+        replay_observed_high_water_bytes: 256,
+        provider_peak_count: 2,
+        provider_peak_bytes: 256,
+        preflight_provider_open_count: 4,
+        production_provider_open_count: 2,
+        operator_block_reads: 2,
+        operator_block_cache_hits: 3,
+        source_member_window_reads: 4,
+        source_tile_cache_loads: 2,
+        source_resolutions: 5,
+        working_set_admission_high_water_bytes: 1024,
+        working_set_observed_high_water_bytes: 768,
+    };
+    let mut metadata = SpatialReferenceCovarianceMetadata {
         schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,
         method: SPATIAL_REFERENCE_COVARIANCE_METHOD.to_owned(),
         method_version: 1,
@@ -41,6 +62,7 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         burst_id: "T078-165482-IW1".to_owned(),
         crs: "EPSG:32611".to_owned(),
         units: "radians".to_owned(),
+        geotransform: Some([500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0]),
         full_grid: CovarianceOperatorGrid {
             row_start: 0,
             col_start: 0,
@@ -53,12 +75,17 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_col: 0,
         gauge_date_index: 0,
         ordered_date_indices: vec![0, 1],
+        acquisition_days: Some(vec![0.0, 12.0]),
         mask_digest: digest(0x11),
         source_replay_digest: digest(0x22),
         l2_map_digest: digest(0x33),
         reference_signature_digest: digest(0x44),
         approximation_receipt_digest: digest(0x55),
         resource_receipt_digest: digest(0x66),
+        runtime_resource_receipt_digest: spatial_reference_runtime_resource_receipt_digest(
+            runtime_resource_receipt,
+        ),
+        runtime_resource_receipt: Some(runtime_resource_receipt),
         review_receipt_digest: String::new(),
         method_manifest_digest: String::new(),
         calibration_scope_digest: String::new(),
@@ -73,19 +100,33 @@ fn metadata() -> SpatialReferenceCovarianceMetadata {
         reference_source_burst_index: 0,
         calibration_scope: SpatialReferenceCalibrationScope::Uncalibrated,
         maximum_block_bytes: 1024,
-    }
+    };
+    metadata.effective_looks_digest = spatial_reference_effective_looks_digest(&[block()]).unwrap();
+    metadata
 }
 
 fn block() -> SpatialReferenceCovarianceBlock {
     SpatialReferenceCovarianceBlock {
         block_id: 1,
-        target_grid: metadata().full_grid,
+        target_grid: CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 1,
+            cols: 1,
+            stride_y: 1,
+            stride_x: 1,
+        },
         maximum_rank: 1,
         rank_by_target: vec![1],
         status: vec![SpatialReferenceCovarianceStatus::Valid],
         source_burst_index_by_target: vec![0],
         difference_factor: vec![0.0, 1.0],
         approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE],
+        effective_looks_fraction: Some(vec![0.75]),
+        support_union_count: Some(vec![9]),
+        effective_looks_receipt: Some(vec![0x71; 32]),
+        resource_high_water_bytes: Some(vec![256]),
+        condition_number: Some(vec![1.0]),
         source_factor_digest: digest(0x77),
     }
 }
@@ -147,6 +188,8 @@ fn write_promotion_evidence(
             "burst_id": value.burst_id,
             "crs": value.crs,
             "units": value.units,
+            "geotransform": value.geotransform,
+            "acquisition_days": value.acquisition_days,
             "grid_row_start": value.full_grid.row_start,
             "grid_col_start": value.full_grid.col_start,
             "grid_rows": value.full_grid.rows,
@@ -341,6 +384,60 @@ fn manifest_is_written_last_and_binds_hdf5_and_scope() {
     .unwrap();
     assert_eq!(manifest.hdf5_sha256, receipt.hdf5_sha256);
     assert_eq!(manifest.reference_signature_digest, digest(0x44));
+    assert_eq!(manifest.schema_version, 3);
+    assert_eq!(manifest.geotransform, metadata().geotransform);
+    assert_eq!(manifest.acquisition_days, metadata().acquisition_days);
+    let runtime = metadata().runtime_resource_receipt.unwrap();
+    assert_eq!(
+        manifest.runtime_resource_receipt_digest,
+        metadata().runtime_resource_receipt_digest
+    );
+    assert_eq!(
+        (
+            manifest.working_set_byte_cap,
+            manifest.factor_block_high_water_bytes,
+            manifest.provider_peak_count,
+            manifest.provider_peak_bytes,
+            manifest.working_set_admission_high_water_bytes,
+            manifest.preflight_provider_open_count,
+            manifest.production_provider_open_count,
+            manifest.operator_block_reads,
+            manifest.source_member_window_reads,
+            manifest.source_tile_cache_loads,
+            manifest.source_resolutions,
+        ),
+        (
+            runtime.working_set_byte_cap,
+            runtime.factor_block_high_water_bytes,
+            runtime.provider_peak_count,
+            runtime.provider_peak_bytes,
+            runtime.working_set_admission_high_water_bytes,
+            runtime.preflight_provider_open_count,
+            runtime.production_provider_open_count,
+            runtime.operator_block_reads,
+            runtime.source_member_window_reads,
+            runtime.source_tile_cache_loads,
+            runtime.source_resolutions,
+        )
+    );
+    assert_eq!(
+        (
+            manifest.effective_looks_fraction_dataset.as_str(),
+            manifest.support_union_count_dataset.as_str(),
+            manifest.effective_looks_receipt_dataset.as_str(),
+            manifest.resource_high_water_bytes_dataset.as_str(),
+            manifest.rank_by_target_dataset.as_str(),
+            manifest.condition_number_dataset.as_str(),
+        ),
+        (
+            "blocks/{block_id:020}/effective_looks_fraction",
+            "blocks/{block_id:020}/support_union_count",
+            "blocks/{block_id:020}/effective_looks_receipt",
+            "blocks/{block_id:020}/resource_high_water_bytes",
+            "blocks/{block_id:020}/rank_by_target",
+            "blocks/{block_id:020}/condition_number",
+        )
+    );
     assert_eq!(manifest.calibration_scope, "uncalibrated");
     assert!(directory
         .join(SPATIAL_REFERENCE_COVARIANCE_FILENAME)
@@ -372,6 +469,24 @@ fn tampered_hdf5_or_manifest_identity_fails_closed() {
     let original = std::fs::read(&manifest_path).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
     manifest["reference_signature_digest"] = serde_json::Value::String(digest(0x99));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    manifest["geotransform"][0] = serde_json::json!(500_030.0);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(read_spatial_reference_covariance_artifact_manifest(&directory).is_err());
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    manifest["acquisition_days"][1] = serde_json::json!(13.0);
     std::fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).unwrap(),
