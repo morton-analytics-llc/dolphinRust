@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic shard preparation and commit driver for F54-07 v5."""
+"""Deterministic shard preparation and commit driver for F54-07 v6."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import resource
+import selectors
 import shutil
 import stat
 import subprocess
@@ -17,7 +18,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
 try:
     from validation.score_spatial_covariance import (
@@ -29,6 +30,8 @@ try:
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
+        FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL,
+        FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL,
         FROZEN_SEED_COUNT,
         FROZEN_SHARD_COUNT,
         SchemaError,
@@ -40,7 +43,8 @@ try:
         _validate_performance_probe,
         _validate_resources,
         regenerate_frozen_attempt_inputs,
-        validate_matched_pair_cohorts,
+        validate_positive_overlap_cohort,
+        validate_positive_overlap_run_binding,
         iter_shard_specs,
         expected_cell_ids,
         expected_seed_count,
@@ -64,6 +68,8 @@ except ModuleNotFoundError:
         FROZEN_MAX_RUN_MANIFEST_BYTES,
         FROZEN_MAX_SHARD_BYTES,
         FROZEN_PROCESS_RSS_BYTES,
+        FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL,
+        FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL,
         FROZEN_SEED_COUNT,
         FROZEN_SHARD_COUNT,
         SchemaError,
@@ -75,7 +81,8 @@ except ModuleNotFoundError:
         _validate_performance_probe,
         _validate_resources,
         regenerate_frozen_attempt_inputs,
-        validate_matched_pair_cohorts,
+        validate_positive_overlap_cohort,
+        validate_positive_overlap_run_binding,
         iter_shard_specs,
         expected_cell_ids,
         expected_seed_count,
@@ -138,18 +145,20 @@ PERFORMANCE_CELL_IDS = {
     "hw_7x14_near_evd_spatial":
         "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress",
 }
-MATCHED_POSITIVE_CELL = (
+POSITIVE_OVERLAP_CELL = (
     "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|"
     "well_separated|spatial_correlation_stress"
-)
-MATCHED_NEGATIVE_CELL = MATCHED_POSITIVE_CELL.replace(
-    "shared_75_positive", "shared_75_negative"
 )
 PARALLEL_BATCH_WORKER_RSS_ADMISSION_BYTES = 2 << 30
 PARALLEL_BATCH_WORKER_COUNT = FROZEN_PROCESS_RSS_BYTES // PARALLEL_BATCH_WORKER_RSS_ADMISSION_BYTES
 PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD = 3
 PARALLEL_BATCH_RSS_SAMPLE_SECONDS = 0.05
-MATCHED_COHORT_SEED_COUNT = 512
+POSITIVE_OVERLAP_SEED_COUNT = 512
+POSITIVE_OVERLAP_SEED_START = 512
+POSITIVE_OVERLAP_STDERR_BYTES_MAX = 16_384
+POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS = 30.0
+POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS = 10.0
+POSITIVE_OVERLAP_EMISSION_RATE_MIN = 0.95
 
 
 def _validated_producer_identities(
@@ -1111,18 +1120,18 @@ class _TraceAccumulator:
             self.sums = [0.0] * len(values)
             self.squares = [0.0] * len(values)
         if len(values) != len(self.sums):
-            raise SchemaError("matched cohort vector length changed")
+            raise SchemaError("positive-overlap cohort vector length changed")
         assert self.squares is not None
         for index, value in enumerate(values):
             if not math.isfinite(value):
-                raise SchemaError("matched cohort contains a nonfinite error")
+                raise SchemaError("positive-overlap cohort contains a nonfinite error")
             self.sums[index] += value
             self.squares[index] += value * value
         self.count += 1
 
     def covariance_trace(self) -> float:
         if self.count < 2 or self.sums is None or self.squares is None:
-            raise SchemaError("matched empirical covariance needs at least two seeds")
+            raise SchemaError("positive-overlap empirical covariance needs at least two seeds")
         return sum(
             (square - total * total / self.count) / self.count
             for total, square in zip(self.sums, self.squares)
@@ -1137,7 +1146,7 @@ def _digest_update(digest: Any, value: Mapping[str, Any]) -> None:
     digest.update(encoded)
 
 
-def _matched_marginal_identity(regenerated: Mapping[str, Any]) -> dict[str, Any]:
+def _positive_overlap_identity(regenerated: Mapping[str, Any]) -> dict[str, Any]:
     fields = (
         "target_support_sha256",
         "reference_support_sha256",
@@ -1161,209 +1170,345 @@ def _matched_marginal_identity(regenerated: Mapping[str, Any]) -> dict[str, Any]
         "source_correlation_distance_scale_pixels",
     )
     if any(field not in regenerated for field in fields):
-        raise SchemaError("matched signed DGP omits a frozen marginal identity field")
+        raise SchemaError("positive-overlap DGP omits a frozen identity field")
     return {
-        "schema": "dolphinrust.spatial-covariance.matched-marginal-identity/1",
+        "schema": "dolphinrust.spatial-covariance.positive-overlap-identity/1",
         **{field: regenerated[field] for field in fields},
     }
 
 
-def generate_matched_pair_cohorts(
+def _positive_overlap_process_diagnostic(
+    process: subprocess.Popen[bytes],
+    stderr: bytes,
+    cell_id: str,
+    seed_index: int,
+    reason: str,
+) -> str:
+    exit_status = process.poll()
+    if len(stderr) > POSITIVE_OVERLAP_STDERR_BYTES_MAX:
+        raise SchemaError(
+            f"positive-overlap Rust cohort {cell_id} seed {seed_index} stderr exceeds "
+            f"the {POSITIVE_OVERLAP_STDERR_BYTES_MAX}-byte cap"
+        )
+    stderr_text = stderr.decode("utf-8", errors="replace").strip() or "<empty>"
+    return (
+        f"positive-overlap Rust cohort {cell_id} seed {seed_index} {reason}; "
+        f"exit_status={exit_status if exit_status is not None else 'running'}; "
+        f"stderr={stderr_text}"
+    )
+
+
+class _BoundedPositiveOverlapProducer:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        stderr_bytes_max: int,
+    ) -> None:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise SchemaError("positive-overlap producer pipes are incomplete")
+        self.process = process
+        self.stderr_bytes_max = stderr_bytes_max
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.stdout_eof = False
+        self.stderr_eof = False
+        self.selector = selectors.DefaultSelector()
+        for name, handle in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(handle.fileno(), False)
+            self.selector.register(handle, selectors.EVENT_READ, name)
+
+    def _terminate(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+
+    def _abort(self, cell_id: str, seed_index: int, reason: str) -> None:
+        self._terminate()
+        raise SchemaError(
+            _positive_overlap_process_diagnostic(
+                self.process, bytes(self.stderr), cell_id, seed_index, reason
+            )
+        )
+
+    def _drain_ready(self, timeout: float, cell_id: str, seed_index: int) -> None:
+        for key, _ in self.selector.select(timeout):
+            name = key.data
+            limit = FROZEN_MAX_RECORD_BYTES if name == "stdout" else self.stderr_bytes_max
+            storage_limit = limit + 1 if name == "stdout" else limit
+            target = self.stdout if name == "stdout" else self.stderr
+            remaining = max(1, storage_limit - len(target))
+            try:
+                chunk = os.read(key.fileobj.fileno(), min(8192, remaining))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                self.selector.unregister(key.fileobj)
+                if name == "stdout":
+                    self.stdout_eof = True
+                else:
+                    self.stderr_eof = True
+                continue
+            allowed = storage_limit - len(target)
+            target.extend(chunk[:allowed])
+            if len(chunk) > allowed or len(target) > limit:
+                self._abort(
+                    cell_id,
+                    seed_index,
+                    f"{name} exceeds the {limit}-byte cap",
+                )
+
+    def read_record(
+        self,
+        cell_id: str,
+        seed_index: int,
+        deadline_seconds: float,
+    ) -> bytes:
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            newline = self.stdout.find(b"\n")
+            if newline >= 0:
+                raw = bytes(self.stdout[: newline + 1])
+                del self.stdout[: newline + 1]
+                if self.stdout:
+                    self._abort(cell_id, seed_index, "emitted buffered stdout top-up bytes")
+                return raw
+            if self.stdout_eof:
+                self._abort(
+                    cell_id,
+                    seed_index,
+                    f"output is incomplete ({len(self.stdout)} bytes)",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                self._abort(cell_id, seed_index, "exceeded the per-record deadline")
+            self._drain_ready(remaining, cell_id, seed_index)
+
+    def finish(
+        self,
+        cell_id: str,
+        seed_index: int,
+        deadline_seconds: float,
+    ) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.close()
+        deadline = time.monotonic() + deadline_seconds
+        while not (self.stdout_eof and self.stderr_eof and self.process.poll() is not None):
+            if self.stdout:
+                self._abort(cell_id, seed_index, "emitted stdout top-up bytes")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                self._abort(cell_id, seed_index, "exceeded the final-exit deadline")
+            self._drain_ready(remaining, cell_id, seed_index)
+        if self.stdout:
+            self._abort(cell_id, seed_index, "emitted stdout top-up bytes")
+        if self.process.returncode != 0 or self.stderr:
+            self._abort(cell_id, seed_index, "failed final exit validation")
+
+    def close(self) -> None:
+        self._terminate()
+        self.selector.close()
+        for handle in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if handle is not None and not handle.closed:
+                handle.close()
+
+
+def generate_positive_overlap_cohort(
     preregistration: Mapping[str, Any],
     preregistration_path: Path,
     batch_binary: Path,
     code_sha256: str,
     binary_sha256: str,
     seed_count: int,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     validate_preregistration(preregistration)
     cell_ids = expected_cell_ids(preregistration)
-    frozen_cohort = preregistration["execution_protocol"]["matched_pair_cohort"]
+    frozen_cohort = preregistration["execution_protocol"]["positive_overlap_cohort"]
     if (
-        frozen_cohort.get("positive_cell") != MATCHED_POSITIVE_CELL
-        or frozen_cohort.get("negative_cell") != MATCHED_NEGATIVE_CELL
-        or frozen_cohort.get("seed_count") != MATCHED_COHORT_SEED_COUNT
+        frozen_cohort.get("cell") != POSITIVE_OVERLAP_CELL
+        or frozen_cohort.get("scheduled_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
+        or frozen_cohort.get("dgp_cell_ordinal")
+        != FROZEN_POSITIVE_OVERLAP_DGP_ORDINAL
+        or frozen_cohort.get("seed_start") != POSITIVE_OVERLAP_SEED_START
+        or frozen_cohort.get("seed_count") != POSITIVE_OVERLAP_SEED_COUNT
+        or frozen_cohort.get("seed_end_exclusive")
+        != POSITIVE_OVERLAP_SEED_START + POSITIVE_OVERLAP_SEED_COUNT
+        or frozen_cohort.get("stderr_bytes_max") != POSITIVE_OVERLAP_STDERR_BYTES_MAX
+        or frozen_cohort.get("record_deadline_seconds")
+        != POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS
+        or frozen_cohort.get("final_exit_deadline_seconds")
+        != POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS
+        or frozen_cohort.get("emission_rate_min") != POSITIVE_OVERLAP_EMISSION_RATE_MIN
         or seed_count != frozen_cohort.get("seed_count")
-        or MATCHED_POSITIVE_CELL not in cell_ids
-        or MATCHED_NEGATIVE_CELL not in cell_ids
+        or POSITIVE_OVERLAP_CELL not in cell_ids
+        or cell_ids.index(POSITIVE_OVERLAP_CELL)
+        != FROZEN_POSITIVE_OVERLAP_SCHEDULED_ORDINAL
     ):
-        raise SchemaError("matched cohort cells or seed count are outside the frozen matrix")
+        raise SchemaError("positive-overlap cell or seed count is outside the frozen matrix")
     preregistration_path = Path(preregistration_path).resolve(strict=True)
     batch_binary = Path(batch_binary).resolve(strict=True)
-    processes = []
-    for cell_id in (MATCHED_POSITIVE_CELL, MATCHED_NEGATIVE_CELL):
-        process = subprocess.Popen(
-            [
-                str(batch_binary),
-                "--preregistration", str(preregistration_path),
-                "--cell-id", cell_id,
-                "--ephemeral-evidence-stdout",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        processes.append(process)
-    accumulators = [
-        CellAccumulator(
-            preregistration, cell_id, cell_ids.index(cell_id), seed_count,
-            code_sha256, binary_sha256,
-            matched_cohort_replay=True,
-        )
-        for cell_id in (MATCHED_POSITIVE_CELL, MATCHED_NEGATIVE_CELL)
-    ]
-    target_errors = [_TraceAccumulator(), _TraceAccumulator()]
-    reference_errors = [_TraceAccumulator(), _TraceAccumulator()]
-    difference_errors = [_TraceAccumulator(), _TraceAccumulator()]
-    predicted_difference_totals = [0.0, 0.0]
-    predicted_marginal_totals = [0.0, 0.0]
-    attempt_digests = [
-        hashlib.sha256(b"dolphinrust:matched-positive-attempts:v1\0"),
-        hashlib.sha256(b"dolphinrust:matched-negative-attempts:v1\0"),
-    ]
-    marginal_digest = hashlib.sha256(b"dolphinrust:matched-marginal-dgp:v1\0")
-    target_support_digest = hashlib.sha256(b"dolphinrust:matched-target-support:v1\0")
-    reference_support_digest = hashlib.sha256(b"dolphinrust:matched-reference-support:v1\0")
-    latent_digest = hashlib.sha256(b"dolphinrust:matched-latent-history:v1\0")
-    orientation_digest = hashlib.sha256(b"dolphinrust:matched-phase-orientation:v1\0")
+    process = subprocess.Popen(
+        [
+            str(batch_binary), "--preregistration", str(preregistration_path),
+            "--cell-id", POSITIVE_OVERLAP_CELL, "--ephemeral-evidence-stdout",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    supervisor = _BoundedPositiveOverlapProducer(
+        process, POSITIVE_OVERLAP_STDERR_BYTES_MAX
+    )
+    accumulator = CellAccumulator(
+        preregistration, POSITIVE_OVERLAP_CELL, cell_ids.index(POSITIVE_OVERLAP_CELL),
+        seed_count, code_sha256, binary_sha256, positive_overlap_replay=True,
+        seed_start=POSITIVE_OVERLAP_SEED_START,
+    )
+    target_errors = _TraceAccumulator()
+    reference_errors = _TraceAccumulator()
+    difference_errors = _TraceAccumulator()
+    predicted_difference_total = 0.0
+    predicted_marginal_total = 0.0
+    attempt_digest = hashlib.sha256(b"dolphinrust:positive-overlap-attempts:v1\0")
+    marginal_digest = hashlib.sha256(b"dolphinrust:positive-overlap-dgp:v1\0")
+    target_support_digest = hashlib.sha256(b"dolphinrust:positive-overlap-target-support:v1\0")
+    reference_support_digest = hashlib.sha256(b"dolphinrust:positive-overlap-reference-support:v1\0")
+    latent_digest = hashlib.sha256(b"dolphinrust:positive-overlap-latent-history:v1\0")
+    orientation_digest = hashlib.sha256(b"dolphinrust:positive-overlap-phase-orientation:v1\0")
+    emitted_seed_digest = hashlib.sha256(b"dolphinrust:positive-overlap-emitted-seeds:v1\0")
+    abstained_seed_digest = hashlib.sha256(b"dolphinrust:positive-overlap-abstained-seeds:v1\0")
+    emitted_seed_count = 0
+    abstained_seed_count = 0
     try:
-        for seed_index in range(seed_count):
-            attempts = []
-            regenerated = []
-            for index, (process, cell_id) in enumerate(zip(
-                processes, (MATCHED_POSITIVE_CELL, MATCHED_NEGATIVE_CELL)
-            )):
-                assert process.stdin is not None and process.stdout is not None
-                request = _cell_request_at(
-                    preregistration, cell_id, cell_ids.index(cell_id),
-                    dict(zip(DIMENSION_NAMES, cell_id.split("|"))), seed_index,
-                )
-                process.stdin.write(compact_json_line(request))
-                process.stdin.flush()
-                raw = process.stdout.readline(FROZEN_MAX_RECORD_BYTES + 2)
-                if not raw or len(raw) > FROZEN_MAX_RECORD_BYTES or not raw.endswith(b"\n"):
-                    raise SchemaError("matched Rust cohort output is incomplete or oversized")
-                try:
-                    attempt = json.loads(raw)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise SchemaError("matched Rust cohort output is malformed") from exc
-                accumulators[index].add(attempt)
-                attempt_digests[index].update(len(raw).to_bytes(8, "big"))
-                attempt_digests[index].update(raw)
-                attempts.append(attempt)
-                regenerated.append(
-                    regenerate_frozen_attempt_inputs(
-                        preregistration,
-                        cell_id,
-                        seed_index,
-                        matched_cohort_replay=True,
-                    )
-                )
-            marginal_identities = [
-                _matched_marginal_identity(value) for value in regenerated
-            ]
-            if marginal_identities[0] != marginal_identities[1]:
-                raise SchemaError("matched signed Rust cohorts do not share exact marginals")
-            common = marginal_identities[0]
+        for seed_index in range(
+            POSITIVE_OVERLAP_SEED_START,
+            POSITIVE_OVERLAP_SEED_START + seed_count,
+        ):
+            assert process.stdin is not None and process.stdout is not None
+            request = _cell_request_at(
+                preregistration, POSITIVE_OVERLAP_CELL,
+                cell_ids.index(POSITIVE_OVERLAP_CELL),
+                dict(zip(DIMENSION_NAMES, POSITIVE_OVERLAP_CELL.split("|"))), seed_index,
+            )
+            process.stdin.write(compact_json_line(request))
+            process.stdin.flush()
+            raw = supervisor.read_record(
+                POSITIVE_OVERLAP_CELL,
+                seed_index,
+                POSITIVE_OVERLAP_RECORD_DEADLINE_SECONDS,
+            )
+            try:
+                attempt = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SchemaError(_positive_overlap_process_diagnostic(
+                    process, bytes(supervisor.stderr), POSITIVE_OVERLAP_CELL, seed_index,
+                    f"output is malformed ({len(raw)} bytes)",
+                )) from exc
+            accumulator.add(attempt)
+            attempt_digest.update(len(raw).to_bytes(8, "big"))
+            attempt_digest.update(raw)
+            regenerated = regenerate_frozen_attempt_inputs(
+                preregistration, POSITIVE_OVERLAP_CELL, seed_index,
+                positive_overlap_replay=True,
+            )
+            common = _positive_overlap_identity(regenerated)
             common["seed_index"] = seed_index
             _digest_update(marginal_digest, common)
             _digest_update(target_support_digest, {
                 "seed_index": seed_index,
-                "sha256": regenerated[0]["target_support_sha256"],
+                "sha256": regenerated["target_support_sha256"],
             })
             _digest_update(reference_support_digest, {
                 "seed_index": seed_index,
-                "sha256": regenerated[0]["reference_support_sha256"],
+                "sha256": regenerated["reference_support_sha256"],
             })
             _digest_update(latent_digest, {
                 "seed_index": seed_index,
-                "sha256": regenerated[0]["latent_history_sha256"],
+                "sha256": regenerated["latent_history_sha256"],
             })
             _digest_update(orientation_digest, {
                 "seed_index": seed_index,
-                "date_axis_sha256": regenerated[0]["date_axis_sha256"],
-                "target_coordinate": regenerated[0]["target_coordinate"],
-                "reference_coordinate": regenerated[0]["reference_coordinate"],
+                "date_axis_sha256": regenerated["date_axis_sha256"],
+                "target_coordinate": regenerated["target_coordinate"],
+                "reference_coordinate": regenerated["reference_coordinate"],
             })
-            for index, (attempt, truth) in enumerate(zip(attempts, regenerated)):
-                target_error = [
-                    estimate - latent
-                    for estimate, latent in zip(
-                        attempt["target_estimate_history"], truth["latent_target_history"]
-                    )
-                ]
-                reference_error = [
-                    estimate - latent
-                    for estimate, latent in zip(
-                        attempt["reference_estimate_history"], truth["latent_reference_history"]
-                    )
-                ]
-                target_errors[index].add(target_error)
-                reference_errors[index].add(reference_error)
-                difference_errors[index].add([
-                    target - reference
-                    for target, reference in zip(target_error, reference_error)
-                ])
-                difference = attempt["predicted_difference_covariance"]
-                predicted_difference_totals[index] += sum(
-                    difference[date][date] for date in range(len(difference))
+            seed_status = {"seed_index": seed_index, "status": attempt["status"]}
+            if not attempt["emitted"]:
+                abstained_seed_count += 1
+                _digest_update(abstained_seed_digest, seed_status)
+                continue
+            emitted_seed_count += 1
+            _digest_update(emitted_seed_digest, seed_status)
+            target_error = [
+                estimate - latent for estimate, latent in zip(
+                    attempt["target_estimate_history"], regenerated["latent_target_history"]
                 )
-                joint = attempt["production_operator_matrix"]
-                dates = len(joint) // 2
-                predicted_marginal_totals[index] += sum(
-                    joint[date][date] + joint[dates + date][dates + date]
-                    for date in range(dates)
+            ]
+            reference_error = [
+                estimate - latent for estimate, latent in zip(
+                    attempt["reference_estimate_history"], regenerated["latent_reference_history"]
                 )
-        for process in processes:
-            assert process.stdin is not None and process.stdout is not None
-            process.stdin.close()
-            if process.stdout.read(1) or process.wait() != 0:
-                raise SchemaError("matched Rust cohort producer failed or emitted top-up evidence")
+            ]
+            target_errors.add(target_error)
+            reference_errors.add(reference_error)
+            difference_errors.add([
+                target - reference for target, reference in zip(target_error, reference_error)
+            ])
+            difference = attempt["predicted_difference_covariance"]
+            predicted_difference_total += sum(
+                difference[date][date] for date in range(len(difference))
+            )
+            joint = attempt["production_operator_matrix"]
+            dates = len(joint) // 2
+            predicted_marginal_total += sum(
+                joint[date][date] + joint[dates + date][dates + date]
+                for date in range(dates)
+            )
+        supervisor.finish(
+            POSITIVE_OVERLAP_CELL,
+            POSITIVE_OVERLAP_SEED_START + seed_count,
+            POSITIVE_OVERLAP_FINAL_EXIT_DEADLINE_SECONDS,
+        )
     finally:
-        for process in processes:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            if process.stdin is not None and not process.stdin.closed:
-                process.stdin.close()
-            if process.stdout is not None:
-                process.stdout.close()
-    shared = {
+        supervisor.close()
+    if emitted_seed_count + abstained_seed_count != seed_count:
+        raise SchemaError("positive-overlap emission accounting is incomplete")
+    if emitted_seed_count < math.ceil(
+        seed_count * POSITIVE_OVERLAP_EMISSION_RATE_MIN
+    ):
+        raise SchemaError(
+            "positive-overlap emission is below its frozen minimum: "
+            f"{emitted_seed_count}/{seed_count}"
+        )
+    result = {
+        "schema": "dolphinrust.spatial-covariance.positive-overlap-cohort/1",
+        "cell_id": POSITIVE_OVERLAP_CELL,
         "marginal_dgp_digest": marginal_digest.hexdigest(),
         "target_support_digest": target_support_digest.hexdigest(),
         "reference_support_digest": reference_support_digest.hexdigest(),
         "latent_history_digest": latent_digest.hexdigest(),
         "phase_orientation_digest": orientation_digest.hexdigest(),
-        "positive_cell_id": MATCHED_POSITIVE_CELL,
-        "negative_cell_id": MATCHED_NEGATIVE_CELL,
-        "seed_count": seed_count,
-        "positive_attempt_digest": attempt_digests[0].hexdigest(),
-        "negative_attempt_digest": attempt_digests[1].hexdigest(),
+        "seed_start": POSITIVE_OVERLAP_SEED_START,
+        "seed_end_exclusive": POSITIVE_OVERLAP_SEED_START + seed_count,
+        "attempted_seed_count": seed_count,
+        "emitted_seed_count": emitted_seed_count,
+        "emitted_seed_digest": emitted_seed_digest.hexdigest(),
+        "abstained_seed_count": abstained_seed_count,
+        "abstained_seed_digest": abstained_seed_digest.hexdigest(),
+        "attempt_digest": attempt_digest.hexdigest(),
         "code_sha256": code_sha256,
         "binary_sha256": binary_sha256,
         "config_sha256": sha256_json(preregistration["generator"]),
     }
-    positive_predicted = predicted_difference_totals[0] / seed_count
-    negative_predicted = predicted_difference_totals[1] / seed_count
-    independent_predicted = sum(predicted_marginal_totals) / (2 * seed_count)
-    positive_empirical = difference_errors[0].covariance_trace()
-    negative_empirical = difference_errors[1].covariance_trace()
-    independent_empirical = 0.5 * sum(
-        target.covariance_trace() + reference.covariance_trace()
-        for target, reference in zip(target_errors, reference_errors)
-    )
-    result = [
-        {"coupling": "positive", **shared,
-         "predicted_covariance_trace": positive_predicted,
-         "empirical_error_covariance_trace": positive_empirical},
-        {"coupling": "independent", **shared,
-         "predicted_covariance_trace": independent_predicted,
-         "empirical_error_covariance_trace": independent_empirical},
-        {"coupling": "negative", **shared,
-         "predicted_covariance_trace": negative_predicted,
-         "empirical_error_covariance_trace": negative_empirical},
-    ]
-    validate_matched_pair_cohorts(
+    result.update({
+        "predicted_covariance_trace": predicted_difference_total / emitted_seed_count,
+        "predicted_marginal_covariance_trace": predicted_marginal_total / emitted_seed_count,
+        "empirical_error_covariance_trace": difference_errors.covariance_trace(),
+        "empirical_marginal_covariance_trace": (
+            target_errors.covariance_trace() + reference_errors.covariance_trace()
+        ),
+    })
+    validate_positive_overlap_cohort(
         result, code_sha256, binary_sha256,
         sha256_json(preregistration["generator"]),
     )
@@ -1397,16 +1542,16 @@ def generate_preoutcome_receipts(
         resources = generate_resource_receipts(
             preregistration, source_root, batch_binary, benchmark_binary
         )
-        matched = generate_matched_pair_cohorts(
+        positive_overlap = generate_positive_overlap_cohort(
             preregistration, preregistration_path, batch_binary,
             code_sha256, binary_sha256,
-            preregistration["execution_protocol"]["matched_pair_cohort"]["seed_count"],
+            preregistration["execution_protocol"]["positive_overlap_cohort"]["seed_count"],
         )
         receipts = {}
         for name, value in (
             ("performance.json", performance),
             ("resources.json", resources),
-            ("matched-pair-cohorts.json", matched),
+            ("positive-overlap-cohort.json", positive_overlap),
         ):
             receipts[name] = _write_bounded_json_atomic(
                 value, partial / name, FROZEN_MAX_RESOURCE_RECEIPT_BYTES
@@ -1444,13 +1589,17 @@ def validate_preoutcome_receipts(
     directory: Path,
     code_sha256: str,
     binary_sha256: str,
-) -> None:
+) -> dict[str, Any]:
     directory = Path(directory).resolve(strict=True)
-    manifest = _load_bounded_json(
+    manifest_raw = _read_bounded_bytes(
         directory / "manifest.json",
         FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
         "pre-outcome receipt manifest",
     )
+    try:
+        manifest = json.loads(manifest_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("pre-outcome receipt manifest is malformed") from exc
     expected_identity = {
         "schema": "dolphinrust.spatial-covariance.preoutcome-receipts/1",
         "code_sha256": code_sha256,
@@ -1462,8 +1611,10 @@ def validate_preoutcome_receipts(
         manifest.get(name) != value for name, value in expected_identity.items()
     ):
         raise SchemaError("pre-outcome receipt manifest identity differs")
+    if manifest_raw != compact_json_line(manifest):
+        raise SchemaError("pre-outcome receipt manifest is not canonical")
     expected_names = (
-        "performance.json", "resources.json", "matched-pair-cohorts.json"
+        "performance.json", "resources.json", "positive-overlap-cohort.json"
     )
     if set(manifest.get("receipts", {})) != set(expected_names):
         raise SchemaError("pre-outcome receipt manifest set differs")
@@ -1489,12 +1640,17 @@ def validate_preoutcome_receipts(
         preregistration, values["resources.json"], binary_sha256
     ) != ["pass"] * 5:
         raise SchemaError("pre-outcome resource receipts did not pass")
-    validate_matched_pair_cohorts(
-        values["matched-pair-cohorts.json"],
+    validate_positive_overlap_cohort(
+        values["positive-overlap-cohort.json"],
         code_sha256,
         binary_sha256,
         sha256_json(preregistration["generator"]),
     )
+    return {
+        "manifest": manifest,
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "receipts": values,
+    }
 
 
 def _summary_root(
@@ -1797,24 +1953,34 @@ def build_run_manifest(
     binary_sha256: str,
     performance_probe: Mapping[str, Any],
     resources: list[Mapping[str, Any]],
+    preoutcome_directory: Path,
     attempt_regenerator: AttemptRegenerator | None = None,
     production_parity_fixture: Mapping[str, Any] | None = None,
-    matched_pair_cohorts: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     validate_preregistration(preregistration)
     if attempt_regenerator is None:
         raise SchemaError(
             "exact shard assembly requires the Rust spatial_covariance_batch replay executable"
         )
-    if production_parity_fixture is None or matched_pair_cohorts is None:
-        raise SchemaError("run assembly requires production parity and matched cohort evidence")
+    if production_parity_fixture is None:
+        raise SchemaError("run assembly requires production parity evidence")
+    preoutcome = validate_preoutcome_receipts(
+        preregistration,
+        preoutcome_directory,
+        code_sha256,
+        binary_sha256,
+    )
+    positive_overlap_cohort = preoutcome["receipts"]["positive-overlap-cohort.json"]
+    positive_overlap_cohort_sha256 = preoutcome["manifest"]["receipts"][
+        "positive-overlap-cohort.json"
+    ]["sha256"]
     paths = tuple(shard_manifest_paths)
     if len(paths) != FROZEN_SHARD_COUNT:
-        raise SchemaError("run manifest requires exactly four compact shards")
+        raise SchemaError("run manifest requires exactly one compact shard")
     _validate_performance_probe(preregistration, performance_probe, code_sha256, binary_sha256)
     _validate_resources(preregistration, resources, binary_sha256)
-    validate_matched_pair_cohorts(
-        matched_pair_cohorts, code_sha256, binary_sha256,
+    validate_positive_overlap_cohort(
+        positive_overlap_cohort, code_sha256, binary_sha256,
         sha256_json(preregistration["generator"]),
     )
     root = Path(run_root).resolve(strict=True)
@@ -1840,14 +2006,24 @@ def build_run_manifest(
             raise SchemaError(f"shard {spec.index} is not exact compact committed evidence")
         entries.append({"path": relative, "sha256": digest})
         digests.append(digest)
-    return {"schema": "dolphinrust.spatial-covariance.run-manifest/4", "schema_version": 4,
+    result = {"schema": "dolphinrust.spatial-covariance.run-manifest/5", "schema_version": 5,
             "preregistration_sha256": preregistration_digest(preregistration), "code_sha256": code_sha256,
             "binary_sha256": binary_sha256, "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]),
             "performance_probe": dict(performance_probe), "resources": [dict(item) for item in resources],
             "shard_manifests": entries, "result_root_sha256": result_root_sha256(digests),
             "production_parity_fixture": dict(production_parity_fixture),
             "production_parity_fixture_sha256": sha256_json(production_parity_fixture),
-            "matched_pair_cohorts": [dict(item) for item in matched_pair_cohorts]}
+            "preoutcome_manifest": dict(preoutcome["manifest"]),
+            "preoutcome_manifest_sha256": preoutcome["manifest_sha256"],
+            "positive_overlap_cohort_sha256": positive_overlap_cohort_sha256,
+            "positive_overlap_cohort": dict(positive_overlap_cohort)}
+    validate_positive_overlap_run_binding(
+        result,
+        code_sha256,
+        binary_sha256,
+        sha256_json(preregistration["generator"]),
+    )
+    return result
 
 
 def main() -> None:
@@ -1900,7 +2076,7 @@ def main() -> None:
     assemble.add_argument("--performance-probe", type=Path, required=True)
     assemble.add_argument("--resources", type=Path, required=True)
     assemble.add_argument("--production-parity-fixture", type=Path, required=True)
-    assemble.add_argument("--matched-pair-cohorts", type=Path, required=True)
+    assemble.add_argument("--preoutcome-directory", type=Path, required=True)
     assemble.add_argument("--destination", type=Path, required=True)
     performance = commands.add_parser(
         "generate-performance", help="measure all frozen outcome-discarding performance classes"
@@ -1912,11 +2088,11 @@ def main() -> None:
         "generate-resources", help="measure all five frozen area/date resource cells"
     )
     resources.add_argument("--destination", type=Path, required=True)
-    matched = commands.add_parser(
-        "generate-matched-cohorts", help="derive matched signed evidence from exact Rust attempts"
+    positive_overlap = commands.add_parser(
+        "generate-positive-overlap", help="derive positive-overlap evidence from exact Rust attempts"
     )
-    matched.add_argument("--seed-count", type=int, default=MATCHED_COHORT_SEED_COUNT)
-    matched.add_argument("--destination", type=Path, required=True)
+    positive_overlap.add_argument("--seed-count", type=int, default=POSITIVE_OVERLAP_SEED_COUNT)
+    positive_overlap.add_argument("--destination", type=Path, required=True)
     preoutcome = commands.add_parser(
         "generate-preoutcome", help="atomically generate all three pre-outcome receipt sets"
     )
@@ -1929,7 +2105,7 @@ def main() -> None:
     outcomes.add_argument("--run-root", type=Path, required=True)
     outcomes.add_argument("--shard-index", type=int, required=True)
     for identity_command in (
-        reduce_cell, commit, resume, assemble, performance, resources, matched, preoutcome,
+        reduce_cell, commit, resume, assemble, performance, resources, positive_overlap, preoutcome,
         outcomes,
     ):
         identity_command.add_argument("--source-root", type=Path, required=True)
@@ -1945,7 +2121,7 @@ def main() -> None:
     preregistration = load_preregistration(args.preregistration)
     identity_commands = {
         "reduce-cell", "commit", "resume", "assemble",
-        "generate-performance", "generate-resources", "generate-matched-cohorts",
+        "generate-performance", "generate-resources", "generate-positive-overlap",
         "generate-preoutcome", "run-outcomes",
     }
     if args.command in identity_commands:
@@ -1983,8 +2159,8 @@ def main() -> None:
         result = _write_bounded_json_atomic(
             receipt, args.destination, FROZEN_MAX_RESOURCE_RECEIPT_BYTES
         )
-    elif args.command == "generate-matched-cohorts":
-        receipt = generate_matched_pair_cohorts(
+    elif args.command == "generate-positive-overlap":
+        receipt = generate_positive_overlap_cohort(
             preregistration, args.preregistration, args.batch_binary,
             code_sha256, binary_sha256, args.seed_count,
         )
@@ -2043,15 +2219,10 @@ def main() -> None:
             FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
             "production parity fixture",
         )
-        matched_pair_cohorts = _load_bounded_json(
-            args.matched_pair_cohorts,
-            FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
-            "matched pair cohorts",
-        )
         run_manifest = build_run_manifest(
             preregistration, run_root, manifest_paths, code_sha256, binary_sha256,
-            performance_probe, resources, attempt_regenerator,
-            production_parity_fixture, matched_pair_cohorts,
+            performance_probe, resources, args.preoutcome_directory, attempt_regenerator,
+            production_parity_fixture,
         )
         result = write_run_manifest_atomic(run_manifest, args.destination)
     print(json.dumps(result, sort_keys=True))
