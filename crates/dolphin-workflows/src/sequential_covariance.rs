@@ -28,7 +28,7 @@ use dolphin_phaselink::{
     CompressionReplayGrid, CompressionReplayStatus, CovarianceReplayError, EstimatorJvpError,
     FixedBranchStatus, FixedEstimatorBranch, InfluenceDag, InfluenceError, NativeSourcePixel,
     NodeId, PhaseReplayGrid, ProperComplexFactor, RectPixelReplay, RectReplayDescriptor, SourceId,
-    TemporalCoordinate, EFFECTIVE_LOOKS_MODEL,
+    TemporalCoordinate,
 };
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
@@ -1196,6 +1196,10 @@ pub struct DependencyConeEstimate {
     pub block_ids: Vec<GlobalBlockId>,
     /// Bytes for active source/node adjoints in the requested microbatch.
     pub frontier_bytes: u64,
+    /// Peak retained per-source influence matrices and local/global map records.
+    pub source_influence_bytes: u64,
+    /// Query-local source-correlation matrix and two streamed multiply buffers.
+    pub source_correlation_workspace_bytes: u64,
     /// Bytes for query-cached raw sources/factors plus one factor working copy.
     pub source_window_bytes: u64,
     /// Peak bytes for one streamed JVP plus topology/adjoint control records.
@@ -1344,6 +1348,64 @@ pub struct EffectiveLooksReplay {
     pub receipt: [u8; 32],
 }
 
+/// Spatial correlation applied between primitive source influence operators.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceCorrelationModel {
+    /// Distinct global source coordinates are independent; exact coordinate
+    /// overlap remains one shared primitive source.
+    Identity,
+    /// Isotropic exponential correlation on global native-grid coordinates.
+    ExponentialEuclidean {
+        /// Positive finite correlation distance scale in native pixels.
+        distance_scale_pixels: f64,
+    },
+}
+
+impl SourceCorrelationModel {
+    /// Stable machine-readable model identity.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity_v1",
+            Self::ExponentialEuclidean { .. } => "exponential_euclidean_v1",
+        }
+    }
+
+    const fn distance_scale_pixels(self) -> f64 {
+        match self {
+            Self::Identity => 0.0,
+            Self::ExponentialEuclidean {
+                distance_scale_pixels,
+            } => distance_scale_pixels,
+        }
+    }
+
+    fn validate(self) -> Result<(), SequentialReplayError> {
+        match self {
+            Self::Identity => Ok(()),
+            Self::ExponentialEuclidean {
+                distance_scale_pixels,
+            } if distance_scale_pixels.is_finite() && distance_scale_pixels > 0.0 => Ok(()),
+            Self::ExponentialEuclidean { .. } => Err(SequentialReplayError::Invalid(
+                "source correlation distance scale must be finite and positive",
+            )),
+        }
+    }
+
+    fn correlation(self, left: (u64, u64), right: (u64, u64)) -> f64 {
+        match self {
+            Self::Identity => f64::from(left == right),
+            Self::ExponentialEuclidean {
+                distance_scale_pixels,
+            } => {
+                let row = left.0.abs_diff(right.0) as f64;
+                let column = left.1.abs_diff(right.1) as f64;
+                (-(row.hypot(column)) / distance_scale_pixels).exp()
+            }
+        }
+    }
+}
+
 /// Global production query routed across captured phase-link tile topologies.
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalReferenceCovarianceQuery<'a> {
@@ -1357,6 +1419,8 @@ pub struct GlobalReferenceCovarianceQuery<'a> {
     pub ordered_dates: &'a [GlobalDateId],
     /// Maximum real source-factor rank across active blocks.
     pub source_rank: usize,
+    /// Explicit spatial correlation for the primitive source support union.
+    pub source_correlation: SourceCorrelationModel,
     /// Total admitted bytes including routing selections and the returned joint matrix.
     pub byte_cap: u64,
     /// Exact fixed-branch tolerance used by capture.
@@ -1482,26 +1546,154 @@ fn combined_query_receipt(domain: &[u8], left: [u8; 32], right: [u8; 32]) -> [u8
     digest.finalize().into()
 }
 
-const EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS: f64 = 1.5;
+fn source_correlation_workspace_bytes(
+    support: u64,
+    selected: u64,
+    model: SourceCorrelationModel,
+) -> Result<u64, SequentialReplayError> {
+    model.validate()?;
+    if matches!(model, SourceCorrelationModel::Identity) {
+        return Ok(0);
+    }
+    let correlation = checked_mul(checked_mul(support, support)?, 8)?;
+    let multiply_buffers = checked_mul(checked_mul(checked_mul(2, support)?, selected)?, 8)?;
+    let coordinate_buffer = checked_mul(support, size_of::<(u64, u64)>() as u64)?;
+    checked_add(
+        correlation,
+        checked_add(multiply_buffers, coordinate_buffer)?,
+    )
+}
 
-fn apply_effective_looks_scaling(
+fn global_source_adjoints(
+    topology: &SequentialReplayTopology,
+    source_adjoints: BTreeMap<usize, Array2<f64>>,
+) -> Result<BTreeMap<(u64, u64), Array2<f64>>, SequentialReplayError> {
+    let mut global = BTreeMap::new();
+    for (native, root) in source_adjoints {
+        let coordinate = topology.global_native_coordinate(native)?;
+        match global.entry(coordinate) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(root);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().dim() != root.dim() {
+                    return Err(SequentialReplayError::Provider(
+                        ReplayStatus::ReplayStateMismatch,
+                        "shared global source influence dimensions differ",
+                    ));
+                }
+                *entry.get_mut() += &root;
+            }
+        }
+    }
+    Ok(global)
+}
+
+fn merge_global_source_adjoints(
+    mut left: BTreeMap<(u64, u64), Array2<f64>>,
+    right: BTreeMap<(u64, u64), Array2<f64>>,
+) -> Result<BTreeMap<(u64, u64), Array2<f64>>, SequentialReplayError> {
+    for (coordinate, root) in right {
+        match left.entry(coordinate) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(root);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().dim() != root.dim() {
+                    return Err(SequentialReplayError::Provider(
+                        ReplayStatus::ReplayStateMismatch,
+                        "shared global source influence dimensions differ",
+                    ));
+                }
+                *entry.get_mut() += &root;
+            }
+        }
+    }
+    Ok(left)
+}
+
+fn contract_source_adjoints(
+    covariance: &mut Array2<f64>,
+    source_adjoints: &BTreeMap<(u64, u64), Array2<f64>>,
+    model: SourceCorrelationModel,
+) -> Result<(), SequentialReplayError> {
+    model.validate()?;
+    let Some(first) = source_adjoints.values().next() else {
+        return Ok(());
+    };
+    if first.ncols() != covariance.nrows() || covariance.nrows() != covariance.ncols() {
+        return Err(SequentialReplayError::Provider(
+            ReplayStatus::ReplayStateMismatch,
+            "source influence dimensions do not match the covariance query",
+        ));
+    }
+    if matches!(model, SourceCorrelationModel::Identity) {
+        for root in source_adjoints.values() {
+            if root.dim() != first.dim() {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::ReplayStateMismatch,
+                    "source influence dimensions differ",
+                ));
+            }
+            for row in 0..covariance.nrows() {
+                for column in 0..covariance.ncols() {
+                    covariance[(row, column)] += (0..root.nrows())
+                        .map(|basis| root[(basis, row)] * root[(basis, column)])
+                        .sum::<f64>();
+                }
+            }
+        }
+        return Ok(());
+    }
+    let coordinates = source_adjoints.keys().copied().collect::<Vec<_>>();
+    let support = coordinates.len();
+    let selected = covariance.nrows();
+    let correlation = Array2::from_shape_fn((support, support), |(left, right)| {
+        model.correlation(coordinates[left], coordinates[right])
+    });
+    let mut basis_influences = Array2::zeros((support, selected));
+    for basis in 0..first.nrows() {
+        for (source, root) in source_adjoints.values().enumerate() {
+            if root.dim() != first.dim() {
+                return Err(SequentialReplayError::Provider(
+                    ReplayStatus::ReplayStateMismatch,
+                    "source influence dimensions differ",
+                ));
+            }
+            for column in 0..selected {
+                basis_influences[(source, column)] = root[(basis, column)];
+            }
+        }
+        let correlated = correlation.dot(&basis_influences);
+        for row in 0..selected {
+            for column in 0..selected {
+                covariance[(row, column)] += (0..support)
+                    .map(|source| basis_influences[(source, row)] * correlated[(source, column)])
+                    .sum::<f64>();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn attach_source_correlation_receipt(
     replay: &mut ReferenceDifferenceCovarianceReplay,
     support_union: &BTreeSet<(u64, u64)>,
+    model: SourceCorrelationModel,
 ) -> Result<(), SequentialReplayError> {
+    model.validate()?;
     if support_union.is_empty() {
         return Err(SequentialReplayError::Provider(
             ReplayStatus::ReplayStateMismatch,
-            "effective-look scaling requires a nonempty realized support union",
+            "source correlation requires a nonempty realized support union",
         ));
     }
     let denominator = support_union
         .iter()
         .flat_map(|left| {
-            support_union.iter().map(move |right| {
-                let row = left.0.abs_diff(right.0) as f64;
-                let column = left.1.abs_diff(right.1) as f64;
-                (-(row.hypot(column)) / EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS).exp()
-            })
+            support_union
+                .iter()
+                .map(move |right| model.correlation(*left, *right))
         })
         .sum::<f64>();
     let fraction = support_union.len() as f64 / denominator;
@@ -1513,17 +1705,13 @@ fn apply_effective_looks_scaling(
     {
         return Err(SequentialReplayError::Provider(
             ReplayStatus::NonFiniteReplayState,
-            "effective-look support correlation is invalid",
+            "source support correlation is invalid",
         ));
     }
     let mut receipt = Sha256::new();
-    receipt.update(b"dolphinrust:effective-looks-realization:v1");
-    receipt.update(EFFECTIVE_LOOKS_MODEL.as_bytes());
-    receipt.update(
-        EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS
-            .to_bits()
-            .to_le_bytes(),
-    );
+    receipt.update(b"dolphinrust:source-correlation-realization:v1");
+    receipt.update(model.as_str().as_bytes());
+    receipt.update(model.distance_scale_pixels().to_bits().to_le_bytes());
     receipt.update((support_union.len() as u64).to_le_bytes());
     for &(row, column) in support_union {
         receipt.update(row.to_le_bytes());
@@ -1532,36 +1720,50 @@ fn apply_effective_looks_scaling(
     receipt.update(fraction.to_bits().to_le_bytes());
     receipt.update(replay.source_factor_receipt);
     receipt.update(replay.support_receipt);
-    let covariance_scale = fraction.recip();
-    for covariance in [
-        &mut replay.target_covariance,
-        &mut replay.reference_covariance,
-        &mut replay.target_reference_covariance,
-        &mut replay.difference_covariance,
-    ] {
-        covariance.mapv_inplace(|value| value * covariance_scale);
-    }
-    if replay
-        .target_covariance
-        .iter()
-        .chain(replay.reference_covariance.iter())
-        .chain(replay.target_reference_covariance.iter())
-        .chain(replay.difference_covariance.iter())
-        .any(|value| !value.is_finite())
-    {
-        return Err(SequentialReplayError::Provider(
-            ReplayStatus::NonFiniteReplayState,
-            "effective-look-scaled covariance is non-finite",
-        ));
-    }
     replay.effective_looks = Some(EffectiveLooksReplay {
-        model: EFFECTIVE_LOOKS_MODEL,
-        distance_scale_pixels: EFFECTIVE_LOOKS_DISTANCE_SCALE_PIXELS,
+        model: model.as_str(),
+        distance_scale_pixels: model.distance_scale_pixels(),
         support_union_count: support_union.len(),
         fraction,
         receipt: receipt.finalize().into(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod source_correlation_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn factorized_source_contraction_matches_direct_ordered_pairs() {
+        let roots = BTreeMap::from([
+            ((0, 0), array![[1.0, -0.5], [0.25, 0.75]]),
+            ((0, 2), array![[-0.4, 0.8], [1.2, -0.3]]),
+        ]);
+        let model = SourceCorrelationModel::ExponentialEuclidean {
+            distance_scale_pixels: 1.5,
+        };
+        let mut expected = Array2::<f64>::zeros((2, 2));
+        for (&left_coordinate, left) in &roots {
+            for (&right_coordinate, right) in &roots {
+                let correlation = model.correlation(left_coordinate, right_coordinate);
+                for row in 0..2 {
+                    for column in 0..2 {
+                        expected[(row, column)] += correlation
+                            * (0..left.nrows())
+                                .map(|basis| left[(basis, row)] * right[(basis, column)])
+                                .sum::<f64>();
+                    }
+                }
+            }
+        }
+        let mut actual = Array2::<f64>::zeros((2, 2));
+        contract_source_adjoints(&mut actual, &roots, model).unwrap();
+        for (&left, &right) in actual.iter().zip(expected.iter()) {
+            assert!((left - right).abs() <= 16.0 * f64::EPSILON);
+        }
+    }
 }
 
 fn global_reference_selection_signature(query: GlobalReferenceCovarianceQuery<'_>) -> [u8; 32] {
@@ -1576,6 +1778,14 @@ fn global_reference_selection_signature(query: GlobalReferenceCovarianceQuery<'_
     for date in query.ordered_dates {
         digest.update(date.get().to_le_bytes());
     }
+    digest.update(query.source_correlation.as_str().as_bytes());
+    digest.update(
+        query
+            .source_correlation
+            .distance_scale_pixels()
+            .to_bits()
+            .to_le_bytes(),
+    );
     digest.finalize().into()
 }
 
@@ -2277,6 +2487,7 @@ impl SequentialReplayTopology {
         }
 
         let mut frontier_coordinates = 0_u64;
+        let mut source_influence_bytes = 0_u64;
         let mut max_real = 0_u64;
         let mut max_combined = 0_u64;
         let mut max_phase_dimension = 0_u64;
@@ -2301,7 +2512,6 @@ impl SequentialReplayTopology {
             // Production replay pads every active root adjoint to the declared
             // maximum source rank so blocks can share one query contract. Charge
             // that actual allocation even when the final ministack is partial.
-            let source_coordinates = checked_mul(source_rank as u64, native)?;
             let phase_coordinates = checked_mul(block.phase_dimension as u64, output)?;
             let compressed_coordinates = checked_mul(2, compressed)?;
             let date_coordinates = cone.selected_dates[block_index]
@@ -2311,10 +2521,18 @@ impl SequentialReplayTopology {
             frontier_coordinates = checked_add(
                 frontier_coordinates,
                 checked_add(
-                    checked_add(source_coordinates, phase_coordinates)?,
+                    phase_coordinates,
                     checked_add(compressed_coordinates, date_coordinates)?,
                 )?,
             )?;
+            let source_payload_bytes = checked_mul(
+                checked_mul(
+                    checked_mul(source_rank as u64, native)?,
+                    selection.len() as u64,
+                )?,
+                8,
+            )?;
+            source_influence_bytes = checked_add(source_influence_bytes, source_payload_bytes)?;
             max_real = max_real.max(real);
             max_phase_dimension = max_phase_dimension.max(block.phase_dimension as u64);
             let combined = checked_add(real, block.carried_parent_ids.len() as u64)?;
@@ -2432,7 +2650,10 @@ impl SequentialReplayTopology {
         let covariance_bytes = checked_mul(checked_mul(selected, selected)?, 8)?;
         let total_bytes = checked_add(
             checked_add(
-                checked_add(frontier_bytes, source_window_bytes)?,
+                checked_add(
+                    checked_add(frontier_bytes, source_influence_bytes)?,
+                    source_window_bytes,
+                )?,
                 checked_add(operator_bytes, baseline_bytes)?,
             )?,
             checked_add(support_bytes, covariance_bytes)?,
@@ -2440,6 +2661,8 @@ impl SequentialReplayTopology {
         Ok(DependencyConeEstimate {
             block_ids,
             frontier_bytes,
+            source_influence_bytes,
+            source_correlation_workspace_bytes: 0,
             source_window_bytes,
             operator_bytes,
             baseline_bytes,
@@ -2470,11 +2693,46 @@ impl SequentialReplayTopology {
         )
     }
 
+    fn source_correlation_workspace_reservation_bytes(
+        &self,
+        cone: &SpatialQueryCone,
+        selected: usize,
+        model: SourceCorrelationModel,
+    ) -> Result<u64, SequentialReplayError> {
+        let support = cone
+            .active_sources
+            .iter()
+            .map(BTreeSet::len)
+            .max()
+            .unwrap_or(0) as u64;
+        source_correlation_workspace_bytes(support, selected as u64, model)
+    }
+
+    fn global_source_map_control_reservation_bytes(
+        &self,
+        cone: &SpatialQueryCone,
+    ) -> Result<u64, SequentialReplayError> {
+        let support = cone
+            .active_sources
+            .iter()
+            .map(BTreeSet::len)
+            .max()
+            .unwrap_or(0) as u64;
+        checked_add(
+            size_of::<BTreeMap<(u64, u64), Array2<f64>>>() as u64,
+            checked_mul(
+                support,
+                btree_record_reservation_bytes::<(u64, u64), Array2<f64>>(),
+            )?,
+        )
+    }
+
     fn plan_reference_difference_query(
         &self,
         target_selection: &[(GlobalDateId, usize)],
         reference_selection: &[(GlobalDateId, usize)],
         query: DependencyConeQuery,
+        source_correlation: SourceCorrelationModel,
     ) -> Result<ReferenceDifferenceQueryPlan, SequentialReplayError> {
         let selection = target_selection
             .iter()
@@ -2498,6 +2756,23 @@ impl SequentialReplayTopology {
             let effective_support_bytes = self.effective_support_reservation_bytes(&cone)?;
             estimate.support_bytes = checked_add(estimate.support_bytes, effective_support_bytes)?;
             estimate.total_bytes = checked_add(estimate.total_bytes, effective_support_bytes)?;
+            let global_source_map_control_bytes =
+                self.global_source_map_control_reservation_bytes(&cone)?;
+            estimate.source_influence_bytes = checked_add(
+                estimate.source_influence_bytes,
+                global_source_map_control_bytes,
+            )?;
+            estimate.total_bytes =
+                checked_add(estimate.total_bytes, global_source_map_control_bytes)?;
+            let source_correlation_workspace_bytes = self
+                .source_correlation_workspace_reservation_bytes(
+                    &cone,
+                    selection.len(),
+                    source_correlation,
+                )?;
+            estimate.source_correlation_workspace_bytes = source_correlation_workspace_bytes;
+            estimate.total_bytes =
+                checked_add(estimate.total_bytes, source_correlation_workspace_bytes)?;
         }
         Ok(ReferenceDifferenceQueryPlan {
             selection,
@@ -2831,17 +3106,19 @@ impl SequentialReplayTopology {
     /// reference signature is part of the receipt and prevents a cached
     /// reference result being reused for another output/date selection.
     #[allow(clippy::too_many_lines)]
-    pub fn replay_reference_difference_covariance_from_provider<P>(
+    pub fn replay_reference_difference_covariance_from_provider_with_source_correlation<P>(
         &self,
         target_selection: &[(GlobalDateId, usize)],
         reference_selection: &[(GlobalDateId, usize)],
         query: DependencyConeQuery,
+        source_correlation: SourceCorrelationModel,
         branch_tolerance: f64,
         provider: &mut P,
     ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
     where
         P: SequentialSourceReplayProvider + ?Sized,
     {
+        source_correlation.validate()?;
         if target_selection.is_empty()
             || target_selection.len() != reference_selection.len()
             || query.source_rank == 0
@@ -2890,7 +3167,12 @@ impl SequentialReplayTopology {
             selection,
             cone,
             estimate: mut dependency_cone,
-        } = self.plan_reference_difference_query(target_selection, reference_selection, query)?;
+        } = self.plan_reference_difference_query(
+            target_selection,
+            reference_selection,
+            query,
+            source_correlation,
+        )?;
         if selection.iter().all(|(date, _)| date.get() == 0) {
             let dates = target_selection.len();
             return Ok(ReferenceDifferenceCovarianceReplay {
@@ -2997,18 +3279,9 @@ impl SequentialReplayTopology {
                     &mut source_adjoints,
                 )?;
             }
-            for root in source_adjoints.values() {
-                for row in 0..selected {
-                    for column in 0..selected {
-                        covariance[(row, column)] += (0..root.nrows())
-                            .map(|basis| root[(basis, row)] * root[(basis, column)])
-                            .sum::<f64>();
-                    }
-                }
-            }
-            for &native in source_adjoints.keys() {
-                effective_support.insert(self.global_native_coordinate(native)?);
-            }
+            let source_adjoints = global_source_adjoints(self, source_adjoints)?;
+            effective_support.extend(source_adjoints.keys().copied());
+            contract_source_adjoints(&mut covariance, &source_adjoints, source_correlation)?;
             provider.clear_block();
         }
         if covariance.iter().any(|value| !value.is_finite()) {
@@ -3046,8 +3319,34 @@ impl SequentialReplayTopology {
             target_disposition: ReplayStatus::Valid,
             reference_disposition: ReplayStatus::Valid,
         };
-        apply_effective_looks_scaling(&mut replay, &effective_support)?;
+        attach_source_correlation_receipt(&mut replay, &effective_support, source_correlation)?;
         Ok(replay)
+    }
+
+    /// Replay one target/reference pair with the production-default
+    /// exponential source correlation.
+    #[allow(clippy::too_many_lines)]
+    pub fn replay_reference_difference_covariance_from_provider<P>(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        reference_selection: &[(GlobalDateId, usize)],
+        query: DependencyConeQuery,
+        branch_tolerance: f64,
+        provider: &mut P,
+    ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
+    where
+        P: SequentialSourceReplayProvider + ?Sized,
+    {
+        self.replay_reference_difference_covariance_from_provider_with_source_correlation(
+            target_selection,
+            reference_selection,
+            query,
+            SourceCorrelationModel::ExponentialEuclidean {
+                distance_scale_pixels: 1.5,
+            },
+            branch_tolerance,
+            provider,
+        )
     }
 
     /// Jointly replay one target/reference pair captured in separate tile topologies.
@@ -3062,7 +3361,10 @@ impl SequentialReplayTopology {
     /// Returns a fail-closed identity, topology, reference, replay-state, or
     /// byte-budget error.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn replay_cross_topology_reference_difference_covariance_from_providers<T, R>(
+    pub fn replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation<
+        T,
+        R,
+    >(
         &self,
         target_selection: &[(GlobalDateId, usize)],
         target_provider: &mut T,
@@ -3070,12 +3372,14 @@ impl SequentialReplayTopology {
         reference_selection: &[(GlobalDateId, usize)],
         reference_provider: &mut R,
         query: DependencyConeQuery,
+        source_correlation: SourceCorrelationModel,
         branch_tolerance: f64,
     ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
     where
         T: SequentialSourceReplayProvider + ?Sized,
         R: SequentialSourceReplayProvider + ?Sized,
     {
+        source_correlation.validate()?;
         if target_provider.identity() != reference_provider.identity() {
             return Err(SequentialReplayError::Provider(
                 ReplayStatus::SourceIdentityMismatch,
@@ -3090,8 +3394,12 @@ impl SequentialReplayTopology {
             let ReferenceDifferenceQueryPlan {
                 estimate: mut aggregate,
                 ..
-            } =
-                self.plan_reference_difference_query(target_selection, reference_selection, query)?;
+            } = self.plan_reference_difference_query(
+                target_selection,
+                reference_selection,
+                query,
+                source_correlation,
+            )?;
             let dates = target_selection.len() as u64;
             let retained_output_bytes =
                 checked_mul(checked_mul(checked_mul(4, dates)?, dates)?, 8)?;
@@ -3116,20 +3424,24 @@ impl SequentialReplayTopology {
                 byte_cap: aggregate.total_bytes,
                 ..query
             };
-            let mut target_replay = self.replay_reference_difference_covariance_from_provider(
-                target_selection,
-                reference_selection,
-                replay_query,
-                branch_tolerance,
-                target_provider,
-            )?;
-            let reference_replay = self.replay_reference_difference_covariance_from_provider(
-                target_selection,
-                reference_selection,
-                replay_query,
-                branch_tolerance,
-                reference_provider,
-            )?;
+            let mut target_replay = self
+                .replay_reference_difference_covariance_from_provider_with_source_correlation(
+                    target_selection,
+                    reference_selection,
+                    replay_query,
+                    source_correlation,
+                    branch_tolerance,
+                    target_provider,
+                )?;
+            let reference_replay = self
+                .replay_reference_difference_covariance_from_provider_with_source_correlation(
+                    target_selection,
+                    reference_selection,
+                    replay_query,
+                    source_correlation,
+                    branch_tolerance,
+                    reference_provider,
+                )?;
             if target_replay.target_covariance != reference_replay.target_covariance
                 || target_replay.reference_covariance != reference_replay.reference_covariance
                 || target_replay.target_reference_covariance
@@ -3215,6 +3527,33 @@ impl SequentialReplayTopology {
             reference_estimate.total_bytes,
             reference_effective_support_bytes,
         )?;
+        let combined_support = target_cone
+            .active_sources
+            .iter()
+            .zip(&reference_cone.active_sources)
+            .map(|(target, reference)| target.len().saturating_add(reference.len()))
+            .max()
+            .unwrap_or(0) as u64;
+        let source_correlation_workspace_bytes =
+            source_correlation_workspace_bytes(combined_support, selected_u64, source_correlation)?;
+        let target_global_map_control_bytes =
+            self.global_source_map_control_reservation_bytes(&target_cone)?;
+        let reference_global_map_control_bytes =
+            reference_topology.global_source_map_control_reservation_bytes(&reference_cone)?;
+        let merged_global_map_control_bytes = checked_add(
+            size_of::<BTreeMap<(u64, u64), Array2<f64>>>() as u64,
+            checked_mul(
+                combined_support,
+                btree_record_reservation_bytes::<(u64, u64), Array2<f64>>(),
+            )?,
+        )?;
+        let global_source_map_control_bytes = checked_add(
+            checked_add(
+                target_global_map_control_bytes,
+                reference_global_map_control_bytes,
+            )?,
+            merged_global_map_control_bytes,
+        )?;
         let mut block_ids = target_estimate.block_ids.clone();
         block_ids.extend(reference_estimate.block_ids.iter().copied());
         block_ids.sort_unstable_by_key(|block| block.get());
@@ -3229,6 +3568,14 @@ impl SequentialReplayTopology {
                 target_estimate.frontier_bytes,
                 reference_estimate.frontier_bytes,
             )?,
+            source_influence_bytes: checked_add(
+                checked_add(
+                    target_estimate.source_influence_bytes,
+                    reference_estimate.source_influence_bytes,
+                )?,
+                global_source_map_control_bytes,
+            )?,
+            source_correlation_workspace_bytes,
             source_window_bytes: checked_add(
                 target_estimate.source_window_bytes,
                 reference_estimate.source_window_bytes,
@@ -3253,7 +3600,13 @@ impl SequentialReplayTopology {
             total_bytes: 0,
         };
         dependency_cone.total_bytes = checked_add(
-            checked_add(target_estimate.total_bytes, reference_estimate.total_bytes)?,
+            checked_add(
+                checked_add(target_estimate.total_bytes, reference_estimate.total_bytes)?,
+                checked_add(
+                    source_correlation_workspace_bytes,
+                    global_source_map_control_bytes,
+                )?,
+            )?,
             provider_bytes,
         )?;
         if dependency_cone.total_bytes > query.byte_cap {
@@ -3404,33 +3757,15 @@ impl SequentialReplayTopology {
                 )?;
             }
 
-            for root in target_roots.values() {
-                for row in 0..dates {
-                    for column in 0..dates {
-                        covariance[(row, column)] += (0..root.nrows())
-                            .map(|basis| root[(basis, row)] * root[(basis, column)])
-                            .sum::<f64>();
-                    }
-                }
-            }
-            for root in reference_roots.values() {
-                for row in 0..dates {
-                    for column in 0..dates {
-                        covariance[(dates + row, dates + column)] += (0..root.nrows())
-                            .map(|basis| root[(basis, dates + row)] * root[(basis, dates + column)])
-                            .sum::<f64>();
-                    }
-                }
-            }
-            for (&target_native, target_root) in &target_roots {
+            for &target_native in target_roots.keys() {
                 let global = self.global_native_coordinate(target_native)?;
                 let Some(reference_native) = reference_topology.native_index_for_global(global)?
                 else {
                     continue;
                 };
-                let Some(reference_root) = reference_roots.get(&reference_native) else {
+                if !reference_roots.contains_key(&reference_native) {
                     continue;
-                };
+                }
                 let target_source = self.resolve_source_checked(
                     target_block,
                     target_native,
@@ -3458,24 +3793,12 @@ impl SequentialReplayTopology {
                         "overlapping cross-topology primitive source factors differ",
                     ));
                 }
-                for row in 0..dates {
-                    for column in 0..dates {
-                        let cross = (0..target_root.nrows())
-                            .map(|basis| {
-                                target_root[(basis, row)] * reference_root[(basis, dates + column)]
-                            })
-                            .sum::<f64>();
-                        covariance[(row, dates + column)] += cross;
-                        covariance[(dates + column, row)] += cross;
-                    }
-                }
             }
-            for &native in target_roots.keys() {
-                effective_support.insert(self.global_native_coordinate(native)?);
-            }
-            for &native in reference_roots.keys() {
-                effective_support.insert(reference_topology.global_native_coordinate(native)?);
-            }
+            let target_roots = global_source_adjoints(self, target_roots)?;
+            let reference_roots = global_source_adjoints(reference_topology, reference_roots)?;
+            let source_adjoints = merge_global_source_adjoints(target_roots, reference_roots)?;
+            effective_support.extend(source_adjoints.keys().copied());
+            contract_source_adjoints(&mut covariance, &source_adjoints, source_correlation)?;
             source_cache_peak_bytes = source_cache_peak_bytes.max(checked_add(
                 target_provider.current_payload_bytes(),
                 reference_provider.current_payload_bytes(),
@@ -3542,8 +3865,39 @@ impl SequentialReplayTopology {
             target_disposition: ReplayStatus::Valid,
             reference_disposition: ReplayStatus::Valid,
         };
-        apply_effective_looks_scaling(&mut replay, &effective_support)?;
+        attach_source_correlation_receipt(&mut replay, &effective_support, source_correlation)?;
         Ok(replay)
+    }
+
+    /// Replay a cross-topology target/reference pair with the
+    /// production-default exponential source correlation.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn replay_cross_topology_reference_difference_covariance_from_providers<T, R>(
+        &self,
+        target_selection: &[(GlobalDateId, usize)],
+        target_provider: &mut T,
+        reference_topology: &Self,
+        reference_selection: &[(GlobalDateId, usize)],
+        reference_provider: &mut R,
+        query: DependencyConeQuery,
+        branch_tolerance: f64,
+    ) -> Result<ReferenceDifferenceCovarianceReplay, SequentialReplayError>
+    where
+        T: SequentialSourceReplayProvider + ?Sized,
+        R: SequentialSourceReplayProvider + ?Sized,
+    {
+        self.replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation(
+            target_selection,
+            target_provider,
+            reference_topology,
+            reference_selection,
+            reference_provider,
+            query,
+            SourceCorrelationModel::ExponentialEuclidean {
+                distance_scale_pixels: 1.5,
+            },
+            branch_tolerance,
+        )
     }
 
     fn same_replay_graph(&self, other: &Self) -> bool {
@@ -4681,11 +5035,14 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
             "global reference replay query is empty or invalid",
         ));
     }
+    query.source_correlation.validate()?;
     let (selected, wrapper_bytes, joint_bytes) = global_reference_wrapper_bytes(query)?;
     if wrapper_bytes > query.byte_cap {
         return Err(SequentialReplayError::Budget(DependencyConeEstimate {
             block_ids: Vec::new(),
             frontier_bytes: 0,
+            source_influence_bytes: 0,
+            source_correlation_workspace_bytes: 0,
             source_window_bytes: 0,
             operator_bytes: 0,
             baseline_bytes: 0,
@@ -4772,10 +5129,11 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
     let mut replay = if target_tile == reference_tile {
         let tile = &mut tiles[target_tile];
         tile.topology
-            .replay_reference_difference_covariance_from_provider(
+            .replay_reference_difference_covariance_from_provider_with_source_correlation(
                 &target_selection,
                 &reference_selection,
                 dependency_query,
+                query.source_correlation,
                 query.branch_tolerance,
                 tile.provider,
             )?
@@ -4785,13 +5143,14 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
         let reference = &mut right[0];
         target
             .topology
-            .replay_cross_topology_reference_difference_covariance_from_providers(
+            .replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation(
                 &target_selection,
                 target.provider,
                 reference.topology,
                 &reference_selection,
                 reference.provider,
                 dependency_query,
+                query.source_correlation,
                 query.branch_tolerance,
             )?
     } else {
@@ -4800,13 +5159,14 @@ pub fn replay_global_reference_difference_covariance_from_provider_bundle(
         let target = &mut right[0];
         target
             .topology
-            .replay_cross_topology_reference_difference_covariance_from_providers(
+            .replay_cross_topology_reference_difference_covariance_from_providers_with_source_correlation(
                 &target_selection,
                 target.provider,
                 reference.topology,
                 &reference_selection,
                 reference.provider,
                 dependency_query,
+                query.source_correlation,
                 query.branch_tolerance,
             )?
     };

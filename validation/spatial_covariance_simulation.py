@@ -666,12 +666,16 @@ def build_run_manifest(
     performance_probe: Mapping[str, Any],
     resources: list[Mapping[str, Any]],
     attempt_regenerator: AttemptRegenerator | None = None,
+    production_parity_fixture: Mapping[str, Any] | None = None,
+    matched_pair_cohorts: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     validate_preregistration(preregistration)
     if attempt_regenerator is None:
         raise SchemaError(
             "exact shard assembly requires the Rust spatial_covariance_batch replay executable"
         )
+    if production_parity_fixture is None or matched_pair_cohorts is None:
+        raise SchemaError("run assembly requires production parity and matched cohort evidence")
     paths = tuple(shard_manifest_paths)
     if len(paths) != FROZEN_SHARD_COUNT:
         raise SchemaError("run manifest requires exactly four compact shards")
@@ -704,7 +708,10 @@ def build_run_manifest(
             "preregistration_sha256": preregistration_digest(preregistration), "code_sha256": code_sha256,
             "binary_sha256": binary_sha256, "generator_protocol_sha256": sha256_json(preregistration["execution_protocol"]),
             "performance_probe": dict(performance_probe), "resources": [dict(item) for item in resources],
-            "shard_manifests": entries, "result_root_sha256": result_root_sha256(digests)}
+            "shard_manifests": entries, "result_root_sha256": result_root_sha256(digests),
+            "production_parity_fixture": dict(production_parity_fixture),
+            "production_parity_fixture_sha256": sha256_json(production_parity_fixture),
+            "matched_pair_cohorts": [dict(item) for item in matched_pair_cohorts]}
 
 
 def main() -> None:
