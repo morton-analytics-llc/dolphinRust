@@ -130,6 +130,7 @@ pub fn write_fixed_cube_bundle(
             "ground_to_sensor_positive_toward_sensor",
         ),
         ("LOS_COMPONENTS", "east,north,up"),
+        ("UNITTYPE", "unitless"),
         ("RASTER_ROLE", "fixed_cube_run_geometry"),
     ];
     for (name, component) in [
@@ -371,6 +372,14 @@ mod tests {
                 .unwrap()
                 .nodata
                 .is_some_and(f64::is_nan));
+            assert_eq!(
+                dolphin_io::read_raster_header(&directory.join(name))
+                    .unwrap()
+                    .metadata
+                    .get("UNITTYPE")
+                    .map(String::as_str),
+                Some("unitless")
+            );
         }
         std::fs::remove_dir_all(directory).unwrap();
     }

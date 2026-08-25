@@ -1316,7 +1316,12 @@ impl SpatialProducts {
     fn apply_validity_mask(&mut self) {
         ndarray::Zip::from(&mut self.validity_mask)
             .and(&self.vel_rad)
-            .for_each(|valid, &velocity| *valid &= velocity.is_finite());
+            .for_each(|valid, &velocity| *valid &= (velocity as f32).is_finite());
+        for epoch in self.disp_rad.axis_iter(Axis(0)) {
+            ndarray::Zip::from(&mut self.validity_mask)
+                .and(epoch)
+                .for_each(|valid, &displacement| *valid &= (displacement as f32).is_finite());
+        }
         let mask = &self.validity_mask;
         mask3_f64(&mut self.disp_rad, mask);
         mask2_f64(&mut self.vel_rad, mask);
@@ -4881,8 +4886,10 @@ mod tests {
         validity_mask[(0, 0)] = false;
         let mut velocity = Array2::from_elem((2, 2), 1.0);
         velocity[(1, 1)] = f64::NAN;
+        let mut displacement = Array3::from_elem((2, 2, 2), 1.0);
+        displacement[(1, 0, 1)] = f64::MAX;
         let mut products = SpatialProducts {
-            disp_rad: Array3::from_elem((2, 2, 2), 1.0),
+            disp_rad: displacement,
             vel_rad: velocity,
             velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
@@ -4943,7 +4950,7 @@ mod tests {
 
         products.apply_validity_mask();
 
-        for (row, col) in [(0, 0), (1, 1)] {
+        for (row, col) in [(0, 0), (0, 1), (1, 1)] {
             assert!(!products.validity_mask[(row, col)]);
             assert!(products.vel_rad[(row, col)].is_nan());
             assert!(products.temporal_coherence[(row, col)].is_nan());
@@ -5000,18 +5007,18 @@ mod tests {
             assert!(geometry.north[(row, col)].is_nan());
             assert!(geometry.up[(row, col)].is_nan());
         }
-        assert!(products.validity_mask[(0, 1)]);
-        assert_eq!(products.vel_rad[(0, 1)], 1.0);
+        assert!(products.validity_mask[(1, 0)]);
+        assert_eq!(products.vel_rad[(1, 0)], 1.0);
         assert_eq!(
             products
                 .velocity_terms
                 .seasonal_amplitude_rad
                 .as_ref()
-                .unwrap()[(0, 1)],
+                .unwrap()[(1, 0)],
             1.0
         );
         assert_eq!(
-            products.loop_closure.as_ref().unwrap().bad_loop_count[(0, 1)],
+            products.loop_closure.as_ref().unwrap().bad_loop_count[(1, 0)],
             1.0
         );
     }

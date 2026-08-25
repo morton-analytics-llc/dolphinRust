@@ -71,6 +71,18 @@ const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
 const TRANSACTION_ARTIFACT_MARKER_SCHEMA: &str = "dolphinrust-temporal-transaction-artifact/1";
 const TRANSACTION_ARTIFACT_MARKER_FILENAME: &str = ".temporal-transaction-owner.json";
 const HELDOUT_COHORT_ID: &str = "f53-06-outer-nonfresno-v1";
+const HELDOUT_PREREGISTRATION_FILE_SHA256: &str =
+    "5fa4bb8935a6edda9c1005e7a041d659d2ff9bf2b1e5cde21ecbd20ef1b00981";
+const HELDOUT_MANIFEST_FILE_SHA256: &str =
+    "662f0fd6e370eb66bfccc116b370199cd9b7aa672cbc85bf77e0edab8ae65fdd";
+const HELDOUT_MANIFEST_CANONICAL_SHA256: &str =
+    "934ce89104f1746ff59f46c5b31115203613683ab2dd9872ee9b9c4d553b9438";
+const HELDOUT_FREEZE_FILE_SHA256: &str =
+    "d3779697cd5d6a7b0d81a17573a4ec845794a8c68c677713b05ec4a749a8fdfd";
+const HELDOUT_RECEIPT_SCORER_SHA256: &str =
+    "942bda853ce55b28b7f92698f28ba9982cce370adfedde42da9e0b0e14426671";
+const HELDOUT_REVIEW_SCORER_SHA256: &str =
+    "7303e0f75437618afc47099cae05e729a7180603737b38c804f0fc7d30ddc2e8";
 static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -78,12 +90,6 @@ const TEMPORAL_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_preregistration.json");
 const HELDOUT_PREREGISTRATION_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_heldout_preregistration.json");
-const SYNTHETIC_SCORER_BYTES: &[u8] =
-    include_bytes!("../../../validation/temporal_covariance_simulation.py");
-const HELDOUT_SCORER_BYTES: &[u8] =
-    include_bytes!("../../../validation/score_temporal_covariance_holdout.py");
-const HELDOUT_LIBRARY_BYTES: &[u8] =
-    include_bytes!("../../../validation/heldout_temporal_covariance/scorer.py");
 const ESTIMATOR_SOURCE_BYTES: &[u8] =
     include_bytes!("../../dolphin-timeseries/src/temporal_covariance.rs");
 const BATCH_SOURCE_BYTES: &[u8] =
@@ -95,6 +101,9 @@ const SPATIAL_ARTIFACT_SOURCE_BYTES: &[u8] = include_bytes!("spatial_covariance_
 const GEOTIFF_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/geotiff.rs");
 const COVARIANCE_IO_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/covariance.rs");
 const CONFIG_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-core/src/config.rs");
+const PROVENANCE_SOURCE_BYTES: &[u8] = include_bytes!("provenance.rs");
+const GEOMETRY_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-corrections/src/geometry.rs");
+const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 
 /// A promotion authorization that cannot be constructed outside this module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,8 +273,28 @@ struct SyntheticResult {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldoutCoverage {
+    status: String,
+    p_value: f64,
+    null_coverage: f64,
+    observed_coverage: f64,
+    evaluated: usize,
+    covered: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeldoutLevel {
     status: String,
+    coverage: HeldoutCoverage,
+    coverage_absolute_error: f64,
+    coverage_absolute_gate: bool,
+    mean_interval_score: f64,
+    mean_baseline_interval_score: f64,
+    median_width_ratio: f64,
+    proper_score_improves: bool,
+    holm_reject: bool,
 }
 
 #[derive(Deserialize)]
@@ -292,7 +321,7 @@ struct HeldoutResult {
     reasons_by_cluster: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct HeldoutAttrition {
     attrited_primary_ids: Vec<String>,
@@ -488,14 +517,7 @@ impl EvidenceDigests {
             spatial_manifest_sha256,
             temporal_preregistration_sha256: sha256(TEMPORAL_PREREGISTRATION_BYTES),
             heldout_preregistration_sha256: sha256(HELDOUT_PREREGISTRATION_BYTES),
-            scorer_sha256: canonical_named_sources_sha256(&[
-                ("temporal_covariance_simulation.py", SYNTHETIC_SCORER_BYTES),
-                ("score_temporal_covariance_holdout.py", HELDOUT_SCORER_BYTES),
-                (
-                    "heldout_temporal_covariance/scorer.py",
-                    HELDOUT_LIBRARY_BYTES,
-                ),
-            ]),
+            scorer_sha256: HELDOUT_REVIEW_SCORER_SHA256.to_owned(),
             source_sha256: canonical_named_sources_sha256(&[
                 (
                     "dolphin-timeseries/src/temporal_covariance.rs",
@@ -524,6 +546,12 @@ impl EvidenceDigests {
                 ("dolphin-io/src/geotiff.rs", GEOTIFF_SOURCE_BYTES),
                 ("dolphin-io/src/covariance.rs", COVARIANCE_IO_SOURCE_BYTES),
                 ("dolphin-core/src/config.rs", CONFIG_SOURCE_BYTES),
+                (
+                    "dolphin-workflows/src/provenance.rs",
+                    PROVENANCE_SOURCE_BYTES,
+                ),
+                ("dolphin-corrections/src/geometry.rs", GEOMETRY_SOURCE_BYTES),
+                ("Cargo.lock", CARGO_LOCK_BYTES),
             ]),
         }
     }
@@ -547,6 +575,27 @@ struct HeldoutReceiptIdentity {
     manifest_sha256: String,
     freeze_receipt_sha256: String,
     factor_scope_sha256: String,
+    attrition: HeldoutAttrition,
+    evaluated_clusters: usize,
+    required_cluster_failed: bool,
+    raw_levels: BTreeMap<String, RawHeldoutLevel>,
+}
+
+#[derive(Debug)]
+struct RawHeldoutLevel {
+    covered: usize,
+    mean_interval_score: f64,
+    mean_baseline_interval_score: f64,
+    median_width_ratio: f64,
+}
+
+#[derive(Debug)]
+struct RawHeldoutObservationLevel {
+    covered: bool,
+    interval_score: f64,
+    baseline_interval_score: f64,
+    width: f64,
+    baseline_width: f64,
 }
 
 fn canonical_json_sha256(bytes: &[u8]) -> Result<String> {
@@ -559,6 +608,42 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn expected_heldout_implementation_source_hashes() -> BTreeMap<String, String> {
+    [
+        (
+            "executor_sha256",
+            "e0185db2618ea6d2ef1b0f7300cbac63955a0e4f4d2d68922907ba22ff70a18c",
+        ),
+        (
+            "cohort_sha256",
+            "2a19bbceda51be62134944a8af1b6a2db32d469bbc828581c5cb8e97ea3b9183",
+        ),
+        (
+            "gps_ground_truth_sha256",
+            "87205de6626aa4687b99b904ad0e429ad49c5aedde82db536390119f3b36c81f",
+        ),
+        (
+            "runner_sha256",
+            "1682c4facdba834098c4ee3af235d81ffa1553498d9585fce68fadc9202a6945",
+        ),
+        (
+            "scorer_sha256",
+            "a0ba776261cc9e774696ccebd62404804403c7b64f6146d52959942814dfa8ab",
+        ),
+        (
+            "runner_cli_sha256",
+            "cb67b8956872ee2525e0f64af18a68de8b57b57b44a08aecdde480ba59ad6211",
+        ),
+        (
+            "scorer_cli_sha256",
+            "d69735f7f2ac36e6c1ebace5467d7e152ef2d083ae2872e43fedea175ca8dea0",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, digest)| (name.to_owned(), digest.to_owned()))
+    .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -578,6 +663,13 @@ fn validate_heldout_receipt(
     let factor_binding = preregistration["factor_binding"].clone();
     let factor_scope_sha256 = sha256(&serde_json::to_vec(&factor_binding)?);
     let scope_hash = sha256(&serde_json::to_vec(&preregistration["field_scope"])?);
+    ensure!(
+        sha256(HELDOUT_PREREGISTRATION_BYTES) == HELDOUT_PREREGISTRATION_FILE_SHA256
+            && manifest_file_sha256 == HELDOUT_MANIFEST_FILE_SHA256
+            && manifest_sha256 == HELDOUT_MANIFEST_CANONICAL_SHA256
+            && freeze_receipt_sha256 == HELDOUT_FREEZE_FILE_SHA256,
+        "held-out preregistration, manifest, or freeze bytes differ from the frozen cohort"
+    );
     ensure!(
         manifest["schema"].as_str() == Some("dolphinrust.temporal_covariance.heldout_cohort")
             && manifest["schema_version"].as_u64() == Some(2)
@@ -600,7 +692,11 @@ fn validate_heldout_receipt(
             && freeze["hashes"]["manifest_file_sha256"].as_str()
                 == Some(manifest_file_sha256.as_str())
             && freeze["hashes"]["manifest_canonical_sha256"].as_str()
-                == Some(manifest_sha256.as_str()),
+                == Some(manifest_sha256.as_str())
+            && freeze["hashes"]["preregistration_file_sha256"].as_str()
+                == Some(HELDOUT_PREREGISTRATION_FILE_SHA256)
+            && freeze["hashes"]["preregistration_canonical_sha256"].as_str()
+                == Some(preregistration_sha256.as_str()),
         "held-out freeze receipt does not bind the supplied 96+20 manifest"
     );
     ensure!(
@@ -653,35 +749,43 @@ fn validate_heldout_receipt(
             && receipt.hashes.get("binary_sha256").map(String::as_str)
                 == Some(receipt.run_identity.binary_sha256.as_str())
             && is_sha256(&receipt.run_identity.run_plan_sha256)
-            && receipt
-                .run_identity
-                .implementation_source_hashes
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-                == std::collections::BTreeSet::from([
-                    "executor_sha256",
-                    "runner_sha256",
-                    "scorer_sha256",
-                    "runner_cli_sha256",
-                    "scorer_cli_sha256",
-                ])
-            && receipt
-                .run_identity
-                .implementation_source_hashes
-                .values()
-                .all(|value| is_sha256(value))
+            && receipt.run_identity.implementation_source_hashes
+                == expected_heldout_implementation_source_hashes()
             && is_sha256(&receipt.run_identity.product_identities_sha256)
             && receipt.run_identity_sha256 == canonical_run_identity_sha256(&receipt.run_identity)?,
         "held-out raw receipt run identity is stale or internally inconsistent"
     );
     validate_heldout_accounting(receipt, &manifest)?;
+    let raw_levels = validate_heldout_cluster_bindings(receipt, &preregistration, &manifest)?;
+    ensure!(
+        receipt.hashes.get("scorer_sha256").map(String::as_str)
+            == Some(HELDOUT_RECEIPT_SCORER_SHA256),
+        "held-out raw receipt was not produced for the frozen scorer"
+    );
+    let primary_ids = manifest_cluster_ids(&manifest, "frozen_clusters")?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let required_cluster_failed = receipt.clusters.iter().any(|cluster| {
+        cluster["cluster_id"]
+            .as_str()
+            .is_some_and(|id| primary_ids.contains(id))
+            && cluster["status"].as_str() == Some("fail")
+    }) || receipt.attrition.used_surplus_ids.iter().any(|used| {
+        receipt.clusters.iter().any(|cluster| {
+            cluster["cluster_id"].as_str() == Some(used.as_str())
+                && cluster["status"].as_str() == Some("fail")
+        })
+    });
     Ok(HeldoutReceiptIdentity {
         receipt_sha256,
         manifest_file_sha256,
         manifest_sha256,
         freeze_receipt_sha256,
         factor_scope_sha256,
+        attrition: receipt.attrition.clone(),
+        evaluated_clusters: receipt.cluster_counts.evaluable,
+        required_cluster_failed,
+        raw_levels,
     })
 }
 
@@ -735,6 +839,480 @@ fn manifest_cluster_ids(manifest: &Value, field: &str) -> Result<Vec<String>> {
                 .context("held-out manifest candidate lacks an identity")
         })
         .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_heldout_cluster_bindings(
+    receipt: &HeldoutReceipt,
+    preregistration: &Value,
+    manifest: &Value,
+) -> Result<BTreeMap<String, RawHeldoutLevel>> {
+    let candidates = manifest["frozen_clusters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            manifest["surplus_clusters"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .map(|candidate| {
+            Ok((
+                candidate["candidate_id"]
+                    .as_str()
+                    .context("held-out candidate lacks an identity")?
+                    .to_owned(),
+                candidate,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let required = &preregistration["factor_binding"];
+    let scope_fields = required["scope_fields"]
+        .as_array()
+        .context("held-out factor binding lacks scope fields")?
+        .iter()
+        .map(|field| {
+            field
+                .as_str()
+                .map(str::to_owned)
+                .context("held-out factor scope field is not a string")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let mut aggregate: BTreeMap<&str, BTreeMap<String, String>> = [
+        "operator_sha256",
+        "operator_manifest_sha256",
+        "persisted_factor_sha256",
+        "persisted_factor_manifest_sha256",
+        "gnss_catalog_sha256",
+        "approximation_receipt_sha256",
+        "resource_receipt_sha256",
+        "calibration_scope_receipt_sha256",
+        "review_receipt_sha256",
+    ]
+    .into_iter()
+    .map(|field| (field, BTreeMap::new()))
+    .collect();
+    let mut cluster_levels = BTreeMap::new();
+    for cluster in &receipt.clusters {
+        let cluster_id = cluster["cluster_id"]
+            .as_str()
+            .context("held-out cluster lacks an identity")?;
+        let candidate = candidates
+            .get(cluster_id)
+            .context("held-out cluster is not frozen")?;
+        ensure!(
+            cluster["station_ids"] == candidate["station_ids"]
+                && cluster["burst_id"] == candidate["burst_id"]
+                && cluster["site_id"] == candidate["site_id"],
+            "held-out cluster scope metadata differs from its frozen candidate"
+        );
+        if !matches!(cluster["status"].as_str(), Some("pass" | "fail")) {
+            continue;
+        }
+        let binding = cluster["difference_covariance"]
+            .as_object()
+            .context("evaluable held-out cluster lacks a direct factor binding")?;
+        ensure!(
+            binding.get("operation") == Some(&required["operation"])
+                && binding.get("input_operator") == Some(&required["input_operator"])
+                && binding.get("output_factor") == Some(&required["output_factor"])
+                && binding.get("mode") == Some(&required["mode"])
+                && binding.get("reference_specific") == Some(&required["reference_specific"])
+                && binding.get("stitched_burst_count") == Some(&required["stitched_burst_count"])
+                && binding.get("marginal_rss_combination_allowed") == Some(&Value::Bool(false))
+                && binding
+                    .get("calibrated_scope_match")
+                    .and_then(Value::as_str)
+                    == Some("calibrated_scope_match"),
+            "held-out cluster factor identity differs from the frozen direct-factor contract"
+        );
+        for field in ["factor_sha256", "scope_sha256"] {
+            ensure!(
+                binding
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256),
+                "held-out cluster factor digest is invalid: {field}"
+            );
+        }
+        let scope = binding
+            .get("scope")
+            .and_then(Value::as_object)
+            .context("evaluable held-out cluster factor scope is missing")?;
+        ensure!(
+            scope
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                == scope_fields
+                && scope.get("target_station_id") == candidate["station_ids"].get(0)
+                && scope.get("control_station_id") == candidate["station_ids"].get(1)
+                && scope.get("burst_id") == Some(&candidate["burst_id"])
+                && scope.get("schema_version") == required["output_factor"].get("schema_version")
+                && scope.get("method_version") == required["output_factor"].get("method_version")
+                && scope.get("method") == required["output_factor"].get("method")
+                && scope.get("calibration_scope")
+                    == required["output_factor"].get("calibration_status")
+                && matches!(
+                    scope.get("units").and_then(Value::as_str),
+                    Some("meters" | "millimeters")
+                ),
+            "held-out cluster factor scope differs from its frozen station/burst identity"
+        );
+        for field in scope_fields
+            .iter()
+            .filter(|field| field.ends_with("_sha256"))
+        {
+            ensure!(
+                scope
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256),
+                "held-out cluster factor scope digest is missing: {field}"
+            );
+        }
+        let scope_sha256 = sha256(&serde_json::to_vec(scope)?);
+        ensure!(
+            binding.get("scope_sha256").and_then(Value::as_str) == Some(scope_sha256.as_str()),
+            "held-out cluster factor scope digest differs from its exact fields"
+        );
+        for field in [
+            "operator_sha256",
+            "operator_manifest_sha256",
+            "persisted_factor_sha256",
+            "persisted_factor_manifest_sha256",
+        ] {
+            let digest = binding
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| is_sha256(value))
+                .context("held-out cluster persisted factor digest is invalid")?;
+            aggregate
+                .get_mut(field)
+                .expect("frozen aggregate field")
+                .insert(cluster_id.to_owned(), digest.to_owned());
+        }
+        let gnss = cluster["gnss_provenance"]["solution_sha256"]
+            .as_str()
+            .filter(|value| is_sha256(value))
+            .context("held-out cluster GNSS digest is invalid")?;
+        aggregate
+            .get_mut("gnss_catalog_sha256")
+            .expect("frozen aggregate field")
+            .insert(cluster_id.to_owned(), gnss.to_owned());
+        validate_heldout_gnss(cluster, candidate, preregistration)?;
+        cluster_levels.insert(
+            cluster_id.to_owned(),
+            score_heldout_observation(&cluster["observation"])?,
+        );
+        for (output, source) in [
+            (
+                "approximation_receipt_sha256",
+                "approximation_receipt_sha256",
+            ),
+            ("resource_receipt_sha256", "resource_receipt_sha256"),
+            ("calibration_scope_receipt_sha256", "method_manifest_sha256"),
+            ("review_receipt_sha256", "review_receipt_sha256"),
+        ] {
+            let digest = scope
+                .get(source)
+                .and_then(Value::as_str)
+                .filter(|value| is_sha256(value))
+                .context("held-out cluster factor-evidence digest is invalid")?;
+            aggregate
+                .get_mut(output)
+                .expect("frozen aggregate field")
+                .insert(cluster_id.to_owned(), digest.to_owned());
+        }
+    }
+    for (field, values) in aggregate {
+        let digest = sha256(&serde_json::to_vec(&values)?);
+        ensure!(
+            receipt.hashes.get(field) == Some(&digest),
+            "held-out raw receipt factor/GNSS aggregate hash is cross-wired: {field}"
+        );
+    }
+    aggregate_selected_heldout_levels(receipt, manifest, &cluster_levels)
+}
+
+fn validate_heldout_gnss(
+    cluster: &Value,
+    candidate: &Value,
+    preregistration: &Value,
+) -> Result<()> {
+    let provenance = cluster["gnss_provenance"]
+        .as_object()
+        .context("held-out cluster GNSS provenance is missing")?;
+    let expected_fields = std::collections::BTreeSet::from([
+        "solution_sources",
+        "solution_sha256",
+        "coordinate_frame",
+        "los_source",
+        "los_sha256",
+        "station_los_vectors",
+        "projection_convention",
+        "epoch_zero_reference_sha256",
+        "covariance_projection",
+    ]);
+    ensure!(
+        provenance
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            == expected_fields,
+        "held-out cluster GNSS provenance fields are incomplete"
+    );
+    for field in [
+        "solution_sha256",
+        "los_sha256",
+        "epoch_zero_reference_sha256",
+    ] {
+        ensure!(
+            provenance
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(is_sha256),
+            "held-out cluster GNSS provenance digest is invalid: {field}"
+        );
+    }
+    let required = &preregistration["gnss_provenance"];
+    ensure!(
+        provenance.get("coordinate_frame") == Some(&required["coordinate_frame"])
+            && provenance.get("projection_convention") == Some(&required["projection"])
+            && provenance.get("covariance_projection") == Some(&required["covariance_projection"])
+            && provenance.get("los_source") == Some(&required["los_source"]),
+        "held-out cluster GNSS projection provenance differs from preregistration"
+    );
+    let station_ids = candidate["station_ids"]
+        .as_array()
+        .context("held-out candidate station identities are missing")?
+        .iter()
+        .map(|station| {
+            station
+                .as_str()
+                .context("held-out candidate station identity is invalid")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let sources = provenance
+        .get("solution_sources")
+        .and_then(Value::as_object)
+        .context("held-out cluster GNSS solution sources are missing")?;
+    let vectors = provenance
+        .get("station_los_vectors")
+        .and_then(Value::as_object)
+        .context("held-out cluster GNSS LOS vectors are missing")?;
+    ensure!(
+        sources
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            == station_ids
+            && vectors
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                == station_ids,
+        "held-out cluster GNSS station identities differ from its frozen candidate"
+    );
+    let tolerance = required["los_norm_tolerance"]
+        .as_f64()
+        .context("held-out GNSS LOS tolerance is invalid")?;
+    for vector in vectors.values() {
+        let components = vector
+            .as_array()
+            .filter(|values| values.len() == 3)
+            .context("held-out cluster GNSS LOS vector is invalid")?;
+        let values = components
+            .iter()
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .context("held-out cluster GNSS LOS vector is nonfinite")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let norm = values.iter().map(|value| value * value).sum::<f64>().sqrt();
+        ensure!(
+            (norm - 1.0).abs() <= tolerance,
+            "held-out cluster GNSS LOS vector is not unit norm"
+        );
+    }
+    Ok(())
+}
+
+fn score_heldout_observation(
+    observation: &Value,
+) -> Result<BTreeMap<String, RawHeldoutObservationLevel>> {
+    let observation = observation
+        .as_object()
+        .context("held-out cluster slope observation is missing")?;
+    let expected_fields = std::collections::BTreeSet::from([
+        "insar_slope_difference",
+        "gnss_slope_difference",
+        "insar_difference_variance",
+        "gnss_slope_variance",
+        "sensor_cross_covariance",
+        "baseline_sigma",
+    ]);
+    ensure!(
+        observation
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            == expected_fields,
+        "held-out cluster slope observation fields differ from the frozen schema"
+    );
+    let finite = |field: &str| -> Result<f64> {
+        observation[field]
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .with_context(|| format!("held-out cluster slope observation is invalid: {field}"))
+    };
+    let insar_difference = finite("insar_slope_difference")?;
+    let gnss_difference = finite("gnss_slope_difference")?;
+    let insar_variance = finite("insar_difference_variance")?;
+    let gnss_variance = finite("gnss_slope_variance")?;
+    let cross_covariance = finite("sensor_cross_covariance")?;
+    ensure!(
+        insar_variance >= 0.0 && gnss_variance >= 0.0 && cross_covariance == 0.0,
+        "held-out cluster slope covariance is invalid"
+    );
+    let variance = insar_variance + gnss_variance;
+    ensure!(
+        variance.is_finite() && variance > 0.0,
+        "held-out cluster combined slope covariance is not positive"
+    );
+    let baseline = observation["baseline_sigma"]
+        .as_object()
+        .context("held-out cluster baseline sigma is missing")?;
+    ensure!(
+        baseline
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            == std::collections::BTreeSet::from(["68", "90", "95"]),
+        "held-out cluster baseline sigma levels are incomplete"
+    );
+    let difference = insar_difference - gnss_difference;
+    let sigma = variance.sqrt();
+    let mut levels = BTreeMap::new();
+    for (level, z) in [
+        ("68", 0.994_457_883_209_753),
+        ("90", 1.644_853_626_951_472_2),
+        ("95", 1.959_963_984_540_054),
+    ] {
+        let nominal = level.parse::<f64>()? / 100.0;
+        let baseline_sigma = baseline[level]
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .context("held-out cluster baseline sigma is invalid")?;
+        let half_width = z * sigma;
+        let baseline_half_width = z * baseline_sigma;
+        levels.insert(
+            level.to_owned(),
+            RawHeldoutObservationLevel {
+                covered: difference.abs() <= half_width,
+                interval_score: interval_score(
+                    difference - half_width,
+                    difference + half_width,
+                    nominal,
+                ),
+                baseline_interval_score: interval_score(
+                    difference - baseline_half_width,
+                    difference + baseline_half_width,
+                    nominal,
+                ),
+                width: 2.0 * half_width,
+                baseline_width: 2.0 * baseline_half_width,
+            },
+        );
+    }
+    Ok(levels)
+}
+
+fn interval_score(lower: f64, upper: f64, nominal: f64) -> f64 {
+    let mut score = upper - lower;
+    if 0.0 < lower {
+        score += 2.0 * lower / (1.0 - nominal);
+    } else if 0.0 > upper {
+        score += 2.0 * -upper / (1.0 - nominal);
+    }
+    score
+}
+
+fn aggregate_selected_heldout_levels(
+    receipt: &HeldoutReceipt,
+    manifest: &Value,
+    cluster_levels: &BTreeMap<String, BTreeMap<String, RawHeldoutObservationLevel>>,
+) -> Result<BTreeMap<String, RawHeldoutLevel>> {
+    let statuses = receipt
+        .clusters
+        .iter()
+        .map(|cluster| {
+            Ok((
+                cluster["cluster_id"]
+                    .as_str()
+                    .context("held-out cluster identity is missing")?,
+                cluster["status"]
+                    .as_str()
+                    .context("held-out cluster status is missing")?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let selected = manifest_cluster_ids(manifest, "frozen_clusters")?
+        .into_iter()
+        .filter(|id| statuses.get(id.as_str()) == Some(&"pass"))
+        .chain(receipt.attrition.used_surplus_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    ensure!(
+        selected.len() == 96,
+        "held-out selected raw cluster denominator is not 96"
+    );
+    let mut result = BTreeMap::new();
+    for level in ["68", "90", "95"] {
+        let values = selected
+            .iter()
+            .map(|id| {
+                cluster_levels
+                    .get(id)
+                    .and_then(|levels| levels.get(level))
+                    .context("selected held-out cluster lacks raw level metrics")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let divisor = values.len() as f64;
+        let mut widths = values.iter().map(|value| value.width).collect::<Vec<_>>();
+        let mut baseline_widths = values
+            .iter()
+            .map(|value| value.baseline_width)
+            .collect::<Vec<_>>();
+        result.insert(
+            level.to_owned(),
+            RawHeldoutLevel {
+                covered: values.iter().filter(|value| value.covered).count(),
+                mean_interval_score: values.iter().map(|value| value.interval_score).sum::<f64>()
+                    / divisor,
+                mean_baseline_interval_score: values
+                    .iter()
+                    .map(|value| value.baseline_interval_score)
+                    .sum::<f64>()
+                    / divisor,
+                median_width_ratio: median(&mut widths)? / median(&mut baseline_widths)?,
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn median(values: &mut [f64]) -> Result<f64> {
+    ensure!(!values.is_empty(), "held-out median is undefined");
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Ok(if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -886,6 +1464,7 @@ fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_heldout_result(
     result: &HeldoutResult,
     expected: &HeldoutReceiptIdentity,
@@ -912,7 +1491,9 @@ fn validate_heldout_result(
     ensure!(
         result.primary_cluster_count == 96
             && result.surplus_cluster_count == 20
-            && result.evaluated_clusters == 96
+            && result.evaluated_clusters == expected.evaluated_clusters
+            && expected.evaluated_clusters == 96
+            && !expected.required_cluster_failed
             && attrition_count <= result.surplus_cluster_count
             && result.used_surplus_ids.len() == attrition_count
             && result.unused_surplus_ids.len() + result.used_surplus_ids.len()
@@ -931,27 +1512,106 @@ fn validate_heldout_result(
             })
             && unique(&result.attrited_primary_ids)
             && unique(&result.used_surplus_ids)
-            && unique(&result.unused_surplus_ids),
+            && unique(&result.unused_surplus_ids)
+            && result.attrited_primary_ids == expected.attrition.attrited_primary_ids
+            && result.used_surplus_ids == expected.attrition.used_surplus_ids
+            && result.unused_surplus_ids == expected.attrition.unused_surplus_ids
+            && result.reasons_by_cluster == expected.attrition.reasons_by_cluster,
         "held-out temporal-covariance result does not account for exact 96+20 frozen slots"
     );
     ensure!(
         result.status == "pass"
             && result.errors.is_empty()
             && result.emission_rate.is_finite()
-            && result.emission_rate >= 0.99,
+            && approximately_equal(result.emission_rate, 1.0),
         "held-out temporal-covariance result did not pass the frozen cohort"
     );
+    let mut p_values = Vec::with_capacity(3);
     ensure!(
         result.levels.len() == 3
-            && ["68", "90", "95"].iter().all(|level| {
-                result
-                    .levels
-                    .get(*level)
-                    .is_some_and(|value| value.status == "pass")
-            }),
+            && ["68", "90", "95"]
+                .iter()
+                .all(|level| result.levels.contains_key(*level)),
         "held-out temporal-covariance level gates are incomplete"
     );
+    for level in ["68", "90", "95"] {
+        let nominal = level.parse::<f64>()? / 100.0;
+        let value = &result.levels[level];
+        let coverage = &value.coverage;
+        let raw = &expected.raw_levels[level];
+        let expected_p =
+            exact_binomial_upper_tail(coverage.covered, coverage.evaluated, nominal - 0.2)?;
+        let observed = coverage.covered as f64 / coverage.evaluated as f64;
+        let coverage_error = (observed - nominal).abs();
+        ensure!(
+            value.status == "pass"
+                && coverage.status == "pass"
+                && coverage.evaluated == expected.evaluated_clusters
+                && coverage.covered == raw.covered
+                && coverage.covered <= coverage.evaluated
+                && approximately_equal(coverage.null_coverage, nominal - 0.2)
+                && approximately_equal(coverage.observed_coverage, observed)
+                && approximately_equal(coverage.p_value, expected_p)
+                && coverage.p_value <= 0.05
+                && approximately_equal(value.coverage_absolute_error, coverage_error)
+                && value.coverage_absolute_gate == (coverage_error <= 0.2)
+                && value.coverage_absolute_gate
+                && value.mean_interval_score.is_finite()
+                && value.mean_interval_score >= 0.0
+                && approximately_equal(value.mean_interval_score, raw.mean_interval_score)
+                && value.mean_baseline_interval_score.is_finite()
+                && value.mean_baseline_interval_score >= 0.0
+                && approximately_equal(
+                    value.mean_baseline_interval_score,
+                    raw.mean_baseline_interval_score,
+                )
+                && value.mean_interval_score < value.mean_baseline_interval_score
+                && value.proper_score_improves
+                && value.median_width_ratio.is_finite()
+                && value.median_width_ratio >= 0.0
+                && approximately_equal(value.median_width_ratio, raw.median_width_ratio)
+                && value.median_width_ratio < 2.0
+                && value.holm_reject,
+            "held-out temporal-covariance level {level} metrics differ from the frozen scorer"
+        );
+        p_values.push((level, coverage.p_value));
+    }
+    p_values.sort_by(|left, right| left.1.total_cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+    ensure!(
+        p_values
+            .iter()
+            .enumerate()
+            .all(|(rank, (_, p_value))| *p_value <= 0.05 / (3 - rank) as f64),
+        "held-out temporal-covariance Holm decisions are inconsistent"
+    );
     Ok(())
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    left.is_finite()
+        && right.is_finite()
+        && (left - right).abs() <= 1e-12_f64.max(1e-12 * left.abs().max(right.abs()))
+}
+
+fn exact_binomial_upper_tail(covered: usize, evaluated: usize, probability: f64) -> Result<f64> {
+    ensure!(
+        evaluated > 0 && covered <= evaluated && probability > 0.0 && probability < 1.0,
+        "held-out binomial inputs are invalid"
+    );
+    let mut coefficient = 1.0;
+    for index in 0..covered {
+        coefficient *= (evaluated - index) as f64 / (index + 1) as f64;
+    }
+    let mut term = coefficient
+        * probability.powi(i32::try_from(covered)?)
+        * (1.0 - probability).powi(i32::try_from(evaluated - covered)?);
+    let mut tail = term;
+    for successes in covered..evaluated {
+        term *= (evaluated - successes) as f64 / (successes + 1) as f64;
+        term *= probability / (1.0 - probability);
+        tail += term;
+    }
+    Ok(tail.min(1.0))
 }
 
 fn validate_review(review: &TemporalReviewReceipt, expected: &EvidenceDigests) -> Result<()> {
@@ -1199,7 +1859,12 @@ fn write_product_transaction_with_validator(
         )
     })();
     let stage_cleanup = if stage.exists() {
-        remove_owned_stage_directory(output_directory, &stage, &transaction.ownership_token)
+        remove_owned_stage_directory(
+            output_directory,
+            &stage,
+            Some(&transaction.ownership_token),
+            || Ok(()),
+        )
     } else {
         Ok(())
     };
@@ -1420,7 +2085,14 @@ fn compose_working_set_admission(
         .block_id_read_cap_bytes
         .checked_div(std::mem::size_of::<u64>() as u64)
         .context("block-ID element size is zero")?;
-    let writer_bookkeeping_bytes = maximum_block_ids
+    ensure!(
+        maximum_block_ids > 0,
+        "block-ID cap cannot hold one identifier"
+    );
+    let writer_block_capacity = maximum_block_ids
+        .checked_next_power_of_two()
+        .context("COG writer block capacity overflow")?;
+    let writer_bookkeeping_bytes = writer_block_capacity
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<BlockIndices>() as u64))
         .context("COG writer bookkeeping size overflow")?;
@@ -1808,6 +2480,7 @@ fn validate_fixed_cube_semantics(
                     .get("LOS_COMPONENTS")
                     .map(String::as_str)
                     == Some("east,north,up")
+                && los_header.metadata.get("UNITTYPE").map(String::as_str) == Some("unitless")
                 && los_header.metadata.get("RASTER_ROLE").map(String::as_str)
                     == Some("fixed_cube_run_geometry"),
             "fixed-cube LOS metadata is invalid: {}",
@@ -3105,7 +3778,7 @@ fn cleanup_orphan_transaction_files(directory: &Path) -> Result<()> {
                     && transaction_marker_is_owned(&marker, directory, &name, None)?,
                 "temporal stage ownership changed before orphan cleanup"
             );
-            std::fs::remove_dir_all(&artifact)?;
+            remove_owned_stage_directory(directory, &artifact, None, || Ok(()))?;
         } else if artifact.exists() {
             let name = artifact
                 .file_name()
@@ -3149,26 +3822,39 @@ fn rollback_incomplete_product_with_journal(
             }
         }
     }
-    restore_fixed_cube_receipt(
-        directory,
-        &journal.original_fixed_cube_receipt,
-        &journal.ownership_token,
-    )?;
-    let stage = directory.join(&journal.stage_directory);
-    if stage.is_dir() {
-        let marker = stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
-        if marker.exists()
-            && transaction_marker_is_owned(
-                &marker,
-                directory,
-                &journal.stage_directory,
-                Some(&journal.ownership_token),
-            )?
-        {
-            std::fs::remove_dir_all(stage)?;
+    let fixed_receipt_path = directory.join("fixed_cube_receipt.json");
+    let original_fixed_receipt_sha256 = sha256(&journal.original_fixed_cube_receipt);
+    let restore_fixed_receipt = if fixed_receipt_path.exists() {
+        let current = sha256_file(&fixed_receipt_path)?;
+        if current == original_fixed_receipt_sha256 {
+            false
+        } else if journal.expected_fixed_receipt_sha256.as_deref() == Some(current.as_str()) {
+            true
         } else {
-            collisions.push(journal.stage_directory.clone());
+            collisions.push("fixed_cube_receipt.json".to_owned());
+            false
         }
+    } else {
+        true
+    };
+    if restore_fixed_receipt {
+        restore_fixed_cube_receipt(
+            directory,
+            &journal.original_fixed_cube_receipt,
+            &journal.ownership_token,
+        )?;
+    }
+    let stage = directory.join(&journal.stage_directory);
+    if stage.exists()
+        && remove_owned_stage_directory(
+            directory,
+            &stage,
+            Some(&journal.ownership_token),
+            || Ok(()),
+        )
+        .is_err()
+    {
+        collisions.push(journal.stage_directory.clone());
     }
     File::open(directory)?.sync_all()?;
     if !collisions.is_empty() {
@@ -3445,7 +4131,7 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
         if marker.exists()
             && transaction_marker_is_owned(&marker, directory, &stage_name, Some(ownership_token))?
         {
-            std::fs::remove_dir_all(&stage)?;
+            remove_owned_stage_directory(directory, &stage, Some(ownership_token), || Ok(()))?;
         }
     }
     initialize
@@ -3454,8 +4140,10 @@ fn create_stage_directory(directory: &Path, ownership_token: &str) -> Result<Pat
 fn remove_owned_stage_directory(
     directory: &Path,
     stage: &Path,
-    ownership_token: &str,
+    ownership_token: Option<&str>,
+    before_isolate: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    static NEXT_CLEANUP_ID: AtomicU64 = AtomicU64::new(0);
     let stage_name = stage
         .file_name()
         .context("temporal product stage has no filename")?
@@ -3467,11 +4155,26 @@ fn remove_owned_stage_directory(
                 &stage.join(TRANSACTION_ARTIFACT_MARKER_FILENAME),
                 directory,
                 &stage_name,
-                Some(ownership_token),
+                ownership_token,
             )?,
         "temporal stage ownership changed before deletion"
     );
-    std::fs::remove_dir_all(stage)?;
+    before_isolate()?;
+    let isolated = directory.join(format!(
+        ".temporal-inference-stage-cleanup-{}-{}",
+        std::process::id(),
+        NEXT_CLEANUP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::rename(stage, &isolated)?;
+    let isolated_marker = isolated.join(TRANSACTION_ARTIFACT_MARKER_FILENAME);
+    if !transaction_marker_is_owned(&isolated_marker, directory, &stage_name, ownership_token)? {
+        if !stage.exists() {
+            std::fs::rename(&isolated, stage)?;
+            File::open(directory)?.sync_all()?;
+        }
+        anyhow::bail!("temporal stage ownership changed while isolating for deletion");
+    }
+    std::fs::remove_dir_all(&isolated)?;
     File::open(directory)?.sync_all()?;
     Ok(())
 }
@@ -3529,11 +4232,11 @@ mod tests {
         output_window, reconstruct_covariance, validate_heldout_result, validate_input_coverage,
         validate_manifest, validate_product_value_semantics, validate_review,
         validate_synthetic_result, validate_working_set_high_water,
-        write_product_transaction_with_validator, EvidenceDigests, HeldoutLevel,
-        HeldoutReceiptIdentity, HeldoutResult, SyntheticResult, SyntheticScores,
-        TemporalCovariancePromotion, TemporalProductTransaction, TemporalPromotionManifest,
-        TemporalReviewReceipt, HELDOUT_SCORE_SCHEMA, PRODUCT_LAYERS, PROMOTION_SCHEMA,
-        REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
+        write_product_transaction_with_validator, EvidenceDigests, HeldoutAttrition,
+        HeldoutCoverage, HeldoutLevel, HeldoutReceiptIdentity, HeldoutResult, RawHeldoutLevel,
+        SyntheticResult, SyntheticScores, TemporalCovariancePromotion, TemporalProductTransaction,
+        TemporalPromotionManifest, TemporalReviewReceipt, HELDOUT_SCORE_SCHEMA, PRODUCT_LAYERS,
+        PROMOTION_SCHEMA, REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -3651,6 +4354,12 @@ mod tests {
         );
         assert!(admitted.total_bytes <= super::COMBINED_WORKING_SET_CAP_BYTES);
         assert!(admit_combined_working_set(&config, 100_000).is_err());
+        let mut non_power_of_two_block_cap = config.clone();
+        non_power_of_two_block_cap.block_id_read_cap_bytes = 4 * 1024 * 1024 + 8;
+        assert!(
+            admit_combined_working_set(&non_power_of_two_block_cap, days.len()).is_err(),
+            "writer Vec capacity growth must be admitted before block reads"
+        );
         let boundary = compose_working_set_admission(&config, days.len()).unwrap();
         assert!(
             validate_working_set_high_water(&boundary, boundary.gdal_cache_budget_bytes).is_ok()
@@ -3777,13 +4486,41 @@ mod tests {
             collision_artifacts: Vec::new(),
         };
         assert!(super::rollback_incomplete_product_with_journal(&directory, &journal).is_err());
+        assert_eq!(
+            std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
+            b"changed",
+            "rollback must preserve a replaced unowned fixed-cube receipt"
+        );
         assert_eq!(std::fs::read(stage.join("user-data")).unwrap(), b"preserve");
         assert_eq!(
             super::read_rollback_journal(&directory)
                 .unwrap()
                 .collision_artifacts,
-            vec![stage_name]
+            vec![stage_name, "fixed_cube_receipt.json"]
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn normal_cleanup_preserves_a_stage_replaced_after_ownership_check() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_cleanup_stage_swap_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let ownership_token = "cleanup-owner";
+        let stage = super::create_stage_directory(&directory, ownership_token).unwrap();
+        let error =
+            super::remove_owned_stage_directory(&directory, &stage, Some(ownership_token), || {
+                std::fs::remove_dir_all(&stage)?;
+                std::fs::create_dir(&stage)?;
+                std::fs::write(stage.join("user-data"), b"preserve")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership changed"));
+        assert_eq!(std::fs::read(stage.join("user-data")).unwrap(), b"preserve");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3900,11 +4637,7 @@ mod tests {
         for prefix in 0..=PRODUCT_LAYERS.len() + 1 {
             let directory = root.join(format!("prefix-{prefix}"));
             std::fs::create_dir(&directory).unwrap();
-            std::fs::write(
-                directory.join("fixed_cube_receipt.json"),
-                br#"{"inference_status":"calibrated_scope_match"}"#,
-            )
-            .unwrap();
+            std::fs::write(directory.join("fixed_cube_receipt.json"), original_receipt).unwrap();
             let stage_name = format!(".temporal-inference-stage-prefix-{prefix}");
             let stage = directory.join(&stage_name);
             std::fs::create_dir(&stage).unwrap();
@@ -3982,6 +4715,29 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn complete_evidence_chain_rejects_tamper_and_scope_mismatch() {
+        fn passing_level(level: &str, covered: usize) -> HeldoutLevel {
+            let nominal = level.parse::<f64>().unwrap() / 100.0;
+            let observed = covered as f64 / 96.0;
+            HeldoutLevel {
+                status: "pass".to_owned(),
+                coverage: HeldoutCoverage {
+                    status: "pass".to_owned(),
+                    p_value: super::exact_binomial_upper_tail(covered, 96, nominal - 0.2).unwrap(),
+                    null_coverage: nominal - 0.2,
+                    observed_coverage: observed,
+                    evaluated: 96,
+                    covered,
+                },
+                coverage_absolute_error: (observed - nominal).abs(),
+                coverage_absolute_gate: true,
+                mean_interval_score: 1.0,
+                mean_baseline_interval_score: 2.0,
+                median_width_ratio: 0.5,
+                proper_score_improves: true,
+                holm_reject: true,
+            }
+        }
+
         let synthetic = SyntheticResult {
             schema: SYNTHETIC_SCHEMA.to_owned(),
             attempted_cells: 240_000,
@@ -4008,8 +4764,31 @@ mod tests {
                 "cd3a0c4bdd5517fb310a55c2b34abbf78ff4bd7ccfe1aa6c1a5f5d61bae99f1c".to_owned(),
             factor_scope_sha256: "ee35862925aa7e88e0c18e0f09633aa5c02ed5781c68c9c2afb3aed3168eb833"
                 .to_owned(),
+            attrition: HeldoutAttrition {
+                attrited_primary_ids: Vec::new(),
+                used_surplus_ids: Vec::new(),
+                unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
+                reasons_by_cluster: BTreeMap::new(),
+            },
+            evaluated_clusters: 96,
+            required_cluster_failed: false,
+            raw_levels: ["68", "90", "95"]
+                .into_iter()
+                .zip([62, 84, 90])
+                .map(|(level, covered)| {
+                    (
+                        level.to_owned(),
+                        RawHeldoutLevel {
+                            covered,
+                            mean_interval_score: 1.0,
+                            mean_baseline_interval_score: 2.0,
+                            median_width_ratio: 0.5,
+                        },
+                    )
+                })
+                .collect(),
         };
-        let heldout = HeldoutResult {
+        let mut heldout = HeldoutResult {
             schema: HELDOUT_SCORE_SCHEMA.to_owned(),
             schema_version: 1,
             cohort_id: "f53-06-outer-nonfresno-v1".to_owned(),
@@ -4023,24 +4802,25 @@ mod tests {
             status: "pass".to_owned(),
             errors: Vec::<Value>::new(),
             levels: ["68", "90", "95"]
-                .map(|level| {
-                    (
-                        level.to_owned(),
-                        HeldoutLevel {
-                            status: "pass".to_owned(),
-                        },
-                    )
-                })
                 .into_iter()
+                .zip([62, 84, 90])
+                .map(|(level, covered)| (level.to_owned(), passing_level(level, covered)))
                 .collect(),
             evaluated_clusters: 96,
-            emission_rate: 0.99,
+            emission_rate: 1.0,
             attrited_primary_ids: Vec::new(),
             used_surplus_ids: Vec::new(),
             unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
             reasons_by_cluster: BTreeMap::new(),
         };
         validate_heldout_result(&heldout, &heldout_identity).unwrap();
+        heldout.levels.get_mut("90").unwrap().coverage.p_value += 0.01;
+        assert!(validate_heldout_result(&heldout, &heldout_identity).is_err());
+        heldout.levels.get_mut("90").unwrap().coverage.p_value =
+            super::exact_binomial_upper_tail(84, 96, 0.7).unwrap();
+        heldout.levels.get_mut("90").unwrap().mean_interval_score = 1.25;
+        assert!(validate_heldout_result(&heldout, &heldout_identity).is_err());
+        heldout.levels.get_mut("90").unwrap().mean_interval_score = 1.0;
         let mut stale_freeze = heldout;
         stale_freeze.freeze_receipt_sha256 = "00".repeat(32);
         assert!(validate_heldout_result(&stale_freeze, &heldout_identity).is_err());
@@ -4162,6 +4942,27 @@ mod tests {
         receipt.attrition.used_surplus_ids.push("p00".to_owned());
         receipt.attrition.unused_surplus_ids.pop();
         assert!(super::validate_heldout_accounting(&receipt, &manifest).is_err());
+    }
+
+    #[test]
+    fn heldout_raw_observation_metrics_are_recomputed() {
+        let mut observation = serde_json::json!({
+            "insar_slope_difference": 0.0,
+            "gnss_slope_difference": 0.0,
+            "insar_difference_variance": 0.25,
+            "gnss_slope_variance": 0.75,
+            "sensor_cross_covariance": 0.0,
+            "baseline_sigma": {"68": 2.0, "90": 2.0, "95": 2.0},
+        });
+        let levels = super::score_heldout_observation(&observation).unwrap();
+        assert!(levels.values().all(|level| level.covered));
+        assert!(levels.values().all(|level| {
+            (level.width / level.baseline_width - 0.5).abs() <= f64::EPSILON
+                && level.interval_score < level.baseline_interval_score
+        }));
+
+        observation["sensor_cross_covariance"] = serde_json::json!(0.01);
+        assert!(super::score_heldout_observation(&observation).is_err());
     }
 
     #[test]
@@ -4488,6 +5289,7 @@ mod tests {
                 "ground_to_sensor_positive_toward_sensor",
             ),
             ("LOS_COMPONENTS", "east,north,up"),
+            ("UNITTYPE", "unitless"),
             ("RASTER_ROLE", "fixed_cube_run_geometry"),
         ];
         dolphin_io::write_raster_with_metadata(
@@ -4770,14 +5572,21 @@ mod tests {
         )
         .unwrap();
         drop(product_transaction);
-        let product_transaction = TemporalProductTransaction::acquire(&directory).unwrap();
+        let collision = TemporalProductTransaction::acquire(&directory).unwrap_err();
+        assert!(collision.to_string().contains("fixed_cube_receipt.json"));
         assert_eq!(
             std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
-            fixed_cube_receipt_before
+            b"corrupt receipt"
         );
         assert!(PRODUCT_LAYERS
             .iter()
             .all(|(name, _)| !directory.join(name).exists()));
+        std::fs::write(
+            directory.join("fixed_cube_receipt.json"),
+            &fixed_cube_receipt_before,
+        )
+        .unwrap();
+        let product_transaction = TemporalProductTransaction::acquire(&directory).unwrap();
         let receipt = write_product_transaction_with_validator(
             &directory,
             &displacement_rasters,
