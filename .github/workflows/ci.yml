@@ -40,7 +40,7 @@ jobs:
       - name: Install Python validation dependencies
         run: |
           python -m pip install "GDAL==$(gdal-config --version)" \
-            asf-search fsspec h5py numpy pyproj rasterio requests ruamel.yaml scipy
+            aiohttp asf-search fsspec h5py numpy pyproj rasterio requests ruamel.yaml scipy
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Workspace check
