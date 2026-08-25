@@ -72,6 +72,7 @@ from validation.score_spatial_covariance import (
 from validation.spatial_covariance_simulation import (
     _cell_request_at,
     _load_bounded_json,
+    _matched_marginal_identity,
     _iter_cell_requests,
     PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD,
     build_run_manifest,
@@ -1991,6 +1992,38 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 self.preregistration, PREREGISTRATION, Path("missing-batch"),
                 CODE, BINARY, 512,
             )
+
+    def test_matched_signed_dgp_separates_joint_identity_from_exact_marginals(self):
+        positive = regenerate_frozen_attempt_inputs(
+            self.preregistration, FROZEN_MATCHED_POSITIVE_CELL, 0
+        )
+        negative = regenerate_frozen_attempt_inputs(
+            self.preregistration,
+            FROZEN_MATCHED_POSITIVE_CELL.replace(
+                "shared_75_positive", "shared_75_negative"
+            ),
+            0,
+        )
+        self.assertNotEqual(
+            positive["raw_dgp_identity_sha256"],
+            negative["raw_dgp_identity_sha256"],
+        )
+        positive_marginal = _matched_marginal_identity(positive)
+        negative_marginal = _matched_marginal_identity(negative)
+        self.assertEqual(positive_marginal, negative_marginal)
+        self.assertEqual(set(positive_marginal), {
+            "schema", "target_support_sha256", "reference_support_sha256",
+            "sequential_ancestry_sha256", "latent_history_sha256",
+            "target_marginal_oracle_sha256", "reference_marginal_oracle_sha256",
+            "source_correlation_receipt_sha256", "target_coordinate",
+            "reference_coordinate", "date_axis_sha256", "raw_input_shape",
+            "raw_input_value_count", "target_source_count",
+            "reference_source_count", "intersection_source_count",
+            "union_source_count", "effective_support_union_count",
+            "effective_looks_fraction", "source_correlation_model",
+            "source_correlation_distance_scale_pixels",
+        })
+        self.assertNotIn("raw_dgp_identity_sha256", positive_marginal)
 
     def test_matched_seed_zero_effective_looks_matches_exact_candidate_adjoint_union(self):
         target, reference = _expected_coordinates(
