@@ -1155,10 +1155,6 @@ def generate_matched_pair_cohorts(
         or seed_count != frozen_cohort.get("seed_count")
         or MATCHED_POSITIVE_CELL not in cell_ids
         or MATCHED_NEGATIVE_CELL not in cell_ids
-        or not 2 <= seed_count <= min(
-            expected_seed_count(MATCHED_POSITIVE_CELL),
-            expected_seed_count(MATCHED_NEGATIVE_CELL),
-        )
     ):
         raise SchemaError("matched cohort cells or seed count are outside the frozen matrix")
     preregistration_path = Path(preregistration_path).resolve(strict=True)

@@ -15,6 +15,7 @@ import numpy as np
 
 from validation.score_spatial_covariance import (
     ATTEMPT_KEYS,
+    DIMENSION_NAMES,
     FROZEN_ATTEMPT_COUNT,
     FROZEN_CELL_COUNT,
     FROZEN_CELL_SUMMARY_COMPONENT_BYTES,
@@ -22,6 +23,7 @@ from validation.score_spatial_covariance import (
     FROZEN_MAX_RUN_MANIFEST_BYTES,
     FROZEN_MAX_RECORD_BYTES,
     FROZEN_MAX_SHARD_MANIFEST_BYTES,
+    FROZEN_MATCHED_POSITIVE_CELL,
     FROZEN_RETAINED_SIZE_BOUND_BYTES,
     FROZEN_SEED_COUNT,
     FROZEN_SHARD_COUNT,
@@ -30,14 +32,18 @@ from validation.score_spatial_covariance import (
     SchemaError,
     ShardSpec,
     _CellSummarySink,
+    _candidate_support,
     _dgp_cell_ordinal,
+    _effective_looks_fraction,
     _expected_seed_hash,
+    _expected_coordinates,
     _fixed_l2_reconstruction_bound,
     _generate_complex_source,
     _growth_exponent,
     _raw_source_digest,
     _read_hashed_json_record,
     _read_single_json_record,
+    _source_correlation_receipt_sha256,
     _validate_performance_probe,
     _validate_resources,
     derive_dense_joint_oracle,
@@ -64,6 +70,7 @@ from validation.score_spatial_covariance import (
     validate_producer_identities,
 )
 from validation.spatial_covariance_simulation import (
+    _cell_request_at,
     _load_bounded_json,
     _iter_cell_requests,
     PARALLEL_BATCH_MAX_REQUESTS_PER_CHILD,
@@ -96,6 +103,7 @@ SUPPORTED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_b
 RISK_CELL = "hw_7x14|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|evd|well_separated|spatial_correlation_stress"
 MASKED_CELL = "hw_1x1|stride_4|glrt_frozen|masked|shared_75_positive|four_blocks|emi|well_separated|spatial_correlation_stress"
 TIED_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|tied_eigenvalue|independent_complex_looks"
+NEAR_TIE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_blocks|emi|near_tie|spatial_correlation_stress"
 
 
 class SpatialCovarianceValidationV5Tests(unittest.TestCase):
@@ -177,6 +185,19 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 else frozen["effective_looks_fraction"]
             ),
             "effective_looks_application": "source_influence_joint_contraction_v1",
+            "effective_support_union_count": (
+                0 if labels["position"] == "masked"
+                else frozen["effective_support_union_count"]
+            ),
+            "source_correlation_receipt_sha256": (
+                _source_correlation_receipt_sha256(
+                    frozen["source_correlation_model"],
+                    frozen["source_correlation_distance_scale_pixels"],
+                    [],
+                )
+                if labels["position"] == "masked"
+                else frozen["source_correlation_receipt_sha256"]
+            ),
             "source_correlation_model": frozen["source_correlation_model"],
             "source_correlation_distance_scale_pixels": frozen[
                 "source_correlation_distance_scale_pixels"
@@ -598,6 +619,20 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
         above["effective_looks_fraction"] += 1.01e-12 * max(1.0, abs(expected))
         with self.assertRaisesRegex(SchemaError, "effective-look realization differs"):
             self._accumulator(SUPPORTED_CELL).add(above)
+
+    def test_source_correlation_support_count_and_receipt_are_exact(self):
+        for field in (
+            "effective_support_union_count",
+            "source_correlation_receipt_sha256",
+        ):
+            attempt = self._attempt(SUPPORTED_CELL, 0, 0)
+            attempt[field] = (
+                attempt[field] + 1
+                if field == "effective_support_union_count"
+                else "f" * 64
+            )
+            with self.assertRaisesRegex(SchemaError, "raw DGP"):
+                self._accumulator(SUPPORTED_CELL).add(attempt)
 
     def test_fabricated_zero_and_self_attested_hashes_are_rejected(self):
         attempt = self._attempt(SUPPORTED_CELL, 0, 0)
@@ -1677,11 +1712,20 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             root = Path(directory)
             (root / "crates" / "producer" / "src").mkdir(parents=True)
             (root / "target" / "release" / "examples").mkdir(parents=True)
+            (root / "validation").mkdir()
             (root / "Cargo.toml").write_text("[workspace]\nmembers=[]\n")
             (root / "Cargo.lock").write_text("version = 3\n")
             source = root / "crates" / "producer" / "src" / "lib.rs"
             source.write_text("pub fn produce() {}\n")
             (root / "crates" / "producer" / "Cargo.toml").write_text("[package]\nname='producer'\nversion='0.1.0'\n")
+            scorer = root / "validation" / "score_spatial_covariance.py"
+            scorer.write_text(
+                'FROZEN_GENERATOR_SHA256 = "generated-a"\n'
+                'FROZEN_SOURCE_SET_SHA256 = "generated-b"\n'
+                "def score(): return 1\n"
+            )
+            simulation = root / "validation" / "spatial_covariance_simulation.py"
+            simulation.write_text("def generate(): return 1\n")
             batch = root / "target" / "release" / "examples" / "spatial_covariance_batch"
             benchmark = root / "target" / "release" / "examples" / "spatial_covariance_bench"
             batch.write_bytes(b"batch-v1")
@@ -1694,6 +1738,23 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
             validate_producer_identities(
                 preregistration, code_sha256, binary_sha256, root, batch, benchmark
             )
+            scorer.write_text(
+                'FROZEN_GENERATOR_SHA256 = "changed-generated-a"\n'
+                'FROZEN_SOURCE_SET_SHA256 = "changed-generated-b"\n'
+                "def score(): return 1\n"
+            )
+            self.assertEqual(
+                producer_identities(root, batch, benchmark)[0], code_sha256
+            )
+            simulation.write_text("def generate(): return 2\n")
+            self.assertNotEqual(
+                producer_identities(root, batch, benchmark)[0], code_sha256
+            )
+            with self.assertRaisesRegex(SchemaError, "source set"):
+                validate_producer_identities(
+                    preregistration, code_sha256, binary_sha256, root, batch, benchmark
+                )
+            simulation.write_text("def generate(): return 1\n")
             source.write_text("pub fn produce() { panic!() }\n")
             with self.assertRaisesRegex(SchemaError, "source set"):
                 validate_producer_identities(
@@ -1923,6 +1984,109 @@ class SpatialCovarianceValidationV5Tests(unittest.TestCase):
                 self.preregistration, PREREGISTRATION, Path("missing-batch"),
                 CODE, BINARY, 32,
             )
+
+    def test_matched_cohort_generator_admits_frozen_512_before_execution(self):
+        with self.assertRaises(FileNotFoundError):
+            generate_matched_pair_cohorts(
+                self.preregistration, PREREGISTRATION, Path("missing-batch"),
+                CODE, BINARY, 512,
+            )
+
+    def test_matched_seed_zero_effective_looks_matches_exact_candidate_adjoint_union(self):
+        target, reference = _expected_coordinates(
+            self.preregistration, FROZEN_MATCHED_POSITIVE_CELL
+        )
+        labels = dict(zip(DIMENSION_NAMES, FROZEN_MATCHED_POSITIVE_CELL.split("|")))
+        window = self.preregistration["generator"]["coordinates"]["window_stride"][
+            f"{labels['half_window']}|{labels['stride']}"
+        ]
+        native_shape = self.preregistration["generator"]["full_replay_dgp"][
+            "native_tile_shape"
+        ]
+        effective_support = sorted(
+            set(_candidate_support(target, window["half_window"], native_shape))
+            | set(_candidate_support(reference, window["half_window"], native_shape))
+        )
+        self.assertEqual(len(effective_support), 18)
+        expected_fraction = _effective_looks_fraction(effective_support)
+        self.assertAlmostEqual(expected_fraction, 0.21680743563593532, places=15)
+        regenerated = regenerate_frozen_attempt_inputs(
+            self.preregistration, FROZEN_MATCHED_POSITIVE_CELL, 0
+        )
+        self.assertEqual(regenerated["effective_looks_fraction"], expected_fraction)
+        self.assertEqual(regenerated["effective_support_union_count"], 18)
+        expected_receipt = _source_correlation_receipt_sha256(
+            "exponential_euclidean_v1", 1.5, effective_support
+        )
+        self.assertEqual(
+            regenerated["source_correlation_receipt_sha256"], expected_receipt
+        )
+
+        source_root = Path(__file__).parents[2]
+        batch = source_root / "target/debug/examples/spatial_covariance_batch"
+        request = _cell_request_at(
+            self.preregistration,
+            FROZEN_MATCHED_POSITIVE_CELL,
+            expected_cell_ids(self.preregistration).index(FROZEN_MATCHED_POSITIVE_CELL),
+            labels,
+            0,
+        )
+        completed = subprocess.run(
+            [
+                str(batch), "--preregistration", str(PREREGISTRATION),
+                "--cell-id", FROZEN_MATCHED_POSITIVE_CELL,
+                "--ephemeral-evidence-stdout",
+            ],
+            input=compact_json_line(request),
+            check=True,
+            capture_output=True,
+        )
+        attempt = json.loads(completed.stdout)
+        self.assertAlmostEqual(
+            attempt["effective_looks_fraction"], expected_fraction, places=15
+        )
+        self.assertEqual(attempt["effective_support_union_count"], 18)
+        self.assertEqual(
+            attempt["source_correlation_receipt_sha256"], expected_receipt
+        )
+        CellAccumulator(
+            self.preregistration,
+            FROZEN_MATCHED_POSITIVE_CELL,
+            expected_cell_ids(self.preregistration).index(FROZEN_MATCHED_POSITIVE_CELL),
+            1,
+            CODE,
+            BINARY,
+        ).add(attempt)
+
+    def test_near_tie_attempt_binds_exact_dependency_cone_support(self):
+        labels = dict(zip(DIMENSION_NAMES, NEAR_TIE_CELL.split("|")))
+        cell_ordinal = expected_cell_ids(self.preregistration).index(NEAR_TIE_CELL)
+        request = _cell_request_at(
+            self.preregistration, NEAR_TIE_CELL, cell_ordinal, labels, 0
+        )
+        completed = subprocess.run(
+            [
+                str(Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch"),
+                "--preregistration", str(PREREGISTRATION),
+                "--cell-id", NEAR_TIE_CELL,
+                "--ephemeral-evidence-stdout",
+            ],
+            input=compact_json_line(request),
+            check=True,
+            capture_output=True,
+        )
+        attempt = json.loads(completed.stdout)
+        expected = regenerate_frozen_attempt_inputs(
+            self.preregistration, NEAR_TIE_CELL, 0
+        )
+        self.assertEqual(attempt["effective_support_union_count"], 18)
+        self.assertEqual(
+            attempt["source_correlation_receipt_sha256"],
+            expected["source_correlation_receipt_sha256"],
+        )
+        CellAccumulator(
+            self.preregistration, NEAR_TIE_CELL, cell_ordinal, 1, CODE, BINARY
+        ).add(attempt)
 
     def test_cli_exposes_compact_lifecycle(self):
         completed = subprocess.run([sys.executable, str(VALIDATION / "spatial_covariance_simulation.py"), "--help"], check=True, capture_output=True, text=True)
