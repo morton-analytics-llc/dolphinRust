@@ -5,7 +5,8 @@
 //! exact valid observation set and its joint covariance; the returned `H` map
 //! therefore preserves shared-source covariance through the date inversion.
 
-use faer::{Mat, Side};
+use faer::linalg::evd::{compute_hermitian_evd_req, ComputeVectors};
+use faer::{get_global_parallelism, Mat, Side};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::inversion::PixelL2ObservationMap;
@@ -18,6 +19,164 @@ pub const FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER: f64 = 1.0e8;
 /// Maximum production weighted-normal condition accepted for propagation.
 pub const FIXED_L2_MAX_MAP_CONDITION_NUMBER: f64 = 1.0e12;
 const RANK_TOLERANCE: f64 = 1.0e-10;
+
+/// Conservative allocation composition for one fixed-L2 difference propagation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedL2WorkspaceComposition {
+    /// Owned arrays and dynamically queried Faer scratch for the joint phase factorization.
+    pub phase_factorization_bytes: u64,
+    /// Fixed L2 maps and dense covariance propagation temporaries.
+    pub propagation_bytes: u64,
+    /// Owned arrays and dynamically queried Faer scratch for the date factorization.
+    pub date_factorization_bytes: u64,
+    /// Arrays retained in the returned propagation receipt.
+    pub returned_bytes: u64,
+    /// Conservative sum of all listed components.
+    pub total_bytes: u64,
+}
+
+/// Project the additional resident bytes needed after the joint phase covariance
+/// has been admitted by replay.
+///
+/// Faer eigendecomposition scratch is queried from the linked implementation;
+/// it is not a version-specific constant.
+///
+/// # Errors
+/// Returns an error for a zero date count or an overflowing projection.
+pub fn fixed_l2_difference_workspace_composition(
+    n_dates: usize,
+) -> Result<FixedL2WorkspaceComposition, SpatialL2Error> {
+    if n_dates == 0 {
+        return Err(error(
+            SpatialL2Status::InvalidInput,
+            "fixed-L2 workspace requires at least one date",
+        ));
+    }
+    let joint_dates = n_dates.checked_mul(2).ok_or_else(|| {
+        error(
+            SpatialL2Status::InvalidInput,
+            "fixed-L2 workspace dimension overflows usize",
+        )
+    })?;
+    let phase_factorization_bytes = factorization_workspace_bytes(joint_dates)?;
+    let date_factorization_bytes = factorization_workspace_bytes(n_dates)?;
+    let date_square = square_f64_bytes(n_dates)?;
+    let joint_by_date = rectangular_f64_bytes(joint_dates, n_dates)?;
+    let propagation_bytes = date_square
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(joint_by_date.checked_mul(2)?))
+        .ok_or_else(workspace_overflow)?;
+    let returned_bytes = date_square
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(joint_by_date))
+        .ok_or_else(workspace_overflow)?;
+    let total_bytes = phase_factorization_bytes
+        .checked_add(propagation_bytes)
+        .and_then(|bytes| bytes.checked_add(date_factorization_bytes))
+        .and_then(|bytes| bytes.checked_add(returned_bytes))
+        .ok_or_else(workspace_overflow)?;
+    Ok(FixedL2WorkspaceComposition {
+        phase_factorization_bytes,
+        propagation_bytes,
+        date_factorization_bytes,
+        returned_bytes,
+        total_bytes,
+    })
+}
+
+fn factorization_workspace_bytes(dimension: usize) -> Result<u64, SpatialL2Error> {
+    Ok(factorization_workspace_composition(dimension)?.total_bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FactorizationWorkspaceComposition {
+    owned_matrix_bytes: u64,
+    eigenvalue_bytes: u64,
+    copied_values_bytes: u64,
+    retained_spectrum_bytes: u64,
+    faer_scratch_bytes: u64,
+    total_bytes: u64,
+}
+
+fn factorization_workspace_composition(
+    dimension: usize,
+) -> Result<FactorizationWorkspaceComposition, SpatialL2Error> {
+    let ndarray_matrix_bytes = square_f64_bytes(dimension)?;
+    let faer_matrix_bytes = faer_real_matrix_bytes(dimension)?;
+    let owned_matrix_bytes = ndarray_matrix_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(faer_matrix_bytes.checked_mul(2)?))
+        .ok_or_else(workspace_overflow)?;
+    let eigenvalue_bytes = rectangular_f64_bytes(dimension, 1)?;
+    let copied_values_bytes = eigenvalue_bytes;
+    let retained_spectrum_bytes = u64::try_from(dimension)
+        .ok()
+        .and_then(|count| {
+            count.checked_mul(u64::try_from(std::mem::size_of::<(usize, f64)>()).ok()?)
+        })
+        .ok_or_else(workspace_overflow)?;
+    let faer_scratch_bytes = u64::try_from(
+        compute_hermitian_evd_req::<f64>(
+            dimension,
+            ComputeVectors::Yes,
+            get_global_parallelism(),
+            Default::default(),
+        )
+        .map_err(|_| workspace_overflow())?
+        .size_bytes(),
+    )
+    .map_err(|_| workspace_overflow())?;
+    let total_bytes = owned_matrix_bytes
+        .checked_add(eigenvalue_bytes)
+        .and_then(|bytes| bytes.checked_add(copied_values_bytes))
+        .and_then(|bytes| bytes.checked_add(retained_spectrum_bytes))
+        .and_then(|bytes| bytes.checked_add(faer_scratch_bytes))
+        .ok_or_else(workspace_overflow)?;
+    Ok(FactorizationWorkspaceComposition {
+        owned_matrix_bytes,
+        eigenvalue_bytes,
+        copied_values_bytes,
+        retained_spectrum_bytes,
+        faer_scratch_bytes,
+        total_bytes,
+    })
+}
+
+fn faer_real_matrix_bytes(dimension: usize) -> Result<u64, SpatialL2Error> {
+    let mut probe = Mat::<f64>::new();
+    probe.reserve_exact(1, 0);
+    let row_alignment = u64::try_from(probe.row_capacity())
+        .map_err(|_| workspace_overflow())?
+        .max(1);
+    let padded_rows = u64::try_from(dimension)
+        .ok()
+        .and_then(|rows| rows.checked_add(row_alignment - 1))
+        .map(|rows| rows / row_alignment * row_alignment)
+        .ok_or_else(workspace_overflow)?;
+    padded_rows
+        .checked_mul(u64::try_from(dimension).map_err(|_| workspace_overflow())?)
+        .and_then(|elements| elements.checked_mul(u64::try_from(std::mem::size_of::<f64>()).ok()?))
+        .ok_or_else(workspace_overflow)
+}
+
+fn square_f64_bytes(dimension: usize) -> Result<u64, SpatialL2Error> {
+    rectangular_f64_bytes(dimension, dimension)
+}
+
+fn rectangular_f64_bytes(rows: usize, columns: usize) -> Result<u64, SpatialL2Error> {
+    u64::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(u64::try_from(columns).ok()?))
+        .and_then(|elements| elements.checked_mul(u64::try_from(std::mem::size_of::<f64>()).ok()?))
+        .ok_or_else(workspace_overflow)
+}
+
+fn workspace_overflow() -> SpatialL2Error {
+    error(
+        SpatialL2Status::InvalidInput,
+        "fixed-L2 workspace byte projection overflows u64",
+    )
+}
 
 /// Estimator branch requested by a spatial covariance query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -899,6 +1058,54 @@ mod production_l2_propagation_contract {
             fixed_l2_pixel_map(design.view(), target.view(), None, (0, 0), 3).unwrap(),
             fixed_l2_pixel_map(design.view(), reference.view(), None, (0, 0), 3).unwrap(),
         )
+    }
+
+    #[test]
+    fn workspace_receipt_is_dynamic_and_exactly_composed() {
+        let small = fixed_l2_difference_workspace_composition(4).unwrap();
+        assert!(small.phase_factorization_bytes > 0);
+        assert!(small.date_factorization_bytes > 0);
+        assert_eq!(
+            small.total_bytes,
+            small.phase_factorization_bytes
+                + small.propagation_bytes
+                + small.date_factorization_bytes
+                + small.returned_bytes
+        );
+        let large = fixed_l2_difference_workspace_composition(8).unwrap();
+        assert!(large.phase_factorization_bytes > small.phase_factorization_bytes);
+        assert!(large.date_factorization_bytes > small.date_factorization_bytes);
+        assert!(large.total_bytes > small.total_bytes);
+        let factorization = factorization_workspace_composition(8).unwrap();
+        assert_eq!(factorization.eigenvalue_bytes, 8 * 8);
+        assert_eq!(factorization.copied_values_bytes, 8 * 8);
+        assert_eq!(
+            factorization.retained_spectrum_bytes,
+            8 * std::mem::size_of::<(usize, f64)>() as u64
+        );
+        let mut actual = Mat::<f64>::new();
+        actual.reserve_exact(8, 8);
+        let actual_capacity_bytes =
+            actual.row_capacity() * actual.col_capacity() * std::mem::size_of::<f64>();
+        assert_eq!(
+            faer_real_matrix_bytes(8).unwrap(),
+            actual_capacity_bytes as u64
+        );
+        assert!(factorization.faer_scratch_bytes > 0);
+        assert_eq!(
+            factorization.total_bytes,
+            factorization.owned_matrix_bytes
+                + factorization.eigenvalue_bytes
+                + factorization.copied_values_bytes
+                + factorization.retained_spectrum_bytes
+                + factorization.faer_scratch_bytes
+        );
+        assert_eq!(
+            fixed_l2_difference_workspace_composition(0)
+                .unwrap_err()
+                .status,
+            SpatialL2Status::InvalidInput
+        );
     }
 
     #[test]

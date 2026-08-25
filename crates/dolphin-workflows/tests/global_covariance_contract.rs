@@ -25,6 +25,7 @@ use dolphin_phaselink::{
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_workflows::{
     admit_covariance_artifact_disk_with_identity_index, empirical_source_factor_receipt_digest,
+    estimate_global_reference_difference_covariance_from_provider_bundle,
     finalize_covariance_artifact,
     replay_global_reference_difference_covariance_from_provider_bundle, run_sequential,
     run_sequential_masked_with_covariance_capture_and_source_factors,
@@ -3217,6 +3218,27 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         SequentialTileReplayProvider::new(&left, &mut global_left),
         SequentialTileReplayProvider::new(&right, &mut global_right),
     ];
+    let mut estimate_left = provider_for(&left_provider);
+    let mut estimate_right = provider_for(&right_provider);
+    let mut estimate_bundle = [
+        SequentialTileReplayProvider::new(&left, &mut estimate_left),
+        SequentialTileReplayProvider::new(&right, &mut estimate_right),
+    ];
+    let estimate = estimate_global_reference_difference_covariance_from_provider_bundle(
+        &mut estimate_bundle,
+        GlobalReferenceCovarianceQuery {
+            burst_id: "cross-tile-burst",
+            target: (0, 0),
+            reference: (0, 1),
+            ordered_dates: &dates,
+            source_rank: 6,
+            byte_cap: u64::MAX,
+            branch_tolerance,
+        },
+    )
+    .unwrap();
+    assert_eq!(estimate_left.source_reads, 0);
+    assert_eq!(estimate_right.source_reads, 0);
     let global = replay_global_reference_difference_covariance_from_provider_bundle(
         &mut bundle,
         GlobalReferenceCovarianceQuery {
@@ -3230,6 +3252,7 @@ fn cross_tile_joint_replay_matches_dense_shared_source_oracle_and_fails_closed()
         },
     )
     .unwrap();
+    assert_eq!(estimate.total_bytes, global.resource_high_water_bytes);
     assert_eq!(global.joint_phase_covariance, actual);
     assert_eq!(
         global.replay.difference_covariance,
