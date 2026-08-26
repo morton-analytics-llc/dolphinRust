@@ -13,6 +13,7 @@ import struct
 import subprocess
 from dataclasses import dataclass, field
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Mapping, Sequence
 
@@ -42,7 +43,7 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "da1e2043f4698e59418a2613f41c646fd2ace7b1d5fc7a37398a2fb5f165c183"
+FROZEN_GENERATOR_SHA256 = "75271bdfb15d7c1ed480be174d9fc6ddc820039b770fc8138cb5e7d422024537"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "47d76bebd40f9f350c21a9f5d4c1e446ad5a73b976b698e4b866e5cdc46c5601"
 FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
@@ -61,7 +62,7 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "9a4341f64155946400e3d705fbe62fae4e35da39d3fdcb8bedd7f9680316b93b"
+FROZEN_SOURCE_SET_SHA256 = "7823a57b89d44dda58ef4ab4b4e10d2003fdbabc9907a1b22f43f102ee0428fc"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
@@ -1736,13 +1737,20 @@ def _tied_probe_attempt_inputs(
     }
 
 
-def _effective_looks_fraction(support: Sequence[tuple[int, int]]) -> float:
+@lru_cache(maxsize=64)
+def _cached_effective_looks_fraction(
+    support: tuple[tuple[int, int], ...]
+) -> float:
     denominator = sum(
         math.exp(-math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5)
         for first in support
         for second in support
     )
     return len(support) / denominator
+
+
+def _effective_looks_fraction(support: Sequence[tuple[int, int]]) -> float:
+    return _cached_effective_looks_fraction(tuple(support))
 
 
 def _source_correlation_receipt_sha256(

@@ -638,6 +638,22 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertTrue(_effective_looks_roundoff_matches(actual, expected, 14_238))
         self.assertFalse(_effective_looks_roundoff_matches(expected + 2e-11, expected, 14_238))
 
+    def test_effective_looks_reuses_the_exact_support_result(self):
+        from validation.score_spatial_covariance import (
+            _cached_effective_looks_fraction,
+            _effective_looks_fraction,
+        )
+
+        support = ((101, 103), (102, 107), (109, 113))
+        _cached_effective_looks_fraction.cache_clear()
+        with mock.patch.object(math, "exp", wraps=math.exp) as exponential:
+            first = _effective_looks_fraction(support)
+            calls = exponential.call_count
+            second = _effective_looks_fraction(support)
+        self.assertEqual(first, second)
+        self.assertEqual(calls, len(support) ** 2)
+        self.assertEqual(exponential.call_count, calls)
+
     def test_source_correlation_support_count_and_receipt_are_exact(self):
         for field in (
             "effective_support_union_count",
