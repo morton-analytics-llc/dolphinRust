@@ -6135,6 +6135,7 @@ mod tests {
             let analytic_half_width = multiplier * actual_adjusted_variance.sqrt();
             let finite_difference_half_width =
                 multiplier * finite_difference_adjusted_variance.sqrt();
+            let interval_tolerance = 1e-7 * finite_difference_half_width.abs().max(1e-12);
             for (analytic, expected) in [
                 (
                     actual.slope - analytic_half_width,
@@ -6146,7 +6147,7 @@ mod tests {
                 ),
             ] {
                 assert!(
-                    (analytic - expected).abs() <= 1e-7 * expected.abs().max(1e-12),
+                    (analytic - expected).abs() <= interval_tolerance,
                     "p={probability}: analytic={analytic:.17e}, finite_difference={expected:.17e}"
                 );
             }
