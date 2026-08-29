@@ -43,9 +43,9 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "75271bdfb15d7c1ed480be174d9fc6ddc820039b770fc8138cb5e7d422024537"
+FROZEN_GENERATOR_SHA256 = "924764fe0763c67896dc2e29fe132446ec2a5abdc2e858f7988e2b90ddd98259"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "47d76bebd40f9f350c21a9f5d4c1e446ad5a73b976b698e4b866e5cdc46c5601"
-FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
+FROZEN_EXECUTION_SHA256 = "6350ae1568314b2a2039793dc38f9ec98763b24018f808a614d92aaabd5a19b7"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
 FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
 FROZEN_RECEIPT_SHA256 = "8e9a26f5b657679d64742059543b8be12952c336d60f369f8d8a17ea2ee098fd"
@@ -62,11 +62,12 @@ FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddb
 FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
 FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "7823a57b89d44dda58ef4ab4b4e10d2003fdbabc9907a1b22f43f102ee0428fc"
+FROZEN_SOURCE_SET_SHA256 = "f599be192bc1ee7303bade6221ef5f8a63d0369a9ebd79bfcc56664295b22221"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
     "Cargo.toml",
+    "validation/run_spatial_covariance_parallel.py",
     "validation/score_spatial_covariance.py",
     "validation/spatial_covariance_simulation.py",
 )
@@ -836,6 +837,8 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         errors.append("v6 retained evidence does not satisfy the frozen compact bound")
     if execution.get("process_rss_bytes_max") != FROZEN_PROCESS_RSS_BYTES:
         errors.append("execution process cap must equal the frozen 24 GiB resource threshold")
+    if execution.get("attempt_rayon_threads") != 1:
+        errors.append("each cell-parallel Rust attempt process must use one Rayon worker")
     if (
         execution.get("protocol_version") != 6
         or execution.get("run_manifest_schema")
@@ -1059,10 +1062,23 @@ def portable_dgp_key_sha256(
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=8192)
 def _f64_from_bits(bits: str) -> float:
     if not isinstance(bits, str) or len(bits) != 16 or any(value not in "0123456789abcdef" for value in bits):
         raise SchemaError("portable DGP table contains an invalid IEEE-754 bit string")
     return struct.unpack("<d", struct.pack("<Q", int(bits, 16)))[0]
+
+
+_PORTABLE_NORMAL_CACHE: dict[int, tuple[Mapping[str, Any], tuple[float, ...]]] = {}
+
+
+def _portable_normal_entries(preregistration: Mapping[str, Any]) -> tuple[float, ...]:
+    table = _portable_dgp_tables(preregistration)["normal_quantile"]
+    cached = _PORTABLE_NORMAL_CACHE.get(id(table))
+    if cached is None or cached[0] is not table:
+        cached = (table, tuple(_f64_from_bits(bits) for bits in table["entries"]))
+        _PORTABLE_NORMAL_CACHE[id(table)] = cached
+    return cached[1]
 
 
 def portable_normal(
@@ -1075,7 +1091,7 @@ def portable_normal(
     ))
     word = int.from_bytes(digest[:8], "little")
     index = word >> (64 - table["index_bits"])
-    return _f64_from_bits(table["entries"][index])
+    return _portable_normal_entries(preregistration)[index]
 
 
 def numeric_digest(domain: str, values: Iterable[float]) -> str:
@@ -1444,15 +1460,17 @@ def _effective_replay_support(
         )
         for output in sorted(active_outputs[index]):
             candidates = fixed_support(output)
-            block_raw = {
+            block_magnitudes = {
                 coordinate: [
-                    raw_by_source[coordinate][acquisition]
+                    abs(raw_by_source[coordinate][acquisition])
                     for acquisition in block_dates
                 ]
                 for coordinate in candidates
             }
             effective_support.update(
-                _select_support(method, candidates, output_center(output), block_raw)
+                _select_support(
+                    method, candidates, output_center(output), block_magnitudes
+                )
             )
             first_parent = block["block_id"] - block["num_compressed"]
             for parent_id in range(first_parent, block["block_id"]):
@@ -1580,29 +1598,54 @@ def _select_support(
     method: str,
     candidates: Sequence[tuple[int, int]],
     center: Sequence[int],
-    raw_by_source: Mapping[tuple[int, int], Sequence[complex]],
+    magnitudes_by_source: Mapping[tuple[int, int], Sequence[float]],
 ) -> list[tuple[int, int]]:
     center_key = (center[0], center[1])
     if method == "rect":
         return list(candidates)
-    center_magnitudes = [abs(value) for value in raw_by_source[center_key]]
+    center_magnitudes = magnitudes_by_source[center_key]
+    if method == "glrt_frozen":
+        center_mean = sum(center_magnitudes) / len(center_magnitudes)
+        center_variance = (
+            sum((value - center_mean) ** 2 for value in center_magnitudes)
+            / len(center_magnitudes)
+        )
+        center_scale = (center_variance + center_mean * center_mean) / 2.0
+    else:
+        first = sorted(center_magnitudes)
+        sqrt_n = math.sqrt(len(first) / 2.0)
+        cutoff = 0.01
+        while cutoff <= 1.0:
+            value = cutoff * (sqrt_n + 0.12 + 0.11 / sqrt_n)
+            pvalue = min(
+                1.0,
+                max(
+                    0.0,
+                    2.0
+                    * sum(
+                        (-1.0) ** (term - 1)
+                        * math.exp(-2.0 * value * value * term * term)
+                        for term in range(1, 101)
+                    ),
+                ),
+            )
+            if pvalue <= 0.001:
+                break
+            cutoff += 0.001
+        ks_cutoff = cutoff if cutoff <= 1.0 else 0.1
     selected: list[tuple[int, int]] = []
     for coordinate in candidates:
         if coordinate == center_key:
             continue
-        magnitudes = [abs(value) for value in raw_by_source[coordinate]]
+        magnitudes = magnitudes_by_source[coordinate]
         if method == "glrt_frozen":
             mean = sum(magnitudes) / len(magnitudes)
             variance = sum((value - mean) ** 2 for value in magnitudes) / len(magnitudes)
-            center_mean = sum(center_magnitudes) / len(center_magnitudes)
-            center_variance = sum((value - center_mean) ** 2 for value in center_magnitudes) / len(center_magnitudes)
-            center_scale = (center_variance + center_mean * center_mean) / 2.0
             scale = (variance + mean * mean) / 2.0
             pooled = (center_scale + scale) / 2.0
             statistic = len(magnitudes) * (2.0 * math.log(pooled) - math.log(center_scale) - math.log(scale))
             keep = statistic < 10.827566170662733
         else:
-            first = sorted(center_magnitudes)
             second = sorted(magnitudes)
             index_first = index_second = output = 0
             cdf_first = cdf_second = distance = 0.0
@@ -1625,15 +1668,7 @@ def _select_support(
                     output += 1
                 output += 1
                 distance = max(distance, abs(cdf_first - cdf_second))
-            sqrt_n = math.sqrt(len(first) / 2.0)
-            cutoff = 0.01
-            while cutoff <= 1.0:
-                value = cutoff * (sqrt_n + 0.12 + 0.11 / sqrt_n)
-                pvalue = min(1.0, max(0.0, 2.0 * sum((-1.0) ** (term - 1) * math.exp(-2.0 * value * value * term * term) for term in range(1, 101))))
-                if pvalue <= 0.001:
-                    break
-                cutoff += 0.001
-            keep = distance < (cutoff if cutoff <= 1.0 else 0.1)
+            keep = distance < ks_cutoff
         if keep:
             selected.append(coordinate)
     return selected
@@ -1741,11 +1776,13 @@ def _tied_probe_attempt_inputs(
 def _cached_effective_looks_fraction(
     support: tuple[tuple[int, int], ...]
 ) -> float:
-    denominator = sum(
-        math.exp(-math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5)
-        for first in support
-        for second in support
-    )
+    coordinates = np.asarray(support, dtype=np.float64)
+    denominator = 0.0
+    for start in range(0, len(support), 128):
+        difference = coordinates[start : start + 128, None, :] - coordinates[None, :, :]
+        denominator += float(
+            np.exp(-np.hypot(difference[:, :, 0], difference[:, :, 1]) / 1.5).sum()
+        )
     return len(support) / denominator
 
 
@@ -1845,8 +1882,13 @@ def regenerate_frozen_attempt_inputs(
     date_count = topology["acquisition_count"]
     dgp_cell_ordinal = _dgp_cell_ordinal(preregistration, cell_id)
     negative_pair = labels["pair_geometry"].endswith("_negative")
-    pair_has_signed_loading = PAIR_SIGN[labels["pair_geometry"]] in {"positive", "negative"}
-    spatial = labels["source_process"] == "spatial_correlation_stress" or pair_has_signed_loading
+    pair_has_signed_loading = PAIR_SIGN[labels["pair_geometry"]] in {
+        "positive", "negative",
+    }
+    spatial = (
+        labels["source_process"] == "spatial_correlation_stress"
+        or pair_has_signed_loading
+    )
     candidate_loading = {
         coordinate: (
             1.0
@@ -1868,12 +1910,23 @@ def regenerate_frozen_attempt_inputs(
     reference_supports = []
     for block in topology["expected_blocks"]:
         block_dates = range(block["real_start"], block["real_start"] + block["num_real"])
-        block_raw = {
-            coordinate: [phase_raw_by_source[coordinate][acquisition] for acquisition in block_dates]
+        block_magnitudes = {
+            coordinate: [
+                abs(phase_raw_by_source[coordinate][acquisition])
+                for acquisition in block_dates
+            ]
             for coordinate in candidate_union
         }
-        target_supports.append(_select_support(labels["support"], target_candidates, target, block_raw))
-        reference_supports.append(_select_support(labels["support"], reference_candidates, reference, block_raw))
+        target_supports.append(
+            _select_support(
+                labels["support"], target_candidates, target, block_magnitudes
+            )
+        )
+        reference_supports.append(
+            _select_support(
+                labels["support"], reference_candidates, reference, block_magnitudes
+            )
+        )
     target_support = sorted(set().union(*map(set, target_supports)))
     reference_support = sorted(set().union(*map(set, reference_supports)))
     union_support = sorted(set(target_support) | set(reference_support))

@@ -638,21 +638,29 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertTrue(_effective_looks_roundoff_matches(actual, expected, 14_238))
         self.assertFalse(_effective_looks_roundoff_matches(expected + 2e-11, expected, 14_238))
 
-    def test_effective_looks_reuses_the_exact_support_result(self):
+    def test_effective_looks_batches_pairwise_kernel_and_reuses_support_result(self):
         from validation.score_spatial_covariance import (
             _cached_effective_looks_fraction,
             _effective_looks_fraction,
         )
 
         support = ((101, 103), (102, 107), (109, 113))
+        expected = len(support) / sum(
+            math.exp(
+                -math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5
+            )
+            for first in support
+            for second in support
+        )
         _cached_effective_looks_fraction.cache_clear()
-        with mock.patch.object(math, "exp", wraps=math.exp) as exponential:
+        with mock.patch.object(
+            math, "exp", side_effect=AssertionError("scalar pairwise kernel used")
+        ):
             first = _effective_looks_fraction(support)
-            calls = exponential.call_count
             second = _effective_looks_fraction(support)
-        self.assertEqual(first, second)
-        self.assertEqual(calls, len(support) ** 2)
-        self.assertEqual(exponential.call_count, calls)
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(_cached_effective_looks_fraction.cache_info().hits, 1)
 
     def test_source_correlation_support_count_and_receipt_are_exact(self):
         for field in (
@@ -1398,9 +1406,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 check=True,
                 cwd=source_root,
             )
-        code_sha256, binary_sha256 = producer_identities(source_root, batch, benchmark)
         preregistration = copy.deepcopy(self.preregistration)
-        preregistration["generator"]["binary"]["source_identity"]["sha256"] = code_sha256
         spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (1,))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
@@ -1422,6 +1428,10 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 mock.patch(
                     "validation.spatial_covariance_simulation.run_parallel_batch",
                     side_effect=execute,
+                ),
+                mock.patch(
+                    "validation.spatial_covariance_simulation._validated_producer_identities",
+                    return_value=(CODE, BINARY),
                 ),
             ):
                 first = run_outcomes(
@@ -1951,6 +1961,8 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             )
             simulation = root / "validation" / "spatial_covariance_simulation.py"
             simulation.write_text("def generate(): return 1\n")
+            parallel = root / "validation" / "run_spatial_covariance_parallel.py"
+            parallel.write_text("def run(): return 1\n")
             batch = root / "target" / "release" / "examples" / "spatial_covariance_batch"
             benchmark = root / "target" / "release" / "examples" / "spatial_covariance_bench"
             batch.write_bytes(b"batch-v1")

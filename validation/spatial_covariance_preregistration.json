@@ -140,6 +140,7 @@
     "max_encoded_run_manifest_bytes": 16777216,
     "retained_size_bound_bytes": 21307392,
     "process_rss_bytes_max": 25769803776,
+    "attempt_rayon_threads": 1,
     "partial_suffix": ".partial",
     "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
     "resume_rule": "reuse requires Rust spatial_covariance_batch replay from seed zero and exact regenerated attempt digest plus byte-identical independently recomputed summary; without that executable the cell is not reusable",
@@ -679,6 +680,7 @@
         "files": [
           "Cargo.lock",
           "Cargo.toml",
+          "validation/run_spatial_covariance_parallel.py",
           "validation/score_spatial_covariance.py",
           "validation/spatial_covariance_simulation.py"
         ],
@@ -686,7 +688,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "7823a57b89d44dda58ef4ab4b4e10d2003fdbabc9907a1b22f43f102ee0428fc"
+        "sha256": "f599be192bc1ee7303bade6221ef5f8a63d0369a9ebd79bfcc56664295b22221"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",

@@ -23,12 +23,12 @@ use dolphin_io::{
     CovarianceRectSupport, CovarianceReplayStatus, CovarianceSupportOrdering, CovarianceTilePlan,
 };
 use dolphin_phaselink::{
-    compress_pixel_jvp, phase_angle_jvp, phase_angle_jvp_workspace_bytes, process_coherence_matrix,
+    compress_pixel_jvp, phase_angle_jvp_workspace_bytes, process_coherence_matrix,
     rect_source_values_coherence_jvp, replay_rect_source_values, CompressionJvpError,
     CompressionReplayGrid, CompressionReplayStatus, CovarianceReplayError, EstimatorJvpError,
     FixedBranchStatus, FixedEstimatorBranch, InfluenceDag, InfluenceError, NativeSourcePixel,
-    NodeId, PhaseReplayGrid, ProperComplexFactor, RectPixelReplay, RectReplayDescriptor, SourceId,
-    TemporalCoordinate,
+    NodeId, PhaseAngleLinearization, PhaseReplayGrid, ProperComplexFactor, RectPixelReplay,
+    RectReplayDescriptor, SourceId, TemporalCoordinate,
 };
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
@@ -4660,6 +4660,13 @@ impl SequentialReplayTopology {
     {
         let window =
             self.load_phase_window(block, output_index, branch_tolerance, source_rank, provider)?;
+        let linearization = PhaseAngleLinearization::prepare(
+            window.replay.coherence.view(),
+            self.estimator_branch,
+            0,
+            branch_tolerance,
+        )
+        .map_err(estimator_jvp_error)?;
         let selected = child_adjoint.ncols();
         let first_real = block.carried_parent_ids.len();
         for (support_index, &source_pixel) in window.replay.source_pixels.iter().enumerate() {
@@ -4684,14 +4691,9 @@ impl SequentialReplayTopology {
                     branch_tolerance,
                 )
                 .map_err(covariance_replay_error)?;
-                let phase_direction = phase_angle_jvp(
-                    window.replay.coherence.view(),
-                    coherence_direction.view(),
-                    self.estimator_branch,
-                    0,
-                    branch_tolerance,
-                )
-                .map_err(estimator_jvp_error)?;
+                let phase_direction = linearization
+                    .apply(coherence_direction.view())
+                    .map_err(estimator_jvp_error)?;
                 let reduced = Array1::from_iter(phase_direction.iter().skip(1).copied());
                 accumulate_basis(root, basis, reduced.view(), child_adjoint);
             }
@@ -4716,14 +4718,9 @@ impl SequentialReplayTopology {
                         branch_tolerance,
                     )
                     .map_err(covariance_replay_error)?;
-                    let phase_direction = phase_angle_jvp(
-                        window.replay.coherence.view(),
-                        coherence_direction.view(),
-                        self.estimator_branch,
-                        0,
-                        branch_tolerance,
-                    )
-                    .map_err(estimator_jvp_error)?;
+                    let phase_direction = linearization
+                        .apply(coherence_direction.view())
+                        .map_err(estimator_jvp_error)?;
                     let reduced = Array1::from_iter(phase_direction.iter().skip(1).copied());
                     accumulate_basis(parent_root, basis, reduced.view(), child_adjoint);
                 }
