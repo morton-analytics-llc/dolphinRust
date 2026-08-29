@@ -572,12 +572,36 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 "batch_binary": binary_identity,
                 "benchmark_binary": {"sha256": "78" * 32, "bytes": 1234},
             }
+            producer = {
+                "schema": module.RUN_IDENTITY_SCHEMA,
+                "preregistration_sha256": hashlib.sha256(
+                    module.canonical_json_bytes(self.prereg)
+                ).hexdigest(),
+                **self.prereg["file_hashes"],
+                "source_set_schema": module.FROZEN_SOURCE_SET_SCHEMA,
+                "source_set_sha256": self.prereg["producer_identity"][
+                    "source_set_sha256"
+                ],
+                "binary_path": self.prereg["producer_identity"]["binary_path"],
+                "binary_sha256": binary_identity["sha256"],
+                "binary_bytes": binary_identity["bytes"],
+                "batch_schema": self.prereg["schemas"]["batch"],
+                "generator_schema": self.prereg["schemas"]["generator"],
+                "source_correlation_model": module.SOURCE_CORRELATION_MODEL,
+                "source_correlation_distance_scale_pixels": (
+                    module.SOURCE_CORRELATION_DISTANCE_SCALE_PIXELS
+                ),
+                "seed_count": self.prereg["outer_seeds_per_supported_cell"],
+            }
             evidence_directory = pathlib.Path(directory)
-            with mock.patch.object(
-                module,
-                "validate_release_resource_evidence",
-                return_value=resource_evidence,
-            ) as validate_resource:
+            with (
+                mock.patch.object(module, "producer_identity", return_value=producer),
+                mock.patch.object(
+                    module,
+                    "validate_release_resource_evidence",
+                    return_value=resource_evidence,
+                ) as validate_resource,
+            ):
                 receipt = module.run(
                     self.prereg,
                     1,
@@ -1724,17 +1748,35 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         for forbidden in ("freeze_after_performance_dry_run", "computed_before_outcomes", "record_at_run"):
             self.assertNotIn(forbidden, serialized)
 
-    def test_frozen_source_hashes_match_files(self):
+    def test_frozen_source_hashes_remain_immutable_after_estimator_change(self):
         paths = {
             "generator_sha256": ROOT / "validation/temporal_covariance_simulation.py",
             "batch_source_sha256": ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs",
             "estimator_source_sha256": ROOT / "crates/dolphin-timeseries/src/temporal_covariance.rs",
         }
-        for identity, path in paths.items():
+        self.assertEqual(
+            self.prereg["file_hashes"],
+            {
+                "generator_sha256": (
+                    "6684130b2b8f596bef67de70ed39f00b8cb65cb1023beb169307f660834f7d56"
+                ),
+                "batch_source_sha256": (
+                    "448afa0813edf06b1ee435c724ab11de16f64a6fee56fec41b08aaea742ee937"
+                ),
+                "estimator_source_sha256": (
+                    "f6c3713b72f4a5f2067e63153d4c7ebdd790cbd53f15d086442a66fe7adff206"
+                ),
+            },
+        )
+        for identity in ("generator_sha256", "batch_source_sha256"):
             self.assertEqual(
-                hashlib.sha256(path.read_bytes()).hexdigest(),
+                hashlib.sha256(paths[identity].read_bytes()).hexdigest(),
                 self.prereg["file_hashes"][identity],
             )
+        self.assertNotEqual(
+            hashlib.sha256(paths["estimator_source_sha256"].read_bytes()).hexdigest(),
+            self.prereg["file_hashes"]["estimator_source_sha256"],
+        )
 
     def test_canonical_source_closure_detects_pr84_and_temporal_mutations(self):
         module = load_generator()
@@ -1763,22 +1805,38 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                     self.assertNotEqual(module.canonical_source_set_sha256(root), baseline)
                     path.write_bytes(original)
 
-    def test_producer_identity_requires_frozen_release_binary_and_source_set(self):
+    def test_producer_identity_rejects_source_drift_and_noncanonical_binary(self):
         module = load_generator()
         release = ROOT / "target/release/examples/temporal_covariance_batch"
-        identity = module.producer_identity(self.prereg, release)
+        with self.assertRaisesRegex(RuntimeError, "source hashes do not match"):
+            module.producer_identity(self.prereg, release)
+        source_hashes = self.prereg["file_hashes"]
+        with (
+            mock.patch.object(
+                module,
+                "sha256_file",
+                side_effect=[
+                    (source_hashes["generator_sha256"], 0),
+                    (source_hashes["batch_source_sha256"], 0),
+                    (source_hashes["estimator_source_sha256"], 0),
+                    ("ab" * 32, 1234567),
+                ],
+            ),
+            mock.patch.object(
+                module,
+                "canonical_source_set_sha256",
+                return_value=self.prereg["producer_identity"]["source_set_sha256"],
+            ),
+        ):
+            identity = module.producer_identity(self.prereg, release)
         self.assertEqual(
             identity["source_set_sha256"],
             self.prereg["producer_identity"]["source_set_sha256"],
         )
         self.assertNotIn("binary_sha256", self.prereg["producer_identity"])
         self.assertNotIn("binary_bytes", self.prereg["producer_identity"])
-        with mock.patch.object(
-                module, "_runtime_binary_identity", return_value=("ab" * 32, 1234567)):
-            alternate = module.producer_identity(self.prereg, release)
-        self.assertEqual(alternate["binary_sha256"], "ab" * 32)
-        self.assertEqual(alternate["binary_bytes"], 1234567)
-        self.assertEqual(alternate["source_set_sha256"], identity["source_set_sha256"])
+        self.assertEqual(identity["binary_sha256"], "ab" * 32)
+        self.assertEqual(identity["binary_bytes"], 1234567)
         with tempfile.TemporaryDirectory() as directory:
             copied = pathlib.Path(directory) / "temporal_covariance_batch"
             copied.write_bytes(release.read_bytes())
