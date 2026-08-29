@@ -18,6 +18,13 @@ from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).parents[2]
+FROZEN_PREREGISTRATION = ROOT / "validation/temporal_covariance_preregistration.json"
+ENGINE_PREREGISTRATION = (
+    ROOT / "validation/temporal_covariance_synthetic_engine_preregistration.json"
+)
+ENGINE_V4_PREREGISTRATION = (
+    ROOT / "validation/temporal_covariance_synthetic_engine_preregistration_v4.json"
+)
 
 
 def load_generator():
@@ -34,13 +41,16 @@ def run_production_batch(request):
         ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
          "temporal_covariance_batch"],
         cwd=ROOT,
-        input="".join(json.dumps(value) + "\n" for value in requests),
+        input="".join(json.dumps({
+            "schema": "dolphinrust-temporal-covariance-batch/7",
+            "requests": [value],
+        }) + "\n" for value in requests),
         text=True,
         capture_output=True,
         check=True,
     )
-    records = [json.loads(line) for line in result.stdout.splitlines()]
-    return records if isinstance(request, list) else records[0]
+    pairs = [json.loads(line)["records"] for line in result.stdout.splitlines()]
+    return pairs if isinstance(request, list) else pairs[0]
 
 
 def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path:
@@ -48,7 +58,9 @@ def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path
     counter = directory / "fake_temporal_batch.count"
     path.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env python3
+        import hashlib
         import json
+        import os
         import pathlib
         import sys
 
@@ -61,56 +73,63 @@ def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path
             "reml_covariance_parameter_adjusted_scalar",
             "slope_profile_likelihood_ml", "complete_refit_bootstrap",
         ]
-        def comparator(status):
-            return {{
-                "point_estimate": None, "standard_error_diagnostic": None,
-                "interval_68": None, "interval_90": None, "interval_95": None,
-                "width_68": None, "width_90": None, "width_95": None,
-                "status": status, "attempted_replicates": 0,
-                "successful_replicates": 0,
-            }}
-        def failed_fit():
-            status = "InsufficientDates"
-            diagnostic = comparator(status)
-            return {{
-                "status": status, "ols_slope": None, "oracle_gls_slope": None,
-                "plugin_gls_slope": None, "adjusted_profile_slope": None,
-                "bootstrap_slope": None, "bootstrap_interval": None,
-                "fitted_rho": None, "fitted_process_variance": None,
-                "raw_correlation": {{"rho": None, "pair_count": 0,
-                    "minimum_gap_days": None, "median_gap_days": None,
-                    "maximum_gap_days": None}},
-                "valid_date_count": 0, "rank": 0, "degrees_of_freedom": 0,
-                "covariance_condition_number": None,
-                "ols": diagnostic, "oracle_gls": diagnostic,
-                "conditional_wls": diagnostic, "scalar_effective_n": diagnostic,
-                "plugin_gls": diagnostic, "adjusted_scalar": diagnostic,
-                "adjusted_profile": diagnostic,
-                "complete_refit_bootstrap": diagnostic,
-                "bootstrap_attempts": 0, "bootstrap_successes": 0,
-            }}
+        def digest_record(record):
+            payload = [
+                record["schema"], record["execution_path"], record["cell_id"],
+                record["cell_index"], record["outer_seed_index"],
+                record["seed_sha256"], record["seed"], record["factor_sha256"],
+                record["realized_factor_rank"], record["fixed_factor_status"],
+                record["production_path_status"], record["comparator_methods"],
+                record["fit"], record["provenance"], record["production_receipts"],
+            ]
+            encoded = json.dumps(payload, separators=(",", ":"))
+            return hashlib.sha256(encoded.encode()).hexdigest()
         for line in sys.stdin:
-            request = json.loads(line)
-            fixed = request["execution_path"] == "fixed_factor"
+            frame = json.loads(line)
+            records = []
+            for request in frame["requests"]:
+                for execution_path in ("fixed_factor", "production_path"):
+                    record = {{
+                        "schema": {batch_schema!r},
+                        "execution_path": execution_path,
+                        "cell_id": request["cell_id"],
+                        "cell_index": request["cell_index"],
+                        "outer_seed_index": request["outer_seed_index"],
+                        "seed_sha256": request["seed_sha256"],
+                        "seed": request["seed"],
+                        "factor_sha256": None,
+                        "realized_factor_rank": None,
+                        "fixed_factor_status": None,
+                        "production_path_status": (
+                            None if execution_path == "fixed_factor"
+                            else "production_contract_mismatch"
+                        ),
+                        "comparator_methods": methods,
+                        "attempted": True,
+                        "emitted": False,
+                        "failed": True,
+                        "fit": None,
+                        "provenance": None,
+                        "production_receipts": None,
+                        "record_sha256": "",
+                    }}
+                    record["record_sha256"] = digest_record(record)
+                    records.append(record)
+            count = len(frame["requests"])
             response = {{
                 "schema": {batch_schema!r},
-                "execution_path": request["execution_path"],
-                "cell_id": request["cell_id"],
-                "cell_index": request["cell_index"],
-                "outer_seed_index": request["outer_seed_index"],
-                "seed_sha256": request["seed_sha256"],
-                "seed": request["seed"],
-                "fixed_factor_status": "InsufficientDates" if fixed else None,
-                "production_path_status": None if fixed else "raw_complex_invalid",
-                "comparator_methods": methods,
-                "attempted": True,
-                "emitted": False,
-                "failed": True,
-                "fit": failed_fit() if fixed else None,
-                "provenance": None,
-                "production_receipts": None,
+                "records": records,
                 "resource": {{
-                    "wall_micros": 1,
+                    "schema": "dolphinrust-temporal-covariance-batch-frame-resource/1",
+                    "request_count": count,
+                    "record_count": 2 * count,
+                    "factor_generation_count": count,
+                    "temporal_fit_count": count,
+                    "profile_fit_count": 0,
+                    "bootstrap_attempts": 0,
+                    "attempt_record_count": 2 * count,
+                    "rayon_worker_count": int(os.environ["RAYON_NUM_THREADS"]),
+                    "wall_micros": count,
                     "resident_set_bytes_before": 1024,
                     "resident_set_bytes_after": 1024,
                 }},
@@ -124,7 +143,9 @@ def write_fake_batch(directory: pathlib.Path, batch_schema: str) -> pathlib.Path
 class TemporalCovariancePreregistrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with (ROOT / "validation/temporal_covariance_preregistration.json").open() as handle:
+        with FROZEN_PREREGISTRATION.open() as handle:
+            cls.frozen_prereg = json.load(handle)
+        with ENGINE_PREREGISTRATION.open() as handle:
             cls.prereg = json.load(handle)
 
     def test_grid_dimensions_are_frozen(self):
@@ -141,11 +162,334 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
     def test_boundary_is_fail_closed(self):
         self.assertEqual(self.prereg["status"], "pre_outcome_frozen")
         self.assertEqual(
-            self.prereg["promotion_status"],
-            "blocked_pending_synthetic_field_review_and_manifest",
+            self.prereg["engine_validation_status"],
+            "blocked_pending_complete_passing_synthetic_execution",
         )
         self.assertFalse(self.prereg["corrected_inferential_sigma_emission"])
-        self.assertTrue(self.prereg["external_holdout_required"])
+        self.assertFalse(self.prereg["engine_validation"]["external_holdout_required"])
+        self.assertFalse(self.prereg["engine_validation"]["independent_review_required"])
+        self.assertEqual(self.prereg["eo_field_acceptance"]["owner"], "eo")
+
+    def test_successor_moves_field_acceptance_out_of_engine_validation(self):
+        frozen_bytes = FROZEN_PREREGISTRATION.read_bytes()
+        frozen = json.loads(frozen_bytes)
+        successor = json.loads(ENGINE_V4_PREREGISTRATION.read_bytes())
+        frozen_canonical_sha256 = hashlib.sha256(
+            json.dumps(
+                frozen, allow_nan=False, separators=(",", ":"), sort_keys=True
+            ).encode()
+        ).hexdigest()
+
+        self.assertEqual(
+            hashlib.sha256(frozen_bytes).hexdigest(),
+            "8cebbdb4399fab031f1101be3c455fe7723b3a44f649c389777a7a35a0880ec6",
+        )
+        self.assertEqual(
+            successor["schema"],
+            "dolphinrust-temporal-covariance-preregistration/4",
+        )
+        self.assertEqual(
+            successor["supersedes"],
+            {
+                "schema_version": 3,
+                "canonical_preregistration_sha256": frozen_canonical_sha256,
+                "outcomes_present": False,
+                "reason": (
+                    "separate engine-bounded synthetic validation from EO field "
+                    "acceptance without changing the frozen synthetic experiment"
+                ),
+            },
+        )
+        self.assertEqual(successor["schemas"]["generator"],
+                         "dolphinrust-temporal-covariance-simulation/8")
+        self.assertEqual(
+            successor["engine_validation"],
+            {
+                "attempt_count": 50_400,
+                "required_gates": [
+                    "exact_seed_denominator_complete",
+                    "all_methods_pass",
+                    "all_resource_gates_pass",
+                    "producer_identity_match",
+                ],
+                "passing_status": "synthetic_validated_scope_match",
+                "blocked_status": (
+                    "blocked_pending_complete_passing_synthetic_execution"
+                ),
+                "external_holdout_required": False,
+                "independent_review_required": False,
+            },
+        )
+        self.assertEqual(
+            successor["eo_field_acceptance"],
+            {
+                "owner": "eo",
+                "evidence": ["held_out_gnss", "independent_review"],
+                "required_for_engine_validation": False,
+            },
+        )
+        self.assertNotIn("promotion_status", successor)
+        self.assertNotIn("external_holdout_required", successor)
+        self.assertEqual(
+            successor["cell_count_without_outer_seeds"]
+            * len(successor["execution_paths"])
+            * successor["outer_seeds_per_supported_cell"],
+            50_400,
+        )
+        changed_fields = {
+            "schema",
+            "supersedes",
+            "producer_identity",
+            "schemas",
+            "file_hashes",
+            "promotion_status",
+            "external_holdout_required",
+        }
+        for field in set(frozen) - changed_fields:
+            self.assertEqual(successor[field], frozen[field], field)
+        for field in set(frozen["schemas"]) - {"generator"}:
+            self.assertEqual(successor["schemas"][field], frozen["schemas"][field])
+        for field in set(frozen["file_hashes"]) - {"generator_sha256"}:
+            self.assertEqual(
+                successor["file_hashes"][field], frozen["file_hashes"][field]
+            )
+        for field in set(frozen["producer_identity"]) - {"source_set_sha256"}:
+            self.assertEqual(
+                successor["producer_identity"][field],
+                frozen["producer_identity"][field],
+            )
+
+    def test_v5_freezes_the_bounded_selected_method_execution(self):
+        module = load_generator()
+        v4_bytes = ENGINE_V4_PREREGISTRATION.read_bytes()
+        v4 = json.loads(v4_bytes)
+        successor = self.prereg
+        expected_retained_bound = 24 * (
+            module.MAX_SHARD_RECORD_BYTES
+            + module.MAX_MANIFEST_BYTES
+            + module.MAX_COMMIT_BYTES
+        ) + (
+            module.MAX_COMMIT_BYTES
+            + module.MAX_MANIFEST_BYTES
+            + module.MAX_COMMIT_BYTES
+            + module.MAX_FINAL_RECEIPT_BYTES
+        )
+
+        self.assertEqual(
+            successor["schema"],
+            "dolphinrust-temporal-covariance-preregistration/5",
+        )
+        self.assertEqual(
+            hashlib.sha256(v4_bytes).hexdigest(),
+            "07c67eb9e6fb1b88143b6997cc289198a5ae998e2756b5916e905e82bc3e16ad",
+        )
+        self.assertEqual(
+            module.canonical_v4_sha256(),
+            "e98f01c9ad7223ae09ee3cb99df99c20b9752f04d291857c0a1359ac2e37ad99",
+        )
+        self.assertEqual(
+            successor["supersedes"],
+            {
+                "schema_version": 4,
+                "canonical_preregistration_sha256": module.canonical_v4_sha256(),
+                "outcomes_present": False,
+                "reason": (
+                    "bind the pre-outcome method-v2 scalar, corrected actual-C54 "
+                    "conditional DGP, active-set boundary inference, bounded "
+                    "fallback, and cell-shard execution"
+                ),
+            },
+        )
+        self.assertEqual(
+            successor["schemas"],
+            {
+                "generator": "dolphinrust-temporal-covariance-simulation/9",
+                "batch": "dolphinrust-temporal-covariance-batch/7",
+                "fixed_factor": "direct_difference_covariance/1",
+                "production_path": (
+                    "raw_complex_actual_evd_capture_replay_fixed_l2_"
+                    "source_correlation/5"
+                ),
+                "scorer": "coverage_bias_interval_score/6",
+                "provenance": "dolphinrust-temporal-covariance-provenance/2",
+                "run_identity": module.RUN_IDENTITY_SCHEMA,
+                "shard_manifest": module.SHARD_MANIFEST_SCHEMA,
+                "shard_commit": module.SHARD_COMMIT_SCHEMA,
+                "run_manifest": module.RUN_MANIFEST_SCHEMA,
+                "run_commit": module.RUN_COMMIT_SCHEMA,
+            },
+        )
+        self.assertEqual(successor["selected_method"], module.SELECTED_METHOD)
+        self.assertEqual(
+            successor["selected_method_version"], module.SELECTED_METHOD_VERSION
+        )
+        self.assertEqual(
+            successor["promotion_methods"], list(module.FROZEN_PROMOTION_METHODS)
+        )
+        self.assertRegex(
+            successor["pre_outcome_selection_receipt_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertEqual(successor["execution_protocol"]["shard_axis"], ["cell_index"])
+        self.assertEqual(successor["execution_protocol"]["shard_count"], 24)
+        self.assertEqual(successor["execution_protocol"]["frame_request_count"], 32)
+        self.assertEqual(successor["execution_protocol"]["maximum_rayon_workers"], 12)
+        self.assertEqual(successor["execution_protocol"]["seed_requests_per_shard"], 1050)
+        self.assertEqual(successor["execution_protocol"]["attempt_records_per_shard"], 2100)
+        self.assertEqual(successor["engine_validation"]["seed_request_count"], 25_200)
+        self.assertEqual(successor["engine_validation"]["attempt_count"], 50_400)
+        self.assertEqual(
+            successor["generator"],
+            {
+                "latent_process": "stationary_irregular_continuous_time_ar1",
+                "initial_state": "N(0,1)",
+                "innovation_sd": "sqrt(1-rho^(2*gap/12))",
+                "conditional_dgp": "y=Xbeta+F54*z+sqrt(q)*D(F54)*a_rho",
+                "measurement_truth": (
+                    "condition_on_actual_C54_factor_then_draw_F54_z_once"
+                ),
+                "temporal_process_truth": (
+                    "sqrt(q)*sqrt(diag(C54)/geometric_mean_positive_diag(C54))*"
+                    "continuous_time_ar1"
+                ),
+                "outer_coverage_dgp": module.OUTER_COVERAGE_DGP,
+                "conditional_covariance_oracle": (
+                    "fixed_capture_common_factor_monte_carlo_v1"
+                ),
+                "conditional_oracle_rule": (
+                    "hold_capture_source_factors_and_phase_jvp_fixed_then_draw_"
+                    "repeated_standard_normals_in_the_replay_joint_common_factor_"
+                    "coordinates"
+                ),
+                "source_factor_shrinkage_alpha": 0.1,
+                "normal_draw": "box_muller_from_splitmix64",
+                "streams": {
+                    "raw_complex": (
+                        "proper_complex_stream_domain_v1:0xD1B54A32D192ED03"
+                    ),
+                    "missingness": (
+                        "missingness_stream_domain_v1:0xA0761D6478BD642F"
+                    ),
+                    "temporal_process": (
+                        "latent_ar_stream_domain_v1:0xE7037ED1A0B428DB"
+                    ),
+                    "measurement_factor": (
+                        "measurement_normal_stream_domain_v1:0x0C54A53D9E3779B9"
+                    ),
+                    "bootstrap": "global_cell_outer_inner_splitmix64_v1",
+                },
+            },
+        )
+        self.assertEqual(
+            successor["optimizer"]["boundary_policy"],
+            "constrained_active_set_evaluated_and_recorded_v1",
+        )
+        self.assertEqual(
+            successor["optimizer"]["nonconvergence_fallback"],
+            (
+                "coordinate_search_then_nested_rho_outer_log_process_variance_"
+                "inner_adaptive_golden_section_v1"
+            ),
+        )
+        self.assertEqual(successor["optimizer"]["max_iterations"], 12)
+        self.assertEqual(
+            successor["likelihoods"]["adjusted_scalar"],
+            (
+                "active_set_reml_nuisance_hessian_delta_method_with_student_t_"
+                "residual_dof_v2"
+            ),
+        )
+        self.assertIn("domain_v2", successor["cell_seed_rule"])
+        active_boundaries = successor["unsupported_strata"][3:7]
+        self.assertTrue(
+            all(entry["expected_status"] == "Evaluated" for entry in active_boundaries)
+        )
+        self.assertEqual(
+            [entry["expected_fitted_parameter_active_set"] for entry in active_boundaries],
+            [
+                "RhoLowerBoundary",
+                "RhoUpperBoundary",
+                "ProcessVarianceLowerBoundary",
+                "ProcessVarianceUpperBoundary",
+            ],
+        )
+        self.assertEqual(
+            successor["resource_limits"]["retained_bound_bytes"],
+            expected_retained_bound,
+        )
+        self.assertNotIn("projected_full_scene_minutes", successor["resource_limits"])
+        changed_fields = {
+            "schema",
+            "supersedes",
+            "promotion_methods",
+            "cell_seed_rule",
+            "unsupported_strata",
+            "unsupported_cell_sha256",
+            "optimizer",
+            "generator",
+            "likelihoods",
+            "resource_limits",
+            "execution_protocol",
+            "producer_identity",
+            "schemas",
+            "file_hashes",
+            "identities",
+            "engine_validation",
+        }
+        for field in set(v4) - changed_fields:
+            self.assertEqual(successor[field], v4[field], field)
+        self.assertEqual(
+            set(successor) - set(v4),
+            {
+                "selected_method",
+                "selected_method_version",
+                "pre_outcome_selection_receipt_sha256",
+            },
+        )
+
+    def test_engine_receipt_uses_engine_bounded_status(self):
+        module = load_generator()
+        preregistration = json.loads(ENGINE_PREREGISTRATION.read_bytes())
+        expected_attempts = (
+            len(module.cells(preregistration))
+            * preregistration["outer_seeds_per_supported_cell"]
+            * len(preregistration["execution_paths"])
+        )
+        receipt = module._result_receipt(
+            preregistration,
+            preregistration["outer_seeds_per_supported_cell"],
+            expected_attempts,
+            expected_attempts,
+            0,
+            0,
+            0,
+            {"all_methods_pass": True},
+            [],
+            True,
+            {},
+            True,
+        )
+        self.assertTrue(receipt["engine_validation_eligible"])
+        self.assertEqual(
+            receipt["engine_validation_status"],
+            "synthetic_validated_scope_match",
+        )
+        self.assertNotIn("promotion_eligible", receipt)
+        self.assertNotIn("promotion_status", receipt)
+
+    def test_holdout_wrappers_are_labeled_as_eo_field_acceptance(self):
+        runner = (
+            ROOT / "validation/run_temporal_covariance_holdout_cluster.py"
+        ).read_text()
+        scorer = (
+            ROOT / "validation/score_temporal_covariance_holdout.py"
+        ).read_text()
+        self.assertIn("EO field acceptance", runner)
+        self.assertIn("EO field acceptance", scorer)
+        self.assertIn('"schema": "eo.temporal_covariance.field_acceptance_score"',
+                      scorer)
+        self.assertNotIn("held-out run identity differs from the promotion contract", runner)
+        self.assertNotIn("held-out scorer output differs from the promotion schema", scorer)
+        self.assertNotIn("held-out score path is not the frozen promotion path", scorer)
 
     def test_cell_count_and_seed_denominator_are_immutable(self):
         self.assertEqual(self.prereg["cell_count_without_outer_seeds"], 24)
@@ -165,7 +509,8 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(self.prereg["bootstrap"]["count"], 200)
         self.assertEqual(self.prereg["bootstrap"]["minimum_successes"], 198)
         self.assertEqual(self.prereg["outer_seeds_per_supported_cell"], 1050)
-        self.assertEqual(self.prereg["execution_protocol"]["shard_count"], 48)
+        self.assertEqual(self.prereg["execution_protocol"]["shard_count"], 24)
+        self.assertEqual(self.prereg["execution_protocol"]["shard_axis"], ["cell_index"])
         self.assertFalse(self.prereg["execution_protocol"]["top_up_allowed"])
         self.assertFalse(
             self.prereg["execution_protocol"]["dense_attempt_evidence_retained"]
@@ -196,42 +541,74 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         self.assertEqual(module.production_cells(self.prereg, frozen), frozen)
         unsupported = module.unsupported_cells(self.prereg)
         self.assertEqual(len(unsupported), 10)
-        self.assertEqual(module.cell_hash(unsupported), self.prereg["unsupported_cell_sha256"])
+        self.assertEqual(
+            module.cell_hash(unsupported),
+            "aa9d73e4fe7ebc28a445efb7db0e882ce73e42e208b89ea3305c07e5d7741cec",
+        )
+        self.assertEqual(
+            module.cell_hash(unsupported), self.prereg["unsupported_cell_sha256"]
+        )
 
     def test_compact_simulation_driver_is_deterministic_and_nonpromoting(self):
+        module = load_generator()
         with tempfile.TemporaryDirectory() as directory:
-            output = pathlib.Path(directory) / "receipt.json"
-            command = [
-                "python3",
-                str(ROOT / "validation/temporal_covariance_simulation.py"),
-                "--prereg",
-                str(ROOT / "validation/temporal_covariance_preregistration.json"),
-                "--output",
-                str(output),
-                "--seeds",
-                "1",
-                "--limit",
-                "2",
-            ]
-            subprocess.run(command, check=True)
-            receipt = json.loads(output.read_text())
-            self.assertEqual(receipt["attempted_cells"], 48)
-            self.assertEqual(receipt["batch_attempted_cells"], 2)
-            self.assertEqual(receipt["emitted_cells"], 0)
-            self.assertEqual(receipt["failed_cells"], 2)
-            self.assertEqual(receipt["skipped_contract_cells"], 46)
+            subprocess.run(
+                [
+                    "cargo", "build", "--release", "-p", "dolphin-timeseries",
+                    "--example", "temporal_covariance_batch",
+                ],
+                check=True,
+                cwd=ROOT,
+            )
+            binary = ROOT / "target/release/examples/temporal_covariance_batch"
+            binary_identity = {
+                "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "bytes": binary.stat().st_size,
+            }
+            resource_evidence = {
+                "candidate_resource_receipt_sha256": "12" * 32,
+                "method_selection_receipt_sha256": "34" * 32,
+                "resource_receipt_sha256": "56" * 32,
+                "batch_binary": binary_identity,
+                "benchmark_binary": {"sha256": "78" * 32, "bytes": 1234},
+            }
+            evidence_directory = pathlib.Path(directory)
+            with mock.patch.object(
+                module,
+                "validate_release_resource_evidence",
+                return_value=resource_evidence,
+            ) as validate_resource:
+                receipt = module.run(
+                    self.prereg,
+                    1,
+                    1,
+                    binary=binary,
+                    resource_evidence_directory=evidence_directory,
+                )
+            validate_resource.assert_called_once_with(
+                self.prereg, evidence_directory
+            )
+            self.assertEqual(receipt["expected_attempt_record_count"], 48)
+            self.assertEqual(receipt["processed_attempt_record_count"], 2)
+            self.assertEqual(receipt["emitted_attempt_record_count"], 2)
+            self.assertEqual(receipt["failed_attempt_record_count"], 0)
+            self.assertEqual(receipt["skipped_attempt_record_count"], 46)
             self.assertFalse(receipt["corrected_inferential_sigma_emission"])
             self.assertEqual(receipt["pre_outcome_status"], "pre_outcome_frozen")
             fixed, production = receipt["records"]
             self.assertEqual(fixed["execution_path"], "fixed_factor")
-            self.assertNotEqual(fixed["fixed_factor_status"], "Evaluated")
+            self.assertEqual(fixed["fixed_factor_status"], "Evaluated")
             self.assertEqual(production["execution_path"], "production_path")
-            self.assertEqual(production["production_path_status"], "estimator_failed")
+            self.assertEqual(production["production_path_status"], "evaluated")
             self.assertEqual(fixed["fit"]["valid_date_count"], 12)
-            self.assertEqual(production["fit"]["status"], "RhoUpperBoundary")
+            self.assertEqual(production["fit"]["status"], "Evaluated")
+            self.assertEqual(
+                production["fit"]["fitted_parameter_active_set"],
+                "RhoLowerBoundary",
+            )
             self.assertEqual(production["fit"]["valid_date_count"], 12)
             self.assertEqual(len(fixed["comparator_methods"]), 8)
-            self.assertIsNone(production["provenance"])
+            self.assertIsNotNone(production["provenance"])
             self.assertIsNotNone(production["production_receipts"])
             self.assertEqual(
                 receipt["scores"]["schema"], self.prereg["schemas"]["scorer"]
@@ -239,9 +616,9 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             self.assertEqual(receipt["scores"]["methods"]["ols"]["scored"], 2)
             self.assertEqual(len(receipt["scores"]["cell_summaries"]), 48)
             self.assertFalse(receipt["exact_seed_denominator_complete"])
-            self.assertIn("resource", fixed)
+            self.assertNotIn("resource", fixed)
             self.assertFalse(receipt["execution_complete"])
-            self.assertFalse(receipt["promotion_eligible"])
+            self.assertFalse(receipt["engine_validation_eligible"])
             self.assertGreater(receipt["resource"]["peak_resident_set_bytes"], 0)
 
     def test_generator_uses_normal_draws_and_seed_varying_mcar(self):
@@ -265,10 +642,13 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             module.missing_indices(cell, 1, count),
             module.missing_indices(cell, 2, count),
         )
-        request = module.request_for(cell, 1, self.prereg, "fixed_factor")
-        retained = sum(value is not None for value in request["fixed_factor"]["observations"]) - 1
+        request = module.request_for(cell, 1, self.prereg)
+        retained = sum(request["production_path"]["validity"]) - 1
         self.assertEqual(retained, cell["date_count"])
-        production = module.request_for(cell, 1, self.prereg, "production_path")["production_path"]
+        production = module.request_for(cell, 1, self.prereg)["production_path"]
+        self.assertNotIn("execution_path", request)
+        self.assertNotIn("fixed_factor", request)
+        self.assertNotIn("difference_covariance", json.dumps(request))
         self.assertNotIn("issue52_target_factor", production)
         self.assertNotIn("issue54_difference_factor", production)
         self.assertNotIn("issue52_seed", production)
@@ -282,6 +662,29 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             production["conditional_covariance_oracle"],
             module.CONDITIONAL_COVARIANCE_ORACLE,
         )
+
+    def test_frame_contract_is_same_cell_consecutive_and_bounded(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        requests = [module.request_for(cell, seed, self.prereg) for seed in range(32)]
+        frame = module.request_frame(requests, "dolphinrust-temporal-covariance-batch/7")
+        self.assertEqual(len(frame["requests"]), 32)
+        self.assertLessEqual(
+            len(module.canonical_json_bytes(frame)) + 1,
+            module.MAX_REQUEST_LINE_BYTES,
+        )
+        with self.assertRaisesRegex(RuntimeError, "request count"):
+            module.request_frame([], frame["schema"])
+        with self.assertRaisesRegex(RuntimeError, "request count"):
+            module.request_frame(requests + [requests[-1]], frame["schema"])
+        nonconsecutive = json.loads(json.dumps(requests[:2]))
+        nonconsecutive[1]["outer_seed_index"] = 3
+        with self.assertRaisesRegex(RuntimeError, "same-cell consecutive"):
+            module.request_frame(nonconsecutive, frame["schema"])
+        cross_cell = json.loads(json.dumps(requests[:2]))
+        cross_cell[1]["cell_id"] = "different-cell"
+        with self.assertRaisesRegex(RuntimeError, "same-cell consecutive"):
+            module.request_frame(cross_cell, frame["schema"])
 
     def test_production_batch_uses_actual_capture_replay_and_fixed_l2(self):
         source = (ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs").read_text()
@@ -378,23 +781,36 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         expected = 2.0 * math.sqrt(1.0 - noise_fraction) * carrier
         self.assertLessEqual(abs(covariance - expected), 12.0 / math.sqrt(seed_count))
 
-    def test_production_request_uses_raw_proper_complex_temporal_covariance(self):
+    def test_production_request_separates_raw_measurement_from_latent_temporal_signal(self):
         module = load_generator()
         cell = module.cells(self.prereg)[0]
         outer_seed = 17
-        request = module.request_for(cell, outer_seed, self.prereg, "production_path")
+        request = module.request_for(cell, outer_seed, self.prereg)
         production = request["production_path"]
         seed = request["seed"]
         days = request["days"]
-        state, ar_path = module.stationary_ar_path(days, cell["rho_at_12_days"], seed)
+        state, ar_path = module.stationary_ar_path(
+            days,
+            cell["rho_at_12_days"],
+            module.splitmix64(seed ^ module.LATENT_AR_STREAM_DOMAIN),
+        )
         del state
+        self.assertEqual(production["latent_ar_path"], [0.0] + ar_path[1:])
+        self.assertEqual(
+            production["measurement_normal_path"],
+            module.standard_normal_path(
+                len(days), module.splitmix64(seed ^ 0xC54A53D9E3779B9)
+            ),
+        )
+        self.assertEqual(production["truth_slope_per_day"], 0.01)
+        self.assertEqual(
+            production["outer_coverage_dgp"],
+            "actual_c54_gaussian_measurement_post_link_ar_v1",
+        )
         diagonal = []
         for index in range(len(days)):
             variance_scale = 1.0 if index < len(days) // 2 else cell["variance_ratio"]
             diagonal.append(0.01 * (variance_scale + cell["reference_contribution_ratio"]))
-        geometric_mean = math.exp(
-            sum(math.log(value) for value in diagonal[1:]) / (len(diagonal) - 1)
-        )
         reference_column = production["reference_pixel"][1]
         correlation = module.production_support_correlation(1, reference_column, 7)
         common_speckle = [
@@ -402,10 +818,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             for column in range(7)
         ]
         for date_index, (day, row) in enumerate(zip(days, production["raw_complex_stack"])):
-            shape = math.sqrt(diagonal[date_index] / geometric_mean)
-            carrier_value = 0.0 if date_index == 0 else (
-                0.01 * day + math.sqrt(0.04) * shape * ar_path[date_index]
-            )
+            carrier_value = 0.0 if date_index == 0 else 0.01 * day
             noise_fraction = module.production_temporal_noise_fraction(
                 0.0 if date_index == 0 else diagonal[date_index], correlation
             )
@@ -427,6 +840,112 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 self.assertAlmostEqual(truth[0], carrier.real, places=12)
                 self.assertAlmostEqual(truth[1], carrier.imag, places=12)
 
+    def test_request_domain_separates_missingness_process_and_measurement_draws(self):
+        module = load_generator()
+        cell = next(
+            cell
+            for cell in module.cells(self.prereg)
+            if cell["missingness"] == "mcar_25_percent"
+        )
+        request = module.request_for(cell, 17, self.prereg)
+        seed = request["seed"]
+        days = request["days"]
+        missing_seed = module.splitmix64(seed ^ 0xA0761D6478BD642F)
+        latent_seed = module.splitmix64(seed ^ 0xE7037ED1A0B428DB)
+        expected_missing = module.missing_indices(cell, missing_seed, len(days) - 1)
+        self.assertEqual(
+            [
+                index
+                for index, valid in enumerate(request["production_path"]["validity"])
+                if not valid
+            ],
+            sorted(expected_missing),
+        )
+        _, ar_path = module.stationary_ar_path(
+            days, cell["rho_at_12_days"], latent_seed
+        )
+        self.assertEqual(
+            request["production_path"]["latent_ar_path"], [0.0] + ar_path[1:]
+        )
+        self.assertEqual(
+            request["production_path"]["measurement_normal_path"],
+            module.standard_normal_path(
+                len(days), module.splitmix64(seed ^ 0x0C54A53D9E3779B9)
+            ),
+        )
+
+    def test_post_link_dgp_uses_actual_retained_c54_and_keeps_raw_receipts_independent(self):
+        module = load_generator()
+        request = module.request_for(module.cells(self.prereg)[0], 0, self.prereg, True)
+        request["options"]["bootstrap_replicates"] = 0
+        request["options"]["bootstrap_minimum_successes"] = 0
+        mutated = json.loads(json.dumps(request))
+        mutated["production_path"]["latent_ar_path"][1] += 0.125
+        mutated["production_path"]["capture_scope_sha256"] = (
+            module.capture_scope_sha256(mutated)
+        )
+        pairs = run_production_batch([request, mutated])
+
+        def assert_identity(candidate, pair):
+            fixed, production = pair
+            self.assertEqual(fixed["fit"], production["fit"])
+            receipts = production["production_receipts"]
+            factor = receipts["fixed_l2_difference_factor"]
+            diagonal = [sum(value * value for value in row) for row in factor]
+            validity = candidate["production_path"]["validity"]
+            retained = [
+                index for index in range(1, len(diagonal)) if validity[index]
+            ]
+            scale = math.exp(
+                sum(math.log(diagonal[index]) for index in retained) / len(retained)
+            )
+            carrier = receipts["carrier_difference_history"]
+            linked = receipts["linked_difference_history"]
+            for index in range(len(diagonal)):
+                expected = 0.0 if index == 0 else (
+                    candidate["production_path"]["truth_slope_per_day"]
+                    * candidate["days"][index]
+                    + math.sqrt(candidate["options"]["oracle_process_variance"])
+                    * math.sqrt(diagonal[index] / scale)
+                    * candidate["production_path"]["latent_ar_path"][index]
+                )
+                self.assertAlmostEqual(carrier[index], expected, places=12)
+                measurement_error = 0.0 if index == 0 else sum(
+                    factor[index][component]
+                    * candidate["production_path"]["measurement_normal_path"][component]
+                    for component in range(receipts["fixed_l2_realized_rank"])
+                )
+                self.assertAlmostEqual(
+                    linked[index] - carrier[index], measurement_error,
+                    places=12,
+                )
+            return fixed, production, receipts
+
+        base_fixed, base_production, base_receipts = assert_identity(request, pairs[0])
+        changed_fixed, changed_production, changed_receipts = assert_identity(mutated, pairs[1])
+        self.assertEqual(base_fixed["factor_sha256"], changed_fixed["factor_sha256"])
+        self.assertEqual(
+            base_receipts["source_manifest_sha256"],
+            changed_receipts["source_manifest_sha256"],
+        )
+        self.assertEqual(
+            base_receipts["issue54_receipt_sha256"],
+            changed_receipts["issue54_receipt_sha256"],
+        )
+        self.assertEqual(
+            base_receipts["source_linked_difference_history"],
+            changed_receipts["source_linked_difference_history"],
+        )
+        self.assertNotEqual(
+            base_receipts["temporal_dgp_receipt_sha256"],
+            changed_receipts["temporal_dgp_receipt_sha256"],
+        )
+        self.assertNotEqual(base_fixed["fit"], changed_fixed["fit"])
+        self.assertNotEqual(
+            base_production["production_receipts"]["linked_difference_history"],
+            changed_production["production_receipts"]["linked_difference_history"],
+        )
+
     def test_raw_outer_dgp_is_not_the_common_factor_conditional_oracle(self):
         module = load_generator()
         base_cell = module.cells(self.prereg)[0]
@@ -437,7 +956,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             overlap_fraction=0.5,
             distance_pixels=1,
         )
-        fixed = module.request_for(cell, 0, self.prereg, "production_path")
+        fixed = module.request_for(cell, 0, self.prereg)
         fixed_stack = fixed["production_path"]["raw_complex_stack"]
         dates = len(fixed_stack)
 
@@ -490,7 +1009,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                     for row in range(dates)]
 
         ensemble = [
-            module.request_for(cell, seed, self.prereg, "production_path")
+            module.request_for(cell, seed, self.prereg)
             ["production_path"]["raw_complex_stack"]
             for seed in range(512)
         ]
@@ -533,16 +1052,20 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 overlap_fraction=jaccard,
                 distance_pixels=distance,
             )
-            request = module.request_for(cell, 0, self.prereg, "production_path")
+            request = module.request_for(cell, 0, self.prereg)
             request["retain_dense_evidence"] = True
             request["conditional_oracle_replicates"] = replicates
             request["options"]["bootstrap_replicates"] = 0
             request["options"]["bootstrap_minimum_successes"] = 0
             requests.append(request)
-        for request, record in zip(requests, run_production_batch(requests)):
+        for request, pair in zip(requests, run_production_batch(requests)):
+            fixed, record = pair
+            self.assertEqual(fixed["fit"], record["fit"])
+            self.assertEqual(fixed["factor_sha256"], record["factor_sha256"])
             receipts = record["production_receipts"]
             self.assertEqual(
-                receipts["outer_coverage_dgp"], "physical_raw_space_v1"
+                receipts["outer_coverage_dgp"],
+                "actual_c54_gaussian_measurement_post_link_ar_v1",
             )
             self.assertEqual(
                 receipts["conditional_covariance_oracle"],
@@ -591,18 +1114,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         cell = module.cells(self.prereg)[0]
-        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request = module.request_for(cell, 99, self.prereg)
         request["production_path"]["source_seed"] = 100
-        result = subprocess.run(
-            ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
-             "temporal_covariance_batch"],
-            cwd=ROOT,
-            input=json.dumps(request) + "\n",
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        record = json.loads(result.stdout)
+        fixed, record = run_production_batch(request)
+        self.assertIsNone(fixed["fit"])
         self.assertEqual(record["production_path_status"], "source_seed_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
@@ -613,18 +1128,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         cell = module.cells(self.prereg)[0]
-        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request = module.request_for(cell, 99, self.prereg)
         request["production_path"]["reference"]["distance_pixels"] += 1.0
-        result = subprocess.run(
-            ["cargo", "run", "--release", "-p", "dolphin-timeseries", "--example",
-             "temporal_covariance_batch"],
-            cwd=ROOT,
-            input=json.dumps(request) + "\n",
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        record = json.loads(result.stdout)
+        fixed, record = run_production_batch(request)
+        self.assertIsNone(fixed["fit"])
         self.assertEqual(record["production_path_status"], "capture_scope_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
@@ -642,16 +1149,16 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         ]
         for field, value in mutations:
             with self.subTest(field=field):
-                request = module.request_for(cell, 99, self.prereg, "production_path")
+                request = module.request_for(cell, 99, self.prereg)
                 request["production_path"][field] = value
-                record = run_production_batch(request)
+                record = run_production_batch(request)[1]
                 self.assertEqual(record["production_path_status"],
                                  "production_contract_mismatch")
                 self.assertFalse(record["emitted"])
                 self.assertIsNone(record["fit"])
-        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request = module.request_for(cell, 99, self.prereg)
         request["conditional_oracle_replicates"] = 16_385
-        record = run_production_batch(request)
+        record = run_production_batch(request)[1]
         self.assertEqual(record["production_path_status"], "production_contract_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
@@ -659,10 +1166,10 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
     def test_production_path_rejects_self_consistent_claimed_geometry(self):
         module = load_generator()
         cell = module.cells(self.prereg)[0]
-        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request = module.request_for(cell, 99, self.prereg)
         request["production_path"]["reference"]["overlap_fraction"] = 0.25
         request["production_path"]["capture_scope_sha256"] = module.capture_scope_sha256(request)
-        record = run_production_batch(request)
+        record = run_production_batch(request)[1]
         self.assertEqual(record["production_path_status"], "reference_context_mismatch")
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["fit"])
@@ -670,12 +1177,17 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
     def test_production_path_captures_replays_and_binds_actual_receipts(self):
         module = load_generator()
         cell = module.cells(self.prereg)[0]
-        request = module.request_for(cell, 99, self.prereg, "production_path")
+        request = module.request_for(cell, 99, self.prereg)
         request["options"]["bootstrap_replicates"] = 0
         request["options"]["bootstrap_minimum_successes"] = 0
-        record = run_production_batch(request)
+        fixed, record = run_production_batch(request)
+        self.assertEqual(fixed["fit"], record["fit"])
+        self.assertEqual(fixed["factor_sha256"], record["factor_sha256"])
         self.assertEqual(record["production_path_status"], "estimator_failed")
-        self.assertEqual(record["fit"]["status"], "RhoUpperBoundary")
+        self.assertEqual(record["fit"]["status"], "DiagnosticNotComputed")
+        self.assertEqual(
+            record["fit"]["fitted_parameter_active_set"], "RhoUpperBoundary"
+        )
         self.assertFalse(record["emitted"])
         self.assertIsNone(record["provenance"])
         receipts = record["production_receipts"]
@@ -699,7 +1211,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
 
         drifted = json.loads(json.dumps(request))
         drifted["production_path"]["raw_complex_stack"][0][0][0] *= 1.0001
-        drifted_record = run_production_batch(drifted)
+        drifted_record = run_production_batch(drifted)[1]
         drifted_receipts = drifted_record["production_receipts"]
         self.assertIsNotNone(drifted_receipts)
         for identity in (
@@ -722,7 +1234,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
         scorer = module.StreamingScores(self.prereg)
         stale = {
             "cell_id": request["cell_id"],
-            "execution_path": request["execution_path"],
+            "execution_path": "fixed_factor",
             "outer_seed_index": 1,
             "seed": request["seed"],
             "seed_sha256": request["seed_sha256"],
@@ -749,25 +1261,26 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 "seed_count": 2,
             }
             shards = module.initialize_run_root(root / "run", identity)
-            paths = module._shard_paths(shards, cell, "fixed_factor")
+            paths = module._shard_paths(shards, cell)
             partial = paths["records"].with_name(paths["records"].name + ".partial")
             partial.write_bytes(b"owned interrupted bytes")
             manifest, reused = module.execute_or_resume_shard(
-                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+                self.prereg, cell, 2, shards, binary, identity
             )
             self.assertFalse(reused)
-            self.assertEqual(manifest["attempted"], 2)
+            self.assertEqual(manifest["seed_request_count"], 2)
+            self.assertEqual(manifest["attempted"], 4)
             self.assertFalse(partial.exists())
             committed = paths["records"].read_bytes().splitlines()
-            self.assertEqual(len(committed), 2)
+            self.assertEqual(len(committed), 4)
             self.assertTrue(all(b"fixed_l2_difference_covariance" not in line
                                 for line in committed))
             resumed, reused = module.execute_or_resume_shard(
-                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+                self.prereg, cell, 2, shards, binary, identity
             )
             self.assertTrue(reused)
             self.assertEqual(resumed, manifest)
-            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "2")
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "1")
 
     def test_resumable_shard_rejects_tamper_missing_duplicate_and_reorder(self):
         module = load_generator()
@@ -784,11 +1297,9 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             }
             shards = module.initialize_run_root(directory / "run", identity)
             module.execute_or_resume_shard(
-                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+                self.prereg, cell, 2, shards, binary, identity
             )
-            return binary, identity, shards, module._shard_paths(
-                shards, cell, "fixed_factor"
-            )
+            return binary, identity, shards, module._shard_paths(shards, cell)
 
         def rebind(paths, lines):
             payload = b"".join(line.rstrip(b"\n") + b"\n" for line in lines)
@@ -820,12 +1331,12 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                 paths["records"].write_bytes(paths["records"].read_bytes() + b" ")
                 with self.assertRaisesRegex(RuntimeError, "hash is stale or tampered"):
                     module.execute_or_resume_shard(
-                        self.prereg, cell, "fixed_factor", 2,
+                        self.prereg, cell, 2,
                         shards, binary, identity,
                     )
         for label, mutate, pattern in (
-            ("missing", lambda lines: lines[:1], "missing, duplicated, or reordered"),
-            ("duplicate", lambda lines: [lines[0], lines[0]], "attempt identity"),
+            ("missing", lambda lines: lines[:-1], "missing, duplicated, or reordered"),
+            ("duplicate", lambda lines: [lines[0], lines[0], *lines[2:]], "record pair"),
             ("reorder", lambda lines: list(reversed(lines)), "attempt identity"),
         ):
             with self.subTest(label):
@@ -835,15 +1346,50 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
                     rebind(paths, mutate(lines))
                     with self.assertRaisesRegex(RuntimeError, pattern):
                         module.execute_or_resume_shard(
-                            self.prereg, cell, "fixed_factor", 2,
+                            self.prereg, cell, 2,
                             shards, binary, identity,
                         )
+
+    def test_compact_record_digest_rejects_stale_allowed_semantic_tamper(self):
+        module = load_generator()
+        cell = module.cells(self.prereg)[0]
+        request = module.request_for(cell, 0, self.prereg)
+        record = {
+            "schema": self.prereg["schemas"]["batch"],
+            "execution_path": "production_path",
+            "cell_id": request["cell_id"],
+            "cell_index": request["cell_index"],
+            "outer_seed_index": request["outer_seed_index"],
+            "seed_sha256": request["seed_sha256"],
+            "seed": request["seed"],
+            "factor_sha256": None,
+            "realized_factor_rank": None,
+            "fixed_factor_status": None,
+            "production_path_status": "production_inputs_missing",
+            "comparator_methods": module.COMPARATOR_METHOD_IDENTITIES,
+            "attempted": True,
+            "emitted": False,
+            "failed": True,
+            "fit": None,
+            "provenance": None,
+            "production_receipts": None,
+            "record_sha256": None,
+        }
+        record["record_sha256"] = module.compact_record_sha256(record)
+        module._validate_compact_record(
+            record, request, self.prereg["schemas"]["batch"]
+        )
+        record["production_path_status"] = "source_seed_mismatch"
+        with self.assertRaisesRegex(RuntimeError, "record digest"):
+            module._validate_compact_record(
+                record, request, self.prereg["schemas"]["batch"]
+            )
 
     def test_rehashed_semantic_response_tamper_fails_closed(self):
         module = load_generator()
         cell = module.cells(self.prereg)[0]
 
-        def committed(directory, execution_path, binary):
+        def committed(directory, binary):
             identity = {
                 "schema": module.RUN_IDENTITY_SCHEMA,
                 "batch_schema": self.prereg["schemas"]["batch"],
@@ -853,13 +1399,17 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             }
             shards = module.initialize_run_root(directory / "run", identity)
             module.execute_or_resume_shard(
-                self.prereg, cell, execution_path, 1, shards, binary, identity
+                self.prereg, cell, 1, shards, binary, identity
             )
-            return identity, shards, module._shard_paths(shards, cell, execution_path)
+            return identity, shards, module._shard_paths(shards, cell)
 
-        def rebind(paths, record):
-            payload = module.canonical_json_bytes(record) + b"\n"
-            semantic = hashlib.sha256(module._response_semantic_bytes(record)).hexdigest()
+        def rebind(paths, records):
+            payload = b"".join(module.record_wire_bytes(record) + b"\n"
+                               for record in records)
+            semantic_digest = hashlib.sha256()
+            for record in records:
+                semantic_digest.update(module._response_semantic_bytes(record))
+            semantic = semantic_digest.hexdigest()
             paths["records"].write_bytes(payload)
             manifest = json.loads(paths["manifest"].read_bytes())
             manifest["records_sha256"] = hashlib.sha256(payload).hexdigest()
@@ -874,51 +1424,68 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             paths["commit"].write_bytes(module.canonical_json_bytes(commit) + b"\n")
 
         cases = {
-            "fabricated evaluated fit": ("fixed_factor", lambda record: (
-                record.update({"fixed_factor_status": "Evaluated", "emitted": True,
-                               "failed": False}),
-                record["fit"].update({"status": "Evaluated"}),
-            ), "batch returned"),
+            "fabricated failed disposition": ("fixed_factor", lambda record:
+                record.update({"emitted": False, "failed": True}), True, "emission"),
             "nonfinite comparator": ("fixed_factor", lambda record:
-                record["fit"]["ols"].update({"point_estimate": "nan"}), "batch returned"),
+                record["fit"]["ols"].update({"point_estimate": "nan"}), True,
+                "comparator"),
             "omitted production receipts": ("production_path", lambda record:
-                record.update({"production_receipts": None}), "batch returned"),
+                record.update({"production_receipts": None}), True, "production state"),
             "invalid production provenance": ("production_path", lambda record:
-                record.update({"provenance": {"schema": "forged"}}), "batch returned"),
+                record.update({"provenance": {"schema": "forged"}}), True,
+                "provenance"),
             "unknown production status": ("production_path", lambda record:
                 record.update({"production_path_status": "fabricated_fail_closed"}),
-                "batch returned"),
+                True, "unknown production status"),
             "capture receipt mismatch": ("production_path", lambda record:
                 record["production_receipts"].update({"capture_scope_sha256": "ff" * 32}),
-                "batch returned"),
-            "finite coupled slope forgery": ("fixed_factor", lambda record: (
+                True, "source-correlation provenance"),
+            "finite coupled slope forgery": ("both", lambda record: (
                 record["fit"].update({
                     "ols_slope": record["fit"]["ols_slope"] + 1000.0,
                 }),
                 record["fit"]["ols"].update({
                     "point_estimate": record["fit"]["ols"]["point_estimate"] + 1000.0,
                 }),
-            ), "response semantics inconsistent"),
-            "finite coupled interval forgery": ("fixed_factor", lambda record: (
+            ), False, "record digest"),
+            "finite coupled interval forgery": ("both", lambda record: (
                 record["fit"]["ols"]["interval_95"].update({
                     "upper": record["fit"]["ols"]["interval_95"]["upper"] + 1000.0,
                 }),
                 record["fit"]["ols"].update({
                     "width_95": record["fit"]["ols"]["width_95"] + 1000.0,
                 }),
-            ), "response semantics inconsistent"),
+            ), False, "record digest"),
+            "paired selected interval forgery": ("both", lambda record: (
+                record["fit"]["adjusted_scalar"]["interval_95"].update({
+                    "lower": record["fit"]["adjusted_scalar"]["interval_95"]["lower"]
+                    - 1.0,
+                }),
+                record["fit"]["adjusted_scalar"].update({
+                    "width_95": record["fit"]["adjusted_scalar"]["width_95"] + 1.0,
+                }),
+            ), False, "record digest"),
         }
-        for label, (execution_path, mutate, pattern) in cases.items():
+        for label, (execution_path, mutate, rehash_record, pattern) in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 binary = ROOT / "target/release/examples/temporal_covariance_batch"
-                identity, shards, paths = committed(root, execution_path, binary)
-                record = json.loads(paths["records"].read_bytes())
-                mutate(record)
-                rebind(paths, record)
+                identity, shards, paths = committed(root, binary)
+                records = [json.loads(line)
+                           for line in paths["records"].read_bytes().splitlines()]
+                if execution_path == "both":
+                    for record in records:
+                        mutate(record)
+                else:
+                    record = records[0 if execution_path == "fixed_factor" else 1]
+                    mutate(record)
+                if rehash_record:
+                    for record in records:
+                        record["record_sha256"] = module.compact_record_sha256(record)
+                rebind(paths, records)
                 with self.assertRaisesRegex(RuntimeError, pattern):
                     module.execute_or_resume_shard(
-                        self.prereg, cell, execution_path, 1,
+                        self.prereg, cell, 1,
                         shards, binary, identity,
                     )
 
@@ -938,7 +1505,7 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             run_root = root / "run"
             shards = module.initialize_run_root(run_root, identity)
             module.execute_or_resume_shard(
-                self.prereg, cell, "fixed_factor", 2, shards, binary, identity
+                self.prereg, cell, 2, shards, binary, identity
             )
             stale = dict(identity, binary_sha256="ff" * 32)
             with self.assertRaisesRegex(RuntimeError, "identity is stale"):
@@ -947,75 +1514,171 @@ class TemporalCovariancePreregistrationTests(unittest.TestCase):
             binary.write_bytes(original_binary + b"\n# changed after commit\n")
             with self.assertRaisesRegex(RuntimeError, "batch binary identity is stale"):
                 module.execute_or_resume_shard(
-                    self.prereg, cell, "fixed_factor", 2,
+                    self.prereg, cell, 2,
                     shards, binary, identity,
                 )
             binary.write_bytes(original_binary)
-            paths = module._shard_paths(shards, cell, "fixed_factor")
+            paths = module._shard_paths(shards, cell)
             paths["manifest"].unlink()
             with self.assertRaisesRegex(RuntimeError, "partial or missing"):
                 module.execute_or_resume_shard(
-                    self.prereg, cell, "fixed_factor", 2,
+                    self.prereg, cell, 2,
                     shards, binary, identity,
                 )
 
-    def test_full_48_shard_run_is_bounded_atomic_and_exactly_resumable(self):
+    def test_full_24_shard_run_is_bounded_atomic_and_exactly_resumable(self):
         module = load_generator()
         preregistration = json.loads(json.dumps(self.prereg))
         preregistration["outer_seeds_per_supported_cell"] = 1
-        preregistration["file_hashes"] = {
-            "generator_sha256": hashlib.sha256(
-                (ROOT / "validation/temporal_covariance_simulation.py").read_bytes()
-            ).hexdigest(),
-            "batch_source_sha256": hashlib.sha256(
-                (ROOT / "crates/dolphin-timeseries/examples/temporal_covariance_batch.rs")
-                .read_bytes()
-            ).hexdigest(),
-            "estimator_source_sha256": hashlib.sha256(
-                (ROOT / "crates/dolphin-timeseries/src/temporal_covariance.rs").read_bytes()
-            ).hexdigest(),
-        }
+        preregistration["execution_protocol"].update({
+            "seed_requests_per_shard": 1,
+            "attempt_records_per_shard": 2,
+        })
+        preregistration["engine_validation"]["attempt_count"] = 48
+        preregistration["engine_validation"]["seed_request_count"] = 24
+        preregistration["resource_limits"]["retained_bound_bytes"] = (
+            24 * (
+                module.MAX_SHARD_RECORD_BYTES
+                + module.MAX_MANIFEST_BYTES
+                + module.MAX_COMMIT_BYTES
+            )
+            + module.MAX_COMMIT_BYTES
+            + module.MAX_MANIFEST_BYTES
+            + module.MAX_COMMIT_BYTES
+            + module.MAX_FINAL_RECEIPT_BYTES
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            binary = write_fake_batch(root, self.prereg["schemas"]["batch"])
+            binary = write_fake_batch(root, preregistration["schemas"]["batch"])
             run_root = root / "run"
             identity = {
                 "schema": module.RUN_IDENTITY_SCHEMA,
-                "batch_schema": self.prereg["schemas"]["batch"],
+                "batch_schema": preregistration["schemas"]["batch"],
                 "source_set_sha256": "11" * 32,
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "binary_bytes": len(binary.read_bytes()),
+                "preregistration_sha256": hashlib.sha256(
+                    module.canonical_json_bytes(preregistration)
+                ).hexdigest(),
                 "seed_count": 1,
             }
-            with mock.patch.object(module, "producer_identity", return_value=identity):
+            resource_evidence = {
+                "candidate_resource_receipt_sha256": "12" * 32,
+                "method_selection_receipt_sha256": "34" * 32,
+                "resource_receipt_sha256": "56" * 32,
+                "batch_binary": {
+                    "sha256": identity["binary_sha256"],
+                    "bytes": identity["binary_bytes"],
+                },
+                "benchmark_binary": {
+                    "sha256": "78" * 32,
+                    "bytes": 1234,
+                },
+            }
+            with (
+                mock.patch.object(module, "producer_identity", return_value=identity),
+                mock.patch.object(
+                    module,
+                    "validate_release_resource_evidence",
+                    return_value=resource_evidence,
+                ) as validate_resource,
+            ):
                 first = module.run(
-                    preregistration, 1, None, run_root=run_root, binary=binary
+                    preregistration,
+                    1,
+                    None,
+                    run_root=run_root,
+                    binary=binary,
+                    resource_evidence_directory=root,
                 )
-            self.assertEqual(first["batch_attempted_cells"], 48)
+            validate_resource.assert_called_once_with(preregistration, root)
+            run_identity = json.loads((run_root / "run_identity.json").read_bytes())
+            self.assertEqual(
+                run_identity["candidate_resource_receipt_sha256"], "12" * 32
+            )
+            self.assertEqual(
+                run_identity["method_selection_receipt_sha256"], "34" * 32
+            )
+            self.assertEqual(run_identity["resource_receipt_sha256"], "56" * 32)
+            self.assertEqual(
+                run_identity["resource_benchmark_binary_sha256"], "78" * 32
+            )
+            self.assertEqual(first["processed_attempt_record_count"], 48)
             self.assertTrue(first["exact_seed_denominator_complete"])
-            self.assertFalse(first["promotion_eligible"])
+            self.assertFalse(first["engine_validation_eligible"])
             self.assertEqual(first["records"], [])
-            self.assertEqual(len(list((run_root / "shards").iterdir())), 144)
+            self.assertEqual(len(list((run_root / "shards").iterdir())), 72)
+            self.assertTrue((run_root / "run_manifest.json").is_file())
+            self.assertTrue((run_root / "run_commit.json").is_file())
             self.assertLessEqual(
                 first["resource"]["result_artifact_bytes"],
                 preregistration["resource_limits"]["retained_bound_bytes"],
             )
             self.assertTrue(first["resource_gates"]["retained_bound"])
-            with mock.patch.object(module, "producer_identity", return_value=identity):
+            self.assertEqual(
+                set(first["resource_gates"]),
+                {
+                    "rss",
+                    "artifact_size",
+                    "bound_resource_receipt",
+                    "retained_bound",
+                },
+            )
+            with (
+                mock.patch.object(module, "producer_identity", return_value=identity),
+                mock.patch.object(
+                    module,
+                    "validate_release_resource_evidence",
+                    return_value=resource_evidence,
+                ),
+            ):
                 second = module.run(
-                    preregistration, 1, None, run_root=run_root, binary=binary
+                    preregistration,
+                    1,
+                    None,
+                    run_root=run_root,
+                    binary=binary,
+                    resource_evidence_directory=root,
                 )
             self.assertEqual(second, first)
-            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "96")
+            self.assertEqual((root / "fake_temporal_batch.count").read_text(), "24")
+            swapped = dict(resource_evidence, resource_receipt_sha256="9a" * 32)
+            with (
+                mock.patch.object(module, "producer_identity", return_value=identity),
+                mock.patch.object(
+                    module,
+                    "validate_release_resource_evidence",
+                    return_value=swapped,
+                ),
+                self.assertRaisesRegex(RuntimeError, "identity is stale"),
+            ):
+                module.run(
+                    preregistration,
+                    1,
+                    None,
+                    run_root=run_root,
+                    binary=binary,
+                    resource_evidence_directory=root,
+                )
 
-    def test_retained_bound_matches_exact_48_shard_composition(self):
+    def test_retained_bound_matches_exact_24_shard_composition(self):
         module = load_generator()
-        expected = 48 * (
+        expected = 24 * (
             module.MAX_SHARD_RECORD_BYTES
             + module.MAX_MANIFEST_BYTES
             + module.MAX_COMMIT_BYTES
-        ) + module.MAX_COMMIT_BYTES + module.MAX_FINAL_RECEIPT_BYTES
+        ) + (
+            module.MAX_COMMIT_BYTES
+            + module.MAX_MANIFEST_BYTES
+            + module.MAX_COMMIT_BYTES
+            + module.MAX_FINAL_RECEIPT_BYTES
+        )
         self.assertEqual(
             self.prereg["resource_limits"]["retained_bound_bytes"], expected
+        )
+        self.assertEqual(
+            self.prereg["resource_limits"]["retained_bound_formula"],
+            "24*(16777216+1048576+65536)+65536+1048576+65536+1048576",
         )
         self.assertLessEqual(
             expected, self.prereg["resource_limits"]["artifact_size_limit_bytes"]

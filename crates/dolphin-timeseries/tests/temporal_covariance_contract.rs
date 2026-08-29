@@ -2,13 +2,14 @@
 
 use dolphin_timeseries::{
     complete_refit_bootstrap_estimate, continuous_time_ar1_correlation, fit_temporal_covariance,
-    relative_standard_deviation_shape, subset_origin_anchored_covariance,
-    temporal_covariance_provenance, temporal_covariance_workspace_composition,
-    temporal_parameter_boundary_status, total_difference_covariance,
-    CompleteRefitBootstrapCadenceStatus, CompleteRefitBootstrapEstimateStatus, Sha256Digest,
-    TemporalCovarianceApproximation, TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs,
-    TemporalInferenceStatus, TemporalReferenceProvenance, TemporalValidationScope,
-    COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS, COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
+    fit_temporal_factor_scalar_batch, relative_standard_deviation_shape,
+    subset_origin_anchored_covariance, temporal_covariance_provenance,
+    temporal_covariance_workspace_composition, temporal_parameter_boundary_status,
+    total_difference_covariance, CompleteRefitBootstrapCadenceStatus,
+    CompleteRefitBootstrapEstimateStatus, Sha256Digest, TemporalCovarianceApproximation,
+    TemporalCovarianceOptions, TemporalCovarianceProvenanceInputs, TemporalInferenceStatus,
+    TemporalReferenceProvenance, TemporalValidationScope, COMPLETE_REFIT_BOOTSTRAP_ATTEMPTS,
+    COMPLETE_REFIT_BOOTSTRAP_MINIMUM_SUCCESSES,
 };
 use statrs::function::erf::erf;
 
@@ -120,6 +121,10 @@ fn complete_refit_bootstrap_candidate_requires_frozen_evaluated_evidence() {
     assert_eq!(
         selected.fitted_process_variance,
         fit.fitted_process_variance
+    );
+    assert_eq!(
+        selected.fitted_parameter_active_set,
+        fit.fitted_parameter_active_set
     );
     assert_eq!(selected.condition_number, fit.covariance_condition_number);
     assert_eq!(
@@ -364,7 +369,7 @@ fn coincident_and_invalid_direct_issue54_factors_abstain() {
 }
 
 #[test]
-fn short_irregular_covariance_fails_at_the_fitted_boundary() {
+fn short_irregular_covariance_uses_the_fitted_boundary_active_set() {
     let days = [6.0, 12.0, 30.0, 48.0];
     let observations = [0.1, 0.8, 1.4, 2.6];
     let difference = [
@@ -402,8 +407,12 @@ fn short_irregular_covariance_fails_at_the_fitted_boundary() {
         },
         &options,
     );
-    assert_eq!(fit.status, TemporalInferenceStatus::RhoLowerBoundary);
-    assert!(fit.adjusted_profile.interval_95.is_none());
+    assert_eq!(fit.status, TemporalInferenceStatus::Evaluated);
+    assert_eq!(
+        fit.fitted_parameter_active_set,
+        Some(TemporalInferenceStatus::RhoLowerBoundary)
+    );
+    assert!(fit.adjusted_scalar.interval_95.is_some());
 }
 
 #[test]
@@ -645,7 +654,7 @@ fn fitted_parameter_boundaries_have_distinct_statuses() {
 }
 
 #[test]
-fn fitted_rho_endpoint_returns_lower_boundary_status() {
+fn fitted_rho_endpoint_uses_lower_boundary_active_set() {
     let (days, _, covariance) = direct_factor_fixture(0.01);
     let observations = days
         .iter()
@@ -659,17 +668,31 @@ fn fitted_rho_endpoint_returns_lower_boundary_status() {
         })
         .collect::<Vec<_>>();
     let options = TemporalCovarianceOptions {
-        bootstrap_replicates: 0,
-        bootstrap_minimum_successes: 0,
+        bootstrap_replicates: 32,
+        bootstrap_minimum_successes: 32,
         ..Default::default()
     };
     let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
-    assert_eq!(fit.status, TemporalInferenceStatus::RhoLowerBoundary);
-    assert!(fit.plugin_gls_slope.is_none());
+    assert_eq!(fit.status, TemporalInferenceStatus::Evaluated);
+    assert_eq!(
+        fit.fitted_parameter_active_set,
+        Some(TemporalInferenceStatus::RhoLowerBoundary)
+    );
+    assert!(fit.plugin_gls_slope.is_some());
+    assert_eq!(
+        fit.adjusted_scalar.status,
+        TemporalInferenceStatus::Evaluated
+    );
+    assert_eq!(fit.bootstrap_attempts, 32);
+    assert_eq!(fit.bootstrap_successes, 32);
+    assert_eq!(
+        fit.complete_refit_bootstrap.status,
+        TemporalInferenceStatus::Evaluated
+    );
 }
 
 #[test]
-fn fitted_rho_endpoint_returns_upper_boundary_status() {
+fn fitted_rho_endpoint_uses_upper_boundary_active_set() {
     let days: Vec<f64> = (0..13).map(|index| index as f64 * 12.0).collect();
     let observations = days
         .iter()
@@ -681,13 +704,171 @@ fn fitted_rho_endpoint_returns_upper_boundary_status() {
         row[index] = 1e-8;
     }
     let options = TemporalCovarianceOptions {
+        rho_max: 0.9,
         bootstrap_replicates: 0,
         bootstrap_minimum_successes: 0,
         ..Default::default()
     };
     let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
-    assert_eq!(fit.status, TemporalInferenceStatus::RhoUpperBoundary);
-    assert!(fit.adjusted_profile.interval_95.is_none());
+    assert_eq!(fit.status, TemporalInferenceStatus::Evaluated);
+    assert_eq!(
+        fit.fitted_parameter_active_set,
+        Some(TemporalInferenceStatus::RhoUpperBoundary),
+        "{fit:?}"
+    );
+    assert!(fit.adjusted_profile.interval_95.is_some());
+}
+
+#[test]
+fn fitted_process_variance_endpoints_use_active_set_inference() {
+    let (days, observations, covariance) = twelve_date_fixture();
+    for (minimum_ratio, maximum_ratio, expected) in [
+        (
+            2.0,
+            10.0,
+            TemporalInferenceStatus::ProcessVarianceLowerBoundary,
+        ),
+        (
+            0.01,
+            0.1,
+            TemporalInferenceStatus::ProcessVarianceUpperBoundary,
+        ),
+    ] {
+        let options = TemporalCovarianceOptions {
+            process_variance_min_ratio: minimum_ratio,
+            process_variance_max_ratio: maximum_ratio,
+            bootstrap_replicates: 0,
+            bootstrap_minimum_successes: 0,
+            ..Default::default()
+        };
+        let fit = fit_temporal_covariance(&days, &observations, &covariance, &options);
+        assert_eq!(fit.status, TemporalInferenceStatus::Evaluated, "{fit:?}");
+        assert_eq!(fit.fitted_parameter_active_set, Some(expected), "{fit:?}");
+        assert_eq!(
+            fit.adjusted_scalar.status,
+            TemporalInferenceStatus::Evaluated,
+            "{fit:?}"
+        );
+        if expected == TemporalInferenceStatus::ProcessVarianceLowerBoundary {
+            assert_eq!(
+                fit.adjusted_scalar
+                    .standard_error_diagnostic
+                    .map(f64::to_bits),
+                fit.plugin_gls.standard_error_diagnostic.map(f64::to_bits),
+                "rho is unidentified and adds no nuisance adjustment when q is fixed at zero"
+            );
+        }
+        assert!(fit.adjusted_profile.interval_95.is_some(), "{fit:?}");
+    }
+}
+
+#[test]
+fn factor_native_upper_boundary_active_set_matches_dense_fit() {
+    let days: Vec<f64> = (0..13).map(|index| index as f64 * 12.0).collect();
+    let observations = days
+        .iter()
+        .enumerate()
+        .map(|(index, day)| 0.01 * day + (index as f64 * 0.07).sin() * 0.2)
+        .collect::<Vec<_>>();
+    let mut covariance = vec![vec![0.0; days.len()]; days.len()];
+    let maximum_rank = days.len() - 1;
+    let mut persisted_factor = vec![0.0; days.len() * maximum_rank];
+    for index in 1..days.len() {
+        covariance[index][index] = 1e-8;
+        persisted_factor[index * maximum_rank + index - 1] = 1e-4;
+    }
+    let options = TemporalCovarianceOptions {
+        rho_max: 0.9,
+        bootstrap_replicates: 0,
+        bootstrap_minimum_successes: 0,
+        ..Default::default()
+    };
+    let dense = fit_temporal_covariance(&days, &observations, &covariance, &options);
+    let factor = fit_temporal_factor_scalar_batch(
+        &days[1..],
+        &observations[1..],
+        &persisted_factor,
+        maximum_rank,
+        &[maximum_rank],
+        &options,
+    )
+    .unwrap();
+    let factor = &factor.outcomes[0];
+    assert_eq!(
+        factor.fitted_parameter_active_set,
+        dense.fitted_parameter_active_set
+    );
+    assert_eq!(
+        factor.fitted_parameter_active_set,
+        Some(TemporalInferenceStatus::RhoUpperBoundary)
+    );
+    assert_eq!(
+        factor.reml_covariance_parameter_adjusted_scalar.status,
+        TemporalInferenceStatus::Evaluated
+    );
+}
+
+#[test]
+fn factor_native_process_variance_active_sets_match_dense_fit() {
+    let (days, observations, covariance) = twelve_date_fixture();
+    let maximum_rank = days.len() - 1;
+    let mut persisted_factor = vec![0.0; days.len() * maximum_rank];
+    for index in 1..days.len() {
+        persisted_factor[index * maximum_rank + index - 1] = 1.0;
+    }
+    for (minimum_ratio, maximum_ratio, expected) in [
+        (
+            2.0,
+            10.0,
+            TemporalInferenceStatus::ProcessVarianceLowerBoundary,
+        ),
+        (
+            0.01,
+            0.1,
+            TemporalInferenceStatus::ProcessVarianceUpperBoundary,
+        ),
+    ] {
+        let options = TemporalCovarianceOptions {
+            process_variance_min_ratio: minimum_ratio,
+            process_variance_max_ratio: maximum_ratio,
+            bootstrap_replicates: 0,
+            bootstrap_minimum_successes: 0,
+            ..Default::default()
+        };
+        let dense = fit_temporal_covariance(&days, &observations, &covariance, &options);
+        let factor = fit_temporal_factor_scalar_batch(
+            &days[1..],
+            &observations[1..],
+            &persisted_factor,
+            maximum_rank,
+            &[maximum_rank],
+            &options,
+        )
+        .unwrap();
+        let factor = &factor.outcomes[0];
+        assert_eq!(
+            factor.fitted_parameter_active_set,
+            dense.fitted_parameter_active_set
+        );
+        assert_eq!(factor.fitted_parameter_active_set, Some(expected));
+        assert_eq!(
+            factor.reml_covariance_parameter_adjusted_scalar.status,
+            TemporalInferenceStatus::Evaluated
+        );
+        if expected == TemporalInferenceStatus::ProcessVarianceLowerBoundary {
+            assert_eq!(
+                factor
+                    .reml_covariance_parameter_adjusted_scalar
+                    .standard_error_diagnostic
+                    .map(f64::to_bits),
+                factor
+                    .plugin_gls_reml
+                    .standard_error_diagnostic
+                    .map(f64::to_bits),
+                "rho is unidentified and adds no nuisance adjustment when q is fixed at zero"
+            );
+        }
+    }
 }
 
 #[test]
@@ -755,6 +936,10 @@ fn provenance_contract_binds_issue_52_issue_54_reference_and_receipt() {
     assert_eq!(provenance.issue52_receipt_sha256.as_str().len(), 64);
     assert_eq!(provenance.issue54_receipt_sha256.as_str().len(), 64);
     assert_eq!(provenance.reference.geometry_id, "burst/reference-window");
+    assert_eq!(
+        provenance.fitted_parameter_active_set,
+        fit.fitted_parameter_active_set
+    );
     assert_eq!(provenance.bootstrap_attempts, 0);
     assert_eq!(
         provenance.validation_receipt_sha256.as_str(),
