@@ -1,0 +1,66 @@
+{
+  "schema": "dolphinrust-temporal-covariance-scorer-policy/1",
+  "scientific_cell_count": 24,
+  "scientific_cells": [
+    "c00000-12-alternating-6-18-day-contiguous-20-percent-v1-alt-r0-far-exact",
+    "c00001-12-jitter-4-day-mcar-10-percent-v16-con-r0.5-mid-exact",
+    "c00002-24-regular-12-day-mcar-25-percent-v4-con-r2-near-exact",
+    "c00003-48-two-36-day-gaps-none-v1-alt-r0.5-near-exact",
+    "c00004-96-alternating-6-18-day-mcar-10-percent-v4-alt-r2-mid-exact",
+    "c00005-48-regular-12-day-none-v16-con-r0-far-exact",
+    "c00006-96-two-36-day-gaps-contiguous-20-percent-v16-con-r2-far-exact",
+    "c00007-24-jitter-4-day-mcar-25-percent-v1-alt-r0-far-exact",
+    "c00008-12-two-36-day-gaps-mcar-25-percent-v4-alt-r0-mid-exact",
+    "c00009-48-alternating-6-18-day-contiguous-20-percent-v4-con-r0.5-near-exact",
+    "c00010-48-jitter-4-day-none-v1-con-r2-mid-exact",
+    "c00011-96-regular-12-day-mcar-10-percent-v1-alt-r0-near-exact",
+    "c00012-96-jitter-4-day-mcar-25-percent-v16-alt-r0.5-near-exact",
+    "c00013-24-regular-12-day-contiguous-20-percent-v16-alt-r0.5-mid-exact",
+    "c00014-12-regular-12-day-none-v4-alt-r2-far-exact",
+    "c00015-24-alternating-6-18-day-mcar-10-percent-v16-alt-r0.5-far-exact",
+    "c00016-12-jitter-4-day-contiguous-20-percent-v4-alt-r0-near-exact",
+    "c00017-48-two-36-day-gaps-mcar-10-percent-v1-alt-r0-far-exact",
+    "c00018-24-two-36-day-gaps-none-v1-alt-r0-far-exact",
+    "c00019-96-alternating-6-18-day-none-v1-alt-r0-far-exact",
+    "c00020-48-alternating-6-18-day-mcar-25-percent-v1-alt-r0-far-exact",
+    "c00021-12-two-36-day-gaps-contiguous-20-percent-v1-alt-r0-far-exact",
+    "c00022-12-regular-12-day-contiguous-20-percent-v1-alt-r0-far-exact",
+    "c00023-48-alternating-6-18-day-contiguous-20-percent-v1-alt-r0-far-exact"
+  ],
+  "truth": "3.6525",
+  "selected_method": "reml_covariance_parameter_adjusted_scalar",
+  "oracle_method": "oracle_gls",
+  "methods": [
+    "ols",
+    "oracle_gls",
+    "legacy_intercept_slope_wls_non_comparable",
+    "lag_one_scalar_effective_n",
+    "plugin_gls_reml",
+    "reml_covariance_parameter_adjusted_scalar",
+    "slope_profile_likelihood_ml",
+    "complete_refit_bootstrap"
+  ],
+  "baseline_methods": [
+    "oracle_gls",
+    "plugin_gls_reml"
+  ],
+  "familywise_alpha": "0.05",
+  "standardized_bias_tolerance": "0.05",
+  "calibration_count_per_cell": 5000,
+  "method_emission_minimum": "0.99",
+  "pairwise_overlap_minimum": "0.98",
+  "coverage": {
+    "68": {"nominal": "0.68", "tolerance": "0.03"},
+    "90": {"nominal": "0.90", "tolerance": "0.02"},
+    "95": {"nominal": "0.95", "tolerance": "0.015"}
+  },
+  "pairwise_rules": {
+    "oracle_gls": {
+      "maximum_mean_score_ratio": "1.10",
+      "maximum_mean_width_ratio": "10.0"
+    },
+    "plugin_gls_reml": {
+      "maximum_mean_score_ratio": "1.0"
+    }
+  }
+}

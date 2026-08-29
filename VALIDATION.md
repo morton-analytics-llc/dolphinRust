@@ -1293,3 +1293,45 @@ missing-date states, negative raw correlation without deflation, bounded re-refe
 mask propagation, and output metadata. These are implementation contracts, not field
 calibration. dolphinRust #52 owns compressed-reference/cross-date covariance. #53 owns selection
 and preregistered coverage validation of any future temporal-covariance slope estimator.
+
+## Temporal covariance scorer /7 (2026-08-29)
+
+The frozen v5 temporal experiment remains a scientific no-go. Its preregistration, producer and
+scorer source, and no-go summary retain SHA-256 values `bf8a0cc9...`, `6684130b...`, and
+`0c885ac2...`. The v7 scorer uses a separate source identity. The v5 result remains frozen.
+
+`validation/score_temporal_covariance_synthetic_v7.py` provides three explicit modes:
+
+- `oracle_calibration` accepts the throwaway seed domain and produces a hash-bound receipt.
+- `candidate_evaluation` requires a passing calibration receipt, the same policy and producer
+  identities, and a verified disjoint seed-index range.
+- `forensic_v5` requires the frozen run manifest, run commit, and exact 24-cell, two-path,
+  1,050-seed schedule. It retains corrected diagnostic tables with certification and retroactive
+  certification disabled.
+
+`validation/temporal_covariance_scorer_policy_v7.json` is the sole certification-eligible policy.
+Other policies can produce diagnostic pass/fail receipts. They are excluded from calibration and
+candidate certification. The policy names the exact 24 scientific cells (`K=24`). It fixes
+familywise alpha at 0.05 and standardized bias tolerance at 0.05, then finds the minimum count from
+`K * 2 * P(T[n-1] > tolerance * sqrt(n)) <= alpha`. The minimum is 3,796 scored observations per
+cell. The throwaway contract uses exactly 5,000 attempts per cell. A count of 1,050 fails the
+count gate. Passing calibration checks the scorer instrument and oracle family.
+Temporal-estimator validation remains a separate, preregistered `candidate_evaluation` gate.
+
+Coverage, each method's 99 percent emission floor, and the 98 percent pairwise overlap floor use
+integer ratios. Each selected-versus-baseline row enforces both individual emission floors, uses
+its own emitted-seed intersection, and retains paired, selected-only, baseline-only, and neither
+counts.
+Candidate eligibility uses the selected-method cell rows and the baselines named in the policy.
+Other method rows remain diagnostic and are excluded from candidate eligibility.
+
+Every receipt retains compact cell, execution-path, and method rows with attempt and emission
+counts, bias moments, coverage counts, interval widths, interval scores, gate values, and failing
+gate names. It also binds the scorer source, certification-policy hash, source preregistration,
+run manifest, run commit, verified seed-index range, and calibration receipt where required.
+
+Run the deterministic contracts with:
+
+```sh
+python3 -m unittest validation.tests.test_temporal_covariance_scorer_v7
+```
