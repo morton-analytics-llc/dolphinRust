@@ -5834,9 +5834,11 @@ mod tests {
             source_sha256: expected.source_sha256.clone(),
         };
 
-        let accepted = validate_synthetic_result(&synthetic, &observed_resource)
-            .and_then(|()| validate_manifest(&manifest, &expected));
-        accepted.unwrap();
+        let source_error = validate_synthetic_result(&synthetic, &observed_resource)
+            .expect_err("frozen v5 evidence must not authorize the changed estimator source");
+        assert!(format!("{source_error:#}")
+            .contains("synthetic temporal-covariance producer identity is stale or malformed"));
+        validate_manifest(&manifest, &expected).unwrap();
 
         let evidence = std::env::temp_dir().join(format!(
             "dolphin_temporal_resource_contract_{}",
@@ -6044,7 +6046,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn synthetic_evidence_chain_rejects_tamper_and_scope_mismatch() {
+    fn frozen_v5_synthetic_evidence_rejects_current_estimator_source_drift() {
         let preregistration: Value =
             serde_json::from_slice(super::TEMPORAL_PREREGISTRATION_BYTES).unwrap();
         let observed_resource = super::ObservedReleaseResourceEvidence {
@@ -6087,7 +6089,7 @@ mod tests {
             resource_receipt_sha256: observed_resource.receipt_sha256.clone(),
             resource_benchmark_binary_sha256: observed_resource.benchmark_binary.sha256.clone(),
         };
-        let mut synthetic = SyntheticResult {
+        let synthetic = SyntheticResult {
             schema: SYNTHETIC_SCHEMA.to_owned(),
             preregistration_schema: super::PREREGISTRATION_SCHEMA.to_owned(),
             expected_attempt_record_count: 50_400,
@@ -6116,36 +6118,20 @@ mod tests {
             ]),
             producer_identity,
         };
-        validate_synthetic_result(&synthetic, &observed_resource).unwrap();
+        assert_ne!(
+            super::sha256(super::ESTIMATOR_SOURCE_BYTES),
+            preregistration["file_hashes"]["estimator_source_sha256"]
+                .as_str()
+                .unwrap()
+        );
+        let source_error = validate_synthetic_result(&synthetic, &observed_resource)
+            .expect_err("frozen v5 evidence must not authorize the changed estimator source");
+        assert!(format!("{source_error:#}")
+            .contains("synthetic temporal-covariance producer identity is stale or malformed"));
+    }
 
-        synthetic.seed_requests_per_cell = 5_000;
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-        synthetic.seed_requests_per_cell = 1_050;
-        synthetic.producer_identity.source_set_sha256 = "cd".repeat(32);
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-        synthetic.producer_identity.source_set_sha256 = preregistration["producer_identity"]
-            ["source_set_sha256"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        synthetic
-            .producer_identity
-            .candidate_resource_receipt_sha256 = "cd".repeat(32);
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-        synthetic
-            .producer_identity
-            .candidate_resource_receipt_sha256 = observed_resource.candidate_receipt_sha256.clone();
-        synthetic.producer_identity.binary_path =
-            "target/debug/examples/temporal_covariance_batch".to_owned();
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-        synthetic.producer_identity.binary_path =
-            "target/release/examples/temporal_covariance_batch".to_owned();
-        synthetic.processed_attempt_record_count = 50_399;
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-        synthetic.processed_attempt_record_count = 50_400;
-        synthetic.resource_gates.insert("rss".to_owned(), false);
-        assert!(validate_synthetic_result(&synthetic, &observed_resource).is_err());
-
+    #[test]
+    fn temporal_promotion_manifest_rejects_scope_and_digest_mismatch() {
         let expected = EvidenceDigests {
             synthetic_result_sha256: "11".repeat(32),
             temporal_resource_receipt_sha256: "12".repeat(32),
