@@ -1053,6 +1053,7 @@ fn factor_adjusted_variance_fallback_preserves_inner_status() {
         bootstrap_replicates: 0,
         bootstrap_minimum_successes: 0,
         bootstrap_seed: 1_651_721_217_991_215_729,
+        minimum_profile_curvature: f64::MAX,
         ..Default::default()
     };
     let report = fit_temporal_factor_scalar_batch(
