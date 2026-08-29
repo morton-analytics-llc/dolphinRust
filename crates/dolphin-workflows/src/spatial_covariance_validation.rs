@@ -91,6 +91,12 @@ pub struct PortableDgpTables {
     independent_spatial_weight: f64,
     spatial_local_weight: f64,
     spatial_global_weight: f64,
+    spatial_filter_radius: usize,
+    spatial_white_lattice_min: i64,
+    spatial_white_lattice_side: u64,
+    spatial_normals_per_block: u64,
+    spatial_filter_vertical: Vec<Vec<f64>>,
+    spatial_filter_horizontal: Vec<Vec<f64>>,
     noise_scale: f64,
     amplitude_scale: BTreeMap<i64, BTreeMap<String, Vec<f64>>>,
     phasor: BTreeMap<i64, Vec<(f64, f64)>>,
@@ -471,6 +477,72 @@ impl PortableDgpTables {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let spatial_filter = coefficients
+            .get("spatial_filter")
+            .context("portable DGP omits the spatial filter")?;
+        let spatial_filter_radius = usize::try_from(
+            spatial_filter
+                .get("radius")
+                .and_then(Value::as_u64)
+                .context("portable DGP spatial filter omits its radius")?,
+        )?;
+        let spatial_filter_rank = usize::try_from(
+            spatial_filter
+                .get("rank")
+                .and_then(Value::as_u64)
+                .context("portable DGP spatial filter omits its rank")?,
+        )?;
+        anyhow::ensure!(
+            spatial_filter_radius == 8 && spatial_filter_rank == 3,
+            "portable DGP spatial filter shape differs"
+        );
+        let spatial_white_lattice_min = spatial_filter
+            .get("white_lattice_min")
+            .and_then(Value::as_i64)
+            .context("portable DGP spatial filter omits its white-lattice minimum")?;
+        let spatial_white_lattice_side = spatial_filter
+            .get("white_lattice_side")
+            .and_then(Value::as_u64)
+            .context("portable DGP spatial filter omits its white-lattice side")?;
+        let spatial_normals_per_block = spatial_filter
+            .get("normal_values_per_block")
+            .and_then(Value::as_u64)
+            .context("portable DGP spatial filter omits its block packing")?;
+        anyhow::ensure!(
+            spatial_white_lattice_min == -12
+                && spatial_white_lattice_side == 337
+                && spatial_normals_per_block == 21
+                && spatial_normals_per_block * u64::from(index_bits) <= 256,
+            "portable DGP spatial white-lattice contract differs"
+        );
+        let parse_factors = |name: &str| -> Result<Vec<Vec<f64>>> {
+            let factors = spatial_filter
+                .get(name)
+                .and_then(Value::as_array)
+                .with_context(|| format!("portable DGP spatial filter omits {name}"))?;
+            anyhow::ensure!(
+                factors.len() == spatial_filter_rank,
+                "portable DGP spatial filter rank differs"
+            );
+            factors
+                .iter()
+                .map(|factor| {
+                    let values = factor
+                        .as_array()
+                        .context("portable DGP spatial filter factor is not an array")?;
+                    anyhow::ensure!(
+                        values.len() == 2 * spatial_filter_radius + 1,
+                        "portable DGP spatial filter width differs"
+                    );
+                    values
+                        .iter()
+                        .map(parse_f64_bits_value)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect()
+        };
+        let spatial_filter_vertical = parse_factors("vertical_factor_bits")?;
+        let spatial_filter_horizontal = parse_factors("horizontal_factor_bits")?;
         Ok(Self {
             dgp_generator_identity,
             normal_quantiles,
@@ -481,6 +553,12 @@ impl PortableDgpTables {
             independent_spatial_weight: scalar("independent_spatial_weight_bits")?,
             spatial_local_weight: scalar("spatial_local_weight_bits")?,
             spatial_global_weight: scalar("spatial_global_weight_bits")?,
+            spatial_filter_radius,
+            spatial_white_lattice_min,
+            spatial_white_lattice_side,
+            spatial_normals_per_block,
+            spatial_filter_vertical,
+            spatial_filter_horizontal,
             noise_scale: scalar("noise_scale_bits")?,
             amplitude_scale,
             phasor,
@@ -519,6 +597,272 @@ impl PortableDgpTables {
         );
         let index = (word >> (64 - self.index_bits)) as usize;
         Ok(self.normal_quantiles[index])
+    }
+
+    fn spatial_white_block(
+        &self,
+        cohort_ordinal: u64,
+        seed_index: u64,
+        date: u32,
+        stream: &str,
+        block: u64,
+    ) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            !stream.is_empty() && stream.len() < u16::MAX as usize && stream.is_ascii(),
+            "portable spatial DGP stream identity is invalid"
+        );
+        let mut digest = Sha256::new();
+        digest.update(b"dolphinrust:spatial-covariance-field-white:v1\0");
+        digest.update(self.dgp_generator_identity);
+        digest.update(cohort_ordinal.to_le_bytes());
+        digest.update(seed_index.to_le_bytes());
+        digest.update(date.to_le_bytes());
+        digest.update((stream.len() as u16).to_le_bytes());
+        digest.update(stream.as_bytes());
+        digest.update(block.to_le_bytes());
+        Ok(digest.finalize().into())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spatial_field(
+        &self,
+        cohort_ordinal: u64,
+        seed_index: u64,
+        coordinates: &BTreeSet<(i64, i64)>,
+        date: u32,
+        stream: &str,
+    ) -> Result<BTreeMap<(i64, i64), f64>> {
+        let first = coordinates
+            .first()
+            .copied()
+            .context("portable spatial DGP coordinate set is empty")?;
+        let min_row = first.0;
+        let max_row = coordinates
+            .last()
+            .map(|coordinate| coordinate.0)
+            .context("portable spatial DGP coordinate set is empty")?;
+        let min_column = coordinates
+            .iter()
+            .map(|coordinate| coordinate.1)
+            .min()
+            .context("portable spatial DGP coordinate set is empty")?;
+        let max_column = coordinates
+            .iter()
+            .map(|coordinate| coordinate.1)
+            .max()
+            .context("portable spatial DGP coordinate set is empty")?;
+        let radius = i64::try_from(self.spatial_filter_radius)?;
+        let white_row_start = min_row
+            .checked_sub(radius)
+            .context("portable spatial DGP row halo underflows")?;
+        let white_row_stop = max_row
+            .checked_add(radius)
+            .context("portable spatial DGP row halo overflows")?;
+        let white_column_start = min_column
+            .checked_sub(radius)
+            .context("portable spatial DGP column halo underflows")?;
+        let white_column_stop = max_column
+            .checked_add(radius)
+            .context("portable spatial DGP column halo overflows")?;
+        let white_rows = usize::try_from(white_row_stop - white_row_start + 1)?;
+        let white_columns = usize::try_from(white_column_stop - white_column_start + 1)?;
+        let mut white = vec![0.0; white_rows * white_columns];
+        let mut cached_block = None;
+        for row in white_row_start..=white_row_stop {
+            for column in white_column_start..=white_column_stop {
+                let index = usize::try_from(row - white_row_start)? * white_columns
+                    + usize::try_from(column - white_column_start)?;
+                let lattice_row = row
+                    .checked_sub(self.spatial_white_lattice_min)
+                    .context("portable spatial DGP row underflows")?;
+                let lattice_column = column
+                    .checked_sub(self.spatial_white_lattice_min)
+                    .context("portable spatial DGP column underflows")?;
+                anyhow::ensure!(
+                    lattice_row >= 0
+                        && lattice_column >= 0
+                        && u64::try_from(lattice_row)? < self.spatial_white_lattice_side
+                        && u64::try_from(lattice_column)? < self.spatial_white_lattice_side,
+                    "portable spatial DGP white coordinate exceeds the frozen lattice"
+                );
+                let linear = u64::try_from(lattice_row)?
+                    .checked_mul(self.spatial_white_lattice_side)
+                    .and_then(|value| value.checked_add(u64::try_from(lattice_column).ok()?))
+                    .context("portable spatial DGP white index overflows")?;
+                let block = linear / self.spatial_normals_per_block;
+                let slot = usize::try_from(linear % self.spatial_normals_per_block)?;
+                if cached_block
+                    .as_ref()
+                    .is_none_or(|(cached, _): &(u64, [u8; 32])| *cached != block)
+                {
+                    cached_block = Some((
+                        block,
+                        self.spatial_white_block(cohort_ordinal, seed_index, date, stream, block)?,
+                    ));
+                }
+                let bytes = &cached_block
+                    .as_ref()
+                    .context("portable spatial DGP white block is missing")?
+                    .1;
+                let mut normal_index = 0_usize;
+                for offset in 0..self.index_bits as usize {
+                    let bit = slot * self.index_bits as usize + offset;
+                    normal_index =
+                        (normal_index << 1) | usize::from((bytes[bit / 8] >> (7 - bit % 8)) & 1);
+                }
+                white[index] = self.normal_quantiles[normal_index];
+            }
+        }
+        let output_rows = usize::try_from(max_row - min_row + 1)?;
+        let output_columns = usize::try_from(max_column - min_column + 1)?;
+        let rank = self.spatial_filter_vertical.len();
+        let mut horizontal = vec![0.0; rank * white_rows * output_columns];
+        for component in 0..rank {
+            for row in 0..white_rows {
+                for column in 0..output_columns {
+                    let mut value = 0.0;
+                    for offset in 0..2 * self.spatial_filter_radius + 1 {
+                        let white_column = column + offset;
+                        let product = self.spatial_filter_horizontal[component][offset]
+                            * white[row * white_columns + white_column];
+                        value += product;
+                    }
+                    horizontal[(component * white_rows + row) * output_columns + column] = value;
+                }
+            }
+        }
+        let mut field = BTreeMap::new();
+        for &coordinate in coordinates {
+            let column = usize::try_from(coordinate.1 - min_column)?;
+            let base_row = usize::try_from(coordinate.0 - radius - white_row_start)?;
+            let mut value = 0.0;
+            for component in 0..rank {
+                for offset in 0..2 * self.spatial_filter_radius + 1 {
+                    let product = self.spatial_filter_vertical[component][offset]
+                        * horizontal[((component * white_rows + base_row + offset)
+                            * output_columns)
+                            + column];
+                    value += product;
+                }
+            }
+            field.insert(coordinate, value);
+        }
+        anyhow::ensure!(
+            output_rows <= white_rows && field.len() == coordinates.len(),
+            "portable spatial DGP field shape differs"
+        );
+        Ok(field)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn source_histories(
+        &self,
+        cohort_ordinal: u64,
+        seed_index: u64,
+        coordinates: &BTreeSet<(i64, i64)>,
+        dates: usize,
+        spatial: bool,
+        eigen_stress: &str,
+        loading: impl Fn((i64, i64)) -> f64,
+    ) -> Result<BTreeMap<(i64, i64), Vec<Cf64>>> {
+        if !spatial {
+            return coordinates
+                .iter()
+                .copied()
+                .map(|coordinate| {
+                    Ok((
+                        coordinate,
+                        self.source_history(
+                            cohort_ordinal,
+                            seed_index,
+                            coordinate,
+                            dates,
+                            false,
+                            eigen_stress,
+                            loading(coordinate),
+                        )?,
+                    ))
+                })
+                .collect();
+        }
+        let mut states = coordinates
+            .iter()
+            .copied()
+            .map(|coordinate| (coordinate, (0.0, 0.0)))
+            .collect::<BTreeMap<_, _>>();
+        let mut histories = coordinates
+            .iter()
+            .copied()
+            .map(|coordinate| (coordinate, Vec::with_capacity(dates)))
+            .collect::<BTreeMap<_, _>>();
+        for date in 0..dates {
+            let date_u32 = u32::try_from(date)?;
+            let signal_real = self.spatial_field(
+                cohort_ordinal,
+                seed_index,
+                coordinates,
+                date_u32,
+                "spatial-signal-real",
+            )?;
+            let signal_imaginary = self.spatial_field(
+                cohort_ordinal,
+                seed_index,
+                coordinates,
+                date_u32,
+                "spatial-signal-imag",
+            )?;
+            let noise_real = self.spatial_field(
+                cohort_ordinal,
+                seed_index,
+                coordinates,
+                date_u32,
+                "spatial-noise-real",
+            )?;
+            let noise_imaginary = self.spatial_field(
+                cohort_ordinal,
+                seed_index,
+                coordinates,
+                date_u32,
+                "spatial-noise-imag",
+            )?;
+            for &coordinate in coordinates {
+                let amplitude = self
+                    .amplitude_scale
+                    .get(&(coordinate.0 + 3 * coordinate.1))
+                    .and_then(|stress| stress.get(eigen_stress))
+                    .and_then(|values| values.get(date))
+                    .context("portable amplitude table does not cover the cell")?;
+                let &(cosine, sine) = self
+                    .phasor
+                    .get(&(2 * coordinate.0 - coordinate.1))
+                    .and_then(|values| values.get(date))
+                    .context("portable phasor table does not cover the cell")?;
+                let state = states
+                    .get_mut(&coordinate)
+                    .context("portable spatial DGP state is missing")?;
+                if date == 0 {
+                    *state = (signal_real[&coordinate], signal_imaginary[&coordinate]);
+                } else {
+                    state.0 = self.temporal_rho * state.0
+                        + self.innovation_weight * signal_real[&coordinate];
+                    state.1 = self.temporal_rho * state.1
+                        + self.innovation_weight * signal_imaginary[&coordinate];
+                }
+                let base_real = amplitude * state.0 + self.noise_scale * noise_real[&coordinate];
+                let base_imaginary = loading(coordinate)
+                    * (amplitude * state.1 + self.noise_scale * noise_imaginary[&coordinate]);
+                let value_real = base_real * cosine - base_imaginary * sine;
+                let value_imaginary = base_real * sine + base_imaginary * cosine;
+                histories
+                    .get_mut(&coordinate)
+                    .context("portable spatial DGP history is missing")?
+                    .push(Cf64::new(
+                        f64::from(value_real as f32),
+                        f64::from(value_imaginary as f32),
+                    ));
+            }
+        }
+        Ok(histories)
     }
 
     /// Generate one exact complex64 source history using fixed scalar order.
@@ -1646,9 +1990,13 @@ pub fn run_frozen_attempt(
             && crop_shape.1.is_multiple_of(geometry.stride.1),
         "frozen production crop is not stride aligned"
     );
-    let spatial = request.source_process == "spatial_correlation_stress"
-        || request.pair_geometry.ends_with("_positive")
-        || request.pair_geometry.ends_with("_negative");
+    let spatial = request.source_process == "spatial_correlation_stress";
+    let cohort_ordinal = match request.half_window.as_str() {
+        "hw_1x1" => 0,
+        "hw_3x6" => 1,
+        "hw_7x14" => 2,
+        _ => anyhow::bail!("frozen spatial DGP half-window cohort is unsupported"),
+    };
     let negative = request.pair_geometry.ends_with("_negative");
     let loading = |coordinate: (i64, i64)| {
         if !negative
@@ -1660,21 +2008,15 @@ pub fn run_frozen_attempt(
             -1.0
         }
     };
-    let mut raw = BTreeMap::new();
-    for &coordinate in &possible_halo {
-        raw.insert(
-            coordinate,
-            tables.source_history(
-                dgp_ordinal,
-                request.seed_index,
-                coordinate,
-                geometry.dates,
-                spatial,
-                &request.eigen_stress,
-                loading(coordinate),
-            )?,
-        );
-    }
+    let raw = tables.source_histories(
+        cohort_ordinal,
+        request.seed_index,
+        &possible_halo,
+        geometry.dates,
+        spatial,
+        &request.eigen_stress,
+        loading,
+    )?;
     let mut stack = Array3::from_elem(
         (geometry.dates, crop_shape.0, crop_shape.1),
         Cf64::new(0.0, 0.0),
@@ -4629,6 +4971,46 @@ mod tests {
         assert_eq!(
             execute_tied_probe(&preregistration).unwrap(),
             dolphin_io::CovarianceOperatorStatus::SingularLocalInformation
+        );
+    }
+
+    #[test]
+    fn portable_spatial_source_matches_python_golden_after_full_filter_halo() {
+        let preregistration: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_preregistration.json"
+        )))
+        .unwrap();
+        let asset: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../validation/spatial_covariance_portable_tables.json"
+        )))
+        .unwrap();
+        let tables = PortableDgpTables::from_documents(&preregistration, &asset).unwrap();
+        let coordinate = (-4, 19);
+        let values = tables
+            .source_histories(
+                17,
+                23,
+                &BTreeSet::from([coordinate]),
+                4,
+                true,
+                "well_separated",
+                |_| -1.0,
+            )
+            .unwrap();
+        let bits = values[&coordinate]
+            .iter()
+            .map(|value| (value.re.to_bits(), value.im.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bits,
+            vec![
+                (0xbfe8_5f56_a000_0000, 0xbfef_c7d0_8000_0000),
+                (0xbfee_cd4c_a000_0000, 0xbfb3_e1dc_4000_0000),
+                (0xbfbb_947e_4000_0000, 0xbfd2_755c_6000_0000),
+                (0xbff6_291a_2000_0000, 0x3fca_a747_e000_0000),
+            ]
         );
     }
 

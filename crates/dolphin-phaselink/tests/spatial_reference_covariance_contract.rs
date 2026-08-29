@@ -2,7 +2,9 @@
 
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::covariance::replay_rect_pixel_covariance;
-use dolphin_phaselink::estimator::{process_coherence_matrix, FixedEstimatorBranch};
+use dolphin_phaselink::estimator::{
+    phase_angle_jvp, process_coherence_matrix, FixedEstimatorBranch, PhaseAngleLinearization,
+};
 use dolphin_phaselink::{
     contract_source_factors, reference_specific_influence_v1, NativeSourcePixel,
     ProperComplexFactor, SpatialInfluenceError,
@@ -271,6 +273,51 @@ fn evd_and_emi_source_jvps_match_finite_difference() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn prepared_phase_linearization_matches_repeated_jvps_exactly() {
+    let stack = stack();
+    let validity = Array2::from_elem((5, 5), true);
+    let replay = replay_rect_pixel_covariance(
+        stack.view(),
+        (1, 1),
+        HalfWindow { y: 1, x: 1 },
+        Strides { y: 1, x: 1 },
+        validity.view(),
+    )
+    .unwrap();
+    let dimensions = replay.coherence.dim();
+    let directions = [
+        Array2::from_shape_fn(dimensions, |(row, column)| {
+            Cf64::new(
+                (row + column + 1) as f64 * 1e-3,
+                (row as f64 - column as f64) * 2e-4,
+            )
+        }),
+        Array2::from_shape_fn(dimensions, |(row, column)| {
+            Cf64::new(
+                (row * column + 1) as f64 * -3e-4,
+                (column as f64 - row as f64) * 1e-4,
+            )
+        }),
+    ];
+    for branch in [
+        FixedEstimatorBranch::Evd,
+        FixedEstimatorBranch::Emi {
+            beta: 0.2,
+            zero_correlation_threshold: 1e-8,
+        },
+    ] {
+        let prepared =
+            PhaseAngleLinearization::prepare(replay.coherence.view(), branch, 0, 1e-9).unwrap();
+        for direction in &directions {
+            let expected =
+                phase_angle_jvp(replay.coherence.view(), direction.view(), branch, 0, 1e-9)
+                    .unwrap();
+            assert_eq!(prepared.apply(direction.view()).unwrap(), expected);
         }
     }
 }

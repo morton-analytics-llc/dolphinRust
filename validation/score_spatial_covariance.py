@@ -43,9 +43,9 @@ FROZEN_MAX_RESOURCE_RECEIPT_BYTES = 1 << 20
 FROZEN_CELL_SUMMARY_COMPONENT_BYTES = FROZEN_CELL_COUNT * FROZEN_MAX_CELL_SUMMARY_BYTES
 FROZEN_RETAINED_SIZE_BOUND_BYTES = 21307392
 FROZEN_PROCESS_RSS_BYTES = 24 << 30
-FROZEN_GENERATOR_SHA256 = "75271bdfb15d7c1ed480be174d9fc6ddc820039b770fc8138cb5e7d422024537"
+FROZEN_GENERATOR_SHA256 = "924764fe0763c67896dc2e29fe132446ec2a5abdc2e858f7988e2b90ddd98259"
 FROZEN_SCIENTIFIC_GENERATOR_SHA256 = "47d76bebd40f9f350c21a9f5d4c1e446ad5a73b976b698e4b866e5cdc46c5601"
-FROZEN_EXECUTION_SHA256 = "9ed52db3a4f33d1874cbb2e5f4765455ebae1264ab9d3bd0c3ecdae1294d383c"
+FROZEN_EXECUTION_SHA256 = "6350ae1568314b2a2039793dc38f9ec98763b24018f808a614d92aaabd5a19b7"
 FROZEN_REDUCERS_SHA256 = "ad4155f90ebc3f29746c11ea67b45d0efe14f50498899d51d3c13f94d7454368"
 FROZEN_MATRIX_SHA256 = "f4bc6d578df66b191430d0818195e7673284b85836a1ac94b40c09291334b61d"
 FROZEN_RECEIPT_SHA256 = "8e9a26f5b657679d64742059543b8be12952c336d60f369f8d8a17ea2ee098fd"
@@ -54,19 +54,20 @@ FROZEN_RESOURCE_SAMPLING_SHA256 = "0874fc530fda38d9f0e72b548549f47d749789e2c380c
 FROZEN_RESOURCE_MATRIX_SHA256 = "2da4e6ab51c72437791b4ae8c225e1df7a4e78da74838dfbade162335e2fdd69"
 FROZEN_CELL_POLICY_SHA256 = "393edffc872fa11fcb7c5c788205735ca622dc913ae818ce115714ffeeabec79"
 FROZEN_V5_PREREGISTRATION_SHA256 = "568e2f713c5468b5ad76a3b82aa61b8b2959c415beeca6fec252b11a9376907c"
-FROZEN_DETERMINISM_SHA256 = "c75bd7704d175d128790a11901f646e9792f81cc753859828e8ae2ff27a2afe2"
+FROZEN_DETERMINISM_SHA256 = "2722e0c4438878a9da4b92e63fadf26f18c83642530159087e0b92898dbd2b9f"
 FROZEN_NUMERIC_SHA256 = "3ba716628b06bc83004c1d7fb971eef39f9a86dc9f5f4330e5cb649961a3f413"
 FROZEN_NORMAL_QUANTILE_SHA256 = "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4"
-FROZEN_DGP_COEFFICIENT_SHA256 = "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3"
-FROZEN_PORTABLE_DGP_TABLE_SHA256 = "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
-FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_140_431
-FROZEN_PORTABLE_DGP_ASSET_SHA256 = "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add"
+FROZEN_DGP_COEFFICIENT_SHA256 = "db69309c9c331532a3813dd7bbdf19b8f6c2852e63cf58b1437f58c4ae78fbb5"
+FROZEN_PORTABLE_DGP_TABLE_SHA256 = "f3025ec3a8635281705c22da1ed60375aa24a0efb1917c8482c5557e99ed70cf"
+FROZEN_PORTABLE_DGP_ASSET_BYTES = 3_143_140
+FROZEN_PORTABLE_DGP_ASSET_SHA256 = "5ea0553983f0c1d96cb6a3274087d3ebd037adce42e523709f6b69a6f1af26ab"
 FROZEN_PORTABLE_DGP_COORDINATE_COUNT = 29_243
-FROZEN_SOURCE_SET_SHA256 = "7823a57b89d44dda58ef4ab4b4e10d2003fdbabc9907a1b22f43f102ee0428fc"
+FROZEN_SOURCE_SET_SHA256 = "f599be192bc1ee7303bade6221ef5f8a63d0369a9ebd79bfcc56664295b22221"
 FROZEN_SOURCE_SET_ROOTS = ("crates",)
 FROZEN_SOURCE_SET_FILES = (
     "Cargo.lock",
     "Cargo.toml",
+    "validation/run_spatial_covariance_parallel.py",
     "validation/score_spatial_covariance.py",
     "validation/spatial_covariance_simulation.py",
 )
@@ -836,6 +837,8 @@ def validate_preregistration(preregistration: Mapping[str, Any]) -> None:
         errors.append("v6 retained evidence does not satisfy the frozen compact bound")
     if execution.get("process_rss_bytes_max") != FROZEN_PROCESS_RSS_BYTES:
         errors.append("execution process cap must equal the frozen 24 GiB resource threshold")
+    if execution.get("attempt_rayon_threads") != 1:
+        errors.append("each cell-parallel Rust attempt process must use one Rayon worker")
     if (
         execution.get("protocol_version") != 6
         or execution.get("run_manifest_schema")
@@ -1059,10 +1062,23 @@ def portable_dgp_key_sha256(
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=8192)
 def _f64_from_bits(bits: str) -> float:
     if not isinstance(bits, str) or len(bits) != 16 or any(value not in "0123456789abcdef" for value in bits):
         raise SchemaError("portable DGP table contains an invalid IEEE-754 bit string")
     return struct.unpack("<d", struct.pack("<Q", int(bits, 16)))[0]
+
+
+_PORTABLE_NORMAL_CACHE: dict[int, tuple[Mapping[str, Any], tuple[float, ...]]] = {}
+
+
+def _portable_normal_entries(preregistration: Mapping[str, Any]) -> tuple[float, ...]:
+    table = _portable_dgp_tables(preregistration)["normal_quantile"]
+    cached = _PORTABLE_NORMAL_CACHE.get(id(table))
+    if cached is None or cached[0] is not table:
+        cached = (table, tuple(_f64_from_bits(bits) for bits in table["entries"]))
+        _PORTABLE_NORMAL_CACHE[id(table)] = cached
+    return cached[1]
 
 
 def portable_normal(
@@ -1075,7 +1091,198 @@ def portable_normal(
     ))
     word = int.from_bytes(digest[:8], "little")
     index = word >> (64 - table["index_bits"])
-    return _f64_from_bits(table["entries"][index])
+    return _portable_normal_entries(preregistration)[index]
+
+
+def _spatial_white_block(
+    preregistration: Mapping[str, Any], cohort_ordinal: int, seed_index: int,
+    date_index: int, stream: str, block: int,
+) -> bytes:
+    integers = (cohort_ordinal, seed_index, date_index, block)
+    if (
+        any(not _integer(value) for value in integers)
+        or not 0 <= cohort_ordinal < 2**64
+        or not 0 <= seed_index < 2**64
+        or not 0 <= date_index < 2**32
+        or not 0 <= block < 2**64
+        or not isinstance(stream, str)
+    ):
+        raise SchemaError("portable spatial DGP block key is invalid")
+    try:
+        stream_bytes = stream.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise SchemaError("portable spatial DGP stream must be ASCII") from exc
+    if not stream_bytes or len(stream_bytes) >= 2**16:
+        raise SchemaError("portable spatial DGP stream length is invalid")
+    digest = hashlib.sha256()
+    digest.update(b"dolphinrust:spatial-covariance-field-white:v1\0")
+    digest.update(bytes.fromhex(_dgp_generator_identity(preregistration)))
+    digest.update(struct.pack("<QQI", cohort_ordinal, seed_index, date_index))
+    digest.update(struct.pack("<H", len(stream_bytes)))
+    digest.update(stream_bytes)
+    digest.update(struct.pack("<Q", block))
+    return digest.digest()
+
+
+def _spatial_white_normal(
+    preregistration: Mapping[str, Any], cohort_ordinal: int, seed_index: int,
+    coordinate: tuple[int, int], date_index: int, stream: str,
+    block_cache: dict[int, bytes] | None = None,
+) -> float:
+    frozen = _portable_dgp_tables(preregistration)["coefficients"]["spatial_filter"]
+    lattice_min = frozen["white_lattice_min"]
+    lattice_side = frozen["white_lattice_side"]
+    normals_per_block = frozen["normal_values_per_block"]
+    row = coordinate[0] - lattice_min
+    column = coordinate[1] - lattice_min
+    if not 0 <= row < lattice_side or not 0 <= column < lattice_side:
+        raise SchemaError("portable spatial DGP white coordinate exceeds the frozen lattice")
+    linear = row * lattice_side + column
+    block, slot = divmod(linear, normals_per_block)
+    cache = block_cache if block_cache is not None else {}
+    digest = cache.get(block)
+    if digest is None:
+        digest = _spatial_white_block(
+            preregistration, cohort_ordinal, seed_index, date_index, stream, block
+        )
+        cache[block] = digest
+    table = _portable_dgp_tables(preregistration)["normal_quantile"]
+    index = 0
+    for offset in range(table["index_bits"]):
+        bit = slot * table["index_bits"] + offset
+        index = (index << 1) | ((digest[bit // 8] >> (7 - bit % 8)) & 1)
+    return _portable_normal_entries(preregistration)[index]
+
+
+def _spatial_field(
+    preregistration: Mapping[str, Any], cohort_ordinal: int, seed_index: int,
+    coordinates: Sequence[tuple[int, int]], date_index: int, stream: str,
+) -> dict[tuple[int, int], float]:
+    ordered = sorted(set(coordinates))
+    if not ordered:
+        raise SchemaError("portable spatial DGP coordinate set is empty")
+    frozen = _portable_dgp_tables(preregistration)["coefficients"]["spatial_filter"]
+    radius = frozen["radius"]
+    rank = frozen["rank"]
+    vertical = [
+        [_f64_from_bits(value) for value in factor]
+        for factor in frozen["vertical_factor_bits"]
+    ]
+    horizontal_factors = [
+        [_f64_from_bits(value) for value in factor]
+        for factor in frozen["horizontal_factor_bits"]
+    ]
+    if (
+        radius != 8
+        or rank != 3
+        or frozen.get("white_lattice_min") != -12
+        or frozen.get("white_lattice_side") != 337
+        or frozen.get("normal_values_per_block") != 21
+        or len(vertical) != rank
+        or len(horizontal_factors) != rank
+        or any(len(factor) != 2 * radius + 1 for factor in vertical)
+        or any(len(factor) != 2 * radius + 1 for factor in horizontal_factors)
+    ):
+        raise SchemaError("portable spatial DGP filter shape differs")
+    min_row = ordered[0][0]
+    max_row = ordered[-1][0]
+    min_column = min(coordinate[1] for coordinate in ordered)
+    max_column = max(coordinate[1] for coordinate in ordered)
+    white_row_start = min_row - radius
+    white_row_stop = max_row + radius
+    white_column_start = min_column - radius
+    white_column_stop = max_column + radius
+    lattice_min = frozen["white_lattice_min"]
+    lattice_stop = lattice_min + frozen["white_lattice_side"]
+    if (
+        white_row_start < lattice_min
+        or white_column_start < lattice_min
+        or white_row_stop >= lattice_stop
+        or white_column_stop >= lattice_stop
+    ):
+        raise SchemaError("portable spatial DGP white coordinate exceeds the frozen lattice")
+    white_rows = white_row_stop - white_row_start + 1
+    white_columns = white_column_stop - white_column_start + 1
+    table = _portable_dgp_tables(preregistration)["normal_quantile"]
+    entries = _portable_normal_entries(preregistration)
+    index_bits = table["index_bits"]
+    index_mask = (1 << index_bits) - 1
+    digest_bits = hashlib.sha256().digest_size * 8
+    if (
+        not _integer(cohort_ordinal)
+        or not 0 <= cohort_ordinal < 2**64
+        or not _integer(seed_index)
+        or not 0 <= seed_index < 2**64
+        or not _integer(date_index)
+        or not 0 <= date_index < 2**32
+        or not isinstance(stream, str)
+    ):
+        raise SchemaError("portable spatial DGP block key is invalid")
+    try:
+        stream_bytes = stream.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise SchemaError("portable spatial DGP stream must be ASCII") from exc
+    if not stream_bytes or len(stream_bytes) >= 2**16:
+        raise SchemaError("portable spatial DGP stream length is invalid")
+    digest_prefix = hashlib.sha256()
+    digest_prefix.update(b"dolphinrust:spatial-covariance-field-white:v1\0")
+    digest_prefix.update(bytes.fromhex(_dgp_generator_identity(preregistration)))
+    digest_prefix.update(struct.pack("<QQI", cohort_ordinal, seed_index, date_index))
+    digest_prefix.update(struct.pack("<H", len(stream_bytes)))
+    digest_prefix.update(stream_bytes)
+    block_cache: dict[int, int] = {}
+    white = np.empty((white_rows, white_columns), dtype=np.float64)
+    for row_offset, row in enumerate(range(white_row_start, white_row_stop + 1)):
+        column_offset = 0
+        while column_offset < white_columns:
+            column = white_column_start + column_offset
+            linear = (
+                (row - frozen["white_lattice_min"]) * frozen["white_lattice_side"]
+                + column
+                - frozen["white_lattice_min"]
+            )
+            block, slot = divmod(linear, frozen["normal_values_per_block"])
+            packed = block_cache.get(block)
+            if packed is None:
+                digest = digest_prefix.copy()
+                digest.update(struct.pack("<Q", block))
+                packed = int.from_bytes(digest.digest(), "big")
+                block_cache[block] = packed
+            count = min(
+                frozen["normal_values_per_block"] - slot,
+                white_columns - column_offset,
+            )
+            for value_offset in range(count):
+                shift = digest_bits - (slot + value_offset + 1) * index_bits
+                index = (packed >> shift) & index_mask
+                white[row_offset, column_offset + value_offset] = entries[index]
+            column_offset += count
+    output_columns = max_column - min_column + 1
+    filtered = np.zeros((rank, white_rows, output_columns), dtype=np.float64)
+    for component in range(rank):
+        for offset in range(2 * radius + 1):
+            filtered[component] += (
+                horizontal_factors[component][offset]
+                * white[:, offset : offset + output_columns]
+            )
+    rows = np.asarray(
+        [coordinate[0] - radius - white_row_start for coordinate in ordered],
+        dtype=np.intp,
+    )
+    columns = np.asarray(
+        [coordinate[1] - min_column for coordinate in ordered], dtype=np.intp
+    )
+    values = np.zeros(len(ordered), dtype=np.float64)
+    for component in range(rank):
+        for offset in range(2 * radius + 1):
+            values += (
+                vertical[component][offset]
+                * filtered[component, rows + offset, columns]
+            )
+    field = {}
+    for coordinate, value in zip(ordered, values):
+        field[coordinate] = float(value)
+    return field
 
 
 def numeric_digest(domain: str, values: Iterable[float]) -> str:
@@ -1444,15 +1651,17 @@ def _effective_replay_support(
         )
         for output in sorted(active_outputs[index]):
             candidates = fixed_support(output)
-            block_raw = {
+            block_magnitudes = {
                 coordinate: [
-                    raw_by_source[coordinate][acquisition]
+                    abs(raw_by_source[coordinate][acquisition])
                     for acquisition in block_dates
                 ]
                 for coordinate in candidates
             }
             effective_support.update(
-                _select_support(method, candidates, output_center(output), block_raw)
+                _select_support(
+                    method, candidates, output_center(output), block_magnitudes
+                )
             )
             first_parent = block["block_id"] - block["num_compressed"]
             for parent_id in range(first_parent, block["block_id"]):
@@ -1470,15 +1679,22 @@ def _generate_complex_source(
     eigen_stress: str,
     global_loading: float,
 ) -> list[complex]:
+    if spatial:
+        return _generate_complex_sources(
+            preregistration,
+            cell_ordinal,
+            seed_index,
+            [coordinate],
+            date_count,
+            True,
+            eigen_stress,
+            {coordinate: global_loading},
+        )[coordinate]
     coefficients = _portable_dgp_tables(preregistration)["coefficients"]
     temporal_rho = _f64_from_bits(coefficients["temporal_rho_bits"])
     innovation_weight = _f64_from_bits(coefficients["innovation_weight_bits"])
-    if spatial:
-        local_weight = _f64_from_bits(coefficients["spatial_local_weight_bits"])
-        spatial_weight = _f64_from_bits(coefficients["spatial_global_weight_bits"])
-    else:
-        local_weight = _f64_from_bits(coefficients["independent_local_weight_bits"])
-        spatial_weight = _f64_from_bits(coefficients["independent_spatial_weight_bits"])
+    local_weight = _f64_from_bits(coefficients["independent_local_weight_bits"])
+    spatial_weight = _f64_from_bits(coefficients["independent_spatial_weight_bits"])
     noise_scale = _f64_from_bits(coefficients["noise_scale_bits"])
     amplitude_scales = coefficients["amplitude_scale_bits"][str(coordinate[0] + 3 * coordinate[1])][eigen_stress]
     phasors = coefficients["phasor_bits"][str(2 * coordinate[0] - coordinate[1])]
@@ -1565,6 +1781,121 @@ def _generate_complex_source(
     return values
 
 
+def _generate_complex_sources(
+    preregistration: Mapping[str, Any],
+    cohort_ordinal: int,
+    seed_index: int,
+    coordinates: Sequence[tuple[int, int]],
+    date_count: int,
+    spatial: bool,
+    eigen_stress: str,
+    loading_by_coordinate: Mapping[tuple[int, int], float],
+) -> dict[tuple[int, int], list[complex]]:
+    ordered = sorted(set(coordinates))
+    if not ordered:
+        return {}
+    if set(ordered) != set(loading_by_coordinate):
+        raise SchemaError("portable DGP loading coordinates differ")
+    if any(loading_by_coordinate[coordinate] not in {-1.0, 1.0} for coordinate in ordered):
+        raise SchemaError("portable DGP loading must be exactly positive or negative one")
+    if not spatial:
+        return {
+            coordinate: _generate_complex_source(
+                preregistration,
+                cohort_ordinal,
+                seed_index,
+                coordinate,
+                date_count,
+                False,
+                eigen_stress,
+                loading_by_coordinate[coordinate],
+            )
+            for coordinate in ordered
+        }
+    coefficients = _portable_dgp_tables(preregistration)["coefficients"]
+    temporal_rho = _f64_from_bits(coefficients["temporal_rho_bits"])
+    innovation_weight = _f64_from_bits(coefficients["innovation_weight_bits"])
+    noise_scale = _f64_from_bits(coefficients["noise_scale_bits"])
+    states = {coordinate: (0.0, 0.0) for coordinate in ordered}
+    histories = {coordinate: [] for coordinate in ordered}
+    for acquisition in range(date_count):
+        signal_real = _spatial_field(
+            preregistration,
+            cohort_ordinal,
+            seed_index,
+            ordered,
+            acquisition,
+            "spatial-signal-real",
+        )
+        signal_imaginary = _spatial_field(
+            preregistration,
+            cohort_ordinal,
+            seed_index,
+            ordered,
+            acquisition,
+            "spatial-signal-imag",
+        )
+        noise_real = _spatial_field(
+            preregistration,
+            cohort_ordinal,
+            seed_index,
+            ordered,
+            acquisition,
+            "spatial-noise-real",
+        )
+        noise_imaginary = _spatial_field(
+            preregistration,
+            cohort_ordinal,
+            seed_index,
+            ordered,
+            acquisition,
+            "spatial-noise-imag",
+        )
+        for coordinate in ordered:
+            amplitude = _f64_from_bits(
+                coefficients["amplitude_scale_bits"][
+                    str(coordinate[0] + 3 * coordinate[1])
+                ][eigen_stress][acquisition]
+            )
+            cosine = _f64_from_bits(
+                coefficients["phasor_bits"][str(2 * coordinate[0] - coordinate[1])][
+                    acquisition
+                ][0]
+            )
+            sine = _f64_from_bits(
+                coefficients["phasor_bits"][str(2 * coordinate[0] - coordinate[1])][
+                    acquisition
+                ][1]
+            )
+            previous_real, previous_imaginary = states[coordinate]
+            if acquisition == 0:
+                state_real = signal_real[coordinate]
+                state_imaginary = signal_imaginary[coordinate]
+            else:
+                state_real = (
+                    temporal_rho * previous_real
+                    + innovation_weight * signal_real[coordinate]
+                )
+                state_imaginary = (
+                    temporal_rho * previous_imaginary
+                    + innovation_weight * signal_imaginary[coordinate]
+                )
+            states[coordinate] = (state_real, state_imaginary)
+            base_real = amplitude * state_real + noise_scale * noise_real[coordinate]
+            base_imaginary = loading_by_coordinate[coordinate] * (
+                amplitude * state_imaginary + noise_scale * noise_imaginary[coordinate]
+            )
+            value_real = base_real * cosine - base_imaginary * sine
+            value_imaginary = base_real * sine + base_imaginary * cosine
+            histories[coordinate].append(
+                complex(
+                    struct.unpack("<f", struct.pack("<f", value_real))[0],
+                    struct.unpack("<f", struct.pack("<f", value_imaginary))[0],
+                )
+            )
+    return histories
+
+
 def _latent_phase_history(
     preregistration: Mapping[str, Any],
     coordinate: Sequence[int],
@@ -1580,29 +1911,54 @@ def _select_support(
     method: str,
     candidates: Sequence[tuple[int, int]],
     center: Sequence[int],
-    raw_by_source: Mapping[tuple[int, int], Sequence[complex]],
+    magnitudes_by_source: Mapping[tuple[int, int], Sequence[float]],
 ) -> list[tuple[int, int]]:
     center_key = (center[0], center[1])
     if method == "rect":
         return list(candidates)
-    center_magnitudes = [abs(value) for value in raw_by_source[center_key]]
+    center_magnitudes = magnitudes_by_source[center_key]
+    if method == "glrt_frozen":
+        center_mean = sum(center_magnitudes) / len(center_magnitudes)
+        center_variance = (
+            sum((value - center_mean) ** 2 for value in center_magnitudes)
+            / len(center_magnitudes)
+        )
+        center_scale = (center_variance + center_mean * center_mean) / 2.0
+    else:
+        first = sorted(center_magnitudes)
+        sqrt_n = math.sqrt(len(first) / 2.0)
+        cutoff = 0.01
+        while cutoff <= 1.0:
+            value = cutoff * (sqrt_n + 0.12 + 0.11 / sqrt_n)
+            pvalue = min(
+                1.0,
+                max(
+                    0.0,
+                    2.0
+                    * sum(
+                        (-1.0) ** (term - 1)
+                        * math.exp(-2.0 * value * value * term * term)
+                        for term in range(1, 101)
+                    ),
+                ),
+            )
+            if pvalue <= 0.001:
+                break
+            cutoff += 0.001
+        ks_cutoff = cutoff if cutoff <= 1.0 else 0.1
     selected: list[tuple[int, int]] = []
     for coordinate in candidates:
         if coordinate == center_key:
             continue
-        magnitudes = [abs(value) for value in raw_by_source[coordinate]]
+        magnitudes = magnitudes_by_source[coordinate]
         if method == "glrt_frozen":
             mean = sum(magnitudes) / len(magnitudes)
             variance = sum((value - mean) ** 2 for value in magnitudes) / len(magnitudes)
-            center_mean = sum(center_magnitudes) / len(center_magnitudes)
-            center_variance = sum((value - center_mean) ** 2 for value in center_magnitudes) / len(center_magnitudes)
-            center_scale = (center_variance + center_mean * center_mean) / 2.0
             scale = (variance + mean * mean) / 2.0
             pooled = (center_scale + scale) / 2.0
             statistic = len(magnitudes) * (2.0 * math.log(pooled) - math.log(center_scale) - math.log(scale))
             keep = statistic < 10.827566170662733
         else:
-            first = sorted(center_magnitudes)
             second = sorted(magnitudes)
             index_first = index_second = output = 0
             cdf_first = cdf_second = distance = 0.0
@@ -1625,15 +1981,7 @@ def _select_support(
                     output += 1
                 output += 1
                 distance = max(distance, abs(cdf_first - cdf_second))
-            sqrt_n = math.sqrt(len(first) / 2.0)
-            cutoff = 0.01
-            while cutoff <= 1.0:
-                value = cutoff * (sqrt_n + 0.12 + 0.11 / sqrt_n)
-                pvalue = min(1.0, max(0.0, 2.0 * sum((-1.0) ** (term - 1) * math.exp(-2.0 * value * value * term * term) for term in range(1, 101))))
-                if pvalue <= 0.001:
-                    break
-                cutoff += 0.001
-            keep = distance < (cutoff if cutoff <= 1.0 else 0.1)
+            keep = distance < ks_cutoff
         if keep:
             selected.append(coordinate)
     return selected
@@ -1741,11 +2089,13 @@ def _tied_probe_attempt_inputs(
 def _cached_effective_looks_fraction(
     support: tuple[tuple[int, int], ...]
 ) -> float:
-    denominator = sum(
-        math.exp(-math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5)
-        for first in support
-        for second in support
-    )
+    coordinates = np.asarray(support, dtype=np.float64)
+    denominator = 0.0
+    for start in range(0, len(support), 128):
+        difference = coordinates[start : start + 128, None, :] - coordinates[None, :, :]
+        denominator += float(
+            np.exp(-np.hypot(difference[:, :, 0], difference[:, :, 1]) / 1.5).sum()
+        )
     return len(support) / denominator
 
 
@@ -1845,9 +2195,21 @@ def regenerate_frozen_attempt_inputs(
     date_count = topology["acquisition_count"]
     dgp_cell_ordinal = _dgp_cell_ordinal(preregistration, cell_id)
     negative_pair = labels["pair_geometry"].endswith("_negative")
-    pair_has_signed_loading = PAIR_SIGN[labels["pair_geometry"]] in {"positive", "negative"}
-    spatial = labels["source_process"] == "spatial_correlation_stress" or pair_has_signed_loading
-    candidate_loading = {
+    spatial = labels["source_process"] == "spatial_correlation_stress"
+    cohort_ordinal = {
+        "hw_1x1": 0,
+        "hw_3x6": 1,
+        "hw_7x14": 2,
+    }[labels["half_window"]]
+    raw_cube_support = set(candidate_union)
+    for _ in topology["expected_blocks"]:
+        raw_cube_support = set(
+            _source_factor_support(
+                raw_cube_support, window["half_window"], native_tile_shape
+            )
+        )
+    raw_cube_support = sorted(raw_cube_support)
+    global_loading_by_source = {
         coordinate: (
             1.0
             if not negative_pair
@@ -1855,25 +2217,42 @@ def regenerate_frozen_attempt_inputs(
             <= (coordinate[0] - reference[0]) ** 2 + (coordinate[1] - reference[1]) ** 2
             else -1.0
         )
-        for coordinate in candidate_union
+        for coordinate in raw_cube_support
     }
+    raw_by_source = _generate_complex_sources(
+        preregistration,
+        cohort_ordinal,
+        seed_index,
+        raw_cube_support,
+        date_count,
+        spatial,
+        labels["eigen_stress"],
+        global_loading_by_source,
+    )
     phase_raw_by_source = {
-        coordinate: _generate_complex_source(
-            preregistration, dgp_cell_ordinal, seed_index, coordinate, date_count,
-            spatial, labels["eigen_stress"], candidate_loading[coordinate],
-        )
-        for coordinate in candidate_union
+        coordinate: raw_by_source[coordinate] for coordinate in candidate_union
     }
     target_supports = []
     reference_supports = []
     for block in topology["expected_blocks"]:
         block_dates = range(block["real_start"], block["real_start"] + block["num_real"])
-        block_raw = {
-            coordinate: [phase_raw_by_source[coordinate][acquisition] for acquisition in block_dates]
+        block_magnitudes = {
+            coordinate: [
+                abs(phase_raw_by_source[coordinate][acquisition])
+                for acquisition in block_dates
+            ]
             for coordinate in candidate_union
         }
-        target_supports.append(_select_support(labels["support"], target_candidates, target, block_raw))
-        reference_supports.append(_select_support(labels["support"], reference_candidates, reference, block_raw))
+        target_supports.append(
+            _select_support(
+                labels["support"], target_candidates, target, block_magnitudes
+            )
+        )
+        reference_supports.append(
+            _select_support(
+                labels["support"], reference_candidates, reference, block_magnitudes
+            )
+        )
     target_support = sorted(set().union(*map(set, target_supports)))
     reference_support = sorted(set().union(*map(set, reference_supports)))
     union_support = sorted(set(target_support) | set(reference_support))
@@ -1888,33 +2267,10 @@ def regenerate_frozen_attempt_inputs(
     ]
     target_raw_support = sorted(set().union(*map(set, target_factor_supports)))
     reference_raw_support = sorted(set().union(*map(set, reference_factor_supports)))
-    raw_cube_support = set(candidate_union)
-    for _ in topology["expected_blocks"]:
-        raw_cube_support = set(
-            _source_factor_support(
-                raw_cube_support, window["half_window"], native_tile_shape
-            )
-        )
-    raw_cube_support = sorted(
-        raw_cube_support | set(target_raw_support) | set(reference_raw_support)
-    )
-    global_loading_by_source = {
-        coordinate: (
-            1.0
-            if not negative_pair
-            or (coordinate[0] - target[0]) ** 2 + (coordinate[1] - target[1]) ** 2
-            <= (coordinate[0] - reference[0]) ** 2 + (coordinate[1] - reference[1]) ** 2
-            else -1.0
-        )
-        for coordinate in raw_cube_support
-    }
-    raw_by_source = {
-        coordinate: phase_raw_by_source.get(coordinate) or _generate_complex_source(
-            preregistration, dgp_cell_ordinal, seed_index, coordinate, date_count,
-            spatial, labels["eigen_stress"], global_loading_by_source[coordinate],
-        )
-        for coordinate in raw_cube_support
-    }
+    if not set(target_raw_support).issubset(raw_by_source) or not set(
+        reference_raw_support
+    ).issubset(raw_by_source):
+        raise SchemaError("portable DGP transitive halo is incomplete")
     effective_support = (
         _effective_replay_support(
             cell_id,

@@ -140,6 +140,7 @@
     "max_encoded_run_manifest_bytes": 16777216,
     "retained_size_bound_bytes": 21307392,
     "process_rss_bytes_max": 25769803776,
+    "attempt_rayon_threads": 1,
     "partial_suffix": ".partial",
     "commit_rule": "each cell summary atomically commits after exact regenerated request order, raw DGP and latent-history comparison, deterministic analytic or stochastic online empirical operator validation, E C E-prime validation, attempt digest, count, and scope validation; one whole-frame and one bounded production HDF5 parity fixture commit at run scope",
     "resume_rule": "reuse requires Rust spatial_covariance_batch replay from seed zero and exact regenerated attempt digest plus byte-identical independently recomputed summary; without that executable the cell is not reusable",
@@ -264,8 +265,8 @@
     },
     "normal_transform": "first uint64_le word of the counter digest; index=word>>(64-index_bits); exact IEEE754 binary64 value loaded from the frozen midpoint inverse-normal LUT; no runtime logarithm, square root, sine, or cosine",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
-    "coefficient_sha256": "56a99bd56ae4ba884ca44ba998b113bbe42c1ee0bb6da92b73d325c13e07ba69",
-    "portable_table_sha256": "414563dae4de1278fba5fb410ec7687959c74e88f04e0261f85978007a1a75ff",
+    "coefficient_sha256": "db69309c9c331532a3813dd7bbdf19b8f6c2852e63cf58b1437f58c4ae78fbb5",
+    "portable_table_sha256": "f3025ec3a8635281705c22da1ed60375aa24a0efb1917c8482c5557e99ed70cf",
     "complex_normal": "four independent named local streams and four cell-global streams per source-factor halo coordinate/date",
     "complex_storage": "fixed scalar operation order, fused multiply-add prohibited, final real and imaginary components rounded to IEEE754 binary32 before the common frozen phasor",
     "matrix_order": "source coordinates row-major, acquisition ascending, component real then imag; estimate histories target then reference; covariance and online reductions row-major",
@@ -679,6 +680,7 @@
         "files": [
           "Cargo.lock",
           "Cargo.toml",
+          "validation/run_spatial_covariance_parallel.py",
           "validation/score_spatial_covariance.py",
           "validation/spatial_covariance_simulation.py"
         ],
@@ -686,7 +688,7 @@
           "FROZEN_GENERATOR_SHA256",
           "FROZEN_SOURCE_SET_SHA256"
         ],
-        "sha256": "7823a57b89d44dda58ef4ab4b4e10d2003fdbabc9907a1b22f43f102ee0428fc"
+        "sha256": "f599be192bc1ee7303bade6221ef5f8a63d0369a9ebd79bfcc56664295b22221"
       },
       "producer_binary_identity": {
         "schema": "dolphinrust.spatial-covariance.producer-binary-bundle/1",
@@ -2244,10 +2246,10 @@
   "portable_dgp_asset": {
     "schema": "dolphinrust.spatial-covariance.portable-dgp-asset/1",
     "path": "spatial_covariance_portable_tables.json",
-    "byte_count": 3140431,
-    "sha256": "d71c34939effe0e01baa5b29d9b9e45c4e1382da88d50b4751995e4c237e4add",
+    "byte_count": 3143140,
+    "sha256": "5ea0553983f0c1d96cb6a3274087d3ebd037adce42e523709f6b69a6f1af26ab",
     "normal_quantile_sha256": "35c91380e9b6c7b388ff195391cc1a16700b3c028e397ea0d940374d821b53a4",
-    "coefficient_sha256": "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3",
-    "table_sha256": "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
+    "coefficient_sha256": "db69309c9c331532a3813dd7bbdf19b8f6c2852e63cf58b1437f58c4ae78fbb5",
+    "table_sha256": "f3025ec3a8635281705c22da1ed60375aa24a0efb1917c8482c5557e99ed70cf"
   }
 }

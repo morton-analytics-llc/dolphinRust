@@ -4109,6 +4109,40 @@
     "independent_spatial_weight_bits": "0000000000000000",
     "spatial_local_weight_bits": "3fe6a09e667f3bcd",
     "spatial_global_weight_bits": "3fe6a09e667f3bcd",
+    "spatial_filter": {
+      "radius": 8,
+      "rank": 3,
+      "white_lattice_min": -12,
+      "white_lattice_side": 337,
+      "normal_values_per_block": 21,
+      "distance_scale_pixels": 1.5,
+      "normal_second_moment_bits": "3feffd5fc0c84f59",
+      "whitening_scale_bits": "3ff000a81a269339",
+      "covariance_max_abs_error": 0.0010029387553392513,
+      "covariance_error_bound": 0.00101,
+      "vertical_factor_bits": [
+        [
+          "bf47ec06f4715c00", "bf597a5148b417c6", "bf6b7921e2e446a1", "bf7e1de4fd3a0641", "bf90e444bdb94615", "bfa39da841ce9233", "bfb823aa52a2173b", "bfd06d39a8ba4291", "bfed729f5be51b67", "bfd06d39a8ba4291", "bfb823aa52a2173b", "bfa39da841ce9233", "bf90e444bdb9461c", "bf7e1de4fd3a0651", "bf6b7921e2e446a1", "bf597a5148b4197a", "bf47ec06f4715f18"
+        ],
+        [
+          "bf6d666d80a28100", "bf7e9a38f92dcc3d", "bf9003d7c759833a", "bfa0dc3dca8518a1", "bfb1d7bbbb99ba69", "bfc2e6558934f5a0", "bfd3a6bf0f595213", "bfe19fab35555fb1", "3fd8adc5bcaf6152", "bfe19fab35555faf", "bfd3a6bf0f595213", "bfc2e6558934f5a0", "bfb1d7bbbb99ba6e", "bfa0dc3dca8518a1", "bf9003d7c75982e1", "bf7e9a38f92dc73c", "bf6d666d80a28903"
+        ],
+        [
+          "bf9472c6def53850", "bfa3f0957d3bd69b", "bfb3243e867ffcb8", "bfc1dd4686ae2e8a", "bfcf8aafef490400", "bfd87ba2a93495d6", "bfd8c46086996eda", "3fd59d1ba6013e6e", "bfb0c184ede047fd", "3fd59d1ba6013e5f", "bfd8c46086996ede", "bfd87ba2a93495d5", "bfcf8aafef4903ff", "bfc1dd4686ae2e87", "bfb3243e867ffcba", "bfa3f0957d3bd5d7", "bf9472c6def5375a"
+        ]
+      ],
+      "horizontal_factor_bits": [
+        [
+          "bf478841c626d436", "bf59100ef91bedae", "bf6b068d25140e69", "bf7da049b581602c", "bf909dd1b9c8c5a4", "bfa34bd8ad32e111", "bfb7befd18393254", "bfd028b721b92e1c", "bfecf7ce65003475", "bfd028b721b92e1a", "bfb7befd18393254", "bfa34bd8ad32e112", "bf909dd1b9c8c5a4", "bf7da049b581602d", "bf6b068d25140efe", "bf59100ef91bed4f", "bf478841c626d42a"
+        ],
+        [
+          "bf451a3fc171b31e", "bf55f72cd5499c8c", "bf66fd7e70b35d02", "bf783424939b8bee", "bf899d2b83cad17b", "bf9b21a0ec1b8031", "bfac35d8223f67c9", "bfb94cafdf6bb840", "3fb1b6b6322c3dc4", "bfb94cafdf6bb83e", "bfac35d8223f67c9", "bf9b21a0ec1b8030", "bf899d2b83cad17b", "bf783424939b8bf0", "bf66fd7e70b35cd2", "bf55f72cd5499ee4", "bf451a3fc171b31e"
+        ],
+        [
+          "bf3b69cf88f247a0", "bf4abb45ba37f33d", "bf59a954f617eb6a", "bf67f2fe47660c8b", "bf7524841624d38c", "bf80693cbaadd8ae", "bf8099ff167180c0", "3f7cf9c1e290acd2", "bf567695ffa8676b", "3f7cf9c1e290acdf", "bf8099ff167180c1", "bf80693cbaadd8ab", "bf7524841624d38c", "bf67f2fe47660c98", "bf59a954f617ec49", "bf4abb45ba37f7c5", "bf3b69cf88f247a1"
+        ]
+      ]
+    },
     "noise_scale_bits": "3fd6a09e667f3bcd",
     "amplitude_scale_bits": {
       "0": {
@@ -121365,7 +121399,7 @@
       ]
     }
   },
-  "coefficient_sha256": "3bdca3c1b84be38d4085f7ddb57554bfd5d57cf0c0749a3cd77042e4439642b3",
+  "coefficient_sha256": "db69309c9c331532a3813dd7bbdf19b8f6c2852e63cf58b1437f58c4ae78fbb5",
   "maximum_date_count": 20,
   "coordinate_count": 29243,
   "amplitude_arguments": 1114,
@@ -121392,5 +121426,5 @@
   ],
   "fused_multiply_add": false,
   "raw_complex_hash_encoding": "domain UTF-8; uint64_le source count; int64_le row,column; uint64_le acquisition count; canonical finite IEEE754 binary32 little-endian real,imag",
-  "table_sha256": "04d9a6a916465b5e3cf3221f7039734f83bb709a1ddbeb0900a61956646c1b44"
+  "table_sha256": "f3025ec3a8635281705c22da1ed60375aa24a0efb1917c8482c5557e99ed70cf"
 }
