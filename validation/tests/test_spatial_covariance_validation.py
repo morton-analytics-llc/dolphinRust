@@ -4,7 +4,6 @@ import json
 import math
 import os
 import runpy
-import struct
 import subprocess
 import sys
 import tempfile
@@ -40,17 +39,12 @@ from validation.score_spatial_covariance import (
     _expected_seed_hash,
     _expected_coordinates,
     _fixed_l2_reconstruction_bound,
-    _f64_from_bits,
     _generate_complex_source,
-    _generate_complex_sources,
     _growth_exponent,
     _raw_source_digest,
     _read_hashed_json_record,
     _read_single_json_record,
     _source_correlation_receipt_sha256,
-    _spatial_field,
-    _spatial_white_normal,
-    _portable_dgp_tables,
     _validate_positive_overlap_execution_replay,
     _validate_performance_probe,
     _validate_resources,
@@ -135,110 +129,6 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             self.preregistration, cell_id, ordinal, seeds, CODE, BINARY,
             artifact_root=self.artifact_root,
         )
-
-    def test_spatial_field_decodes_white_blocks_in_batches(self):
-        with mock.patch(
-            "validation.score_spatial_covariance._spatial_white_normal",
-            side_effect=AssertionError("scalar white decoder used"),
-        ):
-            field = _spatial_field(
-                self.preregistration,
-                0,
-                0,
-                [(0, 0), (1, 1)],
-                0,
-                "spatial-signal-real",
-            )
-        self.assertEqual(set(field), {(0, 0), (1, 1)})
-        self.assertTrue(all(math.isfinite(value) for value in field.values()))
-        with self.assertRaisesRegex(SchemaError, "exceeds the frozen lattice"):
-            _spatial_field(
-                self.preregistration,
-                0,
-                0,
-                [(318, 0)],
-                0,
-                "spatial-signal-real",
-            )
-
-    def test_batched_spatial_field_is_bit_exact_to_scalar_reference(self):
-        def scalar_field(coordinates, cohort, seed, date, stream):
-            frozen = _portable_dgp_tables(self.preregistration)["coefficients"][
-                "spatial_filter"
-            ]
-            radius = frozen["radius"]
-            ordered = sorted(set(coordinates))
-            min_row = min(row for row, _column in ordered)
-            max_row = max(row for row, _column in ordered)
-            min_column = min(column for _row, column in ordered)
-            max_column = max(column for _row, column in ordered)
-            white_row_start = min_row - radius
-            white_column_start = min_column - radius
-            white_rows = max_row - min_row + 2 * radius + 1
-            white_columns = max_column - min_column + 2 * radius + 1
-            white = [
-                _spatial_white_normal(
-                    self.preregistration,
-                    cohort,
-                    seed,
-                    (white_row_start + row, white_column_start + column),
-                    date,
-                    stream,
-                )
-                for row in range(white_rows)
-                for column in range(white_columns)
-            ]
-            vertical = [
-                [_f64_from_bits(value) for value in factor]
-                for factor in frozen["vertical_factor_bits"]
-            ]
-            horizontal = [
-                [_f64_from_bits(value) for value in factor]
-                for factor in frozen["horizontal_factor_bits"]
-            ]
-            output_columns = max_column - min_column + 1
-            filtered = [0.0] * (len(vertical) * white_rows * output_columns)
-            for component in range(len(vertical)):
-                for row in range(white_rows):
-                    for column in range(output_columns):
-                        value = 0.0
-                        for offset in range(2 * radius + 1):
-                            value += horizontal[component][offset] * white[
-                                row * white_columns + column + offset
-                            ]
-                        filtered[
-                            (component * white_rows + row) * output_columns + column
-                        ] = value
-            result = {}
-            for coordinate in ordered:
-                column = coordinate[1] - min_column
-                base_row = coordinate[0] - radius - white_row_start
-                value = 0.0
-                for component in range(len(vertical)):
-                    for offset in range(2 * radius + 1):
-                        value += vertical[component][offset] * filtered[
-                            (component * white_rows + base_row + offset)
-                            * output_columns
-                            + column
-                        ]
-                result[coordinate] = value
-            return result
-
-        cases = (
-            ([(0, 0)], 0, 0, 0, "spatial-signal-real"),
-            ([(0, 0), (0, 20)], 1, 7, 3, "spatial-noise-imag"),
-            ([(1, 1), (3, 8), (5, 2)], 2, 11, 6, "spatial-signal-imag"),
-        )
-        for coordinates, cohort, seed, date, stream in cases:
-            expected = scalar_field(coordinates, cohort, seed, date, stream)
-            actual = _spatial_field(
-                self.preregistration, cohort, seed, coordinates, date, stream
-            )
-            self.assertEqual(actual.keys(), expected.keys())
-            for coordinate in expected:
-                self.assertEqual(
-                    actual[coordinate].hex(), expected[coordinate].hex(), coordinate
-                )
 
     def _attempt(
         self,
@@ -645,15 +535,15 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertEqual(
             [(value.real.hex(), value.imag.hex()) for value in values],
             [
-                ("-0x1.85f56a0000000p-1", "-0x1.fc7d080000000p-1"),
-                ("-0x1.ecd4ca0000000p-1", "-0x1.3e1dc40000000p-4"),
-                ("-0x1.b947e40000000p-4", "-0x1.2755c60000000p-2"),
-                ("-0x1.6291a20000000p+0", "0x1.aa747e0000000p-3"),
+                ("-0x1.16ea600000000p-2", "-0x1.de3d4c0000000p-6"),
+                ("0x1.5175860000000p-3", "0x1.0e40ac0000000p-3"),
+                ("0x1.e045be0000000p-1", "-0x1.8b08520000000p-2"),
+                ("0x1.7c4a440000000p+0", "0x1.88467e0000000p-3"),
             ],
         )
         self.assertEqual(
             _raw_source_digest("portable-golden-v1", [(-4, 19)], {(-4, 19): values}),
-            "22a287f0ba100eaa5ae7b79b4abbd8ca338c94d644fc05eebc9a3e6d9be4a184",
+            "5f5ed14ea6b620fc818d35823206776f738d17da38806861b2e84ac2de748176",
         )
 
     def test_portable_tables_cover_every_frozen_coordinate_and_date(self):
@@ -748,29 +638,21 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertTrue(_effective_looks_roundoff_matches(actual, expected, 14_238))
         self.assertFalse(_effective_looks_roundoff_matches(expected + 2e-11, expected, 14_238))
 
-    def test_effective_looks_batches_pairwise_kernel_and_reuses_support_result(self):
+    def test_effective_looks_reuses_the_exact_support_result(self):
         from validation.score_spatial_covariance import (
             _cached_effective_looks_fraction,
             _effective_looks_fraction,
         )
 
         support = ((101, 103), (102, 107), (109, 113))
-        expected = len(support) / sum(
-            math.exp(
-                -math.hypot(first[0] - second[0], first[1] - second[1]) / 1.5
-            )
-            for first in support
-            for second in support
-        )
         _cached_effective_looks_fraction.cache_clear()
-        with mock.patch.object(
-            math, "exp", side_effect=AssertionError("scalar pairwise kernel used")
-        ):
+        with mock.patch.object(math, "exp", wraps=math.exp) as exponential:
             first = _effective_looks_fraction(support)
+            calls = exponential.call_count
             second = _effective_looks_fraction(support)
-        self.assertEqual(first, expected)
-        self.assertEqual(second, expected)
-        self.assertEqual(_cached_effective_looks_fraction.cache_info().hits, 1)
+        self.assertEqual(first, second)
+        self.assertEqual(calls, len(support) ** 2)
+        self.assertEqual(exponential.call_count, calls)
 
     def test_source_correlation_support_count_and_receipt_are_exact(self):
         for field in (
@@ -832,17 +714,16 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         baseline = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
         target = baseline["target_coordinate"]
         halo_only = (target[0] - 2, target[1] - 2)
-        original = _generate_complex_sources
+        original = _generate_complex_source
 
         def tamper(*args, **kwargs):
-            histories = original(*args, **kwargs)
-            values = histories[halo_only]
-            values[0] = complex(values[0].real + 1.0, values[0].imag)
-            return histories
+            values = original(*args, **kwargs)
+            if args[3] == halo_only:
+                values[0] = complex(values[0].real + 1.0, values[0].imag)
+            return values
 
         with mock.patch(
-            "validation.score_spatial_covariance._generate_complex_sources",
-            side_effect=tamper,
+            "validation.score_spatial_covariance._generate_complex_source", side_effect=tamper
         ):
             changed = regenerate_frozen_attempt_inputs(self.preregistration, CELL, 0)
         self.assertEqual(changed["target_support_sha256"], baseline["target_support_sha256"])
@@ -1036,62 +917,6 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         self.assertEqual(spatial["source_correlation_model"], "exponential_euclidean_v1")
         self.assertEqual(spatial["source_correlation_distance_scale_pixels"], 1.5)
         self.assertLess(spatial["effective_looks_fraction"], 1.0)
-
-    def test_independent_source_process_controls_raw_generation(self):
-        with mock.patch(
-            "validation.score_spatial_covariance._generate_complex_sources",
-            wraps=_generate_complex_sources,
-        ) as generate:
-            regenerate_frozen_attempt_inputs(self.preregistration, INDEPENDENT_CELL, 0)
-        self.assertTrue(generate.call_args_list)
-        self.assertTrue(all(call.args[5] is False for call in generate.call_args_list))
-
-    def test_spatial_field_filter_matches_declared_exponential_covariance(self):
-        tables = json.loads(
-            (VALIDATION / self.preregistration["portable_dgp_asset"]["path"]).read_bytes()
-        )
-        frozen = tables["coefficients"]["spatial_filter"]
-        self.assertEqual(frozen["radius"], 8)
-        self.assertEqual(frozen["rank"], 3)
-        self.assertEqual(frozen["distance_scale_pixels"], 1.5)
-
-        def decode(bits):
-            return struct.unpack(">d", bytes.fromhex(bits))[0]
-
-        normal_second_moment = decode(frozen["normal_second_moment_bits"])
-        vertical = [[decode(value) for value in row] for row in frozen["vertical_factor_bits"]]
-        horizontal = [
-            [decode(value) for value in row]
-            for row in frozen["horizontal_factor_bits"]
-        ]
-        kernel = [
-            [
-                sum(vertical[component][row] * horizontal[component][column]
-                    for component in range(frozen["rank"]))
-                for column in range(2 * frozen["radius"] + 1)
-            ]
-            for row in range(2 * frozen["radius"] + 1)
-        ]
-        maximum_error = 0.0
-        correlations = {}
-        for row_lag in range(71):
-            for column_lag in range(257):
-                implied = 0.0
-                if row_lag <= 2 * frozen["radius"] and column_lag <= 2 * frozen["radius"]:
-                    for row in range(2 * frozen["radius"] + 1 - row_lag):
-                        for column in range(2 * frozen["radius"] + 1 - column_lag):
-                            implied += (
-                                kernel[row][column]
-                                * kernel[row + row_lag][column + column_lag]
-                            )
-                    implied *= normal_second_moment
-                expected = math.exp(-math.hypot(row_lag, column_lag) / 1.5)
-                maximum_error = max(maximum_error, abs(implied - expected))
-                if row_lag == 0 and column_lag in {0, 1, 4}:
-                    correlations[column_lag] = implied
-        self.assertLessEqual(abs(correlations[0] - 1.0), 2e-15)
-        self.assertNotEqual(correlations[1], correlations[4])
-        self.assertLessEqual(maximum_error, frozen["covariance_error_bound"])
 
     def test_effective_looks_accepts_libm_ulp_but_rejects_material_drift(self):
         cell_id = expected_cell_ids(self.preregistration)[0]
@@ -1573,7 +1398,9 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 check=True,
                 cwd=source_root,
             )
+        code_sha256, binary_sha256 = producer_identities(source_root, batch, benchmark)
         preregistration = copy.deepcopy(self.preregistration)
+        preregistration["generator"]["binary"]["source_identity"]["sha256"] = code_sha256
         spec = ShardSpec(0, 0, 1, (MASKED_CELL,), (1,))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
@@ -1595,10 +1422,6 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 mock.patch(
                     "validation.spatial_covariance_simulation.run_parallel_batch",
                     side_effect=execute,
-                ),
-                mock.patch(
-                    "validation.spatial_covariance_simulation._validated_producer_identities",
-                    return_value=(CODE, BINARY),
                 ),
             ):
                 first = run_outcomes(
@@ -2128,8 +1951,6 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             )
             simulation = root / "validation" / "spatial_covariance_simulation.py"
             simulation.write_text("def generate(): return 1\n")
-            parallel = root / "validation" / "run_spatial_covariance_parallel.py"
-            parallel.write_text("def run(): return 1\n")
             batch = root / "target" / "release" / "examples" / "spatial_covariance_batch"
             benchmark = root / "target" / "release" / "examples" / "spatial_covariance_bench"
             batch.write_bytes(b"batch-v1")
@@ -2783,7 +2604,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                 self.preregistration, cell_id, cell_ordinal, 1, CODE, BINARY
             ).add(attempt)
 
-    def test_large_window_coincident_cohort_binds_full_valid_replay_support(self):
+    def test_large_window_coincident_cohort_binds_replay_and_abstention_support(self):
         cell_ordinal = expected_cell_ids(self.preregistration).index(
             LARGE_WINDOW_COINCIDENT_CELL
         )
@@ -2817,9 +2638,6 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         summary = accumulator.finalize()
 
         self.assertEqual(summary["attempted_seeds"], FROZEN_SEED_COUNT)
-        self.assertEqual(summary["emitted_seeds"], FROZEN_SEED_COUNT)
-        self.assertEqual(summary["status_histogram"]["valid"], FROZEN_SEED_COUNT)
-        self.assertEqual(summary["status_histogram"]["ill_conditioned"], 0)
         self.assertEqual(observed[0]["status"], "valid")
         self.assertEqual(observed[0]["effective_support_union_count"], 1519)
         self.assertEqual(
@@ -2827,17 +2645,17 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             "b46a72853152399d62e18a7f8a3a43a73a210865de2c77b4a321634bc43118ed",
         )
         self.assertEqual(observed[0]["effective_looks_fraction"], 0.07732435622036812)
-        self.assertEqual(observed[FROZEN_SEED_COUNT - 1]["status"], "valid")
+        self.assertEqual(observed[FROZEN_SEED_COUNT - 1]["status"], "ill_conditioned")
         self.assertEqual(
-            observed[FROZEN_SEED_COUNT - 1]["effective_support_union_count"], 1519
+            observed[FROZEN_SEED_COUNT - 1]["effective_support_union_count"], 91
         )
         self.assertEqual(
             observed[FROZEN_SEED_COUNT - 1]["source_correlation_receipt_sha256"],
-            "b46a72853152399d62e18a7f8a3a43a73a210865de2c77b4a321634bc43118ed",
+            "e5631412aa67b52f0625fa8160500410f74576a567fed09fd8041fc24ffb18ca",
         )
         self.assertEqual(
             observed[FROZEN_SEED_COUNT - 1]["effective_looks_fraction"],
-            0.07732435622036812,
+            0.10912939346879827,
         )
 
     def test_near_tie_attempt_binds_exact_dependency_cone_support(self):

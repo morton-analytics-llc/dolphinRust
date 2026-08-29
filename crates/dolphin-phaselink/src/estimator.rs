@@ -73,138 +73,6 @@ pub enum EstimatorJvpError {
     NonFiniteDerivative,
 }
 
-/// Fixed estimator state prepared once and reused across coherence directions.
-pub struct PhaseAngleLinearization {
-    coherence: Array2<Cf64>,
-    branch: FixedEstimatorBranch,
-    reference_idx: usize,
-    branch_tolerance: f64,
-    gamma_inverse: Option<Mat<f64>>,
-    values: Vec<f64>,
-    vectors: Mat<c64>,
-    selected: usize,
-    vector: Array1<Cf64>,
-}
-
-impl PhaseAngleLinearization {
-    /// Prepare one fixed-branch eigensystem for repeated directional derivatives.
-    pub fn prepare(
-        coherence: ArrayView2<Cf64>,
-        branch: FixedEstimatorBranch,
-        reference_idx: usize,
-        branch_tolerance: f64,
-    ) -> Result<Self, EstimatorJvpError> {
-        let n = coherence.nrows();
-        if n == 0
-            || coherence.ncols() != n
-            || !branch_tolerance.is_finite()
-            || branch_tolerance < 0.0
-        {
-            return Err(EstimatorJvpError::MatrixShapeMismatch);
-        }
-        if reference_idx >= n {
-            return Err(EstimatorJvpError::ReferenceOutOfBounds);
-        }
-        if coherence.iter().any(|value| !value.is_finite()) {
-            return Err(EstimatorJvpError::NonFiniteState);
-        }
-        let coherence = coherence.to_owned();
-        let (matrix, gamma_inverse) = match branch {
-            FixedEstimatorBranch::Evd => (
-                prepare_evd_matrix(coherence.view(), branch_tolerance)?,
-                None,
-            ),
-            FixedEstimatorBranch::Emi {
-                beta,
-                zero_correlation_threshold,
-            } => {
-                let (matrix, gamma_inverse) = prepare_emi_matrix(
-                    coherence.view(),
-                    beta,
-                    zero_correlation_threshold,
-                    branch_tolerance,
-                )?;
-                (matrix, Some(gamma_inverse))
-            }
-        };
-        let (values, vectors) = selfadjoint_eig(&matrix);
-        let selected = match branch {
-            FixedEstimatorBranch::Evd => argmax(&values),
-            FixedEstimatorBranch::Emi { .. } => argmin(&values),
-        };
-        if selected_eigengap(&values, selected) <= branch_tolerance {
-            return Err(EstimatorJvpError::EigenvalueTie);
-        }
-        let vector = column(&vectors, selected);
-        if vector[reference_idx].norm() <= branch_tolerance {
-            return Err(EstimatorJvpError::VanishingReference);
-        }
-        Ok(Self {
-            coherence,
-            branch,
-            reference_idx,
-            branch_tolerance,
-            gamma_inverse,
-            values,
-            vectors,
-            selected,
-            vector,
-        })
-    }
-
-    /// Apply the prepared eigensystem to one coherence direction.
-    pub fn apply(
-        &self,
-        delta_coherence: ArrayView2<Cf64>,
-    ) -> Result<Array1<f64>, EstimatorJvpError> {
-        if delta_coherence.dim() != self.coherence.dim() {
-            return Err(EstimatorJvpError::MatrixShapeMismatch);
-        }
-        if delta_coherence.iter().any(|value| !value.is_finite()) {
-            return Err(EstimatorJvpError::NonFiniteState);
-        }
-        let delta_matrix = match self.branch {
-            FixedEstimatorBranch::Evd => evd_delta_matrix(
-                self.coherence.view(),
-                delta_coherence,
-                self.branch_tolerance,
-            )?,
-            FixedEstimatorBranch::Emi {
-                beta,
-                zero_correlation_threshold,
-            } => emi_delta_matrix(
-                self.coherence.view(),
-                delta_coherence,
-                beta,
-                zero_correlation_threshold,
-                self.branch_tolerance,
-                self.gamma_inverse
-                    .as_ref()
-                    .expect("prepared EMI linearization has an inverse"),
-            )?,
-        };
-        let mut delta_vector = Array1::zeros(self.coherence.nrows());
-        for other in 0..self.coherence.nrows() {
-            if other == self.selected {
-                continue;
-            }
-            let basis = column(&self.vectors, other);
-            let coefficient =
-                quadratic_cross(basis.view(), delta_matrix.view(), self.vector.view())
-                    / (self.values[self.selected] - self.values[other]);
-            delta_vector += &basis.mapv(|value| value * coefficient);
-        }
-        let raw = Array1::from_shape_fn(self.coherence.nrows(), |index| {
-            (self.vector[index].conj() * delta_vector[index]).im / self.vector[index].norm_sqr()
-        });
-        if raw.iter().any(|value| !value.is_finite()) {
-            return Err(EstimatorJvpError::NonFiniteDerivative);
-        }
-        let reference = raw[self.reference_idx];
-        Ok(raw - reference)
-    }
-}
-
 impl Display for EstimatorJvpError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let message = match self {
@@ -401,28 +269,57 @@ pub fn phase_angle_jvp(
         return Err(EstimatorJvpError::NonFiniteState);
     }
 
-    PhaseAngleLinearization::prepare(coherence, branch, reference_idx, branch_tolerance)?
-        .apply(delta_coherence)
-}
-
-fn prepare_evd_matrix(
-    coherence: ArrayView2<Cf64>,
-    branch_tolerance: f64,
-) -> Result<Mat<c64>, EstimatorJvpError> {
-    if coherence
-        .iter()
-        .any(|value| value.norm() <= branch_tolerance)
-    {
-        return Err(EstimatorJvpError::ZeroMagnitudeBranch);
+    let (matrix, delta_matrix) = match branch {
+        FixedEstimatorBranch::Evd => evd_matrix_jvp(coherence, delta_coherence, branch_tolerance)?,
+        FixedEstimatorBranch::Emi {
+            beta,
+            zero_correlation_threshold,
+        } => emi_matrix_jvp(
+            coherence,
+            delta_coherence,
+            beta,
+            zero_correlation_threshold,
+            branch_tolerance,
+        )?,
+    };
+    let (values, vectors) = selfadjoint_eig(&matrix);
+    let selected = match branch {
+        FixedEstimatorBranch::Evd => argmax(&values),
+        FixedEstimatorBranch::Emi { .. } => argmin(&values),
+    };
+    if selected_eigengap(&values, selected) <= branch_tolerance {
+        return Err(EstimatorJvpError::EigenvalueTie);
     }
-    Ok(hadamard_abs(coherence))
+    let vector = column(&vectors, selected);
+    if vector[reference_idx].norm() <= branch_tolerance {
+        return Err(EstimatorJvpError::VanishingReference);
+    }
+
+    let mut delta_vector = Array1::zeros(n);
+    for other in 0..n {
+        if other == selected {
+            continue;
+        }
+        let basis = column(&vectors, other);
+        let coefficient = quadratic_cross(basis.view(), delta_matrix.view(), vector.view())
+            / (values[selected] - values[other]);
+        delta_vector += &basis.mapv(|value| value * coefficient);
+    }
+    let raw = Array1::from_shape_fn(n, |i| {
+        (vector[i].conj() * delta_vector[i]).im / vector[i].norm_sqr()
+    });
+    if raw.iter().any(|value| !value.is_finite()) {
+        return Err(EstimatorJvpError::NonFiniteDerivative);
+    }
+    let reference = raw[reference_idx];
+    Ok(raw - reference)
 }
 
-fn evd_delta_matrix(
+fn evd_matrix_jvp(
     coherence: ArrayView2<Cf64>,
     delta: ArrayView2<Cf64>,
     branch_tolerance: f64,
-) -> Result<Array2<Cf64>, EstimatorJvpError> {
+) -> Result<(Mat<c64>, Array2<Cf64>), EstimatorJvpError> {
     let n = coherence.nrows();
     let mut delta_matrix = Array2::zeros((n, n));
     for ((i, j), value) in coherence.indexed_iter() {
@@ -433,46 +330,16 @@ fn evd_delta_matrix(
         let delta_magnitude = (value.conj() * delta[(i, j)]).re / magnitude;
         delta_matrix[(i, j)] = delta[(i, j)] * magnitude + *value * delta_magnitude;
     }
-    Ok(delta_matrix)
+    Ok((hadamard_abs(coherence), delta_matrix))
 }
 
-fn prepare_emi_matrix(
-    coherence: ArrayView2<Cf64>,
-    beta: f64,
-    zero_cut: f64,
-    branch_tolerance: f64,
-) -> Result<(Mat<c64>, Mat<f64>), EstimatorJvpError> {
-    for ((i, j), value) in coherence.indexed_iter() {
-        let magnitude = value.norm();
-        let unthresholded = if beta > 0.0 {
-            (1.0 - beta) * magnitude + beta * f64::from(i == j)
-        } else {
-            magnitude
-        };
-        if (unthresholded - zero_cut).abs() <= branch_tolerance {
-            return Err(EstimatorJvpError::ThresholdBoundary);
-        }
-        if unthresholded < zero_cut {
-            continue;
-        }
-        if magnitude <= branch_tolerance {
-            return Err(EstimatorJvpError::ZeroMagnitudeBranch);
-        }
-    }
-    let gamma = regularized_gamma(coherence, beta, zero_cut);
-    let gamma_inverse = invert_spd(&gamma).ok_or(EstimatorJvpError::EmiFallback)?;
-    let matrix = hadamard(&gamma_inverse, coherence);
-    Ok((matrix, gamma_inverse))
-}
-
-fn emi_delta_matrix(
+fn emi_matrix_jvp(
     coherence: ArrayView2<Cf64>,
     delta: ArrayView2<Cf64>,
     beta: f64,
     zero_cut: f64,
     branch_tolerance: f64,
-    gamma_inverse: &Mat<f64>,
-) -> Result<Array2<Cf64>, EstimatorJvpError> {
+) -> Result<(Mat<c64>, Array2<Cf64>), EstimatorJvpError> {
     let n = coherence.nrows();
     let mut delta_gamma = Array2::zeros((n, n));
     for ((i, j), value) in coherence.indexed_iter() {
@@ -494,6 +361,8 @@ fn emi_delta_matrix(
         let scale = if beta > 0.0 { 1.0 - beta } else { 1.0 };
         delta_gamma[(i, j)] = scale * (value.conj() * delta[(i, j)]).re / magnitude;
     }
+    let gamma = regularized_gamma(coherence, beta, zero_cut);
+    let gamma_inverse = invert_spd(&gamma).ok_or(EstimatorJvpError::EmiFallback)?;
     let delta_gamma_inverse = Array2::from_shape_fn((n, n), |(i, j)| {
         let mut value = 0.0;
         for a in 0..n {
@@ -506,7 +375,7 @@ fn emi_delta_matrix(
     let delta_matrix = Array2::from_shape_fn((n, n), |(i, j)| {
         delta_gamma_inverse[(i, j)] * coherence[(i, j)] + gamma_inverse[(i, j)] * delta[(i, j)]
     });
-    Ok(delta_matrix)
+    Ok((hadamard(&gamma_inverse, coherence), delta_matrix))
 }
 
 fn quadratic_cross(

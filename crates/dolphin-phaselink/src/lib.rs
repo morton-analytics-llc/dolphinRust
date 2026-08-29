@@ -34,8 +34,8 @@ pub use crlb::estimate_crlb;
 pub use engine::{ComputeEngine, ResolvedBackend};
 pub use estimator::{
     phase_angle_jvp, phase_angle_jvp_workspace_bytes, process_coherence_matrices,
-    process_coherence_matrix, EstimatorJvpError, FixedEstimatorBranch, PhaseAngleLinearization,
-    PixelEstimate, StackEstimate,
+    process_coherence_matrix, EstimatorJvpError, FixedEstimatorBranch, PixelEstimate,
+    StackEstimate,
 };
 pub use fused::{
     all_non_finite_acquisition_indices, link_fused, link_fused_with_source_replay,

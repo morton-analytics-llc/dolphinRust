@@ -14,12 +14,11 @@ use crate::inversion::PixelL2ObservationMap;
 /// Stable method identity for the fixed-valid-observation L2 map.
 pub const FIXED_L2_SPATIAL_COVARIANCE_METHOD: &str =
     "fixed_valid_observation_l2_spatial_covariance_v1";
-/// Maximum retained-spectrum condition number accepted for propagated date covariance.
-pub const FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER: f64 = 1.0e12;
+/// Maximum retained-spectrum condition number accepted for phase or date covariance.
+pub const FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER: f64 = 1.0e8;
 /// Maximum production weighted-normal condition accepted for propagation.
 pub const FIXED_L2_MAX_MAP_CONDITION_NUMBER: f64 = 1.0e12;
-const PSD_TOLERANCE: f64 = 1.0e-10;
-const RANK_TOLERANCE: f64 = 1.0e-13;
+const RANK_TOLERANCE: f64 = 1.0e-10;
 
 /// Conservative allocation composition for one fixed-L2 difference propagation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,7 +566,7 @@ pub fn propagate_fixed_l2_difference_covariance(
         ));
     }
     validate_joint_phase_gauges(joint_phase_covariance, n_dates)?;
-    let phase_factor = rank_revealing_psd_factor(joint_phase_covariance, true, false)?;
+    let phase_factor = rank_revealing_psd_factor(joint_phase_covariance, true)?;
     let target_map = full_date_l2_map(target);
     let reference_map = full_date_l2_map(reference);
     let propagation_map =
@@ -614,7 +613,7 @@ pub fn propagate_fixed_l2_difference_covariance(
         date_covariance[(0, index)] = 0.0;
         date_covariance[(index, 0)] = 0.0;
     }
-    let mut covariance_factor = rank_revealing_psd_factor(date_covariance.view(), true, true)?;
+    let mut covariance_factor = rank_revealing_psd_factor(date_covariance.view(), true)?;
     for column in 0..covariance_factor.factor.ncols() {
         covariance_factor.factor[(0, column)] = 0.0;
     }
@@ -854,7 +853,6 @@ struct RankRevealingFactor {
 fn rank_revealing_psd_factor(
     matrix: ArrayView2<f64>,
     allow_zero_rank: bool,
-    enforce_condition_bound: bool,
 ) -> Result<RankRevealingFactor, SpatialL2Error> {
     if matrix.nrows() != matrix.ncols() || matrix.nrows() == 0 {
         return Err(error(
@@ -880,8 +878,8 @@ fn rank_revealing_psd_factor(
             log_pseudodeterminant: 0.0,
         });
     }
-    let psd_tolerance = scale * PSD_TOLERANCE;
-    let rank_tolerance = scale * RANK_TOLERANCE;
+    let psd_tolerance = scale * RANK_TOLERANCE;
+    let rank_tolerance = psd_tolerance;
     for row in 0..size {
         for column in row + 1..size {
             if (matrix[(row, column)] - matrix[(column, row)]).abs() > psd_tolerance {
@@ -929,8 +927,7 @@ fn rank_revealing_psd_factor(
         ));
     }
     let condition_number = retained[0].1 / retained[retained.len() - 1].1;
-    if !condition_number.is_finite()
-        || (enforce_condition_bound && condition_number > FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER)
+    if !condition_number.is_finite() || condition_number > FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER
     {
         return Err(error(
             SpatialL2Status::IllConditioned,
@@ -996,7 +993,7 @@ fn spectral_factor(matrix: ArrayView2<f64>) -> Result<SpectralFactor, SpatialL2E
             "spectral factor has zero scale",
         ));
     }
-    let tolerance = scale * PSD_TOLERANCE;
+    let tolerance = scale * RANK_TOLERANCE;
     if values.iter().any(|&value| value < -tolerance) {
         return Err(error(
             SpatialL2Status::InvalidInput,
@@ -1255,62 +1252,23 @@ mod production_l2_propagation_contract {
     }
 
     #[test]
-    fn ill_conditioned_phase_spectrum_is_diagnostic_but_date_covariance_fails_closed() {
+    fn ill_conditioned_joint_phase_covariance_fails_closed() {
         let (target, reference) = maps();
-        let covariance = Array2::from_diag(&array![0.0, 1.0, 1.0, 0.0, 1.0, 5.0e-13]);
-        let propagated = propagate_fixed_l2_difference_covariance(
+        let covariance = Array2::from_diag(&array![0.0, 1.0, 1.0, 0.0, 1.0, 1.0e-9]);
+        let error = propagate_fixed_l2_difference_covariance(
             &target,
             &reference,
             covariance.view(),
             SpatialL2Branch::FixedL2,
         )
-        .unwrap();
-        assert!(
-            propagated.phase_covariance_condition_number > FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER
-        );
-        assert!(propagated.covariance_condition_number <= FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER);
+        .unwrap_err();
+        assert_eq!(error.status, SpatialL2Status::IllConditioned);
 
-        let ill_conditioned_date_covariance = Array2::from_diag(&array![0.0, 1.0, 5.0e-13]);
-        let error = rank_revealing_psd_factor(ill_conditioned_date_covariance.view(), true, true)
+        let ill_conditioned_date_covariance = Array2::from_diag(&array![0.0, 1.0, 1.0e-9]);
+        let error = rank_revealing_psd_factor(ill_conditioned_date_covariance.view(), true)
             .err()
             .unwrap();
         assert_eq!(error.status, SpatialL2Status::IllConditioned);
-    }
-
-    #[test]
-    fn date_covariance_uses_the_frozen_temporal_condition_limit() {
-        let covariance = Array2::from_diag(&array![0.0, 1.0, 1.0 / 358_527_997.005_141_85]);
-        let factor = rank_revealing_psd_factor(covariance.view(), true, true).unwrap();
-        assert!(factor.condition_number > 1.0e8);
-        assert!(factor.condition_number <= 1.0e12);
-    }
-
-    #[test]
-    fn ill_conditioned_common_phase_mode_is_admitted_after_difference_cancellation() {
-        let (target, _) = maps();
-        let mut covariance = Array2::zeros((6, 6));
-        let common_variance = 5.0e-13;
-        let difference_variance = 1.0;
-        let marginal = 0.5 * (common_variance + difference_variance);
-        let cross = 0.5 * (common_variance - difference_variance);
-        for date in 1..3 {
-            covariance[(date, date)] = marginal;
-            covariance[(date + 3, date + 3)] = marginal;
-            covariance[(date, date + 3)] = cross;
-            covariance[(date + 3, date)] = cross;
-        }
-
-        let propagated = propagate_fixed_l2_difference_covariance(
-            &target,
-            &target,
-            covariance.view(),
-            SpatialL2Branch::FixedL2,
-        )
-        .unwrap();
-        assert!(
-            propagated.phase_covariance_condition_number > FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER
-        );
-        assert!(propagated.covariance_condition_number <= FIXED_L2_MAX_COVARIANCE_CONDITION_NUMBER);
     }
 
     #[test]
@@ -1356,7 +1314,7 @@ mod production_l2_propagation_contract {
                 0.088171135706572920
             ],
         ];
-        let receipt = rank_revealing_psd_factor(covariance.view(), false, true).unwrap();
+        let receipt = rank_revealing_psd_factor(covariance.view(), false).unwrap();
         assert_eq!(receipt.rank, 3);
         assert_eq!(receipt.factor.ncols(), receipt.rank);
         let reconstructed = receipt.factor.dot(&receipt.factor.t());
