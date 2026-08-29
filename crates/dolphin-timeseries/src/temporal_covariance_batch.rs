@@ -238,6 +238,7 @@ pub fn fit_temporal_factor_complete_refit_bootstrap(
             } else {
                 TemporalInferenceStatus::BootstrapInsufficientSuccess
             },
+            source_status: None,
             attempted_replicates: attempts,
             successful_replicates: successes,
         },
@@ -502,8 +503,13 @@ fn scalar_pair(
         TemporalInferenceStatus::Evaluated,
     );
     let reml_covariance_parameter_adjusted_scalar = if materialize_adjustment {
-        evaluation
-            .covariance_parameter_adjusted_variance
+        let (adjusted_variance, source_status) =
+            match evaluation.covariance_parameter_adjusted_variance {
+                Some(Ok(variance)) => (Some(variance), None),
+                Some(Err(status)) => (None, Some(status)),
+                None => (None, None),
+            };
+        let mut comparator = adjusted_variance
             .filter(|variance| variance.is_finite() && *variance > 0.0)
             .and_then(|variance| {
                 let distribution =
@@ -526,13 +532,16 @@ fn scalar_pair(
                     width_90: Some(interval_90.upper - interval_90.lower),
                     width_95: Some(interval_95.upper - interval_95.lower),
                     status: TemporalInferenceStatus::Evaluated,
+                    source_status: None,
                     attempted_replicates: 0,
                     successful_replicates: 0,
                 })
             })
             .unwrap_or_else(|| {
                 empty_comparator(TemporalInferenceStatus::WeakParameterIdentification)
-            })
+            });
+        comparator.source_status = source_status;
+        comparator
     } else {
         empty_comparator(TemporalInferenceStatus::DiagnosticNotComputed)
     };
@@ -557,7 +566,7 @@ pub(super) struct TemporalBatchProfileEvaluation {
     pub(super) process_variance: f64,
     pub(super) fitted_parameter_active_set: Option<TemporalInferenceStatus>,
     pub(super) information_variance: f64,
-    pub(super) covariance_parameter_adjusted_variance: Option<f64>,
+    pub(super) covariance_parameter_adjusted_variance: Option<Result<f64, TemporalInferenceStatus>>,
     #[cfg(test)]
     pub(super) profile_rho_curvature: f64,
     pub(super) condition_upper_bound: f64,
@@ -1967,7 +1976,7 @@ fn exact_profile_reference(
             maximum_rank,
             realized_rank,
         );
-        reml_covariance_parameter_adjusted_variance(
+        Some(reml_covariance_parameter_adjusted_variance(
             &prepared.design,
             &arena.reference_observations,
             &difference_covariance,
@@ -1975,8 +1984,7 @@ fn exact_profile_reference(
             fit.process_variance,
             fit.information_variance,
             options,
-        )
-        .ok()
+        ))
     } else {
         None
     };
@@ -2229,7 +2237,7 @@ fn finalize_profile_lane(
         process_variance: state.best_log_variance.exp(),
         fitted_parameter_active_set,
         information_variance,
-        covariance_parameter_adjusted_variance: Some(adjusted_variance),
+        covariance_parameter_adjusted_variance: Some(Ok(adjusted_variance)),
         #[cfg(test)]
         profile_rho_curvature: _rho_curvature,
         condition_upper_bound: certificate.conservative_upper_bound,
@@ -4723,6 +4731,39 @@ mod tests {
     #[test]
     fn bootstrap_interval_is_absent_when_every_refit_fails() {
         assert_eq!(bootstrap_interval(&[], 0.95), None);
+    }
+
+    #[test]
+    fn covariance_nonfinite_adjustment_maps_to_weak_with_source_status() {
+        let outcome = scalar_pair(
+            TemporalBatchProfileEvaluation {
+                score: 0.0,
+                slope: 0.01,
+                rho: 0.3,
+                process_variance: 1.0,
+                fitted_parameter_active_set: None,
+                information_variance: 1.0,
+                covariance_parameter_adjusted_variance: Some(Err(
+                    TemporalInferenceStatus::CovarianceNonfinite,
+                )),
+                profile_rho_curvature: f64::NAN,
+                condition_upper_bound: 1.0,
+                exact_condition_number: Some(1.0),
+            },
+            11,
+            true,
+        );
+        let adjusted = outcome.reml_covariance_parameter_adjusted_scalar;
+        assert_eq!(
+            adjusted.status,
+            TemporalInferenceStatus::WeakParameterIdentification
+        );
+        assert_eq!(
+            adjusted.source_status,
+            Some(TemporalInferenceStatus::CovarianceNonfinite)
+        );
+        assert!(adjusted.point_estimate.is_none());
+        assert!(adjusted.interval_95.is_none());
     }
 
     #[test]

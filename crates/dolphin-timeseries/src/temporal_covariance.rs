@@ -328,6 +328,9 @@ pub struct ComparatorDiagnostics {
     pub width_95: Option<f64>,
     /// Stable comparator disposition.
     pub status: TemporalInferenceStatus,
+    /// Exact upstream failure when this comparator maps it to a stable outer disposition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_status: Option<TemporalInferenceStatus>,
     /// Number of attempted resamples for this comparator.
     pub attempted_replicates: usize,
     /// Number of successful resamples for this comparator.
@@ -1046,6 +1049,7 @@ fn validate_temporal_covariance_prefit(
             (comparator.interval_95, comparator.width_95, multipliers[2]),
         ];
         comparator.status == TemporalInferenceStatus::Evaluated
+            && comparator.source_status.is_none()
             && point.is_finite()
             && (point - expected_point).abs() <= 1e-10 * scale
             && standard_error.is_finite()
@@ -3340,6 +3344,7 @@ pub(super) fn empty_comparator(status: TemporalInferenceStatus) -> ComparatorDia
         width_90: None,
         width_95: None,
         status,
+        source_status: None,
         attempted_replicates: 0,
         successful_replicates: 0,
     }
@@ -3380,6 +3385,7 @@ pub(super) fn normal_comparator(
         width_90: Some(2.0 * z_90 * standard_error),
         width_95: Some(2.0 * z_95 * standard_error),
         status,
+        source_status: None,
         attempted_replicates: 0,
         successful_replicates: 0,
     }
@@ -3553,6 +3559,7 @@ fn reml_adjusted_scalar_comparator(
         width_90: Some(interval_90.upper - interval_90.lower),
         width_95: Some(interval_95.upper - interval_95.lower),
         status: TemporalInferenceStatus::Evaluated,
+        source_status: None,
         attempted_replicates: 0,
         successful_replicates: 0,
     })
@@ -3794,6 +3801,7 @@ fn factor_profile_comparator(
         width_90: Some(interval_results[1].upper - interval_results[1].lower),
         width_95: Some(interval_results[2].upper - interval_results[2].lower),
         status: TemporalInferenceStatus::Evaluated,
+        source_status: None,
         attempted_replicates: 0,
         successful_replicates: 0,
     })
@@ -4001,6 +4009,7 @@ fn profile_comparator(
         width_90: Some(intervals[1].upper - intervals[1].lower),
         width_95: Some(intervals[2].upper - intervals[2].lower),
         status: TemporalInferenceStatus::Evaluated,
+        source_status: None,
         attempted_replicates: 0,
         successful_replicates: 0,
     })
@@ -4099,6 +4108,7 @@ fn bootstrap_comparator(summary: &BootstrapSummary, observed_slope: f64) -> Comp
         } else {
             TemporalInferenceStatus::BootstrapInsufficientSuccess
         },
+        source_status: None,
         attempted_replicates: summary.attempts,
         successful_replicates: summary.successes,
     }
@@ -6037,6 +6047,7 @@ mod tests {
         let actual = report.outcomes[0].as_ref().unwrap();
         let actual_adjusted_variance = actual
             .covariance_parameter_adjusted_variance
+            .expect("primary augmented-jet fit provides adjustment result")
             .expect("primary augmented-jet fit provides adjusted variance");
 
         let evaluate = |eta: f64, log_q: f64| {
@@ -7168,10 +7179,10 @@ mod tests {
                     assert_eq!(
                         actual
                             .covariance_parameter_adjusted_variance
-                            .map(f64::to_bits),
+                            .map(|result| result.map(f64::to_bits)),
                         parallel
                             .covariance_parameter_adjusted_variance
-                            .map(f64::to_bits)
+                            .map(|result| result.map(f64::to_bits))
                     );
                     assert!(one_metrics.per_target_rho_passes[target] > 0);
                 }
@@ -8036,6 +8047,20 @@ mod tests {
             .plugin_gls
             .point_estimate
             .map(|point| point + 1.0);
+        assert_eq!(
+            fit_temporal_covariance_from_prefit(
+                &days,
+                &observations,
+                &covariance,
+                &options,
+                &invalid_prefit,
+            )
+            .status,
+            TemporalInferenceStatus::CovarianceNonfinite
+        );
+        let mut invalid_prefit = prefit.clone();
+        invalid_prefit.plugin_gls.source_status =
+            Some(TemporalInferenceStatus::CovarianceNonfinite);
         assert_eq!(
             fit_temporal_covariance_from_prefit(
                 &days,
