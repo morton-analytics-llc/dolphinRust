@@ -1,5 +1,14 @@
 # Live dolphinRust issue intake — 2026-08-24
 
+> **Superseded #53 boundary (2026-08-28):** The model, frozen synthetic,
+> resource, provenance, and identity parts of DR-053-TEMPORAL remain scheduled
+> in dolphinRust. Its held-out field-evidence and independent temporal-review
+> parts are deferred to `eo` after #53 closes. EO-GNSS-INPUT through
+> EO-GNSS-SERVE and EO-487-SCIENCE retain that downstream ownership, including
+> GroundPulse enablement; any publication is also EO-owned. DR-054-SPATIAL and
+> its independent spatial review are unchanged. The original intake below is
+> retained as a historical snapshot.
+
 **Source:** GitHub issues, pull requests, and Actions refreshed 2026-08-24; `origin/main`
 refreshed to `834f9a9ed8a3479afb4da670759af360db53b184`.
 

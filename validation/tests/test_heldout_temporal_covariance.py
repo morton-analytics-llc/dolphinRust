@@ -19,8 +19,16 @@ from validation.heldout_temporal_covariance.scorer import (
     score_receipt,
     score_slope_difference,
 )
-from validation.score_temporal_covariance_holdout import bind_factor_files, build_scored_result
-from validation.run_temporal_covariance_holdout_cluster import scorer_source_sha256, validate_completed_receipt
+from validation.score_temporal_covariance_holdout import (
+    bind_factor_files,
+    build_scored_result,
+    current_implementation_source_hashes,
+)
+from validation.run_temporal_covariance_holdout_cluster import (
+    implementation_source_hashes,
+    scorer_source_sha256,
+    validate_completed_receipt,
+)
 
 
 VALIDATION = Path(__file__).parents[1]
@@ -240,6 +248,12 @@ def receipt_for_manifest(preregistration, manifest, primary_not_evaluable=(), su
 
 
 class HeldoutCohortTests(unittest.TestCase):
+    def test_runner_and_scorer_bind_the_same_source_files(self):
+        self.assertEqual(
+            current_implementation_source_hashes(),
+            implementation_source_hashes(),
+        )
+
     @classmethod
     def setUpClass(cls):
         cls.preregistration = json.loads(PREREGISTRATION_PATH.read_text(encoding="utf-8"))

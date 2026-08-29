@@ -1,5 +1,11 @@
 # Implementation plan: fixed-cube dolphinRust output and EO GNSS anchor
 
+> **Superseded #53 boundary (2026-08-28):** dolphinRust #53 now closes on
+> frozen synthetic, resource, and identity gates. Any text below assigning an
+> untouched GNSS cohort or independent temporal scientific review to #53 is
+> historical; those gates, GroundPulse enablement, and publication are owned by
+> EO after #53 closes. The #54 spatial-review tasks remain unchanged.
+
 **Status:** full post-demo implementation plan. The same-day execution plan is
 `md/plans/demo-today-fixed-cube-eo-gnss-2026-08-24.md`. Implementation, merge, release, deployment,
 data fetch, and backfill have not started.
@@ -7,8 +13,9 @@ data fetch, and backfill have not started.
 **Intake:** `md/intake/open-issues-2026-08-24.md`.
 
 **Detailed uncertainty contract:** `md/plans/open-issues-uncertainty-2026-08-23.md` remains
-authoritative for the #52, #54, and #53 equations, preregistration, resource gates, and independent
-review requirements. This document is the canonical cross-repo execution order and ownership map.
+authoritative for the #52/#54 equations, preregistration, resource gates, and #54 independent-review
+contract. The 2026-08-28 boundary above supersedes its #53 held-out GNSS and temporal-review
+assignments.
 
 ## Objective
 

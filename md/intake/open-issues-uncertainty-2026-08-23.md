@@ -1,5 +1,14 @@
 # Open uncertainty issues intake
 
+> **Superseded #53 boundary (2026-08-28):** DR-053-MODEL,
+> DR-053-ESTIMATION, DR-053-PREREG, DR-053-COMPARATORS, and
+> DR-053-PROVENANCE remain scheduled in dolphinRust. DR-053-HELDOUT and the
+> field-review portion of DR-053-RELEASE are deferred to `eo`; they re-enter
+> after #53 closes on matching synthetic, resource, and identity receipts.
+> GroundPulse enablement and publication are also EO-owned. All DR-054
+> dispositions, including independent spatial review, are unchanged. The table
+> below is retained as the original 2026-08-23 intake.
+
 **Source:** live GitHub open-issue queue, refreshed 2026-08-23 UTC. The queue contains exactly
 issues #52, #53, and #54; none has comments, an assignee, or a milestone.
 

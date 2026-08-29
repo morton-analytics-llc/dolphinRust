@@ -1,5 +1,12 @@
 # Velocity uncertainty producer contract plan
 
+> **Superseded #53 boundary (2026-08-28):** The C08/DRU-007 synthetic,
+> resource, and identity gate remains dolphinRust #53 work. Its held-out GNSS
+> and independent temporal-review gates now belong to EO after #53 closes,
+> together with GroundPulse enablement and publication. The #54 spatial-review
+> boundary is unchanged. The original producer-contract task text is retained
+> below for history.
+
 Date: 2026-08-23
 
 Intake: `md/intake/velocity-uncertainty-producer-contract-2026-08-23.md`

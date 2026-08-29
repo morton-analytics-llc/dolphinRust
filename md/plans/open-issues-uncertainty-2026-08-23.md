@@ -1,5 +1,12 @@
 # Implementation plan: open uncertainty issues #52 through #54
 
+> **Superseded #53 boundary (2026-08-28):** T53-05 field validation and T53-06
+> independent temporal review are EO-owned gates after the frozen #53
+> synthetic, resource, and identity gates pass. EO also owns GroundPulse
+> enablement and publication. All #54 spatial validation and independent-review
+> requirements below remain unchanged. The original task text is retained as
+> historical planning evidence.
+
 **Status:** planning complete; implementation not started.
 
 **Intake:** `md/intake/open-issues-uncertainty-2026-08-23.md`.
