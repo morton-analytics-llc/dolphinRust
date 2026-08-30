@@ -1199,7 +1199,7 @@ fn emit_displacement(
                     )?;
                 }
                 if cfg.timeseries_options.temporal_uncertainty.method
-                    == dolphin_core::config::TemporalUncertaintyMethod::CompleteRefitBootstrap
+                    == dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
                 {
                     anyhow::ensure!(
                         spatial.corrections.los_geometry.is_some(),

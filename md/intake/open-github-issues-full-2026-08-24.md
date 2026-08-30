@@ -8,6 +8,13 @@
 pull requests exist. This intake supersedes the time-boxed/deferred dispositions in
 `md/intake/open-issues-2026-08-24.md` for these three issues.
 
+**Scope decision (2026-08-28):** #53 closes in dolphinRust on frozen synthetic,
+resource, and identity evidence. Held-out GNSS validation and independent
+scientific review of temporal field evidence move to EO. A passing EO field
+receipt permits a separate GroundPulse enablement review. Serving promotion,
+deployment, publication, and external claims remain separate EO approvals.
+#54's spatial-review contract is unchanged.
+
 ## Canonical requirements
 
 | ID | Issue | Requirement | Disposition |
@@ -23,9 +30,10 @@ pull requests exist. This intake supersedes the time-boxed/deferred dispositions
 | GH-053-02 | #53 | Fit covariance parameters with constrained REML/profile likelihood and account for parameter uncertainty with the selected adjusted or complete-refit bootstrap method. | **Scheduled — F53-02 and F53-03.** |
 | GH-053-03 | #53 | Preregister and run a seeded Monte Carlo matrix with immutable slope-bias and 68/90/95 percent coverage, proper-score, width, failure, and resource tolerances. | **Scheduled — F53-01, F53-04, and F53-05.** |
 | GH-053-04 | #53 | Compare conditional OLS, oracle GLS, plug-in GLS, adjusted inference, and complete-refit bootstrap on the same origin-anchored design; fail closed on unsupported or ill-conditioned fits. | **Scheduled — F53-02 through F53-05.** |
-| GH-053-05 | #53 | Validate the frozen method on an untouched, non-Fresno station-pair cohort disjoint by burst/orbit/footprint/site, using same-frame GNSS and InSAR slope differences. | **Scheduled — F53-06.** This is validation-only; no Fresno anchor, station-serving choice, datum offset, or EO state belongs here. |
+| GH-053-05 | #53 | Validate the frozen method on an untouched, non-Fresno station-pair cohort disjoint by burst/orbit/footprint/site, using same-frame GNSS and InSAR slope differences. | **Deferred — destination: [EO #505](https://github.com/morton-analytics-llc/eo/issues/505); re-enters after dolphinRust #53 closes with matching synthetic, resource, and identity receipts.** EO owns acquisition, scoring, and the field disposition. |
 | GH-053-06 | #53 | Persist estimator/version, date/rank/DOF/cadence diagnostics, fitted/raw correlation, #52/#54 identities, reference geometry, scope, bootstrap counts, calibration hashes, and per-pixel status. | **Scheduled — F53-03 and F53-07.** |
-| GH-053-07 | #53 | Emit separately named corrected slope and standard-error products only for a scope-matched successful receipt; merge on green CI and close #53. | **Scheduled — F53-07 through F53-09.** |
+| GH-053-07 | #53 | Emit separately named temporal-candidate slope and standard-error products only for scope-matched successful synthetic, resource, and identity receipts; merge on green CI and close #53. The products retain a synthetic-only status and carry no field-calibration claim. | **Scheduled — F53-07 through F53-09.** GroundPulse enablement remains deferred to EO. |
+| GH-053-08 | #53 release boundary | Obtain independent scientific review of the temporal field evidence before customer use or publication. | **Deferred — destination: [EO #505](https://github.com/morton-analytics-llc/eo/issues/505); re-enters only after the held-out GNSS gate has a complete, identity-matched result.** The dolphinRust merge and #53 closure contracts exclude this gate. |
 | GH-057-01 | #57 | Read raw orbit ephemeris type independently from `/metadata/orbit/orbit_type` without making otherwise valid orbit metadata unreadable when the field is absent. | **Scheduled — F57-01 and F57-02.** |
 | GH-057-02 | #57 | Normalize `POEORB` to `precise` and `RESORB` to `restituted`; unknown, missing, or inconsistent stacks remain explicit absence with a reason. | **Scheduled — F57-01 through F57-03.** |
 | GH-057-03 | #57 | Add sourced per-run ephemeris-class provenance without changing orbit direction, heading, spacing, timing, or NISAR/data-only behavior. | **Scheduled — F57-03.** |
@@ -35,14 +43,17 @@ pull requests exist. This intake supersedes the time-boxed/deferred dispositions
 ## Ownership boundary
 
 - This intake covers dolphinRust only: analytic kernels, workflow integration, producer artifacts,
-  validation tooling/evidence, and GitHub issue closure.
-- EO serving, datum anchoring, station A/B product behavior, Fresno backfill, API/UI work, release
-  pinning, and deployment remain outside this repository.
-- The #53 outer cohort is scientific validation data for the estimator. It must be non-Fresno and
-  outcome-blinded until the estimator, scorer, attrition rules, and hashes are frozen.
+  frozen synthetic/resource/identity evidence, and GitHub issue closure.
+- EO owns held-out GNSS acquisition and scoring, independent scientific review of the temporal
+  field evidence, release pinning, GroundPulse enablement, serving, datum anchoring, station A/B
+  behavior, Fresno backfill, API/UI work, deployment, and publication.
+- EO must keep its #53 outer cohort non-Fresno and outcome-blinded until the dolphinRust estimator,
+  scorer contract, attrition rules, and identities are frozen. EO records failure or
+  non-evaluability as a no-go. #53 remains closed.
+- #54's independent spatial review remains a dolphinRust #54 requirement.
 
 ## Coverage audit
 
-All live GitHub issues and every acceptance item in their current bodies have a scheduled
-disposition. Nothing is deferred or silently dropped. dolphinRust has no UI, so the backend/UI
-pairing rule does not apply.
+Every intake ID has an explicit disposition. GH-053-05 and GH-053-08 are deferred to EO with named
+re-entry gates; all other IDs remain scheduled in this plan. dolphinRust has no UI, so the
+backend/UI pairing rule does not apply.

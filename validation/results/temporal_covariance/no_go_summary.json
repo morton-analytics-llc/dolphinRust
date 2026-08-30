@@ -1,0 +1,72 @@
+{
+  "schema": "dolphinrust-temporal-covariance-no-go-summary/1",
+  "status": "scientific_no_go",
+  "engine_validation_status": "complete_scientific_no_go",
+  "selected_method": "reml_covariance_parameter_adjusted_scalar",
+  "selected_method_version": 2,
+  "execution": {
+    "supported_cells": 24,
+    "execution_paths": 2,
+    "seeds_per_cell": 1050,
+    "seed_requests": 25200,
+    "attempts": 50400,
+    "emitted": 50394,
+    "failed": 6,
+    "profile_fits": 25200,
+    "bootstrap_attempts": 5040000,
+    "peak_resident_set_bytes": 726335488,
+    "resource_gates_pass": true
+  },
+  "scientific_result": {
+    "selected_method_pass": false,
+    "all_methods_pass": false,
+    "engine_validation_eligible": false,
+    "unique_cells_failing_coverage_68": 10,
+    "unique_cells_failing_coverage_90": 10,
+    "unique_cells_failing_coverage_95": 12,
+    "proper_score_worse_than_plugin_68_cells": 22,
+    "proper_score_worse_than_plugin_90_cells": 24,
+    "proper_score_worse_than_plugin_95_cells": 24,
+    "conclusion": "The adjusted-scalar candidate systematically overcovers and has worse proper interval score than plug-in GLS in the frozen scope. The six weak-identification attempts are not the cause of the no-go."
+  },
+  "failed_seed_requests": [
+    {"cell_index": 12, "outer_seed_index": 481, "seed": 1532838587369168472},
+    {"cell_index": 18, "outer_seed_index": 34, "seed": 16564286117642789927},
+    {"cell_index": 22, "outer_seed_index": 479, "seed": 17745139538064861781}
+  ],
+  "known_scorer_defects": [
+    "The standardized-bias gate is not multiplicity-calibrated for 24 cells at 1050 seeds.",
+    "The paired comparator requires identical emission sets despite the preregistered 99 percent emission allowance.",
+    "Floating subtraction can reject coverage exactly on a tolerance boundary.",
+    "Requiring every comparator to pass is unnecessary for candidate validation but was frozen in v5 and cannot be changed post-outcome."
+  ],
+  "known_implementation_finding": "The exact adjusted-variance fallback erases its inner error before reporting WeakParameterIdentification; this does not change the no-go conclusion.",
+  "upstream_reference": {
+    "dolphin_commit": "c2f7c24a055f3de2be13e5fda717baa03cbabad2",
+    "velocity_behavior": "Post-gauge, spatially referenced, free-intercept degree-1 polyfit scaled by 365.25; unweighted by default, with optional raw-correlation weights.",
+    "uncertainty_behavior": "Upstream Dolphin does not fit temporal covariance or emit velocity standard errors or confidence intervals.",
+    "conclusion": "Issue 53 is a new calibrated-inference method, not Dolphin parity. Dolphin point-velocity parity should be validated separately with an end-to-end post-gauge oracle contract."
+  },
+  "identities": {
+    "source_set_sha256": "f5d71d5ba98e742bef7a3652ac7a6217e52a1a0e1118edf9b7c1b30573e9fc66",
+    "producer_binary_sha256": "bd35df7751cce060d72d839ec4a4747fedc0f630a92e77be87ee2531e96028c9",
+    "resource_benchmark_binary_sha256": "616a8eead44484d1462f7ab9f6f59c37b116b367fe791a3bb176518046862ef7",
+    "coverage_and_replay_sha256": "23b123a6872e080ceb9aea45fba016c7a23d58d59504b5ae1f9e11a6324dfd59",
+    "run_identity_sha256": "3041edfd008f26b4dea6e825bb882df4b1824ef49cb5d9fc0048bdefde85d7bc",
+    "run_manifest_sha256": "bdab395890265496f1fbba8118f741b33be222647e30e3d27b4d84ad33aef05c",
+    "run_commit_sha256": "db53c284bda9be95010622b77c91f783fe668ac65552605f3460f1484ac8f0d6",
+    "candidate_resource_receipt_sha256": "23ddce0429fa7f9de781b90e63721a2a8db8af2c43ae1d1ac0ef29e04453f851",
+    "method_selection_receipt_sha256": "7d59cf8e01bef0048e3b5d6c0e9af669230812805a73f5fe7c657a0ecd038111",
+    "final_resource_receipt_sha256": "0d2966946284c925ab088dd702c2d0e0e04e4177a1eb3c01d5d0eabb2434a131"
+  },
+  "verification": {
+    "replay_byte_identical": true,
+    "independent_review": "execution and implementation evidence complete; issue 53 scientific acceptance is NO-GO",
+    "cargo_check_workspace": "pass",
+    "cargo_clippy_all_targets_deny_warnings": "pass",
+    "cargo_fmt_check": "pass",
+    "git_diff_check": "pass",
+    "python_generator_scorer_resource_tests": "50 passed"
+  },
+  "boundary": "Keep corrected temporal inferential sigma disabled. Do not promote to EO or GroundPulse from this receipt. A successor requires a new preregistration and unseen seed stream."
+}

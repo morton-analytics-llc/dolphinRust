@@ -879,7 +879,7 @@ fn rank_revealing_psd_factor(
         });
     }
     let psd_tolerance = scale * RANK_TOLERANCE;
-    let rank_tolerance = psd_tolerance;
+    let rank_tolerance = scale * RANK_TOLERANCE;
     for row in 0..size {
         for column in row + 1..size {
             if (matrix[(row, column)] - matrix[(column, row)]).abs() > psd_tolerance {

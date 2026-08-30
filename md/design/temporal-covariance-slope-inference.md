@@ -1,8 +1,13 @@
 # Temporal covariance slope inference
 
-This document freezes the pure timeseries boundary for issue #53. It is a
-research/validation component only. It does not authorize a corrected raster,
-serving, release, or a change to the conditional `velocity_sigma.tif` path.
+This document freezes the pure timeseries boundary for issue #53. This
+pure-kernel contract does not by itself authorize a corrected raster, serving,
+release, or a change to the conditional `velocity_sigma.tif` path. #53 closes
+only after the frozen synthetic and resource gates pass and the
+preregistration, producer source set, binary, #52 replay, and reviewed #54
+spatial-factor identities match. [EO #505](https://github.com/morton-analytics-llc/eo/issues/505)
+owns held-out GNSS field acceptance and independent temporal scientific review
+after closure.
 
 ## Estimand and input
 
@@ -43,9 +48,11 @@ correlation, not zero.
 
 ## Frozen synthetic grid
 
-The committed preregistration enumerates every supported factor and immutable
-threshold. The first implementation runs only compact contract fixtures; the
-5,000-seed-per-cell experiment is a separate release-mode artifact step.
+`validation/temporal_covariance_synthetic_engine_preregistration.json` schema
+`dolphinrust-temporal-covariance-preregistration/5` enumerates every supported
+factor and immutable threshold. The first implementation runs only compact
+contract fixtures; the release run uses 1,050 seeds for each of 24 supported
+cells on both execution paths, for 50,400 frozen attempts.
 
 - Dates: 12, 24, 48, and 96 retained dates.
 - Correlation: iid 0, 0.3, 0.6; 0.85 only for 48/96-date cells.
@@ -83,9 +90,25 @@ and preregistration/code hashes are retained separately. Attempted failures are
 never topped up, and aggregate result hashes and measured wall/RSS receipts are
 created only after the batch exits.
 
-## Promotion boundary
+The release producer sends same-cell consecutive seeds in frames of at most 32.
+Each frame generates one direct factor and one temporal fit per seed, evaluates
+the target lanes through the factor-native batch path, and caps Rayon at 12
+workers. Each cell is an independently committed shard, so interruption resumes
+from complete cells without replaying or retaining dense attempt evidence.
 
-Synthetic coverage is necessary but insufficient. An untouched outer cohort,
-independent scientific review, matching #52/#54 provenance, resource receipts,
-and a signed promotion manifest are required before any workflow can emit a
-corrected product. Until then every downstream state is `conditional_only`.
+## dolphinRust closure and EO promotion boundary
+
+dolphinRust closes #53 only after the complete frozen synthetic matrix passes,
+the preregistered resource limits pass, and the preregistration, producer source
+set, binary, #52 replay, and reviewed #54 spatial-factor identities all match.
+The receipt then records `engine_validation_eligible = true` and
+`engine_validation_status = synthetic_validated_scope_match`. This establishes a
+temporal candidate validated against synthetic evidence only. Field calibration
+and GroundPulse use require the downstream EO gates.
+
+EO owns the untouched GNSS station-pair cohort, independent scientific review of
+the temporal field evidence, GroundPulse enablement, and publication. Those gates
+run against the exact dolphinRust candidate and identities after #53 closes. A
+failed or non-evaluable EO gate leaves GroundPulse on conditional output. The
+frozen #53 result remains unchanged. #54's independent spatial review remains
+part of the #54 contract and is unchanged by this boundary.

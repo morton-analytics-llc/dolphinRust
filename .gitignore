@@ -13,6 +13,8 @@ Cargo.lock.bak
 /scratch
 /bench/runs
 /validation/runs
+# Local exact-validation execution artifacts. Force-add only compact receipts.
+/validation/results/
 *.tif
 *.h5
 *.nc

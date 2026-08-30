@@ -263,6 +263,13 @@ def run_parallel_batch(
     if not math.isfinite(generation_delay_seconds) or generation_delay_seconds < 0:
         raise SchemaError("parallel batch generation delay is invalid")
     preregistration = load_preregistration(preregistration_path)
+    preregistration_file_sha256 = hashlib.sha256(
+        _read_bounded_bytes(
+            preregistration_path,
+            FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
+            "parallel batch preregistration",
+        )
+    ).hexdigest()
     cell_ids = expected_cell_ids(preregistration)
     if cell_id not in cell_ids:
         raise SchemaError("parallel batch cell is outside the frozen matrix")
@@ -326,6 +333,7 @@ def run_parallel_batch(
                     "--seed-start", str(seed_start),
                     "--seed-count", str(chunk_seed_count),
                     "--generation-delay-seconds", str(generation_delay_seconds),
+                    "--preregistration-file-sha256", preregistration_file_sha256,
                 ]
                 if request_path is not None:
                     command.extend(["--request-file", str(request_path)])
@@ -440,8 +448,28 @@ def _batch_chunk_worker(args: argparse.Namespace) -> None:
     source_root = args.source_root.resolve(strict=True)
     preregistration_path = args.preregistration.resolve(strict=True)
     batch_binary = args.batch_binary.resolve(strict=True)
-    preregistration = load_preregistration(preregistration_path)
-    cell_ids = expected_cell_ids(preregistration)
+    preregistration_raw = _read_bounded_bytes(
+        preregistration_path,
+        FROZEN_MAX_RESOURCE_RECEIPT_BYTES,
+        "parallel child preregistration",
+    )
+    if hashlib.sha256(preregistration_raw).hexdigest() != args.preregistration_file_sha256:
+        raise SchemaError("parallel child preregistration differs from the parent-bound file")
+    try:
+        preregistration = json.loads(preregistration_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchemaError("parallel child preregistration is malformed") from exc
+    matrix = preregistration.get("matrix_contract", {})
+    stochastic = matrix.get("stochastic_cells", [])
+    deterministic = matrix.get("deterministic_contract_cells", [])
+    cell_ids = [
+        "|".join(labels)
+        for labels in sorted(
+            {tuple(cell_id.split("|")) for cell_id in (*stochastic, *deterministic)}
+        )
+    ]
+    if len(stochastic) != 24 or len(deterministic) != 15 or len(cell_ids) != 39:
+        raise SchemaError("parallel child preregistration cell contract differs")
     if args.cell_id not in cell_ids:
         raise SchemaError("parallel child cell is outside the frozen matrix")
     if (
@@ -472,6 +500,13 @@ def _batch_chunk_worker(args: argparse.Namespace) -> None:
                     if seed_index >= args.seed_start:
                         stdin.write(raw)
         stdin.seek(0)
+        rayon_threads = preregistration.get("execution_protocol", {}).get(
+            "attempt_rayon_threads"
+        )
+        if rayon_threads != 1:
+            raise SchemaError("parallel batch child requires one frozen Rayon worker")
+        child_environment = os.environ.copy()
+        child_environment["RAYON_NUM_THREADS"] = str(rayon_threads)
         completed = subprocess.run(
             [
                 str(batch_binary), "--preregistration", str(preregistration_path),
@@ -482,6 +517,7 @@ def _batch_chunk_worker(args: argparse.Namespace) -> None:
             stdout=sys.stdout.buffer,
             stderr=subprocess.DEVNULL,
             check=False,
+            env=child_environment,
         )
     if completed.returncode != 0:
         raise SchemaError("parallel batch child failed")
@@ -1060,6 +1096,13 @@ def rust_attempt_regenerator(
 ) -> AttemptRegenerator:
     preregistration_path = Path(preregistration_path).resolve(strict=True)
     batch_binary = Path(batch_binary).resolve(strict=True)
+    rayon_threads = preregistration.get("execution_protocol", {}).get(
+        "attempt_rayon_threads"
+    )
+    if rayon_threads != 1:
+        raise SchemaError("Rust attempt replay requires one frozen Rayon worker")
+    child_environment = os.environ.copy()
+    child_environment["RAYON_NUM_THREADS"] = str(rayon_threads)
 
     def regenerate(cell_id: str, cell_ordinal: int) -> Iterator[Mapping[str, Any]]:
         spec = ShardSpec(
@@ -1079,6 +1122,7 @@ def rust_attempt_regenerator(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=child_environment,
         )
         assert process.stdin is not None and process.stdout is not None
         try:
@@ -2047,6 +2091,7 @@ def main() -> None:
     batch_child.add_argument("--seed-start", type=int, required=True)
     batch_child.add_argument("--seed-count", type=int, required=True)
     batch_child.add_argument("--generation-delay-seconds", type=float, default=0.0)
+    batch_child.add_argument("--preregistration-file-sha256", required=True)
     batch_child.add_argument("--request-file", type=Path)
     capture = commands.add_parser("capture-resource", help="capture one benchmark allocation stdout record")
     capture.add_argument("--destination", type=Path, required=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and score one externally supplied #53 held-out receipt bundle."""
+"""Validate and score one GNSS receipt bundle for EO field acceptance."""
 
 from __future__ import annotations
 
@@ -75,6 +75,8 @@ def current_implementation_source_hashes() -> dict[str, str]:
         "scorer_sha256": ROOT / "heldout_temporal_covariance" / "scorer.py",
         "runner_cli_sha256": ROOT / "run_temporal_covariance_holdout_cluster.py",
         "scorer_cli_sha256": Path(__file__).resolve(),
+        "cohort_sha256": ROOT / "heldout_temporal_covariance" / "cohort.py",
+        "gps_ground_truth_sha256": ROOT / "gps_ground_truth.py",
     }
     return {
         name: hashlib.sha256(read_bounded(path, JSON_CAP)).hexdigest()
@@ -85,15 +87,15 @@ def current_implementation_source_hashes() -> dict[str, str]:
 def bind_factor_files(receipt: dict[str, Any], factor_path: Path, manifest_path: Path) -> None:
     hashes = receipt.get("hashes")
     if not isinstance(hashes, dict):
-        raise ValueError("held-out receipt is missing artifact hashes")
+        raise ValueError("EO field-acceptance receipt is missing artifact hashes")
     factor = read_bounded(factor_path, FACTOR_CAP)
     manifest_bytes = read_bounded(manifest_path, MANIFEST_CAP)
     factor_sha256 = sha256(factor)
     manifest_sha256 = sha256(manifest_bytes)
     if factor_sha256 != hashes.get("persisted_factor_sha256"):
-        raise ValueError("held-out receipt factor hash differs from supplied HDF5")
+        raise ValueError("EO field-acceptance factor hash differs from supplied HDF5")
     if manifest_sha256 != hashes.get("persisted_factor_manifest_sha256"):
-        raise ValueError("held-out receipt factor-manifest hash differs from supplied JSON")
+        raise ValueError("EO field-acceptance factor-manifest hash differs from supplied JSON")
     manifest = json.loads(
         manifest_bytes.decode("utf-8"),
         object_pairs_hook=_unique_object,
@@ -124,24 +126,24 @@ def bind_product_files(
     }
     clusters = receipt.get("clusters")
     if not isinstance(clusters, list):
-        raise ValueError("held-out receipt clusters are invalid")
+        raise ValueError("EO field-acceptance receipt clusters are invalid")
     run_identity = receipt.get("run_identity")
     run_identity_sha256 = receipt.get("run_identity_sha256")
     if (
         not isinstance(run_identity, dict)
         or run_identity_sha256 != canonical_digest(run_identity)
     ):
-        raise ValueError("held-out receipt run identity is invalid")
+        raise ValueError("EO field-acceptance receipt run identity is invalid")
     current_products = {
         cluster_id: product_identity_sha256(root, preregistration)
         for cluster_id, root in sorted(product_roots.items())
     }
     for cluster in clusters:
         if not isinstance(cluster, dict):
-            raise ValueError("held-out receipt cluster is invalid")
+            raise ValueError("EO field-acceptance receipt cluster is invalid")
         cluster_id = cluster.get("cluster_id")
         if cluster_id not in product_roots:
-            raise ValueError("held-out receipt cluster is absent from the run plan")
+            raise ValueError("EO field-acceptance cluster is absent from the run plan")
         if cluster.get("status") == "not_used":
             continue
         actual_product_identity = current_products[cluster_id]
@@ -149,14 +151,14 @@ def bind_product_files(
             cluster.get("run_identity_sha256") != run_identity_sha256
             or cluster.get("product_identity_sha256") != actual_product_identity
         ):
-            raise ValueError("held-out cluster product identity differs from current bytes")
+            raise ValueError("EO field-acceptance product identity differs from current bytes")
         if cluster.get("status") not in {"pass", "fail"}:
             continue
         if (
             cluster.get("estimator", {}).get("binary_sha256")
             != run_identity.get("binary_sha256")
         ):
-            raise ValueError("held-out cluster estimator binary is stale")
+            raise ValueError("EO field-acceptance estimator binary is stale")
         binding = cluster.get("difference_covariance")
         if not isinstance(binding, dict) or not isinstance(binding.get("scope"), dict):
             raise ValueError("evaluable cluster factor binding is missing")
@@ -176,7 +178,7 @@ def bind_product_files(
             root / factor_spec["input_operator"]["artifact_manifest"],
         )
         if actual["binding"] != binding:
-            raise ValueError("held-out cluster factor binding differs from current bytes")
+            raise ValueError("EO field-acceptance factor binding differs from current bytes")
 
 
 def build_scored_result(
@@ -200,9 +202,9 @@ def build_scored_result(
         "reasons_by_cluster",
     }
     if set(score) != required_score_fields | {"holm"}:
-        raise ValueError("held-out scorer output differs from the promotion schema")
+        raise ValueError("EO field-acceptance scorer output differs from the acceptance schema")
     return {
-        "schema": "dolphinrust.temporal_covariance.heldout_score",
+        "schema": "eo.temporal_covariance.field_acceptance_score",
         "schema_version": 1,
         "cohort_id": preregistration["cohort_id"],
         "manifest_file_sha256": manifest_file_sha256,
@@ -235,7 +237,7 @@ def main() -> int:
             / preregistration["execution"]["scored_result"]
         ).resolve()
         if args.output.resolve() != expected_output:
-            raise ValueError("held-out score path is not the frozen promotion path")
+            raise ValueError("EO field-acceptance score path is not the frozen acceptance path")
         manifest = read_json(args.manifest)
         freeze_receipt = read_json(args.freeze_receipt)
         run_plan = read_json(args.run_plan)
@@ -253,7 +255,7 @@ def main() -> int:
             or run_identity.get("implementation_source_hashes")
             != current_implementation_source_hashes()
         ):
-            raise ValueError("held-out receipt run identity is stale")
+            raise ValueError("EO field-acceptance receipt run identity is stale")
         bind_product_files(receipt, preregistration, manifest, product_roots)
         result = build_scored_result(
             score_receipt(preregistration, manifest, receipt),

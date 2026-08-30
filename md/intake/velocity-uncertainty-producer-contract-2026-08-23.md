@@ -1,5 +1,13 @@
 # Velocity uncertainty producer contract intake
 
+> **Superseded #53 boundary (2026-08-28):** DRU-007 is split: its frozen
+> synthetic, resource, and identity evidence remains deferred to dolphinRust
+> #53, while held-out GNSS and independent temporal review are deferred to
+> `eo` after #53 closes. DRU-008's consumer canary and GP-DRU-001 remain
+> deferred to EO/GroundPulse; publication is EO-owned. DRU-009 and #54 spatial
+> review are unchanged. The original dispositions below are retained as a
+> historical snapshot.
+
 Source: GroundPulse Fresno demo science review, 2026-08-23.
 
 | ID | Canonical requirement | Disposition |

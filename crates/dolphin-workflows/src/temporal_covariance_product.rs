@@ -1,4 +1,4 @@
-//! Calibrated, fail-closed temporal-GLS raster products for issue #53.
+//! Synthetic-validated, fail-closed temporal-GLS raster products for issue #53.
 
 use std::collections::BTreeMap;
 #[cfg(unix)]
@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use dolphin_core::config::{TemporalUncertaintyMethod, TemporalUncertaintyOptions};
@@ -17,14 +18,14 @@ use dolphin_core::BlockIndices;
 use dolphin_io::{
     read_raster_header, read_raster_window, read_spatial_reference_covariance_block,
     read_spatial_reference_covariance_block_ids, read_spatial_reference_covariance_header,
-    BoundedCogWriter, SpatialReferenceCalibrationScope, SpatialReferenceCovarianceStatus,
+    BoundedCogWriter, CovarianceOperatorGrid, SpatialReferenceCalibrationScope,
+    SpatialReferenceCovarianceMetadata, SpatialReferenceCovarianceStatus,
 };
 use dolphin_timeseries::{
-    complete_refit_bootstrap_estimate, fit_temporal_covariance,
-    temporal_covariance_workspace_composition, CompleteRefitBootstrapCadenceStatus,
-    CompleteRefitBootstrapEstimate, CompleteRefitBootstrapEstimateStatus,
-    TemporalCovarianceOptions, TemporalInferenceStatus, COMPLETE_REFIT_BOOTSTRAP_METHOD,
-    COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+    fit_temporal_factor_plugin_batch, fit_temporal_factor_scalar_batch, TemporalCovarianceOptions,
+    TemporalInferenceStatus, TemporalScalarCandidateMethod,
+    REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+    REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -36,40 +37,48 @@ use crate::spatial_covariance_artifact::{
     read_spatial_reference_covariance_artifact_manifest, SPATIAL_REFERENCE_COVARIANCE_FILENAME,
     SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
 };
+#[cfg(test)]
+use crate::spatial_reference_covariance_output::factor_block_shape;
 
 /// Synthetic result filename required by the promotion validator.
 pub const TEMPORAL_SYNTHETIC_RESULT_FILENAME: &str = "temporal_covariance_synthetic_result.json";
-/// Externally supplied non-Fresno holdout result filename.
-pub const TEMPORAL_HELDOUT_RESULT_FILENAME: &str = "temporal_covariance_heldout_result.json";
-/// Exact one-shot 96+20 raw receipt consumed by the held-out scorer.
-pub const TEMPORAL_HELDOUT_RECEIPT_FILENAME: &str =
-    "temporal_covariance_heldout_result_receipt.json";
-/// Frozen outcome-blind cohort manifest supplied with the held-out receipt.
-pub const TEMPORAL_HELDOUT_MANIFEST_FILENAME: &str =
-    "temporal_covariance_heldout_cohort_manifest.json";
-/// Freeze receipt binding the manifest to the preregistration before unblinding.
-pub const TEMPORAL_HELDOUT_FREEZE_RECEIPT_FILENAME: &str =
-    "temporal_covariance_heldout_cohort_freeze_receipt.json";
-/// Independent scientific-review receipt filename.
-pub const TEMPORAL_REVIEW_RECEIPT_FILENAME: &str = "temporal_covariance_review_receipt.json";
 /// Immutable completion/promotion manifest filename.
 pub const TEMPORAL_PROMOTION_MANIFEST_FILENAME: &str =
     "temporal_covariance_promotion_manifest.json";
+/// Observed release-resource receipt required by the promotion validator.
+pub const TEMPORAL_RESOURCE_RECEIPT_FILENAME: &str = "temporal_inference_resource_receipt.json";
+/// Pre-outcome candidate resource evidence consumed by the method-selection chain.
+pub const TEMPORAL_CANDIDATE_RESOURCE_RECEIPT_FILENAME: &str =
+    "temporal_inference_candidate_resource_receipt.json";
+/// Observed pre-outcome scalar-method selection receipt required by final promotion.
+pub const TEMPORAL_METHOD_SELECTION_FILENAME: &str = "temporal_covariance_method_selection.json";
+/// Canonical observed batch-binary artifact name in the evidence directory.
+pub const TEMPORAL_BATCH_BINARY_FILENAME: &str = "temporal_covariance_batch";
+/// Canonical observed benchmark-binary artifact name in the evidence directory.
+pub const TEMPORAL_INFERENCE_BENCH_BINARY_FILENAME: &str = "temporal_inference_bench";
+/// Direct #52/#54 producer receipt persisted beside a resource-benchmark factor fixture.
+pub const TEMPORAL_DIRECT_FACTOR_RECEIPT_FILENAME: &str = "temporal_direct_factor_receipt.json";
 /// Product provenance completion marker, published after every COG.
 pub const TEMPORAL_INFERENCE_PROVENANCE_FILENAME: &str = "velocity_inference_provenance.json";
 
 const JSON_CAP: u64 = 64 * 1024 * 1024;
-const PRODUCT_SCHEMA: &str = "dolphinrust-temporal-inference-product/1";
-const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/1";
-const REVIEW_SCHEMA: &str = "dolphinrust-temporal-covariance-review/1";
-const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/7";
-const TEMPORAL_BATCH_SCHEMA: &str = "dolphinrust-temporal-covariance-batch/6";
-const TEMPORAL_PRODUCER_IDENTITY_SCHEMA: &str = "dolphinrust-temporal-covariance-run-identity/1";
+const RESOURCE_RECEIPT_CAP: u64 = 1024 * 1024;
+const BINARY_CAP: u64 = 256 * 1024 * 1024;
+const PRODUCT_SCHEMA: &str = "dolphinrust-temporal-inference-product/2";
+const PROMOTION_SCHEMA: &str = "dolphinrust-temporal-covariance-promotion/3";
+const SYNTHETIC_SCHEMA: &str = "dolphinrust-temporal-covariance-simulation/9";
+const PREREGISTRATION_SCHEMA: &str = "dolphinrust-temporal-covariance-preregistration/5";
+const TEMPORAL_RESOURCE_SCHEMA: &str = "dolphinrust-temporal-inference-resource/2";
+const TEMPORAL_METHOD_SELECTION_SCHEMA: &str = "dolphinrust-temporal-covariance-method-selection/1";
+const TEMPORAL_RESOURCE_BENCHMARK_METHOD: &str = "factor_native_direct_issue54_full_tile/2";
+const CONDITIONAL_BENCHMARK_METHOD: &str = "plugin_gls_reml";
+#[cfg(test)]
+const TEMPORAL_BENCHMARK_FACTOR_BLOCK_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+const TEMPORAL_BATCH_SCHEMA: &str = "dolphinrust-temporal-covariance-batch/7";
+const TEMPORAL_PRODUCER_IDENTITY_SCHEMA: &str = "dolphinrust-temporal-covariance-run-identity/2";
 const TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA: &str = "dolphinrust.canonical-producer-source-set/2";
-const HELDOUT_SCORE_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_score";
-const HELDOUT_RECEIPT_SCHEMA: &str = "dolphinrust.temporal_covariance.heldout_receipt";
 const LAYER_COUNT: usize = 14;
-const COMBINED_WORKING_SET_CAP_BYTES: u64 = 512 * 1024 * 1024;
+const COMBINED_WORKING_SET_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TRANSACTION_LOCK_FILENAME: &str = ".temporal-covariance-product.lock";
 const ROLLBACK_JOURNAL_FILENAME: &str = ".temporal-covariance-product.rollback.json";
 const ROLLBACK_JOURNAL_SCHEMA: &str = "dolphinrust-temporal-product-rollback/2";
@@ -78,28 +87,25 @@ const TRANSACTION_ARTIFACT_MARKER_FILENAME: &str = ".temporal-transaction-owner.
 const TRANSACTION_STAGE_CLEANUP_PREFIX: &str = ".temporal-inference-stage-cleanup-";
 #[cfg(unix)]
 const CLEANUP_QUARANTINE_MARKER_SCHEMA: &str = "dolphinrust-temporal-cleanup-quarantine/1";
-const HELDOUT_COHORT_ID: &str = "f53-06-outer-nonfresno-v1";
-const HELDOUT_PREREGISTRATION_FILE_SHA256: &str =
-    "4e960161f149330c57561b15afa2525e6cb608ce9e9b820816c3733749f41d4e";
-const HELDOUT_MANIFEST_FILE_SHA256: &str =
-    "016230fca1f3e4381d24effdd14e1839b603a71d6da3696ff561edc433a1970e";
-const HELDOUT_MANIFEST_CANONICAL_SHA256: &str =
-    "2b9208eaf1f54f10f971544062df348062d4a9b9eb518dd1b373bd8ebe561050";
-const HELDOUT_FREEZE_FILE_SHA256: &str =
-    "5b1317197c55865cfff398c9ecf67a3181bd479f4a615af83bf9b72b30923500";
-const HELDOUT_RECEIPT_SCORER_SHA256: &str =
-    "942bda853ce55b28b7f92698f28ba9982cce370adfedde42da9e0b0e14426671";
-const HELDOUT_REVIEW_SCORER_SHA256: &str =
-    "7303e0f75437618afc47099cae05e729a7180603737b38c804f0fc7d30ddc2e8";
 static NEXT_TRANSACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static GDAL_CACHE_LIMIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Exact target tile row count required by the release-resource contract.
+pub const TEMPORAL_RESOURCE_TILE_ROWS: u64 = 256;
+/// Exact target tile column count required by the release-resource contract.
+pub const TEMPORAL_RESOURCE_TILE_COLUMNS: u64 = 256;
+/// Maximum observed resident set allowed by the release-resource contract.
+pub const TEMPORAL_RESOURCE_RSS_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+/// Maximum candidate-to-conditional wall-time ratio.
+pub const TEMPORAL_RESOURCE_WALL_MULTIPLIER: u64 = 2;
+
 const TEMPORAL_PREREGISTRATION_BYTES: &[u8] =
-    include_bytes!("../../../validation/temporal_covariance_preregistration.json");
+    include_bytes!("../../../validation/temporal_covariance_synthetic_engine_preregistration.json");
+const TEMPORAL_PREREGISTRATION_V4_BYTES: &[u8] = include_bytes!(
+    "../../../validation/temporal_covariance_synthetic_engine_preregistration_v4.json"
+);
 const GENERATOR_SOURCE_BYTES: &[u8] =
     include_bytes!("../../../validation/temporal_covariance_simulation.py");
-const HELDOUT_PREREGISTRATION_BYTES: &[u8] =
-    include_bytes!("../../../validation/temporal_covariance_heldout_preregistration.json");
 const ESTIMATOR_SOURCE_BYTES: &[u8] =
     include_bytes!("../../dolphin-timeseries/src/temporal_covariance.rs");
 const BATCH_SOURCE_BYTES: &[u8] =
@@ -111,6 +117,7 @@ const SPATIAL_ARTIFACT_SOURCE_BYTES: &[u8] = include_bytes!("spatial_covariance_
 const GEOTIFF_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/geotiff.rs");
 const COVARIANCE_IO_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-io/src/covariance.rs");
 const CONFIG_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-core/src/config.rs");
+const BENCH_SOURCE_BYTES: &[u8] = include_bytes!("../examples/temporal_inference_bench.rs");
 const PROVENANCE_SOURCE_BYTES: &[u8] = include_bytes!("provenance.rs");
 const GEOMETRY_SOURCE_BYTES: &[u8] = include_bytes!("../../dolphin-corrections/src/geometry.rs");
 const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
@@ -119,9 +126,7 @@ const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemporalCovariancePromotion {
     manifest_sha256: String,
-    review_sha256: String,
     synthetic_sha256: String,
-    heldout_sha256: String,
     spatial_manifest_sha256: String,
     spatial_factor_sha256: String,
 }
@@ -137,6 +142,190 @@ pub struct TemporalCovarianceProductReceipt {
     pub provenance_sha256: String,
     /// SHA-256 of the promotion manifest that authorized emission.
     pub promotion_manifest_sha256: String,
+}
+
+/// Observed bytes and SHA-256 identity for one release binary artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalInferenceBinaryIdentity {
+    /// Lowercase SHA-256 of the observed artifact bytes.
+    pub sha256: String,
+    /// Exact observed artifact length.
+    pub bytes: u64,
+}
+
+/// Host identity bound to one observed resource benchmark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalInferenceHostIdentity {
+    /// Rust target operating system.
+    pub operating_system: String,
+    /// Rust target architecture.
+    pub architecture: String,
+    /// Logical processors visible to the benchmark process.
+    pub logical_processor_count: u64,
+    /// Rayon worker count used by the conditional estimator.
+    pub rayon_thread_count: u64,
+    /// OpenMP worker count pinned for nested native kernels.
+    pub omp_thread_count: u64,
+    /// OpenBLAS worker count pinned for nested native kernels.
+    pub openblas_thread_count: u64,
+    /// MKL worker count pinned for nested native kernels.
+    pub mkl_thread_count: u64,
+    /// Accelerate/vecLib worker count pinned for nested native kernels.
+    pub veclib_thread_count: u64,
+}
+
+/// One scalar-method measurement from the wired release-resource benchmark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalInferenceScalarMeasurement {
+    /// Exact scalar method executed.
+    pub method: TemporalScalarCandidateMethod,
+    /// SHA-256 of the observed persisted #54 HDF5 artifact.
+    pub factor_sha256: String,
+    /// SHA-256 of the direct #52/#54 producer receipt emitted by the batch binary.
+    pub direct_factor_receipt_sha256: String,
+    /// Number of bounded spatial-factor block reads.
+    pub factor_block_reads: u64,
+    /// Exact realized factor rank for every non-reference valid target.
+    pub nonreference_realized_rank: u64,
+    /// Exact tile targets traversed, including the coincident reference.
+    pub processed_pixels: u64,
+    /// Targets with an evaluated scalar outcome.
+    pub evaluated_pixels: u64,
+    /// REML profiles executed by this method path.
+    pub profile_fit_count: u64,
+    /// Complete-refit bootstrap attempts; required to remain zero.
+    pub bootstrap_attempts: u64,
+    /// Shared REML rho-lane evaluations.
+    pub optimizer_rho_lane_evaluations: u64,
+    /// Shared REML process-variance objective evaluations.
+    pub optimizer_q_objective_evaluations: u64,
+    /// Shared REML primary-rho pass histogram, saturating in bin 20.
+    pub optimizer_primary_rho_pass_histogram: [u64; 21],
+    /// Theta lanes that materialized adjustment-only slope derivatives.
+    pub covariance_parameter_derivative_lane_evaluations: u64,
+    /// Final analytic covariance-parameter adjustments materialized.
+    pub covariance_parameter_adjustment_count: u64,
+    /// Rayon worker count represented by the bounded arena pool.
+    pub rayon_worker_count: u64,
+    /// Maximum retained solver scratch for one worker.
+    pub maximum_worker_scratch_bytes: u64,
+    /// Exact optimizer fallbacks observed.
+    pub exact_optimizer_fallback_targets: u64,
+    /// Exact condition-number fallbacks observed.
+    pub condition_exact_fallbacks: u64,
+    /// Observed factor-read through in-memory layer materialization wall time.
+    pub wall_micros: u64,
+    /// Two counterbalanced raw wired-estimator trials.
+    pub wall_micros_trials: Vec<u64>,
+    /// Observed full persisted-factor-to-COG wall time.
+    pub full_product_wall_micros: u64,
+    /// Two counterbalanced raw full-product trials.
+    pub full_product_wall_micros_trials: Vec<u64>,
+    /// Maximum resident set observed by the method process.
+    pub peak_resident_set_bytes: u64,
+    /// Deterministic checksum proving the emitted layers were consumed.
+    pub checksum: f64,
+}
+
+/// One date-count comparison on an identical direct #54 factor and varied tile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalInferenceResourceMeasurement {
+    /// Retained post-gauge date count frozen by the resource contract.
+    pub post_gauge_date_count: u64,
+    /// Total acquisition count, including the exact gauge acquisition.
+    pub acquisition_count: u64,
+    /// Exact number of targets in the 256-square tile.
+    pub target_count: u64,
+    /// Number of distinct factor-plus-observation fingerprints in the measured tile.
+    pub varied_target_fingerprint_count: u64,
+    /// Plug-in GLS baseline on the shared factor and observations.
+    pub plugin_gls_reml: TemporalInferenceScalarMeasurement,
+    /// Analytic covariance-parameter-adjusted scalar on the shared factor and observations.
+    pub reml_covariance_parameter_adjusted_scalar: TemporalInferenceScalarMeasurement,
+    /// Observed adjusted-to-plug-in wired wall ratio.
+    pub adjusted_to_plugin_wall_ratio: f64,
+    /// Observed adjusted-to-plug-in full-product wall ratio.
+    pub adjusted_to_plugin_full_product_wall_ratio: f64,
+}
+
+/// Typed observed resource evidence for temporal-candidate promotion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalInferenceResourceReceipt {
+    /// Receipt schema.
+    pub schema: String,
+    /// Candidate-only or final-pass receipt disposition.
+    pub status: String,
+    /// Exact benchmarked production-core method.
+    pub benchmark_method: String,
+    /// Comparable baseline method.
+    pub baseline_method: String,
+    /// Temporal candidate method.
+    pub candidate_method: String,
+    /// Temporal candidate method version.
+    pub candidate_method_version: u16,
+    /// Exact tile row count.
+    pub tile_rows: u64,
+    /// Exact tile column count.
+    pub tile_columns: u64,
+    /// Exact target count in every measured tile.
+    pub target_count: u64,
+    /// Maximum permitted scratch retained by one worker.
+    pub worker_scratch_limit_bytes: u64,
+    /// Maximum permitted process resident set.
+    pub resident_set_limit_bytes: u64,
+    /// Default target-count cap used by the wired product path.
+    pub maximum_targets_per_block: u64,
+    /// Default factor-block-ID allocation cap.
+    pub block_id_read_cap_bytes: u64,
+    /// Default factor-block allocation cap.
+    pub factor_block_read_cap_bytes: u64,
+    /// Default combined temporal-product working-set cap.
+    pub combined_working_set_cap_bytes: u64,
+    /// Exact product source identity compiled into the benchmark binary.
+    pub product_source_sha256: String,
+    /// Exact benchmark source identity compiled into the benchmark binary.
+    pub benchmark_source_sha256: String,
+    /// Exact batch source identity compiled into the observed producer binary.
+    pub batch_source_sha256: String,
+    /// SHA-256 of the observed pre-outcome scalar-selection receipt; absent only for candidate evidence.
+    pub pre_outcome_selection_receipt_sha256: Option<String>,
+    /// Observed benchmark host identity.
+    pub host: TemporalInferenceHostIdentity,
+    /// Observed release batch-binary identity.
+    pub temporal_covariance_batch_binary: TemporalInferenceBinaryIdentity,
+    /// Observed release benchmark-binary identity.
+    pub temporal_inference_bench_binary: TemporalInferenceBinaryIdentity,
+    /// Measurements in exact 12/48/96-date order.
+    pub measurements: Vec<TemporalInferenceResourceMeasurement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemporalMethodSelectionReceipt {
+    schema: String,
+    status: String,
+    selected_method: String,
+    selected_method_version: u16,
+    candidate_resource_receipt_sha256: String,
+    canonical_v4_preregistration_sha256: String,
+    product_source_sha256: String,
+    benchmark_source_sha256: String,
+    batch_source_sha256: String,
+    temporal_covariance_batch_binary_sha256: String,
+    temporal_inference_bench_binary_sha256: String,
+    tile_rows: u64,
+    tile_columns: u64,
+    target_count: u64,
+    post_gauge_date_counts: Vec<u64>,
+    adjusted_to_plugin_wall_ratio_limit: f64,
+    worker_scratch_limit_bytes: u64,
+    resident_set_limit_bytes: u64,
+    outcomes_present: bool,
 }
 
 #[derive(Debug)]
@@ -309,142 +498,34 @@ struct SyntheticProducerIdentity {
     source_correlation_model: String,
     source_correlation_distance_scale_pixels: f64,
     seed_count: u64,
+    candidate_resource_receipt_sha256: String,
+    method_selection_receipt_sha256: String,
+    resource_receipt_sha256: String,
+    resource_benchmark_binary_sha256: String,
 }
 
 #[derive(Deserialize)]
 struct SyntheticResult {
     schema: String,
-    attempted_cells: u64,
-    batch_attempted_cells: u64,
-    seed_count: u64,
+    preregistration_schema: String,
+    expected_attempt_record_count: u64,
+    processed_attempt_record_count: u64,
+    seed_request_count: u64,
+    expected_seed_request_count: u64,
+    attempt_record_count: u64,
+    emitted_attempt_record_count: u64,
+    failed_attempt_record_count: u64,
+    skipped_attempt_record_count: u64,
+    seed_requests_per_cell: u64,
     execution_complete: bool,
     exact_seed_denominator_complete: bool,
+    run_committed: bool,
     corrected_inferential_sigma_emission: bool,
-    promotion_eligible: bool,
-    promotion_status: String,
+    engine_validation_eligible: bool,
+    engine_validation_status: String,
     scores: SyntheticScores,
     resource_gates: BTreeMap<String, bool>,
     producer_identity: SyntheticProducerIdentity,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutCoverage {
-    status: String,
-    p_value: f64,
-    null_coverage: f64,
-    observed_coverage: f64,
-    evaluated: usize,
-    covered: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutLevel {
-    status: String,
-    coverage: HeldoutCoverage,
-    coverage_absolute_error: f64,
-    coverage_absolute_gate: bool,
-    mean_interval_score: f64,
-    mean_baseline_interval_score: f64,
-    median_width_ratio: f64,
-    proper_score_improves: bool,
-    holm_reject: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutResult {
-    schema: String,
-    schema_version: u16,
-    cohort_id: String,
-    manifest_file_sha256: String,
-    manifest_sha256: String,
-    freeze_receipt_sha256: String,
-    factor_scope_sha256: String,
-    heldout_receipt_sha256: String,
-    primary_cluster_count: usize,
-    surplus_cluster_count: usize,
-    status: String,
-    errors: Vec<Value>,
-    levels: BTreeMap<String, HeldoutLevel>,
-    evaluated_clusters: usize,
-    emission_rate: f64,
-    attrited_primary_ids: Vec<String>,
-    used_surplus_ids: Vec<String>,
-    unused_surplus_ids: Vec<String>,
-    reasons_by_cluster: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct HeldoutAttrition {
-    attrited_primary_ids: Vec<String>,
-    used_surplus_ids: Vec<String>,
-    unused_surplus_ids: Vec<String>,
-    reasons_by_cluster: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutRunIdentity {
-    generation_id: String,
-    preregistration_sha256: String,
-    manifest_sha256: String,
-    freeze_receipt_sha256: String,
-    run_plan_sha256: String,
-    binary_sha256: String,
-    implementation_source_hashes: BTreeMap<String, String>,
-    product_identities_sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutClusterCounts {
-    primary: usize,
-    surplus: usize,
-    executed: usize,
-    evaluable: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeldoutReceipt {
-    schema: String,
-    schema_version: u16,
-    outcomes_present: bool,
-    one_shot_unblinding: bool,
-    cohort_id: String,
-    generation_id: String,
-    preregistration_sha256: String,
-    manifest_sha256: String,
-    scope_hash: String,
-    calibrated_scope_match: bool,
-    factor_binding: Value,
-    hashes: BTreeMap<String, String>,
-    cluster_counts: HeldoutClusterCounts,
-    attrition: HeldoutAttrition,
-    clusters: Vec<Value>,
-    run_identity: HeldoutRunIdentity,
-    run_identity_sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TemporalReviewReceipt {
-    schema: String,
-    review_status: String,
-    reviewer: String,
-    independent: bool,
-    unresolved_findings: u32,
-    synthetic_result_sha256: String,
-    heldout_result_sha256: String,
-    heldout_receipt_sha256: String,
-    spatial_manifest_sha256: String,
-    temporal_preregistration_sha256: String,
-    heldout_preregistration_sha256: String,
-    scorer_sha256: String,
-    source_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -456,23 +537,21 @@ struct TemporalPromotionManifest {
     selected_method: String,
     selected_method_version: u16,
     synthetic_result_sha256: String,
-    heldout_result_sha256: String,
-    heldout_receipt_sha256: String,
-    review_receipt_sha256: String,
+    temporal_resource_receipt_sha256: String,
+    temporal_covariance_batch_binary_sha256: String,
+    temporal_inference_bench_binary_sha256: String,
     spatial_factor_sha256: String,
     spatial_manifest_sha256: String,
     temporal_preregistration_sha256: String,
-    heldout_preregistration_sha256: String,
-    scorer_sha256: String,
     source_sha256: String,
 }
 
-/// Validate the full immutable #54/#53 evidence chain and return an
-/// unforgeable authorization token.
+/// Validate the immutable #54 spatial and #53 synthetic evidence chain.
 pub fn validate_temporal_covariance_promotion(
     evidence_directory: &Path,
     factor_directory: &Path,
 ) -> Result<TemporalCovariancePromotion> {
+    let resource = validate_release_resource_evidence(evidence_directory)?;
     let spatial = read_spatial_reference_covariance_artifact_manifest(factor_directory)?;
     ensure!(
         spatial.calibration_scope == "calibrated_scope_match",
@@ -488,57 +567,24 @@ pub fn validate_temporal_covariance_promotion(
         JSON_CAP,
     )?;
     let synthetic: SyntheticResult = serde_json::from_slice(&synthetic_bytes)?;
-    validate_synthetic_result(&synthetic)?;
-    let heldout_bytes = read_bounded(
-        &evidence_directory.join(TEMPORAL_HELDOUT_RESULT_FILENAME),
-        JSON_CAP,
-    )?;
-    let heldout: HeldoutResult = serde_json::from_slice(&heldout_bytes)?;
-    let heldout_receipt_bytes = read_bounded(
-        &evidence_directory.join(TEMPORAL_HELDOUT_RECEIPT_FILENAME),
-        JSON_CAP,
-    )?;
-    let heldout_receipt: HeldoutReceipt = serde_json::from_slice(&heldout_receipt_bytes)?;
-    let heldout_manifest_bytes = read_bounded(
-        &evidence_directory.join(TEMPORAL_HELDOUT_MANIFEST_FILENAME),
-        JSON_CAP,
-    )?;
-    let heldout_freeze_bytes = read_bounded(
-        &evidence_directory.join(TEMPORAL_HELDOUT_FREEZE_RECEIPT_FILENAME),
-        JSON_CAP,
-    )?;
-    let heldout_identity = validate_heldout_receipt(
-        &heldout_receipt,
-        &heldout_manifest_bytes,
-        &heldout_freeze_bytes,
-        sha256(&heldout_receipt_bytes),
-    )?;
-    validate_heldout_result(&heldout, &heldout_identity)?;
-    let review_bytes = read_bounded(
-        &evidence_directory.join(TEMPORAL_REVIEW_RECEIPT_FILENAME),
-        JSON_CAP,
-    )?;
-    let review: TemporalReviewReceipt = serde_json::from_slice(&review_bytes)?;
+    validate_synthetic_result(&synthetic, &resource)?;
     let expected = EvidenceDigests::current(
         sha256(&synthetic_bytes),
-        sha256(&heldout_bytes),
-        sha256(&heldout_receipt_bytes),
+        resource.receipt_sha256,
+        resource.batch_binary.sha256,
+        resource.benchmark_binary.sha256,
         spatial.hdf5_sha256,
         spatial_manifest_sha256.clone(),
     );
-    validate_review(&review, &expected)?;
-    let review_sha256 = sha256(&review_bytes);
     let manifest_bytes = read_bounded(
         &evidence_directory.join(TEMPORAL_PROMOTION_MANIFEST_FILENAME),
         JSON_CAP,
     )?;
     let manifest: TemporalPromotionManifest = serde_json::from_slice(&manifest_bytes)?;
-    validate_manifest(&manifest, &expected, &review_sha256)?;
+    validate_manifest(&manifest, &expected)?;
     Ok(TemporalCovariancePromotion {
         manifest_sha256: sha256(&manifest_bytes),
-        review_sha256,
         synthetic_sha256: expected.synthetic_result_sha256,
-        heldout_sha256: expected.heldout_result_sha256,
         spatial_manifest_sha256,
         spatial_factor_sha256: expected.spatial_factor_sha256,
     })
@@ -546,33 +592,32 @@ pub fn validate_temporal_covariance_promotion(
 
 struct EvidenceDigests {
     synthetic_result_sha256: String,
-    heldout_result_sha256: String,
-    heldout_receipt_sha256: String,
+    temporal_resource_receipt_sha256: String,
+    temporal_covariance_batch_binary_sha256: String,
+    temporal_inference_bench_binary_sha256: String,
     spatial_factor_sha256: String,
     spatial_manifest_sha256: String,
     temporal_preregistration_sha256: String,
-    heldout_preregistration_sha256: String,
-    scorer_sha256: String,
     source_sha256: String,
 }
 
 impl EvidenceDigests {
     fn current(
         synthetic_result_sha256: String,
-        heldout_result_sha256: String,
-        heldout_receipt_sha256: String,
+        temporal_resource_receipt_sha256: String,
+        temporal_covariance_batch_binary_sha256: String,
+        temporal_inference_bench_binary_sha256: String,
         spatial_factor_sha256: String,
         spatial_manifest_sha256: String,
     ) -> Self {
         Self {
             synthetic_result_sha256,
-            heldout_result_sha256,
-            heldout_receipt_sha256,
+            temporal_resource_receipt_sha256,
+            temporal_covariance_batch_binary_sha256,
+            temporal_inference_bench_binary_sha256,
             spatial_factor_sha256,
             spatial_manifest_sha256,
             temporal_preregistration_sha256: sha256(TEMPORAL_PREREGISTRATION_BYTES),
-            heldout_preregistration_sha256: sha256(HELDOUT_PREREGISTRATION_BYTES),
-            scorer_sha256: HELDOUT_REVIEW_SCORER_SHA256.to_owned(),
             source_sha256: canonical_named_sources_sha256(&[
                 (
                     "dolphin-timeseries/src/temporal_covariance.rs",
@@ -602,6 +647,10 @@ impl EvidenceDigests {
                 ("dolphin-io/src/covariance.rs", COVARIANCE_IO_SOURCE_BYTES),
                 ("dolphin-core/src/config.rs", CONFIG_SOURCE_BYTES),
                 (
+                    "dolphin-workflows/examples/temporal_inference_bench.rs",
+                    BENCH_SOURCE_BYTES,
+                ),
+                (
                     "dolphin-workflows/src/provenance.rs",
                     PROVENANCE_SOURCE_BYTES,
                 ),
@@ -624,894 +673,553 @@ fn canonical_named_sources_sha256(sources: &[(&str, &[u8])]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-struct HeldoutReceiptIdentity {
-    receipt_sha256: String,
-    manifest_file_sha256: String,
-    manifest_sha256: String,
-    freeze_receipt_sha256: String,
-    factor_scope_sha256: String,
-    attrition: HeldoutAttrition,
-    evaluated_clusters: usize,
-    required_cluster_failed: bool,
-    raw_levels: BTreeMap<String, RawHeldoutLevel>,
-}
-
-#[derive(Debug)]
-struct RawHeldoutLevel {
-    covered: usize,
-    mean_interval_score: f64,
-    mean_baseline_interval_score: f64,
-    median_width_ratio: f64,
-}
-
-#[derive(Debug)]
-struct RawHeldoutObservationLevel {
-    covered: bool,
-    interval_score: f64,
-    baseline_interval_score: f64,
-    width: f64,
-    baseline_width: f64,
-}
-
 fn canonical_json_sha256(bytes: &[u8]) -> Result<String> {
     let value: Value = serde_json::from_slice(bytes)?;
     Ok(sha256(&serde_json::to_vec(&value)?))
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn expected_heldout_implementation_source_hashes() -> BTreeMap<String, String> {
-    [
-        (
-            "executor_sha256",
-            "e0185db2618ea6d2ef1b0f7300cbac63955a0e4f4d2d68922907ba22ff70a18c",
-        ),
-        (
-            "cohort_sha256",
-            "89bdb8adc569e31e3bb45872767795b4d5a7bbf563c8b8a5b20dfa1d75482614",
-        ),
-        (
-            "gps_ground_truth_sha256",
-            "87205de6626aa4687b99b904ad0e429ad49c5aedde82db536390119f3b36c81f",
-        ),
-        (
-            "runner_sha256",
-            "ae8ffa1cd31e97f1ccccc3dd31b66aa36a4859c8d0347d5187fb827cb1920e71",
-        ),
-        (
-            "scorer_sha256",
-            "a0ba776261cc9e774696ccebd62404804403c7b64f6146d52959942814dfa8ab",
-        ),
-        (
-            "runner_cli_sha256",
-            "cb67b8956872ee2525e0f64af18a68de8b57b57b44a08aecdde480ba59ad6211",
-        ),
-        (
-            "scorer_cli_sha256",
-            "d69735f7f2ac36e6c1ebace5467d7e152ef2d083ae2872e43fedea175ca8dea0",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, digest)| (name.to_owned(), digest.to_owned()))
-    .collect()
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_heldout_receipt(
-    receipt: &HeldoutReceipt,
-    manifest_bytes: &[u8],
-    freeze_bytes: &[u8],
+struct ObservedReleaseResourceEvidence {
     receipt_sha256: String,
-) -> Result<HeldoutReceiptIdentity> {
-    let preregistration: Value = serde_json::from_slice(HELDOUT_PREREGISTRATION_BYTES)?;
-    let manifest: Value = serde_json::from_slice(manifest_bytes)?;
-    let freeze: Value = serde_json::from_slice(freeze_bytes)?;
-    let preregistration_sha256 = canonical_json_sha256(HELDOUT_PREREGISTRATION_BYTES)?;
-    let manifest_sha256 = canonical_json_sha256(manifest_bytes)?;
-    let manifest_file_sha256 = sha256(manifest_bytes);
-    let freeze_receipt_sha256 = sha256(freeze_bytes);
-    let factor_binding = preregistration["factor_binding"].clone();
-    let factor_scope_sha256 = sha256(&serde_json::to_vec(&factor_binding)?);
-    let scope_hash = sha256(&serde_json::to_vec(&preregistration["field_scope"])?);
-    ensure!(
-        sha256(HELDOUT_PREREGISTRATION_BYTES) == HELDOUT_PREREGISTRATION_FILE_SHA256
-            && manifest_file_sha256 == HELDOUT_MANIFEST_FILE_SHA256
-            && manifest_sha256 == HELDOUT_MANIFEST_CANONICAL_SHA256
-            && freeze_receipt_sha256 == HELDOUT_FREEZE_FILE_SHA256,
-        "held-out preregistration, manifest, or freeze bytes differ from the frozen cohort"
-    );
-    ensure!(
-        manifest["schema"].as_str() == Some("dolphinrust.temporal_covariance.heldout_cohort")
-            && manifest["schema_version"].as_u64() == Some(2)
-            && manifest["cohort_id"].as_str() == Some(HELDOUT_COHORT_ID)
-            && manifest["status"].as_str() == Some("frozen_metadata_only")
-            && manifest["outcomes_present"].as_bool() == Some(false)
-            && manifest["frozen_clusters"].as_array().map(Vec::len) == Some(96)
-            && manifest["surplus_clusters"].as_array().map(Vec::len) == Some(20),
-        "held-out manifest is not the exact outcome-blind 96+20 schema"
-    );
-    ensure!(
-        freeze["schema"].as_str()
-            == Some("dolphinrust.temporal_covariance.heldout_cohort_freeze_receipt")
-            && freeze["schema_version"].as_u64() == Some(1)
-            && freeze["cohort_id"].as_str() == Some(HELDOUT_COHORT_ID)
-            && freeze["outcomes_present"].as_bool() == Some(false)
-            && freeze["selection_outcome_blind"].as_bool() == Some(true)
-            && freeze["counts"]["frozen_clusters"].as_u64() == Some(96)
-            && freeze["counts"]["surplus_clusters"].as_u64() == Some(20)
-            && freeze["hashes"]["manifest_file_sha256"].as_str()
-                == Some(manifest_file_sha256.as_str())
-            && freeze["hashes"]["manifest_canonical_sha256"].as_str()
-                == Some(manifest_sha256.as_str())
-            && freeze["hashes"]["preregistration_file_sha256"].as_str()
-                == Some(HELDOUT_PREREGISTRATION_FILE_SHA256)
-            && freeze["hashes"]["preregistration_canonical_sha256"].as_str()
-                == Some(preregistration_sha256.as_str()),
-        "held-out freeze receipt does not bind the supplied 96+20 manifest"
-    );
-    ensure!(
-        receipt.schema == HELDOUT_RECEIPT_SCHEMA
-            && receipt.schema_version == 1
-            && receipt.outcomes_present
-            && receipt.one_shot_unblinding
-            && receipt.cohort_id == HELDOUT_COHORT_ID
-            && receipt.generation_id == "f53-06-v1"
-            && receipt.preregistration_sha256 == preregistration_sha256
-            && receipt.manifest_sha256 == manifest_sha256
-            && receipt.scope_hash == scope_hash
-            && receipt.calibrated_scope_match
-            && receipt.factor_binding == factor_binding,
-        "held-out raw receipt schema or frozen scope identity differs"
-    );
-    let expected_hash_fields = preregistration["receipt_hash_fields"]
-        .as_array()
-        .context("held-out preregistration lacks receipt hash fields")?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .context("held-out receipt hash field is not a string")
-        })
-        .collect::<Result<std::collections::BTreeSet<_>>>()?;
-    ensure!(
-        expected_hash_fields.contains("binary_sha256")
-            && expected_hash_fields.contains("scorer_sha256")
-            && expected_hash_fields.contains("gnss_catalog_sha256")
-            && expected_hash_fields.contains("factor_scope_sha256")
-            && receipt
-                .hashes
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-                == expected_hash_fields
-            && receipt.hashes.values().all(|value| is_sha256(value))
-            && receipt.hashes.get("preregistration_sha256") == Some(&preregistration_sha256)
-            && receipt.hashes.get("manifest_sha256") == Some(&manifest_sha256)
-            && receipt.hashes.get("factor_scope_sha256") == Some(&factor_scope_sha256),
-        "held-out raw receipt implementation/factor/GNSS hash inventory is incomplete"
-    );
-    ensure!(
-        receipt.run_identity.generation_id == receipt.generation_id
-            && receipt.run_identity.preregistration_sha256 == preregistration_sha256
-            && receipt.run_identity.manifest_sha256 == manifest_sha256
-            && receipt.run_identity.freeze_receipt_sha256 == freeze_receipt_sha256
-            && receipt.hashes.get("binary_sha256").map(String::as_str)
-                == Some(receipt.run_identity.binary_sha256.as_str())
-            && is_sha256(&receipt.run_identity.run_plan_sha256)
-            && receipt.run_identity.implementation_source_hashes
-                == expected_heldout_implementation_source_hashes()
-            && is_sha256(&receipt.run_identity.product_identities_sha256)
-            && receipt.run_identity_sha256 == canonical_run_identity_sha256(&receipt.run_identity)?,
-        "held-out raw receipt run identity is stale or internally inconsistent"
-    );
-    validate_heldout_accounting(receipt, &manifest)?;
-    let raw_levels = validate_heldout_cluster_bindings(receipt, &preregistration, &manifest)?;
-    ensure!(
-        receipt.hashes.get("scorer_sha256").map(String::as_str)
-            == Some(HELDOUT_RECEIPT_SCORER_SHA256),
-        "held-out raw receipt was not produced for the frozen scorer"
-    );
-    let primary_ids = manifest_cluster_ids(&manifest, "frozen_clusters")?
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let required_cluster_failed = receipt.clusters.iter().any(|cluster| {
-        cluster["cluster_id"]
-            .as_str()
-            .is_some_and(|id| primary_ids.contains(id))
-            && cluster["status"].as_str() == Some("fail")
-    }) || receipt.attrition.used_surplus_ids.iter().any(|used| {
-        receipt.clusters.iter().any(|cluster| {
-            cluster["cluster_id"].as_str() == Some(used.as_str())
-                && cluster["status"].as_str() == Some("fail")
-        })
-    });
-    Ok(HeldoutReceiptIdentity {
-        receipt_sha256,
-        manifest_file_sha256,
-        manifest_sha256,
-        freeze_receipt_sha256,
-        factor_scope_sha256,
-        attrition: receipt.attrition.clone(),
-        evaluated_clusters: receipt.cluster_counts.evaluable,
-        required_cluster_failed,
-        raw_levels,
+    candidate_receipt_sha256: String,
+    selection_receipt_sha256: String,
+    batch_binary: TemporalInferenceBinaryIdentity,
+    benchmark_binary: TemporalInferenceBinaryIdentity,
+}
+
+/// Build the typed release-resource receipt with the compiled source and default-cap identities.
+///
+/// # Errors
+/// Returns an error when a platform count cannot be represented by the receipt schema.
+pub fn temporal_inference_resource_receipt(
+    temporal_covariance_batch_binary: TemporalInferenceBinaryIdentity,
+    temporal_inference_bench_binary: TemporalInferenceBinaryIdentity,
+    host: TemporalInferenceHostIdentity,
+    pre_outcome_selection_receipt_sha256: Option<String>,
+    measurements: Vec<TemporalInferenceResourceMeasurement>,
+) -> Result<TemporalInferenceResourceReceipt> {
+    let config = TemporalUncertaintyOptions::default();
+    Ok(TemporalInferenceResourceReceipt {
+        schema: TEMPORAL_RESOURCE_SCHEMA.to_owned(),
+        status: if pre_outcome_selection_receipt_sha256.is_some() {
+            "pass"
+        } else {
+            "candidate_evidence_only"
+        }
+        .to_owned(),
+        benchmark_method: TEMPORAL_RESOURCE_BENCHMARK_METHOD.to_owned(),
+        baseline_method: CONDITIONAL_BENCHMARK_METHOD.to_owned(),
+        candidate_method: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD.to_owned(),
+        candidate_method_version: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
+        tile_rows: TEMPORAL_RESOURCE_TILE_ROWS,
+        tile_columns: TEMPORAL_RESOURCE_TILE_COLUMNS,
+        target_count: TEMPORAL_RESOURCE_TILE_ROWS * TEMPORAL_RESOURCE_TILE_COLUMNS,
+        worker_scratch_limit_bytes: u64::try_from(
+            dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES,
+        )?,
+        resident_set_limit_bytes: TEMPORAL_RESOURCE_RSS_LIMIT_BYTES,
+        maximum_targets_per_block: u64::try_from(config.maximum_targets_per_block)?,
+        block_id_read_cap_bytes: config.block_id_read_cap_bytes,
+        factor_block_read_cap_bytes: config.factor_block_read_cap_bytes,
+        combined_working_set_cap_bytes: COMBINED_WORKING_SET_CAP_BYTES,
+        product_source_sha256: sha256(PRODUCT_SOURCE_BYTES),
+        benchmark_source_sha256: sha256(BENCH_SOURCE_BYTES),
+        batch_source_sha256: sha256(BATCH_SOURCE_BYTES),
+        pre_outcome_selection_receipt_sha256,
+        host,
+        temporal_covariance_batch_binary,
+        temporal_inference_bench_binary,
+        measurements,
     })
 }
 
-fn canonical_run_identity_sha256(identity: &HeldoutRunIdentity) -> Result<String> {
-    let fields = BTreeMap::from([
-        (
-            "binary_sha256",
-            Value::String(identity.binary_sha256.clone()),
-        ),
-        (
-            "freeze_receipt_sha256",
-            Value::String(identity.freeze_receipt_sha256.clone()),
-        ),
-        (
-            "generation_id",
-            Value::String(identity.generation_id.clone()),
-        ),
-        (
-            "implementation_source_hashes",
-            serde_json::to_value(&identity.implementation_source_hashes)?,
-        ),
-        (
-            "manifest_sha256",
-            Value::String(identity.manifest_sha256.clone()),
-        ),
-        (
-            "preregistration_sha256",
-            Value::String(identity.preregistration_sha256.clone()),
-        ),
-        (
-            "product_identities_sha256",
-            Value::String(identity.product_identities_sha256.clone()),
-        ),
-        (
-            "run_plan_sha256",
-            Value::String(identity.run_plan_sha256.clone()),
-        ),
-    ]);
-    Ok(sha256(&serde_json::to_vec(&fields)?))
-}
-
-fn manifest_cluster_ids(manifest: &Value, field: &str) -> Result<Vec<String>> {
-    manifest[field]
-        .as_array()
-        .context("held-out manifest cluster list is missing")?
-        .iter()
-        .map(|candidate| {
-            candidate["candidate_id"]
-                .as_str()
-                .map(str::to_owned)
-                .context("held-out manifest candidate lacks an identity")
-        })
-        .collect()
-}
-
+/// Run one scalar method through the actual persisted-factor, raster-read, and COG-write path.
+///
+/// # Errors
+/// Returns an error when the fixture scope, default admission, factor identity, scalar outputs, or
+/// bounded worker evidence differs from the release contract.
 #[allow(clippy::too_many_lines)]
-fn validate_heldout_cluster_bindings(
-    receipt: &HeldoutReceipt,
-    preregistration: &Value,
-    manifest: &Value,
-) -> Result<BTreeMap<String, RawHeldoutLevel>> {
-    let candidates = manifest["frozen_clusters"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(
-            manifest["surplus_clusters"]
-                .as_array()
-                .into_iter()
-                .flatten(),
-        )
-        .map(|candidate| {
-            Ok((
-                candidate["candidate_id"]
-                    .as_str()
-                    .context("held-out candidate lacks an identity")?
-                    .to_owned(),
-                candidate,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let required = &preregistration["factor_binding"];
-    let scope_fields = required["scope_fields"]
-        .as_array()
-        .context("held-out factor binding lacks scope fields")?
-        .iter()
-        .map(|field| {
-            field
-                .as_str()
-                .map(str::to_owned)
-                .context("held-out factor scope field is not a string")
-        })
-        .collect::<Result<std::collections::BTreeSet<_>>>()?;
-    let mut aggregate: BTreeMap<&str, BTreeMap<String, String>> = [
-        "operator_sha256",
-        "operator_manifest_sha256",
-        "persisted_factor_sha256",
-        "persisted_factor_manifest_sha256",
-        "gnss_catalog_sha256",
-        "approximation_receipt_sha256",
-        "resource_receipt_sha256",
-        "calibration_scope_receipt_sha256",
-        "review_receipt_sha256",
-    ]
-    .into_iter()
-    .map(|field| (field, BTreeMap::new()))
-    .collect();
-    let mut cluster_levels = BTreeMap::new();
-    for cluster in &receipt.clusters {
-        let cluster_id = cluster["cluster_id"]
-            .as_str()
-            .context("held-out cluster lacks an identity")?;
-        let candidate = candidates
-            .get(cluster_id)
-            .context("held-out cluster is not frozen")?;
-        ensure!(
-            cluster["station_ids"] == candidate["station_ids"]
-                && cluster["burst_id"] == candidate["burst_id"]
-                && cluster["site_id"] == candidate["site_id"],
-            "held-out cluster scope metadata differs from its frozen candidate"
-        );
-        if !matches!(cluster["status"].as_str(), Some("pass" | "fail")) {
-            continue;
-        }
-        let binding = cluster["difference_covariance"]
-            .as_object()
-            .context("evaluable held-out cluster lacks a direct factor binding")?;
-        ensure!(
-            binding.get("operation") == Some(&required["operation"])
-                && binding.get("input_operator") == Some(&required["input_operator"])
-                && binding.get("output_factor") == Some(&required["output_factor"])
-                && binding.get("mode") == Some(&required["mode"])
-                && binding.get("reference_specific") == Some(&required["reference_specific"])
-                && binding.get("stitched_burst_count") == Some(&required["stitched_burst_count"])
-                && binding.get("marginal_rss_combination_allowed") == Some(&Value::Bool(false))
-                && binding
-                    .get("calibrated_scope_match")
-                    .and_then(Value::as_str)
-                    == Some("calibrated_scope_match"),
-            "held-out cluster factor identity differs from the frozen direct-factor contract"
-        );
-        for field in ["factor_sha256", "scope_sha256"] {
-            ensure!(
-                binding
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(is_sha256),
-                "held-out cluster factor digest is invalid: {field}"
-            );
-        }
-        let scope = binding
-            .get("scope")
-            .and_then(Value::as_object)
-            .context("evaluable held-out cluster factor scope is missing")?;
-        ensure!(
-            scope
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-                == scope_fields
-                && scope.get("target_station_id") == candidate["station_ids"].get(0)
-                && scope.get("control_station_id") == candidate["station_ids"].get(1)
-                && scope.get("burst_id") == Some(&candidate["burst_id"])
-                && scope.get("schema_version") == required["output_factor"].get("schema_version")
-                && scope.get("method_version") == required["output_factor"].get("method_version")
-                && scope.get("method") == required["output_factor"].get("method")
-                && scope.get("calibration_scope")
-                    == required["output_factor"].get("calibration_status")
-                && matches!(
-                    scope.get("units").and_then(Value::as_str),
-                    Some("meters" | "millimeters")
-                ),
-            "held-out cluster factor scope differs from its frozen station/burst identity"
-        );
-        for field in scope_fields
-            .iter()
-            .filter(|field| field.ends_with("_sha256"))
-        {
-            ensure!(
-                scope
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(is_sha256),
-                "held-out cluster factor scope digest is missing: {field}"
-            );
-        }
-        let scope_sha256 = sha256(&serde_json::to_vec(scope)?);
-        ensure!(
-            binding.get("scope_sha256").and_then(Value::as_str) == Some(scope_sha256.as_str()),
-            "held-out cluster factor scope digest differs from its exact fields"
-        );
-        for field in [
-            "operator_sha256",
-            "operator_manifest_sha256",
-            "persisted_factor_sha256",
-            "persisted_factor_manifest_sha256",
-        ] {
-            let digest = binding
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| is_sha256(value))
-                .context("held-out cluster persisted factor digest is invalid")?;
-            aggregate
-                .get_mut(field)
-                .expect("frozen aggregate field")
-                .insert(cluster_id.to_owned(), digest.to_owned());
-        }
-        let gnss = cluster["gnss_provenance"]["solution_sha256"]
-            .as_str()
-            .filter(|value| is_sha256(value))
-            .context("held-out cluster GNSS digest is invalid")?;
-        aggregate
-            .get_mut("gnss_catalog_sha256")
-            .expect("frozen aggregate field")
-            .insert(cluster_id.to_owned(), gnss.to_owned());
-        validate_heldout_gnss(cluster, candidate, preregistration)?;
-        cluster_levels.insert(
-            cluster_id.to_owned(),
-            score_heldout_observation(&cluster["observation"])?,
-        );
-        for (output, source) in [
-            (
-                "approximation_receipt_sha256",
-                "approximation_receipt_sha256",
-            ),
-            ("resource_receipt_sha256", "resource_receipt_sha256"),
-            ("calibration_scope_receipt_sha256", "method_manifest_sha256"),
-            ("review_receipt_sha256", "review_receipt_sha256"),
-        ] {
-            let digest = scope
-                .get(source)
-                .and_then(Value::as_str)
-                .filter(|value| is_sha256(value))
-                .context("held-out cluster factor-evidence digest is invalid")?;
-            aggregate
-                .get_mut(output)
-                .expect("frozen aggregate field")
-                .insert(cluster_id.to_owned(), digest.to_owned());
-        }
-    }
-    for (field, values) in aggregate {
-        let digest = sha256(&serde_json::to_vec(&values)?);
-        ensure!(
-            receipt.hashes.get(field) == Some(&digest),
-            "held-out raw receipt factor/GNSS aggregate hash is cross-wired: {field}"
-        );
-    }
-    aggregate_selected_heldout_levels(receipt, manifest, &cluster_levels)
-}
-
-fn validate_heldout_gnss(
-    cluster: &Value,
-    candidate: &Value,
-    preregistration: &Value,
-) -> Result<()> {
-    let provenance = cluster["gnss_provenance"]
-        .as_object()
-        .context("held-out cluster GNSS provenance is missing")?;
-    let expected_fields = std::collections::BTreeSet::from([
-        "solution_sources",
-        "solution_sha256",
-        "coordinate_frame",
-        "los_source",
-        "los_sha256",
-        "station_los_vectors",
-        "projection_convention",
-        "epoch_zero_reference_sha256",
-        "covariance_projection",
-    ]);
+pub fn run_temporal_scalar_candidate_resource_probe(
+    fixture_directory: &Path,
+    post_gauge_date_count: u64,
+    method: TemporalScalarCandidateMethod,
+) -> Result<TemporalInferenceScalarMeasurement> {
     ensure!(
-        provenance
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            == expected_fields,
-        "held-out cluster GNSS provenance fields are incomplete"
+        [12_u64, 48, 96].contains(&post_gauge_date_count)
+            && method != TemporalScalarCandidateMethod::SlopeProfileLikelihoodMl,
+        "temporal scalar resource method or date count is unsupported"
     );
-    for field in [
-        "solution_sha256",
-        "los_sha256",
-        "epoch_zero_reference_sha256",
-    ] {
-        ensure!(
-            provenance
-                .get(field)
-                .and_then(Value::as_str)
-                .is_some_and(is_sha256),
-            "held-out cluster GNSS provenance digest is invalid: {field}"
-        );
-    }
-    let required = &preregistration["gnss_provenance"];
+    let rows = usize::try_from(TEMPORAL_RESOURCE_TILE_ROWS)?;
+    let columns = usize::try_from(TEMPORAL_RESOURCE_TILE_COLUMNS)?;
+    let tile_pixels = rows
+        .checked_mul(columns)
+        .context("temporal scalar resource tile area overflow")?;
+    let acquisition_count = usize::try_from(post_gauge_date_count + 1)?;
+    let days = (0..acquisition_count)
+        .map(|date| date as f64 * 12.0)
+        .collect::<Vec<_>>();
+    let displacement_rasters = (0..usize::try_from(post_gauge_date_count)?)
+        .map(|date| fixture_directory.join(format!("displacement_{date:03}.tif")))
+        .collect::<Vec<_>>();
+    let mask_path = fixture_directory.join("velocity_validity_mask.tif");
+    let factor_path = fixture_directory.join(SPATIAL_REFERENCE_COVARIANCE_FILENAME);
+    let direct_receipt_path = fixture_directory.join(TEMPORAL_DIRECT_FACTOR_RECEIPT_FILENAME);
     ensure!(
-        provenance.get("coordinate_frame") == Some(&required["coordinate_frame"])
-            && provenance.get("projection_convention") == Some(&required["projection"])
-            && provenance.get("covariance_projection") == Some(&required["covariance_projection"])
-            && provenance.get("los_source") == Some(&required["los_source"]),
-        "held-out cluster GNSS projection provenance differs from preregistration"
+        factor_path.is_file()
+            && mask_path.is_file()
+            && direct_receipt_path.is_file()
+            && displacement_rasters.iter().all(|path| path.is_file()),
+        "temporal scalar resource fixture is incomplete"
     );
-    let station_ids = candidate["station_ids"]
-        .as_array()
-        .context("held-out candidate station identities are missing")?
-        .iter()
-        .map(|station| {
-            station
-                .as_str()
-                .context("held-out candidate station identity is invalid")
-        })
-        .collect::<Result<std::collections::BTreeSet<_>>>()?;
-    let sources = provenance
-        .get("solution_sources")
-        .and_then(Value::as_object)
-        .context("held-out cluster GNSS solution sources are missing")?;
-    let vectors = provenance
-        .get("station_los_vectors")
-        .and_then(Value::as_object)
-        .context("held-out cluster GNSS LOS vectors are missing")?;
+    let direct_receipt = read_bounded(&direct_receipt_path, RESOURCE_RECEIPT_CAP)?;
+    let direct_factor_receipt_sha256 = sha256(&direct_receipt);
+    let factor_sha256 = sha256_file(&factor_path)?;
+    let config = TemporalUncertaintyOptions::default();
+    let block_ids =
+        read_spatial_reference_covariance_block_ids(&factor_path, config.block_id_read_cap_bytes)?;
+    let factor_metadata =
+        read_spatial_reference_covariance_header(&factor_path, config.factor_block_read_cap_bytes)?;
     ensure!(
-        sources
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            == station_ids
-            && vectors
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-                == station_ids,
-        "held-out cluster GNSS station identities differ from its frozen candidate"
-    );
-    let tolerance = required["los_norm_tolerance"]
-        .as_f64()
-        .context("held-out GNSS LOS tolerance is invalid")?;
-    for vector in vectors.values() {
-        let components = vector
-            .as_array()
-            .filter(|values| values.len() == 3)
-            .context("held-out cluster GNSS LOS vector is invalid")?;
-        let values = components
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .filter(|value| value.is_finite())
-                    .context("held-out cluster GNSS LOS vector is nonfinite")
+        factor_metadata.full_grid
+            == (CovarianceOperatorGrid {
+                row_start: 0,
+                col_start: 0,
+                rows: u32::try_from(rows)?,
+                cols: u32::try_from(columns)?,
+                stride_y: 1,
+                stride_x: 1,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let norm = values.iter().map(|value| value * value).sum::<f64>().sqrt();
-        ensure!(
-            (norm - 1.0).abs() <= tolerance,
-            "held-out cluster GNSS LOS vector is not unit norm"
-        );
-    }
-    Ok(())
-}
-
-fn score_heldout_observation(
-    observation: &Value,
-) -> Result<BTreeMap<String, RawHeldoutObservationLevel>> {
-    let observation = observation
-        .as_object()
-        .context("held-out cluster slope observation is missing")?;
-    let expected_fields = std::collections::BTreeSet::from([
-        "insar_slope_difference",
-        "gnss_slope_difference",
-        "insar_difference_variance",
-        "gnss_slope_variance",
-        "sensor_cross_covariance",
-        "baseline_sigma",
-    ]);
-    ensure!(
-        observation
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            == expected_fields,
-        "held-out cluster slope observation fields differ from the frozen schema"
+            && factor_metadata.ordered_date_indices.len() == acquisition_count
+            && factor_metadata.acquisition_days.as_deref() == Some(days.as_slice()),
+        "temporal scalar resource factor scope differs from the exact release tile"
     );
-    let finite = |field: &str| -> Result<f64> {
-        observation[field]
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .with_context(|| format!("held-out cluster slope observation is invalid: {field}"))
+    let factor_layout = observed_factor_layout(&factor_metadata, &block_ids, block_ids.capacity())?;
+    let admission = admit_combined_working_set(&config, acquisition_count, factor_layout)?;
+    let gdal_cache = ScopedGdalCacheLimit::acquire(admission.gdal_cache_budget_bytes)?;
+    let mut working_set = WorkingSetMonitor::new(admission);
+    let header = read_raster_header(&displacement_rasters[0])?;
+    ensure!(
+        header.shape == (rows, columns),
+        "temporal scalar resource raster shape differs from the release tile"
+    );
+    let method_name = match method {
+        TemporalScalarCandidateMethod::PluginGlsReml => "plugin-gls-reml",
+        TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar => {
+            "reml-covariance-parameter-adjusted-scalar"
+        }
+        TemporalScalarCandidateMethod::SlopeProfileLikelihoodMl => unreachable!(),
     };
-    let insar_difference = finite("insar_slope_difference")?;
-    let gnss_difference = finite("gnss_slope_difference")?;
-    let insar_variance = finite("insar_difference_variance")?;
-    let gnss_variance = finite("gnss_slope_variance")?;
-    let cross_covariance = finite("sensor_cross_covariance")?;
+    let stage = fixture_directory.join(format!("{method_name}-output"));
     ensure!(
-        insar_variance >= 0.0 && gnss_variance >= 0.0 && cross_covariance == 0.0,
-        "held-out cluster slope covariance is invalid"
+        !stage.exists(),
+        "temporal scalar resource output already exists"
     );
-    let variance = insar_variance + gnss_variance;
-    ensure!(
-        variance.is_finite() && variance > 0.0,
-        "held-out cluster combined slope covariance is not positive"
-    );
-    let baseline = observation["baseline_sigma"]
-        .as_object()
-        .context("held-out cluster baseline sigma is missing")?;
-    ensure!(
-        baseline
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            == std::collections::BTreeSet::from(["68", "90", "95"]),
-        "held-out cluster baseline sigma levels are incomplete"
-    );
-    let difference = insar_difference - gnss_difference;
-    let sigma = variance.sqrt();
-    let mut levels = BTreeMap::new();
-    for (level, z) in [
-        ("68", 0.994_457_883_209_753),
-        ("90", 1.644_853_626_951_472_2),
-        ("95", 1.959_963_984_540_054),
-    ] {
-        let nominal = level.parse::<f64>()? / 100.0;
-        let baseline_sigma = baseline[level]
-            .as_f64()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .context("held-out cluster baseline sigma is invalid")?;
-        let half_width = z * sigma;
-        let baseline_half_width = z * baseline_sigma;
-        levels.insert(
-            level.to_owned(),
-            RawHeldoutObservationLevel {
-                covered: difference.abs() <= half_width,
-                interval_score: interval_score(
-                    difference - half_width,
-                    difference + half_width,
-                    nominal,
-                ),
-                baseline_interval_score: interval_score(
-                    difference - baseline_half_width,
-                    difference + baseline_half_width,
-                    nominal,
-                ),
-                width: 2.0 * half_width,
-                baseline_width: 2.0 * baseline_half_width,
-            },
-        );
-    }
-    Ok(levels)
-}
-
-fn interval_score(lower: f64, upper: f64, nominal: f64) -> f64 {
-    let mut score = upper - lower;
-    if 0.0 < lower {
-        score += 2.0 * lower / (1.0 - nominal);
-    } else if 0.0 > upper {
-        score += 2.0 * -upper / (1.0 - nominal);
-    }
-    score
-}
-
-fn aggregate_selected_heldout_levels(
-    receipt: &HeldoutReceipt,
-    manifest: &Value,
-    cluster_levels: &BTreeMap<String, BTreeMap<String, RawHeldoutObservationLevel>>,
-) -> Result<BTreeMap<String, RawHeldoutLevel>> {
-    let statuses = receipt
-        .clusters
+    std::fs::create_dir(&stage)?;
+    let full_started = Instant::now();
+    let mut layers = create_layer_writers(&stage, &header, &factor_metadata.units, method_name)?;
+    let processing = process_factor_blocks(
+        &factor_path,
+        &block_ids,
+        &displacement_rasters,
+        &mask_path,
+        &days,
+        &config,
+        method,
+        factor_metadata.full_grid,
+        &mut layers,
+        &mut working_set,
+        &gdal_cache,
+    )?;
+    finalize_layers(&stage, &mut layers, &mut working_set, &gdal_cache)?;
+    let full_window = BlockIndices {
+        row_start: 0,
+        row_stop: rows,
+        col_start: 0,
+        col_stop: columns,
+    };
+    let checksum = PRODUCT_LAYERS
         .iter()
-        .map(|cluster| {
-            Ok((
-                cluster["cluster_id"]
-                    .as_str()
-                    .context("held-out cluster identity is missing")?,
-                cluster["status"]
-                    .as_str()
-                    .context("held-out cluster status is missing")?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let selected = manifest_cluster_ids(manifest, "frozen_clusters")?
-        .into_iter()
-        .filter(|id| statuses.get(id.as_str()) == Some(&"pass"))
-        .chain(receipt.attrition.used_surplus_ids.iter().cloned())
-        .collect::<Vec<_>>();
+        .map(|(name, _)| read_raster_window::<f32>(&stage.join(name), full_window))
+        .collect::<dolphin_io::Result<Vec<_>>>()?
+        .iter()
+        .flat_map(Array2::iter)
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(*value))
+        .sum::<f64>();
+    let nonreference_realized_rank = processing
+        .minimum_nonreference_realized_rank
+        .filter(|minimum| Some(*minimum) == processing.maximum_nonreference_realized_rank)
+        .context("temporal scalar resource factor ranks are absent or differ across targets")?;
     ensure!(
-        selected.len() == 96,
-        "held-out selected raw cluster denominator is not 96"
+        processing.processed_pixels == u64::try_from(tile_pixels)?
+            && processing.evaluated_pixels == u64::try_from(tile_pixels - 1)?
+            && processing.profile_fit_count == u64::try_from(tile_pixels - 1)?
+            && processing.bootstrap_attempts == 0
+            && processing.maximum_worker_scratch_bytes
+                <= u64::try_from(
+                    dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES,
+                )?
+            && nonreference_realized_rank == post_gauge_date_count
+            && checksum.is_finite(),
+        "temporal scalar resource execution is incomplete"
     );
-    let mut result = BTreeMap::new();
-    for level in ["68", "90", "95"] {
-        let values = selected
-            .iter()
-            .map(|id| {
-                cluster_levels
-                    .get(id)
-                    .and_then(|levels| levels.get(level))
-                    .context("selected held-out cluster lacks raw level metrics")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let divisor = values.len() as f64;
-        let mut widths = values.iter().map(|value| value.width).collect::<Vec<_>>();
-        let mut baseline_widths = values
-            .iter()
-            .map(|value| value.baseline_width)
-            .collect::<Vec<_>>();
-        result.insert(
-            level.to_owned(),
-            RawHeldoutLevel {
-                covered: values.iter().filter(|value| value.covered).count(),
-                mean_interval_score: values.iter().map(|value| value.interval_score).sum::<f64>()
-                    / divisor,
-                mean_baseline_interval_score: values
-                    .iter()
-                    .map(|value| value.baseline_interval_score)
-                    .sum::<f64>()
-                    / divisor,
-                median_width_ratio: median(&mut widths)? / median(&mut baseline_widths)?,
-            },
-        );
-    }
-    Ok(result)
+    let full_product_wall_micros = u64::try_from(full_started.elapsed().as_micros())?.max(1);
+    Ok(TemporalInferenceScalarMeasurement {
+        method,
+        factor_sha256,
+        direct_factor_receipt_sha256,
+        factor_block_reads: processing.factor_block_reads,
+        nonreference_realized_rank,
+        processed_pixels: processing.processed_pixels,
+        evaluated_pixels: processing.evaluated_pixels,
+        profile_fit_count: processing.profile_fit_count,
+        bootstrap_attempts: processing.bootstrap_attempts,
+        optimizer_rho_lane_evaluations: processing.optimizer_rho_lane_evaluations,
+        optimizer_q_objective_evaluations: processing.optimizer_q_objective_evaluations,
+        optimizer_primary_rho_pass_histogram: processing.optimizer_primary_rho_pass_histogram,
+        covariance_parameter_derivative_lane_evaluations: processing
+            .covariance_parameter_derivative_lane_evaluations,
+        covariance_parameter_adjustment_count: processing.covariance_parameter_adjustment_count,
+        rayon_worker_count: processing.rayon_worker_count,
+        maximum_worker_scratch_bytes: processing.maximum_worker_scratch_bytes,
+        exact_optimizer_fallback_targets: processing.exact_optimizer_fallback_targets,
+        condition_exact_fallbacks: processing.condition_exact_fallbacks,
+        wall_micros: processing.wired_estimator_wall_micros.max(1),
+        wall_micros_trials: vec![processing.wired_estimator_wall_micros.max(1)],
+        full_product_wall_micros,
+        full_product_wall_micros_trials: vec![full_product_wall_micros],
+        peak_resident_set_bytes: benchmark_resident_set_bytes(),
+        checksum,
+    })
 }
 
-fn median(values: &mut [f64]) -> Result<f64> {
-    ensure!(!values.is_empty(), "held-out median is undefined");
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    Ok(if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) / 2.0
-    } else {
-        values[middle]
+fn benchmark_resident_set_bytes() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` initializes the supplied `rusage` on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: the successful call above initialized `usage`.
+    let maximum = unsafe { usage.assume_init() }.ru_maxrss;
+    #[cfg(target_os = "macos")]
+    let bytes = u64::try_from(maximum).unwrap_or(0);
+    #[cfg(not(target_os = "macos"))]
+    let bytes = u64::try_from(maximum).unwrap_or(0).saturating_mul(1024);
+    bytes
+}
+
+fn observed_binary_identity(path: &Path) -> Result<TemporalInferenceBinaryIdentity> {
+    let bytes = read_bounded(path, BINARY_CAP)
+        .with_context(|| format!("reading observed release binary {}", path.display()))?;
+    ensure!(!bytes.is_empty(), "observed release binary is empty");
+    Ok(TemporalInferenceBinaryIdentity {
+        sha256: sha256(&bytes),
+        bytes: u64::try_from(bytes.len())?,
+    })
+}
+
+fn validate_release_resource_evidence(
+    evidence_directory: &Path,
+) -> Result<ObservedReleaseResourceEvidence> {
+    let receipt_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_RESOURCE_RECEIPT_FILENAME),
+        RESOURCE_RECEIPT_CAP,
+    )
+    .context("temporal release-resource receipt is missing or unreadable")?;
+    let receipt: TemporalInferenceResourceReceipt = serde_json::from_slice(&receipt_bytes)
+        .context("temporal release-resource receipt is malformed")?;
+    let batch_binary =
+        observed_binary_identity(&evidence_directory.join(TEMPORAL_BATCH_BINARY_FILENAME))?;
+    let benchmark_binary = observed_binary_identity(
+        &evidence_directory.join(TEMPORAL_INFERENCE_BENCH_BINARY_FILENAME),
+    )?;
+    validate_temporal_inference_resource_receipt(&receipt, &batch_binary, &benchmark_binary)?;
+    ensure!(
+        receipt.status == "pass",
+        "candidate-only temporal resource evidence cannot authorize promotion"
+    );
+    let selection_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_METHOD_SELECTION_FILENAME),
+        RESOURCE_RECEIPT_CAP,
+    )
+    .context("temporal pre-outcome method-selection receipt is missing or unreadable")?;
+    let selection: TemporalMethodSelectionReceipt = serde_json::from_slice(&selection_bytes)
+        .context("temporal pre-outcome method-selection receipt is malformed")?;
+    let selection_sha256 = sha256(&selection_bytes);
+    let candidate_bytes = read_bounded(
+        &evidence_directory.join(TEMPORAL_CANDIDATE_RESOURCE_RECEIPT_FILENAME),
+        RESOURCE_RECEIPT_CAP,
+    )
+    .context("temporal candidate resource receipt is missing or unreadable")?;
+    let candidate: TemporalInferenceResourceReceipt = serde_json::from_slice(&candidate_bytes)
+        .context("temporal candidate resource receipt is malformed")?;
+    validate_temporal_inference_resource_receipt(
+        &candidate,
+        &candidate.temporal_covariance_batch_binary,
+        &candidate.temporal_inference_bench_binary,
+    )
+    .context("temporal candidate resource receipt failed structural validation")?;
+    let canonical_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    ensure!(
+        receipt.pre_outcome_selection_receipt_sha256.as_deref() == Some(selection_sha256.as_str())
+            && selection.schema == TEMPORAL_METHOD_SELECTION_SCHEMA
+            && selection.status == "pre_outcome_selected"
+            && selection.selected_method == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD
+            && selection.selected_method_version
+                == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION
+            && selection.candidate_resource_receipt_sha256 == sha256(&candidate_bytes)
+            && candidate.status == "candidate_evidence_only"
+            && candidate.pre_outcome_selection_receipt_sha256.is_none()
+            && candidate.product_source_sha256 == selection.product_source_sha256
+            && candidate.benchmark_source_sha256 == selection.benchmark_source_sha256
+            && candidate.batch_source_sha256 == selection.batch_source_sha256
+            && candidate.product_source_sha256 == receipt.product_source_sha256
+            && candidate.benchmark_source_sha256 == receipt.benchmark_source_sha256
+            && candidate.batch_source_sha256 == receipt.batch_source_sha256
+            && candidate.temporal_covariance_batch_binary.sha256
+                == selection.temporal_covariance_batch_binary_sha256
+            && candidate.temporal_inference_bench_binary.sha256
+                == selection.temporal_inference_bench_binary_sha256
+            && selection.canonical_v4_preregistration_sha256
+                == canonical_json_sha256(TEMPORAL_PREREGISTRATION_V4_BYTES)?
+            && canonical_sha256(&selection.product_source_sha256)
+            && canonical_sha256(&selection.benchmark_source_sha256)
+            && canonical_sha256(&selection.batch_source_sha256)
+            && canonical_sha256(&selection.temporal_covariance_batch_binary_sha256)
+            && canonical_sha256(&selection.temporal_inference_bench_binary_sha256)
+            && selection.tile_rows == TEMPORAL_RESOURCE_TILE_ROWS
+            && selection.tile_columns == TEMPORAL_RESOURCE_TILE_COLUMNS
+            && selection.target_count
+                == TEMPORAL_RESOURCE_TILE_ROWS * TEMPORAL_RESOURCE_TILE_COLUMNS
+            && selection.post_gauge_date_counts == [12_u64, 48, 96]
+            && selection.adjusted_to_plugin_wall_ratio_limit
+                == TEMPORAL_RESOURCE_WALL_MULTIPLIER as f64
+            && selection.worker_scratch_limit_bytes
+                == u64::try_from(
+                    dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES,
+                )?
+            && selection.resident_set_limit_bytes == TEMPORAL_RESOURCE_RSS_LIMIT_BYTES
+            && !selection.outcomes_present,
+        "temporal pre-outcome method-selection receipt differs from the frozen contract"
+    );
+    Ok(ObservedReleaseResourceEvidence {
+        receipt_sha256: sha256(&receipt_bytes),
+        candidate_receipt_sha256: sha256(&candidate_bytes),
+        selection_receipt_sha256: selection_sha256,
+        batch_binary,
+        benchmark_binary,
     })
 }
 
 #[allow(clippy::too_many_lines)]
-fn validate_heldout_accounting(receipt: &HeldoutReceipt, manifest: &Value) -> Result<()> {
-    let primary_ids = manifest_cluster_ids(manifest, "frozen_clusters")?;
-    let surplus_ids = manifest_cluster_ids(manifest, "surplus_clusters")?;
-    let primary = primary_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let surplus = surplus_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut statuses = BTreeMap::new();
-    let mut receipt_ids = Vec::with_capacity(receipt.clusters.len());
-    for cluster in &receipt.clusters {
-        let id = cluster["cluster_id"]
-            .as_str()
-            .context("held-out cluster lacks an identity")?;
-        let status = cluster["status"]
-            .as_str()
-            .context("held-out cluster lacks a status")?;
-        ensure!(
-            matches!(status, "pass" | "fail" | "not_evaluable" | "not_used")
-                && statuses.insert(id.to_owned(), status.to_owned()).is_none(),
-            "held-out cluster accounting has an invalid or duplicate entry"
-        );
-        receipt_ids.push(id.to_owned());
-    }
-    let attrition = &receipt.attrition;
-    let used = attrition
-        .used_surplus_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let unused = attrition
-        .unused_surplus_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let attrited = attrition
-        .attrited_primary_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let expected_attrited = primary_ids
-        .iter()
-        .filter(|id| statuses.get(*id).map(String::as_str) == Some("not_evaluable"))
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_used = surplus_ids
-        .iter()
-        .filter(|id| matches!(statuses.get(*id).map(String::as_str), Some("pass" | "fail")))
-        .take(expected_attrited.len())
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_unused = surplus_ids
-        .iter()
-        .filter(|id| !expected_used.contains(id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_reasons = statuses
-        .iter()
-        .filter_map(|(id, status)| (status == "not_evaluable").then_some(id))
-        .collect::<std::collections::BTreeSet<_>>();
-    let executed = statuses
-        .values()
-        .filter(|status| *status != "not_used")
-        .count();
-    let evaluable = statuses
-        .values()
-        .filter(|status| matches!(status.as_str(), "pass" | "fail"))
-        .count();
+fn validate_temporal_inference_resource_receipt(
+    receipt: &TemporalInferenceResourceReceipt,
+    observed_batch: &TemporalInferenceBinaryIdentity,
+    observed_benchmark: &TemporalInferenceBinaryIdentity,
+) -> Result<()> {
+    let default_config = TemporalUncertaintyOptions::default();
+    let canonical_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
     ensure!(
-        primary.len() == 96
-            && surplus.len() == 20
-            && receipt.cluster_counts.primary == primary.len()
-            && receipt.cluster_counts.surplus == surplus.len()
-            && receipt.cluster_counts.executed == executed
-            && receipt.cluster_counts.evaluable == evaluable
-            && primary.is_disjoint(&surplus)
-            && receipt_ids
-                == primary_ids
-                    .iter()
-                    .chain(&surplus_ids)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            && used.len() == attrition.used_surplus_ids.len()
-            && unused.len() == attrition.unused_surplus_ids.len()
-            && attrited.len() == attrition.attrited_primary_ids.len()
-            && used.is_disjoint(&unused)
-            && attrited.is_subset(&primary)
-            && used.is_subset(&surplus)
-            && unused.is_subset(&surplus)
-            && used.len() == attrited.len()
-            && used.len() + unused.len() == 20
-            && attrition.attrited_primary_ids == expected_attrited
-            && attrition.used_surplus_ids == expected_used
-            && attrition.unused_surplus_ids == expected_unused
-            && primary.iter().all(|id| matches!(
-                statuses.get(id).map(String::as_str),
-                Some("pass" | "fail" | "not_evaluable")
-            ))
-            && used
-                .iter()
-                .all(|id| matches!(statuses.get(id).map(String::as_str), Some("pass" | "fail")))
-            && unused.iter().all(|id| matches!(
-                statuses.get(id).map(String::as_str),
-                Some("not_used" | "not_evaluable")
-            ))
-            && attrition
-                .reasons_by_cluster
-                .keys()
-                .collect::<std::collections::BTreeSet<_>>()
-                == expected_reasons
-            && attrition.reasons_by_cluster.iter().all(|(id, reason)| {
-                !reason.is_empty() && statuses.get(id).map(String::as_str) == Some("not_evaluable")
-            }),
-        "held-out raw receipt does not exactly account for 96 primary and 20 surplus clusters"
+        receipt.schema == TEMPORAL_RESOURCE_SCHEMA
+            && matches!(
+                (
+                    receipt.status.as_str(),
+                    receipt.pre_outcome_selection_receipt_sha256.as_deref()
+                ),
+                ("candidate_evidence_only", None) | ("pass", Some(_))
+            )
+            && receipt.benchmark_method == TEMPORAL_RESOURCE_BENCHMARK_METHOD
+            && receipt.baseline_method == CONDITIONAL_BENCHMARK_METHOD
+            && receipt.candidate_method == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD
+            && receipt.candidate_method_version
+                == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION
+            && receipt
+                .pre_outcome_selection_receipt_sha256
+                .as_deref()
+                .is_none_or(canonical_sha256),
+        "unsupported temporal release-resource method or schema"
     );
+    let tile_pixels = TEMPORAL_RESOURCE_TILE_ROWS * TEMPORAL_RESOURCE_TILE_COLUMNS;
+    ensure!(
+        receipt.tile_rows == TEMPORAL_RESOURCE_TILE_ROWS
+            && receipt.tile_columns == TEMPORAL_RESOURCE_TILE_COLUMNS
+            && receipt.target_count == tile_pixels
+            && receipt.worker_scratch_limit_bytes
+                == u64::try_from(
+                    dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES,
+                )?
+            && receipt.resident_set_limit_bytes == TEMPORAL_RESOURCE_RSS_LIMIT_BYTES
+            && receipt.maximum_targets_per_block
+                == u64::try_from(default_config.maximum_targets_per_block)?
+            && receipt.block_id_read_cap_bytes == default_config.block_id_read_cap_bytes
+            && receipt.factor_block_read_cap_bytes == default_config.factor_block_read_cap_bytes
+            && receipt.combined_working_set_cap_bytes == COMBINED_WORKING_SET_CAP_BYTES
+            && receipt.product_source_sha256 == sha256(PRODUCT_SOURCE_BYTES)
+            && receipt.benchmark_source_sha256 == sha256(BENCH_SOURCE_BYTES)
+            && receipt.batch_source_sha256 == sha256(BATCH_SOURCE_BYTES)
+            && !receipt.host.operating_system.is_empty()
+            && !receipt.host.architecture.is_empty()
+            && receipt.host.logical_processor_count > 0
+            && receipt.host.rayon_thread_count > 0
+            && receipt.host.omp_thread_count == 1
+            && receipt.host.openblas_thread_count == 1
+            && receipt.host.mkl_thread_count == 1
+            && receipt.host.veclib_thread_count == 1,
+        "temporal release-resource scope differs from the frozen contract"
+    );
+    ensure!(
+        receipt.temporal_covariance_batch_binary == *observed_batch
+            && receipt.temporal_inference_bench_binary == *observed_benchmark,
+        "temporal release-resource binary identity is not observed"
+    );
+    ensure!(
+        receipt.measurements.len() == 3,
+        "temporal release-resource receipt must contain exactly three date cases"
+    );
+    for (measurement, post_gauge_dates) in receipt.measurements.iter().zip([12_u64, 48, 96]) {
+        let baseline = &measurement.plugin_gls_reml;
+        let candidate = &measurement.reml_covariance_parameter_adjusted_scalar;
+        let ratio_limit = baseline
+            .wall_micros
+            .checked_mul(TEMPORAL_RESOURCE_WALL_MULTIPLIER)
+            .context("temporal release-resource wall ratio overflows")?;
+        let full_product_ratio_limit = baseline
+            .full_product_wall_micros
+            .checked_mul(TEMPORAL_RESOURCE_WALL_MULTIPLIER)
+            .context("temporal release-resource full-product wall ratio overflows")?;
+        let expected_ratio = candidate.wall_micros as f64 / baseline.wall_micros as f64;
+        let ratio_tolerance = expected_ratio.abs().max(1.0) * 1.0e-12;
+        let expected_full_product_ratio =
+            candidate.full_product_wall_micros as f64 / baseline.full_product_wall_micros as f64;
+        let full_product_ratio_tolerance = expected_full_product_ratio.abs().max(1.0) * 1.0e-12;
+        let scalar_valid =
+            |scalar: &TemporalInferenceScalarMeasurement,
+             expected_method: TemporalScalarCandidateMethod| {
+                scalar.method == expected_method
+                    && canonical_sha256(&scalar.factor_sha256)
+                    && canonical_sha256(&scalar.direct_factor_receipt_sha256)
+                    && scalar.factor_block_reads > 0
+                    && scalar.nonreference_realized_rank == post_gauge_dates
+                    && scalar.processed_pixels == tile_pixels
+                    && scalar.evaluated_pixels == tile_pixels - 1
+                    && scalar.profile_fit_count == tile_pixels - 1
+                    && scalar.bootstrap_attempts == 0
+                    && scalar.optimizer_rho_lane_evaluations > 0
+                    && scalar.optimizer_q_objective_evaluations > 0
+                    && scalar
+                        .optimizer_primary_rho_pass_histogram
+                        .iter()
+                        .sum::<u64>()
+                        == tile_pixels - 1
+                    && scalar.rayon_worker_count == receipt.host.rayon_thread_count
+                    && scalar.maximum_worker_scratch_bytes <= receipt.worker_scratch_limit_bytes
+                    && scalar.exact_optimizer_fallback_targets == 0
+                    && scalar.condition_exact_fallbacks == 0
+                    && scalar.wall_micros > 0
+                    && scalar.wall_micros_trials.len() == 2
+                    && scalar.wall_micros_trials.iter().all(|value| *value > 0)
+                    && scalar.wall_micros == *scalar.wall_micros_trials.iter().max().unwrap()
+                    && scalar.full_product_wall_micros >= scalar.wall_micros
+                    && scalar.full_product_wall_micros_trials.len() == 2
+                    && scalar
+                        .full_product_wall_micros_trials
+                        .iter()
+                        .all(|value| *value > 0)
+                    && scalar.full_product_wall_micros
+                        == *scalar.full_product_wall_micros_trials.iter().max().unwrap()
+                    && scalar.peak_resident_set_bytes > 0
+                    && scalar.peak_resident_set_bytes <= receipt.resident_set_limit_bytes
+                    && scalar.checksum.is_finite()
+            };
+        ensure!(
+            measurement.post_gauge_date_count == post_gauge_dates
+                && measurement.acquisition_count == post_gauge_dates + 1
+                && measurement.target_count == tile_pixels
+                && (257..=tile_pixels).contains(&measurement.varied_target_fingerprint_count)
+                && scalar_valid(baseline, TemporalScalarCandidateMethod::PluginGlsReml)
+                && scalar_valid(
+                    candidate,
+                    TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar,
+                )
+                && baseline.factor_sha256 == candidate.factor_sha256
+                && baseline.direct_factor_receipt_sha256 == candidate.direct_factor_receipt_sha256
+                && baseline.factor_block_reads == candidate.factor_block_reads
+                && baseline.optimizer_rho_lane_evaluations
+                    == candidate.optimizer_rho_lane_evaluations
+                && baseline.optimizer_q_objective_evaluations
+                    == candidate.optimizer_q_objective_evaluations
+                && baseline.optimizer_primary_rho_pass_histogram
+                    == candidate.optimizer_primary_rho_pass_histogram
+                && baseline.covariance_parameter_derivative_lane_evaluations == 0
+                && baseline.covariance_parameter_adjustment_count == 0
+                && candidate.covariance_parameter_derivative_lane_evaluations
+                    == candidate.optimizer_q_objective_evaluations
+                && candidate.covariance_parameter_adjustment_count == tile_pixels - 1
+                && candidate.wall_micros <= ratio_limit
+                && candidate.full_product_wall_micros <= full_product_ratio_limit
+                && measurement.adjusted_to_plugin_wall_ratio.is_finite()
+                && (measurement.adjusted_to_plugin_wall_ratio - expected_ratio).abs()
+                    <= ratio_tolerance
+                && measurement.adjusted_to_plugin_wall_ratio
+                    <= TEMPORAL_RESOURCE_WALL_MULTIPLIER as f64
+                && measurement
+                    .adjusted_to_plugin_full_product_wall_ratio
+                    .is_finite()
+                && (measurement.adjusted_to_plugin_full_product_wall_ratio
+                    - expected_full_product_ratio)
+                    .abs()
+                    <= full_product_ratio_tolerance
+                && measurement.adjusted_to_plugin_full_product_wall_ratio
+                    <= TEMPORAL_RESOURCE_WALL_MULTIPLIER as f64,
+            "temporal release-resource case failed at {post_gauge_dates} post-gauge dates"
+        );
+    }
     Ok(())
 }
 
-fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
+fn validate_synthetic_result(
+    result: &SyntheticResult,
+    resource: &ObservedReleaseResourceEvidence,
+) -> Result<()> {
     let preregistration: Value = serde_json::from_slice(TEMPORAL_PREREGISTRATION_BYTES)?;
     let producer = &result.producer_identity;
     ensure!(
-        result.schema == SYNTHETIC_SCHEMA,
+        preregistration["schema"].as_str() == Some(PREREGISTRATION_SCHEMA)
+            && result.schema == SYNTHETIC_SCHEMA
+            && result.preregistration_schema == PREREGISTRATION_SCHEMA,
         "unsupported synthetic result schema"
     );
     ensure!(
         result.execution_complete
             && result.exact_seed_denominator_complete
-            && result.promotion_eligible
-            && result.promotion_status == "eligible_for_external_field_review"
+            && result.engine_validation_eligible
+            && result.engine_validation_status == "synthetic_validated_scope_match"
             && result.scores.all_methods_pass
             && !result.corrected_inferential_sigma_emission,
         "synthetic temporal-covariance result is incomplete or failed"
     );
     ensure!(
-        result.seed_count == 1_050
-            && result.attempted_cells == 50_400
-            && result.batch_attempted_cells == result.attempted_cells,
+        result.expected_attempt_record_count == 50_400
+            && result.processed_attempt_record_count == result.expected_attempt_record_count
+            && result.attempt_record_count == result.processed_attempt_record_count
+            && result.seed_request_count == 25_200
+            && result.expected_seed_request_count == result.seed_request_count
+            && result.seed_requests_per_cell == 1_050
+            && result.skipped_attempt_record_count == 0
+            && result
+                .emitted_attempt_record_count
+                .checked_add(result.failed_attempt_record_count)
+                == Some(result.processed_attempt_record_count)
+            && result.run_committed,
         "synthetic temporal-covariance denominator is not the exact frozen matrix"
     );
     ensure!(
@@ -1521,199 +1229,58 @@ fn validate_synthetic_result(result: &SyntheticResult) -> Result<()> {
             && producer.generator_sha256 == sha256(GENERATOR_SOURCE_BYTES)
             && producer.batch_source_sha256 == sha256(BATCH_SOURCE_BYTES)
             && producer.estimator_source_sha256 == sha256(ESTIMATOR_SOURCE_BYTES)
+            && preregistration["file_hashes"]["generator_sha256"].as_str()
+                == Some(producer.generator_sha256.as_str())
+            && preregistration["file_hashes"]["batch_source_sha256"].as_str()
+                == Some(producer.batch_source_sha256.as_str())
+            && preregistration["file_hashes"]["estimator_source_sha256"].as_str()
+                == Some(producer.estimator_source_sha256.as_str())
             && producer.source_set_schema == TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA
+            && preregistration["producer_identity"]["schema"].as_str()
+                == Some("dolphinrust.temporal-covariance.producer-identity/2")
             && preregistration["producer_identity"]["source_set_schema"].as_str()
                 == Some(producer.source_set_schema.as_str())
             && preregistration["producer_identity"]["source_set_sha256"].as_str()
                 == Some(producer.source_set_sha256.as_str())
+            && producer.binary_path == "target/release/examples/temporal_covariance_batch"
             && preregistration["producer_identity"]["binary_path"].as_str()
                 == Some(producer.binary_path.as_str())
-            && producer.binary_path == "target/release/examples/temporal_covariance_batch"
-            && is_sha256(&producer.binary_sha256)
-            && producer.binary_bytes > 0
+            && producer.binary_sha256 == resource.batch_binary.sha256
+            && producer.binary_bytes == resource.batch_binary.bytes
             && producer.batch_schema == TEMPORAL_BATCH_SCHEMA
+            && preregistration["schemas"]["batch"].as_str() == Some(producer.batch_schema.as_str())
             && producer.generator_schema == SYNTHETIC_SCHEMA
+            && preregistration["schemas"]["generator"].as_str()
+                == Some(producer.generator_schema.as_str())
             && producer.source_correlation_model == "exponential_euclidean_v1"
+            && preregistration["identities"]["source_correlation_model"].as_str()
+                == Some(producer.source_correlation_model.as_str())
             && producer.source_correlation_distance_scale_pixels == 1.5
-            && producer.seed_count == result.seed_count,
+            && preregistration["identities"]["source_correlation_distance_scale_pixels"].as_f64()
+                == Some(producer.source_correlation_distance_scale_pixels)
+            && producer.seed_count == result.seed_requests_per_cell
+            && preregistration["outer_seeds_per_supported_cell"].as_u64()
+                == Some(producer.seed_count)
+            && producer.candidate_resource_receipt_sha256 == resource.candidate_receipt_sha256
+            && producer.method_selection_receipt_sha256 == resource.selection_receipt_sha256
+            && producer.resource_receipt_sha256 == resource.receipt_sha256
+            && producer.resource_benchmark_binary_sha256 == resource.benchmark_binary.sha256,
         "synthetic temporal-covariance producer identity is stale or malformed"
     );
     ensure!(
-        !result.resource_gates.is_empty() && result.resource_gates.values().all(|passed| *passed),
-        "synthetic temporal-covariance resource gates did not all pass"
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_heldout_result(
-    result: &HeldoutResult,
-    expected: &HeldoutReceiptIdentity,
-) -> Result<()> {
-    let unique = |values: &[String]| {
-        values
-            .iter()
+        result
+            .resource_gates
+            .keys()
+            .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == values.len()
-    };
-    let attrition_count = result.attrited_primary_ids.len();
-    ensure!(
-        result.schema == HELDOUT_SCORE_SCHEMA
-            && result.schema_version == 1
-            && result.cohort_id == HELDOUT_COHORT_ID
-            && result.manifest_file_sha256 == expected.manifest_file_sha256
-            && result.manifest_sha256 == expected.manifest_sha256
-            && result.freeze_receipt_sha256 == expected.freeze_receipt_sha256
-            && result.factor_scope_sha256 == expected.factor_scope_sha256
-            && result.heldout_receipt_sha256 == expected.receipt_sha256,
-        "held-out temporal-covariance result is not bound to the exact frozen cohort"
-    );
-    ensure!(
-        result.primary_cluster_count == 96
-            && result.surplus_cluster_count == 20
-            && result.evaluated_clusters == expected.evaluated_clusters
-            && expected.evaluated_clusters == 96
-            && !expected.required_cluster_failed
-            && attrition_count <= result.surplus_cluster_count
-            && result.used_surplus_ids.len() == attrition_count
-            && result.unused_surplus_ids.len() + result.used_surplus_ids.len()
-                == result.surplus_cluster_count
-            && result.attrited_primary_ids.iter().all(|id| {
-                result.reasons_by_cluster.contains_key(id)
-                    && !result.used_surplus_ids.contains(id)
-                    && !result.unused_surplus_ids.contains(id)
-            })
-            && result
-                .used_surplus_ids
-                .iter()
-                .all(|id| !result.unused_surplus_ids.contains(id))
-            && result.reasons_by_cluster.keys().all(|id| {
-                result.attrited_primary_ids.contains(id) || result.unused_surplus_ids.contains(id)
-            })
-            && unique(&result.attrited_primary_ids)
-            && unique(&result.used_surplus_ids)
-            && unique(&result.unused_surplus_ids)
-            && result.attrited_primary_ids == expected.attrition.attrited_primary_ids
-            && result.used_surplus_ids == expected.attrition.used_surplus_ids
-            && result.unused_surplus_ids == expected.attrition.unused_surplus_ids
-            && result.reasons_by_cluster == expected.attrition.reasons_by_cluster,
-        "held-out temporal-covariance result does not account for exact 96+20 frozen slots"
-    );
-    ensure!(
-        result.status == "pass"
-            && result.errors.is_empty()
-            && result.emission_rate.is_finite()
-            && approximately_equal(result.emission_rate, 1.0),
-        "held-out temporal-covariance result did not pass the frozen cohort"
-    );
-    let mut p_values = Vec::with_capacity(3);
-    ensure!(
-        result.levels.len() == 3
-            && ["68", "90", "95"]
-                .iter()
-                .all(|level| result.levels.contains_key(*level)),
-        "held-out temporal-covariance level gates are incomplete"
-    );
-    for level in ["68", "90", "95"] {
-        let nominal = level.parse::<f64>()? / 100.0;
-        let value = &result.levels[level];
-        let coverage = &value.coverage;
-        let raw = &expected.raw_levels[level];
-        let expected_p =
-            exact_binomial_upper_tail(coverage.covered, coverage.evaluated, nominal - 0.2)?;
-        let observed = coverage.covered as f64 / coverage.evaluated as f64;
-        let coverage_error = (observed - nominal).abs();
-        ensure!(
-            value.status == "pass"
-                && coverage.status == "pass"
-                && coverage.evaluated == expected.evaluated_clusters
-                && coverage.covered == raw.covered
-                && coverage.covered <= coverage.evaluated
-                && approximately_equal(coverage.null_coverage, nominal - 0.2)
-                && approximately_equal(coverage.observed_coverage, observed)
-                && approximately_equal(coverage.p_value, expected_p)
-                && coverage.p_value <= 0.05
-                && approximately_equal(value.coverage_absolute_error, coverage_error)
-                && value.coverage_absolute_gate == (coverage_error <= 0.2)
-                && value.coverage_absolute_gate
-                && value.mean_interval_score.is_finite()
-                && value.mean_interval_score >= 0.0
-                && approximately_equal(value.mean_interval_score, raw.mean_interval_score)
-                && value.mean_baseline_interval_score.is_finite()
-                && value.mean_baseline_interval_score >= 0.0
-                && approximately_equal(
-                    value.mean_baseline_interval_score,
-                    raw.mean_baseline_interval_score,
-                )
-                && value.mean_interval_score < value.mean_baseline_interval_score
-                && value.proper_score_improves
-                && value.median_width_ratio.is_finite()
-                && value.median_width_ratio >= 0.0
-                && approximately_equal(value.median_width_ratio, raw.median_width_ratio)
-                && value.median_width_ratio < 2.0
-                && value.holm_reject,
-            "held-out temporal-covariance level {level} metrics differ from the frozen scorer"
-        );
-        p_values.push((level, coverage.p_value));
-    }
-    p_values.sort_by(|left, right| left.1.total_cmp(&right.1).then_with(|| left.0.cmp(right.0)));
-    ensure!(
-        p_values
-            .iter()
-            .enumerate()
-            .all(|(rank, (_, p_value))| *p_value <= 0.05 / (3 - rank) as f64),
-        "held-out temporal-covariance Holm decisions are inconsistent"
-    );
-    Ok(())
-}
-
-fn approximately_equal(left: f64, right: f64) -> bool {
-    left.is_finite()
-        && right.is_finite()
-        && (left - right).abs() <= 1e-12_f64.max(1e-12 * left.abs().max(right.abs()))
-}
-
-fn exact_binomial_upper_tail(covered: usize, evaluated: usize, probability: f64) -> Result<f64> {
-    ensure!(
-        evaluated > 0 && covered <= evaluated && probability > 0.0 && probability < 1.0,
-        "held-out binomial inputs are invalid"
-    );
-    let mut coefficient = 1.0;
-    for index in 0..covered {
-        coefficient *= (evaluated - index) as f64 / (index + 1) as f64;
-    }
-    let mut term = coefficient
-        * probability.powi(i32::try_from(covered)?)
-        * (1.0 - probability).powi(i32::try_from(evaluated - covered)?);
-    let mut tail = term;
-    for successes in covered..evaluated {
-        term *= (evaluated - successes) as f64 / (successes + 1) as f64;
-        term *= probability / (1.0 - probability);
-        tail += term;
-    }
-    Ok(tail.min(1.0))
-}
-
-fn validate_review(review: &TemporalReviewReceipt, expected: &EvidenceDigests) -> Result<()> {
-    ensure!(
-        review.schema == REVIEW_SCHEMA
-            && review.review_status == "approved"
-            && !review.reviewer.trim().is_empty()
-            && review.independent
-            && review.unresolved_findings == 0,
-        "independent temporal-covariance review is not approved"
-    );
-    ensure!(
-        review.synthetic_result_sha256 == expected.synthetic_result_sha256
-            && review.heldout_result_sha256 == expected.heldout_result_sha256
-            && review.heldout_receipt_sha256 == expected.heldout_receipt_sha256
-            && review.spatial_manifest_sha256 == expected.spatial_manifest_sha256
-            && review.temporal_preregistration_sha256 == expected.temporal_preregistration_sha256
-            && review.heldout_preregistration_sha256 == expected.heldout_preregistration_sha256
-            && review.scorer_sha256 == expected.scorer_sha256
-            && review.source_sha256 == expected.source_sha256,
-        "independent temporal-covariance review hashes are stale"
+            == std::collections::BTreeSet::from([
+                "artifact_size",
+                "bound_resource_receipt",
+                "retained_bound",
+                "rss",
+            ])
+            && result.resource_gates.values().all(|passed| *passed),
+        "synthetic temporal-covariance resource gates did not all pass"
     );
     Ok(())
 }
@@ -1721,26 +1288,27 @@ fn validate_review(review: &TemporalReviewReceipt, expected: &EvidenceDigests) -
 fn validate_manifest(
     manifest: &TemporalPromotionManifest,
     expected: &EvidenceDigests,
-    review_sha256: &str,
 ) -> Result<()> {
     ensure!(
         manifest.schema == PROMOTION_SCHEMA
             && manifest.promotion_status == "approved"
-            && manifest.calibration_scope == "calibrated_scope_match"
-            && manifest.selected_method == COMPLETE_REFIT_BOOTSTRAP_METHOD
-            && manifest.selected_method_version == COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+            && manifest.calibration_scope == "synthetic_validated_scope_match"
+            && manifest.selected_method == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD
+            && manifest.selected_method_version
+                == REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
         "temporal-covariance promotion manifest is not approved for the selected method"
     );
     ensure!(
         manifest.synthetic_result_sha256 == expected.synthetic_result_sha256
-            && manifest.heldout_result_sha256 == expected.heldout_result_sha256
-            && manifest.heldout_receipt_sha256 == expected.heldout_receipt_sha256
-            && manifest.review_receipt_sha256 == review_sha256
+            && manifest.temporal_resource_receipt_sha256
+                == expected.temporal_resource_receipt_sha256
+            && manifest.temporal_covariance_batch_binary_sha256
+                == expected.temporal_covariance_batch_binary_sha256
+            && manifest.temporal_inference_bench_binary_sha256
+                == expected.temporal_inference_bench_binary_sha256
             && manifest.spatial_factor_sha256 == expected.spatial_factor_sha256
             && manifest.spatial_manifest_sha256 == expected.spatial_manifest_sha256
             && manifest.temporal_preregistration_sha256 == expected.temporal_preregistration_sha256
-            && manifest.heldout_preregistration_sha256 == expected.heldout_preregistration_sha256
-            && manifest.scorer_sha256 == expected.scorer_sha256
             && manifest.source_sha256 == expected.source_sha256,
         "temporal-covariance promotion manifest hashes are stale or scope-mismatched"
     );
@@ -1759,7 +1327,7 @@ pub fn write_temporal_covariance_products(
     config: &TemporalUncertaintyOptions,
 ) -> Result<TemporalCovarianceProductReceipt> {
     ensure!(
-        config.method == TemporalUncertaintyMethod::CompleteRefitBootstrap,
+        config.method == TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar,
         "corrected temporal inference is disabled"
     );
     let transaction = TemporalProductTransaction::acquire(output_directory)?;
@@ -1892,7 +1460,13 @@ fn write_product_transaction_with_validator(
     )?;
     let stage = create_stage_directory(output_directory, &transaction.ownership_token)?;
     let transaction_result = (|| {
-        let admission = admit_combined_working_set(config, acquisition_days.len())?;
+        let block_ids = read_spatial_reference_covariance_block_ids(
+            &scope.factor_path,
+            config.block_id_read_cap_bytes,
+        )?;
+        let factor_layout =
+            observed_factor_layout(&scope.factor_metadata, &block_ids, block_ids.capacity())?;
+        let admission = admit_combined_working_set(config, acquisition_days.len(), factor_layout)?;
         let gdal_cache = ScopedGdalCacheLimit::acquire(admission.gdal_cache_budget_bytes)?;
         let mut working_set = WorkingSetMonitor::new(admission);
         let mut layers = create_layer_writers(
@@ -1902,12 +1476,14 @@ fn write_product_transaction_with_validator(
             &transaction.ownership_token,
         )?;
         working_set.observe_gdal_cache(&gdal_cache)?;
-        process_factor_blocks(
+        let _metrics = process_factor_blocks(
             &scope.factor_path,
+            &block_ids,
             displacement_rasters,
             &scope.fixed_cube_mask_path,
             acquisition_days,
             config,
+            TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar,
             scope.factor_metadata.full_grid,
             &mut layers,
             &mut working_set,
@@ -2036,26 +1612,28 @@ fn prepare_product_scope(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_factor_blocks(
     factor_path: &Path,
+    block_ids: &[u64],
     displacement_rasters: &[PathBuf],
     fixed_cube_mask_path: &Path,
     acquisition_days: &[f64],
     config: &TemporalUncertaintyOptions,
+    method: TemporalScalarCandidateMethod,
     full_grid: dolphin_io::CovarianceOperatorGrid,
     layers: &mut [ProductLayer],
     working_set: &mut WorkingSetMonitor,
     gdal_cache: &ScopedGdalCacheLimit,
-) -> Result<()> {
-    let block_ids =
-        read_spatial_reference_covariance_block_ids(factor_path, config.block_id_read_cap_bytes)?;
+) -> Result<TemporalFactorProcessingMetrics> {
     ensure!(
         !block_ids.is_empty(),
         "factor artifact contains no target blocks"
     );
     let options = TemporalCovarianceOptions::default();
-    for block_id in block_ids {
+    let mut metrics = TemporalFactorProcessingMetrics::default();
+    for &block_id in block_ids {
+        let estimator_started = Instant::now();
         let read = read_spatial_reference_covariance_block(
             factor_path,
             block_id,
@@ -2070,21 +1648,118 @@ fn process_factor_blocks(
             target_count <= config.maximum_targets_per_block,
             "factor block exceeds configured target microbatch cap"
         );
+        for (&status, &rank) in read.block.status.iter().zip(&read.block.rank_by_target) {
+            if status == SpatialReferenceCovarianceStatus::Valid && rank > 0 {
+                let rank = u64::from(rank);
+                metrics.minimum_nonreference_realized_rank = Some(
+                    metrics
+                        .minimum_nonreference_realized_rank
+                        .map_or(rank, |current| current.min(rank)),
+                );
+                metrics.maximum_nonreference_realized_rank = Some(
+                    metrics
+                        .maximum_nonreference_realized_rank
+                        .map_or(rank, |current| current.max(rank)),
+                );
+            }
+        }
         let output_window = output_window(read.block.target_grid, full_grid)?;
         let observations = displacement_rasters
             .iter()
             .map(|path| read_raster_window::<f32>(path, output_window))
             .collect::<dolphin_io::Result<Vec<_>>>()?;
         let common_support = read_raster_window::<u8>(fixed_cube_mask_path, output_window)?;
-        let values = evaluate_block(
+        let output = evaluate_scalar_probe_block(
             &read.block,
             &observations,
             common_support.view(),
             acquisition_days,
             &options,
+            method,
         )?;
-        validate_product_value_semantics(&values)?;
-        for (layer, value) in layers.iter_mut().zip(values.iter()) {
+        validate_product_value_semantics(&output.layers)?;
+        metrics.wired_estimator_wall_micros = metrics
+            .wired_estimator_wall_micros
+            .checked_add(
+                u64::try_from(estimator_started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            )
+            .context("temporal candidate core wall time overflow")?;
+        metrics.factor_block_reads = metrics
+            .factor_block_reads
+            .checked_add(1)
+            .context("temporal factor block read count overflow")?;
+        metrics.processed_pixels = metrics
+            .processed_pixels
+            .checked_add(u64::try_from(target_count)?)
+            .context("temporal processed-pixel count overflow")?;
+        metrics.evaluated_pixels = metrics
+            .evaluated_pixels
+            .checked_add(output.evaluated_pixels)
+            .context("temporal evaluated-pixel count overflow")?;
+        metrics.profile_fit_count = metrics
+            .profile_fit_count
+            .checked_add(u64::try_from(output.batch_metrics.profile_fit_count)?)
+            .context("temporal profile-fit count overflow")?;
+        metrics.bootstrap_attempts = metrics
+            .bootstrap_attempts
+            .checked_add(u64::try_from(output.batch_metrics.bootstrap_attempts)?)
+            .context("temporal bootstrap-attempt count overflow")?;
+        metrics.optimizer_rho_lane_evaluations = metrics
+            .optimizer_rho_lane_evaluations
+            .checked_add(u64::try_from(
+                output.batch_metrics.optimizer_rho_lane_evaluations,
+            )?)
+            .context("temporal optimizer rho-lane count overflow")?;
+        metrics.optimizer_q_objective_evaluations = metrics
+            .optimizer_q_objective_evaluations
+            .checked_add(u64::try_from(
+                output.batch_metrics.optimizer_q_objective_evaluations,
+            )?)
+            .context("temporal optimizer q-objective count overflow")?;
+        for (total, count) in metrics
+            .optimizer_primary_rho_pass_histogram
+            .iter_mut()
+            .zip(output.batch_metrics.optimizer_primary_rho_pass_histogram)
+        {
+            *total = total
+                .checked_add(count)
+                .context("temporal optimizer pass histogram overflow")?;
+        }
+        metrics.covariance_parameter_derivative_lane_evaluations = metrics
+            .covariance_parameter_derivative_lane_evaluations
+            .checked_add(u64::try_from(
+                output
+                    .batch_metrics
+                    .covariance_parameter_derivative_lane_evaluations,
+            )?)
+            .context("temporal adjustment derivative count overflow")?;
+        metrics.covariance_parameter_adjustment_count = metrics
+            .covariance_parameter_adjustment_count
+            .checked_add(u64::try_from(
+                output.batch_metrics.covariance_parameter_adjustment_count,
+            )?)
+            .context("temporal adjustment count overflow")?;
+        metrics.rayon_worker_count = metrics
+            .rayon_worker_count
+            .max(u64::try_from(output.batch_metrics.worker_count)?);
+        metrics.maximum_worker_scratch_bytes = metrics.maximum_worker_scratch_bytes.max(
+            u64::try_from(output.batch_metrics.maximum_worker_scratch_bytes)?,
+        );
+        metrics.exact_optimizer_fallback_targets = metrics
+            .exact_optimizer_fallback_targets
+            .checked_add(u64::try_from(
+                output.batch_metrics.exact_optimizer_fallback_targets,
+            )?)
+            .context("temporal optimizer fallback count overflow")?;
+        metrics.condition_exact_fallbacks = metrics
+            .condition_exact_fallbacks
+            .checked_add(u64::try_from(
+                output.batch_metrics.condition_exact_fallbacks,
+            )?)
+            .context("temporal condition fallback count overflow")?;
+        for (layer, value) in layers.iter_mut().zip(output.layers.iter()) {
             layer
                 .writer
                 .as_mut()
@@ -2093,12 +1768,36 @@ fn process_factor_blocks(
         }
         working_set.observe_gdal_cache(gdal_cache)?;
     }
-    Ok(())
+    Ok(metrics)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TemporalFactorProcessingMetrics {
+    factor_block_reads: u64,
+    processed_pixels: u64,
+    evaluated_pixels: u64,
+    wired_estimator_wall_micros: u64,
+    profile_fit_count: u64,
+    bootstrap_attempts: u64,
+    optimizer_rho_lane_evaluations: u64,
+    optimizer_q_objective_evaluations: u64,
+    optimizer_primary_rho_pass_histogram: [u64; 21],
+    covariance_parameter_derivative_lane_evaluations: u64,
+    covariance_parameter_adjustment_count: u64,
+    rayon_worker_count: u64,
+    maximum_worker_scratch_bytes: u64,
+    exact_optimizer_fallback_targets: u64,
+    condition_exact_fallbacks: u64,
+    minimum_nonreference_realized_rank: Option<u64>,
+    maximum_nonreference_realized_rank: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkingSetAdmission {
     factor_block_bytes: u64,
+    factor_batch_compact_bytes: u64,
+    factor_batch_observation_bytes: u64,
+    factor_batch_result_bytes: u64,
     block_id_bytes: u64,
     displacement_window_bytes: u64,
     output_window_bytes: u64,
@@ -2132,18 +1831,95 @@ impl WorkingSetMonitor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedFactorLayout {
+    maximum_block_payload_bytes: u64,
+    block_id_count: usize,
+    block_id_capacity: usize,
+}
+
+fn factor_target_payload_bytes(acquisition_count: usize) -> Result<u64> {
+    u64::try_from(acquisition_count)?
+        .checked_mul(u64::try_from(acquisition_count)?)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>() as u64))
+        .and_then(|value| value.checked_add(82))
+        .context("temporal factor target payload bytes overflow")
+}
+
+fn observed_factor_layout(
+    metadata: &SpatialReferenceCovarianceMetadata,
+    block_ids: &[u64],
+    block_id_capacity: usize,
+) -> Result<ObservedFactorLayout> {
+    let runtime = metadata
+        .runtime_resource_receipt
+        .context("factor header is missing its runtime resource receipt")?;
+    ensure!(
+        block_id_capacity >= block_ids.len(),
+        "observed factor block-ID capacity is smaller than its length"
+    );
+    Ok(ObservedFactorLayout {
+        maximum_block_payload_bytes: runtime.factor_block_high_water_bytes,
+        block_id_count: block_ids.len(),
+        block_id_capacity,
+    })
+}
+
 fn admit_combined_working_set(
     config: &TemporalUncertaintyOptions,
     acquisition_count: usize,
+    factor: ObservedFactorLayout,
 ) -> Result<WorkingSetAdmission> {
-    compose_working_set_admission(config, acquisition_count)
+    compose_observed_working_set_admission(config, acquisition_count, factor)
 }
 
+#[cfg(test)]
 fn compose_working_set_admission(
     config: &TemporalUncertaintyOptions,
     acquisition_count: usize,
 ) -> Result<WorkingSetAdmission> {
+    let per_target = factor_target_payload_bytes(acquisition_count)?;
     let targets = u64::try_from(config.maximum_targets_per_block)?;
+    let maximum_block_payload_bytes = targets
+        .checked_mul(per_target)
+        .context("configured factor payload size overflow")?
+        .min(config.factor_block_read_cap_bytes / per_target * per_target);
+    let block_id_capacity =
+        usize::try_from(config.block_id_read_cap_bytes / std::mem::size_of::<u64>() as u64)?;
+    compose_observed_working_set_admission(
+        config,
+        acquisition_count,
+        ObservedFactorLayout {
+            maximum_block_payload_bytes,
+            block_id_count: block_id_capacity,
+            block_id_capacity,
+        },
+    )
+}
+
+fn compose_observed_working_set_admission(
+    config: &TemporalUncertaintyOptions,
+    acquisition_count: usize,
+    factor: ObservedFactorLayout,
+) -> Result<WorkingSetAdmission> {
+    let per_target = factor_target_payload_bytes(acquisition_count)?;
+    ensure!(
+        factor.maximum_block_payload_bytes > 0
+            && factor.maximum_block_payload_bytes <= config.factor_block_read_cap_bytes
+            && factor
+                .maximum_block_payload_bytes
+                .is_multiple_of(per_target),
+        "observed factor payload is invalid or exceeds its configured cap"
+    );
+    ensure!(
+        factor.block_id_count > 0 && factor.block_id_capacity >= factor.block_id_count,
+        "observed factor block-ID allocation is invalid"
+    );
+    let targets = factor.maximum_block_payload_bytes / per_target;
+    ensure!(
+        targets <= u64::try_from(config.maximum_targets_per_block)?,
+        "observed factor block exceeds configured target cap"
+    );
     let dates = u64::try_from(acquisition_count)?;
     let post_gauge_dates = dates
         .checked_sub(1)
@@ -2156,22 +1932,34 @@ fn compose_working_set_admission(
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
         .context("output-window working-set size overflow")?;
-    let temporal_solver_workspace_bytes = temporal_covariance_workspace_composition(
-        acquisition_count,
-        TemporalCovarianceOptions::default().bootstrap_replicates,
-    )
-    .context("temporal-fit workspace composition overflow")?
-    .total_bytes;
+    let factor_batch_compact_bytes = targets
+        .checked_mul(post_gauge_dates)
+        .and_then(|value| value.checked_mul(post_gauge_dates))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>() as u64))
+        .context("factor-native compact-factor working-set size overflow")?;
+    let factor_batch_observation_bytes = targets
+        .checked_mul(post_gauge_dates)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>() as u64))
+        .context("factor-native observation working-set size overflow")?;
+    let factor_batch_result_bytes = targets
+        .checked_mul(u64::try_from(
+            2 * std::mem::size_of::<dolphin_timeseries::TemporalFactorScalarPair>()
+                + 4 * std::mem::size_of::<usize>(),
+        )?)
+        .context("factor-native ordered-result working-set size overflow")?;
+    let temporal_solver_workspace_bytes =
+        u64::try_from(dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES)?
+            .checked_mul(u64::try_from(rayon::current_num_threads())?)
+            .context("parallel temporal-fit workspace composition overflow")?;
     let output_write_copy_bytes = output_windows;
-    let maximum_block_ids = config
-        .block_id_read_cap_bytes
-        .checked_div(std::mem::size_of::<u64>() as u64)
-        .context("block-ID element size is zero")?;
+    let block_id_bytes = u64::try_from(factor.block_id_capacity)?
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .context("observed block-ID byte count overflow")?;
     ensure!(
-        maximum_block_ids > 0,
-        "block-ID cap cannot hold one identifier"
+        block_id_bytes > 0 && block_id_bytes <= config.block_id_read_cap_bytes,
+        "observed block-ID bytes exceed their configured cap"
     );
-    let writer_block_capacity = maximum_block_ids
+    let writer_block_capacity = u64::try_from(factor.block_id_count)?
         .checked_next_power_of_two()
         .map(|capacity| capacity.max(4))
         .context("COG writer block capacity overflow")?;
@@ -2179,9 +1967,12 @@ fn compose_working_set_admission(
         .checked_mul(LAYER_COUNT as u64)
         .and_then(|value| value.checked_mul(std::mem::size_of::<BlockIndices>() as u64))
         .context("COG writer bookkeeping size overflow")?;
-    let non_gdal = config
-        .factor_block_read_cap_bytes
-        .checked_add(config.block_id_read_cap_bytes)
+    let non_gdal = factor
+        .maximum_block_payload_bytes
+        .checked_add(factor_batch_compact_bytes)
+        .and_then(|value| value.checked_add(factor_batch_observation_bytes))
+        .and_then(|value| value.checked_add(factor_batch_result_bytes))
+        .and_then(|value| value.checked_add(block_id_bytes))
         .and_then(|value| value.checked_add(displacement_windows))
         .and_then(|value| value.checked_add(output_windows))
         .and_then(|value| value.checked_add(output_write_copy_bytes))
@@ -2196,8 +1987,11 @@ fn compose_working_set_admission(
         "temporal working set leaves no GDAL cache budget"
     );
     Ok(WorkingSetAdmission {
-        factor_block_bytes: config.factor_block_read_cap_bytes,
-        block_id_bytes: config.block_id_read_cap_bytes,
+        factor_block_bytes: factor.maximum_block_payload_bytes,
+        factor_batch_compact_bytes,
+        factor_batch_observation_bytes,
+        factor_batch_result_bytes,
+        block_id_bytes,
         displacement_window_bytes: displacement_windows,
         output_window_bytes: output_windows,
         output_write_copy_bytes,
@@ -2913,8 +2707,11 @@ fn create_layer_writers(
                 &[
                     ("PRODUCT_ROLE", *role),
                     ("UNITTYPE", unit),
-                    ("TEMPORAL_ESTIMATOR", COMPLETE_REFIT_BOOTSTRAP_METHOD),
-                    ("CALIBRATION_STATUS", "calibrated_scope_match"),
+                    (
+                        "TEMPORAL_ESTIMATOR",
+                        REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+                    ),
+                    ("CALIBRATION_STATUS", "synthetic_validated_scope_match"),
                     ("NODATA_POLICY", "per_pixel_abstention"),
                     ("TRANSACTION_OWNERSHIP_TOKEN", ownership_token),
                 ],
@@ -3003,6 +2800,7 @@ fn install_no_replace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn evaluate_block(
     block: &dolphin_io::SpatialReferenceCovarianceBlock,
     observations: &[Array2<f32>],
@@ -3010,11 +2808,44 @@ fn evaluate_block(
     acquisition_days: &[f64],
     options: &TemporalCovarianceOptions,
 ) -> Result<[Array2<f32>; LAYER_COUNT]> {
+    Ok(evaluate_scalar_probe_block(
+        block,
+        observations,
+        common_support,
+        acquisition_days,
+        options,
+        TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar,
+    )?
+    .layers)
+}
+
+struct ScalarProbeBlockOutput {
+    layers: [Array2<f32>; LAYER_COUNT],
+    evaluated_pixels: u64,
+    batch_metrics: dolphin_timeseries::TemporalFactorScalarBatchMetrics,
+}
+
+#[allow(clippy::too_many_lines)]
+fn evaluate_scalar_probe_block(
+    block: &dolphin_io::SpatialReferenceCovarianceBlock,
+    observations: &[Array2<f32>],
+    common_support: ndarray::ArrayView2<'_, u8>,
+    acquisition_days: &[f64],
+    options: &TemporalCovarianceOptions,
+    method: TemporalScalarCandidateMethod,
+) -> Result<ScalarProbeBlockOutput> {
+    ensure!(
+        method != TemporalScalarCandidateMethod::SlopeProfileLikelihoodMl,
+        "slope-profile likelihood is not a factor-native product candidate"
+    );
     let shape = (
         usize::try_from(block.target_grid.rows)?,
         usize::try_from(block.target_grid.cols)?,
     );
-    let target_count = shape.0 * shape.1;
+    let target_count = shape
+        .0
+        .checked_mul(shape.1)
+        .context("temporal scalar probe block area overflow")?;
     ensure!(
         observations
             .len()
@@ -3022,59 +2853,170 @@ fn evaluate_block(
             .is_some_and(|count| count == acquisition_days.len())
             && observations.iter().all(|values| values.dim() == shape)
             && common_support.dim() == shape,
-        "displacement windows differ from factor block"
+        "temporal scalar probe windows differ from factor block"
     );
-    let mut output: [Array2<f32>; LAYER_COUNT] =
-        std::array::from_fn(|_| Array2::from_elem(shape, f32::NAN));
-    for target in 0..target_count {
-        let support = common_support
-            .as_slice()
-            .context("fixed-cube common-support mask is not contiguous")?[target];
-        ensure!(support <= 1, "fixed-cube common-support mask is not binary");
-        if support == 0 {
-            output[2]
-                .as_slice_mut()
-                .context("status layer is not contiguous")?[target] = 2_000.0;
-            continue;
+    let support = common_support
+        .as_slice()
+        .context("temporal scalar probe support mask is not contiguous")?;
+    ensure!(
+        support.iter().all(|value| *value <= 1),
+        "temporal scalar probe support mask is not binary"
+    );
+    let realized_ranks = support
+        .iter()
+        .enumerate()
+        .map(|(target, &supported)| {
+            if supported == 1 && block.status[target] == SpatialReferenceCovarianceStatus::Valid {
+                usize::try_from(block.rank_by_target[target]).unwrap_or(usize::MAX)
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    for (target, &realized_rank) in realized_ranks.iter().enumerate() {
+        if realized_rank > 0 {
+            let row = target / shape.1;
+            let column = target % shape.1;
+            ensure!(
+                observations
+                    .iter()
+                    .all(|observed| observed[(row, column)].is_finite()),
+                "temporal scalar probe support contains a missing displacement epoch"
+            );
         }
-        if block.status[target] != SpatialReferenceCovarianceStatus::Valid {
-            output[2]
-                .as_slice_mut()
-                .context("status layer is not contiguous")?[target] =
-                1_000.0 + block.status[target] as u16 as f32;
-            continue;
-        }
-        let rank = usize::try_from(block.rank_by_target[target])?;
-        let maximum_rank = usize::try_from(block.maximum_rank)?;
-        let covariance = reconstruct_covariance(
-            &block.difference_factor,
-            target,
-            acquisition_days.len(),
-            maximum_rank,
-            rank,
-        )?;
-        let row = target / shape.1;
-        let col = target % shape.1;
-        ensure!(
-            observations
-                .iter()
-                .all(|values| values[(row, col)].is_finite()),
-            "fixed-cube common support contains a missing displacement epoch"
-        );
-        let mut series = Vec::with_capacity(acquisition_days.len());
-        series.push(0.0);
-        series.extend(
-            observations
-                .iter()
-                .map(|values| f64::from(values[(row, col)])),
-        );
-        let fit = fit_temporal_covariance(acquisition_days, &series, &covariance, options);
-        let selected = complete_refit_bootstrap_estimate(&fit, options);
-        write_target_diagnostics(&mut output, target, &selected)?;
     }
-    Ok(output)
+    let mut observations_soa = Vec::with_capacity(observations.len() * target_count);
+    for observed in observations {
+        observations_soa.extend(
+            observed
+                .as_slice()
+                .context("temporal scalar probe observation is not contiguous")?
+                .iter()
+                .map(|value| f64::from(*value)),
+        );
+    }
+    let fit_batch = match method {
+        TemporalScalarCandidateMethod::PluginGlsReml => fit_temporal_factor_plugin_batch,
+        TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar => {
+            fit_temporal_factor_scalar_batch
+        }
+        TemporalScalarCandidateMethod::SlopeProfileLikelihoodMl => unreachable!(),
+    };
+    let report = fit_batch(
+        &acquisition_days[1..],
+        &observations_soa,
+        &block.difference_factor,
+        usize::try_from(block.maximum_rank)?,
+        &realized_ranks,
+        options,
+    )
+    .map_err(|status| anyhow::anyhow!("factor-native scalar batch failed: {status:?}"))?;
+    let mut layers: [Array2<f32>; LAYER_COUNT] =
+        std::array::from_fn(|_| Array2::from_elem(shape, f32::NAN));
+    let mut evaluated_pixels = 0_u64;
+    for (target, pair) in report.outcomes.iter().enumerate() {
+        let mut values = [f32::NAN; LAYER_COUNT];
+        if support[target] == 0 {
+            values[2] = 2_000.0;
+        } else if block.status[target] != SpatialReferenceCovarianceStatus::Valid {
+            values[2] = 1_000.0 + block.status[target] as u16 as f32;
+        } else {
+            let comparator = match method {
+                TemporalScalarCandidateMethod::PluginGlsReml => &pair.plugin_gls_reml,
+                TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar => {
+                    &pair.reml_covariance_parameter_adjusted_scalar
+                }
+                TemporalScalarCandidateMethod::SlopeProfileLikelihoodMl => unreachable!(),
+            };
+            values[3] = inference_status_code(comparator.status) as f32;
+            values[4] = 0.0;
+            values[5] = checked_f32(acquisition_days.len() as f64 - 1.0, "valid date count")?;
+            values[6] = 1.0;
+            values[7] = checked_f32(acquisition_days.len() as f64 - 2.0, "degrees of freedom")?;
+            set_optional(&mut values[9], pair.fitted_rho, "fitted rho")?;
+            set_optional(
+                &mut values[10],
+                pair.fitted_process_variance,
+                "fitted process variance",
+            )?;
+            set_optional(
+                &mut values[11],
+                pair.exact_condition_number.or(pair.condition_upper_bound),
+                "condition certificate",
+            )?;
+            values[12] = 0.0;
+            values[13] = 0.0;
+            let evaluated = comparator.status == TemporalInferenceStatus::Evaluated;
+            if evaluated {
+                let point = comparator
+                    .point_estimate
+                    .context("evaluated temporal scalar point is absent")?;
+                let standard_error = comparator
+                    .standard_error_diagnostic
+                    .context("evaluated temporal scalar standard error is absent")?;
+                ensure!(
+                    point.is_finite() && standard_error.is_finite() && standard_error > 0.0,
+                    "evaluated temporal scalar is non-finite or nonpositive"
+                );
+                values[0] = checked_f32(point, "temporal scalar point")?;
+                values[1] = checked_f32(standard_error, "temporal scalar standard error")?;
+                values[2] = 0.0;
+                evaluated_pixels = evaluated_pixels
+                    .checked_add(1)
+                    .context("temporal scalar probe evaluated-pixel count overflow")?;
+            } else {
+                values[2] = 1.0;
+            }
+        }
+        for (layer, value) in layers.iter_mut().zip(values) {
+            layer
+                .as_slice_mut()
+                .context("temporal scalar probe layer is not contiguous")?[target] = value;
+        }
+    }
+    for target in 0..target_count {
+        let selection = layers[2]
+            .as_slice()
+            .context("temporal scalar probe status layer is not contiguous")?[target];
+        ensure!(
+            layers.iter().all(|layer| !layer
+                .as_slice()
+                .expect("constructed scalar probe layers are contiguous")[target]
+                .is_infinite())
+                && if selection == 0.0 {
+                    layers[0]
+                        .as_slice()
+                        .expect("constructed scalar probe layer is contiguous")[target]
+                        .is_finite()
+                        && layers[1]
+                            .as_slice()
+                            .expect("constructed scalar probe layer is contiguous")[target]
+                            .is_finite()
+                        && layers[1]
+                            .as_slice()
+                            .expect("constructed scalar probe layer is contiguous")[target]
+                            > 0.0
+                } else {
+                    layers[0]
+                        .as_slice()
+                        .expect("constructed scalar probe layer is contiguous")[target]
+                        .is_nan()
+                        && layers[1]
+                            .as_slice()
+                            .expect("constructed scalar probe layer is contiguous")[target]
+                            .is_nan()
+                },
+            "temporal scalar probe output violates fail-closed scalar semantics"
+        );
+    }
+    Ok(ScalarProbeBlockOutput {
+        layers,
+        evaluated_pixels,
+        batch_metrics: report.metrics,
+    })
 }
 
+#[cfg(test)]
 fn reconstruct_covariance(
     factor: &[f64],
     target: usize,
@@ -3107,105 +3049,10 @@ fn reconstruct_covariance(
         .collect())
 }
 
-fn write_target_diagnostics(
-    layers: &mut [Array2<f32>; LAYER_COUNT],
-    target: usize,
-    selected: &CompleteRefitBootstrapEstimate,
-) -> Result<()> {
-    let set = |layer: &mut Array2<f32>, value: f32| -> Result<()> {
-        layer
-            .as_slice_mut()
-            .context("temporal product layer is not contiguous")?[target] = value;
-        Ok(())
-    };
-    if selected.status == CompleteRefitBootstrapEstimateStatus::Evaluated {
-        set_checked(
-            &mut layers[0],
-            target,
-            selected
-                .slope_per_year
-                .context("evaluated slope is absent")?,
-            "selected velocity",
-        )?;
-        set_checked(
-            &mut layers[1],
-            target,
-            selected
-                .standard_error_per_year
-                .context("evaluated standard error is absent")?,
-            "corrected standard error",
-        )?;
-    }
-    set(&mut layers[2], estimate_status_code(selected.status) as f32)?;
-    set(
-        &mut layers[3],
-        inference_status_code(selected.fit_status) as f32,
-    )?;
-    set(
-        &mut layers[4],
-        cadence_status_code(selected.cadence_status) as f32,
-    )?;
-    set_checked(
-        &mut layers[5],
-        target,
-        selected.valid_date_count as f64,
-        "valid date count",
-    )?;
-    set_checked(&mut layers[6], target, selected.rank as f64, "design rank")?;
-    set_checked(
-        &mut layers[7],
-        target,
-        selected.degrees_of_freedom as f64,
-        "degrees of freedom",
-    )?;
-    set_optional(&mut layers[8], target, selected.raw_rho, "raw rho")?;
-    set_optional(&mut layers[9], target, selected.fitted_rho, "fitted rho")?;
-    set_optional(
-        &mut layers[10],
-        target,
-        selected.fitted_process_variance,
-        "fitted process variance",
-    )?;
-    set_optional(
-        &mut layers[11],
-        target,
-        selected.condition_number,
-        "condition number",
-    )?;
-    set_checked(
-        &mut layers[12],
-        target,
-        selected.bootstrap_attempts as f64,
-        "bootstrap attempts",
-    )?;
-    set_checked(
-        &mut layers[13],
-        target,
-        selected.bootstrap_successes as f64,
-        "bootstrap successes",
-    )?;
-    Ok(())
-}
-
-fn set_optional(
-    layer: &mut Array2<f32>,
-    target: usize,
-    value: Option<f64>,
-    field: &str,
-) -> Result<()> {
+fn set_optional(output: &mut f32, value: Option<f64>, field: &str) -> Result<()> {
     if let Some(value) = value.filter(|value| value.is_finite()) {
-        layer
-            .as_slice_mut()
-            .context("temporal diagnostic layer is not contiguous")?[target] =
-            checked_f32(value, field)?;
+        *output = checked_f32(value, field)?;
     }
-    Ok(())
-}
-
-fn set_checked(layer: &mut Array2<f32>, target: usize, value: f64, field: &str) -> Result<()> {
-    layer
-        .as_slice_mut()
-        .context("temporal product layer is not contiguous")?[target] = checked_f32(value, field)?;
     Ok(())
 }
 
@@ -3291,26 +3138,6 @@ fn validate_product_value_semantics(layers: &[Array2<f32>; LAYER_COUNT]) -> Resu
     Ok(())
 }
 
-fn estimate_status_code(status: CompleteRefitBootstrapEstimateStatus) -> u16 {
-    match status {
-        CompleteRefitBootstrapEstimateStatus::Evaluated => 0,
-        CompleteRefitBootstrapEstimateStatus::FitNotEvaluated => 1,
-        CompleteRefitBootstrapEstimateStatus::ComparatorNotEvaluated => 2,
-        CompleteRefitBootstrapEstimateStatus::FrozenConfigurationMismatch => 3,
-        CompleteRefitBootstrapEstimateStatus::BootstrapAccountingMismatch => 4,
-        CompleteRefitBootstrapEstimateStatus::BootstrapInsufficientSuccess => 5,
-        CompleteRefitBootstrapEstimateStatus::InvalidEstimate => 6,
-    }
-}
-
-fn cadence_status_code(status: CompleteRefitBootstrapCadenceStatus) -> u16 {
-    match status {
-        CompleteRefitBootstrapCadenceStatus::Supported => 0,
-        CompleteRefitBootstrapCadenceStatus::Unsupported => 1,
-        CompleteRefitBootstrapCadenceStatus::Unavailable => 2,
-    }
-}
-
 fn inference_status_code(status: TemporalInferenceStatus) -> u16 {
     match status {
         TemporalInferenceStatus::Evaluated => 0,
@@ -3332,6 +3159,7 @@ fn inference_status_code(status: TemporalInferenceStatus) -> u16 {
         TemporalInferenceStatus::OptimizerNonconverged => 16,
         TemporalInferenceStatus::WeakParameterIdentification => 17,
         TemporalInferenceStatus::LegacyNonComparable => 18,
+        TemporalInferenceStatus::DiagnosticNotComputed => 19,
     }
 }
 
@@ -3432,8 +3260,6 @@ struct TemporalInferenceProvenance<'a> {
     spatial_burst_ownership_sha256: &'a str,
     spatial_manifest_sha256: &'a str,
     synthetic_result_sha256: &'a str,
-    heldout_result_sha256: &'a str,
-    review_receipt_sha256: &'a str,
     promotion_manifest_sha256: &'a str,
     corrected_velocity_sha256: &'a str,
     corrected_sigma_sha256: &'a str,
@@ -3471,9 +3297,9 @@ impl<'a> TemporalInferenceProvenance<'a> {
         Self {
             schema: PRODUCT_SCHEMA,
             transaction_ownership_token,
-            calibration_scope: "calibrated_scope_match",
-            estimator: COMPLETE_REFIT_BOOTSTRAP_METHOD,
-            estimator_version: COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+            calibration_scope: "synthetic_validated_scope_match",
+            estimator: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+            estimator_version: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
             acquisition_days: days,
             acquisition_days_sha256: sha256(&day_bytes),
             displacement_rasters: scope.input_receipts.clone(),
@@ -3505,8 +3331,6 @@ impl<'a> TemporalInferenceProvenance<'a> {
             spatial_burst_ownership_sha256: &factor.burst_ownership_digest,
             spatial_manifest_sha256: &promotion.spatial_manifest_sha256,
             synthetic_result_sha256: &promotion.synthetic_sha256,
-            heldout_result_sha256: &promotion.heldout_sha256,
-            review_receipt_sha256: &promotion.review_sha256,
             promotion_manifest_sha256: &promotion.manifest_sha256,
             corrected_velocity_sha256: velocity_sha256,
             corrected_sigma_sha256: sigma_sha256,
@@ -3577,7 +3401,7 @@ fn verify_final_cogs(
                     .metadata
                     .get("TEMPORAL_ESTIMATOR")
                     .map(String::as_str)
-                    == Some(COMPLETE_REFIT_BOOTSTRAP_METHOD)
+                    == Some(REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD)
                 && header
                     .metadata
                     .get("TRANSACTION_OWNERSHIP_TOKEN")
@@ -3626,7 +3450,7 @@ fn verify_promoted_fixed_cube_receipt(
         1024 * 1024,
     )?)?;
     ensure!(
-        receipt.inference_status == "calibrated_scope_match"
+        receipt.inference_status == "synthetic_validated_scope_match"
             && receipt.corrected_velocity_raster.as_deref() == Some("velocity_temporal_gls.tif")
             && receipt.corrected_sigma_raster.as_deref() == Some("velocity_sigma_corrected.tif")
             && receipt.corrected_velocity_sha256.as_deref() == Some(velocity_sha256)
@@ -3720,7 +3544,7 @@ fn promoted_fixed_cube_receipt_bytes(
             && receipt.semantic_validation.is_none(),
         "fixed-cube receipt is not eligible for temporal-inference promotion"
     );
-    receipt.inference_status = "calibrated_scope_match".to_owned();
+    receipt.inference_status = "synthetic_validated_scope_match".to_owned();
     receipt.corrected_velocity_raster = Some("velocity_temporal_gls.tif".to_owned());
     receipt.corrected_sigma_raster = Some("velocity_sigma_corrected.tif".to_owned());
     receipt.corrected_velocity_sha256 = Some(corrected_velocity_sha256.to_owned());
@@ -3937,7 +3761,7 @@ fn read_bounded_at(parent: RawFd, name: &CStr, cap: u64) -> Result<Vec<u8>> {
         "cleanup receipt exceeds byte cap"
     );
     let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(cap.checked_add(1).context("cleanup receipt cap overflow")?)
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
@@ -4491,7 +4315,7 @@ fn validate_completed_bundle(directory: &Path, journal: &ProductRollbackJournal)
                     .metadata
                     .get("TEMPORAL_ESTIMATOR")
                     .map(String::as_str)
-                    == Some(COMPLETE_REFIT_BOOTSTRAP_METHOD)
+                    == Some(REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD)
                 && header
                     .metadata
                     .get("TRANSACTION_OWNERSHIP_TOKEN")
@@ -4577,7 +4401,7 @@ fn validate_completed_bundle(directory: &Path, journal: &ProductRollbackJournal)
     let fixed: crate::fixed_cube::FixedCubeReceipt =
         serde_json::from_slice(&read_bounded(&fixed_receipt_path, 1024 * 1024)?)?;
     ensure!(
-        fixed.inference_status == "calibrated_scope_match"
+        fixed.inference_status == "synthetic_validated_scope_match"
             && fixed.corrected_velocity_raster.as_deref() == Some(PRODUCT_LAYERS[0].0)
             && fixed.corrected_sigma_raster.as_deref() == Some(PRODUCT_LAYERS[1].0)
             && fixed.corrected_velocity_sha256.as_deref()
@@ -4805,7 +4629,9 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     let opened = file.metadata()?;
     let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
     let read_cap = cap.checked_add(1).context("JSON read cap overflow")?;
-    file.by_ref().take(read_cap).read_to_end(&mut bytes)?;
+    Read::by_ref(&mut file)
+        .take(read_cap)
+        .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
     ensure!(
         before.len() == opened.len()
@@ -4846,16 +4672,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        admit_combined_working_set, complete_publication_after_legacy_check,
-        compose_working_set_admission, ensure_same_run_factor_directory, install_no_replace,
-        output_window, reconstruct_covariance, validate_heldout_result, validate_input_coverage,
-        validate_manifest, validate_product_value_semantics, validate_review,
-        validate_synthetic_result, validate_working_set_high_water,
-        write_product_transaction_with_validator, EvidenceDigests, HeldoutAttrition,
-        HeldoutCoverage, HeldoutLevel, HeldoutReceiptIdentity, HeldoutResult, RawHeldoutLevel,
+        complete_publication_after_legacy_check, compose_working_set_admission,
+        ensure_same_run_factor_directory, install_no_replace, output_window,
+        reconstruct_covariance, validate_input_coverage, validate_manifest,
+        validate_product_value_semantics, validate_synthetic_result,
+        validate_working_set_high_water, write_product_transaction_with_validator, EvidenceDigests,
         SyntheticResult, SyntheticScores, TemporalCovariancePromotion, TemporalProductTransaction,
-        TemporalPromotionManifest, TemporalReviewReceipt, HELDOUT_SCORE_SCHEMA, PRODUCT_LAYERS,
-        PROMOTION_SCHEMA, REVIEW_SCHEMA, ROLLBACK_JOURNAL_FILENAME, SYNTHETIC_SCHEMA,
+        TemporalPromotionManifest, PRODUCT_LAYERS, PROMOTION_SCHEMA, ROLLBACK_JOURNAL_FILENAME,
+        SYNTHETIC_SCHEMA,
     };
     use dolphin_core::config::{
         DisplacementWorkflow, TemporalUncertaintyMethod, TemporalUncertaintyOptions,
@@ -4871,10 +4695,108 @@ mod tests {
         SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE,
     };
     use dolphin_timeseries::{
-        COMPLETE_REFIT_BOOTSTRAP_METHOD, COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+        REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+        REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
     };
     use ndarray::{array, Array2};
     use serde_json::Value;
+
+    fn resource_binary_identity(bytes: &[u8]) -> super::TemporalInferenceBinaryIdentity {
+        super::TemporalInferenceBinaryIdentity {
+            sha256: super::sha256(bytes),
+            bytes: bytes.len() as u64,
+        }
+    }
+
+    fn valid_resource_measurements() -> Vec<super::TemporalInferenceResourceMeasurement> {
+        [12_u64, 48, 96]
+            .into_iter()
+            .map(|post_gauge_date_count| {
+                let target_count = super::TEMPORAL_RESOURCE_TILE_ROWS
+                    * super::TEMPORAL_RESOURCE_TILE_COLUMNS;
+                let mut pass_histogram = [0_u64; 21];
+                pass_histogram[2] = target_count - 1;
+                let scalar = |method,
+                              wall_micros,
+                              wall_micros_trials,
+                              full_product_wall_micros,
+                              full_product_wall_micros_trials,
+                              adjustment_derivatives,
+                              adjustments| {
+                    super::TemporalInferenceScalarMeasurement {
+                        method,
+                        factor_sha256: "11".repeat(32),
+                        direct_factor_receipt_sha256: "22".repeat(32),
+                        factor_block_reads: 1,
+                        nonreference_realized_rank: post_gauge_date_count,
+                        processed_pixels: target_count,
+                        evaluated_pixels: target_count - 1,
+                        profile_fit_count: target_count - 1,
+                        bootstrap_attempts: 0,
+                        optimizer_rho_lane_evaluations: 2 * (target_count - 1),
+                        optimizer_q_objective_evaluations: 3 * (target_count - 1),
+                        optimizer_primary_rho_pass_histogram: pass_histogram,
+                        covariance_parameter_derivative_lane_evaluations: adjustment_derivatives,
+                        covariance_parameter_adjustment_count: adjustments,
+                        rayon_worker_count: 2,
+                        maximum_worker_scratch_bytes: 1024,
+                        exact_optimizer_fallback_targets: 0,
+                        condition_exact_fallbacks: 0,
+                        wall_micros,
+                        wall_micros_trials,
+                        full_product_wall_micros,
+                        full_product_wall_micros_trials,
+                        peak_resident_set_bytes: 1024,
+                        checksum: 1.0,
+                    }
+                };
+                let plugin = scalar(
+                    dolphin_timeseries::TemporalScalarCandidateMethod::PluginGlsReml,
+                    1_100,
+                    vec![1_000, 1_100],
+                    2_100,
+                    vec![2_000, 2_100],
+                    0,
+                    0,
+                );
+                let adjusted = scalar(
+                    dolphin_timeseries::TemporalScalarCandidateMethod::RemlCovarianceParameterAdjustedScalar,
+                    1_800,
+                    vec![1_500, 1_800],
+                    3_900,
+                    vec![3_000, 3_900],
+                    3 * (target_count - 1),
+                    target_count - 1,
+                );
+                super::TemporalInferenceResourceMeasurement {
+                    post_gauge_date_count,
+                    acquisition_count: post_gauge_date_count + 1,
+                    target_count,
+                    varied_target_fingerprint_count: 257,
+                    adjusted_to_plugin_wall_ratio: adjusted.wall_micros as f64
+                        / plugin.wall_micros as f64,
+                    adjusted_to_plugin_full_product_wall_ratio: adjusted
+                        .full_product_wall_micros as f64
+                        / plugin.full_product_wall_micros as f64,
+                    plugin_gls_reml: plugin,
+                    reml_covariance_parameter_adjusted_scalar: adjusted,
+                }
+            })
+            .collect()
+    }
+
+    fn resource_host() -> super::TemporalInferenceHostIdentity {
+        super::TemporalInferenceHostIdentity {
+            operating_system: "contract-os".to_owned(),
+            architecture: "contract-arch".to_owned(),
+            logical_processor_count: 2,
+            rayon_thread_count: 2,
+            omp_thread_count: 1,
+            openblas_thread_count: 1,
+            mkl_thread_count: 1,
+            veclib_thread_count: 1,
+        }
+    }
 
     #[test]
     fn reconstructs_covariance_from_target_major_factor() {
@@ -4883,6 +4805,82 @@ mod tests {
         assert_eq!(covariance[0], vec![0.0, 0.0, 0.0]);
         assert_eq!(covariance[1], vec![0.0, 5.0, 11.0]);
         assert_eq!(covariance[2], vec![0.0, 11.0, 25.0]);
+    }
+
+    #[test]
+    fn head_factor_hdf5_round_trip_preserves_covariance_and_provenance() {
+        let dates = 13;
+        let realized_rank = 12;
+        let grid = CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: 1,
+            cols: 1,
+            stride_y: 1,
+            stride_x: 1,
+        };
+        let mut source_factor = Array2::zeros((dates, realized_rank));
+        for component in 0..realized_rank {
+            source_factor[(component + 1, component)] = 0.25 + component as f64 * 0.01;
+        }
+        let mut block = crate::spatial_reference_covariance_output::build_factor_block(
+            17,
+            grid,
+            dates,
+            1.0,
+            &[crate::spatial_reference_covariance_output::TargetFactor {
+                status: SpatialReferenceCovarianceStatus::Valid,
+                source_burst_index: 0,
+                date_factor: Some(source_factor.clone()),
+                source_factor_receipt: [0x51; 32],
+                effective_looks_fraction: 0.75,
+                support_union_count: 25,
+                effective_looks_receipt: [0x72; 32],
+                resource_high_water_bytes: 1_024,
+                condition_number: (0.36_f64 / 0.25).powi(2),
+            }],
+        )
+        .unwrap();
+        block.approximation_error_bound[0] = 0.0;
+        let source_factor_digest = block.source_factor_digest.clone();
+        let days = (0..dates)
+            .map(|date| date as f64 * 12.0)
+            .collect::<Vec<_>>();
+        let metadata = calibrated_metadata(&days, &block);
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_compact_factor_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("contract")
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("spatial_reference_covariance.h5");
+        write_spatial_reference_covariance(&path, &metadata, std::slice::from_ref(&block)).unwrap();
+        let read = dolphin_io::read_spatial_reference_covariance_block(&path, 17, 1 << 20).unwrap();
+
+        assert_eq!(read.block.maximum_rank, 13);
+        assert_eq!(read.block.rank_by_target, vec![12]);
+        assert_eq!(
+            read.block.status,
+            vec![SpatialReferenceCovarianceStatus::Valid]
+        );
+        assert_eq!(read.block.source_factor_digest, source_factor_digest);
+        assert_eq!(read.logical_payload_bytes, 13 * 13 * 8 + 82);
+        let covariance = reconstruct_covariance(
+            &read.block.difference_factor,
+            0,
+            dates,
+            usize::try_from(read.block.maximum_rank).unwrap(),
+            realized_rank,
+        )
+        .unwrap();
+        for (left, covariance_row) in covariance.iter().enumerate() {
+            for (right, observed) in covariance_row.iter().enumerate() {
+                let expected = source_factor.row(left).dot(&source_factor.row(right));
+                assert_eq!(observed.to_bits(), expected.to_bits());
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4949,20 +4947,22 @@ mod tests {
             fit.bootstrap_attempts,
             temporal_options.bootstrap_replicates
         );
-        let admitted = admit_combined_working_set(&config, days.len()).unwrap();
-        let composition = dolphin_timeseries::temporal_covariance_workspace_composition(
-            days.len(),
-            temporal_options.bootstrap_replicates,
-        )
-        .unwrap();
+        let admitted = compose_working_set_admission(&config, days.len()).unwrap();
         assert_eq!(
             admitted.temporal_solver_workspace_bytes,
-            composition.total_bytes
+            dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES as u64
+                * rayon::current_num_threads() as u64
         );
-        assert!(admitted.temporal_solver_workspace_bytes > 12 * 12 * 8);
+        assert_eq!(
+            admitted.factor_batch_compact_bytes,
+            config.maximum_targets_per_block as u64 * 12 * 12 * 8
+        );
         assert_eq!(
             admitted.total_bytes,
             admitted.factor_block_bytes
+                + admitted.factor_batch_compact_bytes
+                + admitted.factor_batch_observation_bytes
+                + admitted.factor_batch_result_bytes
                 + admitted.block_id_bytes
                 + admitted.displacement_window_bytes
                 + admitted.output_window_bytes
@@ -4972,12 +4972,15 @@ mod tests {
                 + admitted.gdal_cache_budget_bytes
         );
         assert!(admitted.total_bytes <= super::COMBINED_WORKING_SET_CAP_BYTES);
-        assert!(admit_combined_working_set(&config, 100_000).is_err());
+        assert!(compose_working_set_admission(&config, 100_000).is_err());
         let mut non_power_of_two_block_cap = config.clone();
         non_power_of_two_block_cap.block_id_read_cap_bytes = 4 * 1024 * 1024 + 8;
+        let non_power_of_two =
+            compose_working_set_admission(&non_power_of_two_block_cap, days.len()).unwrap();
         assert!(
-            admit_combined_working_set(&non_power_of_two_block_cap, days.len()).is_err(),
-            "writer Vec capacity growth must be admitted before block reads"
+            non_power_of_two.writer_bookkeeping_bytes
+                > super::LAYER_COUNT as u64 * non_power_of_two_block_cap.block_id_read_cap_bytes,
+            "writer Vec capacity growth must be charged before block reads"
         );
         for block_ids in [1_u64, 2] {
             let mut small_block_cap = config.clone();
@@ -4998,6 +5001,76 @@ mod tests {
             validate_working_set_high_water(&boundary, boundary.gdal_cache_budget_bytes + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn actual_factor_layout_admits_97_acquisition_default_path() {
+        let config = TemporalUncertaintyOptions::default();
+        let workspace = dolphin_timeseries::fixed_l2_difference_workspace_composition(97).unwrap();
+        let shape = super::factor_block_shape(
+            (256, 256),
+            97,
+            super::TEMPORAL_BENCHMARK_FACTOR_BLOCK_CAP_BYTES,
+            workspace,
+            1,
+        )
+        .unwrap();
+        let actual_factor_payload_bytes = u64::try_from(shape.0 * shape.1).unwrap()
+            * super::factor_target_payload_bytes(97).unwrap();
+        let actual_block_id_bytes = 32 * std::mem::size_of::<u64>() as u64;
+        let admission = super::compose_observed_working_set_admission(
+            &config,
+            97,
+            super::ObservedFactorLayout {
+                maximum_block_payload_bytes: actual_factor_payload_bytes,
+                block_id_count: 20,
+                block_id_capacity: 32,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "97 acquisitions with actual factor payload {actual_factor_payload_bytes} and block IDs {actual_block_id_bytes} must be admitted: {error:#}"
+            )
+        });
+        assert_eq!(admission.factor_block_bytes, actual_factor_payload_bytes);
+        assert_eq!(admission.block_id_bytes, actual_block_id_bytes);
+    }
+
+    #[test]
+    fn default_temporal_consumer_admits_head_issue54_full_rank_blocks() {
+        let config = TemporalUncertaintyOptions::default();
+        for acquisition_count in [13_usize, 49, 97] {
+            let workspace =
+                dolphin_timeseries::fixed_l2_difference_workspace_composition(acquisition_count)
+                    .unwrap();
+            let block_shape = super::factor_block_shape(
+                (256, 256),
+                acquisition_count,
+                super::TEMPORAL_BENCHMARK_FACTOR_BLOCK_CAP_BYTES,
+                workspace,
+                1,
+            )
+            .unwrap();
+            let payload = u64::try_from(block_shape.0 * block_shape.1).unwrap()
+                * super::factor_target_payload_bytes(acquisition_count).unwrap();
+            let block_count = 256_usize.div_ceil(block_shape.0) * 256_usize.div_ceil(block_shape.1);
+            let block_id_capacity = block_count.next_power_of_two();
+            let admission = super::compose_observed_working_set_admission(
+                &config,
+                acquisition_count,
+                super::ObservedFactorLayout {
+                    maximum_block_payload_bytes: payload,
+                    block_id_count: block_count,
+                    block_id_capacity,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "HEAD #54 {acquisition_count}-acquisition full-rank block {payload} bytes must be admitted: {error:#}"
+                )
+            });
+            assert!(admission.total_bytes <= super::TEMPORAL_RESOURCE_RSS_LIMIT_BYTES);
+        }
     }
 
     #[test]
@@ -5486,7 +5559,10 @@ mod tests {
                 Some(f64::NAN),
                 &[
                     ("PRODUCT_ROLE", role),
-                    ("TEMPORAL_ESTIMATOR", COMPLETE_REFIT_BOOTSTRAP_METHOD),
+                    (
+                        "TEMPORAL_ESTIMATOR",
+                        REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+                    ),
                     ("TRANSACTION_OWNERSHIP_TOKEN", token),
                 ],
             )
@@ -5582,33 +5658,410 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn complete_evidence_chain_rejects_tamper_and_scope_mismatch() {
-        fn passing_level(level: &str, covered: usize) -> HeldoutLevel {
-            let nominal = level.parse::<f64>().unwrap() / 100.0;
-            let observed = covered as f64 / 96.0;
-            HeldoutLevel {
-                status: "pass".to_owned(),
-                coverage: HeldoutCoverage {
-                    status: "pass".to_owned(),
-                    p_value: super::exact_binomial_upper_tail(covered, 96, nominal - 0.2).unwrap(),
-                    null_coverage: nominal - 0.2,
-                    observed_coverage: observed,
-                    evaluated: 96,
-                    covered,
-                },
-                coverage_absolute_error: (observed - nominal).abs(),
-                coverage_absolute_gate: true,
-                mean_interval_score: 1.0,
-                mean_baseline_interval_score: 2.0,
-                median_width_ratio: 0.5,
-                proper_score_improves: true,
-                holm_reject: true,
-            }
-        }
+    fn temporal_promotion_manifest_excludes_external_field_receipts() {
+        let manifest: TemporalPromotionManifest = serde_json::from_value(serde_json::json!({
+            "schema": PROMOTION_SCHEMA,
+            "promotion_status": "approved",
+            "calibration_scope": "synthetic_validated_scope_match",
+            "selected_method": REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+            "selected_method_version": REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
+            "synthetic_result_sha256": "11".repeat(32),
+            "temporal_resource_receipt_sha256": "12".repeat(32),
+            "temporal_covariance_batch_binary_sha256": "13".repeat(32),
+            "temporal_inference_bench_binary_sha256": "14".repeat(32),
+            "spatial_factor_sha256": "22".repeat(32),
+            "spatial_manifest_sha256": "33".repeat(32),
+            "temporal_preregistration_sha256": "44".repeat(32),
+            "source_sha256": "55".repeat(32),
+        }))
+        .unwrap();
+        assert_eq!(manifest.schema, PROMOTION_SCHEMA);
+        assert_eq!(
+            manifest.calibration_scope,
+            "synthetic_validated_scope_match"
+        );
 
+        let external_field_receipt = serde_json::json!({
+            "schema": PROMOTION_SCHEMA,
+            "promotion_status": "approved",
+            "calibration_scope": "synthetic_validated_scope_match",
+            "selected_method": REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD,
+            "selected_method_version": REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
+            "synthetic_result_sha256": "11".repeat(32),
+            "temporal_resource_receipt_sha256": "12".repeat(32),
+            "temporal_covariance_batch_binary_sha256": "13".repeat(32),
+            "temporal_inference_bench_binary_sha256": "14".repeat(32),
+            "heldout_result_sha256": "66".repeat(32),
+            "spatial_factor_sha256": "22".repeat(32),
+            "spatial_manifest_sha256": "33".repeat(32),
+            "temporal_preregistration_sha256": "44".repeat(32),
+            "source_sha256": "55".repeat(32),
+        });
+        assert!(
+            serde_json::from_value::<TemporalPromotionManifest>(external_field_receipt).is_err()
+        );
+    }
+
+    #[test]
+    fn synthetic_producer_identity_binds_external_resource_chain() {
+        let parsed =
+            serde_json::from_value::<super::SyntheticProducerIdentity>(serde_json::json!({
+                "schema": super::TEMPORAL_PRODUCER_IDENTITY_SCHEMA,
+                "preregistration_sha256": "01".repeat(32),
+                "generator_sha256": "02".repeat(32),
+                "batch_source_sha256": "03".repeat(32),
+                "estimator_source_sha256": "04".repeat(32),
+                "source_set_schema": super::TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA,
+                "source_set_sha256": "05".repeat(32),
+                "binary_path": "target/release/examples/temporal_covariance_batch",
+                "binary_sha256": "06".repeat(32),
+                "binary_bytes": 1,
+                "batch_schema": super::TEMPORAL_BATCH_SCHEMA,
+                "generator_schema": super::SYNTHETIC_SCHEMA,
+                "source_correlation_model": "exponential_euclidean_v1",
+                "source_correlation_distance_scale_pixels": 1.5,
+                "seed_count": 1_050,
+                "candidate_resource_receipt_sha256": "07".repeat(32),
+                "method_selection_receipt_sha256": "08".repeat(32),
+                "resource_receipt_sha256": "09".repeat(32),
+                "resource_benchmark_binary_sha256": "0a".repeat(32),
+            }));
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn synthetic_campaign_timing_cannot_authorize_release_tile_resource_gate() {
         let preregistration: Value =
             serde_json::from_slice(super::TEMPORAL_PREREGISTRATION_BYTES).unwrap();
+        let observed_resource = super::ObservedReleaseResourceEvidence {
+            receipt_sha256: "e3".repeat(32),
+            candidate_receipt_sha256: "c1".repeat(32),
+            selection_receipt_sha256: "d2".repeat(32),
+            batch_binary: super::TemporalInferenceBinaryIdentity {
+                sha256: "ab".repeat(32),
+                bytes: 1,
+            },
+            benchmark_binary: super::TemporalInferenceBinaryIdentity {
+                sha256: "f4".repeat(32),
+                bytes: 2,
+            },
+        };
+        let synthetic = SyntheticResult {
+            schema: SYNTHETIC_SCHEMA.to_owned(),
+            preregistration_schema: super::PREREGISTRATION_SCHEMA.to_owned(),
+            expected_attempt_record_count: 50_400,
+            processed_attempt_record_count: 50_400,
+            seed_request_count: 25_200,
+            expected_seed_request_count: 25_200,
+            attempt_record_count: 50_400,
+            emitted_attempt_record_count: 50_400,
+            failed_attempt_record_count: 0,
+            skipped_attempt_record_count: 0,
+            seed_requests_per_cell: 1_050,
+            execution_complete: true,
+            exact_seed_denominator_complete: true,
+            run_committed: true,
+            corrected_inferential_sigma_emission: false,
+            engine_validation_eligible: true,
+            engine_validation_status: "synthetic_validated_scope_match".to_owned(),
+            scores: SyntheticScores {
+                all_methods_pass: true,
+            },
+            resource_gates: BTreeMap::from([
+                ("artifact_size".to_owned(), true),
+                ("bound_resource_receipt".to_owned(), true),
+                ("retained_bound".to_owned(), true),
+                ("rss".to_owned(), true),
+            ]),
+            producer_identity: super::SyntheticProducerIdentity {
+                schema: super::TEMPORAL_PRODUCER_IDENTITY_SCHEMA.to_owned(),
+                preregistration_sha256: super::canonical_json_sha256(
+                    super::TEMPORAL_PREREGISTRATION_BYTES,
+                )
+                .unwrap(),
+                generator_sha256: super::sha256(super::GENERATOR_SOURCE_BYTES),
+                batch_source_sha256: super::sha256(super::BATCH_SOURCE_BYTES),
+                estimator_source_sha256: super::sha256(super::ESTIMATOR_SOURCE_BYTES),
+                source_set_schema: super::TEMPORAL_PRODUCER_SOURCE_SET_SCHEMA.to_owned(),
+                source_set_sha256: preregistration["producer_identity"]["source_set_sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                binary_path: "target/release/examples/temporal_covariance_batch".to_owned(),
+                binary_sha256: "ab".repeat(32),
+                binary_bytes: 1,
+                batch_schema: super::TEMPORAL_BATCH_SCHEMA.to_owned(),
+                generator_schema: SYNTHETIC_SCHEMA.to_owned(),
+                source_correlation_model: "exponential_euclidean_v1".to_owned(),
+                source_correlation_distance_scale_pixels: 1.5,
+                seed_count: 1_050,
+                candidate_resource_receipt_sha256: observed_resource
+                    .candidate_receipt_sha256
+                    .clone(),
+                method_selection_receipt_sha256: observed_resource.selection_receipt_sha256.clone(),
+                resource_receipt_sha256: observed_resource.receipt_sha256.clone(),
+                resource_benchmark_binary_sha256: observed_resource.benchmark_binary.sha256.clone(),
+            },
+        };
+        let expected = EvidenceDigests {
+            synthetic_result_sha256: "11".repeat(32),
+            temporal_resource_receipt_sha256: "12".repeat(32),
+            temporal_covariance_batch_binary_sha256: "13".repeat(32),
+            temporal_inference_bench_binary_sha256: "14".repeat(32),
+            spatial_factor_sha256: "22".repeat(32),
+            spatial_manifest_sha256: "33".repeat(32),
+            temporal_preregistration_sha256: "44".repeat(32),
+            source_sha256: "55".repeat(32),
+        };
+        let manifest = TemporalPromotionManifest {
+            schema: PROMOTION_SCHEMA.to_owned(),
+            promotion_status: "approved".to_owned(),
+            calibration_scope: "synthetic_validated_scope_match".to_owned(),
+            selected_method: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD.to_owned(),
+            selected_method_version: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
+            synthetic_result_sha256: expected.synthetic_result_sha256.clone(),
+            temporal_resource_receipt_sha256: expected.temporal_resource_receipt_sha256.clone(),
+            temporal_covariance_batch_binary_sha256: expected
+                .temporal_covariance_batch_binary_sha256
+                .clone(),
+            temporal_inference_bench_binary_sha256: expected
+                .temporal_inference_bench_binary_sha256
+                .clone(),
+            spatial_factor_sha256: expected.spatial_factor_sha256.clone(),
+            spatial_manifest_sha256: expected.spatial_manifest_sha256.clone(),
+            temporal_preregistration_sha256: expected.temporal_preregistration_sha256.clone(),
+            source_sha256: expected.source_sha256.clone(),
+        };
+
+        let source_error = validate_synthetic_result(&synthetic, &observed_resource)
+            .expect_err("frozen v5 evidence must not authorize the changed estimator source");
+        assert!(format!("{source_error:#}")
+            .contains("synthetic temporal-covariance producer identity is stale or malformed"));
+        validate_manifest(&manifest, &expected).unwrap();
+
+        let evidence = std::env::temp_dir().join(format!(
+            "dolphin_temporal_resource_contract_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&evidence);
+        std::fs::create_dir(&evidence).unwrap();
+        std::fs::write(
+            evidence.join(super::TEMPORAL_SYNTHETIC_RESULT_FILENAME),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": synthetic.schema,
+                "preregistration_schema": synthetic.preregistration_schema,
+                "expected_attempt_record_count": synthetic.expected_attempt_record_count,
+                "processed_attempt_record_count": synthetic.processed_attempt_record_count,
+                "seed_request_count": synthetic.seed_request_count,
+                "expected_seed_request_count": synthetic.expected_seed_request_count,
+                "attempt_record_count": synthetic.attempt_record_count,
+                "emitted_attempt_record_count": synthetic.emitted_attempt_record_count,
+                "failed_attempt_record_count": synthetic.failed_attempt_record_count,
+                "skipped_attempt_record_count": synthetic.skipped_attempt_record_count,
+                "seed_requests_per_cell": synthetic.seed_requests_per_cell,
+                "execution_complete": synthetic.execution_complete,
+                "exact_seed_denominator_complete": synthetic.exact_seed_denominator_complete,
+                "run_committed": synthetic.run_committed,
+                "corrected_inferential_sigma_emission": synthetic.corrected_inferential_sigma_emission,
+                "engine_validation_eligible": synthetic.engine_validation_eligible,
+                "engine_validation_status": synthetic.engine_validation_status,
+                "scores": {"all_methods_pass": synthetic.scores.all_methods_pass},
+                "resource_gates": synthetic.resource_gates,
+                "producer_identity": {
+                    "schema": synthetic.producer_identity.schema,
+                    "preregistration_sha256": synthetic.producer_identity.preregistration_sha256,
+                    "generator_sha256": synthetic.producer_identity.generator_sha256,
+                    "batch_source_sha256": synthetic.producer_identity.batch_source_sha256,
+                    "estimator_source_sha256": synthetic.producer_identity.estimator_source_sha256,
+                    "source_set_schema": synthetic.producer_identity.source_set_schema,
+                    "source_set_sha256": synthetic.producer_identity.source_set_sha256,
+                    "binary_path": synthetic.producer_identity.binary_path,
+                    "binary_sha256": synthetic.producer_identity.binary_sha256,
+                    "binary_bytes": synthetic.producer_identity.binary_bytes,
+                    "batch_schema": synthetic.producer_identity.batch_schema,
+                    "generator_schema": synthetic.producer_identity.generator_schema,
+                    "source_correlation_model": synthetic.producer_identity.source_correlation_model,
+                    "source_correlation_distance_scale_pixels": synthetic.producer_identity.source_correlation_distance_scale_pixels,
+                    "seed_count": synthetic.producer_identity.seed_count,
+                    "candidate_resource_receipt_sha256": synthetic.producer_identity.candidate_resource_receipt_sha256,
+                    "method_selection_receipt_sha256": synthetic.producer_identity.method_selection_receipt_sha256,
+                    "resource_receipt_sha256": synthetic.producer_identity.resource_receipt_sha256,
+                    "resource_benchmark_binary_sha256": synthetic.producer_identity.resource_benchmark_binary_sha256,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.join(super::TEMPORAL_PROMOTION_MANIFEST_FILENAME),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": manifest.schema,
+                "promotion_status": manifest.promotion_status,
+                "calibration_scope": manifest.calibration_scope,
+                "selected_method": manifest.selected_method,
+                "selected_method_version": manifest.selected_method_version,
+                "synthetic_result_sha256": manifest.synthetic_result_sha256,
+                "temporal_resource_receipt_sha256": manifest.temporal_resource_receipt_sha256,
+                "temporal_covariance_batch_binary_sha256": manifest.temporal_covariance_batch_binary_sha256,
+                "temporal_inference_bench_binary_sha256": manifest.temporal_inference_bench_binary_sha256,
+                "spatial_factor_sha256": manifest.spatial_factor_sha256,
+                "spatial_manifest_sha256": manifest.spatial_manifest_sha256,
+                "temporal_preregistration_sha256": manifest.temporal_preregistration_sha256,
+                "source_sha256": manifest.source_sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = super::validate_temporal_covariance_promotion(&evidence, &evidence)
+            .expect_err("synthetic evidence without observed resource/binaries must fail");
+        assert!(format!("{error:#}").contains("release-resource receipt is missing"));
+        std::fs::remove_dir_all(evidence).unwrap();
+    }
+
+    #[test]
+    fn resource_receipt_rejects_collapsed_rank_or_condition_fallback() {
+        let binary = resource_binary_identity(b"release-binary");
+        let mut receipt = super::temporal_inference_resource_receipt(
+            binary.clone(),
+            binary.clone(),
+            resource_host(),
+            None,
+            valid_resource_measurements(),
+        )
+        .unwrap();
+        super::validate_temporal_inference_resource_receipt(&receipt, &binary, &binary).unwrap();
+        receipt.measurements[2]
+            .reml_covariance_parameter_adjusted_scalar
+            .nonreference_realized_rank = 1;
+        assert!(
+            super::validate_temporal_inference_resource_receipt(&receipt, &binary, &binary)
+                .is_err()
+        );
+        receipt.measurements[2]
+            .reml_covariance_parameter_adjusted_scalar
+            .nonreference_realized_rank = 96;
+        receipt.measurements[2]
+            .reml_covariance_parameter_adjusted_scalar
+            .condition_exact_fallbacks = 1;
+        assert!(
+            super::validate_temporal_inference_resource_receipt(&receipt, &binary, &binary)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn release_resource_chain_rejects_missing_or_tampered_candidate_receipt() {
+        let directory = std::env::temp_dir().join(format!(
+            "dolphin_temporal_candidate_chain_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let batch_bytes = b"observed-batch-binary";
+        let benchmark_bytes = b"observed-benchmark-binary";
+        let batch = resource_binary_identity(batch_bytes);
+        let benchmark = resource_binary_identity(benchmark_bytes);
+        let candidate = super::temporal_inference_resource_receipt(
+            batch.clone(),
+            benchmark.clone(),
+            resource_host(),
+            None,
+            valid_resource_measurements(),
+        )
+        .unwrap();
+        let candidate_bytes = serde_json::to_vec(&candidate).unwrap();
+        let selection = super::TemporalMethodSelectionReceipt {
+            schema: super::TEMPORAL_METHOD_SELECTION_SCHEMA.to_owned(),
+            status: "pre_outcome_selected".to_owned(),
+            selected_method: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD.to_owned(),
+            selected_method_version: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
+            candidate_resource_receipt_sha256: super::sha256(&candidate_bytes),
+            canonical_v4_preregistration_sha256: super::canonical_json_sha256(
+                super::TEMPORAL_PREREGISTRATION_V4_BYTES,
+            )
+            .unwrap(),
+            product_source_sha256: candidate.product_source_sha256.clone(),
+            benchmark_source_sha256: candidate.benchmark_source_sha256.clone(),
+            batch_source_sha256: candidate.batch_source_sha256.clone(),
+            temporal_covariance_batch_binary_sha256: batch.sha256.clone(),
+            temporal_inference_bench_binary_sha256: benchmark.sha256.clone(),
+            tile_rows: super::TEMPORAL_RESOURCE_TILE_ROWS,
+            tile_columns: super::TEMPORAL_RESOURCE_TILE_COLUMNS,
+            target_count: super::TEMPORAL_RESOURCE_TILE_ROWS
+                * super::TEMPORAL_RESOURCE_TILE_COLUMNS,
+            post_gauge_date_counts: vec![12, 48, 96],
+            adjusted_to_plugin_wall_ratio_limit: super::TEMPORAL_RESOURCE_WALL_MULTIPLIER as f64,
+            worker_scratch_limit_bytes:
+                dolphin_timeseries::TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES as u64,
+            resident_set_limit_bytes: super::TEMPORAL_RESOURCE_RSS_LIMIT_BYTES,
+            outcomes_present: false,
+        };
+        let selection_bytes = serde_json::to_vec(&selection).unwrap();
+        let final_receipt = super::temporal_inference_resource_receipt(
+            batch,
+            benchmark,
+            resource_host(),
+            Some(super::sha256(&selection_bytes)),
+            valid_resource_measurements(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(super::TEMPORAL_BATCH_BINARY_FILENAME),
+            batch_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(super::TEMPORAL_INFERENCE_BENCH_BINARY_FILENAME),
+            benchmark_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(super::TEMPORAL_RESOURCE_RECEIPT_FILENAME),
+            serde_json::to_vec(&final_receipt).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(super::TEMPORAL_METHOD_SELECTION_FILENAME),
+            &selection_bytes,
+        )
+        .unwrap();
+
+        let missing = super::validate_release_resource_evidence(&directory)
+            .err()
+            .expect("missing candidate resource receipt must fail");
+        assert!(format!("{missing:#}").contains("candidate resource receipt is missing"));
+        let candidate_path = directory.join(super::TEMPORAL_CANDIDATE_RESOURCE_RECEIPT_FILENAME);
+        std::fs::write(&candidate_path, &candidate_bytes).unwrap();
+        super::validate_release_resource_evidence(&directory).unwrap();
+        let mut tampered = candidate_bytes;
+        tampered.push(b'\n');
+        std::fs::write(candidate_path, tampered).unwrap();
+        let tampered = super::validate_release_resource_evidence(&directory)
+            .err()
+            .expect("tampered candidate resource receipt must fail");
+        assert!(format!("{tampered:#}").contains("pre-outcome method-selection receipt differs"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn frozen_v5_synthetic_evidence_rejects_current_estimator_source_drift() {
+        let preregistration: Value =
+            serde_json::from_slice(super::TEMPORAL_PREREGISTRATION_BYTES).unwrap();
+        let observed_resource = super::ObservedReleaseResourceEvidence {
+            receipt_sha256: "e3".repeat(32),
+            candidate_receipt_sha256: "c1".repeat(32),
+            selection_receipt_sha256: "d2".repeat(32),
+            batch_binary: super::TemporalInferenceBinaryIdentity {
+                sha256: "ab".repeat(32),
+                bytes: 1,
+            },
+            benchmark_binary: super::TemporalInferenceBinaryIdentity {
+                sha256: "f4".repeat(32),
+                bytes: 2,
+            },
+        };
         let producer_identity = super::SyntheticProducerIdentity {
             schema: super::TEMPORAL_PRODUCER_IDENTITY_SCHEMA.to_owned(),
             preregistration_sha256: super::canonical_json_sha256(
@@ -5631,250 +6084,90 @@ mod tests {
             source_correlation_model: "exponential_euclidean_v1".to_owned(),
             source_correlation_distance_scale_pixels: 1.5,
             seed_count: 1_050,
+            candidate_resource_receipt_sha256: observed_resource.candidate_receipt_sha256.clone(),
+            method_selection_receipt_sha256: observed_resource.selection_receipt_sha256.clone(),
+            resource_receipt_sha256: observed_resource.receipt_sha256.clone(),
+            resource_benchmark_binary_sha256: observed_resource.benchmark_binary.sha256.clone(),
         };
-        let mut synthetic = SyntheticResult {
+        let synthetic = SyntheticResult {
             schema: SYNTHETIC_SCHEMA.to_owned(),
-            attempted_cells: 50_400,
-            batch_attempted_cells: 50_400,
-            seed_count: 1_050,
+            preregistration_schema: super::PREREGISTRATION_SCHEMA.to_owned(),
+            expected_attempt_record_count: 50_400,
+            processed_attempt_record_count: 50_400,
+            seed_request_count: 25_200,
+            expected_seed_request_count: 25_200,
+            attempt_record_count: 50_400,
+            emitted_attempt_record_count: 50_400,
+            failed_attempt_record_count: 0,
+            skipped_attempt_record_count: 0,
+            seed_requests_per_cell: 1_050,
             execution_complete: true,
             exact_seed_denominator_complete: true,
+            run_committed: true,
             corrected_inferential_sigma_emission: false,
-            promotion_eligible: true,
-            promotion_status: "eligible_for_external_field_review".to_owned(),
+            engine_validation_eligible: true,
+            engine_validation_status: "synthetic_validated_scope_match".to_owned(),
             scores: SyntheticScores {
                 all_methods_pass: true,
             },
-            resource_gates: BTreeMap::from([("rss".to_owned(), true)]),
+            resource_gates: BTreeMap::from([
+                ("artifact_size".to_owned(), true),
+                ("bound_resource_receipt".to_owned(), true),
+                ("retained_bound".to_owned(), true),
+                ("rss".to_owned(), true),
+            ]),
             producer_identity,
         };
-        validate_synthetic_result(&synthetic).unwrap();
-        synthetic.seed_count = 5_000;
-        synthetic.attempted_cells = 240_000;
-        synthetic.batch_attempted_cells = 240_000;
-        assert!(validate_synthetic_result(&synthetic).is_err());
-        synthetic.seed_count = 1_050;
-        synthetic.attempted_cells = 50_400;
-        synthetic.batch_attempted_cells = 50_400;
-        synthetic.producer_identity.seed_count = 1_050;
-        synthetic.producer_identity.source_set_sha256 = "cd".repeat(32);
-        assert!(validate_synthetic_result(&synthetic).is_err());
-        synthetic.producer_identity.source_set_sha256 = preregistration["producer_identity"]
-            ["source_set_sha256"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let heldout_identity = HeldoutReceiptIdentity {
-            receipt_sha256: "aa".repeat(32),
-            manifest_file_sha256:
-                "75ce4e149aa8ed49ddb22cfedcac8056201a18c75af73ebb4fa22e7f9290ab1d".to_owned(),
-            manifest_sha256: "534b9c534255404a71d3e2f53cc55cccc41ef4ef372bc18bb16e3a842826ee7e"
-                .to_owned(),
-            freeze_receipt_sha256:
-                "cd3a0c4bdd5517fb310a55c2b34abbf78ff4bd7ccfe1aa6c1a5f5d61bae99f1c".to_owned(),
-            factor_scope_sha256: "ee35862925aa7e88e0c18e0f09633aa5c02ed5781c68c9c2afb3aed3168eb833"
-                .to_owned(),
-            attrition: HeldoutAttrition {
-                attrited_primary_ids: Vec::new(),
-                used_surplus_ids: Vec::new(),
-                unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
-                reasons_by_cluster: BTreeMap::new(),
-            },
-            evaluated_clusters: 96,
-            required_cluster_failed: false,
-            raw_levels: ["68", "90", "95"]
-                .into_iter()
-                .zip([62, 84, 90])
-                .map(|(level, covered)| {
-                    (
-                        level.to_owned(),
-                        RawHeldoutLevel {
-                            covered,
-                            mean_interval_score: 1.0,
-                            mean_baseline_interval_score: 2.0,
-                            median_width_ratio: 0.5,
-                        },
-                    )
-                })
-                .collect(),
-        };
-        let mut heldout = HeldoutResult {
-            schema: HELDOUT_SCORE_SCHEMA.to_owned(),
-            schema_version: 1,
-            cohort_id: "f53-06-outer-nonfresno-v1".to_owned(),
-            manifest_file_sha256: heldout_identity.manifest_file_sha256.clone(),
-            manifest_sha256: heldout_identity.manifest_sha256.clone(),
-            freeze_receipt_sha256: heldout_identity.freeze_receipt_sha256.clone(),
-            factor_scope_sha256: heldout_identity.factor_scope_sha256.clone(),
-            heldout_receipt_sha256: heldout_identity.receipt_sha256.clone(),
-            primary_cluster_count: 96,
-            surplus_cluster_count: 20,
-            status: "pass".to_owned(),
-            errors: Vec::<Value>::new(),
-            levels: ["68", "90", "95"]
-                .into_iter()
-                .zip([62, 84, 90])
-                .map(|(level, covered)| (level.to_owned(), passing_level(level, covered)))
-                .collect(),
-            evaluated_clusters: 96,
-            emission_rate: 1.0,
-            attrited_primary_ids: Vec::new(),
-            used_surplus_ids: Vec::new(),
-            unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
-            reasons_by_cluster: BTreeMap::new(),
-        };
-        validate_heldout_result(&heldout, &heldout_identity).unwrap();
-        heldout.levels.get_mut("90").unwrap().coverage.p_value += 0.01;
-        assert!(validate_heldout_result(&heldout, &heldout_identity).is_err());
-        heldout.levels.get_mut("90").unwrap().coverage.p_value =
-            super::exact_binomial_upper_tail(84, 96, 0.7).unwrap();
-        heldout.levels.get_mut("90").unwrap().mean_interval_score = 1.25;
-        assert!(validate_heldout_result(&heldout, &heldout_identity).is_err());
-        heldout.levels.get_mut("90").unwrap().mean_interval_score = 1.0;
-        let mut stale_freeze = heldout;
-        stale_freeze.freeze_receipt_sha256 = "00".repeat(32);
-        assert!(validate_heldout_result(&stale_freeze, &heldout_identity).is_err());
+        assert_ne!(
+            super::sha256(super::ESTIMATOR_SOURCE_BYTES),
+            preregistration["file_hashes"]["estimator_source_sha256"]
+                .as_str()
+                .unwrap()
+        );
+        let source_error = validate_synthetic_result(&synthetic, &observed_resource)
+            .expect_err("frozen v5 evidence must not authorize the changed estimator source");
+        assert!(format!("{source_error:#}")
+            .contains("synthetic temporal-covariance producer identity is stale or malformed"));
+    }
+
+    #[test]
+    fn temporal_promotion_manifest_rejects_scope_and_digest_mismatch() {
         let expected = EvidenceDigests {
             synthetic_result_sha256: "11".repeat(32),
-            heldout_result_sha256: "22".repeat(32),
-            heldout_receipt_sha256: "2a".repeat(32),
-            spatial_factor_sha256: "33".repeat(32),
-            spatial_manifest_sha256: "44".repeat(32),
-            temporal_preregistration_sha256: "55".repeat(32),
-            heldout_preregistration_sha256: "66".repeat(32),
-            scorer_sha256: "77".repeat(32),
-            source_sha256: "88".repeat(32),
+            temporal_resource_receipt_sha256: "12".repeat(32),
+            temporal_covariance_batch_binary_sha256: "13".repeat(32),
+            temporal_inference_bench_binary_sha256: "14".repeat(32),
+            spatial_factor_sha256: "22".repeat(32),
+            spatial_manifest_sha256: "33".repeat(32),
+            temporal_preregistration_sha256: "44".repeat(32),
+            source_sha256: "55".repeat(32),
         };
-        let review = TemporalReviewReceipt {
-            schema: REVIEW_SCHEMA.to_owned(),
-            review_status: "approved".to_owned(),
-            reviewer: "independent-reviewer".to_owned(),
-            independent: true,
-            unresolved_findings: 0,
-            synthetic_result_sha256: expected.synthetic_result_sha256.clone(),
-            heldout_result_sha256: expected.heldout_result_sha256.clone(),
-            heldout_receipt_sha256: expected.heldout_receipt_sha256.clone(),
-            spatial_manifest_sha256: expected.spatial_manifest_sha256.clone(),
-            temporal_preregistration_sha256: expected.temporal_preregistration_sha256.clone(),
-            heldout_preregistration_sha256: expected.heldout_preregistration_sha256.clone(),
-            scorer_sha256: expected.scorer_sha256.clone(),
-            source_sha256: expected.source_sha256.clone(),
-        };
-        validate_review(&review, &expected).unwrap();
         let mut manifest = TemporalPromotionManifest {
             schema: PROMOTION_SCHEMA.to_owned(),
             promotion_status: "approved".to_owned(),
-            calibration_scope: "calibrated_scope_match".to_owned(),
-            selected_method: COMPLETE_REFIT_BOOTSTRAP_METHOD.to_owned(),
-            selected_method_version: COMPLETE_REFIT_BOOTSTRAP_METHOD_VERSION,
+            calibration_scope: "synthetic_validated_scope_match".to_owned(),
+            selected_method: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD.to_owned(),
+            selected_method_version: REML_COVARIANCE_PARAMETER_ADJUSTED_SCALAR_METHOD_VERSION,
             synthetic_result_sha256: expected.synthetic_result_sha256.clone(),
-            heldout_result_sha256: expected.heldout_result_sha256.clone(),
-            heldout_receipt_sha256: expected.heldout_receipt_sha256.clone(),
-            review_receipt_sha256: "99".repeat(32),
+            temporal_resource_receipt_sha256: expected.temporal_resource_receipt_sha256.clone(),
+            temporal_covariance_batch_binary_sha256: expected
+                .temporal_covariance_batch_binary_sha256
+                .clone(),
+            temporal_inference_bench_binary_sha256: expected
+                .temporal_inference_bench_binary_sha256
+                .clone(),
             spatial_factor_sha256: expected.spatial_factor_sha256.clone(),
             spatial_manifest_sha256: expected.spatial_manifest_sha256.clone(),
             temporal_preregistration_sha256: expected.temporal_preregistration_sha256.clone(),
-            heldout_preregistration_sha256: expected.heldout_preregistration_sha256.clone(),
-            scorer_sha256: expected.scorer_sha256.clone(),
             source_sha256: expected.source_sha256.clone(),
         };
-        validate_manifest(&manifest, &expected, &"99".repeat(32)).unwrap();
+        validate_manifest(&manifest, &expected).unwrap();
         manifest.calibration_scope = "scope_mismatch".to_owned();
-        assert!(validate_manifest(&manifest, &expected, &"99".repeat(32)).is_err());
-        manifest.calibration_scope = "calibrated_scope_match".to_owned();
+        assert!(validate_manifest(&manifest, &expected).is_err());
+        manifest.calibration_scope = "synthetic_validated_scope_match".to_owned();
         manifest.synthetic_result_sha256 = "aa".repeat(32);
-        assert!(validate_manifest(&manifest, &expected, &"99".repeat(32)).is_err());
+        assert!(validate_manifest(&manifest, &expected).is_err());
     }
-
-    #[test]
-    fn heldout_receipt_requires_exact_frozen_slot_accounting() {
-        let primary = (0..96)
-            .map(|index| serde_json::json!({"candidate_id": format!("p{index:02}")}))
-            .collect::<Vec<_>>();
-        let surplus = (0..20)
-            .map(|index| serde_json::json!({"candidate_id": format!("s{index:02}")}))
-            .collect::<Vec<_>>();
-        let manifest = serde_json::json!({
-            "frozen_clusters": primary,
-            "surplus_clusters": surplus,
-        });
-        let mut clusters = (0..96)
-            .map(
-                |index| serde_json::json!({"cluster_id": format!("p{index:02}"), "status": "pass"}),
-            )
-            .collect::<Vec<_>>();
-        clusters.extend((0..20).map(
-            |index| serde_json::json!({"cluster_id": format!("s{index:02}"), "status": "not_used"}),
-        ));
-        let mut receipt = super::HeldoutReceipt {
-            schema: super::HELDOUT_RECEIPT_SCHEMA.to_owned(),
-            schema_version: 1,
-            outcomes_present: true,
-            one_shot_unblinding: true,
-            cohort_id: "f53-06-outer-nonfresno-v1".to_owned(),
-            generation_id: "f53-06-v1".to_owned(),
-            preregistration_sha256: "11".repeat(32),
-            manifest_sha256: "22".repeat(32),
-            scope_hash: "33".repeat(32),
-            calibrated_scope_match: true,
-            factor_binding: serde_json::json!({}),
-            hashes: BTreeMap::new(),
-            cluster_counts: super::HeldoutClusterCounts {
-                primary: 96,
-                surplus: 20,
-                executed: 96,
-                evaluable: 96,
-            },
-            attrition: super::HeldoutAttrition {
-                attrited_primary_ids: Vec::new(),
-                used_surplus_ids: Vec::new(),
-                unused_surplus_ids: (0..20).map(|index| format!("s{index:02}")).collect(),
-                reasons_by_cluster: BTreeMap::new(),
-            },
-            clusters,
-            run_identity: super::HeldoutRunIdentity {
-                generation_id: "f53-06-v1".to_owned(),
-                preregistration_sha256: "11".repeat(32),
-                manifest_sha256: "22".repeat(32),
-                freeze_receipt_sha256: "44".repeat(32),
-                run_plan_sha256: "55".repeat(32),
-                binary_sha256: "66".repeat(32),
-                implementation_source_hashes: BTreeMap::new(),
-                product_identities_sha256: "88".repeat(32),
-            },
-            run_identity_sha256: "77".repeat(32),
-        };
-        super::validate_heldout_accounting(&receipt, &manifest).unwrap();
-
-        receipt.clusters.swap(0, 1);
-        assert!(super::validate_heldout_accounting(&receipt, &manifest).is_err());
-        receipt.clusters.swap(0, 1);
-        receipt.attrition.used_surplus_ids.push("p00".to_owned());
-        receipt.attrition.unused_surplus_ids.pop();
-        assert!(super::validate_heldout_accounting(&receipt, &manifest).is_err());
-    }
-
-    #[test]
-    fn heldout_raw_observation_metrics_are_recomputed() {
-        let mut observation = serde_json::json!({
-            "insar_slope_difference": 0.0,
-            "gnss_slope_difference": 0.0,
-            "insar_difference_variance": 0.25,
-            "gnss_slope_variance": 0.75,
-            "sensor_cross_covariance": 0.0,
-            "baseline_sigma": {"68": 2.0, "90": 2.0, "95": 2.0},
-        });
-        let levels = super::score_heldout_observation(&observation).unwrap();
-        assert!(levels.values().all(|level| level.covered));
-        assert!(levels.values().all(|level| {
-            (level.width / level.baseline_width - 0.5).abs() <= f64::EPSILON
-                && level.interval_score < level.baseline_interval_score
-        }));
-
-        observation["sensor_cross_covariance"] = serde_json::json!(0.01);
-        assert!(super::score_heldout_observation(&observation).is_err());
-    }
-
     #[test]
     fn output_values_must_match_status_semantics_and_fit_f32() {
         assert!(super::checked_f32(f64::MAX, "overflow contract").is_err());
@@ -5921,7 +6214,7 @@ mod tests {
         block.status[0] = SpatialReferenceCovarianceStatus::Valid;
         block.rank_by_target[0] = 1;
         for date in 1..13 {
-            block.difference_factor[date] = 1.0;
+            block.difference_factor[date * 13] = 1.0;
         }
         let mut observations = (1..13)
             .map(|date| Array2::from_elem((2, 1), date as f32))
@@ -5939,6 +6232,76 @@ mod tests {
     }
 
     #[test]
+    fn adjusted_scalar_product_is_bit_exact_and_never_executes_bootstrap() {
+        let acquisition_count = 13;
+        let maximum_rank = acquisition_count;
+        let realized_rank = acquisition_count - 1;
+        let mut block = masked_block(acquisition_count);
+        block.maximum_rank = u32::try_from(maximum_rank).unwrap();
+        block.rank_by_target = vec![u32::try_from(realized_rank).unwrap(), 0];
+        block.status = vec![
+            SpatialReferenceCovarianceStatus::Valid,
+            SpatialReferenceCovarianceStatus::MaskedTarget,
+        ];
+        block.difference_factor = vec![0.0; 2 * acquisition_count * maximum_rank];
+        for component in 0..realized_rank {
+            block.difference_factor[(component + 1) * maximum_rank + component] = 0.1;
+        }
+        let acquisition_days = (0..acquisition_count)
+            .map(|date| date as f64 * 12.0)
+            .collect::<Vec<_>>();
+        let observations = (1..acquisition_count)
+            .map(|date| {
+                Array2::from_shape_fn((2, 1), |(target, _)| {
+                    let day = acquisition_days[date];
+                    (0.01 * day + 2.0 * (date as f64 * 0.7 + target as f64 * 0.03).sin()) as f32
+                })
+            })
+            .collect::<Vec<_>>();
+        let support = Array2::from_elem((2, 1), 1_u8);
+        let options = dolphin_timeseries::TemporalCovarianceOptions::default();
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                super::evaluate_block(
+                    &block,
+                    &observations,
+                    support.view(),
+                    &acquisition_days,
+                    &options,
+                )
+                .unwrap()
+            });
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                super::evaluate_block(
+                    &block,
+                    &observations,
+                    support.view(),
+                    &acquisition_days,
+                    &options,
+                )
+                .unwrap()
+            });
+
+        for (single_layer, parallel_layer) in single.iter().zip(&parallel) {
+            assert_eq!(single_layer.dim(), parallel_layer.dim());
+            assert!(single_layer
+                .iter()
+                .zip(parallel_layer)
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+        }
+        assert_eq!(single[2][(0, 0)], 0.0);
+        assert_eq!(single[12][(0, 0)], 0.0);
+        assert_eq!(single[13][(0, 0)], 0.0);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
     fn bounded_transaction_abstains_and_promotes_receipt_without_touching_legacy() {
@@ -5949,7 +6312,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir(&directory).unwrap();
-        let days = (0..12).map(|date| date as f64 * 12.0).collect::<Vec<_>>();
+        let days = (0..13).map(|date| date as f64 * 12.0).collect::<Vec<_>>();
         let block = masked_block(days.len());
         let metadata = calibrated_metadata(&days, &block);
         write_spatial_reference_covariance(
@@ -6039,7 +6402,7 @@ mod tests {
                 "total_tiles":1,
                 "linked_tiles":1,
                 "nodata_tiles":0,
-                "bursts":[{"burst_index":0,"acquisition_count":12,"total_tiles":1,"linked_tiles":1,"nodata_tiles":0}],
+                "bursts":[{"burst_index":0,"acquisition_count":13,"total_tiles":1,"linked_tiles":1,"nodata_tiles":0}],
                 "output_pixels":2,
                 "valid_pixels":2,
                 "valid_fraction":1.0
@@ -6232,14 +6595,12 @@ mod tests {
             super::sha256_file(&directory.join("velocity_sigma.tif")).unwrap();
         let promotion = TemporalCovariancePromotion {
             manifest_sha256: "11".repeat(32),
-            review_sha256: "22".repeat(32),
             synthetic_sha256: "33".repeat(32),
-            heldout_sha256: "44".repeat(32),
             spatial_manifest_sha256: "55".repeat(32),
             spatial_factor_sha256: "66".repeat(32),
         };
         let config = TemporalUncertaintyOptions {
-            method: TemporalUncertaintyMethod::CompleteRefitBootstrap,
+            method: TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar,
             evidence_directory: Some(directory.clone()),
             factor_directory: Some(directory.clone()),
             maximum_targets_per_block: 2,
@@ -6552,6 +6913,13 @@ mod tests {
             &std::fs::read(directory.join(super::TEMPORAL_INFERENCE_PROVENANCE_FILENAME)).unwrap(),
         )
         .unwrap();
+        assert_eq!(provenance["schema"], super::PRODUCT_SCHEMA);
+        assert_eq!(
+            provenance["calibration_scope"],
+            "synthetic_validated_scope_match"
+        );
+        assert!(provenance.get("heldout_result_sha256").is_none());
+        assert!(provenance.get("review_receipt_sha256").is_none());
         assert_eq!(
             provenance["fixed_cube_semantics"]["observed_valid_pixels"],
             2
@@ -6591,7 +6959,7 @@ mod tests {
             &std::fs::read(directory.join("fixed_cube_receipt.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(fixed.inference_status, "calibrated_scope_match");
+        assert_eq!(fixed.inference_status, "synthetic_validated_scope_match");
         assert_eq!(
             fixed
                 .semantic_validation
@@ -6619,11 +6987,11 @@ mod tests {
                 stride_y: 1,
                 stride_x: 1,
             },
-            maximum_rank: 1,
+            maximum_rank: u32::try_from(date_count).unwrap(),
             rank_by_target: vec![0, 0],
             status: vec![SpatialReferenceCovarianceStatus::MaskedTarget; 2],
             source_burst_index_by_target: vec![SPATIAL_REFERENCE_SOURCE_BURST_UNAVAILABLE; 2],
-            difference_factor: vec![0.0; 2 * date_count],
+            difference_factor: vec![0.0; 2 * date_count * date_count],
             approximation_error_bound: vec![SPATIAL_REFERENCE_APPROXIMATION_ERROR_UNAVAILABLE; 2],
             effective_looks_fraction: Some(vec![f64::NAN; 2]),
             support_union_count: Some(vec![0; 2]),
@@ -6638,9 +7006,34 @@ mod tests {
         days: &[f64],
         block: &SpatialReferenceCovarianceBlock,
     ) -> SpatialReferenceCovarianceMetadata {
+        let factor_block_high_water_bytes = u64::try_from(
+            block.difference_factor.len() * std::mem::size_of::<f64>()
+                + block.rank_by_target.len() * std::mem::size_of::<u32>()
+                + block.status.len() * std::mem::size_of::<u16>()
+                + block.source_burst_index_by_target.len() * std::mem::size_of::<u32>()
+                + block.approximation_error_bound.len() * std::mem::size_of::<f64>()
+                + block
+                    .effective_looks_fraction
+                    .as_ref()
+                    .map_or(0, |values| values.len() * std::mem::size_of::<f64>())
+                + block
+                    .support_union_count
+                    .as_ref()
+                    .map_or(0, |values| values.len() * std::mem::size_of::<u64>())
+                + block.effective_looks_receipt.as_ref().map_or(0, Vec::len)
+                + block
+                    .resource_high_water_bytes
+                    .as_ref()
+                    .map_or(0, |values| values.len() * std::mem::size_of::<u64>())
+                + block
+                    .condition_number
+                    .as_ref()
+                    .map_or(0, |values| values.len() * std::mem::size_of::<f64>()),
+        )
+        .unwrap();
         let runtime = SpatialReferenceRuntimeResourceReceipt {
             working_set_byte_cap: 32_768,
-            factor_block_high_water_bytes: 8_192,
+            factor_block_high_water_bytes,
             serialization_high_water_bytes: 2_048,
             fixed_l2_workspace_admission_bytes: 2_048,
             fixed_l2_workspace_observed_high_water_bytes: 1_024,
@@ -6655,8 +7048,8 @@ mod tests {
             source_member_window_reads: 1,
             source_tile_cache_loads: 1,
             source_resolutions: 1,
-            working_set_admission_high_water_bytes: 16_384,
-            working_set_observed_high_water_bytes: 12_800,
+            working_set_admission_high_water_bytes: factor_block_high_water_bytes + 8_192,
+            working_set_observed_high_water_bytes: factor_block_high_water_bytes + 4_608,
         };
         let mut metadata = SpatialReferenceCovarianceMetadata {
             schema_version: SPATIAL_REFERENCE_COVARIANCE_SCHEMA_VERSION,

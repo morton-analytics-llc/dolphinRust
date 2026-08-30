@@ -244,10 +244,10 @@ pub(crate) fn promote_fixed_cube_receipt(
     let provenance: serde_json::Value = serde_json::from_slice(&std::fs::read(provenance_source)?)?;
     ensure!(
         provenance.get("schema").and_then(|value| value.as_str())
-            == Some("dolphinrust-temporal-inference-product/1"),
+            == Some("dolphinrust-temporal-inference-product/2"),
         "temporal provenance completion marker has the wrong schema"
     );
-    receipt.inference_status = "calibrated_scope_match".to_owned();
+    receipt.inference_status = "synthetic_validated_scope_match".to_owned();
     receipt.corrected_velocity_raster = Some("velocity_temporal_gls.tif".to_owned());
     receipt.corrected_sigma_raster = Some("velocity_sigma_corrected.tif".to_owned());
     receipt.corrected_velocity_sha256 = Some(corrected_velocity_sha256);

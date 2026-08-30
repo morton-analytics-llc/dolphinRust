@@ -351,7 +351,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     conditional!(
         "timeseries_options.temporal_uncertainty",
         "CFG-TEMPORAL-UNCERTAINTY",
-        "timeseries_options.temporal_uncertainty.method is complete_refit_bootstrap"
+        "timeseries_options.temporal_uncertainty.method is reml_covariance_parameter_adjusted_scalar"
     ),
     compatibility_only!(
         "timeseries_options.correct_velocity_temporal_correlation",
@@ -812,8 +812,8 @@ pub struct TimeseriesOptions {
     /// temporal-fit diagnostics from the final corrected, spatially referenced
     /// displacement series. This is not total or field-calibrated uncertainty.
     pub write_velocity_uncertainty: bool,
-    /// Calibrated temporal-covariance inference. Disabled by default and
-    /// fail-closed unless every immutable #54/#53 evidence artifact matches.
+    /// Synthetic-validated temporal-covariance inference. Disabled by default
+    /// and fail-closed unless every immutable #54/#53 evidence artifact matches.
     pub temporal_uncertainty: TemporalUncertaintyOptions,
     /// Deprecated YAML compatibility field. A scalar effective-sample-size
     /// multiplier is not a valid slope-variance correction for an irregular,
@@ -875,19 +875,25 @@ pub enum TemporalUncertaintyMethod {
     /// Preserve the legacy velocity products and emit no corrected inference.
     #[default]
     Disabled,
-    /// Frozen issue #53 complete-refit bootstrap temporal GLS estimator.
-    CompleteRefitBootstrap,
+    /// Issue #53 REML covariance-parameter-adjusted scalar estimator.
+    RemlCovarianceParameterAdjustedScalar,
 }
 
-/// Fail-closed paths and memory bounds for calibrated temporal inference.
+/// Allocation cap for one persisted temporal factor block, matching the #54 producer cap.
+pub const TEMPORAL_FACTOR_BLOCK_READ_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+/// Producer payload budget reserved below the read cap for bounded HDF5 metadata.
+pub const TEMPORAL_FACTOR_BLOCK_METADATA_RESERVATION_BYTES: u64 = 1024 * 1024;
+
+/// Fail-closed paths and memory bounds for synthetic-validated temporal inference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TemporalUncertaintyOptions {
     /// Selected corrected-inference method.
     pub method: TemporalUncertaintyMethod,
-    /// Directory containing the immutable #53 result/review/promotion bundle.
+    /// Directory containing the immutable #53 synthetic result, observed
+    /// release-resource receipt, release binaries, and promotion manifest.
     pub evidence_directory: Option<PathBuf>,
-    /// Directory containing the calibrated #54 factor and manifest.
+    /// Directory containing the calibrated and independently reviewed #54 factor and manifest.
     pub factor_directory: Option<PathBuf>,
     /// Maximum target pixels admitted from one persisted factor block.
     pub maximum_targets_per_block: usize,
@@ -905,7 +911,7 @@ impl Default for TemporalUncertaintyOptions {
             factor_directory: None,
             maximum_targets_per_block: 65_536,
             block_id_read_cap_bytes: 4 * 1024 * 1024,
-            factor_block_read_cap_bytes: 256 * 1024 * 1024,
+            factor_block_read_cap_bytes: TEMPORAL_FACTOR_BLOCK_READ_CAP_BYTES,
         }
     }
 }
@@ -1443,34 +1449,34 @@ impl DisplacementWorkflow {
             ));
         }
         if self.timeseries_options.temporal_uncertainty.method
-            == TemporalUncertaintyMethod::CompleteRefitBootstrap
+            == TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
         {
             let temporal = &self.timeseries_options.temporal_uncertainty;
             if temporal.evidence_directory.is_none() {
                 return Err(CoreError::InvalidConfig(
-                    "timeseries_options.temporal_uncertainty.evidence_directory is required for complete_refit_bootstrap".into(),
+                    "timeseries_options.temporal_uncertainty.evidence_directory is required for reml_covariance_parameter_adjusted_scalar".into(),
                 ));
             }
             if temporal.factor_directory.is_none() {
                 return Err(CoreError::InvalidConfig(
-                    "timeseries_options.temporal_uncertainty.factor_directory is required for complete_refit_bootstrap".into(),
+                    "timeseries_options.temporal_uncertainty.factor_directory is required for reml_covariance_parameter_adjusted_scalar".into(),
                 ));
             }
             if self.timeseries_options.method != TimeseriesMethod::L2 {
                 return Err(CoreError::InvalidConfig(
-                    "complete_refit_bootstrap temporal uncertainty requires timeseries_options.method: l2".into(),
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty requires timeseries_options.method: l2".into(),
                 ));
             }
             if !self.phase_linking.write_covariance_operator {
                 return Err(CoreError::InvalidConfig(
-                    "complete_refit_bootstrap temporal uncertainty requires phase_linking.write_covariance_operator".into(),
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty requires phase_linking.write_covariance_operator".into(),
                 ));
             }
             if self.timeseries_options.velocity_seasonal
                 || !self.timeseries_options.velocity_step_dates.is_empty()
             {
                 return Err(CoreError::InvalidConfig(
-                    "complete_refit_bootstrap temporal uncertainty supports only the frozen linear temporal model".into(),
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty supports only the frozen linear temporal model".into(),
                 ));
             }
             if temporal.maximum_targets_per_block == 0

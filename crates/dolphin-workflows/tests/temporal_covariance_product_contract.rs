@@ -16,7 +16,7 @@ fn corrected_temporal_uncertainty_is_disabled_and_fail_closed_by_default() {
 
     let mut enabled = cfg;
     enabled.timeseries_options.temporal_uncertainty.method =
-        TemporalUncertaintyMethod::CompleteRefitBootstrap;
+        TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar;
     let error = enabled
         .validate_supported_options()
         .unwrap_err()

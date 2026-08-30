@@ -97,10 +97,16 @@ pub use spatial_covariance_artifact::{
     SPATIAL_REFERENCE_COVARIANCE_FILENAME, SPATIAL_REFERENCE_COVARIANCE_MANIFEST_FILENAME,
 };
 pub use temporal_covariance_product::{
+    run_temporal_scalar_candidate_resource_probe, temporal_inference_resource_receipt,
     validate_temporal_covariance_promotion, write_temporal_covariance_products,
-    TemporalCovarianceProductReceipt, TemporalCovariancePromotion,
-    TEMPORAL_HELDOUT_RESULT_FILENAME, TEMPORAL_INFERENCE_PROVENANCE_FILENAME,
-    TEMPORAL_PROMOTION_MANIFEST_FILENAME, TEMPORAL_REVIEW_RECEIPT_FILENAME,
-    TEMPORAL_SYNTHETIC_RESULT_FILENAME,
+    TemporalCovarianceProductReceipt, TemporalCovariancePromotion, TemporalInferenceBinaryIdentity,
+    TemporalInferenceHostIdentity, TemporalInferenceResourceMeasurement,
+    TemporalInferenceResourceReceipt, TemporalInferenceScalarMeasurement,
+    TEMPORAL_BATCH_BINARY_FILENAME, TEMPORAL_CANDIDATE_RESOURCE_RECEIPT_FILENAME,
+    TEMPORAL_DIRECT_FACTOR_RECEIPT_FILENAME, TEMPORAL_INFERENCE_BENCH_BINARY_FILENAME,
+    TEMPORAL_INFERENCE_PROVENANCE_FILENAME, TEMPORAL_METHOD_SELECTION_FILENAME,
+    TEMPORAL_PROMOTION_MANIFEST_FILENAME, TEMPORAL_RESOURCE_RECEIPT_FILENAME,
+    TEMPORAL_RESOURCE_RSS_LIMIT_BYTES, TEMPORAL_RESOURCE_TILE_COLUMNS, TEMPORAL_RESOURCE_TILE_ROWS,
+    TEMPORAL_RESOURCE_WALL_MULTIPLIER, TEMPORAL_SYNTHETIC_RESULT_FILENAME,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};

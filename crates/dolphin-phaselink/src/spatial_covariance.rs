@@ -16,7 +16,7 @@ use crate::covariance::{
     rect_pixel_source_coherence_jvp, replay_rect_pixel_covariance, CovarianceReplayError,
     NativeSourcePixel,
 };
-use crate::estimator::{phase_angle_jvp, EstimatorJvpError, FixedEstimatorBranch};
+use crate::estimator::{EstimatorJvpError, FixedEstimatorBranch, PhaseAngleLinearization};
 use crate::source_influence::{ProperComplexFactor, SourceModelError};
 
 /// Stable identity for the local reference-specific influence kernel.
@@ -322,6 +322,12 @@ fn factor_for_output(
     let offsets = source_factor_offsets(source_factors, source_pixels, nslc)?;
     let total_columns = *offsets.last().ok_or(SpatialInfluenceError::EmptySupport)?;
     let mut factor = Array2::zeros((nslc, total_columns));
+    let linearization = PhaseAngleLinearization::prepare(
+        replay.coherence.view(),
+        branch,
+        reference_idx,
+        branch_tolerance,
+    )?;
     for (source_index, &source) in source_pixels.iter().enumerate() {
         if !replay.source_pixels.contains(&source) {
             continue;
@@ -340,13 +346,7 @@ fn factor_for_output(
                 real_direction.view(),
                 branch_tolerance,
             )?;
-            let real_phase = phase_angle_jvp(
-                replay.coherence.view(),
-                real_delta.view(),
-                branch,
-                reference_idx,
-                branch_tolerance,
-            )?;
+            let real_phase = linearization.apply(real_delta.view())?;
             raw_jacobian.column_mut(component).assign(&real_phase);
 
             let imaginary_direction =
@@ -358,13 +358,7 @@ fn factor_for_output(
                 imaginary_direction.view(),
                 branch_tolerance,
             )?;
-            let imaginary_phase = phase_angle_jvp(
-                replay.coherence.view(),
-                imaginary_delta.view(),
-                branch,
-                reference_idx,
-                branch_tolerance,
-            )?;
+            let imaginary_phase = linearization.apply(imaginary_delta.view())?;
             raw_jacobian
                 .column_mut(nslc + component)
                 .assign(&imaginary_phase);

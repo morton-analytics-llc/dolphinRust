@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the exact frozen #53 held-out cohort once."""
+"""Execute the frozen GNSS cohort once for EO field acceptance."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def implementation_hashes(preregistration: Mapping[str, Any], manifest: Mapping[
         **{name: canonical_digest(value) for name, value in scope_values.items()},
     }
     if set(values) != set(preregistration["receipt_hash_fields"]):
-        raise ValueError("held-out implementation hashes differ from preregistration")
+        raise ValueError("EO field-acceptance hashes differ from preregistration")
     return values
 
 
@@ -113,7 +113,7 @@ def implementation_source_hashes() -> dict[str, str]:
         "gps_ground_truth_sha256": ROOT / "gps_ground_truth.py",
     }
     if set(paths) != IMPLEMENTATION_SOURCE_HASH_FIELDS:
-        raise ValueError("held-out implementation source identity fields differ")
+        raise ValueError("EO field-acceptance source identity fields differ")
     return {name: sha256_file(path) for name, path in paths.items()}
 
 
@@ -210,7 +210,7 @@ def main() -> int:
         ),
     }
     if set(identity) != RUN_IDENTITY_FIELDS:
-        raise ValueError("held-out run identity differs from the promotion contract")
+        raise ValueError("EO field-acceptance run identity differs from the acceptance contract")
     ledger = CohortRunLedger.acquire(ledger_path, identity)
     product_identities = {
         cluster_id: product_identity_sha256(root, preregistration)
@@ -234,7 +234,7 @@ def main() -> int:
             product_roots[cluster_id], preregistration
         )
         if product_identity != product_identities[cluster_id]:
-            raise ValueError("held-out product changed after run identity was frozen")
+            raise ValueError("EO field-acceptance product changed after run identity was frozen")
         if path.exists():
             value = read_json(path)
             if value.get("cluster_id") != cluster_id or value.get("manifest_sha256") != identity["manifest_sha256"] or value.get("preregistration_sha256") != identity["preregistration_sha256"] or value.get("freeze_receipt_sha256") != identity["freeze_receipt_sha256"] or value.get("run_identity_sha256") != canonical_digest(identity) or value.get("product_identity_sha256") != product_identity:
@@ -250,7 +250,7 @@ def main() -> int:
             ngl_session=requests.Session(),
         )
         if product_identity_sha256(product_roots[cluster_id], preregistration) != product_identity:
-            raise ValueError("held-out product changed during cluster execution")
+            raise ValueError("EO field-acceptance product changed during cluster execution")
         write_one_shot(path, value)
         return value
 
@@ -277,7 +277,7 @@ def main() -> int:
     )
     ledger.complete(sha256_file(receipt_path))
     ledger.close()
-    print(json.dumps({"status": "receipt_complete", "receipt": str(receipt_path), "executed_clusters": len(fragments)}, sort_keys=True))
+    print(json.dumps({"status": "eo_field_acceptance_receipt_complete", "receipt": str(receipt_path), "executed_clusters": len(fragments)}, sort_keys=True))
     return 0
 
 

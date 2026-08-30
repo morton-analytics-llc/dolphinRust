@@ -1,5 +1,12 @@
 # Plan: land #54 and #53, then serve the GNSS demo locally
 
+> **Superseded #53 boundary (2026-08-28):** T53-5 held-out field validation
+> and T53-6 independent temporal review are EO-owned downstream gates.
+> dolphinRust closes #53 on the frozen synthetic, resource, and identity
+> receipts. EO also owns GroundPulse enablement and publication. The #54
+> independent spatial-review gate is unchanged; the original same-day tasks
+> below are retained for history.
+
 **Date:** 2026-08-24
 
 **Status:** plan complete. Implementation, GitHub mutation, merge, release, external-data acquisition,

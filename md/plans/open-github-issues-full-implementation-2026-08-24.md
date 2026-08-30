@@ -13,6 +13,11 @@ time-boxed and deferred execution plans for these issues. It does not stop at co
 research harnesses, or unmerged branches: every workstream ends on green `main` with its issue
 closed.
 
+**Scope decision (2026-08-28):** #53 closes on its frozen synthetic, resource,
+and identity gates. EO owns held-out GNSS validation, independent scientific
+review of temporal field evidence, GroundPulse enablement, and publication.
+The #54 independent spatial-review gate remains unchanged.
+
 ## Objective
 
 Deliver the complete scientific and producer behavior described by all three open issues:
@@ -20,13 +25,15 @@ Deliver the complete scientific and producer behavior described by all three ope
 1. expose sourced POEORB/RESORB ephemeris provenance (#57);
 2. compute and persist bounded, reference-specific spatial covariance from shared phase-link
    influence through the actual L2 displacement path (#54); and
-3. fit, validate, and emit calibrated irregular-cadence temporal slope inference using #54's
-   difference factor, including parameter uncertainty and an untouched field cohort (#53).
+3. fit and emit an irregular-cadence temporal slope candidate using #54's difference factor,
+   including parameter uncertainty and frozen synthetic, resource, and identity evidence (#53).
 
 The completed tree must emit a reproducible fixed-cube velocity product, sourced LOS geometry,
-reference-specific displacement covariance, and separately named corrected slope/standard-error
-products with machine-verifiable provenance. EO code, serving, Fresno anchoring, datum offsets,
-deployment, and submodule pinning are not part of this repository.
+reference-specific displacement covariance, and separately named temporal-candidate
+slope/standard-error products with machine-verifiable provenance. This repository ends at those
+candidate artifacts and their receipts. EO owns held-out GNSS validation, independent temporal
+scientific review, EO code, GroundPulse enablement, serving, Fresno anchoring, datum offsets,
+deployment, publication, and submodule pinning.
 
 ## Current state
 
@@ -40,10 +47,10 @@ deployment, and submodule pinning are not part of this repository.
   the test repeats one pixel-level fixture and measures no raster approximation error.
 - PR #60 merged a 32-cell temporal harness with OLS/oracle-GLS point estimates and an explicit
   blocked status. It has no cadence-irregularity dimension, covariance-parameter fit, bootstrap,
-  interval coverage, corrected product, or held-out field evidence.
+  interval coverage, temporal-candidate product, or complete synthetic/resource receipt.
 - Legacy `velocity_sigma.tif` remains an IID-conditional component and legacy displacement
   variance remains an independent-marginal approximation. Their non-inferential labels stay in
-  place until the new products are independently eligible.
+  place; the new synthetic-validated candidate products are separate artifacts.
 - #57's data uncertainty is resolved. `oracle/fixtures/geomprov_ci_cslc.h5` contains scalar
   `/metadata/orbit/orbit_type = POEORB`; its HDF5 description defines POEORB as precise and RESORB
   as restituted. The current reader simply does not expose it.
@@ -101,10 +108,10 @@ R[i,j] = rho_12^(abs(t_i - t_j) / 12 days)      otherwise
 Missing dates subset `C54_delta`, `D`, and the design without imputation. Fit `sigma^2` and
 `rho_12` with constrained REML/profile likelihood. Compare conditional OLS/WLS, oracle GLS,
 plug-in GLS, Kenward-Roger-style adjusted scalar inference, profile inference, and complete-refit
-parametric bootstrap on the same origin-anchored design. The selected production method must emit
+parametric bootstrap on the same origin-anchored design. The selected candidate method must emit
 one paired slope and scalar standard error whose symmetric 68/90/95 percent intervals pass the
-frozen synthetic and outer-cohort criteria; otherwise the corrected product is absent for that
-pixel with a stable status.
+frozen synthetic criteria; otherwise the temporal-candidate product is absent for that pixel with
+a stable status.
 
 Emit new products only:
 
@@ -114,6 +121,8 @@ Emit new products only:
 - `velocity_inference_provenance.json`.
 
 Do not relabel or overwrite legacy `velocity.tif` or `velocity_sigma.tif`.
+The new products remain synthetic-validated candidates until EO passes held-out GNSS and
+independent temporal-review gates and separately authorizes GroundPulse use.
 
 ## Technical requirements
 
@@ -155,7 +164,7 @@ Do not relabel or overwrite legacy `velocity.tif` or `velocity_sigma.tif`.
 - The production scope becomes `calibrated_scope_match` only when its immutable #54 analytic,
   approximation, resource, and review receipt hashes match the code and inputs.
 
-### R53 — calibrated temporal inference
+### R53 — synthetic-validated temporal candidate
 
 - Require a calibrated same-scope #54 difference factor. Marginal CRLB, two-marginal addition,
   zero-cross metadata, or a bare #52 factor are rejected.
@@ -169,16 +178,18 @@ Do not relabel or overwrite legacy `velocity.tif` or `velocity_sigma.tif`.
 - The frozen synthetic matrix includes 12/24/48/96 valid dates; regular, alternating, jittered,
   and gapped cadence; none/MCAR/block missingness; variance ratios 1/4/16; reference contribution;
   #54 overlap/distance/sequential-depth/approximation strata; supported, boundary, weak-ID, and
-  invalid cells; at least 5,000 attempted seeds per supported cell; and end-to-end raw-look cells.
+  invalid cells; 1,050 seeds for each of 24 supported cells on both execution paths (50,400 frozen
+  attempts); and end-to-end raw-look cells.
 - Frozen per-cell criteria are standardized slope bias <= 0.05 empirical SD; absolute coverage
   error <= 0.03/0.02/0.015 at 68/90/95 percent; >= 99 percent supported-cell emission; improved
   proper interval score over conditional and plug-in baselines; and no width-only inflation pass.
-- The outer cohort is new, non-Fresno, and disjoint from exposed MMX1/five-burst data by
-  burst/orbit/footprint/site/station. Freeze cohort, binary, estimator, scorer, attrition, and
-  hashes before unblinding outcomes. Use direct same-frame #54 station-pair covariance and GNSS
-  slope covariance; no raster-sigma RSS substitute.
-- Emit corrected products only when the exact #52/#54/#53 receipts and calibrated scope match.
-  Unsupported pixels remain conditional-only with stable machine-readable reasons.
+- Close #53 only when the complete frozen synthetic matrix and resource limits pass and the exact
+  preregistration, producer source set, binary, #52 replay, and reviewed #54 spatial-factor
+  identities match.
+- Emit temporal-candidate products only when those synthetic, resource, and identity receipts
+  match. Unsupported pixels remain conditional-only with stable machine-readable reasons.
+- Do not acquire or score held-out GNSS in this plan. EO owns the non-Fresno cohort, independent
+  temporal scientific review, GroundPulse enablement, and publication after #53 closes.
 
 ## Constraints and guardrails
 
@@ -201,8 +212,9 @@ Do not relabel or overwrite legacy `velocity.tif` or `velocity_sigma.tif`.
   sequentially.
 - #57 may run in parallel with early #54 kernel work because their write scopes do not overlap.
   #53 production integration starts only after the #54 public factor/schema is merged.
-- A reviewer agent/person must not author the code or validation artifacts it reviews. Review
-  findings are fixed and rerun before merge; review is a deliverable, not a reason to defer work.
+- The #54 reviewer must not author the code or validation artifacts under review. Its findings are
+  fixed and rerun before merge; the #54 spatial-review contract is unchanged. Temporal field review
+  is an EO gate after #53 closure.
 - Merge each PR only after exact-head CI passes. After every merge, run combined-tree CI before
   starting the next dependent branch. Final completion requires all three issues closed on green
   `main`.
@@ -250,8 +262,8 @@ Do not relabel or overwrite legacy `velocity.tif` or `velocity_sigma.tif`.
 | C53-06 | Invalid #54/scope/gauge/grid/unit/model inputs | No corrected sigma and one stable reason; no marginal fallback. | timeseries/workflow contracts |
 | C53-07 | Frozen synthetic matrix | Every cell/method reports attempted/emitted/failed counts, coverage, bias, scores, widths, timing, RSS, and identities. | Rust batches plus Python scorer/schema test |
 | C53-08 | End-to-end raw-look cells | The same realization produces #52/#54 and slope inference; fixed-factor success cannot hide production-path error. | workflow batch contract |
-| C53-09 | Untouched station-pair cohort | Same-frame InSAR/GNSS slope-difference coverage and interval scores satisfy the frozen cohort test. | cohort/scorer contracts |
-| C53-10 | Corrected output authorization | Only scope-matched successful receipts emit paired corrected slope/SE; legacy products remain unchanged. | workflow output contract |
+| C53-09 | Untouched station-pair cohort | **Deferred to EO.** EO scores identity-matched same-frame InSAR/GNSS slope differences after #53 closes. The dolphinRust closure proof excludes this field result. | EO intake/plan |
+| C53-10 | Temporal-candidate output authorization | Only scope-matched successful synthetic/resource/identity receipts emit paired candidate slope/SE; legacy products remain unchanged. | workflow output contract |
 | C53-11 | Provenance/status persistence | Rasters and sidecar preserve all estimator, date, reference, covariance, calibration, and receipt identities. | workflow provenance contract |
 | C53-12 | 256x256 at 12/48/96 dates | Peak RSS < 24 GiB, <= 2x conditional-fit wall time, no whole-frame covariance, projected 3.9M pixels <= 60 minutes. | release benchmark |
 | C53-13 | Full regression | Workspace Rust/Python tests remain green and pass/fail/not-evaluable remain distinct. | CI `verify` job |
@@ -407,8 +419,8 @@ disabled until #53 lands.
 **Requirements:** GH-053-01 through GH-053-04.
 
 **Files:** `md/design/temporal-covariance-slope-inference.md`,
-`validation/temporal_covariance_preregistration.json`, new Rust/Python analytic contracts and
-fixtures.
+`validation/temporal_covariance_synthetic_engine_preregistration.json`, new Rust/Python analytic
+contracts and fixtures.
 
 Replace PR #60's reduced 32-cell grid with the complete model, cell matrix, seed hierarchy,
 supported cadence, parameter bounds, status registry, bias/coverage/score/width criteria, resource
@@ -455,23 +467,20 @@ receipt under `validation/results/temporal_covariance/`. Preserve all failed att
 implementation and rerun the unchanged preregistration until every supported cell passes bias,
 coverage, emission, proper-score, width, and resource criteria. Turn C53-07/C53-08 green.
 
-### F53-06 — acquire and pass the untouched outer cohort
+### F53-06 — hand the held-out contract to EO
 
 **Requirements:** GH-053-05.
 
-**Files:** immutable cohort manifest, extensions to validation acquisition/projection tooling, new
-held-out slope scorer/tests, hashed receipts under the cohort result directory.
+**Disposition:** deferred to [EO #505](https://github.com/morton-analytics-llc/eo/issues/505).
+dolphinRust retains reusable field-validation tooling for EO but does not acquire, unblind, or
+score the cohort. EO runs the identity-matched field gate after #53 closes.
 
-Use metadata-only discovery to create a non-Fresno candidate pool disjoint from all exposed
-development data. Freeze station pairs, burst/orbit/footprint/site clusters, dates, crops,
-pre-outcome evaluability rules, surplus/attrition rules, exact cluster test, power, binary/scorer
-hashes, GNSS solution provenance, and #54 configuration before unblinding. Run the one-shot cohort,
-combine direct #54 InSAR station-pair slope covariance with independently projected GNSS slope
-covariance, and score coverage, proper interval score, and width at 68/90/95 percent. Fix only
-predeclared implementation defects; outcome-informed method/scorer changes invalidate and replace
-the cohort. Turn C53-09 green.
+EO re-enters after #53 closes with matching synthetic, resource, preregistration, producer, #52,
+and reviewed #54 identities. EO freezes the non-Fresno cohort, outcome-blinding, attrition, scorer,
+and GNSS provenance before unblinding, then records pass, fail, or non-evaluable. C53-09 remains a
+downstream EO gate. F53-07 through F53-09 proceed independently of that result.
 
-### F53-07 — wire corrected products
+### F53-07 — wire temporal-candidate products
 
 **Requirements:** GH-053-06 and GH-053-07.
 
@@ -479,26 +488,31 @@ the cohort. Turn C53-09 green.
 `crates/dolphin-workflows/src/displacement.rs`, temporal provenance/output modules, benchmarks,
 docs/changelog.
 
-Add the explicit uncertainty-method enum and verify matching #52/#54/#53 receipt identities before
-allocation. Assemble total `V(theta)`, emit `velocity_temporal_gls.tif`,
+Add the explicit uncertainty-method enum and verify matching synthetic, resource, #52/#54/#53
+receipt identities before allocation. Assemble total `V(theta)`, emit `velocity_temporal_gls.tif`,
 `velocity_sigma_corrected.tif`, diagnostics/status rasters, and the sidecar. Preserve legacy
-products unchanged and never fall back. Run the 12/48/96-date benchmark and turn C53-10 through
-C53-12 green.
+products unchanged, label the new pair as a synthetic-validated candidate, and never fall back.
+Run the 12/48/96-date benchmark and turn C53-10 through C53-12 green. This task does not enable
+GroundPulse.
 
-### F53-08 — independent review and promotion receipt
+### F53-08 — bind the immutable #53 synthetic promotion manifest
 
-Assign a reviewer with no #53 implementation or cohort ownership. Review the model,
-preregistration, source, parity, complete synthetic matrix, untouched field result, #52/#54
-manifests, resource receipt, output semantics, and every failure. Resolve findings and rerun the
-unchanged contracts. Persist a promotion manifest binding every artifact and review hash. Prove
-missing, failed, stale, or scope-mismatched evidence leaves output `conditional_only`.
+Persist `temporal_covariance_promotion_manifest.json` schema
+`dolphinrust-temporal-covariance-promotion/2`, binding the frozen preregistration, producer source
+set and binary, complete synthetic result, resource receipt, #52 replay identity, reviewed #54
+spatial-factor identity, output semantics, and every failed attempt. Prove missing, failed, stale,
+or scope-mismatched evidence leaves output `conditional_only`. The manifest must identify the scope
+as `synthetic_validated_scope_match`; field-calibrated and GroundPulse-enabled scopes are invalid.
+Independent temporal scientific review is deferred to EO under GH-053-08.
 
 ### F53-09 — merge and close #53
 
-Merge research, validation, product, and promotion PRs sequentially on green exact-head CI. Run
-combined-tree CI on the final merge. Execute one fixed-cube local smoke run and verify the exact
-common dates, sourced LOS, mask/reference identity, reference-specific #54 factor, corrected paired
-products, diagnostics, and matching manifests. Close #53.
+Merge research, synthetic validation, product, and completion-receipt PRs sequentially on green
+exact-head CI. Run combined-tree CI on the final merge. Execute one fixed-cube local smoke run and
+verify the exact common dates, sourced LOS, mask/reference identity, reference-specific #54 factor,
+temporal-candidate paired products, diagnostics, and matching manifests. Close #53 once the frozen
+synthetic, resource, and identity gates pass. Record held-out GNSS, independent temporal review,
+GroundPulse enablement, and publication as EO-owned downstream gates.
 
 ### P99 — final repository reconciliation
 
@@ -509,8 +523,9 @@ Refresh GitHub and assert:
 - `origin/main` contains every merge;
 - push CI for final `main` is green;
 - the root worktree and user-owned worktrees were not reset or cleaned;
-- the final validation receipts match the merged code identity; and
-- no release, EO pin, deployment, serving mutation, or Fresno anchor was claimed.
+- the final synthetic/resource receipts match the merged code identity; and
+- no held-out GNSS result, temporal independent review, release, publication, EO pin, GroundPulse
+  enablement, deployment, serving mutation, or Fresno anchor was claimed.
 
 ## Validation commands
 
@@ -534,14 +549,11 @@ cargo run --release -p dolphin-workflows --example temporal_covariance_e2e_batch
 cargo run --release -p dolphin-workflows --example temporal_inference_bench
 oracle/.venv/bin/python -m unittest discover -s validation/tests
 oracle/.venv/bin/python validation/temporal_covariance_simulation.py \
-  --prereg validation/temporal_covariance_preregistration.json \
-  --rust-batch target/release/examples/temporal_covariance_batch \
-  --rust-e2e-batch target/release/examples/temporal_covariance_e2e_batch \
+  --prereg validation/temporal_covariance_synthetic_engine_preregistration.json \
+  --run-root validation/results/temporal_covariance/run \
+  --resource-evidence-directory validation/results/temporal_covariance \
+  --seeds 1050 \
   --output validation/results/temporal_covariance/coverage.json
-oracle/.venv/bin/python validation/score_temporal_covariance_holdout.py \
-  --cohort validation/temporal_covariance_holdout.json \
-  --results-root validation/results/temporal_covariance
-
 cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -565,17 +577,17 @@ plan/intake
   -> #54 validation/review/promotion
   -> #54 closure
   -> #53 estimator/research
-  -> #53 synthetic + outer-cohort validation
-  -> #53 product/review/promotion
+  -> #53 synthetic/resource validation
+  -> #53 temporal-candidate product + identity receipt
   -> #53 closure
   -> final combined-tree reconciliation
+  -> downstream EO held-out GNSS + independent temporal review + GroundPulse decision
 ```
 
 ## Open questions
 
-None. The load-bearing execution assumption is that a new non-Fresno station-pair cohort may be
-acquired solely as dolphinRust scientific-validation evidence. It does not become EO station
-selection, a datum anchor, serving state, or product configuration.
+None. The 2026-08-28 decision assigns held-out GNSS, independent temporal scientific review,
+GroundPulse enablement, and publication to EO after #53 closes.
 
 ## Coding-agent prompt
 
@@ -586,13 +598,14 @@ Complete and merge every task through #57, #54, and #53 closure. Start every sci
 with the named red contract. Preserve the exact gauge, fixed-cube dates/masks/reference, sourced
 LOS geometry, and legacy conditional-output labels. Do not add placeholders or independent-
 marginal inference fallbacks. Run the full frozen #54 approximation/resource matrix and #53
-synthetic/outer-cohort validation; failed cells remain visible and trigger implementation fixes,
-not tolerance changes or deferral.
+synthetic/resource/identity validation; failed cells remain visible and trigger implementation
+fixes. Tolerance changes and deferral are prohibited.
 
 Use clean isolated worktrees and non-overlapping agent file ownership. Merge PRs sequentially only
 after exact-head CI, then require combined-tree CI. Finish with zero open dolphinRust issues and no
-open implementation PRs. Do not release, pin or modify EO, deploy, mutate serving state, or perform
-a Fresno datum anchor.
+open implementation PRs. Do not acquire or score held-out GNSS, perform temporal independent
+scientific review, enable GroundPulse, publish, release, pin or modify EO, deploy, mutate serving
+state, or perform a Fresno datum anchor.
 ```
 
 ## Coverage audit
@@ -606,9 +619,10 @@ a Fresno datum anchor.
 | GH-054-07 | F54-08 and F54-09 |
 | GH-053-01, GH-053-02 | F53-01 through F53-03 |
 | GH-053-03, GH-053-04 | F53-01, F53-02, F53-04, and F53-05 |
-| GH-053-05 | F53-06 |
+| GH-053-05 | Deferred to [EO #505](https://github.com/morton-analytics-llc/eo/issues/505); re-enters after F53-09 with matching synthetic/resource/identity receipts |
 | GH-053-06 | F53-03 and F53-07 |
 | GH-053-07 | F53-07 through F53-09 |
+| GH-053-08 | Deferred to [EO #505](https://github.com/morton-analytics-llc/eo/issues/505); re-enters after the held-out GNSS result is complete and identity-matched |
 
-Every intake ID is scheduled. Nothing is deferred or out of scope except EO-specific product and
-operational work, which is not a dolphinRust GitHub issue.
+Every intake ID has an explicit disposition. GH-053-05 and GH-053-08 are deferred to EO; all other
+IDs are scheduled. #54's spatial review remains F54-08 and is unchanged.
