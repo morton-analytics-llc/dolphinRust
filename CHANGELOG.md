@@ -6,6 +6,8 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+## [v1.6.0] — 2026-08-30
+
 ### Breaking changes
 - **Velocity uncertainty is now an uncalibrated IID-conditional component.**
   `write_velocity_uncertainty` fits the finite post-gauge dates from the final corrected,
@@ -79,8 +81,23 @@ All notable changes to dolphinRust are documented here. The format follows
   path. The emitted CRLB is labeled as a changing-reference ministack diagnostic. Displacement
   variance is labeled as a parameter-covariance diagonal under an independent-IFG error model,
   which is uncalibrated because the interferograms share acquisitions. Full stitched-reference,
-  corrected temporal, and spatial-reference covariance remain tracked in #52, #53, and #54
-  rather than being inferred from the current products.
+  corrected temporal, and spatial-reference covariance are not inferred from the current
+  products. #52 and #54 landed in this release; #53 was closed as not planned, leaving the
+  conditional-sigma boundary in place.
+
+- **`ComparatorDiagnostics` reports the inner failure behind an adjusted-variance fallback**
+  (issue #95). The optional `source_status` field preserves the exact inner error under the
+  public `WeakParameterIdentification` status instead of erasing it; the field is omitted from
+  successful comparator JSON, so existing consumers are unaffected.
+- **Frozen-attempt spatial covariance validation is reproducible again** (issue #94).
+  Per-attempt frozen DGP streams, the fixed-L2 `1e8` phase/date condition policy, and the
+  `ill_conditioned` / `nondifferentiable_node` statuses were restored while keeping the
+  prepared estimator/JVP cache and bounded parallel replay.
+- **The temporal synthetic scorer can certify a candidate** (issue #96). `coverage_bias_interval_score/7`
+  adds `oracle_calibration`, `candidate_evaluation`, and `forensic_v5` modes with familywise
+  bias calibration, disjoint seed domains enforced as an interval-overlap check, and a
+  hash-bound calibration receipt. `forensic_v5` cannot reach a passing verdict, so the frozen
+  v5 no-go cannot be certified retroactively.
 
 ## [v1.5.0] — 2026-08-17
 
@@ -722,6 +739,7 @@ physically-meaningful tolerances.
 - CRLB / closure-phase rasters, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform,
   `EagerLoader` prefetch, and tophu/spurt/whirlwind unwrappers are deferred (see STATUS.md).
 
-[Unreleased]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.6.0...HEAD
+[v1.6.0]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.5.0...v1.6.0
 [v1.5.0]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.4.0...v1.5.0
 [1.0.0]: https://github.com/morton-analytics-llc/dolphinRust/releases/tag/v1.0.0
