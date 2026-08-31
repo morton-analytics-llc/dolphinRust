@@ -24,43 +24,40 @@ Entry format:
 
 ### D2 — External-TEC-free (split-spectrum) ionospheric correction
 - **Source**: competitive + ecosystem (MintPy split-spectrum; Earth Planets and Space 2025 practical-recipe paper)
-- **Issue**: #23 (enhancement-labeled, NOT yet backlog-ready)
+- **Issue**: #23 (closed 2026-08-10, gate checked and NOT met — closed as "deferred with
+  the gate unchanged" rather than left open; this ledger entry is the live record)
 - **Re-entry gate**: a real scene is found where IONEX/GNSS TEC coverage is missing or
   demonstrably insufficient, OR the real multi-date NISAR validation work (ROADMAP.md's
   "NISAR calibrated-data timing" external gate) surfaces an ionospheric residual large
-  enough to justify a second correction path.
+  enough to justify a second correction path. Still unmet as of 2026-08-31 — no NISAR
+  validation run and no real-data IONEX shortfall reported since #23 was closed.
 - **Design sketch**: analytic fixture with injected sub-band ionospheric phase ramp;
   recover known TEC/delay via split-spectrum estimator; additive fallback/cross-check to
   the existing IONEX path in `dolphin-corrections::ionosphere`, off by default.
 - **Added**: 2026-08-01 by scheduled scout run
+- **Reconciled**: 2026-08-31 scheduled scout run (ledger was stale — issue closure on
+  2026-08-10 was never reflected here)
 
-### D4 — Possible output-grid geometry ambiguity under asymmetric strides
-- **Source**: inbound (cross-repo signal, `../eo`#277 — P1 production incident, unconfirmed hypothesis)
-- **Issue**: #26 (enhancement-labeled, NOT yet backlog-ready)
-- **Re-entry gate**: `../eo`#277's own reproduction step (default `{y:3, x:6}` strides vs.
-  the `{x:2, y:1}` override on the Montana harness AOI) runs and points at dolphinRust's
-  own output-grid/analysis-domain geometry math — rather than `../eo`'s water-mask/
-  geotransform derivation — as the actual locus of the bug.
-- **Design sketch**: if gated in, a property/contract test asserting the reported
-  output-grid geotransform/dimensions and "bounded analysis domain" coverage check agree
-  pixel-for-pixel with the actual strided output raster for asymmetric strides (`y≠x`),
-  extending the existing Phase 0 block-manager property tests.
-- **Added**: 2026-08-03 by scheduled scout run
+## SHIPPED
 
 ### D6 — Expose orbit ephemeris class (POE/RESORB) for processing provenance
 - **Source**: inbound (cross-repo signal, `../eo`#483 — Table 5 processing-provenance audit)
-- **Issue**: #57 (enhancement-labeled, NOT yet backlog-ready)
-- **Re-entry gate**: confirm the exact HDF5 dataset/group path for orbit-file provenance
-  (e.g. `/metadata/processing_information/inputs/orbit_files` or similar) against a real
-  OPERA CSLC-S1 granule or the authoritative product spec — `dolphin-io::cslc_metadata`'s
-  existing keys were granule-verified before shipping, and this field hasn't been.
-- **Design sketch**: if confirmed, a small `dolphin-io` reader mirroring
-  `read_cslc_burst_metadata`, plus a `dolphin-workflows::provenance` classification step
-  (orbit filename pattern `*_AUX_POEORB_*` / `*_AUX_RESORB_*` → `Precise`/`Restituted`/
-  `Unknown`), keeping this module's IO-only / interpretation-elsewhere split.
+- **Issue**: #57
+- **Gate result**: confirmed — `dolphin-io::cslc_metadata` already reads
+  `/metadata/orbit/orbit_type` directly (added alongside the module's existing
+  `/identification` and orbit-state-vector readers); no separate
+  `processing_information/inputs/orbit_files` group was needed. Classification lives in
+  `dolphin-workflows::provenance` (`read_cslc_orbit_type` → `POEORB`→`precise`,
+  `RESORB`→`restituted`, case-insensitive, cross-granule consistency checked, unknown/mixed
+  values kept explicit and non-fatal).
+- **Design sketch**: as originally sketched — small `dolphin-io` reader plus a
+  `dolphin-workflows::provenance` classification step, keeping the module's IO-only /
+  interpretation-elsewhere split. Geometry-provenance artifact schema bumped to
+  `dolphinrust-geometry-provenance/4` (prior `/2`/`/3` remain deserializable).
 - **Added**: 2026-08-24 by scheduled scout run
-
-## SHIPPED
+- **Shipped**: 2026-08-24 by manual contract-first implementation (PR #63, `853cc5e`)
+- **Reconciled**: 2026-08-31 scheduled scout run (ledger still listed this as DEFERRED
+  after it had already shipped and closed)
 
 ### D3 — Automated loop-closure QC gate for unwrap-network errors
 - **Source**: competitive (LiCSBAS)
@@ -94,6 +91,25 @@ Entry format:
 - **Shipped**: 2026-07-21 by manual contract-first implementation
 
 ## OUT OF SCOPE
+
+### D4 — Possible output-grid geometry ambiguity under asymmetric strides
+- **Source**: inbound (cross-repo signal, `../eo`#277 — P1 production incident, unconfirmed hypothesis)
+- **Issue**: #26 (closed 2026-08-09 — gate resolved away from dolphinRust)
+- **Disposition**: `../eo`#277's own resolution (closed 2026-08-03) states the root cause
+  as "fixed by rebuilding the AOI water mask from the authoritative CSLC output grid" — the
+  eo-side branch of the gate, not dolphinRust's output-grid geometry math. The re-entry
+  condition ("...and it points at dolphinRust's own output-grid/analysis-domain geometry as
+  the actual locus") was not met, so no dolphinRust bug was built. Residual test coverage
+  was added anyway: `crates/dolphin-core/tests/blocks_contract.rs` gained the exact
+  `{y:1, x:2}` override from eo#277 and its transpose `{y:6, x:3}` (`dfdfeb1`) — both pass
+  all three block-manager invariants, independently confirming the bug was never here.
+- **Re-entry gate**: a future incident's reproduction points at dolphinRust's own
+  output-grid/analysis-domain geometry math (not `../eo`'s water-mask/geotransform
+  derivation) as the actual locus.
+- **Added**: 2026-08-03 by scheduled scout run
+- **Closed locally**: 2026-08-09 after eo-side root-cause resolution
+- **Reconciled**: 2026-08-31 scheduled scout run (ledger was stale — resolution on
+  2026-08-09 was never reflected here)
 
 ### D5 — ERA5-based tropospheric delay as a dolphinRust correction source
 - **Source**: inbound (cross-repo signal, `../eo`#238, itself sourced from an ecosystem scan)
