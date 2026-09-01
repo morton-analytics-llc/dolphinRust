@@ -29,14 +29,101 @@ Entry format:
 - **Re-entry gate**: a real scene is found where IONEX/GNSS TEC coverage is missing or
   demonstrably insufficient, OR the real multi-date NISAR validation work (ROADMAP.md's
   "NISAR calibrated-data timing" external gate) surfaces an ionospheric residual large
-  enough to justify a second correction path. Still unmet as of 2026-08-31 — no NISAR
-  validation run and no real-data IONEX shortfall reported since #23 was closed.
+  enough to justify a second correction path. Still unmet as of 2026-09-01 — see new
+  evidence below; no NISAR validation run and no real-data IONEX shortfall reported since
+  #23 was closed.
 - **Design sketch**: analytic fixture with injected sub-band ionospheric phase ramp;
   recover known TEC/delay via split-spectrum estimator; additive fallback/cross-check to
   the existing IONEX path in `dolphin-corrections::ionosphere`, off by default.
 - **Added**: 2026-08-01 by scheduled scout run
 - **Reconciled**: 2026-08-31 scheduled scout run (ledger was stale — issue closure on
   2026-08-10 was never reflected here)
+- **New evidence (2026-09-01 scheduled scout run, not sufficient to close the gate)**:
+  NISAR L-band data is now flowing — calibrated observations from acquisitions on/after
+  2026-06-17 are at the ASF DAAC, with provisional L-band products released 2026-07-20
+  explicitly flagged by the mission as more uncertain at higher latitudes "where
+  ionospheric variability" is higher. NISAR's built-in dual sub-bands are architecturally
+  suited to the split-spectrum method, and a practical-recipe paper targeting NISAR
+  specifically now exists (Earth Planets and Space, doi:10.1186/s40623-025-02206-9,
+  2025-06). This is evidence the *precondition* for the gate (real NISAR data existing)
+  is now met, but the gate itself requires an actual multi-date NISAR validation run
+  surfacing a measured ionospheric residual, or a real scene with demonstrated IONEX/GNSS
+  shortfall — neither has happened yet. No new issue opened; re-check at the next
+  scheduled run once NISAR validation work (if any) produces a residual measurement.
+
+### D7 — NISAR azimuth-block splitting for parallel full-frame processing
+- **Source**: researcher (isce-framework/dolphin PR #717 + #723, merged 2026-06, unreleased on `main`)
+- **Issue**: #105 (enhancement-labeled, NOT backlog-ready)
+- **Re-entry gate**: a real full-frame NISAR GSLC processing case exists (validation
+  harness or GroundPulse NISAR integration) where single-block wall-clock or memory is
+  measured as an actual bottleneck.
+- **Design sketch**: azimuth-block-splitting pass ahead of the existing burst-pool
+  dispatch in `dolphin-workflows`, matching dolphin's halo computation, plus a
+  compressed-SLC/output stitcher for block boundaries.
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D8 — COFI-PL sequential covariance-fitting phase linking (third estimator)
+- **Source**: researcher (El Hajjar et al., arXiv:2502.09248 / arXiv:2403.08646)
+- **Issue**: #106
+- **Re-entry gate**: dolphin adopts an equivalent estimator (parity target + oracle), OR
+  an independent benchmark on a real dolphinRust-validated scene (e.g. MMX1/ICMX) shows
+  EVD/EMI's bias/variance is measurably worse than the paper's reported COFI-PL numbers.
+- **Design sketch**: new estimator variant in `dolphin-phaselink/src/estimator.rs`
+  alongside `FixedEstimatorBranch::{Evd,Emi}`; analytic fixture first, then the paper's
+  own real-data statistics as a secondary check (no dolphin oracle exists for this).
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D9 — Incremental PS amplitude-dispersion updates + small-stack quality metrics
+- **Source**: researcher (Staniewicz et al., arXiv:2511.12051 — dolphin's own lead-author team)
+- **Issue**: #107
+- **Re-entry gate**: dolphin ships either refinement in a release, giving a concrete
+  algorithm and oracle to validate against.
+- **Design sketch**: extend `MiniStackPlanner`/`update_sequential`'s carry-forward pattern
+  to amplitude-dispersion running statistics rather than the full amplitude history.
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D10 — Adaptive (data-driven) ministack partitioning
+- **Source**: researcher (Wang et al. 2025, IJAEOG v139, S1569843225001992)
+- **Issue**: #108
+- **Re-entry gate**: a real production AOI with heterogeneous coherence regimes shows
+  fixed `ministack_size` measurably underperforming an adaptive partition **and**
+  PLAYBOOK §Elevated questions #2 (ministack/tile partitioning vs. the bit-identical
+  tiled/whole contract) has been answered.
+- **Design sketch**: alternative `MiniStackPlanner` path using Otsu's-algorithm
+  coherence-matrix partitioning, config-gated, validated against the fixed-size planner's
+  existing contract tests before enabling adaptivity.
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D11 — Complex-elliptical-model SHP selection
+- **Source**: researcher (Yao, Frery, Balz, arXiv:2509.12700)
+- **Issue**: #109
+- **Re-entry gate**: a production AOI with mixed urban/vegetated terrain shows GLRT/KS
+  SHP selection producing PS/DS density anomalies or clustering issues this method would
+  plausibly fix.
+- **Design sketch**: third `shp_method` in `dolphin-shp` driven by the complex angular
+  central Gaussian distribution, plus a non-Rayleigh phase estimator variant.
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D12 — Sequential joint-scatterer (PS+DS unified) estimation
+- **Source**: researcher (S-JSInSAR, Remote Sensing 18(2):329, 2026, doi:10.3390/rs18020329)
+- **Issue**: #110 — high bar, scope-only, do not commit without the gate
+- **Re-entry gate**: dolphin/MintPy/ISCE3/the OPERA DISP-S1 SAS adopts a joint PS+DS
+  estimator (parity target), OR dolphinRust's separate PS/DS pipeline is shown on real
+  data to have decorrelation bias or redundant compute a joint estimator would fix.
+- **Design sketch**: none yet — needs a design review given the Phase 1↔Phase 3
+  architectural boundary it crosses; do not scaffold ahead of the gate.
+- **Added**: 2026-09-01 by scheduled scout run
+
+### D13 — NSBAS-style temporal-smoothness gap-bridging inversion
+- **Source**: competitive (LiCSBAS `LiCSBAS13_sb_inv.py`, NSBAS / Lopez-Quiroz et al. 2009)
+- **Issue**: #111
+- **Re-entry gate**: a real production interferogram network is shown (GNSS harness or
+  GroundPulse run) to have a rank-deficient or gap-degraded inversion that denser network
+  construction (`max_bandwidth`) cannot practically resolve.
+- **Design sketch**: second-derivative temporal-smoothness regularization term added to
+  the existing L2 design-matrix assembly in `dolphin-timeseries`, config-gated, off by
+  default (dolphin has no NSBAS equivalent).
+- **Added**: 2026-09-01 by scheduled scout run
 
 ## SHIPPED
 
