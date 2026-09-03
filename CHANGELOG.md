@@ -6,6 +6,16 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **`PhaseAngleLinearization`'s EMI inverse is now unrepresentable instead of `expect`ed**
+  (issue #98). The prepared branch state folds the EMI regularized-gamma inverse into the
+  `Emi` variant that owns it, replacing a detached `branch: FixedEstimatorBranch` +
+  `gamma_inverse: Option<Mat<f64>>` pair whose EMI-implies-`Some` invariant held only by
+  convention. `apply` matches the variant directly; no `Option` to unwrap remains on the
+  `prepare`/`apply` path. Behavior-preserving — `phase_angle_jvp` and the estimator JVP
+  contract tests (error precedence for `ZeroMagnitudeBranch`, `ThresholdBoundary`,
+  `EigenvalueTie`, `VanishingReference`) pass unchanged.
+
 ## [v1.6.0] — 2026-08-30
 
 ### Breaking changes
