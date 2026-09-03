@@ -1,5 +1,7 @@
 # Implementation plan: velocity scorer, v1.5.0, and atmospheric follow-up
 
+**Status:** complete 2026-09-03. T01-T04, T06, T07 implemented; T05 (GroundPulse submodule repin) landed separately - `../eo` pins v1.5.0 at `8a63fe2`.
+
 **Status:** approved for execution 2026-08-17.
 **Intake:** `md/intake/velocity-validation-release-atmosphere-2026-08-17.md`.
 **Order:** eo #419/#440 remains a separate operational incident; within this plan execute
