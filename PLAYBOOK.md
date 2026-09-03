@@ -779,6 +779,41 @@ lever is **blocked on an architecture decision**, not implemented.
   now tracked as issue #29 (the mask is still never wired into `sequential.rs`,
   which blocks the GNSS uncertainty-reliability scorer — see VALIDATION.md).
 
+### DISP-S1 production comparison (2026-09-03, issue #104)
+
+First head-to-head against published real-production numbers rather than an
+internal A/B: Staniewicz et al., arXiv:2511.12051 (IEEE TGRS Jan 2026), reporting
+DISP-S1 North America production over 6,000+ 15-date mini-stacks. Full writeup and
+caveats in [`bench/DISP_S1.md`](bench/DISP_S1.md); raw numbers in `bench/disp_s1.json`.
+
+**Measured** (dolphinRust 1.6.0, 15 dates of CSLC-S1 `T005-008704-IW1`, 936x4197
+crop = 3.93 Mpix/date, half-window 11x5, strides 6x3 — the same geometry DISP-S1
+production uses — native unwrapper, Apple M2 Pro 12-core, 3 reps):
+
+| | warm wall | unwrap | phase_linking | peak RSS |
+|---|---|---|---|---|
+| burst mini-stack | 20.0 s | 15.23 s (76.1%) | 2.69 s (13.5%) | 0.70 GiB |
+
+**The finding that carries no scaling assumption:** the bottleneck profile
+reproduces. Published DISP-S1 is ~80% unwrapping; this is **76.1%**. The native
+in-process unwrapper did not move unwrapping off the critical path — it is still
+three-quarters of the run, and remains the thing to attack. Phase-linking is a
+*smaller* share here (13.5% vs their 22.4% = 90 min / 6.7 h).
+
+**Multiples are banded, not measured.** The paper publishes no frame pixel count,
+so the 27-burst frame size is derived here (~800 Mpix/date, +/-25%). On that band
+dolphinRust is **~4.7-7.9x** end-to-end and **~7.9-13.1x** on phase-linking, per
+pixel, on 12 cores against their 32-vCPU EC2. Do not quote a single multiple
+without the band or the hardware difference.
+
+**Limits.** One burst crop, one scene, one host, no GPU path measured, no
+multi-burst frame assembly — frame-scale stitching, I/O and memory are precisely
+where a laptop burst run says least. A real head-to-head needs a full 27-burst
+frame on comparable hardware. The issue's cited "GPU 5-20x over CPU" claim is not
+in the paper's runtime section (CPU-only EC2 runs) and is not carried forward.
+
+---
+
 ---
 
 ## Out of scope (initial)
