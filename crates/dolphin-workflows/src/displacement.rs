@@ -198,6 +198,11 @@ pub struct DisplacementOutput {
     /// Mean coherence-matrix magnitude across real acquisitions, distinct from
     /// estimator-fit temporal coherence. `None` unless `calc_average_coh` is on.
     pub phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial neighbour-phase agreement per pixel (Wang et al. 2022 eq. 5),
+    /// `(rows, cols)`. A distinct QA signal from the temporal/coherence layers:
+    /// it falls at phase discontinuities and on isolated scatterers. `Some` only
+    /// when `phase_linking.write_phase_similarity` is set.
+    pub phase_similarity: Option<Array2<f64>>,
     /// Pixels with complete temporal input support after burst mosaicking and trim.
     pub validity_mask: Array2<bool>,
     /// Per-ministack marginal CRLB phase-estimate σ (radians), stitched as
@@ -420,6 +425,19 @@ fn finish_displacement(
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
+    // Spatial neighbour-phase agreement, computed on the stitched linked phase
+    // (single-reference ifgs) the way dolphin runs `create_similarities` on its
+    // stitched rasters, not per-burst.
+    let phase_similarity = cfg.phase_linking.write_phase_similarity.then(|| {
+        timed("phase_similarity", || {
+            dolphin_phaselink::estimate_phase_similarity(
+                pl.view(),
+                cfg.phase_linking.phase_similarity_search_radius,
+                dolphin_phaselink::PhaseSimilaritySummary::Median,
+                Some(validity_mask.view()),
+            )
+        })
+    });
     let temporal_coherence = stitched.temp_coh;
     let epsg = (stitched.geo.epsg != 0).then_some(stitched.geo.epsg);
     let geotransform = stitched.geo.geotransform;
@@ -561,6 +579,7 @@ fn finish_displacement(
         validity_mask,
         burst_coverage,
         phase_linking_coherence: stitched.phase_linking_coherence,
+        phase_similarity,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
         corrections,
@@ -1060,6 +1079,8 @@ struct SpatialProducts {
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
     phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial phase-similarity quality raster, if enabled.
+    phase_similarity: Option<Array2<f64>>,
     crlb_sigma: Option<Array3<f64>>,
     closure_phase: Option<Array3<f64>>,
     corrections: CorrectionLayers,
@@ -1141,6 +1162,7 @@ fn emit_displacement(
             .len()
             .saturating_sub(spatial.disp_rad.dim().0),
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
+        phase_similarity: spatial.phase_similarity.as_ref(),
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -1245,6 +1267,7 @@ fn emit_displacement(
         unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
+        phase_similarity: spatial.phase_similarity,
         validity_mask: spatial.validity_mask,
         crlb_sigma: cfg
             .phase_linking
@@ -4498,6 +4521,9 @@ fn write_outputs(
     if let Some(coherence) = quality.phase_linking_coherence {
         write_f32("phase_linking_coherence.tif", coherence.view())?;
     }
+    if let Some(similarity) = quality.phase_similarity {
+        write_f32("phase_similarity.tif", similarity.view())?;
+    }
     write_bands(&write_f32, displacement, "displacement")?;
     if let Some(crlb) = quality.crlb_sigma {
         for band in 0..crlb.dim().0 {
@@ -4636,6 +4662,7 @@ struct QualityLayers<'a> {
     /// `n_interferograms - (n_dates - 1)`.
     network_residual_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
+    phase_similarity: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
     displacement_variance: Option<&'a Array3<f64>>,
@@ -4910,6 +4937,7 @@ mod tests {
             validity_mask,
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
+            phase_similarity: None,
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -5042,6 +5070,7 @@ mod tests {
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5104,6 +5133,7 @@ mod tests {
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5632,6 +5662,7 @@ mod tests {
             QualityLayers {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
+                phase_similarity: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: None,
@@ -6406,6 +6437,7 @@ mod tests {
                 QualityLayers {
                     network_residual_dof: dof,
                     phase_linking_coherence: None,
+                    phase_similarity: None,
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
                     displacement_variance: Some(&variance),
@@ -6579,6 +6611,7 @@ mod tests {
             validity_mask: Array2::from_elem((2, 2), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -6608,6 +6641,7 @@ mod tests {
             QualityLayers {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
+                phase_similarity: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: scaled.displacement_variance.as_ref(),
@@ -7515,6 +7549,7 @@ mod tests {
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {

@@ -56,6 +56,8 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "phase_linking.write_crlb",
     "phase_linking.write_closure_phase",
     "phase_linking.calc_average_coh",
+    "phase_linking.write_phase_similarity",
+    "phase_linking.phase_similarity_search_radius",
     "phase_linking.correct_phase_bias",
     "interferogram_network.reference_idx",
     "interferogram_network.max_bandwidth",
@@ -249,6 +251,8 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
             write_crlb,
             write_closure_phase,
             calc_average_coh,
+            write_phase_similarity,
+            phase_similarity_search_radius,
             correct_phase_bias,
         ]
     );
@@ -269,6 +273,8 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
         write_crlb,
         write_closure_phase,
         calc_average_coh,
+        write_phase_similarity,
+        phase_similarity_search_radius,
         correct_phase_bias,
     );
     audit_fields!(

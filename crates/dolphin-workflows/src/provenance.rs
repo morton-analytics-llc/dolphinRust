@@ -32,6 +32,7 @@ pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
 /// `temporal_coherence.tif`; relative to `work_directory`.
 const PHASE_LINKING_COHERENCE_KEY: &str = "phase_linking_coherence.tif";
+const PHASE_SIMILARITY_KEY: &str = "phase_similarity.tif";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 const HEADING_SPREAD_GATE_DEG: f64 = 1.0;
@@ -78,6 +79,9 @@ pub struct GeometryProvenance {
     /// Artifact key of the phase-linking coherence raster, relative to
     /// `work_directory`; absent when `calc_average_coh` is disabled.
     pub phase_linking_coherence: Option<String>,
+    /// Artifact key of the spatial phase-similarity raster, relative to
+    /// `work_directory`; absent when `write_phase_similarity` is disabled.
+    pub phase_similarity: Option<String>,
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
@@ -242,6 +246,10 @@ pub fn assemble_geometry_provenance_with_coverage(
             .phase_linking
             .calc_average_coh
             .then(|| PHASE_LINKING_COHERENCE_KEY.into()),
+        phase_similarity: cfg
+            .phase_linking
+            .write_phase_similarity
+            .then(|| PHASE_SIMILARITY_KEY.into()),
         decomposition_geometry_complete: orbit_direction.is_some()
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()
