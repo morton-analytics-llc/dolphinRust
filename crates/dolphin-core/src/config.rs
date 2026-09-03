@@ -282,6 +282,16 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "phase_linking.calc_average_coh is true"
     ),
     conditional!(
+        "phase_linking.write_phase_similarity",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_phase_similarity is true"
+    ),
+    conditional!(
+        "phase_linking.phase_similarity_search_radius",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_phase_similarity is true"
+    ),
+    conditional!(
         "phase_linking.correct_phase_bias",
         "CFG-PHASE-LINK",
         "phase_linking.correct_phase_bias is true"
@@ -708,6 +718,13 @@ pub struct PhaseLinkingOptions {
     /// Calculate average coherence magnitude per SLC date (dolphin
     /// `calc_average_coh`) and emit the distinct phase-linking-coherence raster.
     pub calc_average_coh: bool,
+    /// Compute the spatial phase-similarity quality raster (Wang et al. 2022
+    /// eq. 5, dolphin `similarity.median_similarity`) from the stitched linked
+    /// phase and emit `phase_similarity.tif`. Off by default.
+    pub write_phase_similarity: bool,
+    /// Neighbourhood radius in pixels for [`Self::write_phase_similarity`],
+    /// matching dolphin's `create_similarities` default.
+    pub phase_similarity_search_radius: usize,
     /// Apply the phase-bias / non-closure correction (Michaelides et al. 2022) to
     /// the linked-phase series before the interferogram network. **Off by default**
     /// (this leads Python dolphin, which has no such correction; enabling it changes
@@ -735,6 +752,8 @@ impl Default for PhaseLinkingOptions {
             write_crlb: true,
             write_closure_phase: false,
             calc_average_coh: false,
+            write_phase_similarity: false,
+            phase_similarity_search_radius: 7,
             correct_phase_bias: false,
         }
     }
