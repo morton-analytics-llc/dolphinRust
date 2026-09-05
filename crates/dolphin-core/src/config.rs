@@ -58,6 +58,11 @@ pub struct ConfigBehaviorContract {
 /// Checked behavior-contract catalog for consumed and conditional config fields.
 pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
     ConfigBehaviorContract {
+        id: "CFG-NATIVE-MASK",
+        reader: "dolphin-workflows::displacement::restrict_publication_mask",
+        evidence: "dolphin-io::quality_mask::tests::native_quality_mask_respects_sensor_codes_and_all_subpixels",
+    },
+    ConfigBehaviorContract {
         id: "CFG-INPUT-READ",
         reader: "dolphin-workflows::displacement::{source_layouts, read_burst_tile, acquisition_days, finish_displacement, scale_outputs}",
         evidence: "dolphin-workflows::{displacement_contract, nisar_e2e_contract} and displacement nondefault-date-format mapping contract",
@@ -489,6 +494,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-UNWRAP-BACKEND",
         "unwrap_method is tophu"
     ),
+    conditional!("input_options.acquisition_metadata", "CFG-INPUT-READ", "verified acquisition metadata is supplied"),
+    conditional!("input_options.apply_native_input_masks", "CFG-NATIVE-MASK", "input_options.apply_native_input_masks is true"),
+    consumed!("correction_options.acquisition_utc", "CFG-CORRECTIONS"),
+    conditional!("correction_options.nisar_geometry_group", "CFG-CORRECTIONS", "NISAR geometry is supplied"),
+    conditional!("correction_options.nisar_ellipsoidal_dem_file", "CFG-CORRECTIONS", "NISAR geometry is supplied"),
     consumed!("input_options.input_type", "CFG-INPUT-READ"),
     consumed!("input_options.subdataset", "CFG-INPUT-READ"),
     consumed!("input_options.cslc_date_fmt", "CFG-INPUT-READ"),
@@ -1094,10 +1104,27 @@ pub enum InputType {
     NisarGslc,
 }
 
-/// Input granule discovery. dolphin `InputOptions`.
+/// Verified acquisition identity independent of staged filenames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquisitionMetadata {
+    /// Local immutable input path.
+    pub path: PathBuf,
+    /// Verified acquisition time in UTC.
+    pub acquisition_utc: chrono::DateTime<chrono::Utc>,
+    /// Burst or frame, including orbit, frequency, and polarization identity.
+    pub spatial_group: String,
+    /// Stable source grid identity within this spatial group.
+    pub grid_id: String,
+}
+
+/// Input reader and verified acquisition metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputOptions {
+    /// Require native sensor quality masks when publishing displacement.
+    pub apply_native_input_masks: bool,
+    /// Complete metadata for the input list; empty retains legacy filename parsing.
+    pub acquisition_metadata: Vec<AcquisitionMetadata>,
     /// Input-product reader to use (OPERA CSLC vs NISAR GSLC). Forward
     /// divergence from dolphin v0.35.0 (see [`InputType`]).
     pub input_type: InputType,
@@ -1115,6 +1142,8 @@ impl Default for InputOptions {
     fn default() -> Self {
         Self {
             input_type: InputType::default(),
+            apply_native_input_masks: false,
+            acquisition_metadata: Vec::new(),
             subdataset: None,
             cslc_date_fmt: "%Y%m%d".into(),
             wavelength: None,
@@ -1135,6 +1164,12 @@ impl Default for InputOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CorrectionOptions {
+    /// Verified UTC in acquisition order; empty retains legacy filename time parsing.
+    pub acquisition_utc: Vec<chrono::DateTime<chrono::Utc>>,
+    /// NISAR radarGrid LOS cube group; absent uses OPERA STATIC geometry.
+    pub nisar_geometry_group: Option<String>,
+    /// DEM of ellipsoidal heights in meters for NISAR radarGrid interpolation.
+    pub nisar_ellipsoidal_dem_file: Option<PathBuf>,
     /// GNSS-derived IONEX TEC maps for ionospheric correction (one per date).
     /// Source: <https://cddis.nasa.gov/archive/gnss/products/ionex/>. dolphin name.
     pub ionosphere_files: Vec<PathBuf>,
@@ -1167,6 +1202,9 @@ pub struct CorrectionOptions {
 impl Default for CorrectionOptions {
     fn default() -> Self {
         Self {
+            acquisition_utc: Vec::new(),
+            nisar_geometry_group: None,
+            nisar_ellipsoidal_dem_file: None,
             ionosphere_files: Vec::new(),
             troposphere_files: Vec::new(),
             geometry_files: Vec::new(),

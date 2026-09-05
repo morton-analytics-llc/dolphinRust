@@ -19,6 +19,7 @@ pub mod geotiff;
 pub mod nisar;
 #[cfg(any(test, feature = "nisar-fixture"))]
 pub mod nisar_fixture;
+pub mod quality_mask;
 
 pub use covariance::{
     covariance_content_bound_source_id, covariance_identified_id,

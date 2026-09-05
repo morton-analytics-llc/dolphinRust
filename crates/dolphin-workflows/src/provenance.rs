@@ -637,20 +637,36 @@ fn incidence(
     }
     // A wrong-track/wrong-pass STATIC yields plausible incidence (up is
     // sign-insensitive) — cross-check its identity against the CSLC stack.
-    let consistency_note = match cslc.as_ref() {
-        Some(granules) => {
-            if let Err(reason) =
-                verify_static_consistency(&cfg.correction_options.geometry_files, granules)
-            {
-                return mark_absent(fields, FIELD, &reason);
-            }
-            None
+    let consistency_note = if cfg.input_options.input_type == InputType::NisarGslc {
+        if cfg
+            .correction_options
+            .geometry_files
+            .iter()
+            .any(|p| !cfg.cslc_file_list.contains(p))
+        {
+            return mark_absent(
+                fields,
+                FIELD,
+                "NISAR geometry must come from the immutable GSLC inputs",
+            );
         }
-        None => Some(
-            "consistency with CSLC stack unverified (CSLC identification unreadable); \
+        None
+    } else {
+        match cslc.as_ref() {
+            Some(granules) => {
+                if let Err(reason) =
+                    verify_static_consistency(&cfg.correction_options.geometry_files, granules)
+                {
+                    return mark_absent(fields, FIELD, &reason);
+                }
+                None
+            }
+            None => Some(
+                "consistency with CSLC stack unverified (CSLC identification unreadable); \
              decomposition gate is closed via the CSLC-derived fields anyway"
-                .to_string(),
-        ),
+                    .to_string(),
+            ),
+        }
     };
     let spread_note = (stats.std_deg > INCIDENCE_SPREAD_GATE_DEG).then(|| {
         format!(
@@ -672,7 +688,19 @@ fn incidence(
                 .iter()
                 .map(|p| granule_name(p))
                 .collect(),
-            source_keys: vec!["/data/los_east".into(), "/data/los_north".into()],
+            source_keys: cfg
+                .correction_options
+                .nisar_geometry_group
+                .as_ref()
+                .map_or_else(
+                    || vec!["/data/los_east".into(), "/data/los_north".into()],
+                    |group| {
+                        vec![
+                            format!("{group}/losUnitVectorX"),
+                            format!("{group}/losUnitVectorY"),
+                        ]
+                    },
+                ),
             method: "mean/std/min/max over finite pixels of degrees(acos(los_up)), \
                  up = +sqrt(1−e²−n²), on the resolved output grid"
                 .into(),
