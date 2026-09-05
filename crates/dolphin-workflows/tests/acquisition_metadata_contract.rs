@@ -62,6 +62,18 @@ fn sentinel_bursts_share_pass_dates_without_discarding_their_utc() {
     }
     let groups = workflow_groups(&cfg).unwrap();
     assert_eq!(groups.keys().next().unwrap(), "burst-a");
+    cfg.correction_options.solid_earth_tide = true;
+    assert!(workflow_groups(&cfg)
+        .unwrap_err()
+        .to_string()
+        .contains("identical UTC"));
+    cfg.correction_options.solid_earth_tide = false;
+    cfg.correction_options.ionosphere_files = vec!["ionex.dat".into()];
+    assert!(workflow_groups(&cfg)
+        .unwrap_err()
+        .to_string()
+        .contains("identical UTC"));
+    cfg.correction_options.ionosphere_files.clear();
     cfg.input_options.acquisition_metadata[3].acquisition_utc =
         cfg.input_options.acquisition_metadata[2].acquisition_utc;
     assert!(workflow_groups(&cfg).is_err());

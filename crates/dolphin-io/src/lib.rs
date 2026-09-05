@@ -18,6 +18,7 @@ pub mod geotiff;
 pub mod nisar;
 #[cfg(any(test, feature = "nisar-fixture"))]
 pub mod nisar_fixture;
+pub mod quality_mask;
 
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use cslc_metadata::{

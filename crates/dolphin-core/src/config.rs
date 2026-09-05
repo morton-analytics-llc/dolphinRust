@@ -427,6 +427,8 @@ pub struct AcquisitionMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputOptions {
+    /// Require native sensor quality masks when publishing displacement.
+    pub apply_native_input_masks: bool,
     /// Complete metadata for the input list; empty retains legacy filename parsing.
     pub acquisition_metadata: Vec<AcquisitionMetadata>,
     /// Input-product reader to use (OPERA CSLC vs NISAR GSLC). Forward
@@ -446,6 +448,7 @@ impl Default for InputOptions {
     fn default() -> Self {
         Self {
             input_type: InputType::default(),
+            apply_native_input_masks: false,
             acquisition_metadata: Vec::new(),
             subdataset: None,
             cslc_date_fmt: "%Y%m%d".into(),

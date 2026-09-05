@@ -838,6 +838,85 @@ struct SpatialProducts {
     unwrap_connected_components: Array3<u32>,
 }
 
+fn restrict_publication_mask(
+    cfg: &DisplacementWorkflow,
+    geo: GeoInfo,
+    validity: &mut Array2<bool>,
+    reference: Option<(usize, usize)>,
+) -> Result<()> {
+    for path in cfg
+        .mask_file
+        .iter()
+        .chain(cfg.layover_shadow_mask_files.iter())
+    {
+        let mask =
+            read_aligned_raster_window::<f64>(path, geo.geotransform, geo.epsg, validity.dim())?;
+        ndarray::Zip::from(&mut *validity)
+            .and(&mask)
+            .for_each(|valid, &value| *valid &= value == 1.0);
+    }
+    if cfg.input_options.apply_native_input_masks {
+        let nisar = cfg.input_options.input_type == InputType::NisarGslc;
+        let files = if nisar {
+            &cfg.cslc_file_list
+        } else {
+            &cfg.correction_options.geometry_files
+        };
+        anyhow::ensure!(
+            !files.is_empty(),
+            "native input masks require immutable sensor mask sources"
+        );
+        let dataset = if nisar {
+            let subdataset = cfg
+                .input_options
+                .subdataset
+                .as_deref()
+                .context("NISAR mask requires explicit polarization subdataset")?;
+            format!(
+                "{}/mask",
+                subdataset
+                    .rsplit_once('/')
+                    .context("invalid NISAR subdataset")?
+                    .0
+            )
+        } else {
+            "/data/layover_shadow_mask".to_owned()
+        };
+        let mut coverage = Array2::from_elem(validity.dim(), false);
+        for path in files {
+            let (good, covered) = dolphin_io::quality_mask::read_native_quality_mask(
+                path,
+                &dataset,
+                nisar,
+                geo,
+                validity.dim(),
+            )?;
+            ndarray::Zip::from(&mut *validity)
+                .and(&mut coverage)
+                .and(&good)
+                .and(&covered)
+                .for_each(|valid, any, &good, &covered| {
+                    *any |= covered;
+                    if covered {
+                        *valid &= good;
+                    } else if nisar {
+                        *valid = false;
+                    }
+                });
+        }
+        ndarray::Zip::from(&mut *validity)
+            .and(&coverage)
+            .for_each(|valid, &covered| *valid &= covered);
+    }
+    if let Some(point) = reference {
+        anyhow::ensure!(
+            validity.get(point).copied().unwrap_or(false),
+            "reference pixel is excluded by publication quality masks"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_displacement(
     cfg: &DisplacementWorkflow,
@@ -851,6 +930,15 @@ fn emit_displacement(
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
     spatial.apply_validity_mask();
+    restrict_publication_mask(
+        cfg,
+        GeoInfo {
+            epsg: epsg.unwrap_or(0),
+            geotransform: spatial.geotransform,
+        },
+        &mut spatial.validity_mask,
+        spatial.reference_point,
+    )?;
     if let (Some(variance), Some(point)) = (
         spatial.posterior_variance_rad.as_mut(),
         spatial.reference_point,
@@ -2786,6 +2874,32 @@ fn write_bands(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_masks_restrict_support_and_reject_masked_reference() {
+        let path = std::env::temp_dir().join("configured_publication_mask.tif");
+        let geo = GeoInfo {
+            epsg: 32611,
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+        };
+        let mask = ndarray::arr2(&[[1u8, 0], [1, 1]]);
+        write_raster(&path, mask.view(), geo.geotransform, Some(geo.epsg), None).unwrap();
+        let mut cfg = DisplacementWorkflow {
+            layover_shadow_mask_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let mut valid = Array2::from_elem((2, 2), true);
+        restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
+        assert_eq!(valid, mask.mapv(|v| v == 1));
+        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 1))).is_err());
+        cfg.layover_shadow_mask_files.clear();
+        cfg.mask_file = Some(path.clone());
+        let mut valid = Array2::from_elem((2, 2), true);
+        restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
+        assert_eq!(valid, mask.mapv(|v| v == 1));
+        std::fs::remove_file(path).unwrap();
+        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).is_err());
+    }
+
     use super::*;
     use dolphin_core::config::ComputeBackend;
     use dolphin_core::{HalfWindow, Strides};

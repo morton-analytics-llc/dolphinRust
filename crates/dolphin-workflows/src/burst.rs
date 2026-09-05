@@ -69,6 +69,7 @@ pub fn workflow_groups(
         "NISAR requires one spatial group per run"
     );
     let mut common_dates = None;
+    let mut common_utc = None;
     for indices in groups.values() {
         let records: Vec<_> = indices
             .iter()
@@ -88,6 +89,15 @@ pub fn workflow_groups(
             dates.windows(2).all(|w| w[0] < w[1]),
             "acquisition UTC must be unique and increasing within each group"
         );
+        if !cfg.correction_options.ionosphere_files.is_empty()
+            || cfg.correction_options.solid_earth_tide
+        {
+            if let Some(expected) = &common_utc {
+                ensure!(expected == &dates, "temporal corrections require identical UTC across spatial groups; per-burst correction evaluation is required");
+            } else {
+                common_utc = Some(dates.clone());
+            }
+        }
         let epoch_dates: Vec<_> = dates.iter().map(chrono::DateTime::date_naive).collect();
         if let Some(expected) = &common_dates {
             ensure!(
