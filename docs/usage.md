@@ -36,9 +36,9 @@ acquisition per HDF5 file), all on the same grid:
   used, so OPERA granule names (`..._20221119T232411Z_...`) and short names
   (`cslc_20221119.h5`) both work. **Real temporal baselines are derived from these dates** —
   they drive the velocity rate, so correct filenames matter.
-- **Georeferencing:** for projected output, the CSLC group should carry `x_coordinates`,
-  `y_coordinates`, and a `projection` (EPSG) dataset (OPERA layout). When absent, output
-  falls back to an identity geotransform and `output_options.epsg`.
+- **Georeferencing:** the CSLC group must carry `x_coordinates`, `y_coordinates`, and a
+  `projection` (EPSG) dataset (OPERA layout). Missing source georeferencing fails; output
+  reprojection and an identity-grid fallback are not implemented.
 - **Ordering:** list files in acquisition order in `cslc_file_list`.
 
 ### NISAR / L-band input (`input_type: nisar_gslc`)
@@ -75,13 +75,14 @@ Single-burst only in v1.0.0 — multi-burst frame mosaics are not yet stitched.
 ## 3. Configuration
 
 dolphinRust deserializes a genuine dolphin `DisplacementWorkflow` YAML unchanged (generate
-one with `dolphin config ...`); unknown solver blocks (tophu/spurt/whirlwind) are ignored.
-Key parameters (defaults match dolphin):
+one with `dolphin config ...`). Compatibility-only fields round-trip at their dolphin
+defaults and fail before input I/O when set to unsupported values. Key parameters:
 
 ```yaml
 cslc_file_list:
   - /data/cslc_20221119.h5
   - /data/cslc_20221201.h5     # 12-day cadence drives the mm/yr velocity
+layover_shadow_mask_files: []  # optional single-band native-grid GTiffs, one per active burst
 input_options:
   subdataset: /data/VV         # HDF5 path to the complex grid (required)
   cslc_date_fmt: "%Y%m%d"      # date parser for the filenames
@@ -92,22 +93,23 @@ phase_linking:
   ministack_size: 15           # SLCs per ministack (sequential estimator)
   half_window: { y: 7, x: 14 } # covariance/SHP window half-extent
   use_evd: false               # false = EMI (default), true = EVD
-  write_crlb: true             # per-date CRLB σ uncertainty layer (default on)
+  write_covariance_operator: false # uncalibrated source-DAG capture; CPU full-batch only
+  write_crlb: true             # per-ministack marginal CRLB quality diagnostic (default on)
   write_closure_phase: false   # per-triplet closure-phase layer (default off)
 interferogram_network:
   reference_idx: 0             # single-reference network; or set max_bandwidth / max_temporal_baseline
 timeseries_options:
   method: L1                   # L1 (dolphin default, ADMM/LAD) or L2 (weighted least squares)
-  use_coherence_weights: true  # L2 IFG precision from per-date CRLBs; L1 remains unweighted
-  write_posterior_uncertainty: false # L2 only: variance + residual RMS rasters
-  write_velocity_uncertainty: false  # date-CRLB-weighted slope sigma raster
+  use_coherence_weights: true  # L2 IFG quality weights from stitched CRLB; L1 remains unweighted
+  write_posterior_uncertainty: false # L2 diagonal-network approximation + misclosure
+  write_velocity_uncertainty: false  # IID-conditional slope SE + fit diagnostics
 unwrap_options:
   unwrap_method: snaphu        # default; or `tophu` for multi-scale (see below)
   snaphu_options: { cost: smooth, init_method: mcf, ntiles: [1, 1] }
   tophu_options: { ntiles: [4, 4], downsample_factor: [3, 3], init_method: mcf, cost: smooth }
 output_options:
   strides: { y: 1, x: 1 }      # output multilooking
-  epsg: 32611                  # fallback CRS when the CSLC carries none
+  # epsg: 32611                # bounded-run assertion only; must match the source CRS
 correction_options:           # atmospheric corrections — OFF by default (see §3a)
   ionosphere_files: []         # IONEX TEC maps, one per date → ionospheric delay
   troposphere_files: []        # OPERA L4 netCDF, one per date → tropospheric delay
@@ -118,6 +120,34 @@ work_directory: /out           # outputs are written here
 
 The complete config tree, with every field documented, is the rustdoc for
 `dolphin_core::config::DisplacementWorkflow` (`cargo doc --no-deps -p dolphin-core --open`).
+
+`write_velocity_uncertainty: true` currently supports only the linear model. Combining it
+with `velocity_seasonal: true` or non-empty `velocity_step_dates` fails validation. Enabling it
+also changes the point estimator from the full-series fit using stitched-CRLB relative precision
+with whole-pixel unit fallback to a unit-weighted post-gauge fit, so `velocity` and
+`velocity_mm_yr` can change. The returned
+`velocity_estimator` and `VELOCITY_ESTIMATOR` raster metadata record the exact path. Compare the
+rates in a field canary before a consumer enables the flag.
+
+`layover_shadow_mask_files` is independent of the later unwrap `mask_file`. For OPERA,
+mask filenames are matched to active CSLC groups by burst ID; missing, duplicate, extra, or
+unparseable mappings fail. A single NISAR group accepts one mask. Masks must use the GDAL
+`GTiff` driver, contain exactly one raster band, and cover the native source grid without
+reprojection or resampling.
+Zero, non-finite, raster-nodata, and GDAL-invalid pixels are excluded before covariance;
+finite nonzero pixels are valid. Resumable updates bind the mask and every effective backing
+file reported by GDAL and reject any identity or validity change before new CSLC I/O.
+
+`write_covariance_operator: true` is restricted to the CPU/f64 Rect path with
+`max_num_compressed > 0`, `compressed_slc_plan: always_first`, output reference 0, and
+`correct_phase_bias: false`. It is available only for a full batch under the full output policy;
+GroundPulse serialization and resumable entry points reject it before source reads. Capture
+writes an implicit source-keyed replay operator rather than a dense temporal covariance cube.
+The CLI does not supply the proper-complex source model needed for replay, so its artifact is
+marked `source_model_unavailable`. A low-level query must provide verified immutable raw samples,
+ordered component IDs, and exact numeric factors matching the artifact's per-source receipts. The
+method is uncalibrated and cannot feed displacement or velocity inference until #54 and #53 pass
+their separate gates.
 
 ### 3a. Atmospheric corrections (ionospheric + tropospheric)
 
@@ -222,7 +252,8 @@ async fn run_displacement_job(cfg: DisplacementWorkflow) -> anyhow::Result<Displ
 ```
 
 `DisplacementOutput` owns its arrays (`ndarray`), so it crosses the `spawn_blocking`
-boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the COGs directly.
+boundary freely. eo may persist `velocity_mm_yr` as local LOS ground-motion evidence and serve
+the COGs directly. The field is not asset response or asset risk.
 
 ## 5. Output schema
 
@@ -234,15 +265,17 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 |---|---|---|---|
 | `displacement` | `Array3<f64>` `(n_dates-1, rows, cols)` | meters (if `wavelength`) else radians | cumulative LOS vs acquisition 0 |
 | `velocity` | `Array2<f64>` `(rows, cols)` | m/yr (if `wavelength`) else rad/yr | raster-unit linear rate |
+| `velocity_estimator` | `VelocityEstimator` | — | exact full-series/post-gauge precision policy, including whole-pixel unit fallback, for both velocity fields |
 | `velocity_mm_yr` | `Array2<f64>` `(rows, cols)` | **mm/yr** | LOS rate via `−λ/4π`; config λ or Sentinel-1 default |
-| `velocity_sigma` | `Option<Array2<f64>>` | displacement units/yr | CRLB-weighted slope σ; opt-in |
-| `displacement_variance` | `Option<Array3<f64>>` | displacement units² | L2 posterior diagonal; opt-in |
+| `velocity_sigma` | `Option<Array2<f64>>` | displacement units/yr | IID-conditional residual slope SE after final correction/reference and acquisition-0 gauge exclusion; opt-in, uncalibrated |
+| `velocity_diagnostics` | `Option<VelocityTemporalDiagnostics>` | mixed | opt-in valid-date count, rank/DOF, uncertainty/cadence status, raw lag-1 correlation, pair count, and diagnostic-only inflation/effective N |
+| `displacement_variance` | `Option<Array3<f64>>` | displacement units² | L2 parameter-covariance diagonal under an independent-IFG error model; opt-in, not calibrated |
 | `network_misclosure_rms` | `Option<Array2<f64>>` | displacement units | SBAS network-inversion misclosure RMS (`A·φ=Δφ`); `Some` only for `write_posterior_uncertainty` L2 runs |
 | `timeseries_residual_rms` | `Option<Array2<f64>>` | displacement units | temporal motion-model fit residual RMS (rate ± seasonal/step); `None` only on the unweighted-linear fast path |
 | `interferogram_pairs` | `Vec<(usize, usize)>` | date indexes | ordering for unwrap bands and component labels |
 | `unwrap_connected_components` | `Array3<u32>` | labels | actual native/SNAPHU labels, one band per pair |
 | `temporal_coherence` | `Array2<f64>` `(rows, cols)` | `[0, 1]` | per-ministack-stitched phase quality (dolphin's NaN-aware mean across ministacks; unmasked) |
-| `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-date Cramér–Rao σ lower bound; band 0 = reference (σ=0), singular-Γ pixels `NaN`. `Some` by default (`write_crlb`) |
+| `crlb_sigma` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | radians | per-ministack marginal Cramér–Rao σ lower bound; band 0 is the structural gauge. Sequential ministacks change compressed references and omit cross-date covariance, so this is a quality diagnostic rather than global date covariance |
 | `closure_phase` | `Option<Array3<f64>>` `(n_dates-2, rows, cols)` | radians | per-triplet nearest-neighbour non-closure; `Some` only when `write_closure_phase` |
 | `ionosphere_delay` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | meters | per-date ionospheric range delay subtracted; `Some` only when `ionosphere_files` supplied |
 | `troposphere_delay` | `Option<Array3<f64>>` `(n_dates, rows, cols)` | meters | per-date tropospheric range delay subtracted; `Some` only when `troposphere_files` supplied |
@@ -252,36 +285,62 @@ boundary freely. eo can persist `velocity_mm_yr` for risk scoring and serve the 
 
 ### On-disk rasters (`work_directory`)
 
-All are single-band **Cloud-Optimized GeoTIFFs** (`float32`, internally tiled 256×256,
-DEFLATE-compressed, overviews) sharing `epsg` + `geotransform`:
+All are single-band **Cloud-Optimized GeoTIFFs**, internally tiled 256×256 with DEFLATE
+compression and overviews, sharing `epsg` and `geotransform`. The new status and availability
+rasters are UInt8; the remaining velocity-evidence rasters are Float32. `velocity_sigma.tif`
+and its ten support/status/diagnostic rasters require `write_velocity_uncertainty: true`.
 
 | File | Band | Units |
 |---|---|---|
-| `velocity.tif` | linear velocity | raster units/yr (m/yr or rad/yr) |
-| `velocity_sigma.tif` | one-sigma linear-rate uncertainty (opt-in) | raster units/yr |
+| `velocity.tif` | linear velocity; `VELOCITY_ESTIMATOR` identifies the point fit | `UNITTYPE=m/yr` or `rad/yr` |
+| `velocity_sigma.tif` | IID-conditional residual slope SE (opt-in, uncalibrated) | `UNITTYPE=m/yr` or `rad/yr` |
+| `velocity_valid_date_count.tif` | finite post-gauge dates used | count |
+| `velocity_regression_rank.tif` | intercept-plus-slope design rank | count |
+| `velocity_regression_dof.tif` | residual regression DOF | count |
+| `velocity_uncertainty_status.tif` | `0=unavailable;1=iid_conditional` | code |
+| `velocity_lag1_rho.tif` | raw lag-1 standardized-residual correlation | dimensionless |
+| `velocity_correlation_pair_count.tif` | adjacent residual pairs used | count |
+| `velocity_cadence_status.tif` | unavailable, regular/contiguous, irregular, or missing | code |
+| `velocity_correlation_available.tif` | lag-1 diagnostic eligibility | boolean |
+| `velocity_diagnostic_inflation_factor.tif` | non-inferential no-deflation factor | dimensionless |
+| `velocity_diagnostic_effective_sample_size.tif` | non-inferential effective N | count |
 | `timeseries_residual_rms.tif` | temporal motion-model fit residual RMS | meters or radians |
 | `network_misclosure_rms.tif` | SBAS network-inversion misclosure RMS (with posterior output) | meters or radians |
 | `temporal_coherence.tif` | temporal coherence | `[0, 1]` |
 | `displacement_NN.tif` | cumulative displacement at date `NN+1` | meters or radians |
-| `displacement_variance_NN.tif` | L2 posterior displacement variance (opt-in) | meters² or radians² |
-| `crlb_sigma_NN.tif` | CRLB σ at date `NN` (band 0 = reference; `UNITTYPE=rad`) | radians |
+| `displacement_variance_NN.tif` | L2 parameter-covariance diagonal under an independent-IFG error model (opt-in) | `UNITTYPE=m^2` or `rad^2` |
+| `crlb_sigma_NN.tif` | per-ministack marginal CRLB σ (band 0 = structural gauge; `UNITTYPE=rad`) | radians |
 | `conncomp_NN.tif` | unwrap connected-component labels for interferogram `NN` | integer labels |
 | `closure_phase_NN.tif` | nearest-neighbour closure of triplet `NN` (only if `write_closure_phase`) | radians |
 | `ionosphere_NN.tif` | ionospheric range delay at date `NN` (only if `ionosphere_files`) | meters |
 | `troposphere_NN.tif` | tropospheric range delay at date `NN` (only if `troposphere_files`) | meters |
 
-No-data is unset (the typed layers are filled, not masked); threshold on
-`temporal_coherence` to mask low-quality pixels downstream.
+With `phase_linking.write_covariance_operator: true`, a successful full-batch phase-link stage
+also writes:
 
-**CRLB → GroundPulse `confidence_score`.** `crlb_sigma` is the per-pixel, per-date
-*physical* uncertainty (radians) of the phase-linking estimate — the Cramér–Rao lower bound
-from the Fisher information of the coherence model. It is the missing input to GroundPulse's
-asset-risk `confidence_score`: a velocity is only as trustworthy as the σ of the phases it
-was fit from. A pixel with low CRLB σ (and high temporal coherence) carries a high-confidence
-velocity; a high-σ or `NaN` (singular-Γ, fully decorrelated) pixel should be down-weighted or
-masked. To reduce the per-date layer to one scalar per pixel for scoring, take a
-baseline-appropriate summary (e.g. the last date's σ, or the RMS across dates); the choice is
-the consumer's, so dolphinRust surfaces the full per-date bound rather than pre-collapsing it.
+| File | Contents |
+|---|---|
+| `phase_covariance_operator.h5` | chunked `sequential_source_dag_v1` topology and fixed-branch numeric replay state |
+| `phase_covariance_provenance.json` | final commit marker binding the HDF5 digest, method/schema, gauge, source/model status, disk admission, and inference block |
+
+The manifest must verify before the HDF5 file is consumed. Both files are uncalibrated sidecars.
+Current displacement and velocity inference code does not read them.
+
+Continuous evidence uses `NaN` when unavailable. Status and availability rasters use `0` as a
+valid unavailable/false value and do not declare `0` as nodata. Apply the validity/status
+contract as well as any downstream coherence threshold.
+
+**Science boundary.** `velocity_sigma.tif` is conditional on independent residuals and unit
+relative precision. The lag-1 fields are diagnostics and never rescale it. The stitched CRLB
+cube is not used in that fit because its changing ministack references do not carry the
+covariance needed to treat it as global per-date variance. `displacement_variance_NN.tif`
+retains only the parameter-covariance diagonal under an independent-IFG error model even though
+interferograms share acquisitions. Spatial referencing adds the target and reference marginal
+variances but omits their covariance; `SPATIAL_COVARIANCE` and
+`SPATIAL_REFERENCE_PROPAGATION` state that approximation. None of these products is total
+uncertainty, a confidence interval, field calibration, or asset risk.
+Use `CALIBRATION_STATUS`, `TEMPORAL_COVARIANCE`, and the status rasters; abstain where the
+required component is unavailable.
 
 ## 5b. Phase unwrapping: SNAPHU (default) vs tophu multi-scale
 

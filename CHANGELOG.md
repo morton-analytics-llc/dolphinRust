@@ -6,6 +6,109 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **`PhaseAngleLinearization`'s EMI inverse is now unrepresentable instead of `expect`ed**
+  (issue #98). The prepared branch state folds the EMI regularized-gamma inverse into the
+  `Emi` variant that owns it, replacing a detached `branch: FixedEstimatorBranch` +
+  `gamma_inverse: Option<Mat<f64>>` pair whose EMI-implies-`Some` invariant held only by
+  convention. `apply` matches the variant directly; no `Option` to unwrap remains on the
+  `prepare`/`apply` path. Behavior-preserving — `phase_angle_jvp` and the estimator JVP
+  contract tests (error precedence for `ZeroMagnitudeBranch`, `ThresholdBoundary`,
+  `EigenvalueTie`, `VanishingReference`) pass unchanged.
+
+## [v1.6.0] — 2026-08-30
+
+### Breaking changes
+- **Velocity uncertainty is now an uncalibrated IID-conditional component.**
+  `write_velocity_uncertainty` fits the finite post-gauge dates from the final corrected,
+  spatially referenced displacement series with unit relative precision. `velocity_sigma`
+  no longer consumes the stitched CRLB or applies the scalar AR(1) effective-N multiplier.
+  `correct_velocity_temporal_correlation: true` is rejected; the field remains readable only
+  for YAML compatibility. `write_velocity_uncertainty: true` currently supports only the
+  linear model and rejects seasonal or step terms. The public `VelocityOutputNeff` type and
+  `estimate_velocity_with_uncertainty_neff` function are replaced by
+  `VelocityDiagnosticsOutput` and `estimate_velocity_with_diagnostics`. Existing consumers
+  must treat the component as unavailable unless its per-pixel status is `iid_conditional`.
+  Enabling the flag also changes the point velocity from the full reconstructed-series fit using
+  stitched-CRLB relative precision with whole-pixel unit fallback to the unit-weighted post-gauge
+  fit, so served rates can change.
+  `DisplacementOutput.velocity_estimator` and `VELOCITY_ESTIMATOR` metadata expose the exact
+  path. Consumers must compare both estimators in a field canary before enabling the flag.
+- **Modeled but unsupported dolphin config values now fail before input I/O** (issue #50).
+  The public config tree has an exhaustive `Consumed` / `Conditional` /
+  `CompatibilityOnly` registry. Compatibility-only fields still deserialize and round-trip,
+  but a non-default value returns a path-specific config error instead of being ignored.
+  Unsupported ICU/PHASS/SPURT/Whirlwind unwrap methods, invalid SNAPHU/Tophu option strings,
+  and unbounded `output_options.epsg` also fail instead of falling through or claiming an
+  unimplemented CRS fallback. GroundPulse's checked-in real-dolphin YAML currently sets
+  `worker_settings.threads_per_worker: 6` and must be normalized before this engine is pinned;
+  its programmatic configs retain supported defaults.
+
+### Added
+- **Orbit ephemeris provenance.** Geometry provenance now reads the sourced
+  `/metadata/orbit/orbit_type` field, normalizing `POEORB`/`RESORB` to `precise`/`restituted`
+  while keeping missing, unknown, and mixed values explicit and non-fatal to other geometry
+  metadata. The artifact schema is `dolphinrust-geometry-provenance/4`; prior `/2` and `/3`
+  artifacts remain deserializable.
+- **A bounded sequential source-covariance replay operator is available behind an opt-in flag**
+  (issue #52). `phase_linking.write_covariance_operator` streams fixed-branch phase-link and
+  compression replay blocks into `phase_covariance_operator.h5`; a SHA-256-bound JSON manifest is
+  committed last. Same-pixel temporal covariance is contracted from verified primitive-source
+  factors without allocating a date-by-date-by-area cube, and acquisition 0 remains an exact zero
+  gauge row and column. The initial scope is full-batch CPU/f64, Rect support, `AlwaysFirst`, and
+  output reference 0. The CLI capture has no source-factor model and records
+  `source_model_unavailable`; the low-level API requires a matching external resolver. Artifacts
+  bind exact raw-source and numeric-factor receipts, and replay preflight reserves sparse-tree,
+  support-vector, and padded estimator workspace before source I/O. Artifacts
+  remain `uncalibrated` and `blocked_pending_issue_54_and_53`, and GroundPulse, resumable, spatial-
+  reference, and velocity consumers remain disconnected.
+- **Per-pixel temporal-fit support and diagnostics.** Velocity output now retains valid-date
+  count, regression rank/DOF, uncertainty status, cadence status, raw lag-1 residual
+  correlation, pair count, diagnostic-only inflation, and diagnostic-only effective sample
+  size. The same fields are written as co-registered rasters. Metadata states
+  `TEMPORAL_GAUGE=acquisition_0_excluded`, `TEMPORAL_COVARIANCE=not_modeled`, and
+  `CALIBRATION_STATUS=uncalibrated_component`. Exact-linear fits report the point estimate but
+  abstain on sigma because the residual scale is zero.
+- **Uncertainty COGs now carry physical-unit and spatial-reference metadata.**
+  `velocity_sigma.tif` declares `m/yr` or `rad/yr`; `displacement_variance_NN.tif` declares
+  `m^2` or `rad^2` and states that target/reference covariance is not modeled.
+- **Per-burst layover/shadow masks now enter before covariance and phase linking** (issue
+  #50). `layover_shadow_mask_files` accepts one single-band native-grid GTiff per active burst, maps
+  OPERA masks by burst ID independent of list order, and rejects missing, duplicate, extra,
+  unparseable, misaligned, partially covered, or changed incremental inputs. Zero, raster
+  nodata, GDAL-invalid pixels, and non-finite values are invalid; every finite nonzero pixel
+  is valid. A stride cell is invalid only when all of its native pixels are invalid, and that
+  validity reaches every final output layer. Resumable identity binds every mask backing file
+  reported by GDAL. The later unwrap `mask_file` remains independent.
+  GroundPulse does not yet extract or populate these masks; caller wiring requires a separate
+  released-engine integration.
+
+### Fixed
+- **Deterministic corrections now precede the final spatial reference.** Atmospheric and tide
+  corrections are applied before subtracting the selected reference history. Automatic whole-
+  frame and bounded selection excludes mask-invalid or non-finite displacement pixels, and the
+  bounded path reselects a target-local reference and refits through the same velocity fitting
+  path. The emitted CRLB is labeled as a changing-reference ministack diagnostic. Displacement
+  variance is labeled as a parameter-covariance diagonal under an independent-IFG error model,
+  which is uncalibrated because the interferograms share acquisitions. Full stitched-reference,
+  corrected temporal, and spatial-reference covariance are not inferred from the current
+  products. #52 and #54 landed in this release; #53 was closed as not planned, leaving the
+  conditional-sigma boundary in place.
+
+- **`ComparatorDiagnostics` reports the inner failure behind an adjusted-variance fallback**
+  (issue #95). The optional `source_status` field preserves the exact inner error under the
+  public `WeakParameterIdentification` status instead of erasing it; the field is omitted from
+  successful comparator JSON, so existing consumers are unaffected.
+- **Frozen-attempt spatial covariance validation is reproducible again** (issue #94).
+  Per-attempt frozen DGP streams, the fixed-L2 `1e8` phase/date condition policy, and the
+  `ill_conditioned` / `nondifferentiable_node` statuses were restored while keeping the
+  prepared estimator/JVP cache and bounded parallel replay.
+- **The temporal synthetic scorer can certify a candidate** (issue #96). `coverage_bias_interval_score/7`
+  adds `oracle_calibration`, `candidate_evaluation`, and `forensic_v5` modes with familywise
+  bias calibration, disjoint seed domains enforced as an interval-overlap check, and a
+  hash-bound calibration receipt. `forensic_v5` cannot reach a passing verdict, so the frozen
+  v5 no-go cannot be certified retroactively.
+
 ## [v1.5.0] — 2026-08-17
 
 ### Breaking changes
@@ -646,6 +749,7 @@ physically-meaningful tolerances.
 - CRLB / closure-phase rasters, complex-GeoTIFF (CFloat32) writer, NISAR custom geotransform,
   `EagerLoader` prefetch, and tophu/spurt/whirlwind unwrappers are deferred (see STATUS.md).
 
-[Unreleased]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.6.0...HEAD
+[v1.6.0]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.5.0...v1.6.0
 [v1.5.0]: https://github.com/morton-analytics-llc/dolphinRust/compare/v1.4.0...v1.5.0
 [1.0.0]: https://github.com/morton-analytics-llc/dolphinRust/releases/tag/v1.0.0

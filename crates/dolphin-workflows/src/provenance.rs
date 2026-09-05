@@ -15,8 +15,8 @@ use chrono::NaiveDateTime;
 use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_corrections::LosGeometry;
 use dolphin_io::{
-    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, CslcBurstMetadata,
-    CslcIdentification, CslcOrbit,
+    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, read_cslc_orbit_type,
+    CslcBurstMetadata, CslcIdentification, CslcOrbit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,13 +25,14 @@ use crate::crop::ProcessingBoundsProvenance;
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/3";
-const METHOD_VERSION: &str = "3.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/4";
+const METHOD_VERSION: &str = "4.0.0";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
 /// `temporal_coherence.tif`; relative to `work_directory`.
 const PHASE_LINKING_COHERENCE_KEY: &str = "phase_linking_coherence.tif";
+const PHASE_SIMILARITY_KEY: &str = "phase_similarity.tif";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 const HEADING_SPREAD_GATE_DEG: f64 = 1.0;
@@ -49,12 +50,15 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/3`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/4`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
     /// `ascending`/`descending`, normalized lowercase.
     pub orbit_direction: Option<String>,
+    /// Orbit ephemeris class: `precise` or `restituted` when sourced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbit_ephemeris_class: Option<String>,
     /// Spatial mean ellipsoidal incidence over the output grid, degrees.
     pub incidence_angle_deg: Option<f64>,
     /// Population std of the per-pixel incidence, degrees.
@@ -75,6 +79,9 @@ pub struct GeometryProvenance {
     /// Artifact key of the phase-linking coherence raster, relative to
     /// `work_directory`; absent when `calc_average_coh` is disabled.
     pub phase_linking_coherence: Option<String>,
+    /// Artifact key of the spatial phase-similarity raster, relative to
+    /// `work_directory`; absent when `write_phase_similarity` is disabled.
+    pub phase_similarity: Option<String>,
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
@@ -206,6 +213,7 @@ pub fn assemble_geometry_provenance_with_coverage(
     let mut fields = BTreeMap::new();
     let cslc = read_granules(cfg, &mut fields);
     let orbit_direction = orbit_direction(&cslc, &mut fields);
+    let orbit_ephemeris_class = orbit_ephemeris_class(cfg, &mut fields);
     let heading_deg = heading(&cslc, &mut fields);
     let native_range_spacing_m = range_spacing(&cslc, &mut fields);
     let native_azimuth_spacing_m = azimuth_spacing(&cslc, &mut fields);
@@ -225,6 +233,7 @@ pub fn assemble_geometry_provenance_with_coverage(
         schema: SCHEMA.into(),
         method_version: METHOD_VERSION.into(),
         orbit_direction: orbit_direction.clone(),
+        orbit_ephemeris_class,
         incidence_angle_deg: incidence.map(|s| s.mean_deg),
         incidence_angle_spread_deg: incidence.map(|s| s.std_deg),
         incidence_angle_min_deg: incidence.map(|s| s.min_deg),
@@ -237,6 +246,10 @@ pub fn assemble_geometry_provenance_with_coverage(
             .phase_linking
             .calc_average_coh
             .then(|| PHASE_LINKING_COHERENCE_KEY.into()),
+        phase_similarity: cfg
+            .phase_linking
+            .write_phase_similarity
+            .then(|| PHASE_SIMILARITY_KEY.into()),
         decomposition_geometry_complete: orbit_direction.is_some()
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()
@@ -270,6 +283,8 @@ const CSLC_FIELDS: [&str; 5] = [
     "native_azimuth_spacing_m",
     "acquisition_time_of_day_utc_s",
 ];
+
+const ORBIT_EPHEMERIS_FIELD: &[&str] = &["orbit_ephemeris_class"];
 
 /// `Sourced` entry with no raw value or note (the common case).
 fn sourced(source_files: Vec<String>, source_keys: Vec<String>, method: &str) -> FieldProvenance {
@@ -338,6 +353,81 @@ fn granule_name(path: &Path) -> String {
 
 fn granule_names(granules: &[GranuleMeta]) -> Vec<String> {
     granules.iter().map(|g| g.name.clone()).collect()
+}
+
+/// Read and classify `/metadata/orbit/orbit_type` independently from the
+/// geometry metadata bundle. Missing or invalid orbit class never erases other
+/// readable geometry provenance.
+fn orbit_ephemeris_class(
+    cfg: &DisplacementWorkflow,
+    fields: &mut BTreeMap<String, FieldProvenance>,
+) -> Option<String> {
+    if cfg.input_options.input_type == InputType::NisarGslc {
+        return mark_absent(
+            fields,
+            ORBIT_EPHEMERIS_FIELD,
+            "NISAR GSLC orbit ephemeris class mapping not implemented",
+        );
+    }
+    if cfg.cslc_file_list.is_empty() {
+        return mark_absent(fields, ORBIT_EPHEMERIS_FIELD, "cslc_file_list is empty");
+    }
+    let mut raw_values = Vec::with_capacity(cfg.cslc_file_list.len());
+    for path in &cfg.cslc_file_list {
+        let name = granule_name(path);
+        match read_cslc_orbit_type(path) {
+            Ok(value) => raw_values.push(value),
+            Err(error) => {
+                return mark_absent(
+                    fields,
+                    ORBIT_EPHEMERIS_FIELD,
+                    &format!("granule {name}: orbit_type unreadable ({error})"),
+                );
+            }
+        }
+    }
+    let normalized = raw_values
+        .iter()
+        .map(|value| {
+            value
+                .trim_matches(|character: char| {
+                    character == '\0' || character.is_ascii_whitespace()
+                })
+                .to_ascii_uppercase()
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = normalized.first() else {
+        return mark_absent(fields, ORBIT_EPHEMERIS_FIELD, "orbit_type values are empty");
+    };
+    let class = match first.as_str() {
+        "POEORB" => "precise",
+        "RESORB" => "restituted",
+        _ => {
+            return mark_absent(
+                fields,
+                ORBIT_EPHEMERIS_FIELD,
+                &format!("unrecognized orbit_type values {raw_values:?}"),
+            );
+        }
+    };
+    if normalized.iter().any(|value| value != first) {
+        return mark_absent(
+            fields,
+            ORBIT_EPHEMERIS_FIELD,
+            &format!("orbit_type inconsistent across granules: {raw_values:?}"),
+        );
+    }
+    fields.insert(
+        "orbit_ephemeris_class".into(),
+        FieldProvenance::Sourced {
+            source_files: cfg.cslc_file_list.iter().map(|path| granule_name(path)).collect(),
+            source_keys: vec!["/metadata/orbit/orbit_type".into()],
+            method: "read scalar per granule, case-insensitive consistency; POEORB=precise, RESORB=restituted".into(),
+            raw_value: Some(raw_values[0].clone()),
+            note: None,
+        },
+    );
+    Some(class.into())
 }
 
 /// `/identification/orbit_pass_direction`, case-insensitive, all granules agreeing.

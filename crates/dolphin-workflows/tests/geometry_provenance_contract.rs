@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use dolphin_core::config::DisplacementWorkflow;
+use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_corrections::geometry::resolve_los_geometry;
 use dolphin_corrections::LosGeometry;
 use dolphin_workflows::provenance::{
@@ -40,6 +40,24 @@ fn cfg_with_inputs(files: &[PathBuf]) -> DisplacementWorkflow {
         cslc_file_list: files.to_vec(),
         ..Default::default()
     }
+}
+
+fn orbit_type_fixture(value: Option<&str>, suffix: &str) -> PathBuf {
+    let source = fixtures().join("geomprov_ci_cslc.h5");
+    let target = std::env::temp_dir().join(format!("dolphin_geomprov_orbit_type_{suffix}.h5"));
+    let _ = std::fs::remove_file(&target);
+    std::fs::copy(source, &target).unwrap();
+    let file = hdf5::File::open_rw(&target).unwrap();
+    let orbit = file.group("metadata/orbit").unwrap();
+    match value {
+        Some(value) => orbit
+            .dataset("orbit_type")
+            .unwrap()
+            .write_scalar(&hdf5::types::FixedAscii::<64>::from_ascii(value).unwrap())
+            .unwrap(),
+        None => orbit.unlink("orbit_type").unwrap(),
+    }
+    target
 }
 
 /// Config whose `geometry_files` mirror the run invariant that a resolved
@@ -93,6 +111,26 @@ fn real_metadata_sample_maps_to_exported_fields() {
         "heading {heading} vs oracle 189.981317"
     );
     assert_eq!(prov.native_range_spacing_m, Some(2.329_562_114_715_323));
+    assert_eq!(prov.orbit_ephemeris_class.as_deref(), Some("precise"));
+    let Some(FieldProvenance::Sourced {
+        source_keys,
+        raw_value,
+        ..
+    }) = prov.geometry_provenance.fields.get("orbit_ephemeris_class")
+    else {
+        panic!("orbit_ephemeris_class not sourced");
+    };
+    assert_eq!(raw_value.as_deref(), Some("POEORB"));
+    assert_eq!(source_keys, &["/metadata/orbit/orbit_type"]);
+    let decoded: GeometryProvenance =
+        serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/4");
+    assert_eq!(decoded.orbit_ephemeris_class.as_deref(), Some("precise"));
+    assert!(matches!(
+        decoded.geometry_provenance.fields.get("orbit_ephemeris_class"),
+        Some(FieldProvenance::Sourced { source_keys, .. })
+            if source_keys == &["/metadata/orbit/orbit_type"]
+    ));
     let az = prov
         .native_azimuth_spacing_m
         .expect("azimuth spacing sourced");
@@ -156,7 +194,7 @@ fn coverage_v3_round_trips_without_identifiers() {
     let json = serde_json::to_string(&provenance).unwrap();
     let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/3");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/4");
     assert_eq!(decoded.input_coverage, Some(coverage));
     for forbidden in [
         "source_path",
@@ -186,6 +224,65 @@ fn provenance_v2_without_coverage_still_deserializes() {
     let decoded: GeometryProvenance = serde_json::from_value(value).unwrap();
     assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/2");
     assert_eq!(decoded.input_coverage, None);
+    assert_eq!(decoded.orbit_ephemeris_class, None);
+}
+
+#[test]
+fn orbit_type_normalizes_resorb_without_changing_geometry() {
+    let _hdf5 = hdf5_guard();
+    let path = orbit_type_fixture(Some("RESORB"), "resorb");
+    let prov = assemble_geometry_provenance(&cfg_with_inputs(std::slice::from_ref(&path)), None);
+
+    assert_eq!(prov.orbit_ephemeris_class.as_deref(), Some("restituted"));
+    assert_eq!(prov.orbit_direction.as_deref(), Some("descending"));
+    assert!(prov.heading_deg.is_some());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn missing_or_unknown_orbit_type_is_absent_only_for_new_field() {
+    let _hdf5 = hdf5_guard();
+    for (value, suffix, expected_reason) in [
+        (None, "missing", "orbit_type"),
+        (Some("UNKNOWN"), "unknown", "unrecognized orbit_type"),
+    ] {
+        let path = orbit_type_fixture(value, suffix);
+        let prov =
+            assemble_geometry_provenance(&cfg_with_inputs(std::slice::from_ref(&path)), None);
+        assert_eq!(prov.orbit_ephemeris_class, None);
+        assert!(absent_reason(&prov, "orbit_ephemeris_class").contains(expected_reason));
+        assert_eq!(prov.orbit_direction.as_deref(), Some("descending"));
+        assert!(prov.heading_deg.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn mixed_orbit_types_are_absent_without_erasing_geometry() {
+    let _hdf5 = hdf5_guard();
+    let precise = orbit_type_fixture(Some("POEORB"), "mixed_precise");
+    let restituted = orbit_type_fixture(Some("RESORB"), "mixed_restituted");
+    let prov = assemble_geometry_provenance(
+        &cfg_with_inputs(&[precise.clone(), restituted.clone()]),
+        None,
+    );
+
+    assert_eq!(prov.orbit_ephemeris_class, None);
+    assert!(absent_reason(&prov, "orbit_ephemeris_class").contains("inconsistent"));
+    assert_eq!(prov.orbit_direction.as_deref(), Some("descending"));
+    assert!(prov.heading_deg.is_some());
+    let _ = std::fs::remove_file(precise);
+    let _ = std::fs::remove_file(restituted);
+}
+
+#[test]
+fn nisar_orbit_type_is_explicitly_absent() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.input_options.input_type = InputType::NisarGslc;
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.orbit_ephemeris_class, None);
+    assert!(absent_reason(&prov, "orbit_ephemeris_class").contains("NISAR"));
 }
 
 /// Contract 2a: a /data-only granule (cropped, no metadata groups) yields explicit
@@ -197,6 +294,7 @@ fn data_only_granule_is_explicitly_absent() {
     let prov = assemble_geometry_provenance(&cfg, None);
 
     assert_eq!(prov.orbit_direction, None);
+    assert_eq!(prov.orbit_ephemeris_class, None);
     assert_eq!(prov.incidence_angle_deg, None);
     assert_eq!(prov.heading_deg, None);
     assert_eq!(prov.native_range_spacing_m, None);
@@ -205,6 +303,7 @@ fn data_only_granule_is_explicitly_absent() {
     assert!(!prov.decomposition_geometry_complete);
     for field in [
         "orbit_direction",
+        "orbit_ephemeris_class",
         "incidence_angle_deg",
         "heading_deg",
         "native_range_spacing_m",

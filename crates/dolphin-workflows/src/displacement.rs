@@ -5,42 +5,79 @@
 //! velocity → write COGs. Single-burst stacks take the stitch identity path.
 //! Synchronous; the host app bridges to its runtime.
 
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dolphin_core::config::{DisplacementWorkflow, InputType, TimeseriesMethod, UnwrapMethod};
+use dolphin_core::config::{
+    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, TimeseriesMethod,
+    UnwrapMethod,
+};
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
+    covariance_identity_index_peak_bytes, covariance_source_model_identity_digest,
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
-    read_nisar_geotransform, read_nisar_window, write_raster, write_raster_with_metadata, GeoInfo,
+    read_nisar_geotransform, read_nisar_window, recover_incomplete_covariance_operator,
+    write_raster, write_raster_with_metadata, CovarianceBurstPlan, CovarianceOperatorBlock,
+    CovarianceOperatorGrid, CovarianceOperatorMetadata, CovarianceOperatorPlan,
+    CovarianceOperatorWriter, CovarianceReplayStatus, GeoInfo, SourceReplayIdentity,
+    StitchedCovarianceStatus,
 };
 use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
+use dolphin_stack::MiniStackPlanner;
 use dolphin_timeseries::{
-    build_network, estimate_velocity, estimate_velocity_with_model,
-    estimate_velocity_with_uncertainty, estimate_velocity_with_uncertainty_neff,
-    get_incidence_matrix, invert_stack, invert_stack_l1, invert_stack_with_uncertainty,
-    loop_closure_qc, mask_failed_loops, network_triplets, reference_to_point,
-    select_reference_point, L1Config, LoopClosureQc, NetworkConfig, VelocityModel,
+    build_network, estimate_velocity, estimate_velocity_with_diagnostics,
+    estimate_velocity_with_model, estimate_velocity_with_uncertainty, get_incidence_matrix,
+    invert_stack, invert_stack_l1, invert_stack_with_uncertainty, loop_closure_qc,
+    mask_failed_loops, network_triplets, reference_to_point, select_reference_point, L1Config,
+    LoopClosureQc, NetworkConfig, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
     DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
+use sha2::{Digest, Sha256};
 
-use crate::burst::{burst_offset, frame_grid, workflow_groups, BurstGeo, FrameGrid};
+use crate::burst::{
+    burst_offset, frame_grid, resolve_layover_shadow_masks, workflow_groups, BurstGeo, FrameGrid,
+};
 use crate::corrections::{apply_corrections, CorrectionLayers};
+use crate::covariance_artifact::{
+    finalize_covariance_artifact, preflight_covariance_artifact_disk_with_identity_index,
+    CovarianceArtifactDiskAdmission, CovarianceArtifactManifest, CovarianceArtifactTransaction,
+};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
-use crate::dates::{acquisition_days, parse_date};
+use crate::cslc_covariance_source::{
+    empirical_factor_config, CslcCovarianceManifest, CslcCovarianceSourceResolver,
+    CslcCovarianceValidityReader, CSLC_COVARIANCE_SOURCE_MODEL,
+    CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
+    CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+};
+use crate::dates::parse_date;
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
-    run_sequential, run_sequential_resumable, update_sequential, SequentialConfig,
+    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
+    run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
+    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, update_sequential,
+    update_sequential_masked, SequentialConfig, SequentialCovarianceCaptureRequest,
     SequentialOutput, SequentialState,
+};
+use crate::sequential_covariance::{
+    sequential_replay_config_digest, sequential_replay_kernel_digest,
+};
+use crate::spatial_reference_covariance_output::{
+    correction_order_digest, unwrap_branch_digest, BurstOutputMapping, CapturedReplayTile,
+    FixedL2WorkflowInputs, ProductionCovarianceReplayContext, ProductionCovarianceState,
+    NO_BURST_OWNER,
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
@@ -53,6 +90,8 @@ use dolphin_corrections::LosGeometry;
 const SENTINEL1_WAVELENGTH_M: f64 = 0.055_465_76;
 const MIN_SEAM_SUPPORT: usize = 4;
 const MIN_SEAM_COHERENCE: f64 = 0.5;
+const MASK_PREFLIGHT_STRIPE_ROWS: usize = 1_024;
+const COVARIANCE_BRANCH_TOLERANCE: f64 = 1e-10;
 
 /// Typed failure from multi-burst phase-offset reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +111,43 @@ pub enum StitchError {
     },
 }
 
+/// Point estimator used for the emitted linear velocity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VelocityEstimator {
+    /// Full reconstructed series, ordinary least squares.
+    LinearFullSeriesUnitPrecision,
+    /// Full reconstructed series, weighted by stitched-CRLB-derived relative
+    /// precision where every date has a finite bound, with unit precision for
+    /// an entire pixel otherwise. The stitched CRLB is not global calibrated
+    /// covariance.
+    LinearFullSeriesStitchedCrlbWithUnitFallback,
+    /// Finite post-gauge dates, ordinary least squares. This is selected when
+    /// the IID-conditional velocity component is enabled.
+    LinearPostGaugeUnitPrecision,
+    /// Full reconstructed series with configured seasonal/step terms and unit
+    /// relative precision.
+    TimeFunctionFullSeriesUnitPrecision,
+    /// Full reconstructed series with configured seasonal/step terms and
+    /// stitched-CRLB-derived relative precision with whole-pixel unit fallback.
+    TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
+}
+
+impl VelocityEstimator {
+    pub(crate) const fn metadata_value(self) -> &'static str {
+        match self {
+            Self::LinearFullSeriesUnitPrecision => "linear_full_series_unit_precision",
+            Self::LinearFullSeriesStitchedCrlbWithUnitFallback => {
+                "linear_full_series_stitched_crlb_with_unit_fallback"
+            }
+            Self::LinearPostGaugeUnitPrecision => "linear_post_gauge_unit_precision",
+            Self::TimeFunctionFullSeriesUnitPrecision => "time_function_full_series_unit_precision",
+            Self::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback => {
+                "time_function_full_series_stitched_crlb_with_unit_fallback"
+            }
+        }
+    }
+}
+
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
 pub struct DisplacementOutput {
     /// Per-date cumulative displacement, `(n_dates-1, rows, cols)`, referenced
@@ -81,13 +157,23 @@ pub struct DisplacementOutput {
     /// Linear velocity per pixel in raster units/year (m/yr with wavelength,
     /// else rad/yr), `(rows, cols)`.
     pub velocity: Array2<f64>,
-    /// Linear velocity per pixel in **mm/yr** (the rate eo stores for risk
-    /// scoring). Derived from the LOS phase rate via `-λ/4π`, using the config
-    /// wavelength or the Sentinel-1 default, `(rows, cols)`.
+    /// Exact point-estimator identity for [`Self::velocity`] and
+    /// [`Self::velocity_mm_yr`].
+    pub velocity_estimator: VelocityEstimator,
+    /// Linear LOS ground velocity per pixel in **mm/yr**. GroundPulse may retain
+    /// this as local motion evidence, but it is not asset response or asset risk.
+    /// Derived from the LOS phase rate via `-λ/4π`, using the config wavelength
+    /// or the Sentinel-1 default, `(rows, cols)`.
     pub velocity_mm_yr: Array2<f64>,
-    /// One-sigma linear-rate uncertainty in the same units/year as `velocity`.
+    /// Independent-residual conditional linear-rate standard error in the same
+    /// units/year as `velocity`. This is not total or field-calibrated uncertainty.
     pub velocity_sigma: Option<Array2<f64>>,
-    /// L2 posterior displacement variance in the same units squared as `displacement`.
+    /// Per-pixel temporal-fit support and non-inferential correlation diagnostics.
+    pub velocity_diagnostics: Option<VelocityTemporalDiagnostics>,
+    /// L2 network-parameter covariance diagonal under an independent-IFG error
+    /// assumption, in the same units squared as `displacement`. Interferograms
+    /// sharing acquisitions are correlated, so this is not a calibrated posterior
+    /// or independent empirical uncertainty.
     pub displacement_variance: Option<Array3<f64>>,
     /// SBAS network-inversion misclosure RMS (residual of `A*phi = dphi` in the
     /// same units as `displacement`) — how well the interferogram network
@@ -112,12 +198,18 @@ pub struct DisplacementOutput {
     /// Mean coherence-matrix magnitude across real acquisitions, distinct from
     /// estimator-fit temporal coherence. `None` unless `calc_average_coh` is on.
     pub phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial neighbour-phase agreement per pixel (Wang et al. 2022 eq. 5),
+    /// `(rows, cols)`. A distinct QA signal from the temporal/coherence layers:
+    /// it falls at phase discontinuities and on isolated scatterers. `Some` only
+    /// when `phase_linking.write_phase_similarity` is set.
+    pub phase_similarity: Option<Array2<f64>>,
     /// Pixels with complete temporal input support after burst mosaicking and trim.
     pub validity_mask: Array2<bool>,
-    /// Per-date CRLB phase-estimate σ (radians), `(n_dates, rows, cols)`, band 0 =
-    /// reference (σ=0); a singular-Γ pixel is `NaN`. The physical uncertainty that
-    /// feeds GroundPulse's `confidence_score`. `None` when `phase_linking.write_crlb`
-    /// is off. Present by default (dolphin defaults `write_crlb = true`).
+    /// Per-ministack marginal CRLB phase-estimate σ (radians), stitched as
+    /// `(n_dates, rows, cols)`. Band 0 is a structural gauge zero and later
+    /// ministacks use changing compressed references; cross-date covariance is
+    /// not propagated. This is a quality diagnostic, not global per-date or
+    /// predictive uncertainty. `None` when `phase_linking.write_crlb` is off.
     pub crlb_sigma: Option<Array3<f64>>,
     /// Per-triplet nearest-neighbour closure phase (radians), band-major; the
     /// non-closure diagnostic. `None` unless `phase_linking.write_closure_phase`
@@ -156,6 +248,32 @@ pub struct DisplacementOutput {
     /// eo #120), mirrored on disk as `geometry_provenance.json`. Always present;
     /// unsourceable fields are explicitly absent inside it, never defaulted.
     pub geometry_provenance: GeometryProvenance,
+}
+
+/// Temporal-fit evidence emitted with [`DisplacementOutput::velocity_sigma`].
+/// Correlation-derived fields are diagnostics only and never rescale the standard error.
+#[derive(Debug, PartialEq)]
+pub struct VelocityTemporalDiagnostics {
+    /// Number of finite post-gauge dates used by the fit.
+    pub valid_date_count: Array2<u32>,
+    /// Rank of the intercept-plus-slope design.
+    pub regression_rank: Array2<u32>,
+    /// Residual degrees of freedom, `valid_date_count - regression_rank`.
+    pub regression_dof: Array2<u32>,
+    /// Availability and interpretation of the conditional standard error.
+    pub uncertainty_status: Array2<VelocityUncertaintyStatus>,
+    /// Raw lag-one correlation of standardized residuals.
+    pub lag1_rho: Array2<f64>,
+    /// Number of adjacent residual pairs used for `lag1_rho`.
+    pub correlation_pair_count: Array2<u32>,
+    /// Cadence classification gating lag-one diagnostics.
+    pub cadence_status: Array2<VelocityCadenceStatus>,
+    /// Whether the lag-one diagnostics passed their support gates.
+    pub correlation_available: Array2<bool>,
+    /// Diagnostic-only no-deflation factor; it does not rescale `velocity_sigma`.
+    pub diagnostic_inflation_factor: Array2<f64>,
+    /// Diagnostic-only effective sample size clamped to `[1, valid_date_count]`.
+    pub diagnostic_effective_sample_size: Array2<f64>,
 }
 
 /// Current and high-water resident memory from Linux procfs, in KiB. Zeros mean
@@ -226,55 +344,103 @@ pub fn run_displacement_with_output_policy(
     cfg: &DisplacementWorkflow,
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
-    validate_uncertainty_options(cfg)?;
+    validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator
+            || output_policy == DisplacementOutputPolicy::Full,
+        "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
+    );
     let groups = workflow_groups(cfg)?;
+    validate_common_burst_dates(cfg, &groups)?;
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    let mut covariance = match cfg.phase_linking.write_covariance_operator {
+        true => Some(CovarianceCaptureArtifact::create(
+            cfg,
+            &groups,
+            crop.as_ref(),
+        )?),
+        false => None,
+    };
     // One compute engine for the whole run: it acquires a single GPU context (if
     // selected and available) and is reused across every burst + ministack.
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let bursts = timed("phase_linking", || {
         groups
-            .values()
+            .iter()
             .enumerate()
-            .filter_map(|(index, idxs)| {
+            .filter_map(|(index, (id, idxs))| {
                 let window = crop
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(link_one_burst(cfg, idxs, index, &engine, window))
+                Some(link_one_burst(
+                    cfg,
+                    idxs,
+                    id,
+                    index,
+                    &engine,
+                    window,
+                    prepared_masks[id].as_ref(),
+                    covariance.as_mut(),
+                ))
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    finish_displacement(cfg, bursts, crop.as_ref(), output_policy)
+    let covariance_replay = covariance
+        .map(|covariance| covariance.finish(prepared_masks))
+        .transpose()?;
+    finish_displacement(cfg, bursts, crop.as_ref(), output_policy, covariance_replay)
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
 /// inversion → atmospheric corrections → reference → velocity → write COGs.
 /// Identical for a full run and an incremental update — both feed it the same
 /// per-burst phase-linking products, so both produce the same output.
+#[allow(clippy::too_many_lines)]
 fn finish_displacement(
     cfg: &DisplacementWorkflow,
     bursts: Vec<BurstLink>,
     crop: Option<&BoundedPlan>,
     output_policy: DisplacementOutputPolicy,
+    covariance_replay: Option<ProductionCovarianceReplayContext>,
 ) -> Result<DisplacementOutput> {
     let groups = workflow_groups(cfg)?;
     let days = bursts
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
-    let stitched = timed("stitch", || stitch_bursts(bursts))?;
+    let stitched = timed("stitch", || {
+        stitch_bursts(bursts, cfg.phase_linking.write_covariance_operator)
+    })?;
     let validity_mask = stitched.validity_mask;
     let burst_coverage = stitched.coverage;
     let mut pl = stitched.pl;
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
+    // Spatial neighbour-phase agreement, computed on the stitched linked phase
+    // (single-reference ifgs) the way dolphin runs `create_similarities` on its
+    // stitched rasters, not per-burst.
+    let phase_similarity = cfg.phase_linking.write_phase_similarity.then(|| {
+        timed("phase_similarity", || {
+            dolphin_phaselink::estimate_phase_similarity(
+                pl.view(),
+                cfg.phase_linking.phase_similarity_search_radius,
+                dolphin_phaselink::PhaseSimilaritySummary::Median,
+                Some(validity_mask.view()),
+            )
+        })
+    });
     let temporal_coherence = stitched.temp_coh;
-    let geo = stitched.geo;
-    let epsg = (geo.epsg != 0).then_some(geo.epsg);
-    let geotransform = geo.geotransform;
+    let epsg = (stitched.geo.epsg != 0).then_some(stitched.geo.epsg);
+    let geotransform = stitched.geo.geotransform;
     anyhow::ensure!(
         days.len() == pl.dim().0,
         "parsed {} dates but phase-linking produced {} acquisitions",
@@ -295,6 +461,12 @@ fn finish_displacement(
     })?;
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
+    let configured_reference = checked_configured_analysis_reference(
+        cfg.timeseries_options.reference_point,
+        crop,
+        temporal_coherence.view(),
+        validity_mask.view(),
+    )?;
 
     let unwrap = timed("unwrap", || {
         unwrap_network(
@@ -302,48 +474,106 @@ fn finish_displacement(
             pl.view(),
             &pairs,
             temporal_coherence.view(),
+            validity_mask.view(),
             geotransform,
             epsg,
         )
     })?;
-    let (mut inversion, loop_closure) =
-        solve_time_series(cfg, unwrap.unwrapped, &pairs, stitched.crlb_sigma.as_ref())?;
-    // Spatially reference the series to a stable pixel (dolphin parity): the
-    // configured point, else the center-of-mass of the high-coherence region.
-    let configured_reference = configured_analysis_reference(
-        cfg.timeseries_options.reference_point,
-        crop,
-        temporal_coherence.dim(),
+    let (mut inversion, loop_closure) = solve_time_series(
+        cfg,
+        unwrap.unwrapped,
+        &pairs,
+        stitched.crlb_sigma.as_ref(),
+        cfg.phase_linking.write_covariance_operator,
     )?;
-    let analysis_reference_point = configured_reference.or_else(|| {
-        select_reference_point(
-            temporal_coherence.view(),
-            cfg.timeseries_options.correlation_threshold,
-        )
-    });
+    // Atmospheric corrections subtract per-date delay from the inverted series
+    // before the final spatial reference and velocity. Reference selection runs
+    // on the corrected series so it cannot choose a high-coherence pixel whose
+    // displacement became non-finite.
     let date_files = first_burst_files(cfg, &groups);
-    let corrections = timed("corrections", || {
-        correct_and_reference(
-            cfg,
+    let (corrections, analysis_reference_point) = timed("corrections", || {
+        correct_then_reference(
             &mut inversion.displacement,
-            &date_files,
-            GeoInfo {
-                epsg: epsg.unwrap_or(0),
-                geotransform,
+            |displacement| {
+                correct_and_reference(
+                    cfg,
+                    displacement,
+                    &date_files,
+                    GeoInfo {
+                        epsg: epsg.unwrap_or(0),
+                        geotransform,
+                    },
+                    None,
+                )
             },
-            analysis_reference_point,
+            |displacement| {
+                if let Some(point) = configured_reference {
+                    anyhow::ensure!(
+                        reference_pixel_is_valid(validity_mask.view(), displacement, point),
+                        "timeseries_options.reference_point has non-finite corrected displacement"
+                    );
+                    return Ok(Some(point));
+                }
+                let selected = select_valid_reference_point(
+                    temporal_coherence.view(),
+                    validity_mask.view(),
+                    displacement,
+                    cfg.timeseries_options.correlation_threshold,
+                );
+                anyhow::ensure!(
+                    selected.is_some() || !cfg.timeseries_options.write_velocity_uncertainty,
+                    "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
+                );
+                Ok(selected)
+            },
         )
     })?;
+    let production_covariance = if cfg.phase_linking.write_covariance_operator {
+        let backend_config = serde_json::to_vec(&cfg.unwrap_options)
+            .context("serializing production unwrap configuration")?;
+        Some(ProductionCovarianceState {
+            replay_context: covariance_replay,
+            fixed_l2_inputs: inversion.fixed_l2_inputs.take(),
+            ownership: stitched
+                .ownership
+                .context("covariance output requires retained burst ownership")?,
+            seam_rotations: stitched
+                .seam_rotations
+                .context("covariance output requires retained seam rotations")?,
+            source_burst_ids: groups.keys().cloned().collect(),
+            burst_output_mappings: stitched
+                .burst_output_mappings
+                .context("covariance output requires burst coordinate mappings")?,
+            analysis_origin: (0, 0),
+            correction_order_digest: correction_order_digest(
+                &cfg.correction_options,
+                cfg.input_options.wavelength,
+                &corrections,
+            )?,
+            unwrap_branch_digest: unwrap_branch_digest(
+                cfg.unwrap_options.unwrap_method,
+                &backend_config,
+                &pairs,
+                validity_mask.view(),
+                unwrap.connected_components.view(),
+                cfg.timeseries_options.mask_unwrap_loop_errors,
+            ),
+        })
+    } else {
+        None
+    };
     let (velocity_model, fit) = frame_velocity(
         cfg,
         inversion.displacement.view(),
         &days,
         stitched.crlb_sigma.as_ref(),
+        analysis_reference_point,
         &date_files,
     )?;
     let spatial = SpatialProducts {
         disp_rad: inversion.displacement,
         vel_rad: fit.velocity,
+        velocity_estimator: fit.estimator,
         velocity_model,
         velocity_terms: fit.terms,
         loop_closure,
@@ -351,6 +581,7 @@ fn finish_displacement(
         validity_mask,
         burst_coverage,
         phase_linking_coherence: stitched.phase_linking_coherence,
+        phase_similarity,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
         corrections,
@@ -358,16 +589,64 @@ fn finish_displacement(
         network_misclosure_rad: inversion.network_misclosure_rms,
         timeseries_residual_rad: fit.residual_rms,
         velocity_sigma_rad: fit.sigma,
+        velocity_diagnostics: fit.diagnostics,
         interferogram_pairs: pairs,
         unwrap_connected_components: unwrap.connected_components,
         geotransform,
         reference_point: analysis_reference_point,
+        production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
 }
 
+fn correct_then_reference(
+    displacement: &mut Array3<f64>,
+    correct: impl FnOnce(&mut Array3<f64>) -> Result<CorrectionLayers>,
+    select_reference: impl FnOnce(ArrayView3<f64>) -> Result<Option<(usize, usize)>>,
+) -> Result<(CorrectionLayers, Option<(usize, usize)>)> {
+    let corrections = correct(displacement)?;
+    let reference_point = select_reference(displacement.view())?;
+    if let Some(point) = reference_point {
+        reference_to_point(displacement, point);
+    }
+    Ok((corrections, reference_point))
+}
+
+fn reference_pixel_is_valid(
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+    point: (usize, usize),
+) -> bool {
+    validity_mask[point]
+        && displacement
+            .axis_iter(Axis(0))
+            .all(|band| band[point].is_finite())
+}
+
+fn select_valid_reference_point(
+    quality: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+    threshold: f64,
+) -> Option<(usize, usize)> {
+    if quality.dim() != validity_mask.dim()
+        || quality.dim() != (displacement.dim().1, displacement.dim().2)
+    {
+        return None;
+    }
+    let eligible_quality = Array2::from_shape_fn(quality.dim(), |point| {
+        if reference_pixel_is_valid(validity_mask, displacement, point) {
+            quality[point]
+        } else {
+            f64::NAN
+        }
+    });
+    select_reference_point(eligible_quality.view(), threshold)
+}
+
 struct InversionProducts {
     displacement: Array3<f64>,
+    fixed_l2_inputs: Option<FixedL2WorkflowInputs>,
     posterior_variance: Option<Array3<f64>>,
     /// L2 SBAS network-inversion misclosure RMS (residual of `A*phi = dphi`) —
     /// how well the interferogram network closed, not how well displacement
@@ -383,6 +662,7 @@ fn invert_time_series(
     dphi: ArrayView3<f64>,
     crlb_sigma: Option<&Array3<f64>>,
     pairs: &[(usize, usize)],
+    retain_fixed_l2_inputs: bool,
 ) -> Result<InversionProducts> {
     anyhow::ensure!(
         !(cfg.timeseries_options.write_posterior_uncertainty
@@ -404,12 +684,13 @@ fn invert_time_series(
     } else {
         None
     };
-    match cfg.timeseries_options.method {
-        TimeseriesMethod::L1 => Ok(InversionProducts {
+    let mut products = match cfg.timeseries_options.method {
+        TimeseriesMethod::L1 => InversionProducts {
             displacement: invert_stack_l1(incidence, dphi, L1Config::default()),
+            fixed_l2_inputs: None,
             posterior_variance: None,
             network_misclosure_rms: None,
-        }),
+        },
         TimeseriesMethod::L2 if cfg.timeseries_options.write_posterior_uncertainty => {
             let output = invert_stack_with_uncertainty(
                 incidence,
@@ -428,18 +709,28 @@ fn invert_time_series(
                     clear_unbounded_uncertainty_2d(&mut band, valid.view());
                 }
             }
-            Ok(InversionProducts {
+            InversionProducts {
                 displacement: output.phase,
+                fixed_l2_inputs: None,
                 posterior_variance: Some(posterior_variance),
                 network_misclosure_rms: Some(output.residual_rms),
-            })
+            }
         }
-        TimeseriesMethod::L2 => Ok(InversionProducts {
+        TimeseriesMethod::L2 => InversionProducts {
             displacement: invert_stack(incidence, dphi, precision.as_ref().map(Array3::view)),
+            fixed_l2_inputs: None,
             posterior_variance: None,
             network_misclosure_rms: None,
-        }),
+        },
+    };
+    if retain_fixed_l2_inputs && cfg.timeseries_options.method == TimeseriesMethod::L2 {
+        products.fixed_l2_inputs = Some(FixedL2WorkflowInputs::new(
+            incidence.to_owned(),
+            dphi.to_owned(),
+            precision,
+        )?);
     }
+    Ok(products)
 }
 
 fn correct_and_reference(
@@ -477,28 +768,6 @@ fn correct_and_reference(
     Ok(corrections)
 }
 
-/// Weighted velocity and its one-sigma, applying the opt-in AR(1)
-/// temporal-correlation inflation when configured. The residual RMS is
-/// identical between the two branches (the correction rescales sigma, not the
-/// fit), so it is returned once alongside whichever sigma was requested.
-fn velocity_and_sigma(
-    correct_temporal_correlation: bool,
-    days: &[f64],
-    series: ArrayView3<f64>,
-    precision: ArrayView3<f64>,
-) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-    if !correct_temporal_correlation {
-        let output = estimate_velocity_with_uncertainty(days, series, precision);
-        return (output.velocity, output.sigma, output.residual_rms);
-    }
-    let output = estimate_velocity_with_uncertainty_neff(days, series, precision);
-    (
-        output.velocity,
-        output.sigma_temporal_corrected,
-        output.residual_rms,
-    )
-}
-
 /// Optional velocity time-function terms, in the same phase units (rad) as the
 /// velocity fit — except `seasonal_phase_days`, which is days. Empty unless
 /// `timeseries_options.velocity_seasonal` / `velocity_step_dates` are configured.
@@ -513,7 +782,9 @@ struct VelocityTerms {
 /// whole-frame and bounded/tiled paths cannot drift apart.
 struct VelocityFit {
     velocity: Array2<f64>,
+    estimator: VelocityEstimator,
     sigma: Option<Array2<f64>>,
+    diagnostics: Option<VelocityTemporalDiagnostics>,
     /// Temporal motion-model fit residual RMS: the per-pixel scatter of
     /// displacement around the fitted rate (+ seasonal/step terms), in the same
     /// units as `displacement` (issue #40). Distinct from the SBAS
@@ -648,13 +919,21 @@ fn solve_time_series(
     mut dphi_rad: Array3<f64>,
     pairs: &[(usize, usize)],
     crlb_sigma: Option<&Array3<f64>>,
+    retain_fixed_l2_inputs: bool,
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
         apply_loop_closure_qc(cfg, &mut dphi_rad, pairs)
     });
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
-        invert_time_series(cfg, incidence.view(), dphi_rad.view(), crlb_sigma, pairs)
+        invert_time_series(
+            cfg,
+            incidence.view(),
+            dphi_rad.view(),
+            crlb_sigma,
+            pairs,
+            retain_fixed_l2_inputs,
+        )
     })?;
     Ok((inversion, loop_closure))
 }
@@ -697,11 +976,12 @@ fn frame_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     crlb_sigma: Option<&Array3<f64>>,
+    reference_point: Option<(usize, usize)>,
     date_files: &[PathBuf],
 ) -> Result<(VelocityModel, VelocityFit)> {
     let model = velocity_model(cfg, date_files)?;
     let fit = timed("velocity", || {
-        fit_velocity(cfg, displacement, days, crlb_sigma, &model)
+        fit_velocity(cfg, displacement, days, crlb_sigma, reference_point, &model)
     })?;
     Ok((model, fit))
 }
@@ -711,30 +991,73 @@ fn fit_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     crlb_sigma: Option<&Array3<f64>>,
+    reference_point: Option<(usize, usize)>,
     model: &VelocityModel,
 ) -> Result<VelocityFit> {
-    let weighted = cfg.timeseries_options.use_coherence_weights
-        || cfg.timeseries_options.write_velocity_uncertainty;
-    if !weighted && model.is_linear() {
+    let options = &cfg.timeseries_options;
+    if options.write_velocity_uncertainty {
+        anyhow::ensure!(
+            model.is_linear(),
+            "velocity uncertainty is validated only for the linear temporal model"
+        );
+        let reference = reference_point
+            .context("velocity uncertainty requires a final spatial reference point")?;
+        anyhow::ensure!(
+            displacement
+                .axis_iter(Axis(0))
+                .all(|band| band[reference] == 0.0),
+            "velocity uncertainty requires an exact zero at the final spatial reference"
+        );
+        anyhow::ensure!(
+            days.len() == displacement.dim().0 + 1,
+            "velocity dates do not match the displacement series"
+        );
+        let series = series_with_reference(displacement);
+        let post_gauge = series.slice(s![1.., .., ..]);
+        let precision = post_gauge.mapv(|value| f64::from(value.is_finite()));
+        let output = estimate_velocity_with_diagnostics(&days[1..], post_gauge, precision.view());
+        return Ok(VelocityFit {
+            velocity: output.velocity,
+            estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            sigma: Some(output.sigma),
+            diagnostics: Some(VelocityTemporalDiagnostics {
+                valid_date_count: output.valid_date_count,
+                regression_rank: output.rank,
+                regression_dof: output.regression_dof,
+                uncertainty_status: output.uncertainty_status,
+                lag1_rho: output.lag1_rho,
+                correlation_pair_count: output.correlation_pair_count,
+                cadence_status: output.cadence_status,
+                correlation_available: output.correlation_available,
+                diagnostic_inflation_factor: output.diagnostic_inflation_factor,
+                diagnostic_effective_sample_size: output.diagnostic_effective_sample_size,
+            }),
+            residual_rms: Some(output.residual_rms),
+            terms: VelocityTerms::default(),
+        });
+    }
+    if !options.use_coherence_weights && model.is_linear() {
         // The cheapest path: no precision, no fit statistics at all. Computing a
         // residual here would mean fitting a second, otherwise-unneeded model per
         // pixel just to report it, so this path stays a rate-only estimate,
         // matching `sigma`'s existing `None` rule.
         return Ok(VelocityFit {
             velocity: velocity_of(displacement, days),
+            estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             sigma: None,
+            diagnostics: None,
             residual_rms: None,
             terms: VelocityTerms::default(),
         });
     }
     let series = series_with_reference(displacement);
-    if !weighted {
+    if !options.use_coherence_weights {
         return Ok(fit_velocity_with_model(
-            cfg,
             days,
             series.view(),
             None,
             model,
+            VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
         ));
     }
     let sigma = crlb_sigma
@@ -743,60 +1066,43 @@ fn fit_velocity(
     let valid = uncertainty_valid(sigma);
     let precision = date_precisions(sigma, valid.view());
     if !model.is_linear() {
-        let mut fit =
-            fit_velocity_with_model(cfg, days, series.view(), Some(precision.view()), model);
-        if let Some(sigma) = fit.sigma.as_mut() {
-            clear_unbounded_uncertainty(sigma, valid.view());
-        }
-        return Ok(fit);
+        return Ok(fit_velocity_with_model(
+            days,
+            series.view(),
+            Some(precision.view()),
+            model,
+            VelocityEstimator::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
+        ));
     }
-    if !cfg.timeseries_options.write_velocity_uncertainty {
-        // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
-        // (velocity is bit-identical); the uncertainty variant is used instead so
-        // the residual it already computes is not thrown away.
-        let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
-        return Ok(VelocityFit {
-            velocity: output.velocity,
-            sigma: None,
-            residual_rms: Some(output.residual_rms),
-            terms: VelocityTerms::default(),
-        });
-    }
-    let (velocity, mut sigma, residual_rms) = velocity_and_sigma(
-        cfg.timeseries_options.correct_velocity_temporal_correlation,
-        days,
-        series.view(),
-        precision.view(),
-    );
-    clear_unbounded_uncertainty(&mut sigma, valid.view());
+    // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
+    // (velocity is bit-identical); the uncertainty variant is used instead so
+    // the residual it already computes is not thrown away.
+    let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
     Ok(VelocityFit {
-        velocity,
-        sigma: Some(sigma),
-        residual_rms: Some(residual_rms),
+        velocity: output.velocity,
+        estimator: VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback,
+        sigma: None,
+        diagnostics: None,
+        residual_rms: Some(output.residual_rms),
         terms: VelocityTerms::default(),
     })
 }
 
-/// The joint seasonal/step fit, sharing the linear path's uncertainty switches:
-/// sigma is emitted only when `write_velocity_uncertainty`, and the AR(1)
-/// inflation applies to this model's own residuals when configured.
+/// The joint seasonal/step fit. Conditional standard-error output is currently
+/// restricted to the linear path, so this returns point estimates and residuals.
 fn fit_velocity_with_model(
-    cfg: &DisplacementWorkflow,
     days: &[f64],
     series: ArrayView3<f64>,
     precision: Option<ArrayView3<f64>>,
     model: &VelocityModel,
+    estimator: VelocityEstimator,
 ) -> VelocityFit {
     let output = estimate_velocity_with_model(days, series, precision, model);
-    let sigma = cfg.timeseries_options.write_velocity_uncertainty.then(|| {
-        match cfg.timeseries_options.correct_velocity_temporal_correlation {
-            true => &output.sigma * &output.inflation_factor,
-            false => output.sigma.clone(),
-        }
-    });
     VelocityFit {
         velocity: output.velocity,
-        sigma,
+        estimator,
+        sigma: None,
+        diagnostics: None,
         // Unlike sigma, the residual is not gated by write_velocity_uncertainty:
         // estimate_velocity_with_model always computes it as part of the fit, so
         // reporting it here costs nothing extra.
@@ -812,6 +1118,7 @@ fn fit_velocity_with_model(
 struct SpatialProducts {
     disp_rad: Array3<f64>,
     vel_rad: Array2<f64>,
+    velocity_estimator: VelocityEstimator,
     velocity_model: VelocityModel,
     velocity_terms: VelocityTerms,
     loop_closure: Option<LoopClosureQc>,
@@ -819,6 +1126,8 @@ struct SpatialProducts {
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
     phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial phase-similarity quality raster, if enabled.
+    phase_similarity: Option<Array2<f64>>,
     crlb_sigma: Option<Array3<f64>>,
     closure_phase: Option<Array3<f64>>,
     corrections: CorrectionLayers,
@@ -834,8 +1143,10 @@ struct SpatialProducts {
     /// `network_misclosure_rad` (issue #40).
     timeseries_residual_rad: Option<Array2<f64>>,
     velocity_sigma_rad: Option<Array2<f64>>,
+    velocity_diagnostics: Option<VelocityTemporalDiagnostics>,
     interferogram_pairs: Vec<(usize, usize)>,
     unwrap_connected_components: Array3<u32>,
+    production_covariance: Option<ProductionCovarianceState>,
 }
 
 fn restrict_publication_mask(
@@ -844,11 +1155,7 @@ fn restrict_publication_mask(
     validity: &mut Array2<bool>,
     reference: Option<(usize, usize)>,
 ) -> Result<()> {
-    for path in cfg
-        .mask_file
-        .iter()
-        .chain(cfg.layover_shadow_mask_files.iter())
-    {
+    if let Some(path) = &cfg.mask_file {
         let mask =
             read_aligned_raster_window::<f64>(path, geo.geotransform, geo.epsg, validity.dim())?;
         ndarray::Zip::from(&mut *validity)
@@ -939,19 +1246,54 @@ fn emit_displacement(
         &mut spatial.validity_mask,
         spatial.reference_point,
     )?;
+    if let Some(covariance) = spatial.production_covariance.as_mut() {
+        covariance.correction_order_digest = correction_order_digest(
+            &cfg.correction_options,
+            cfg.input_options.wavelength,
+            &spatial.corrections,
+        )?;
+        let backend_config = serde_json::to_vec(&cfg.unwrap_options)
+            .context("serializing final covariance unwrap configuration")?;
+        covariance.unwrap_branch_digest = unwrap_branch_digest(
+            cfg.unwrap_options.unwrap_method,
+            &backend_config,
+            &spatial.interferogram_pairs,
+            spatial.validity_mask.view(),
+            spatial.unwrap_connected_components.view(),
+            cfg.timeseries_options.mask_unwrap_loop_errors,
+        );
+    }
     if let (Some(variance), Some(point)) = (
         spatial.posterior_variance_rad.as_mut(),
         spatial.reference_point,
     ) {
         reference_variance_to_point(variance, point);
     }
+    if let Some(covariance) = spatial.production_covariance.take() {
+        let reference = spatial
+            .reference_point
+            .context("production spatial covariance requires a final analysis reference")?;
+        let output_epsg = epsg.context("production spatial covariance requires an exact CRS")?;
+        timed("spatial_reference_covariance", || {
+            covariance.emit(
+                cfg,
+                &sequential_config(cfg),
+                spatial.validity_mask.view(),
+                reference,
+                output_epsg,
+                spatial.geotransform,
+                &days,
+            )
+        })?;
+    }
     let scaled = scale_outputs(cfg, &spatial);
     let quality = QualityLayers {
-        posterior_dof: spatial
+        network_residual_dof: spatial
             .interferogram_pairs
             .len()
             .saturating_sub(spatial.disp_rad.dim().0),
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
+        phase_similarity: spatial.phase_similarity.as_ref(),
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -962,6 +1304,7 @@ fn emit_displacement(
         network_misclosure_rms: scaled.network_misclosure_rms.as_ref(),
         timeseries_residual_rms: scaled.timeseries_residual_rms.as_ref(),
         velocity_sigma: scaled.velocity_sigma.as_ref(),
+        velocity_diagnostics: spatial.velocity_diagnostics.as_ref(),
         connected_components: &spatial.unwrap_connected_components,
         velocity_terms: VelocityTermLayers {
             seasonal_amplitude: scaled.seasonal_amplitude.as_ref(),
@@ -984,6 +1327,7 @@ fn emit_displacement(
                     cfg,
                     scaled.displacement.view(),
                     scaled.velocity.view(),
+                    spatial.velocity_estimator,
                     spatial.temporal_coherence.view(),
                     quality,
                     epsg,
@@ -993,7 +1337,37 @@ fn emit_displacement(
                 crate::provenance::write_geometry_provenance(
                     &cfg.work_directory,
                     &geometry_provenance,
-                )
+                )?;
+                if let Some(geometry) = spatial.corrections.los_geometry.as_ref() {
+                    crate::fixed_cube::write_fixed_cube_bundle(
+                        cfg,
+                        &days,
+                        spatial.velocity_estimator,
+                        scaled.velocity_sigma.is_some(),
+                        spatial.validity_mask.view(),
+                        geometry,
+                        spatial.reference_point,
+                        epsg,
+                        spatial.geotransform,
+                    )?;
+                }
+                if cfg.timeseries_options.temporal_uncertainty.method
+                    == dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
+                {
+                    anyhow::ensure!(
+                        spatial.corrections.los_geometry.is_some(),
+                        "corrected temporal inference requires a completed fixed-cube receipt"
+                    );
+                    let displacement_rasters =
+                        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
+                    crate::temporal_covariance_product::write_temporal_covariance_products(
+                        &cfg.work_directory,
+                        &displacement_rasters,
+                        &days,
+                        &cfg.timeseries_options.temporal_uncertainty,
+                    )?;
+                }
+                Ok(())
             }
             DisplacementOutputPolicy::GroundPulse => {
                 std::fs::create_dir_all(&cfg.work_directory)?;
@@ -1013,8 +1387,10 @@ fn emit_displacement(
     Ok(DisplacementOutput {
         displacement: scaled.displacement,
         velocity: scaled.velocity,
+        velocity_estimator: spatial.velocity_estimator,
         velocity_mm_yr: scaled.velocity_mm_yr,
         velocity_sigma: scaled.velocity_sigma,
+        velocity_diagnostics: spatial.velocity_diagnostics,
         displacement_variance: scaled.displacement_variance,
         network_misclosure_rms: scaled.network_misclosure_rms,
         timeseries_residual_rms: scaled.timeseries_residual_rms,
@@ -1022,6 +1398,7 @@ fn emit_displacement(
         unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
+        phase_similarity: spatial.phase_similarity,
         validity_mask: spatial.validity_mask,
         crlb_sigma: cfg
             .phase_linking
@@ -1039,6 +1416,18 @@ fn emit_displacement(
         los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
+}
+
+fn temporal_product_displacement_rasters(
+    directory: &Path,
+    acquisition_count: usize,
+) -> Result<Vec<PathBuf>> {
+    let persisted_count = acquisition_count
+        .checked_sub(1)
+        .context("temporal inference requires a gauge acquisition")?;
+    Ok((0..persisted_count)
+        .map(|date| directory.join(format!("displacement_{date:02}.tif")))
+        .collect())
 }
 
 fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenance {
@@ -1081,7 +1470,12 @@ impl SpatialProducts {
     fn apply_validity_mask(&mut self) {
         ndarray::Zip::from(&mut self.validity_mask)
             .and(&self.vel_rad)
-            .for_each(|valid, &velocity| *valid &= velocity.is_finite());
+            .for_each(|valid, &velocity| *valid &= (velocity as f32).is_finite());
+        for epoch in self.disp_rad.axis_iter(Axis(0)) {
+            ndarray::Zip::from(&mut self.validity_mask)
+                .and(epoch)
+                .for_each(|valid, &displacement| *valid &= (displacement as f32).is_finite());
+        }
         let mask = &self.validity_mask;
         mask3_f64(&mut self.disp_rad, mask);
         mask2_f64(&mut self.vel_rad, mask);
@@ -1106,6 +1500,40 @@ impl SpatialProducts {
         }
         if let Some(layer) = self.velocity_sigma_rad.as_mut() {
             mask2_f64(layer, mask);
+        }
+        if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
+            mask2_value(&mut diagnostics.valid_date_count, mask, 0);
+            mask2_value(&mut diagnostics.regression_rank, mask, 0);
+            mask2_value(&mut diagnostics.regression_dof, mask, 0);
+            mask2_value(
+                &mut diagnostics.uncertainty_status,
+                mask,
+                VelocityUncertaintyStatus::Unavailable,
+            );
+            mask2_f64(&mut diagnostics.lag1_rho, mask);
+            mask2_value(&mut diagnostics.correlation_pair_count, mask, 0);
+            mask2_value(
+                &mut diagnostics.cadence_status,
+                mask,
+                VelocityCadenceStatus::Unavailable,
+            );
+            mask2_value(&mut diagnostics.correlation_available, mask, false);
+            mask2_f64(&mut diagnostics.diagnostic_inflation_factor, mask);
+            mask2_f64(&mut diagnostics.diagnostic_effective_sample_size, mask);
+        }
+        if let Some(layer) = self.velocity_terms.seasonal_amplitude_rad.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.velocity_terms.seasonal_phase_days.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        for layer in &mut self.velocity_terms.step_magnitude_rad {
+            mask2_f64(layer, mask);
+        }
+        if let Some(qc) = self.loop_closure.as_mut() {
+            mask2_f64(&mut qc.bad_loop_count, mask);
+            mask2_f64(&mut qc.evaluable_loop_count, mask);
+            mask2_f64(&mut qc.worst_residual_cycles, mask);
         }
         if let Some(layer) = self.corrections.ionosphere.as_mut() {
             mask3_f64(layer, mask);
@@ -1134,6 +1562,7 @@ impl SpatialProducts {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     fn trim(
         &mut self,
         target: BlockIndices,
@@ -1153,12 +1582,23 @@ impl SpatialProducts {
                 target.row_start..target.row_stop,
                 target.col_start..target.col_stop
             ]);
-            let local = select_reference_point(
+            let target_validity = self.validity_mask.slice(s![
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let target_displacement = self.disp_rad.slice(s![
+                ..,
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let local = select_valid_reference_point(
                 target_coherence,
+                target_validity,
+                target_displacement,
                 cfg.timeseries_options.correlation_threshold,
             )
             .context(
-                "bounded target has no pixel meeting the configured reference coherence threshold",
+                "bounded target has no displacement-valid pixel meeting the configured reference coherence threshold",
             )?;
             let global = (target.row_start + local.0, target.col_start + local.1);
             reference_to_point(&mut self.disp_rad, global);
@@ -1169,11 +1609,14 @@ impl SpatialProducts {
                 self.disp_rad.view(),
                 days,
                 self.crlb_sigma.as_ref(),
+                Some(global),
                 &self.velocity_model,
             )
             .context("bounded velocity re-fit after re-referencing")?;
             self.vel_rad = fit.velocity;
+            self.velocity_estimator = fit.estimator;
             self.velocity_sigma_rad = fit.sigma;
+            self.velocity_diagnostics = fit.diagnostics;
             // Re-referencing shifts every date's displacement, which shifts the
             // temporal-fit residual too; the network misclosure is unaffected (it
             // is computed upstream, from the inversion, before re-referencing).
@@ -1222,7 +1665,29 @@ impl SpatialProducts {
             .velocity_sigma_rad
             .take()
             .map(|layer| trim2(&layer, target));
+        if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
+            diagnostics.valid_date_count = trim2(&diagnostics.valid_date_count, target);
+            diagnostics.regression_rank = trim2(&diagnostics.regression_rank, target);
+            diagnostics.regression_dof = trim2(&diagnostics.regression_dof, target);
+            diagnostics.uncertainty_status = trim2(&diagnostics.uncertainty_status, target);
+            diagnostics.lag1_rho = trim2(&diagnostics.lag1_rho, target);
+            diagnostics.correlation_pair_count = trim2(&diagnostics.correlation_pair_count, target);
+            diagnostics.cadence_status = trim2(&diagnostics.cadence_status, target);
+            diagnostics.correlation_available = trim2(&diagnostics.correlation_available, target);
+            diagnostics.diagnostic_inflation_factor =
+                trim2(&diagnostics.diagnostic_inflation_factor, target);
+            diagnostics.diagnostic_effective_sample_size =
+                trim2(&diagnostics.diagnostic_effective_sample_size, target);
+        }
+        if let Some(qc) = self.loop_closure.as_mut() {
+            qc.bad_loop_count = trim2(&qc.bad_loop_count, target);
+            qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
+            qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
+        }
         self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
+        if let Some(covariance) = self.production_covariance.as_mut() {
+            covariance.trim(target);
+        }
         trim_corrections(&mut self.corrections, target);
         self.reference_point = trim_reference(self.reference_point, target);
         self.geotransform =
@@ -1249,6 +1714,468 @@ struct BurstLink {
     geo: BurstGeo,
     /// Acquisition decimal-days for this burst's dates.
     days: Vec<f64>,
+    /// Global output-grid origin used by captured replay IDs.
+    covariance_output_origin: Option<(u64, u64)>,
+}
+
+struct CovarianceCaptureArtifact {
+    writer: Option<CovarianceOperatorWriter>,
+    scratch_path: PathBuf,
+    metadata: CovarianceOperatorMetadata,
+    disk_admission: CovarianceArtifactDiskAdmission,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    source_model_hash: [u8; 32],
+    source_manifest: CslcCovarianceManifest,
+    replay_tiles: Vec<CapturedReplayTile>,
+    operator_block_byte_cap: u64,
+    transaction: CovarianceArtifactTransaction,
+}
+
+struct CovarianceArtifactProjection {
+    hdf5_bytes: u64,
+    identity_index_peak_bytes: u64,
+    operator_block_byte_cap: u64,
+    plan: CovarianceOperatorPlan,
+}
+
+impl CovarianceCaptureArtifact {
+    fn create(
+        cfg: &DisplacementWorkflow,
+        groups: &BTreeMap<String, Vec<usize>>,
+        crop: Option<&BoundedPlan>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&cfg.work_directory)?;
+        let transaction = CovarianceArtifactTransaction::acquire(&cfg.work_directory)?;
+        let scratch_path = cfg
+            .work_directory
+            .join("phase_covariance_operator.h5.scratch");
+        recover_incomplete_covariance_operator(&scratch_path)
+            .context("recovering prior covariance scratch artifact")?;
+        let subdataset = cfg
+            .input_options
+            .subdataset
+            .clone()
+            .context("input_options.subdataset is required for covariance source capture")?;
+        let source_manifest = CslcCovarianceManifest::capture(
+            cfg.input_options.input_type,
+            subdataset,
+            &cfg.cslc_file_list,
+        )?;
+        let source_manifest_digest = source_manifest.digest();
+        let source_model_version_digest = covariance_source_model_identity_digest(
+            CSLC_COVARIANCE_SOURCE_PROVIDER,
+            CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+            CSLC_COVARIANCE_SOURCE_MODEL,
+            CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+        );
+        let source_model_hash =
+            *empirical_factor_config(&cfg.phase_linking.empirical_source_factor)?.config_digest();
+        let projection = projected_covariance_artifact(
+            cfg,
+            groups,
+            crop,
+            source_manifest_digest,
+            source_model_version_digest,
+        )?;
+        let disk_admission = preflight_covariance_artifact_disk_with_identity_index(
+            &cfg.work_directory,
+            projection.hdf5_bytes,
+            projection.identity_index_peak_bytes,
+        )?;
+        let included_bursts = crop.map_or(groups.len(), |plan| {
+            plan.windows
+                .iter()
+                .filter(|window| window.is_some())
+                .count()
+        });
+        let metadata = CovarianceOperatorMetadata {
+            producer_commit: option_env!("DOLPHIN_GIT_COMMIT").map(str::to_owned),
+            normalized_config_digest: format!(
+                "sha256:{}",
+                hex_digest(sequential_replay_config_digest(&sequential_config(cfg)))
+            ),
+            kernel_digest: format!("sha256:{}", hex_digest(sequential_replay_kernel_digest())),
+            source: SourceReplayIdentity {
+                manifest_digest: Some(format!("sha256:{}", hex_digest(source_manifest_digest))),
+                provider: Some(CSLC_COVARIANCE_SOURCE_PROVIDER.to_owned()),
+                provider_version: Some(CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION.to_owned()),
+                model: Some(CSLC_COVARIANCE_SOURCE_MODEL.to_owned()),
+                model_version: Some(CSLC_COVARIANCE_SOURCE_MODEL_VERSION.to_owned()),
+                model_version_digest: Some(format!(
+                    "sha256:{}",
+                    hex_digest(source_model_version_digest)
+                )),
+                model_receipt_digest: Some(format!("sha256:{}", hex_digest(source_model_hash))),
+            },
+            replay_status: CovarianceReplayStatus::Replayable,
+            stitched_status: match included_bursts {
+                0 | 1 => StitchedCovarianceStatus::NotStitched,
+                _ => StitchedCovarianceStatus::UnsupportedSeamCovariance,
+            },
+            ..CovarianceOperatorMetadata::default()
+        };
+        let writer = CovarianceOperatorWriter::create_with_identity_index_disk_cap(
+            &scratch_path,
+            &metadata,
+            &projection.plan,
+            projection.identity_index_peak_bytes,
+        )
+        .context("creating covariance operator scratch artifact")?;
+        Ok(Self {
+            writer: Some(writer),
+            scratch_path,
+            metadata,
+            disk_admission,
+            source_manifest_digest,
+            source_model_version_digest,
+            source_model_hash,
+            source_manifest,
+            replay_tiles: Vec::new(),
+            operator_block_byte_cap: projection.operator_block_byte_cap,
+            transaction,
+        })
+    }
+
+    fn finish(
+        mut self,
+        masks: BTreeMap<String, Option<PreparedBurstMask>>,
+    ) -> Result<ProductionCovarianceReplayContext> {
+        self.source_manifest
+            .verify_unchanged()
+            .context("verifying immutable CSLC members before covariance finalization")?;
+        let write_receipt = self
+            .writer
+            .take()
+            .context("covariance operator writer was already finalized")?
+            .finish()
+            .context("finishing covariance operator HDF5")?;
+        anyhow::ensure!(
+            write_receipt.peak_identity_index_disk_bytes
+                <= self.disk_admission.projected_identity_index_peak_bytes,
+            "covariance identity-index peak exceeded its preflight projection"
+        );
+        self.source_manifest
+            .verify_unchanged()
+            .context("verifying immutable CSLC members before covariance commit")?;
+        let operator_manifest: CovarianceArtifactManifest = finalize_covariance_artifact(
+            &self.transaction,
+            &self.scratch_path,
+            &self.metadata,
+            self.disk_admission,
+            &write_receipt,
+        )?;
+        Ok(ProductionCovarianceReplayContext {
+            source_manifest: self.source_manifest,
+            operator_manifest,
+            tiles: self.replay_tiles,
+            masks,
+            operator_block_byte_cap: self.operator_block_byte_cap,
+        })
+    }
+}
+
+struct TileCovarianceCapture<'a> {
+    burst_id: String,
+    source_origin: (usize, usize),
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+    member_indices: Vec<usize>,
+    processed_shape: (usize, usize),
+    source_resolver: Option<CslcCovarianceSourceResolver<'a>>,
+    replay_tiles: &'a mut Vec<CapturedReplayTile>,
+    sink: &'a mut dyn CovarianceBlockSink,
+}
+
+trait CovarianceBlockSink {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str>;
+}
+
+impl CovarianceBlockSink for CovarianceOperatorWriter {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str> {
+        CovarianceOperatorWriter::write_block(self, &block)
+            .map_err(|_| "writing covariance operator block")
+    }
+}
+
+#[cfg(test)]
+impl CovarianceBlockSink for Vec<CovarianceOperatorBlock> {
+    fn write_block(&mut self, block: CovarianceOperatorBlock) -> Result<(), &'static str> {
+        self.push(block);
+        Ok(())
+    }
+}
+
+impl TileCovarianceCapture<'_> {
+    fn request(
+        &mut self,
+        plan: &TilePlan,
+        strides: dolphin_core::Strides,
+        native_validity: Option<ArrayView2<'_, bool>>,
+    ) -> Result<SequentialCovarianceCaptureRequest> {
+        let grids = covariance_tile_plan(self.source_origin, plan, strides)?;
+        let request = SequentialCovarianceCaptureRequest {
+            burst_id: self.burst_id.clone(),
+            source_manifest_digest: self.source_manifest_digest,
+            source_model_version_digest: self.source_model_version_digest,
+            native_grid: grids.native_grid,
+            output_grid: grids.output_grid,
+            owned_output_grid: grids.owned_output_grid,
+            branch_tolerance: COVARIANCE_BRANCH_TOLERANCE,
+        };
+        if let Some(resolver) = self.source_resolver.as_mut() {
+            resolver.set_tile_grid(request.native_grid);
+        }
+        let native_shape = (plan.read.height(), plan.read.width());
+        self.replay_tiles.push(CapturedReplayTile {
+            request: request.clone(),
+            member_indices: self.member_indices.clone(),
+            processed_origin: self.source_origin,
+            processed_shape: self.processed_shape,
+            native_validity: native_validity.map_or_else(
+                || Array2::from_elem(native_shape, true),
+                |mask| mask.to_owned(),
+            ),
+            num_real_dates: self.member_indices.len(),
+        });
+        Ok(request)
+    }
+}
+
+fn covariance_tile_plan(
+    source_origin: (usize, usize),
+    plan: &TilePlan,
+    strides: dolphin_core::Strides,
+) -> Result<dolphin_io::CovarianceTilePlan> {
+    let native_row = source_origin
+        .0
+        .checked_add(plan.read.row_start)
+        .context("covariance native row origin overflow")?;
+    let native_col = source_origin
+        .1
+        .checked_add(plan.read.col_start)
+        .context("covariance native column origin overflow")?;
+    anyhow::ensure!(
+        native_row % strides.y == 0 && native_col % strides.x == 0,
+        "covariance bounded/tiled source origin is not on the output stride lattice"
+    );
+    let output_shape = strides.out_shape((plan.read.height(), plan.read.width()));
+    let output_row = native_row / strides.y;
+    let output_col = native_col / strides.x;
+    Ok(dolphin_io::CovarianceTilePlan {
+        native_grid: covariance_grid(
+            (native_row, native_col),
+            (plan.read.height(), plan.read.width()),
+            (1, 1),
+        )?,
+        output_grid: covariance_grid(
+            (output_row, output_col),
+            output_shape,
+            (strides.y, strides.x),
+        )?,
+        owned_output_grid: covariance_grid(
+            (
+                output_row
+                    .checked_add(plan.local_row0)
+                    .context("covariance owned output row overflow")?,
+                output_col
+                    .checked_add(plan.local_col0)
+                    .context("covariance owned output column overflow")?,
+            ),
+            (plan.out.height(), plan.out.width()),
+            (strides.y, strides.x),
+        )?,
+    })
+}
+
+fn covariance_grid(
+    origin: (usize, usize),
+    shape: (usize, usize),
+    strides: (usize, usize),
+) -> Result<CovarianceOperatorGrid> {
+    Ok(CovarianceOperatorGrid {
+        row_start: u64::try_from(origin.0).context("covariance grid row origin exceeds u64")?,
+        col_start: u64::try_from(origin.1).context("covariance grid column origin exceeds u64")?,
+        rows: u32::try_from(shape.0).context("covariance grid rows exceed u32")?,
+        cols: u32::try_from(shape.1).context("covariance grid columns exceed u32")?,
+        stride_y: u32::try_from(strides.0).context("covariance grid row stride exceeds u32")?,
+        stride_x: u32::try_from(strides.1).context("covariance grid column stride exceeds u32")?,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn projected_covariance_artifact(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    crop: Option<&BoundedPlan>,
+    source_manifest_digest: [u8; 32],
+    source_model_version_digest: [u8; 32],
+) -> Result<CovarianceArtifactProjection> {
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to size the covariance artifact")?;
+    let strides = cfg.output_options.strides;
+    let support_rows = (cfg.phase_linking.half_window.y as u128)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("covariance support row count overflow")?;
+    let support_cols = (cfg.phase_linking.half_window.x as u128)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .context("covariance support column count overflow")?;
+    let support_slots = support_rows
+        .checked_mul(support_cols)
+        .context("covariance support area overflow")?;
+    let support_bytes = support_slots.div_ceil(8);
+    let max_phase_components =
+        cfg.phase_linking
+            .ministack_size
+            .checked_add(cfg.phase_linking.max_num_compressed)
+            .context("covariance phase-component count overflow")? as u128;
+    let mut projected = 16_u128 * 1024 * 1024;
+    let mut identity_records = 0_u128;
+    let mut operator_block_byte_cap = 0_u128;
+    let mut burst_plans = Vec::new();
+    for (burst_index, (burst_id, indices)) in groups.iter().enumerate() {
+        let Some(&first_index) = indices.first() else {
+            continue;
+        };
+        let bounded = crop.and_then(|plan| plan.windows[burst_index]);
+        if crop.is_some() && bounded.is_none() {
+            continue;
+        }
+        let source = burst_source_window(&cfg.cslc_file_list[first_index], subdataset, bounded)?;
+        let shape = (source.height(), source.width());
+        let window_rows = cfg
+            .phase_linking
+            .half_window
+            .y
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .context("covariance Rect row window overflow")?;
+        let window_cols = cfg
+            .phase_linking
+            .half_window
+            .x
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .context("covariance Rect column window overflow")?;
+        anyhow::ensure!(
+            window_rows <= shape.0 && window_cols <= shape.1,
+            "covariance Rect support exceeds the bounded source grid"
+        );
+        let sequential_plan = MiniStackPlanner {
+            num_slc: indices.len(),
+            max_num_compressed: cfg.phase_linking.max_num_compressed,
+            output_reference_idx: isize::try_from(
+                cfg.phase_linking.output_reference_idx.unwrap_or(0),
+            )
+            .context("covariance output reference exceeds isize")?,
+            compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
+        }
+        .plan(cfg.phase_linking.ministack_size)
+        .map_err(anyhow::Error::msg)?;
+        let depth = sequential_plan.len();
+        let source_dates_by_generation = sequential_plan
+            .iter()
+            .map(|block| {
+                let stop = block
+                    .real_start
+                    .checked_add(block.num_real)
+                    .context("covariance generation date range overflow")?;
+                (block.real_start..stop)
+                    .map(|date| {
+                        u32::try_from(date).context("covariance generation date exceeds u32")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (block_rows, block_cols) = cfg.worker_settings.block_shape;
+        let out_block = (
+            (block_rows / strides.y).max(1),
+            (block_cols / strides.x).max(1),
+        );
+        let tiles = plan_tiles(
+            shape,
+            strides,
+            cfg.phase_linking.half_window,
+            depth,
+            out_block,
+        );
+        let mut planned_tiles = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            let native_area = tile.read.height() as u128 * tile.read.width() as u128;
+            let output_shape = strides.out_shape((tile.read.height(), tile.read.width()));
+            let output_area = output_shape.0 as u128 * output_shape.1 as u128;
+            let native_payload = native_area
+                .checked_mul(16 + 16 + 8 + 8 + 32 + 32 + 8 + 4 + 2)
+                .and_then(|bytes| bytes.checked_add(native_area.div_ceil(8)))
+                .context("covariance native payload projection overflow")?;
+            let phase_bytes = max_phase_components
+                .checked_mul(8)
+                .context("covariance phase payload projection overflow")?;
+            let output_payload = output_area
+                .checked_mul(8 + 8 + 8 + 2 + phase_bytes + support_bytes)
+                .context("covariance output payload projection overflow")?;
+            let numeric_payload = native_payload
+                .checked_add(output_payload)
+                .context("covariance block payload projection overflow")?;
+            let projected_block = numeric_payload
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(256 * 1024))
+                .context("covariance HDF5 block projection overflow")?;
+            operator_block_byte_cap = operator_block_byte_cap.max(projected_block);
+            projected = projected
+                .checked_add(
+                    (depth as u128)
+                        .checked_mul(projected_block)
+                        .context("covariance artifact projection overflow")?,
+                )
+                .context("covariance artifact projection overflow")?;
+            let identities_per_block = native_area
+                .checked_mul(2)
+                .and_then(|records| records.checked_add(output_area))
+                .context("covariance identity record projection overflow")?;
+            identity_records = identity_records
+                .checked_add(
+                    (depth as u128)
+                        .checked_mul(identities_per_block)
+                        .context("covariance identity projection overflow")?,
+                )
+                .context("covariance identity projection overflow")?;
+            planned_tiles.push(covariance_tile_plan(
+                (source.row_start, source.col_start),
+                &tile,
+                strides,
+            )?);
+        }
+        burst_plans.push(CovarianceBurstPlan {
+            burst_id: burst_id.clone(),
+            source_dates_by_generation,
+            tiles: planned_tiles,
+        });
+    }
+    let identity_records =
+        u64::try_from(identity_records).context("covariance identity projection exceeds u64")?;
+    Ok(CovarianceArtifactProjection {
+        hdf5_bytes: u64::try_from(projected)
+            .context("covariance artifact projection exceeds u64")?,
+        identity_index_peak_bytes: covariance_identity_index_peak_bytes(identity_records)
+            .context("projecting covariance identity-index peak")?,
+        operator_block_byte_cap: u64::try_from(operator_block_byte_cap)
+            .context("covariance operator block projection exceeds u64")?,
+        plan: CovarianceOperatorPlan {
+            source_manifest_digest,
+            source_model_version_digest,
+            bursts: burst_plans,
+        },
+    })
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Phase-link a single burst from the CSLC files at `idxs` in `cfg.cslc_file_list`.
@@ -1257,32 +2184,67 @@ struct BurstLink {
 /// [`crate::tiling`]) so peak memory is bounded by a tile (block + halo) and its
 /// `N×N` coherence cube, never the whole stack. The result is bit-identical to a
 /// whole-burst run.
+#[allow(clippy::too_many_arguments)]
 fn link_one_burst(
     cfg: &DisplacementWorkflow,
     idxs: &[usize],
+    burst_id: &str,
     burst_index: usize,
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
+    mask: Option<&PreparedBurstMask>,
+    covariance: Option<&mut CovarianceCaptureArtifact>,
 ) -> Result<BurstLink> {
     let files = burst_files(cfg, idxs);
-    let days = acquisition_days(&files, &cfg.input_options)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let days = acquisition_days(cfg, &files)?;
     let subdataset = cfg
         .input_options
         .subdataset
         .clone()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let full_shape = read_cslc_shape(&files[0], &subdataset)?;
-    let source = bounded.map_or(
-        BlockIndices {
-            row_start: 0,
-            row_stop: full_shape.0,
-            col_start: 0,
-            col_stop: full_shape.1,
-        },
-        |window| window.source,
-    );
-    let tiled = phase_link_tiled(
+    let source = burst_source_window(&files[0], &subdataset, bounded)?;
+    let tile_capture = match covariance {
+        Some(artifact) => {
+            let initial_grid = CovarianceOperatorGrid {
+                row_start: source.row_start as u64,
+                col_start: source.col_start as u64,
+                rows: u32::try_from(source.height()).context("source rows exceed u32")?,
+                cols: u32::try_from(source.width()).context("source columns exceed u32")?,
+                stride_y: 1,
+                stride_x: 1,
+            };
+            let source_resolver = artifact.source_manifest.resolver(
+                idxs,
+                burst_id,
+                (source.row_start, source.col_start),
+                (source.height(), source.width()),
+                initial_grid,
+                &cfg.phase_linking.empirical_source_factor,
+                artifact.source_model_version_digest,
+                mask.map(|value| value as &dyn CslcCovarianceValidityReader),
+            )?;
+            anyhow::ensure!(
+                source_resolver.source_identity().source_model_hash == artifact.source_model_hash,
+                "covariance source-factor receipt changed after artifact creation"
+            );
+            Some(TileCovarianceCapture {
+                burst_id: burst_id.to_owned(),
+                source_origin: (source.row_start, source.col_start),
+                source_manifest_digest: artifact.source_manifest_digest,
+                source_model_version_digest: artifact.source_model_version_digest,
+                member_indices: idxs.to_vec(),
+                processed_shape: (source.height(), source.width()),
+                source_resolver: Some(source_resolver),
+                replay_tiles: &mut artifact.replay_tiles,
+                sink: artifact
+                    .writer
+                    .as_mut()
+                    .expect("unfinished covariance writer"),
+            })
+        }
+        None => None,
+    };
+    let tiled = phase_link_tiled_impl(
         cfg,
         (source.height(), source.width()),
         files.len(),
@@ -1295,6 +2257,11 @@ fn link_one_burst(
                 offset_block(block, source.row_start, source.col_start),
             )
         },
+        |block| {
+            mask.as_ref()
+                .map_or(Ok(None), |mask| mask.reader.read(block).map(Some))
+        },
+        tile_capture,
     )
     .with_context(|| format!("burst ordinal {burst_index} phase linking failed"))?;
     let mut link = burst_link(
@@ -1374,12 +2341,27 @@ impl TiledPhaseLinkStats {
 /// input (block + halo) across all epochs as `Cf64`; tiling guarantees each
 /// output pixel sees the same window it would in a whole-burst run, so the
 /// assembled result is bit-identical.
+#[cfg(test)]
 fn phase_link_tiled(
     cfg: &DisplacementWorkflow,
     full_shape: (usize, usize),
     nslc: usize,
     engine: &ComputeEngine,
     read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
+    read_mask: impl Fn(BlockIndices) -> Result<Option<Array2<bool>>>,
+) -> Result<TiledPhaseLinkOutput> {
+    phase_link_tiled_impl(cfg, full_shape, nslc, engine, read_tile, read_mask, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn phase_link_tiled_impl(
+    cfg: &DisplacementWorkflow,
+    full_shape: (usize, usize),
+    nslc: usize,
+    engine: &ComputeEngine,
+    read_tile: impl Fn(BlockIndices) -> Result<Array3<Cf64>>,
+    read_mask: impl Fn(BlockIndices) -> Result<Option<Array2<bool>>>,
+    mut covariance: Option<TileCovarianceCapture<'_>>,
 ) -> Result<TiledPhaseLinkOutput> {
     let strides = cfg.output_options.strides;
     let half = cfg.phase_linking.half_window;
@@ -1429,15 +2411,12 @@ fn phase_link_tiled(
         );
         let t_read = Instant::now();
         let stack = read_tile(plan.read)?;
+        let tile_mask = read_mask(plan.read)?;
         stats.read_s += t_read.elapsed().as_secs_f64();
-        let missing = all_non_finite_acquisition_indices(stack.view());
-        let mut locally_finite = vec![true; nslc];
-        for &ordinal in &missing {
-            locally_finite[ordinal] = false;
-        }
-        for (seen, finite) in stats.acquisition_has_finite.iter_mut().zip(locally_finite) {
-            *seen |= finite;
-        }
+        let all_masked = tile_mask
+            .as_ref()
+            .is_some_and(|mask| !mask.iter().any(|valid| *valid));
+        let missing = record_finite_acquisitions(stack.view(), &mut stats.acquisition_has_finite);
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
             stage = "phase_linking_tile",
@@ -1448,13 +2427,67 @@ fn phase_link_tiled(
             peak_rss_kib,
             "phase-linking tile read complete"
         );
-        if !missing.is_empty() {
+        if !(missing.is_empty() || all_masked && covariance.is_some()) {
+            anyhow::ensure!(
+                covariance.is_none(),
+                "covariance operator capture requires finite source data for every acquisition in every owned tile; missing ordinals {missing:?}"
+            );
+            stats.nodata_tiles += 1;
+            acc.place_nodata(&plan);
+            continue;
+        }
+        if all_masked && covariance.is_none() {
             stats.nodata_tiles += 1;
             acc.place_nodata(&plan);
             continue;
         }
         let t_pl = Instant::now();
-        let out = phase_link(cfg, stack.view(), engine)?;
+        let valid_mask = tile_mask.as_ref().map(Array2::view);
+        let out = match covariance.as_mut() {
+            Some(capture) => {
+                let request = capture.request(&plan, cfg.output_options.strides, valid_mask)?;
+                match (valid_mask, capture.source_resolver.as_mut()) {
+                    (Some(mask), Some(resolver)) => {
+                        run_sequential_masked_with_covariance_capture_and_source_factors(
+                            stack.view(),
+                            mask,
+                            &sequential_config(cfg),
+                            engine,
+                            &request,
+                            resolver,
+                            |block| capture.sink.write_block(block),
+                        )
+                    }
+                    (None, Some(resolver)) => {
+                        run_sequential_with_covariance_capture_and_source_factors(
+                            stack.view(),
+                            &sequential_config(cfg),
+                            engine,
+                            &request,
+                            resolver,
+                            |block| capture.sink.write_block(block),
+                        )
+                    }
+                    (Some(mask), None) => run_sequential_masked_with_covariance_capture(
+                        stack.view(),
+                        mask,
+                        &sequential_config(cfg),
+                        engine,
+                        &request,
+                        |block| capture.sink.write_block(block),
+                    ),
+                    (None, None) => run_sequential_with_covariance_capture(
+                        stack.view(),
+                        &sequential_config(cfg),
+                        engine,
+                        &request,
+                        |block| capture.sink.write_block(block),
+                    ),
+                }
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+            None => phase_link(cfg, stack.view(), engine, valid_mask)?,
+        };
         stats.compute_s += t_pl.elapsed().as_secs_f64();
         let (rss_kib, peak_rss_kib) = memory_kib();
         tracing::debug!(
@@ -1484,6 +2517,18 @@ fn phase_link_tiled(
     stats.finish(acc)
 }
 
+fn record_finite_acquisitions(stack: ArrayView3<Cf64>, seen: &mut [bool]) -> Vec<usize> {
+    let missing = all_non_finite_acquisition_indices(stack);
+    let mut locally_finite = vec![true; seen.len()];
+    for &ordinal in &missing {
+        locally_finite[ordinal] = false;
+    }
+    for (global, local) in seen.iter_mut().zip(locally_finite) {
+        *global |= local;
+    }
+    missing
+}
+
 /// Read one tile's input (`block`, including halo) across all `files` epochs as a
 /// `(nslc, h, w)` `Cf64` stack. Each epoch is read as a `Cf32` window and upcast
 /// in place — the global `Cf32→Cf64` doubling of the whole-burst load is gone;
@@ -1504,6 +2549,393 @@ fn read_burst_tile(
         upcast_into(tile.index_axis_mut(Axis(0), k), window.view());
     }
     Ok(tile)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BurstMaskState {
+    path: PathBuf,
+    semantic_fingerprint: [u8; 32],
+    file_fingerprint: [u8; 32],
+    effective_dataset_fingerprint: [u8; 32],
+}
+
+pub(crate) struct PreparedBurstMask {
+    path: PathBuf,
+    semantic_fingerprint: [u8; 32],
+    reader: BurstMaskReader,
+    canonical_reader: BurstMaskReader,
+}
+
+impl CslcCovarianceValidityReader for PreparedBurstMask {
+    fn read_validity(
+        &self,
+        block: BlockIndices,
+    ) -> std::result::Result<Array2<bool>, crate::sequential_covariance::SequentialReplayError>
+    {
+        self.canonical_reader.read(block).map_err(|_| {
+            crate::sequential_covariance::SequentialReplayError::Provider(
+                crate::sequential_covariance::ReplayStatus::SourceUnavailable,
+                "reading canonical source-factor validity failed",
+            )
+        })
+    }
+}
+
+struct PreparedUpdateMask {
+    prepared: Option<PreparedBurstMask>,
+    state: Option<BurstMaskState>,
+}
+
+impl PreparedBurstMask {
+    fn resumable_state(&self) -> Result<BurstMaskState> {
+        let file = capture_mask_file(&self.path)?;
+        Ok(BurstMaskState {
+            path: file.path,
+            semantic_fingerprint: self.semantic_fingerprint,
+            file_fingerprint: file.fingerprint,
+            effective_dataset_fingerprint: file.effective_dataset_fingerprint,
+        })
+    }
+}
+
+struct BurstMaskReader {
+    path: PathBuf,
+    geotransform: [f64; 6],
+    epsg: u32,
+    shape: (usize, usize),
+}
+
+impl BurstMaskReader {
+    fn read(&self, block: BlockIndices) -> Result<Array2<bool>> {
+        anyhow::ensure!(
+            block.row_start <= block.row_stop
+                && block.col_start <= block.col_stop
+                && block.row_stop <= self.shape.0
+                && block.col_stop <= self.shape.1,
+            "layover/shadow mask '{}' read window exceeds the processed burst grid",
+            self.path.display()
+        );
+        let target_geotransform =
+            offset_geotransform(self.geotransform, block.row_start, block.col_start);
+        let values = read_aligned_raster_window::<f64>(
+            &self.path,
+            target_geotransform,
+            self.epsg,
+            (block.height(), block.width()),
+        )
+        .with_context(|| format!("reading layover/shadow mask '{}'", self.path.display()))?;
+        Ok(values.mapv(|value| value.is_finite() && value != 0.0))
+    }
+
+    fn full_block(&self) -> BlockIndices {
+        BlockIndices {
+            row_start: 0,
+            row_stop: self.shape.0,
+            col_start: 0,
+            col_stop: self.shape.1,
+        }
+    }
+}
+
+fn preflight_burst_mask(
+    cfg: &DisplacementWorkflow,
+    first_cslc: &Path,
+    mask_path: Option<&Path>,
+    source: BlockIndices,
+) -> Result<Option<PreparedBurstMask>> {
+    let Some(path) = mask_path else {
+        return Ok(None);
+    };
+    ensure_gtiff_mask(path)?;
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to align a layover/shadow mask")?;
+    let source_geo = match cfg.input_options.input_type {
+        InputType::OperaCslc => read_geotransform(first_cslc, subdataset),
+        InputType::NisarGslc => read_nisar_geotransform(first_cslc, subdataset),
+    }
+    .context("reading source georeference for layover/shadow mask alignment")?;
+    anyhow::ensure!(
+        source_geo.epsg != 0,
+        "layover/shadow mask '{}' requires a sourced CSLC EPSG",
+        path.display()
+    );
+    let reader = BurstMaskReader {
+        path: path.to_path_buf(),
+        geotransform: offset_geotransform(
+            source_geo.geotransform,
+            source.row_start,
+            source.col_start,
+        ),
+        epsg: source_geo.epsg,
+        shape: (source.height(), source.width()),
+    };
+    let canonical_shape = read_cslc_shape(first_cslc, subdataset)
+        .context("reading canonical CSLC grid for source-factor validity")?;
+    let canonical_reader = BurstMaskReader {
+        path: path.to_path_buf(),
+        geotransform: source_geo.geotransform,
+        epsg: source_geo.epsg,
+        shape: canonical_shape,
+    };
+    let strides = cfg.output_options.strides;
+    anyhow::ensure!(
+        strides.y > 0 && strides.x > 0,
+        "output_options.strides must be positive"
+    );
+    let looked_extent = (
+        reader.shape.0 / strides.y * strides.y,
+        reader.shape.1 / strides.x * strides.x,
+    );
+    let semantic_fingerprint = preflight_mask_semantics(&reader, looked_extent)?;
+    Ok(Some(PreparedBurstMask {
+        path: path.to_path_buf(),
+        semantic_fingerprint,
+        reader,
+        canonical_reader,
+    }))
+}
+
+fn preflight_mask_semantics(
+    reader: &BurstMaskReader,
+    looked_extent: (usize, usize),
+) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        looked_extent.0 <= reader.shape.0 && looked_extent.1 <= reader.shape.1,
+        "layover/shadow mask '{}' effective grid exceeds the processed burst grid",
+        reader.path.display()
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"dolphinRust:layover-shadow-validity:v2\0");
+    hasher.update(reader.epsg.to_le_bytes());
+    for value in reader.geotransform {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher.update((reader.shape.0 as u64).to_le_bytes());
+    hasher.update((reader.shape.1 as u64).to_le_bytes());
+    hasher.update((looked_extent.0 as u64).to_le_bytes());
+    hasher.update((looked_extent.1 as u64).to_le_bytes());
+    let mut any_valid = false;
+    let mut row_bytes = Vec::with_capacity(reader.shape.1);
+    for row_start in (0..reader.shape.0).step_by(MASK_PREFLIGHT_STRIPE_ROWS) {
+        let stripe = reader.read(BlockIndices {
+            row_start,
+            row_stop: (row_start + MASK_PREFLIGHT_STRIPE_ROWS).min(reader.shape.0),
+            col_start: 0,
+            col_stop: reader.shape.1,
+        })?;
+        for (local_row, row) in stripe.rows().into_iter().enumerate() {
+            row_bytes.clear();
+            row_bytes.extend(row.iter().map(|&valid| u8::from(valid)));
+            if row_start + local_row < looked_extent.0 {
+                any_valid |= row_bytes[..looked_extent.1].iter().any(|&valid| valid != 0);
+            }
+            hasher.update(&row_bytes);
+        }
+    }
+    anyhow::ensure!(
+        any_valid,
+        "layover/shadow mask '{}' has no valid pixel in the processed burst window",
+        reader.path.display()
+    );
+    Ok(hasher.finalize().into())
+}
+
+fn preflight_included_burst_masks(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+    crop: Option<&BoundedPlan>,
+) -> Result<BTreeMap<String, Option<PreparedBurstMask>>> {
+    let subdataset = cfg
+        .input_options
+        .subdataset
+        .as_deref()
+        .context("input_options.subdataset is required to align a layover/shadow mask")?;
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (id, idxs))| {
+            let bounded = crop
+                .as_ref()
+                .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
+            Some((|| {
+                let prepared = match masks[id].as_deref() {
+                    Some(mask_path) => {
+                        let first = &cfg.cslc_file_list[idxs[0]];
+                        let source = burst_source_window(first, subdataset, bounded)?;
+                        preflight_burst_mask(cfg, first, Some(mask_path), source)?
+                    }
+                    None => None,
+                };
+                Ok((id.clone(), prepared))
+            })())
+        })
+        .collect()
+}
+
+fn burst_source_window(
+    first_file: &Path,
+    subdataset: &str,
+    bounded: Option<BurstWindow>,
+) -> Result<BlockIndices> {
+    let full_shape = read_cslc_shape(first_file, subdataset)?;
+    Ok(bounded.map_or(
+        BlockIndices {
+            row_start: 0,
+            row_stop: full_shape.0,
+            col_start: 0,
+            col_stop: full_shape.1,
+        },
+        |window| window.source,
+    ))
+}
+
+fn fingerprint_mask_file(path: &Path) -> Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "layover/shadow mask '{}' must be std::fs-readable to bind resumable state",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let count = file.read(&mut buffer).with_context(|| {
+            format!(
+                "reading layover/shadow mask '{}' for resumable identity",
+                path.display()
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn ensure_gtiff_mask(path: &Path) -> Result<gdal::Dataset> {
+    let dataset = gdal::Dataset::open(path)
+        .with_context(|| format!("opening layover/shadow mask '{}'", path.display()))?;
+    let driver = dataset.driver().short_name();
+    anyhow::ensure!(
+        driver == "GTiff",
+        "layover/shadow mask '{}' must use the GDAL GTiff driver for stable file identity; found {driver}",
+        path.display()
+    );
+    anyhow::ensure!(
+        dataset.raster_count() == 1,
+        "layover/shadow mask '{}' must have exactly one raster band; found {}",
+        path.display(),
+        dataset.raster_count()
+    );
+    Ok(dataset)
+}
+
+fn capture_mask_file(path: &Path) -> Result<MaskFileState> {
+    let dataset = ensure_gtiff_mask(path)?;
+    Ok(MaskFileState {
+        path: path.to_path_buf(),
+        fingerprint: fingerprint_mask_file(path)?,
+        effective_dataset_fingerprint: fingerprint_mask_effective_dataset(&dataset)?,
+    })
+}
+
+fn fingerprint_mask_effective_dataset(dataset: &gdal::Dataset) -> Result<[u8; 32]> {
+    let band = dataset
+        .rasterband(1)
+        .context("opening the layover/shadow mask band for resumable identity")?;
+    let geotransform = dataset
+        .geo_transform()
+        .context("reading the layover/shadow mask geotransform for resumable identity")?;
+    let spatial_ref = dataset
+        .spatial_ref()
+        .context("reading the layover/shadow mask CRS for resumable identity")?;
+    let epsg = spatial_ref
+        .auth_code()
+        .context("reading the layover/shadow mask EPSG for resumable identity")?;
+    let spatial_wkt = spatial_ref
+        .to_wkt()
+        .context("serializing the layover/shadow mask CRS for resumable identity")?;
+    let nodata = band.no_data_value();
+    let mask_flags = band
+        .mask_flags()
+        .context("reading the layover/shadow validity contract for resumable identity")?;
+    let _mask_band = band
+        .open_mask_band()
+        .context("opening the layover/shadow validity band for resumable identity")?;
+
+    // SAFETY: GDAL owns the null-terminated string list. Every entry is copied
+    // before the matching CSLDestroy call, and the dataset remains open.
+    let raw_files = unsafe { gdal_sys::GDALGetFileList(dataset.c_dataset()) };
+    anyhow::ensure!(
+        !raw_files.is_null(),
+        "GDAL did not report the files backing the layover/shadow mask"
+    );
+    let files = (|| -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let mut index = 0;
+        loop {
+            // SAFETY: GDALGetFileList returns a null-terminated CSL string list.
+            let raw_path = unsafe { *raw_files.add(index) };
+            if raw_path.is_null() {
+                break;
+            }
+            // SAFETY: each non-null CSL entry is a valid null-terminated string.
+            let path = unsafe { CStr::from_ptr(raw_path) }
+                .to_str()
+                .context("GDAL reported a non-UTF8 layover/shadow mask file")?;
+            paths.push(PathBuf::from(path));
+            index += 1;
+        }
+        Ok(paths)
+    })();
+    // SAFETY: raw_files came from GDALGetFileList and has not been freed.
+    unsafe { gdal_sys::CSLDestroy(raw_files) };
+
+    let mut files = files?;
+    files.sort_unstable();
+    files.dedup();
+    anyhow::ensure!(
+        !files.is_empty(),
+        "GDAL reported no files backing the layover/shadow mask"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"dolphinRust:gtiff-mask-effective-dataset:v1\0");
+    let (cols, rows) = dataset.raster_size();
+    hasher.update((rows as u64).to_le_bytes());
+    hasher.update((cols as u64).to_le_bytes());
+    hasher.update((band.band_type() as u32).to_le_bytes());
+    hasher.update(band.color_interpretation().c_int().to_le_bytes());
+    for coefficient in geotransform {
+        hasher.update(coefficient.to_bits().to_le_bytes());
+    }
+    hasher.update(epsg.to_le_bytes());
+    hasher.update((spatial_wkt.len() as u64).to_le_bytes());
+    hasher.update(spatial_wkt.as_bytes());
+    match nodata {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([
+        u8::from(mask_flags.is_all_valid()),
+        u8::from(mask_flags.is_per_dataset()),
+        u8::from(mask_flags.is_alpha()),
+        u8::from(mask_flags.is_nodata()),
+    ]);
+    for file in files {
+        let encoded = file.as_os_str().as_encoded_bytes();
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(encoded);
+        hasher.update(fingerprint_mask_file(&file)?);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Upcast a `Cf32` window into a `Cf64` destination view (the only place the
@@ -1585,6 +3017,22 @@ fn configured_analysis_reference(
     Ok(Some(local))
 }
 
+fn checked_configured_analysis_reference(
+    point: Option<(usize, usize)>,
+    crop: Option<&BoundedPlan>,
+    temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+) -> Result<Option<(usize, usize)>> {
+    let reference = configured_analysis_reference(point, crop, temporal_coherence.dim())?;
+    if let Some((row, col)) = reference {
+        anyhow::ensure!(
+            validity_mask[(row, col)] && temporal_coherence[(row, col)].is_finite(),
+            "timeseries_options.reference_point resolves to a layover/shadow-invalid pixel"
+        );
+    }
+    Ok(reference)
+}
+
 fn offset_geotransform(gt: [f64; 6], row: usize, col: usize) -> [f64; 6] {
     [
         gt[0] + col as f64 * gt[1] + row as f64 * gt[2],
@@ -1662,7 +3110,7 @@ impl TiledOutput {
         }
         self.validity_mask
             .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
-            .fill(true);
+            .assign(&out.validity_mask.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
         Ok(())
     }
 
@@ -1682,6 +3130,7 @@ impl TiledOutput {
             phase_linking_coherence: self.phase_linking_coherence,
             crlb_sigma: self.crlb,
             closure_phase: self.closure,
+            validity_mask: self.validity_mask,
         }
     }
 }
@@ -1716,13 +3165,28 @@ fn burst_link(
         days.len(),
         out.cpx_phase.dim().0
     );
+    let covariance_output_origin = if cfg.phase_linking.write_covariance_operator {
+        let strides = cfg.output_options.strides;
+        anyhow::ensure!(
+            source_offset.0.is_multiple_of(strides.y) && source_offset.1.is_multiple_of(strides.x),
+            "covariance burst origin is not on the output stride lattice"
+        );
+        Some((
+            u64::try_from(source_offset.0 / strides.y)
+                .context("covariance output row origin exceeds u64")?,
+            u64::try_from(source_offset.1 / strides.x)
+                .context("covariance output column origin exceeds u64")?,
+        ))
+    } else {
+        None
+    };
     Ok(BurstLink {
         pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
         phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
-        validity_mask: Array2::from_elem((rows, cols), true),
+        validity_mask: out.validity_mask,
         coverage: BurstCoverageProvenance {
             burst_index: 0,
             acquisition_count: days.len(),
@@ -1732,6 +3196,7 @@ fn burst_link(
         },
         geo: resolve_burst_geo(cfg, first_file, rows, cols, source_offset)?,
         days,
+        covariance_output_origin,
     })
 }
 
@@ -1741,6 +3206,16 @@ fn mask2_f64(values: &mut Array2<f64>, mask: &Array2<bool>) {
         .for_each(|value, &valid| {
             if !valid {
                 *value = f64::NAN;
+            }
+        });
+}
+
+fn mask2_value<T: Clone>(values: &mut Array2<T>, mask: &Array2<bool>, fill: T) {
+    ndarray::Zip::from(values)
+        .and(mask)
+        .for_each(|value, &valid| {
+            if !valid {
+                *value = fill.clone();
             }
         });
 }
@@ -1762,9 +3237,25 @@ fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
 /// [`run_displacement_resumable`] and thread it through [`update_displacement`].
 ///
 /// Opaque; the same config (phase-linking parameters, strides, input type) must
-/// be used across the resumed series.
+/// be used across the resumed series. Configured layover/shadow masks must use
+/// the GDAL `GTiff` driver; resumable identity binds every effective backing
+/// file reported by GDAL.
 pub struct DisplacementState {
+    input_groups: BTreeMap<String, InputGroupState>,
     bursts: Vec<BurstState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputGroupState {
+    files: Vec<PathBuf>,
+    mask: Option<MaskFileState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaskFileState {
+    path: PathBuf,
+    fingerprint: [u8; 32],
+    effective_dataset_fingerprint: [u8; 32],
 }
 
 /// One burst's resumable state.
@@ -1775,8 +3266,10 @@ struct BurstState {
     files: Vec<PathBuf>,
     /// Footprint on the output grid (stable across updates).
     geo: BurstGeo,
-    /// Full-resolution source read window (stable across updates).
+    /// Full-resolution source read window used by the latest completed run.
     source_window: BlockIndices,
+    /// Resolved native terrain-validity contract used by the initial run.
+    mask: Option<BurstMaskState>,
     /// Sequential phase-linking carry (sealed ministacks + open trailing SLCs).
     seq: SequentialState,
 }
@@ -1788,28 +3281,37 @@ fn link_one_burst_resumable(
     engine: &ComputeEngine,
     bounded: Option<BurstWindow>,
     burst_index: usize,
-) -> Result<(BurstLink, SequentialState, BlockIndices)> {
+    mask: Option<&PreparedBurstMask>,
+) -> Result<(
+    BurstLink,
+    SequentialState,
+    BlockIndices,
+    Option<BurstMaskState>,
+)> {
     let files = burst_files(cfg, idxs);
-    let days = acquisition_days(&files, &cfg.input_options)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let days = acquisition_days(cfg, &files)?;
     let subdataset = cfg
         .input_options
         .subdataset
         .as_deref()
         .context("input_options.subdataset is required to read CSLC HDF5")?;
-    let full_shape = read_cslc_shape(&files[0], subdataset)?;
-    let source = bounded.map_or(
-        BlockIndices {
-            row_start: 0,
-            row_stop: full_shape.0,
-            col_start: 0,
-            col_stop: full_shape.1,
-        },
-        |window| window.source,
-    );
+    let source = burst_source_window(&files[0], subdataset, bounded)?;
+    let mask_state = mask.map(PreparedBurstMask::resumable_state).transpose()?;
     let stack = read_burst_tile(cfg.input_options.input_type, &files, subdataset, source)?;
-    let (out, state) = run_sequential_resumable(stack.view(), &sequential_config(cfg), engine)
-        .map_err(anyhow::Error::msg)?;
+    let native_validity = mask
+        .as_ref()
+        .map(|mask| mask.reader.read(mask.reader.full_block()))
+        .transpose()?;
+    let (out, state) = match native_validity.as_ref() {
+        Some(valid) => run_sequential_resumable_masked(
+            stack.view(),
+            valid.view(),
+            &sequential_config(cfg),
+            engine,
+        ),
+        None => run_sequential_resumable(stack.view(), &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)?;
     let mut link = burst_link(
         cfg,
         out,
@@ -1819,13 +3321,146 @@ fn link_one_burst_resumable(
     )?;
     link.coverage.burst_index = burst_index;
     link.coverage.acquisition_count = files.len();
-    Ok((link, state, source))
+    Ok((link, state, source, mask_state))
 }
 
 /// The CSLC files for a burst's indices into `cfg.cslc_file_list`.
 fn burst_files(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Vec<PathBuf> {
     idxs.iter()
         .map(|&i| cfg.cslc_file_list[i].clone())
+        .collect()
+}
+
+fn acquisition_days(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Vec<f64>> {
+    crate::dates::acquisition_days(files, &cfg.input_options)
+        .context("parsing acquisition dates from CSLC filenames")
+}
+
+fn validate_common_burst_dates(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+) -> Result<()> {
+    if !cfg.input_options.acquisition_metadata.is_empty() {
+        return workflow_groups(cfg).map(|_| ());
+    }
+    let mut axes = Vec::with_capacity(groups.len());
+    for (id, indices) in groups {
+        let files = burst_files(cfg, indices);
+        acquisition_days(cfg, &files).with_context(|| format!("burst {id}"))?;
+        let dates = files
+            .iter()
+            .map(|file| parse_date(file, &cfg.input_options.cslc_date_fmt))
+            .collect::<Result<Vec<_>>>()?;
+        axes.push((id, dates));
+    }
+    let Some((reference_id, reference_dates)) = axes.first() else {
+        return Ok(());
+    };
+    for (id, dates) in axes.iter().skip(1) {
+        anyhow::ensure!(
+            dates == reference_dates,
+            "bursts have different ordered acquisition dates: {reference_id} and {id}"
+        );
+    }
+    Ok(())
+}
+
+fn capture_input_groups(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, InputGroupState>> {
+    groups
+        .iter()
+        .map(|(id, idxs)| {
+            let mask = masks[id].as_deref().map(capture_mask_file).transpose()?;
+            Ok((
+                id.clone(),
+                InputGroupState {
+                    files: burst_files(cfg, idxs),
+                    mask,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn validate_updated_input_groups(
+    previous: &BTreeMap<String, InputGroupState>,
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, InputGroupState>> {
+    anyhow::ensure!(
+        previous.keys().eq(groups.keys()),
+        "incremental update must preserve the active burst-group set"
+    );
+    for (id, idxs) in groups {
+        let files = burst_files(cfg, idxs);
+        let prior = &previous[id];
+        anyhow::ensure!(
+            files.starts_with(&prior.files),
+            "burst {id}: prior files must be a date-ordered prefix of the updated list"
+        );
+        anyhow::ensure!(
+            files.len() > prior.files.len(),
+            "burst {id}: no new acquisitions; an update must extend every burst"
+        );
+        match (&prior.mask, &masks[id]) {
+            (None, None) => {}
+            (Some(old), Some(path)) if old.path == *path => {}
+            _ => anyhow::bail!(
+                "burst {id}: layover/shadow mask path or mapping changed during an incremental update"
+            ),
+        }
+    }
+    let current = capture_input_groups(cfg, groups, masks)?;
+    for (id, prior) in previous {
+        if prior.mask != current[id].mask {
+            anyhow::bail!(
+                "burst {id}: layover/shadow mask file or valid-pixel content changed during an incremental update"
+            );
+        }
+    }
+    Ok(current)
+}
+
+fn preflight_update_masks(
+    state: &DisplacementState,
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    masks: &BTreeMap<String, Option<PathBuf>>,
+) -> Result<BTreeMap<String, PreparedUpdateMask>> {
+    groups
+        .iter()
+        .map(|(id, idxs)| {
+            let previous = state
+                .bursts
+                .iter()
+                .find(|burst| burst.id == *id)
+                .with_context(|| format!("burst {id} is new; updates must not introduce bursts"))?;
+            let first = &cfg.cslc_file_list[idxs[0]];
+            let prepared =
+                preflight_burst_mask(cfg, first, masks[id].as_deref(), previous.source_window)?;
+            let current = prepared
+                .as_ref()
+                .map(PreparedBurstMask::resumable_state)
+                .transpose()?;
+            match (&previous.mask, &current) {
+                (None, None) => {}
+                (Some(old), Some(new)) if old == new => {}
+                _ => anyhow::bail!(
+                    "burst {id}: layover/shadow mask path, mapping, grid, or valid-pixel content changed during an incremental update"
+                ),
+            }
+            Ok((
+                id.clone(),
+                PreparedUpdateMask {
+                    prepared,
+                    state: current,
+                },
+            ))
+        })
         .collect()
 }
 
@@ -1861,12 +3496,24 @@ fn source_layouts(
 pub fn run_displacement_resumable(
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
-    validate_uncertainty_options(cfg)?;
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
+    validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator,
+        "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
+    );
     let groups = workflow_groups(cfg)?;
+    validate_common_burst_dates(cfg, &groups)?;
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
+    let input_groups = capture_input_groups(cfg, &groups, &masks)?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let linked = timed("phase_linking", || -> Result<Vec<_>> {
@@ -1878,25 +3525,44 @@ pub fn run_displacement_resumable(
                     .as_ref()
                     .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
                 Some((|| {
-                    let (link, seq, source) =
-                        link_one_burst_resumable(cfg, idxs, &engine, window, index)?;
-                    Ok((id.clone(), burst_files(cfg, idxs), link, seq, source))
+                    let (link, seq, source, mask) = link_one_burst_resumable(
+                        cfg,
+                        idxs,
+                        &engine,
+                        window,
+                        index,
+                        prepared_masks[id].as_ref(),
+                    )?;
+                    Ok((id.clone(), burst_files(cfg, idxs), link, seq, source, mask))
                 })())
             })
             .collect()
     })?;
-    for (id, files, link, seq, source_window) in linked {
+    for (id, files, link, seq, source_window, mask) in linked {
         states.push(BurstState {
             id,
             files,
             geo: link.geo,
             source_window,
+            mask,
             seq,
         });
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
-    Ok((output, DisplacementState { bursts: states }))
+    let output = finish_displacement(
+        cfg,
+        bursts,
+        crop.as_ref(),
+        DisplacementOutputPolicy::Full,
+        None,
+    )?;
+    Ok((
+        output,
+        DisplacementState {
+            input_groups,
+            bursts: states,
+        },
+    ))
 }
 
 /// Fold newly-arrived acquisitions into an existing displacement series. `cfg`
@@ -1917,32 +3583,32 @@ pub fn update_displacement(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
 ) -> Result<(DisplacementOutput, DisplacementState)> {
-    validate_uncertainty_options(cfg)?;
-    // The finite dependency cone grows when an update adds ministacks. Reusing a
-    // prior bounded state could therefore omit newly-required halo pixels. A
-    // bounded update deliberately recomputes the bounded analysis domain; it is
-    // still memory-bounded and scientifically equivalent to a fresh AOI-local run.
+    validate_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.phase_linking.write_covariance_operator,
+        "phase_linking.write_covariance_operator is unsupported for resumable updates"
+    );
+    let groups = workflow_groups(cfg)?;
+    validate_common_burst_dates(cfg, &groups)?;
+    let masks = resolve_layover_shadow_masks(
+        cfg.input_options.input_type,
+        &groups,
+        &cfg.layover_shadow_mask_files,
+    )?;
+    let input_groups = validate_updated_input_groups(&state.input_groups, cfg, &groups, &masks)?;
     if cfg.output_options.bounds.is_some() {
         return run_displacement_resumable(cfg);
     }
-    let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
-    let groups = workflow_groups(cfg)?;
-    let layouts = source_layouts(cfg, &groups)?;
-    let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
-    let crop = plan_bounds(cfg, &layouts, acquisitions)?;
+    let prepared_masks = preflight_update_masks(state, cfg, &groups, &masks)?;
+    let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
     let updated = timed("phase_linking", || -> Result<Vec<_>> {
         groups
             .iter()
             .enumerate()
-            .filter_map(|(index, (id, idxs))| {
-                let window = crop
-                    .as_ref()
-                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(update_one_burst(
-                    state, cfg, id, idxs, &engine, window, index,
-                ))
+            .map(|(index, (id, idxs))| {
+                update_one_burst(state, cfg, id, idxs, &engine, index, &prepared_masks[id])
             })
             .collect()
     })?;
@@ -1950,19 +3616,24 @@ pub fn update_displacement(
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, crop.as_ref(), DisplacementOutputPolicy::Full)?;
-    Ok((output, DisplacementState { bursts: states }))
+    let output = finish_displacement(cfg, bursts, None, DisplacementOutputPolicy::Full, None)?;
+    Ok((
+        output,
+        DisplacementState {
+            input_groups,
+            bursts: states,
+        },
+    ))
 }
 
-/// Fold new acquisitions into one burst, returning its extended link + new state.
 fn update_one_burst(
     state: &DisplacementState,
     cfg: &DisplacementWorkflow,
     id: &str,
     idxs: &[usize],
     engine: &ComputeEngine,
-    bounded: Option<BurstWindow>,
     burst_index: usize,
+    mask: &PreparedUpdateMask,
 ) -> Result<(BurstLink, BurstState)> {
     let files = burst_files(cfg, idxs);
     let prev = state
@@ -1979,11 +3650,6 @@ fn update_one_burst(
         !new_files.is_empty(),
         "burst {id}: no new acquisitions; an update must extend every burst"
     );
-    let planned_window = bounded.map_or(prev.source_window, |window| window.source);
-    anyhow::ensure!(
-        planned_window == prev.source_window,
-        "bounded source window changed during an incremental update"
-    );
     let subdataset = cfg
         .input_options
         .subdataset
@@ -1995,11 +3661,23 @@ fn update_one_burst(
         subdataset,
         prev.source_window,
     )?;
-    let (out, seq) =
-        update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine)
-            .map_err(anyhow::Error::msg)?;
-    let days = acquisition_days(&files, &cfg.input_options)
-        .context("parsing acquisition dates from CSLC filenames")?;
+    let native_validity = mask
+        .prepared
+        .as_ref()
+        .map(|mask| mask.reader.read(mask.reader.full_block()))
+        .transpose()?;
+    let (out, seq) = match native_validity.as_ref() {
+        Some(valid) => update_sequential_masked(
+            &prev.seq,
+            new_stack.view(),
+            valid.view(),
+            &sequential_config(cfg),
+            engine,
+        ),
+        None => update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)?;
+    let days = acquisition_days(cfg, &files)?;
     let mut link = burst_link(
         cfg,
         out,
@@ -2014,30 +3692,51 @@ fn update_one_burst(
         files,
         geo: prev.geo,
         source_window: prev.source_window,
+        mask: mask.state.clone(),
         seq,
     };
     Ok((link, next))
 }
 
-fn validate_uncertainty_options(cfg: &DisplacementWorkflow) -> Result<()> {
+fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
+    cfg.validate_supported_options()?;
     anyhow::ensure!(
-        !cfg
-            .timeseries_options
-            .correct_velocity_temporal_correlation
-            || cfg.timeseries_options.write_velocity_uncertainty,
-        "timeseries_options.correct_velocity_temporal_correlation requires write_velocity_uncertainty"
+        !cfg.timeseries_options.write_velocity_uncertainty
+            || (!cfg.timeseries_options.velocity_seasonal
+                && cfg.timeseries_options.velocity_step_dates.is_empty()),
+        "timeseries_options.write_velocity_uncertainty is validated only for the linear temporal model"
     );
-    // `preprocess_options` round-trips a dolphin YAML and `crop.rs` already
-    // reserves `max_radius` of halo for it, but no interpolation stage exists —
-    // so accepting the flag would widen every AOI read and change nothing. Reject
-    // it rather than silently ignore it (same rule as the check above, #25).
-    anyhow::ensure!(
-        !cfg.unwrap_options.run_interpolation,
-        "unwrap_options.run_interpolation is accepted for dolphin YAML round-trip but the \
-         pre-unwrap interpolation stage is not implemented; leave it false (dolphin's own \
-         default) rather than running with it silently ignored"
-    );
+    if cfg.phase_linking.write_covariance_operator {
+        anyhow::ensure!(
+            cfg.phase_linking.max_num_compressed > 0,
+            "phase_linking.write_covariance_operator requires max_num_compressed > 0"
+        );
+        anyhow::ensure!(
+            cfg.worker_settings.compute_backend == ComputeBackend::Cpu,
+            "phase_linking.write_covariance_operator requires the CPU f64 backend"
+        );
+        anyhow::ensure!(
+            cfg.phase_linking.output_reference_idx.unwrap_or(0) == 0,
+            "phase_linking.write_covariance_operator requires output_reference_idx = 0"
+        );
+        anyhow::ensure!(
+            cfg.phase_linking.compressed_slc_plan == CompressedSlcPlan::AlwaysFirst,
+            "phase_linking.write_covariance_operator requires compressed_slc_plan = always_first"
+        );
+        anyhow::ensure!(
+            !cfg.phase_linking.correct_phase_bias,
+            "phase_linking.write_covariance_operator requires correct_phase_bias = false"
+        );
+        anyhow::ensure!(
+            cfg.timeseries_options.method == TimeseriesMethod::L2,
+            "phase_linking.write_covariance_operator requires timeseries_options.method = l2"
+        );
+    }
     Ok(())
+}
+
+fn configured_compute_backend(cfg: &DisplacementWorkflow) -> ComputeBackend {
+    cfg.worker_settings.compute_backend
 }
 
 /// The frame-grid mosaic of the per-burst phase-linking products.
@@ -2053,6 +3752,12 @@ struct Stitched {
     /// Per-triplet closure phase (band-major), if enabled.
     closure_phase: Option<Array3<f64>>,
     validity_mask: Array2<bool>,
+    /// Date-wise source-burst owner under the exact finite-overwrite rule.
+    ownership: Option<Array3<u32>>,
+    /// Applied acquisition-wise seam rotations keyed by source-burst index.
+    seam_rotations: Option<Vec<(u32, Vec<Cf64>)>>,
+    /// Mapping from stitched-frame coordinates to captured output coordinates.
+    burst_output_mappings: Option<Vec<BurstOutputMapping>>,
     coverage: Vec<BurstCoverageProvenance>,
     /// Frame grid georeferencing.
     geo: GeoInfo,
@@ -2060,10 +3765,36 @@ struct Stitched {
 
 /// Mosaic the per-burst phase-linking products onto the frame grid. A single
 /// burst is returned as-is (identity path).
-fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
+#[allow(clippy::too_many_lines)]
+fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
         let b = bursts.remove(0);
+        let owner =
+            u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
+        let ownership = retain_covariance_lineage.then(|| {
+            b.pl.mapv(|value| {
+                if value.re.is_finite() && value.im.is_finite() {
+                    owner
+                } else {
+                    NO_BURST_OWNER
+                }
+            })
+        });
+        let seam_rotations = retain_covariance_lineage
+            .then(|| vec![(owner, vec![Cf64::new(1.0, 0.0); b.pl.dim().0])]);
+        let burst_output_mappings = if retain_covariance_lineage {
+            Some(vec![BurstOutputMapping {
+                owner,
+                frame_origin: (0, 0),
+                output_origin: b
+                    .covariance_output_origin
+                    .context("covariance-linked burst lacks a captured output origin")?,
+                shape: (b.pl.dim().1, b.pl.dim().2),
+            }])
+        } else {
+            None
+        };
         return Ok(Stitched {
             pl: b.pl,
             temp_coh: b.temp_coh,
@@ -2071,6 +3802,9 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
             crlb_sigma: b.crlb_sigma,
             closure_phase: b.closure_phase,
             validity_mask: b.validity_mask,
+            ownership,
+            seam_rotations,
+            burst_output_mappings,
             coverage: vec![b.coverage],
             geo: b.geo.geo,
         });
@@ -2084,13 +3818,48 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
     );
     let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
+    let mut ownership = retain_covariance_lineage
+        .then(|| Array3::<u32>::from_elem((nslc, frame.rows, frame.cols), NO_BURST_OWNER));
+    let mut seam_rotations = retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
+    let mut burst_output_mappings =
+        retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
     for (burst_index, b) in bursts.iter_mut().enumerate() {
         anyhow::ensure!(b.pl.dim().0 == nslc, "bursts have differing date counts");
         let off = burst_offset(&frame, &b.geo);
-        if burst_index > 0 {
-            level_burst_offsets(&pl, &temp_coh, &covered, b, off, burst_index)?;
+        let rotations = if burst_index > 0 {
+            level_burst_offsets(
+                &pl,
+                &temp_coh,
+                &covered,
+                b,
+                off,
+                burst_index,
+                retain_covariance_lineage,
+            )?
+        } else {
+            retain_covariance_lineage.then(|| vec![Cf64::new(1.0, 0.0); nslc])
+        };
+        let owner =
+            u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
+        if let (Some(seams), Some(rotations)) = (seam_rotations.as_mut(), rotations) {
+            seams.push((owner, rotations));
         }
-        paste3_finite_complex(&mut pl, &b.pl, off);
+        if let Some(mappings) = burst_output_mappings.as_mut() {
+            mappings.push(BurstOutputMapping {
+                owner,
+                frame_origin: off,
+                output_origin: b
+                    .covariance_output_origin
+                    .context("covariance-linked burst lacks a captured output origin")?,
+                shape: (b.pl.dim().1, b.pl.dim().2),
+            });
+        }
+        match ownership.as_mut() {
+            Some(ownership) => {
+                paste3_finite_complex_with_owner(&mut pl, ownership, &b.pl, off, owner);
+            }
+            None => paste3_finite_complex(&mut pl, &b.pl, off),
+        }
         paste2_finite(&mut temp_coh, &b.temp_coh, off);
         let (rows, cols) = b.temp_coh.dim();
         let mut target = covered.slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols]);
@@ -2109,6 +3878,9 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>) -> Result<Stitched> {
         crlb_sigma,
         closure_phase,
         validity_mask: covered,
+        ownership,
+        seam_rotations,
+        burst_output_mappings,
         coverage: bursts.iter().map(|burst| burst.coverage.clone()).collect(),
         geo: frame.geo,
     })
@@ -2123,6 +3895,28 @@ fn paste2_finite(frame: &mut Array2<f64>, burst: &Array2<f64>, offset: (usize, u
         .for_each(|dst, &src| {
             if src.is_finite() {
                 *dst = src;
+            }
+        });
+}
+
+fn paste3_finite_complex_with_owner(
+    frame: &mut Array3<Cf64>,
+    ownership: &mut Array3<u32>,
+    burst: &Array3<Cf64>,
+    offset: (usize, usize),
+    owner: u32,
+) {
+    let (row, col) = offset;
+    let (_, rows, cols) = burst.dim();
+    let target = frame.slice_mut(s![.., row..row + rows, col..col + cols]);
+    let owner_target = ownership.slice_mut(s![.., row..row + rows, col..col + cols]);
+    ndarray::Zip::from(target)
+        .and(owner_target)
+        .and(burst)
+        .for_each(|dst, dst_owner, &src| {
+            if src.re.is_finite() && src.im.is_finite() {
+                *dst = src;
+                *dst_owner = owner;
             }
         });
 }
@@ -2150,8 +3944,10 @@ fn level_burst_offsets(
     burst: &mut BurstLink,
     offset: (usize, usize),
     burst_index: usize,
-) -> std::result::Result<(), StitchError> {
+    capture_rotations: bool,
+) -> std::result::Result<Option<Vec<Cf64>>, StitchError> {
     let (_, rows, cols) = burst.pl.dim();
+    let mut rotations = capture_rotations.then(|| Vec::with_capacity(burst.pl.dim().0));
     for acquisition_index in 0..burst.pl.dim().0 {
         let mut sum = Cf64::new(0.0, 0.0);
         let mut support = 0;
@@ -2187,12 +3983,15 @@ fn level_burst_offsets(
             });
         }
         let rotation = Cf64::from_polar(1.0, sum.arg());
+        if let Some(rotations) = rotations.as_mut() {
+            rotations.push(rotation);
+        }
         burst
             .pl
             .index_axis_mut(Axis(0), acquisition_index)
             .mapv_inplace(|value| value * rotation);
     }
-    Ok(())
+    Ok(rotations)
 }
 
 /// Mosaic an optional per-burst 2D layer onto the frame grid.
@@ -2276,8 +4075,13 @@ fn phase_link(
     cfg: &DisplacementWorkflow,
     stack: ArrayView3<Cf64>,
     engine: &ComputeEngine,
+    valid_mask: Option<ArrayView2<bool>>,
 ) -> Result<SequentialOutput> {
-    run_sequential(stack, &sequential_config(cfg), engine).map_err(anyhow::Error::msg)
+    match valid_mask {
+        Some(mask) => run_sequential_masked(stack, mask, &sequential_config(cfg), engine),
+        None => run_sequential(stack, &sequential_config(cfg), engine),
+    }
+    .map_err(anyhow::Error::msg)
 }
 
 /// Subtract the phase-bias (non-closure) cumulative bias from the stitched linked
@@ -2303,9 +4107,7 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         zero_correlation_threshold: cfg.phase_linking.zero_correlation_threshold,
         output_reference_idx: cfg.phase_linking.output_reference_idx.unwrap_or(0),
         compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
-        compute_crlb: cfg.phase_linking.write_crlb
-            || cfg.timeseries_options.use_coherence_weights
-            || cfg.timeseries_options.write_velocity_uncertainty,
+        compute_crlb: cfg.phase_linking.write_crlb || cfg.timeseries_options.use_coherence_weights,
         // The phase-bias correction consumes the closure layer, so force it on
         // when the correction is enabled even if the raster isn't written.
         compute_closure_phase: cfg.phase_linking.write_closure_phase
@@ -2350,16 +4152,35 @@ fn unwrap_network(
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
     temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
 ) -> Result<UnwrapNetworkOutput> {
     let (_, rows, cols) = pl.dim();
+    anyhow::ensure!(
+        validity_mask.dim() == (rows, cols),
+        "phase-link validity shape differs from unwrap grid"
+    );
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let correlation =
+    let mut correlation =
         analysis_correlation(cfg, temporal_coherence, geotransform, epsg, (rows, cols))?;
-    let masked_phase = (cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some())
-        .then(|| apply_phase_mask(pl, correlation.view()));
+    ndarray::Zip::from(&mut correlation)
+        .and(validity_mask)
+        .for_each(|correlation, &valid| {
+            if !valid {
+                *correlation = 0.0;
+            }
+        });
+    let apply_configured_mask = cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some();
+    let has_invalid_phase_link_pixel = validity_mask.iter().any(|valid| !*valid);
+    let masked_phase = (has_invalid_phase_link_pixel || apply_configured_mask).then(|| {
+        apply_phase_masks(
+            pl,
+            validity_mask,
+            apply_configured_mask.then_some(correlation.view()),
+        )
+    });
     let backend = unwrap_backend(cfg, (rows, cols));
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
@@ -2371,10 +4192,17 @@ fn unwrap_network(
     }
 }
 
-fn apply_phase_mask(pl: ArrayView3<Cf64>, mask: ArrayView2<f32>) -> Array3<Cf64> {
+fn apply_phase_masks(
+    pl: ArrayView3<Cf64>,
+    phase_link_validity: ArrayView2<bool>,
+    configured_mask: Option<ArrayView2<f32>>,
+) -> Array3<Cf64> {
     let mut values = pl.to_owned();
-    for ((row, col), &validity) in mask.indexed_iter() {
-        if validity == 0.0 {
+    for ((row, col), &valid) in phase_link_validity.indexed_iter() {
+        let configured_invalid = configured_mask
+            .as_ref()
+            .is_some_and(|mask| mask[(row, col)] == 0.0);
+        if !valid || configured_invalid {
             values.slice_mut(s![.., row, col]).fill(Cf64::new(0.0, 0.0));
         }
     }
@@ -2622,14 +4450,7 @@ fn date_precisions(sigma: ArrayView3<f64>, valid: ArrayView2<bool>) -> Array3<f6
     })
 }
 
-/// Blank an uncertainty layer wherever the pixel has no usable bound. Uniform
-/// weights recover the displacement; they do not manufacture an uncertainty, so
-/// the derived σ must still read as absent.
-fn clear_unbounded_uncertainty(layer: &mut Array2<f64>, valid: ArrayView2<bool>) {
-    clear_unbounded_uncertainty_2d(&mut layer.view_mut(), valid);
-}
-
-/// [`clear_unbounded_uncertainty`] over a borrowed 2-D view (one band of a cube).
+/// Blank a diagonal network-covariance band wherever the pixel has no usable bound.
 fn clear_unbounded_uncertainty_2d(
     layer: &mut ndarray::ArrayViewMut2<f64>,
     valid: ArrayView2<bool>,
@@ -2646,10 +4467,12 @@ fn clear_unbounded_uncertainty_2d(
 /// Write the velocity, temporal-coherence, per-date displacement, and (when
 /// enabled) per-band CRLB σ + closure-phase rasters as GeoTIFFs, all sharing the
 /// resolved geotransform + EPSG.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_outputs(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     velocity: ArrayView2<f64>,
+    velocity_estimator: VelocityEstimator,
     temporal_coherence: ArrayView2<f64>,
     quality: QualityLayers,
     epsg: Option<u32>,
@@ -2660,17 +4483,66 @@ fn write_outputs(
     let write_f32 = |name: &str, a: ArrayView2<f64>| {
         write_raster(&dir.join(name), a.mapv(|v| v as f32).view(), gt, epsg, None)
     };
-    // Issue #36: which layer is *the* uncertainty is not a matter of taste, it
-    // depends on whether the interferogram system has residual degrees of freedom.
-    // Say so in the raster rather than leaving it to the reader.
-    let (scale, scale_note) = uncertainty_scale(quality.posterior_dof);
-    let dof_text = quality.posterior_dof.to_string();
-    let posterior_tags = [
-        ("UNCERTAINTY_SCALE", scale),
-        ("POSTERIOR_DOF", dof_text.as_str()),
-        ("DESCRIPTION", scale_note),
+    let write_f32_with_metadata = |name: &str, a: ArrayView2<f64>, metadata: &[(&str, &str)]| {
+        write_raster_with_metadata(
+            &dir.join(name),
+            a.mapv(|v| v as f32).view(),
+            gt,
+            epsg,
+            None,
+            metadata,
+        )
+    };
+    let temporal_support_tags = [
+        ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+        ("EVIDENCE_ROLE", "fit_support"),
+        ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+        ("TEMPORAL_COVARIANCE", "not_modeled"),
+        ("CALIBRATION_STATUS", "not_calibrated"),
     ];
-    write_f32("velocity.tif", velocity)?;
+    let temporal_diagnostic_tags = [
+        ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+        ("EVIDENCE_ROLE", "diagnostic_only"),
+        ("INFERENTIAL_USE", "prohibited"),
+        ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+        ("TEMPORAL_COVARIANCE", "not_modeled"),
+        ("CALIBRATION_STATUS", "not_calibrated"),
+    ];
+    let (velocity_unit, variance_unit) = match cfg.input_options.wavelength {
+        Some(_) => ("m/yr", "m^2"),
+        None => ("rad/yr", "rad^2"),
+    };
+    let network_dof_text = quality.network_residual_dof.to_string();
+    let network_covariance_tags = [
+        ("UNITTYPE", variance_unit),
+        (
+            "UNCERTAINTY_SCOPE",
+            "independent_ifg_parameter_covariance_diagonal_approximation",
+        ),
+        ("IFG_ERROR_ASSUMPTION", "independent"),
+        (
+            "SPATIAL_COVARIANCE",
+            "target_reference_covariance_not_modeled",
+        ),
+        (
+            "SPATIAL_REFERENCE_PROPAGATION",
+            "independent_pixel_variances_added",
+        ),
+        ("NETWORK_RESIDUAL_DOF", network_dof_text.as_str()),
+        ("CALIBRATION_STATUS", "not_calibrated"),
+        ("DESCRIPTION", NETWORK_COVARIANCE_NOTE),
+    ];
+    write_raster_with_metadata(
+        &dir.join("velocity.tif"),
+        velocity.mapv(|v| v as f32).view(),
+        gt,
+        epsg,
+        None,
+        &[
+            ("UNITTYPE", velocity_unit),
+            ("VELOCITY_ESTIMATOR", velocity_estimator.metadata_value()),
+        ],
+    )?;
     if let Some(sigma) = quality.velocity_sigma {
         write_raster_with_metadata(
             &dir.join("velocity_sigma.tif"),
@@ -2678,7 +4550,99 @@ fn write_outputs(
             gt,
             epsg,
             None,
-            &posterior_tags,
+            &[
+                ("UNITTYPE", velocity_unit),
+                ("UNCERTAINTY_COMPONENT", "independent_residual_conditional"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "uncalibrated_component"),
+                ("DESCRIPTION", VELOCITY_CONDITIONAL_SE_NOTE),
+            ],
+        )?;
+    }
+    if let Some(diagnostics) = quality.velocity_diagnostics {
+        write_f32_with_metadata(
+            "velocity_valid_date_count.tif",
+            diagnostics.valid_date_count.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_regression_rank.tif",
+            diagnostics.regression_rank.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_regression_dof.tif",
+            diagnostics.regression_dof.mapv(f64::from).view(),
+            &temporal_support_tags,
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_uncertainty_status.tif"),
+            diagnostics
+                .uncertainty_status
+                .mapv(|status| status as u8)
+                .view(),
+            gt,
+            epsg,
+            None,
+            &[
+                ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+                ("EVIDENCE_ROLE", "component_status"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "uncalibrated_component"),
+                ("VALUE_MAP", "0=unavailable;1=iid_conditional"),
+            ],
+        )?;
+        write_f32_with_metadata(
+            "velocity_lag1_rho.tif",
+            diagnostics.lag1_rho.view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_correlation_pair_count.tif",
+            diagnostics.correlation_pair_count.mapv(f64::from).view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_cadence_status.tif"),
+            diagnostics
+                .cadence_status
+                .mapv(|status| status as u8)
+                .view(),
+            gt,
+            epsg,
+            None,
+            &[
+                ("EVIDENCE_SCOPE", "post_gauge_temporal_fit"),
+                ("EVIDENCE_ROLE", "diagnostic_only"),
+                ("INFERENTIAL_USE", "prohibited"),
+                ("TEMPORAL_GAUGE", "acquisition_0_excluded"),
+                ("TEMPORAL_COVARIANCE", "not_modeled"),
+                ("CALIBRATION_STATUS", "not_calibrated"),
+                (
+                    "VALUE_MAP",
+                    "0=unavailable;1=regular_contiguous;2=irregular;3=missing",
+                ),
+            ],
+        )?;
+        write_raster_with_metadata(
+            &dir.join("velocity_correlation_available.tif"),
+            diagnostics.correlation_available.mapv(u8::from).view(),
+            gt,
+            epsg,
+            None,
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_diagnostic_inflation_factor.tif",
+            diagnostics.diagnostic_inflation_factor.view(),
+            &temporal_diagnostic_tags,
+        )?;
+        write_f32_with_metadata(
+            "velocity_diagnostic_effective_sample_size.tif",
+            diagnostics.diagnostic_effective_sample_size.view(),
+            &temporal_diagnostic_tags,
         )?;
     }
     if let Some(residual) = quality.timeseries_residual_rms {
@@ -2690,6 +4654,9 @@ fn write_outputs(
     write_f32("temporal_coherence.tif", temporal_coherence)?;
     if let Some(coherence) = quality.phase_linking_coherence {
         write_f32("phase_linking_coherence.tif", coherence.view())?;
+    }
+    if let Some(similarity) = quality.phase_similarity {
+        write_f32("phase_similarity.tif", similarity.view())?;
     }
     write_bands(&write_f32, displacement, "displacement")?;
     if let Some(crlb) = quality.crlb_sigma {
@@ -2703,6 +4670,10 @@ fn write_outputs(
                 &[
                     ("UNITTYPE", "rad"),
                     ("UNCERTAINTY_SCALE", "crlb_bound"),
+                    ("UNCERTAINTY_SCOPE", "per_ministack_marginal_crlb"),
+                    ("TEMPORAL_COVARIANCE", "not_propagated"),
+                    ("CALIBRATION_STATUS", "not_calibrated"),
+                    ("INFERENCE_READY", "false"),
                     ("DESCRIPTION", CRLB_BOUND_NOTE),
                 ],
             )?;
@@ -2742,7 +4713,7 @@ fn write_outputs(
                 gt,
                 epsg,
                 None,
-                &posterior_tags,
+                &network_covariance_tags,
             )?;
         }
     }
@@ -2804,45 +4775,36 @@ fn write_correction_outputs(
 /// what it is not is a predictive sigma, and a consumer reading the band without
 /// this would have no way to know (#36).
 const CRLB_BOUND_NOTE: &str =
-    "Cramer-Rao LOWER BOUND on the phase-linking sigma, not a predictive uncertainty. \
-     It under-covers the true spread by construction. Do not publish it as the \
-     uncertainty layer.";
+    "Per-ministack marginal Cramer-Rao lower bound on phase-linking sigma. The sequential \
+     cube changes compressed temporal reference and omits cross-date covariance, so it is a \
+     quality diagnostic, not global per-date covariance or predictive uncertainty.";
 
-/// In-band note on the posterior layers when the interferogram system is exactly
-/// determined, so their scale is not empirical.
-const POSTERIOR_BOUND_NOTE: &str =
-    "dof=0: the interferogram system is exactly determined (single-reference network), so \
-     the residual-based inflation is pinned to 1 and this sigma traces entirely to the \
-     CRLB lower bound. It is NOT an empirically scaled uncertainty. Set \
-     interferogram_network.max_bandwidth for a posterior scaled by the data.";
+const NETWORK_COVARIANCE_NOTE: &str =
+    "Network-parameter covariance diagonal under an independent-interferogram error \
+     assumption. Interferograms sharing acquisitions are correlated, so network residual DOF \
+     is algebraic diagnostics rather than independent empirical evidence. Spatial referencing \
+     adds target and reference variances but omits their covariance. Do not use this product as \
+     calibrated uncertainty.";
 
-/// In-band note on the posterior layers when they do carry empirical scale.
-const POSTERIOR_EMPIRICAL_NOTE: &str =
-    "Posterior sigma scaled by the fit residuals (dof>0). This is the layer to carry as \
-     the uncertainty product.";
-
-/// Where an uncertainty layer's scale comes from, given the posterior degrees of
-/// freedom `n_interferograms - n_unknowns`.
-fn uncertainty_scale(posterior_dof: usize) -> (&'static str, &'static str) {
-    match posterior_dof {
-        0 => ("crlb_bound", POSTERIOR_BOUND_NOTE),
-        _ => ("empirical", POSTERIOR_EMPIRICAL_NOTE),
-    }
-}
+const VELOCITY_CONDITIONAL_SE_NOTE: &str =
+    "Independent-residual conditional slope standard error from the final corrected and \
+     spatially referenced displacement series, excluding the structural acquisition-0 gauge. \
+     Temporal covariance and total field calibration are not included.";
 
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
-    /// Residual degrees of freedom of the SBAS solve,
-    /// `n_interferograms - (n_dates - 1)`. Zero on a single-reference network,
-    /// which is what decides whether the posterior layers carry empirical scale.
-    posterior_dof: usize,
+    /// Algebraic residual degrees of freedom of the SBAS network solve,
+    /// `n_interferograms - (n_dates - 1)`.
+    network_residual_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
+    phase_similarity: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
     displacement_variance: Option<&'a Array3<f64>>,
     network_misclosure_rms: Option<&'a Array2<f64>>,
     timeseries_residual_rms: Option<&'a Array2<f64>>,
     velocity_sigma: Option<&'a Array2<f64>>,
+    velocity_diagnostics: Option<&'a VelocityTemporalDiagnostics>,
     connected_components: &'a Array3<u32>,
     /// Seasonal amplitude in displacement units, peak day, and per-step
     /// magnitudes — present only when the time-function model is configured.
@@ -2883,26 +4845,49 @@ mod tests {
         };
         let mask = ndarray::arr2(&[[1u8, 0], [1, 1]]);
         write_raster(&path, mask.view(), geo.geotransform, Some(geo.epsg), None).unwrap();
-        let mut cfg = DisplacementWorkflow {
-            layover_shadow_mask_files: vec![path.clone()],
+        let cfg = DisplacementWorkflow {
+            mask_file: Some(path.clone()),
             ..Default::default()
         };
         let mut valid = Array2::from_elem((2, 2), true);
         restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
         assert_eq!(valid, mask.mapv(|v| v == 1));
         assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 1))).is_err());
-        cfg.layover_shadow_mask_files.clear();
-        cfg.mask_file = Some(path.clone());
-        let mut valid = Array2::from_elem((2, 2), true);
-        restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
-        assert_eq!(valid, mask.mapv(|v| v == 1));
         std::fs::remove_file(path).unwrap();
         assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).is_err());
     }
 
     use super::*;
-    use dolphin_core::config::ComputeBackend;
+    use dolphin_core::config::{CompressedSlcPlan, InterferogramNetwork, ShpMethod};
     use dolphin_core::{HalfWindow, Strides};
+
+    #[test]
+    fn temporal_product_uses_only_persisted_post_gauge_displacement_names() {
+        let directory = Path::new("/tmp/dolphin-temporal-product-contract");
+        let paths = temporal_product_displacement_rasters(directory, 4).unwrap();
+        assert_eq!(
+            paths,
+            [
+                directory.join("displacement_00.tif"),
+                directory.join("displacement_01.tif"),
+                directory.join("displacement_02.tif"),
+            ]
+        );
+        assert!(temporal_product_displacement_rasters(directory, 0).is_err());
+    }
+
+    fn run_isolated_hdf5_test(name: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", name, "--test-threads=1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated HDF5 contract failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     /// A config whose velocity path is the unweighted degree-1 fit — the branch
     /// the bounded-trim reference-reselection tests exercise.
@@ -2941,6 +4926,7 @@ mod tests {
                 cols: 3,
             },
             days: vec![0.0, 12.0],
+            covariance_output_origin: Some((0, 0)),
         }
     }
 
@@ -2952,7 +4938,7 @@ mod tests {
         let coherence = Array2::from_elem((3, 3), 0.9);
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(0.7, 0.9);
-        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false).unwrap();
         for (actual, expected) in burst.pl.iter().zip(frame.iter()) {
             assert!((*actual - *expected).norm() < 1e-12);
         }
@@ -2964,8 +4950,8 @@ mod tests {
         let coherence = Array2::from_elem((3, 3), 0.9);
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(0.7, 0.1);
-        let error =
-            level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap_err();
+        let error = level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false)
+            .unwrap_err();
         assert!(matches!(
             error,
             StitchError::InsufficientOffsetSupport { support: 0, .. }
@@ -2982,7 +4968,7 @@ mod tests {
         let covered = Array2::from_elem((3, 3), true);
         let mut burst = seam_burst(-0.4, 0.9);
         burst.pl[(1, 0, 1)] = Cf64::new(0.0, 0.0);
-        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1).unwrap();
+        level_burst_offsets(&frame, &coherence, &covered, &mut burst, (0, 0), 1, false).unwrap();
         assert!((burst.pl[(0, 1, 1)] - frame[(0, 1, 1)]).norm() < 1e-12);
         assert!((burst.pl[(1, 1, 1)] - frame[(1, 1, 1)]).norm() < 1e-12);
     }
@@ -2996,10 +4982,48 @@ mod tests {
         second.temp_coh[(0, 0)] = f64::NAN;
         second.validity_mask[(0, 0)] = false;
         second.coverage.burst_index = 1;
-        let stitched = stitch_bursts(vec![first, second]).unwrap();
+        let stitched = stitch_bursts(vec![first, second], true).unwrap();
         assert_eq!(stitched.pl[(0, 0, 0)], expected);
         assert!(stitched.temp_coh[(0, 0)].is_finite());
         assert!(stitched.validity_mask[(0, 0)]);
+        let ownership = stitched.ownership.unwrap();
+        assert_eq!(ownership[(0, 0, 0)], 0);
+        assert_eq!(ownership[(1, 0, 0)], 1);
+        assert_eq!(stitched.seam_rotations.unwrap().len(), 2);
+        assert_eq!(
+            crate::spatial_reference_covariance_output::same_constant_owner(
+                ownership.view(),
+                (0, 0),
+                (0, 1),
+            ),
+            None,
+            "date-varying overlap ownership must abstain"
+        );
+    }
+
+    #[test]
+    fn disabled_covariance_capture_does_not_retain_frame_lineage() {
+        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false).unwrap();
+        assert!(stitched.ownership.is_none());
+        assert!(stitched.seam_rotations.is_none());
+    }
+
+    #[test]
+    fn covariance_retains_the_exact_post_loop_qc_l2_observation_branch() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
+        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true).unwrap();
+        assert!(qc.is_some());
+        let retained = inversion.fixed_l2_inputs.unwrap();
+        assert!(retained.pixel_map((0, 0)).is_ok());
+        assert_eq!(
+            retained.pixel_map((0, 1)).unwrap_err().status,
+            dolphin_timeseries::inversion::PixelL2MapStatus::InsufficientObservations
+        );
     }
     #[test]
     fn proc_status_memory_parser_is_bounded_and_path_free() {
@@ -3039,21 +5063,37 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn validity_mask_propagates_nodata_through_every_output_layer() {
         let mut validity_mask = Array2::from_elem((2, 2), true);
         validity_mask[(0, 0)] = false;
         let mut velocity = Array2::from_elem((2, 2), 1.0);
         velocity[(1, 1)] = f64::NAN;
+        let mut displacement = Array3::from_elem((2, 2, 2), 1.0);
+        displacement[(1, 0, 1)] = f64::MAX;
         let mut products = SpatialProducts {
-            disp_rad: Array3::from_elem((2, 2, 2), 1.0),
+            disp_rad: displacement,
             vel_rad: velocity,
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
-            velocity_terms: VelocityTerms::default(),
-            loop_closure: None,
+            velocity_terms: VelocityTerms {
+                seasonal_amplitude_rad: Some(Array2::from_elem((2, 2), 1.0)),
+                seasonal_phase_days: Some(Array2::from_elem((2, 2), 2.0)),
+                step_magnitude_rad: vec![
+                    Array2::from_elem((2, 2), 3.0),
+                    Array2::from_elem((2, 2), 4.0),
+                ],
+            },
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_elem((2, 2), 1.0),
+                evaluable_loop_count: Array2::from_elem((2, 2), 2.0),
+                worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
+            }),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
+            phase_similarity: None,
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -3072,13 +5112,29 @@ mod tests {
             network_misclosure_rad: Some(Array2::from_elem((2, 2), 1.0)),
             timeseries_residual_rad: Some(Array2::from_elem((2, 2), 1.0)),
             velocity_sigma_rad: Some(Array2::from_elem((2, 2), 1.0)),
+            velocity_diagnostics: Some(VelocityTemporalDiagnostics {
+                valid_date_count: Array2::from_elem((2, 2), 8),
+                regression_rank: Array2::from_elem((2, 2), 2),
+                regression_dof: Array2::from_elem((2, 2), 6),
+                uncertainty_status: Array2::from_elem(
+                    (2, 2),
+                    VelocityUncertaintyStatus::IidConditional,
+                ),
+                lag1_rho: Array2::from_elem((2, 2), 0.5),
+                correlation_pair_count: Array2::from_elem((2, 2), 7),
+                cadence_status: Array2::from_elem((2, 2), VelocityCadenceStatus::RegularContiguous),
+                correlation_available: Array2::from_elem((2, 2), true),
+                diagnostic_inflation_factor: Array2::from_elem((2, 2), 1.5),
+                diagnostic_effective_sample_size: Array2::from_elem((2, 2), 4.0),
+            }),
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::from_elem((2, 2, 2), 1),
+            production_covariance: None,
         };
 
         products.apply_validity_mask();
 
-        for (row, col) in [(0, 0), (1, 1)] {
+        for (row, col) in [(0, 0), (0, 1), (1, 1)] {
             assert!(!products.validity_mask[(row, col)]);
             assert!(products.vel_rad[(row, col)].is_nan());
             assert!(products.temporal_coherence[(row, col)].is_nan());
@@ -3086,6 +5142,35 @@ mod tests {
             assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.velocity_sigma_rad.as_ref().unwrap()[(row, col)].is_nan());
+            let diagnostics = products.velocity_diagnostics.as_ref().unwrap();
+            assert_eq!(diagnostics.valid_date_count[(row, col)], 0);
+            assert_eq!(
+                diagnostics.uncertainty_status[(row, col)],
+                VelocityUncertaintyStatus::Unavailable
+            );
+            assert!(!diagnostics.correlation_available[(row, col)]);
+            assert!(diagnostics.lag1_rho[(row, col)].is_nan());
+            assert!(products
+                .velocity_terms
+                .seasonal_amplitude_rad
+                .as_ref()
+                .unwrap()[(row, col)]
+                .is_nan());
+            assert!(products
+                .velocity_terms
+                .seasonal_phase_days
+                .as_ref()
+                .unwrap()[(row, col)]
+                .is_nan());
+            assert!(products
+                .velocity_terms
+                .step_magnitude_rad
+                .iter()
+                .all(|layer| layer[(row, col)].is_nan()));
+            let loop_closure = products.loop_closure.as_ref().unwrap();
+            assert!(loop_closure.bad_loop_count[(row, col)].is_nan());
+            assert!(loop_closure.evaluable_loop_count[(row, col)].is_nan());
+            assert!(loop_closure.worst_residual_cycles[(row, col)].is_nan());
             for band in 0..2 {
                 assert!(products.disp_rad[(band, row, col)].is_nan());
                 assert!(products.crlb_sigma.as_ref().unwrap()[(band, row, col)].is_nan());
@@ -3106,8 +5191,20 @@ mod tests {
             assert!(geometry.north[(row, col)].is_nan());
             assert!(geometry.up[(row, col)].is_nan());
         }
-        assert!(products.validity_mask[(0, 1)]);
-        assert_eq!(products.vel_rad[(0, 1)], 1.0);
+        assert!(products.validity_mask[(1, 0)]);
+        assert_eq!(products.vel_rad[(1, 0)], 1.0);
+        assert_eq!(
+            products
+                .velocity_terms
+                .seasonal_amplitude_rad
+                .as_ref()
+                .unwrap()[(1, 0)],
+            1.0
+        );
+        assert_eq!(
+            products.loop_closure.as_ref().unwrap().bad_loop_count[(1, 0)],
+            1.0
+        );
     }
 
     #[test]
@@ -3117,13 +5214,19 @@ mod tests {
                 date as f64 + row as f64 * 0.1 + col as f64 * 0.01
             }),
             vel_rad: Array2::zeros((6, 8)),
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
-            loop_closure: None,
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_shape_fn((6, 8), |(row, col)| (row * 10 + col) as f64),
+                evaluable_loop_count: Array2::from_elem((6, 8), 2.0),
+                worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
+            }),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -3138,8 +5241,10 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 6, 8)),
+            production_covariance: None,
         };
         let target = BlockIndices {
             row_start: 2,
@@ -3147,9 +5252,10 @@ mod tests {
             col_start: 3,
             col_stop: 7,
         };
-        products
-            .trim(target, &[0.0, 12.0, 24.0], &unweighted_cfg(0.5))
-            .unwrap();
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        products.trim(target, &[0.0, 12.0, 24.0], &cfg).unwrap();
+        products.apply_validity_mask();
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
         assert!(products
@@ -3157,20 +5263,33 @@ mod tests {
             .slice(s![.., reference.0, reference.1])
             .iter()
             .all(|value| value.abs() < 1e-12));
+        let diagnostics = products.velocity_diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.valid_date_count.dim(), (3, 4));
+        assert_eq!(diagnostics.valid_date_count[(0, 0)], 2);
+        assert!(products.velocity_sigma_rad.as_ref().unwrap()[reference].is_nan());
+        let qc = products.loop_closure.as_ref().unwrap();
+        assert_eq!(qc.bad_loop_count.dim(), (3, 4));
+        assert_eq!(qc.evaluable_loop_count.dim(), (3, 4));
+        assert_eq!(qc.worst_residual_cycles.dim(), (3, 4));
+        assert_eq!(qc.bad_loop_count[(0, 0)], 23.0);
     }
 
     #[test]
-    fn bounded_trim_rejects_low_quality_target_when_reference_is_in_halo() {
+    fn bounded_trim_rejects_target_without_a_displacement_valid_reference() {
+        let mut displacement = Array3::zeros((2, 4, 4));
+        displacement.slice_mut(s![.., 1..4, 1..4]).fill(f64::NAN);
         let mut products = SpatialProducts {
-            disp_rad: Array3::zeros((2, 4, 4)),
+            disp_rad: displacement,
             vel_rad: Array2::zeros((4, 4)),
+            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
-            temporal_coherence: Array2::from_elem((4, 4), 0.1),
+            temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -3185,8 +5304,10 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
+            production_covariance: None,
         };
         let error = products
             .trim(
@@ -3200,7 +5321,9 @@ mod tests {
                 &unweighted_cfg(0.5),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("reference coherence threshold"));
+        assert!(error.to_string().contains(
+            "no displacement-valid pixel meeting the configured reference coherence threshold"
+        ));
     }
 
     #[test]
@@ -3265,6 +5388,75 @@ mod tests {
     }
 
     #[test]
+    fn sole_valid_pixel_in_dropped_stride_remainder_fails_precompute() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_stride_remainder_mask_{}.tif",
+            std::process::id()
+        ));
+        let mut values = Array2::zeros((5, 5));
+        values[(4, 4)] = 1.0_f64;
+        let geotransform = [0.0, 30.0, 0.0, 150.0, 0.0, -30.0];
+        write_raster(&path, values.view(), geotransform, Some(32611), Some(0.0)).unwrap();
+        let reader = BurstMaskReader {
+            path: path.clone(),
+            geotransform,
+            epsg: 32611,
+            shape: (5, 5),
+        };
+        let error = preflight_mask_semantics(&reader, (4, 4)).unwrap_err();
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains("has no valid pixel in the processed burst window"),
+            "{error}"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn semantic_fingerprint_includes_trailing_stride_support() {
+        let base = std::env::temp_dir().join(format!(
+            "dolphin_stride_remainder_identity_{}",
+            std::process::id()
+        ));
+        let first_path = base.with_extension("first.tif");
+        let second_path = base.with_extension("second.tif");
+        let geotransform = [0.0, 30.0, 0.0, 150.0, 0.0, -30.0];
+        let mut first = Array2::zeros((5, 5));
+        first[(0, 0)] = 1.0_f64;
+        let mut second = first.clone();
+        second[(4, 4)] = 1.0;
+        write_raster(
+            &first_path,
+            first.view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        write_raster(
+            &second_path,
+            second.view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let reader = |path: &Path| BurstMaskReader {
+            path: path.to_path_buf(),
+            geotransform,
+            epsg: 32611,
+            shape: (5, 5),
+        };
+        let first_fingerprint = preflight_mask_semantics(&reader(&first_path), (4, 4)).unwrap();
+        let second_fingerprint = preflight_mask_semantics(&reader(&second_path), (4, 4)).unwrap();
+        assert_ne!(first_fingerprint, second_fingerprint);
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
     fn mask_is_not_read_when_zero_where_masked_is_false() {
         let cfg = DisplacementWorkflow {
             mask_file: Some(std::env::temp_dir().join("does-not-exist.tif")),
@@ -3304,14 +5496,73 @@ mod tests {
         cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.write_posterior_uncertainty = true;
-        let output = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
-            .expect("unweighted posterior");
+        let output =
+            invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)], false)
+                .expect("unweighted posterior");
         assert!(output.posterior_variance.is_some());
         cfg.timeseries_options.method = TimeseriesMethod::L1;
-        let error = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)])
+        let error = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &[(0, 1)], false)
             .err()
             .expect("L1 must reject posterior output");
         assert!(error.to_string().contains("only for L2"));
+    }
+
+    #[test]
+    fn corrections_precede_the_final_spatial_reference() {
+        let mut displacement =
+            Array3::from_shape_vec((2, 1, 2), vec![10.0, 3.0, 20.0, 5.0]).unwrap();
+        let corrections = Array3::from_shape_vec((2, 1, 2), vec![1.0, 4.0, 2.0, 1.0]).unwrap();
+
+        correct_then_reference(
+            &mut displacement,
+            |series| {
+                *series -= &corrections;
+                Ok(CorrectionLayers {
+                    ionosphere: None,
+                    troposphere: None,
+                    solid_earth_tide: None,
+                    los_geometry: None,
+                })
+            },
+            |_| Ok(Some((0, 1))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            displacement,
+            Array3::from_shape_vec((2, 1, 2), vec![10.0, 0.0, 14.0, 0.0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_reference_skips_a_nonfinite_displacement_candidate() {
+        let quality = Array2::from_elem((5, 5), 0.9);
+        let validity = Array2::from_elem((5, 5), true);
+        let mut displacement = Array3::from_elem((3, 5, 5), 1.0);
+        displacement[(1, 2, 2)] = f64::NAN;
+
+        let reference =
+            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5)
+                .expect("another coherent finite reference remains");
+
+        assert_ne!(reference, (2, 2));
+        assert!(reference_pixel_is_valid(
+            validity.view(),
+            displacement.view(),
+            reference
+        ));
+    }
+
+    #[test]
+    fn automatic_reference_abstains_when_every_displacement_candidate_is_invalid() {
+        let quality = Array2::from_elem((3, 3), 0.9);
+        let validity = Array2::from_elem((3, 3), true);
+        let displacement = Array3::from_elem((2, 3, 3), f64::NAN);
+
+        assert_eq!(
+            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5,),
+            None
+        );
     }
 
     /// Issue #40: the SBAS network-inversion misclosure and the temporal
@@ -3337,8 +5588,9 @@ mod tests {
         cfg.timeseries_options.method = TimeseriesMethod::L2;
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.write_posterior_uncertainty = true;
-        let inversion = invert_time_series(&cfg, incidence.view(), dphi.view(), None, &pairs)
-            .expect("redundant, well-conditioned network");
+        let inversion =
+            invert_time_series(&cfg, incidence.view(), dphi.view(), None, &pairs, false)
+                .expect("redundant, well-conditioned network");
         let misclosure = inversion
             .network_misclosure_rms
             .as_ref()
@@ -3350,14 +5602,17 @@ mod tests {
 
         // The same true phase history as a velocity-fit input: date 0 is the
         // dropped reference (implicit zero), dates 1..3 are the fitted bands.
-        let series = Array3::from_shape_fn((3, 1, 1), |(d, _, _)| true_phi[d + 1]);
+        let series = Array3::from_shape_fn((3, 1, 2), |(d, _, col)| match col {
+            0 => true_phi[d + 1],
+            _ => 0.0,
+        });
         cfg.timeseries_options.write_velocity_uncertainty = true;
-        let crlb = Array3::from_elem((4, 1, 1), 1.0);
         let fit = fit_velocity(
             &cfg,
             series.view(),
             &days,
-            Some(&crlb),
+            None,
+            Some((0, 1)),
             &VelocityModel::default(),
         )
         .unwrap();
@@ -3368,79 +5623,122 @@ mod tests {
         );
     }
 
-    /// The correction changes only the emitted uncertainty product, so enabling
-    /// it without that product must fail rather than silently doing nothing.
+    /// The legacy scalar N_eff correction is retained only for YAML compatibility.
     #[test]
-    fn temporal_correlation_requires_velocity_uncertainty_output() {
+    fn scalar_temporal_correlation_correction_is_rejected() {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.correct_velocity_temporal_correlation = true;
 
-        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        let error = validate_config(&cfg).unwrap_err();
         assert!(error
             .to_string()
-            .contains("requires write_velocity_uncertainty"));
-
+            .contains("correct_velocity_temporal_correlation"));
+        assert!(error.to_string().contains("not supported"));
         cfg.timeseries_options.write_velocity_uncertainty = true;
-        validate_uncertainty_options(&cfg).expect("valid uncertainty options");
+        assert!(validate_config(&cfg).is_err());
     }
 
-    /// Issue #33: velocity sigma understates the slope uncertainty because the
-    /// residuals are temporally correlated. Opt-in AR(1) inflation, off by
-    /// default so no downstream threshold moves unreviewed.
+    /// The stitched CRLB cube is a per-ministack quality diagnostic, not a global
+    /// temporal covariance. Velocity evidence therefore fits post-gauge dates with
+    /// unit precision and is invariant to the CRLB input.
     #[test]
-    fn temporal_correlation_inflates_velocity_sigma_only_when_enabled() {
-        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
-        // A drifting (positively autocorrelated) departure from the trend.
-        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| {
-            let time = days[t + 1];
-            0.01 * time + 4.0 * (f64::from(t as i32) * 0.45).sin()
+    fn velocity_uncertainty_excludes_the_gauge_and_does_not_consume_crlb() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let target = [0.2, 1.0, 1.4, 2.8, 2.5];
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(t, _, col)| match col {
+            0 => target[t],
+            _ => 0.0,
         });
-        let crlb = Array3::from_elem((12, 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let linear = VelocityModel::default();
+        let crlb = Array3::from_shape_fn((6, 1, 2), |(date, _, col)| {
+            0.01 + (date * 2 + col) as f64 * 100.0
+        });
+        let without_crlb = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            None,
+            Some((0, 1)),
+            &linear,
+        )
+        .unwrap();
+        let with_crlb = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &linear,
+        )
+        .unwrap();
 
-        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-
-        let plain = plain.expect("velocity sigma")[(0, 0)];
-        let corrected = corrected.expect("velocity sigma")[(0, 0)];
-        assert!(plain.is_finite() && corrected.is_finite());
-        assert!(
-            corrected > plain,
-            "correlated residuals must inflate sigma: {corrected} !> {plain}"
+        assert_eq!(without_crlb.velocity, with_crlb.velocity);
+        assert_eq!(
+            without_crlb.estimator,
+            VelocityEstimator::LinearPostGaugeUnitPrecision
+        );
+        let sigma = without_crlb.sigma.as_ref().unwrap();
+        assert_eq!(sigma[(0, 0)], with_crlb.sigma.as_ref().unwrap()[(0, 0)]);
+        assert!(sigma[(0, 0)].is_finite());
+        assert!(sigma[(0, 1)].is_nan(), "the spatial reference must abstain");
+        let diagnostics = without_crlb.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.valid_date_count[(0, 0)], 5);
+        assert_eq!(diagnostics.regression_rank[(0, 0)], 2);
+        assert_eq!(diagnostics.regression_dof[(0, 0)], 3);
+        assert_eq!(
+            diagnostics.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::IidConditional
+        );
+        assert_eq!(
+            diagnostics.cadence_status[(0, 0)],
+            VelocityCadenceStatus::RegularContiguous
         );
     }
 
-    /// The correction is a no-op on uncorrelated residuals — it must not inflate
-    /// sigma just because it is switched on.
     #[test]
-    fn temporal_correlation_correction_is_a_no_op_without_correlation() {
-        let days: Vec<f64> = (0..12).map(|t| f64::from(t) * 12.0).collect();
-        // Exactly linear: zero residual, so no autocorrelation to find.
-        let displacement = Array3::from_shape_fn((11, 1, 1), |(t, _, _)| 0.01 * days[t + 1]);
-        let crlb = Array3::from_elem((12, 1, 1), 0.5);
+    fn enabling_velocity_uncertainty_names_and_can_change_the_point_estimator() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let target = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(date, _, col)| match col {
+            0 => target[date],
+            _ => 0.0,
+        });
+        let crlb = Array3::from_elem((6, 1, 2), 1.0);
         let mut cfg = DisplacementWorkflow::default();
-        cfg.timeseries_options.write_velocity_uncertainty = true;
-        let linear = VelocityModel::default();
+        let default_fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &VelocityModel::default(),
+        )
+        .unwrap();
 
-        let plain = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        cfg.timeseries_options.correct_velocity_temporal_correlation = true;
-        let corrected = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &linear)
-            .unwrap()
-            .sigma;
-        let plain = plain.expect("velocity sigma")[(0, 0)];
-        let corrected = corrected.expect("velocity sigma")[(0, 0)];
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let evidence_fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&crlb),
+            Some((0, 1)),
+            &VelocityModel::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            default_fit.estimator,
+            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
+        );
+        assert_eq!(
+            evidence_fit.estimator,
+            VelocityEstimator::LinearPostGaugeUnitPrecision
+        );
         assert!(
-            (corrected - plain).abs() < 1e-12,
-            "uncorrelated residuals must not inflate sigma: {corrected} vs {plain}"
+            (default_fit.velocity[(0, 0)] - evidence_fit.velocity[(0, 0)]).abs() > 1.0,
+            "the fixture must expose the served-rate migration"
         );
     }
 
@@ -3478,20 +5776,94 @@ mod tests {
         assert!((ifg[(0, 0, 1)] - 1.0).abs() < 1e-12);
     }
 
-    /// The bound must still be reported as absent — falling back to uniform
-    /// weights recovers the displacement, it does not manufacture an uncertainty.
     #[test]
-    fn an_unbounded_pixel_reports_no_uncertainty() {
-        let mut sigma = Array3::from_elem((2, 1, 2), 2.0);
-        sigma[(1, 0, 1)] = f64::NAN;
-        let valid = uncertainty_valid(sigma.view());
-        let mut velocity_sigma = ndarray::array![[0.5_f64, 0.5]];
-        clear_unbounded_uncertainty(&mut velocity_sigma, valid.view());
-        assert!(velocity_sigma[(0, 0)].is_finite());
-        assert!(
-            velocity_sigma[(0, 1)].is_nan(),
-            "a pixel without a usable CRLB must not report a velocity sigma"
+    fn mixed_crlb_validity_is_named_as_a_whole_pixel_unit_fallback_policy() {
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let values = [5.0, 1.0, 8.0];
+        let displacement = Array3::from_shape_fn((3, 1, 2), |(date, _, _)| values[date]);
+        let mut sigma = Array3::from_shape_fn((4, 1, 2), |(date, _, _)| match date {
+            0 | 2 => 0.5,
+            _ => 10.0,
+        });
+        sigma[(2, 0, 1)] = f64::NAN;
+        let cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join("dolphin_mixed_velocity_precision"),
+            ..Default::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.work_directory);
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some(&sigma),
+            None,
+            &VelocityModel::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fit.estimator,
+            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
         );
+        let uniform = velocity_of(displacement.view(), &days);
+        assert!((fit.velocity[(0, 1)] - uniform[(0, 1)]).abs() < 1e-9);
+        assert!((fit.velocity[(0, 0)] - uniform[(0, 0)]).abs() > 1.0);
+
+        let connected_components = Array3::<u32>::zeros((0, 1, 2));
+        write_outputs(
+            &cfg,
+            displacement.view(),
+            fit.velocity.view(),
+            fit.estimator,
+            Array2::from_elem((1, 2), 0.9).view(),
+            QualityLayers {
+                network_residual_dof: 0,
+                phase_linking_coherence: None,
+                phase_similarity: None,
+                crlb_sigma: None,
+                closure_phase: None,
+                displacement_variance: None,
+                network_misclosure_rms: None,
+                timeseries_residual_rms: None,
+                velocity_sigma: None,
+                velocity_diagnostics: None,
+                connected_components: &connected_components,
+                velocity_terms: VelocityTermLayers::default(),
+                loop_closure: None,
+            },
+            Some(32611),
+            [0.0, 30.0, 0.0, 30.0, 0.0, -30.0],
+        )
+        .unwrap();
+        use gdal::Metadata;
+        let dataset = gdal::Dataset::open(cfg.work_directory.join("velocity.tif")).unwrap();
+        assert_eq!(
+            dataset.metadata_item("VELOCITY_ESTIMATOR", "").as_deref(),
+            Some("linear_full_series_stitched_crlb_with_unit_fallback")
+        );
+        let _ = std::fs::remove_dir_all(&cfg.work_directory);
+    }
+
+    /// Conditional velocity evidence requires the final spatial reference to have
+    /// been applied exactly; an absent or merely finite candidate is not enough.
+    #[test]
+    fn velocity_uncertainty_requires_an_exact_final_spatial_reference() {
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let mut displacement =
+            Array3::from_shape_fn((3, 1, 2), |(date, _, col)| (date + col) as f64);
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let model = VelocityModel::default();
+
+        let missing = fit_velocity(&cfg, displacement.view(), &days, None, None, &model)
+            .err()
+            .expect("missing reference must fail");
+        assert!(missing.to_string().contains("spatial reference point"));
+
+        displacement[(1, 0, 1)] = f64::NAN;
+        let nonzero = fit_velocity(&cfg, displacement.view(), &days, None, Some((0, 1)), &model)
+            .err()
+            .expect("nonzero reference must fail");
+        assert!(nonzero.to_string().contains("exact zero"));
     }
 
     #[test]
@@ -3505,12 +5877,15 @@ mod tests {
     }
 
     #[test]
-    fn enabled_mask_zeros_linked_phase_before_wrapped_interferograms() {
+    fn terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms() {
         let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
+        let validity = ndarray::array![[true, true], [false, true]];
         let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
-        let masked = apply_phase_mask(phase.view(), mask.view());
+        let masked = apply_phase_masks(phase.view(), validity.view(), Some(mask.view()));
         assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 0, 1)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(0, 1, 0)], Cf64::new(0.0, 0.0));
+        assert_eq!(masked[(1, 1, 0)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 1, 1)], Cf64::new(1.0, 1.0));
     }
 
@@ -3559,7 +5934,7 @@ mod tests {
         let (_, nr, nc) = a.dim();
         let mut diffs = 0;
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            if x == y {
+            if x == y || (x.re.is_nan() && x.im.is_nan() && y.re.is_nan() && y.im.is_nan()) {
                 continue;
             }
             let (band, r, c) = (i / (nr * nc), (i / nc) % nr, i % nc);
@@ -3591,10 +5966,15 @@ mod tests {
         let cfg = tiled_cfg(strides, half, block);
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
-        let whole = phase_link(&cfg, stack.view(), &engine).unwrap();
-        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |b| {
-            Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned())
-        })
+        let whole = phase_link(&cfg, stack.view(), &engine, None).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |b| Ok(stack.slice(s![.., b.rows(), b.cols()]).to_owned()),
+            |_| Ok(None),
+        )
         .unwrap();
         assert_eq!(tiled.nodata_tiles, 0);
         assert_eq!(tiled.linked_tiles, tiled.total_tiles);
@@ -3634,6 +6014,227 @@ mod tests {
     }
 
     #[test]
+    fn tiled_covariance_capture_streams_blocks_without_changing_phase_output() {
+        let strides = Strides { y: 2, x: 2 };
+        let half = HalfWindow { y: 1, x: 1 };
+        let dims = (8, 8);
+        let mut cfg = tiled_cfg(strides, half, (4, 4));
+        cfg.phase_linking.ministack_size = 3;
+        cfg.phase_linking.max_num_compressed = 2;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.phase_linking.use_evd = true;
+        let stack = Array3::from_shape_fn((6, dims.0, dims.1), |(date, row, col)| {
+            let amplitude = 1.0 + 0.07 * date as f64 + 0.01 * (row + col) as f64;
+            let phase = 0.11 * date as f64 + 0.017 * row as f64 - 0.013 * col as f64;
+            Cf64::from_polar(amplitude, phase)
+        });
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let expected = phase_link_tiled(
+            &cfg,
+            dims,
+            6,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+
+        let source_manifest_digest = [3; 32];
+        let source_model_version_digest = [4; 32];
+        let mut blocks = Vec::new();
+        let mut replay_tiles = Vec::new();
+        let captured = phase_link_tiled_impl(
+            &cfg,
+            dims,
+            6,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+            Some(TileCovarianceCapture {
+                burst_id: "fixture-burst".to_owned(),
+                source_origin: (0, 0),
+                source_manifest_digest,
+                source_model_version_digest,
+                member_indices: (0..6).collect(),
+                processed_shape: dims,
+                source_resolver: None,
+                replay_tiles: &mut replay_tiles,
+                sink: &mut blocks,
+            }),
+        )
+        .unwrap();
+
+        assert_c64_eq(
+            captured.output.cpx_phase.view(),
+            expected.output.cpx_phase.view(),
+            "captured cpx_phase",
+        );
+        let tile_count = plan_tiles(dims, strides, half, 2, (2, 2)).len();
+        assert_eq!(blocks.len(), tile_count * 2);
+        assert_eq!(replay_tiles.len(), tile_count);
+        assert!(replay_tiles.iter().all(
+            |tile| tile.num_real_dates == 6 && tile.native_validity.iter().all(|valid| *valid)
+        ));
+        assert!(blocks.iter().all(|block| {
+            block.burst_id == "fixture-burst"
+                && block.owned_output_grid.rows > 0
+                && block.owned_output_grid.cols > 0
+        }));
+        let mut source_ids = BTreeMap::new();
+        let mut shared_overlap = false;
+        for block in blocks.iter().filter(|block| block.generation == 0) {
+            let columns = block.native_grid.cols as usize;
+            for (local, &source_id) in block.source_ids.iter().enumerate() {
+                let key = (
+                    block.native_grid.row_start + (local / columns) as u64,
+                    block.native_grid.col_start + (local % columns) as u64,
+                );
+                if let Some(previous) = source_ids.insert(key, source_id) {
+                    assert_eq!(previous, source_id, "overlap source identity drifted");
+                    shared_overlap = true;
+                }
+            }
+        }
+        assert!(
+            shared_overlap,
+            "fixture must exercise an overlapping tile halo"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[ignore = "run through the isolated wrapper to avoid GDAL/HDF5 process-global races"]
+    fn tiled_covariance_capture_accepts_all_masked_nonfinite_tiles_with_production_resolver_isolated(
+    ) {
+        let dims = (8, 16);
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (4, 4));
+        cfg.phase_linking.ministack_size = 2;
+        cfg.phase_linking.max_num_compressed = 1;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.phase_linking.use_evd = true;
+        cfg.phase_linking.empirical_source_factor.half_window = HalfWindow { y: 1, x: 1 };
+        let mut raw = Array3::from_shape_fn((4, dims.0, dims.1), |(date, row, col)| {
+            Cf32::new(
+                1.0 + date as f32 * 0.1 + row as f32 * 0.01,
+                0.5 + col as f32 * 0.02,
+            )
+        });
+        raw.slice_mut(s![.., .., ..8])
+            .fill(Cf32::new(f32::NAN, f32::NAN));
+        let stack = raw.mapv(|value| Cf64::new(f64::from(value.re), f64::from(value.im)));
+        let mut validity = Array2::from_elem(dims, true);
+        validity.slice_mut(s![.., ..8]).fill(false);
+        struct TestValidity<'a>(&'a Array2<bool>);
+        impl CslcCovarianceValidityReader for TestValidity<'_> {
+            fn read_validity(
+                &self,
+                block: BlockIndices,
+            ) -> std::result::Result<
+                Array2<bool>,
+                crate::sequential_covariance::SequentialReplayError,
+            > {
+                Ok(self.0.slice(s![block.rows(), block.cols()]).to_owned())
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "dolphin_displacement_masked_source_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = (0..4)
+            .map(|date| root.join(format!("source_{date}.h5")))
+            .collect::<Vec<_>>();
+        for (date, path) in paths.iter().enumerate() {
+            let file = hdf5::File::create(path).unwrap();
+            file.new_dataset_builder()
+                .with_data(&raw.index_axis(Axis(0), date))
+                .create("data")
+                .unwrap();
+        }
+        let manifest =
+            CslcCovarianceManifest::capture(InputType::OperaCslc, "/data", &paths).unwrap();
+        let source_model_version_digest = covariance_source_model_identity_digest(
+            CSLC_COVARIANCE_SOURCE_PROVIDER,
+            CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
+            CSLC_COVARIANCE_SOURCE_MODEL,
+            CSLC_COVARIANCE_SOURCE_MODEL_VERSION,
+        );
+        let initial_grid = CovarianceOperatorGrid {
+            row_start: 0,
+            col_start: 0,
+            rows: dims.0 as u32,
+            cols: dims.1 as u32,
+            stride_y: 1,
+            stride_x: 1,
+        };
+        let test_validity = TestValidity(&validity);
+        let source_resolver = manifest
+            .resolver(
+                &[0, 1, 2, 3],
+                "masked-fixture",
+                (0, 0),
+                dims,
+                initial_grid,
+                &cfg.phase_linking.empirical_source_factor,
+                source_model_version_digest,
+                Some(&test_validity),
+            )
+            .unwrap();
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let mut blocks = Vec::new();
+        let mut replay_tiles = Vec::new();
+        let captured = phase_link_tiled_impl(
+            &cfg,
+            dims,
+            4,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| {
+                Ok(Some(
+                    validity.slice(s![block.rows(), block.cols()]).to_owned(),
+                ))
+            },
+            Some(TileCovarianceCapture {
+                burst_id: "masked-fixture".to_owned(),
+                source_origin: (0, 0),
+                source_manifest_digest: manifest.digest(),
+                source_model_version_digest,
+                member_indices: vec![0, 1, 2, 3],
+                processed_shape: dims,
+                source_resolver: Some(source_resolver),
+                replay_tiles: &mut replay_tiles,
+                sink: &mut blocks,
+            }),
+        )
+        .unwrap();
+
+        assert!(captured.validity_mask.iter().any(|valid| !*valid));
+        assert!(captured.validity_mask.iter().any(|valid| *valid));
+        assert!(replay_tiles
+            .iter()
+            .any(|tile| tile.native_validity.iter().any(|valid| !*valid)));
+        assert!(blocks.iter().any(|block| {
+            block
+                .status
+                .iter()
+                .all(|status| *status == dolphin_io::CovarianceOperatorStatus::Masked)
+        }));
+        assert!(blocks.iter().all(|block| block
+            .source_factor_digests
+            .chunks_exact(32)
+            .all(|receipt| receipt.iter().any(|byte| *byte != 0))));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tiled_covariance_capture_accepts_all_masked_nonfinite_tiles_with_production_resolver() {
+        run_isolated_hdf5_test(
+            "displacement::tests::tiled_covariance_capture_accepts_all_masked_nonfinite_tiles_with_production_resolver_isolated",
+        );
+    }
+
+    #[test]
     fn locally_empty_edge_tile_becomes_nodata_without_aborting_burst() {
         use std::cell::Cell;
 
@@ -3643,14 +6244,21 @@ mod tests {
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
         let calls = Cell::new(0_usize);
-        let tiled = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            if calls.replace(calls.get() + 1) == 0 {
-                tile.index_axis_mut(Axis(0), 2)
-                    .fill(Cf64::new(f64::NAN, f64::NAN));
-            }
-            Ok(tile)
-        })
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                if calls.replace(calls.get() + 1) == 0 {
+                    tile.index_axis_mut(Axis(0), 2)
+                        .fill(Cf64::new(f64::NAN, f64::NAN));
+                }
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .unwrap();
         assert_eq!(tiled.nodata_tiles, 1);
         assert!(tiled.linked_tiles > 0);
@@ -3664,18 +6272,129 @@ mod tests {
     }
 
     #[test]
+    fn masked_tiled_phase_link_matches_whole_and_skips_invalid_tiles() {
+        let dims = (40, 50);
+        let nslc = 8;
+        let cfg = tiled_cfg(Strides { y: 2, x: 2 }, HalfWindow { y: 2, x: 3 }, (12, 12));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let mut valid = Array2::from_elem(dims, false);
+        valid.slice_mut(s![10..30, 12..38]).fill(true);
+
+        let whole = phase_link(&cfg, stack.view(), &engine, Some(valid.view())).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| Ok(Some(valid.slice(s![block.rows(), block.cols()]).to_owned())),
+        )
+        .unwrap();
+        assert!(tiled.nodata_tiles > 0, "fixture must skip invalid tiles");
+        assert!(tiled.linked_tiles > 0, "fixture must retain valid tiles");
+        assert_eq!(tiled.validity_mask, whole.validity_mask);
+        let tiled = tiled.output;
+        assert_c64_eq(
+            tiled.cpx_phase.view(),
+            whole.cpx_phase.view(),
+            "masked phase",
+        );
+        assert_f64_eq(
+            tiled.temporal_coherence.view().insert_axis(Axis(0)),
+            whole.temporal_coherence.view().insert_axis(Axis(0)),
+            "masked temporal coherence",
+        );
+        assert_f64_eq(
+            tiled
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            whole
+                .phase_linking_coherence
+                .as_ref()
+                .unwrap()
+                .view()
+                .insert_axis(Axis(0)),
+            "masked phase-linking coherence",
+        );
+        assert_f64_eq(
+            tiled.crlb_sigma.as_ref().unwrap().view(),
+            whole.crlb_sigma.as_ref().unwrap().view(),
+            "masked CRLB",
+        );
+        assert_f64_eq(
+            tiled.closure_phase.as_ref().unwrap().view(),
+            whole.closure_phase.as_ref().unwrap().view(),
+            "masked closure",
+        );
+    }
+
+    #[test]
+    fn masked_nondivisible_tiled_phase_link_matches_whole_burst() {
+        let dims = (5, 5);
+        let nslc = 6;
+        let cfg = tiled_cfg(Strides { y: 2, x: 2 }, HalfWindow { y: 1, x: 1 }, (2, 2));
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let mut valid = Array2::from_elem(dims, true);
+        valid[(0, 0)] = false;
+        let whole = phase_link(&cfg, stack.view(), &engine, Some(valid.view())).unwrap();
+        let tiled = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |block| Ok(Some(valid.slice(s![block.rows(), block.cols()]).to_owned())),
+        )
+        .unwrap();
+
+        assert_eq!(tiled.validity_mask, whole.validity_mask);
+        assert_c64_eq(
+            tiled.output.cpx_phase.view(),
+            whole.cpx_phase.view(),
+            "nondivisible masked phase",
+        );
+        assert_f64_eq(
+            tiled.output.temporal_coherence.view().insert_axis(Axis(0)),
+            whole.temporal_coherence.view().insert_axis(Axis(0)),
+            "nondivisible masked temporal coherence",
+        );
+        assert_f64_eq(
+            tiled.output.crlb_sigma.as_ref().unwrap().view(),
+            whole.crlb_sigma.as_ref().unwrap().view(),
+            "nondivisible masked CRLB",
+        );
+        assert_f64_eq(
+            tiled.output.closure_phase.as_ref().unwrap().view(),
+            whole.closure_phase.as_ref().unwrap().view(),
+            "nondivisible masked closure",
+        );
+    }
+
+    #[test]
     fn globally_empty_acquisition_reports_safe_ordinal() {
         let dims = (17, 19);
         let nslc = 5;
         let cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
-        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            tile.index_axis_mut(Axis(0), 3)
-                .fill(Cf64::new(f64::NAN, f64::NAN));
-            Ok(tile)
-        })
+        let error = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                tile.index_axis_mut(Axis(0), 3)
+                    .fill(Cf64::new(f64::NAN, f64::NAN));
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .err()
         .expect("globally empty acquisition must fail");
         assert!(error.to_string().contains("ordinals [3]"));
@@ -3691,13 +6410,20 @@ mod tests {
         let engine = ComputeEngine::new(ComputeBackend::Cpu);
         let stack = synth_stack(nslc, dims.0, dims.1);
         let calls = Cell::new(0_usize);
-        let error = phase_link_tiled(&cfg, dims, nslc, &engine, |block| {
-            let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
-            let ordinal = calls.replace(calls.get() + 1) % 2;
-            tile.index_axis_mut(Axis(0), ordinal)
-                .fill(Cf64::new(f64::NAN, f64::NAN));
-            Ok(tile)
-        })
+        let error = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| {
+                let mut tile = stack.slice(s![.., block.rows(), block.cols()]).to_owned();
+                let ordinal = calls.replace(calls.get() + 1) % 2;
+                tile.index_axis_mut(Axis(0), ordinal)
+                    .fill(Cf64::new(f64::NAN, f64::NAN));
+                Ok(tile)
+            },
+            |_| Ok(None),
+        )
         .err()
         .expect("no complete tile must fail");
         assert!(error
@@ -3796,6 +6522,7 @@ mod tests {
                 disp.view(),
                 &days,
                 Some(&Array3::from_elem((3, 3, 3), 1.0)),
+                Some((1, 0)),
                 &VelocityModel::default(),
             )
             .unwrap();
@@ -3885,12 +6612,11 @@ mod tests {
         assert!((v6 - phase_per_yr).abs() < 1e-9);
     }
 
-    /// Issue #36: the emitted rasters must say where their scale comes from. On a
-    /// single-reference network `dof = 0`, the residual inflation is inert, and
-    /// every uncertainty layer traces to the CRLB bound — so the bands are tagged
-    /// `crlb_bound`, not left for a consumer to misread as a predictive sigma.
+    /// Network DOF never upgrades correlated interferograms into independent
+    /// empirical evidence, and the velocity component carries separate metadata.
     #[test]
-    fn uncertainty_layers_declare_their_scale_in_band() {
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn uncertainty_layers_declare_scope_without_an_empirical_claim() {
         let dir = std::env::temp_dir().join("dolphin_uncertainty_scale_tags");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = DisplacementWorkflow {
@@ -3903,22 +6629,40 @@ mod tests {
         let sigma = Array2::from_elem((2, 2), 2.0);
         let crlb = Array3::from_elem((2, 2, 2), 1.0);
         let conncomp = Array3::<u32>::zeros((0, 2, 2));
+        let diagnostics = VelocityTemporalDiagnostics {
+            valid_date_count: Array2::from_elem((2, 2), 8),
+            regression_rank: Array2::from_elem((2, 2), 2),
+            regression_dof: Array2::from_elem((2, 2), 6),
+            uncertainty_status: Array2::from_elem(
+                (2, 2),
+                VelocityUncertaintyStatus::IidConditional,
+            ),
+            lag1_rho: Array2::from_elem((2, 2), 0.4),
+            correlation_pair_count: Array2::from_elem((2, 2), 7),
+            cadence_status: Array2::from_elem((2, 2), VelocityCadenceStatus::RegularContiguous),
+            correlation_available: Array2::from_elem((2, 2), true),
+            diagnostic_inflation_factor: Array2::from_elem((2, 2), 1.2),
+            diagnostic_effective_sample_size: Array2::from_elem((2, 2), 5.0),
+        };
 
         let write = |dof: usize| {
             write_outputs(
                 &cfg,
                 displacement.view(),
                 Array2::zeros((2, 2)).view(),
+                VelocityEstimator::LinearPostGaugeUnitPrecision,
                 Array2::from_elem((2, 2), 0.9).view(),
                 QualityLayers {
-                    posterior_dof: dof,
+                    network_residual_dof: dof,
                     phase_linking_coherence: None,
+                    phase_similarity: None,
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
                     displacement_variance: Some(&variance),
                     network_misclosure_rms: None,
                     timeseries_residual_rms: None,
                     velocity_sigma: Some(&sigma),
+                    velocity_diagnostics: Some(&diagnostics),
                     connected_components: &conncomp,
                     velocity_terms: VelocityTermLayers::default(),
                     loop_closure: None,
@@ -3937,31 +6681,216 @@ mod tests {
         };
 
         write(0);
-        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
-        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "0");
         assert_eq!(
-            tag("displacement_variance_00.tif", "UNCERTAINTY_SCALE"),
-            "crlb_bound"
+            tag("velocity_sigma.tif", "UNCERTAINTY_COMPONENT"),
+            "independent_residual_conditional"
         );
-        assert!(tag("velocity_sigma.tif", "DESCRIPTION").contains("NOT an empirically scaled"));
-        // The bound is always a bound, whatever the network.
+        assert_eq!(
+            tag("velocity_sigma.tif", "TEMPORAL_GAUGE"),
+            "acquisition_0_excluded"
+        );
+        assert_eq!(
+            tag("velocity_sigma.tif", "CALIBRATION_STATUS"),
+            "uncalibrated_component"
+        );
+        assert_eq!(tag("velocity.tif", "UNITTYPE"), "rad/yr");
+        assert_eq!(
+            tag("velocity.tif", "VELOCITY_ESTIMATOR"),
+            "linear_post_gauge_unit_precision"
+        );
+        assert_eq!(tag("velocity_sigma.tif", "UNITTYPE"), "rad/yr");
+        assert!(tag("velocity_sigma.tif", "POSTERIOR_DOF").is_empty());
+        assert_eq!(
+            tag("displacement_variance_00.tif", "UNCERTAINTY_SCOPE"),
+            "independent_ifg_parameter_covariance_diagonal_approximation"
+        );
+        assert_eq!(
+            tag("displacement_variance_00.tif", "IFG_ERROR_ASSUMPTION"),
+            "independent"
+        );
+        assert_eq!(tag("displacement_variance_00.tif", "UNITTYPE"), "rad^2");
+        assert_eq!(
+            tag("displacement_variance_00.tif", "SPATIAL_COVARIANCE"),
+            "target_reference_covariance_not_modeled"
+        );
+        assert_eq!(
+            tag(
+                "displacement_variance_00.tif",
+                "SPATIAL_REFERENCE_PROPAGATION"
+            ),
+            "independent_pixel_variances_added"
+        );
+        assert_eq!(
+            tag("displacement_variance_00.tif", "NETWORK_RESIDUAL_DOF"),
+            "0"
+        );
         assert_eq!(tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"), "crlb_bound");
-        assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("LOWER BOUND"));
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "UNCERTAINTY_SCOPE"),
+            "per_ministack_marginal_crlb"
+        );
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "TEMPORAL_COVARIANCE"),
+            "not_propagated"
+        );
+        assert_eq!(
+            tag("crlb_sigma_00.tif", "CALIBRATION_STATUS"),
+            "not_calibrated"
+        );
+        assert_eq!(tag("crlb_sigma_00.tif", "INFERENCE_READY"), "false");
+        assert!(tag("crlb_sigma_00.tif", "DESCRIPTION").contains("not global per-date"));
         assert_eq!(tag("crlb_sigma_00.tif", "UNITTYPE"), "rad");
+        assert_eq!(
+            tag("velocity_uncertainty_status.tif", "VALUE_MAP"),
+            "0=unavailable;1=iid_conditional"
+        );
+        assert_eq!(
+            tag("velocity_cadence_status.tif", "VALUE_MAP"),
+            "0=unavailable;1=regular_contiguous;2=irregular;3=missing"
+        );
+        assert_eq!(
+            tag("velocity_valid_date_count.tif", "EVIDENCE_ROLE"),
+            "fit_support"
+        );
+        assert_eq!(
+            tag("velocity_lag1_rho.tif", "EVIDENCE_ROLE"),
+            "diagnostic_only"
+        );
+        assert_eq!(
+            tag(
+                "velocity_diagnostic_inflation_factor.tif",
+                "INFERENTIAL_USE"
+            ),
+            "prohibited"
+        );
+        for name in [
+            "velocity_uncertainty_status.tif",
+            "velocity_cadence_status.tif",
+            "velocity_correlation_available.tif",
+        ] {
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert!(
+                dataset.rasterband(1).unwrap().no_data_value().is_none(),
+                "zero is valid data in {name}"
+            );
+        }
+        assert!(dir.join("velocity_valid_date_count.tif").exists());
+        assert!(dir
+            .join("velocity_diagnostic_effective_sample_size.tif")
+            .exists());
+        for (name, expected) in [
+            ("velocity_sigma.tif", 2.0_f32),
+            ("displacement_variance_00.tif", 4.0_f32),
+        ] {
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert_eq!(dataset.raster_size(), (2, 2));
+            assert_eq!(dataset.geo_transform().unwrap(), gt);
+            assert_eq!(dataset.spatial_ref().unwrap().auth_code().unwrap(), 32614);
+            assert!(dataset.rasterband(1).unwrap().no_data_value().is_none());
+            let raster = dolphin_io::read_raster::<f32>(&dir.join(name)).unwrap();
+            assert!(raster.data.iter().all(|&value| value == expected));
+        }
 
-        // An over-determined network is the case where the posterior earns the name.
         write(3);
-        assert_eq!(tag("velocity_sigma.tif", "UNCERTAINTY_SCALE"), "empirical");
-        assert_eq!(tag("velocity_sigma.tif", "POSTERIOR_DOF"), "3");
         assert_eq!(
-            tag("displacement_variance_01.tif", "UNCERTAINTY_SCALE"),
-            "empirical"
+            tag("displacement_variance_01.tif", "UNCERTAINTY_SCOPE"),
+            "independent_ifg_parameter_covariance_diagonal_approximation"
         );
         assert_eq!(
-            tag("crlb_sigma_00.tif", "UNCERTAINTY_SCALE"),
-            "crlb_bound",
-            "the CRLB is a bound regardless of the network"
+            tag("displacement_variance_01.tif", "NETWORK_RESIDUAL_DOF"),
+            "3"
         );
+        assert_eq!(
+            tag("displacement_variance_01.tif", "CALIBRATION_STATUS"),
+            "not_calibrated"
+        );
+        assert!(tag("displacement_variance_01.tif", "DESCRIPTION")
+            .contains("rather than independent empirical evidence"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uncertainty_cogs_preserve_meter_scaling_and_units() {
+        let dir = std::env::temp_dir().join("dolphin_uncertainty_meter_units");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = DisplacementWorkflow {
+            work_directory: dir.clone(),
+            ..Default::default()
+        };
+        cfg.input_options.wavelength = Some(2.0 * std::f64::consts::PI);
+        let spatial = SpatialProducts {
+            disp_rad: Array3::zeros((1, 2, 2)),
+            vel_rad: Array2::from_elem((2, 2), 6.0),
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
+            temporal_coherence: Array2::from_elem((2, 2), 0.9),
+            validity_mask: Array2::from_elem((2, 2), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            phase_similarity: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+            reference_point: Some((0, 0)),
+            posterior_variance_rad: Some(Array3::from_elem((1, 2, 2), 4.0)),
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: Some(Array2::from_elem((2, 2), 2.0)),
+            velocity_diagnostics: None,
+            interferogram_pairs: vec![(0, 1)],
+            unwrap_connected_components: Array3::zeros((0, 2, 2)),
+            production_covariance: None,
+        };
+        let scaled = scale_outputs(&cfg, &spatial);
+        write_outputs(
+            &cfg,
+            scaled.displacement.view(),
+            scaled.velocity.view(),
+            spatial.velocity_estimator,
+            spatial.temporal_coherence.view(),
+            QualityLayers {
+                network_residual_dof: 0,
+                phase_linking_coherence: None,
+                phase_similarity: None,
+                crlb_sigma: None,
+                closure_phase: None,
+                displacement_variance: scaled.displacement_variance.as_ref(),
+                network_misclosure_rms: None,
+                timeseries_residual_rms: None,
+                velocity_sigma: scaled.velocity_sigma.as_ref(),
+                velocity_diagnostics: None,
+                connected_components: &spatial.unwrap_connected_components,
+                velocity_terms: VelocityTermLayers::default(),
+                loop_closure: None,
+            },
+            Some(32614),
+            spatial.geotransform,
+        )
+        .unwrap();
+
+        for (name, expected, unit) in [
+            ("velocity.tif", -3.0_f32, "m/yr"),
+            ("velocity_sigma.tif", 1.0_f32, "m/yr"),
+            ("displacement_variance_00.tif", 1.0_f32, "m^2"),
+        ] {
+            use gdal::Metadata;
+            let dataset = gdal::Dataset::open(dir.join(name)).unwrap();
+            assert_eq!(dataset.metadata_item("UNITTYPE", "").as_deref(), Some(unit));
+            assert_eq!(dataset.raster_size(), (2, 2));
+            assert_eq!(dataset.geo_transform().unwrap(), spatial.geotransform);
+            assert_eq!(dataset.spatial_ref().unwrap().auth_code().unwrap(), 32614);
+            assert!(dataset.rasterband(1).unwrap().no_data_value().is_none());
+            let raster = dolphin_io::read_raster::<f32>(&dir.join(name)).unwrap();
+            assert!(raster.data.iter().all(|&value| value == expected));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3987,6 +6916,59 @@ mod tests {
         assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]);
     }
 
+    #[test]
+    fn workflow_network_options_map_to_network_builder() {
+        let days = [0.0, 5.0, 20.0, 45.0];
+        let cases = [
+            (
+                InterferogramNetwork {
+                    reference_idx: Some(1),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2), (1, 3)],
+            ),
+            (
+                InterferogramNetwork {
+                    max_bandwidth: Some(1),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                InterferogramNetwork {
+                    max_temporal_baseline: Some(15.0),
+                    ..Default::default()
+                },
+                vec![(0, 1), (1, 2)],
+            ),
+            (
+                InterferogramNetwork {
+                    indexes: Some(vec![(0, 3), (1, 3)]),
+                    ..Default::default()
+                },
+                vec![(0, 3), (1, 3)],
+            ),
+        ];
+        for (configured, expected) in cases {
+            let cfg = DisplacementWorkflow {
+                interferogram_network: configured,
+                ..Default::default()
+            };
+            assert_eq!(network(&cfg, &days), expected);
+        }
+    }
+
+    #[test]
+    fn workflow_date_format_maps_to_acquisition_parser() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.input_options.cslc_date_fmt = "%Y-%m-%d".into();
+        let files = [
+            PathBuf::from("burst_2024-01-02.h5"),
+            PathBuf::from("burst_2024-01-17.h5"),
+        ];
+        assert_eq!(acquisition_days(&cfg, &files).unwrap(), vec![0.0, 15.0]);
+    }
+
     /// Issue #25: `run_interpolation` round-trips from a dolphin YAML and already
     /// widens the AOI halo, but no interpolation stage exists — so it must be
     /// rejected, not silently ignored.
@@ -3994,12 +6976,616 @@ mod tests {
     fn run_interpolation_is_rejected_as_unimplemented() {
         let mut cfg = DisplacementWorkflow::default();
         assert!(
-            validate_uncertainty_options(&cfg).is_ok(),
+            validate_config(&cfg).is_ok(),
             "dolphin's own default (false) must pass"
         );
         cfg.unwrap_options.run_interpolation = true;
-        let error = validate_uncertainty_options(&cfg).unwrap_err();
+        let error = validate_config(&cfg).unwrap_err();
         assert!(error.to_string().contains("run_interpolation"), "{error}");
+    }
+
+    #[test]
+    fn covariance_operator_rejects_unsupported_producer_scope_before_io() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.write_covariance_operator = true;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        for method in [ShpMethod::Rect, ShpMethod::Glrt, ShpMethod::Ks] {
+            cfg.phase_linking.shp_method = method;
+            validate_config(&cfg)
+                .expect("Rect, GLRT, and KS capture share the frozen source-factor identity");
+        }
+
+        cfg.phase_linking.max_num_compressed = 0;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("max_num_compressed > 0"));
+        cfg.phase_linking.max_num_compressed = 10;
+
+        cfg.worker_settings.compute_backend = ComputeBackend::Gpu;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("CPU f64"));
+        cfg.worker_settings.compute_backend = ComputeBackend::Cpu;
+
+        cfg.phase_linking.output_reference_idx = Some(1);
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("output_reference_idx = 0"));
+        cfg.phase_linking.output_reference_idx = None;
+
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::FirstPerMinistack;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("compressed_slc_plan = always_first"));
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::AlwaysFirst;
+
+        cfg.phase_linking.correct_phase_bias = true;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("correct_phase_bias = false"));
+        cfg.phase_linking.correct_phase_bias = false;
+
+        cfg.timeseries_options.method = TimeseriesMethod::L1;
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("timeseries_options.method = l2"));
+    }
+
+    #[test]
+    #[ignore = "run through the isolated wrapper to avoid GDAL/HDF5 process-global races"]
+    fn covariance_finalization_rehashes_original_manifest_before_commit_isolated() {
+        let root = std::env::temp_dir().join(format!(
+            "dolphin_covariance_final_manifest_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = (0..3)
+            .map(|date| root.join(format!("source_{date}.h5")))
+            .collect::<Vec<_>>();
+        for (date, path) in paths.iter().enumerate() {
+            let values = Array2::from_shape_fn((5, 5), |(row, col)| {
+                Cf32::new(1.0 + date as f32 + row as f32 * 0.1, col as f32 * 0.2)
+            });
+            let file = hdf5::File::create(path).unwrap();
+            file.new_dataset_builder()
+                .with_data(&values)
+                .create("data")
+                .unwrap();
+        }
+        let mut cfg = DisplacementWorkflow {
+            work_directory: root.join("work"),
+            cslc_file_list: paths.clone(),
+            ..DisplacementWorkflow::default()
+        };
+        cfg.input_options.subdataset = Some("/data".to_owned());
+        cfg.phase_linking.half_window = HalfWindow { y: 1, x: 1 };
+        cfg.phase_linking.empirical_source_factor.half_window = HalfWindow { y: 1, x: 1 };
+        cfg.output_options.strides = Strides { y: 1, x: 1 };
+        let groups = BTreeMap::from([("burst".to_owned(), vec![0, 1, 2])]);
+        let artifact = CovarianceCaptureArtifact::create(&cfg, &groups, None).unwrap();
+
+        let changed = Array2::from_elem((5, 5), Cf32::new(99.0, -3.0));
+        let file = hdf5::File::create(&paths[1]).unwrap();
+        file.new_dataset_builder()
+            .with_data(&changed)
+            .create("data")
+            .unwrap();
+        drop(file);
+
+        let error = artifact
+            .finish(BTreeMap::new())
+            .err()
+            .expect("manifest mutation must fail")
+            .to_string();
+        assert!(error.contains("immutable CSLC members"), "{error}");
+        assert!(!cfg
+            .work_directory
+            .join(crate::covariance_artifact::COVARIANCE_OPERATOR_FILENAME)
+            .exists());
+        assert!(!cfg
+            .work_directory
+            .join(crate::covariance_artifact::COVARIANCE_OPERATOR_MANIFEST_FILENAME)
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn covariance_finalization_rehashes_original_manifest_before_commit() {
+        run_isolated_hdf5_test(
+            "displacement::tests::covariance_finalization_rehashes_original_manifest_before_commit_isolated",
+        );
+    }
+
+    #[test]
+    fn covariance_operator_rejects_groundpulse_and_resumable_modes_before_source_io() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.write_covariance_operator = true;
+        cfg.phase_linking.shp_method = ShpMethod::Rect;
+        cfg.timeseries_options.method = TimeseriesMethod::L2;
+        cfg.cslc_file_list = vec![PathBuf::from("definitely-missing-covariance-source.h5")];
+
+        let error =
+            run_displacement_with_output_policy(&cfg, DisplacementOutputPolicy::GroundPulse)
+                .err()
+                .expect("GroundPulse covariance capture must fail")
+                .to_string();
+        assert!(error.contains("GroundPulse output policy"), "{error}");
+
+        let error = run_displacement_resumable(&cfg)
+            .err()
+            .expect("resumable covariance capture must fail")
+            .to_string();
+        assert!(error.contains("full batch"), "{error}");
+    }
+
+    #[test]
+    fn workflow_phase_linking_options_map_to_sequential_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.ministack_size = 7;
+        cfg.phase_linking.max_num_compressed = 3;
+        cfg.phase_linking.output_reference_idx = Some(4);
+        cfg.phase_linking.half_window = HalfWindow { y: 5, x: 6 };
+        cfg.phase_linking.use_evd = true;
+        cfg.phase_linking.beta = 0.17;
+        cfg.phase_linking.zero_correlation_threshold = 0.23;
+        cfg.phase_linking.shp_method = ShpMethod::Ks;
+        cfg.phase_linking.shp_alpha = 0.007;
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::LastPerMinistack;
+        cfg.phase_linking.write_crlb = false;
+        cfg.phase_linking.write_closure_phase = false;
+        cfg.phase_linking.calc_average_coh = true;
+        cfg.phase_linking.correct_phase_bias = true;
+        cfg.output_options.strides = Strides { y: 2, x: 3 };
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.write_velocity_uncertainty = false;
+
+        let mapped = sequential_config(&cfg);
+        assert_eq!(mapped.ministack_size, 7);
+        assert_eq!(mapped.max_num_compressed, 3);
+        assert_eq!(mapped.output_reference_idx, 4);
+        assert_eq!(mapped.half_window, HalfWindow { y: 5, x: 6 });
+        assert_eq!(mapped.strides, Strides { y: 2, x: 3 });
+        assert!(mapped.use_evd);
+        assert_eq!(mapped.beta, 0.17);
+        assert_eq!(mapped.zero_correlation_threshold, 0.23);
+        assert_eq!(mapped.shp_method, ShpMethod::Ks);
+        assert_eq!(mapped.shp_alpha, 0.007);
+        assert_eq!(
+            mapped.compressed_slc_plan,
+            CompressedSlcPlan::LastPerMinistack
+        );
+        assert!(!mapped.compute_crlb);
+        assert!(mapped.compute_closure_phase, "phase-bias forces closure");
+        assert!(mapped.compute_average_coherence);
+
+        cfg.phase_linking.correct_phase_bias = false;
+        cfg.phase_linking.write_closure_phase = true;
+        cfg.timeseries_options.use_coherence_weights = true;
+        let forced = sequential_config(&cfg);
+        assert!(forced.compute_crlb, "coherence weighting forces CRLB");
+        assert!(forced.compute_closure_phase, "write flag maps to closure");
+    }
+
+    #[test]
+    fn workflow_compute_backend_maps_to_every_engine_entry() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.worker_settings.compute_backend = ComputeBackend::Gpu;
+        assert_eq!(configured_compute_backend(&cfg), ComputeBackend::Gpu);
+    }
+
+    #[test]
+    fn worker_block_shape_controls_phase_link_tile_count() {
+        let dims = (24, 24);
+        let nslc = 5;
+        let stack = synth_stack(nslc, dims.0, dims.1);
+        let engine = ComputeEngine::new(ComputeBackend::Cpu);
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let small = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+        cfg.worker_settings.block_shape = (64, 64);
+        let large = phase_link_tiled(
+            &cfg,
+            dims,
+            nslc,
+            &engine,
+            |block| Ok(stack.slice(s![.., block.rows(), block.cols()]).to_owned()),
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(small.total_tiles > large.total_tiles);
+    }
+
+    #[test]
+    fn native_unwrap_options_map_to_backend_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.unwrap_options.snaphu_options.ntiles = (3, 4);
+        cfg.unwrap_options.snaphu_options.cost = "defo".into();
+        let mapped = native_config(&cfg, (4_096, 4_096));
+        assert_eq!(mapped.tile, Some((3, 4)), "explicit tiles override auto");
+        assert!(matches!(mapped.cost, CostMode::Defo));
+    }
+
+    #[test]
+    fn snaphu_unwrap_options_map_to_backend_config_and_auto_tile() {
+        let mut cfg = DisplacementWorkflow::default();
+        let options = &mut cfg.unwrap_options.snaphu_options;
+        options.ntiles = (2, 3);
+        options.tile_overlap = (11, 13);
+        options.n_parallel_tiles = 5;
+        options.init_method = "mst".into();
+        options.cost = "defo".into();
+        let explicit = unwrap_config(&cfg, (2_048, 1_536));
+        assert_eq!(explicit.ntiles, (2, 3));
+        assert_eq!(explicit.tile_overlap, (11, 13));
+        assert_eq!(explicit.nproc, 5);
+        assert!(matches!(explicit.init, InitMethod::Mst));
+        assert!(matches!(explicit.cost, CostMode::Defo));
+
+        cfg.unwrap_options.snaphu_options.auto_tile = true;
+        let auto = unwrap_config(&cfg, (2_048, 1_536));
+        let (expected_tiles, expected_processes) = auto_tiling((2_048, 1_536));
+        assert_eq!(auto.ntiles, expected_tiles);
+        assert_eq!(auto.nproc, expected_processes);
+        assert_eq!(auto.tile_overlap, (11, 13));
+    }
+
+    #[test]
+    fn tophu_unwrap_options_map_to_backend_config() {
+        let mut cfg = DisplacementWorkflow::default();
+        let options = &mut cfg.unwrap_options.tophu_options;
+        options.ntiles = (4, 5);
+        options.downsample_factor = (6, 7);
+        options.init_method = "mst".into();
+        options.cost = "defo".into();
+        let mapped = tophu_config(&cfg);
+        assert_eq!(mapped.ntiles, (4, 5));
+        assert_eq!(mapped.downsample_factor, (6, 7));
+        assert_eq!(mapped.tile_overlap, TophuConfig::default().tile_overlap);
+        assert!(matches!(mapped.init, InitMethod::Mst));
+        assert!(matches!(mapped.cost, CostMode::Defo));
+    }
+
+    #[test]
+    fn unsupported_worker_config_fails_before_io_at_every_entry_point() {
+        let missing = PathBuf::from("missing_worker_config_contract.h5");
+        let mut worker_cfg = DisplacementWorkflow {
+            cslc_file_list: vec![missing.clone()],
+            ..Default::default()
+        };
+        worker_cfg.worker_settings.threads_per_worker = 2;
+        let mut stride_cfg = worker_cfg.clone();
+        stride_cfg.worker_settings.threads_per_worker = 1;
+        stride_cfg.output_options.strides.y = 0;
+        let state = DisplacementState {
+            input_groups: BTreeMap::new(),
+            bursts: Vec::new(),
+        };
+        for (path, cfg) in [
+            ("worker_settings.threads_per_worker", worker_cfg),
+            ("output_options.strides.y", stride_cfg),
+        ] {
+            let errors = [
+                run_displacement(&cfg).err().expect("batch config guard"),
+                run_displacement_resumable(&cfg)
+                    .err()
+                    .expect("resumable config guard"),
+                update_displacement(&state, &cfg)
+                    .err()
+                    .expect("update config guard"),
+            ];
+            for error in errors {
+                assert!(error.to_string().contains(path), "{error}");
+            }
+        }
+        assert!(!missing.exists(), "fixture must remain nonexistent");
+    }
+
+    #[test]
+    fn incremental_update_rejects_removed_layover_shadow_mask_before_io() {
+        let mut cfg = tiled_cfg(Strides { y: 1, x: 1 }, HalfWindow { y: 1, x: 1 }, (8, 8));
+        let old = PathBuf::from("cslc_20230101.h5");
+        let new = PathBuf::from("cslc_20230113.h5");
+        cfg.cslc_file_list = vec![old.clone(), new];
+        let state = DisplacementState {
+            input_groups: BTreeMap::from([(
+                "single".into(),
+                InputGroupState {
+                    files: vec![old],
+                    mask: Some(MaskFileState {
+                        path: PathBuf::from("layover_shadow_mask.tif"),
+                        fingerprint: [0; 32],
+                        effective_dataset_fingerprint: [0; 32],
+                    }),
+                },
+            )]),
+            bursts: Vec::new(),
+        };
+
+        let error = match update_displacement(&state, &cfg) {
+            Err(error) => error,
+            Ok(_) => panic!("removing a configured mask must fail"),
+        };
+        assert!(error.to_string().contains("layover/shadow mask"), "{error}");
+        assert!(error.to_string().contains("changed"), "{error}");
+    }
+
+    #[test]
+    fn configured_mask_requires_gtiff_driver() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_driver_{}.vrt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"<VRTDataset rasterXSize="1" rasterYSize="1"><VRTRasterBand dataType="Byte" band="1"/></VRTDataset>"#,
+        )
+        .unwrap();
+        let error = ensure_gtiff_mask(&path).unwrap_err();
+        assert!(error.to_string().contains("GTiff"), "{error}");
+        assert!(error.to_string().contains("VRT"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn configured_mask_requires_exactly_one_raster_band() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_band_count_{}.tif",
+            std::process::id()
+        ));
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 2)
+            .unwrap();
+        drop(dataset);
+        let error = ensure_gtiff_mask(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("exactly one raster band"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("found 2"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mask_identity_tracks_gdal_reported_case_variant_world_file() {
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_effective_files_{}.BIN",
+            std::process::id()
+        ));
+        let world_path = path.with_extension("BNW");
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 1)
+            .unwrap();
+        dataset
+            .set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(32611).unwrap())
+            .unwrap();
+        drop(dataset);
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n15\n45\n").unwrap();
+        let baseline = capture_mask_file(&path).unwrap();
+        let dataset = ensure_gtiff_mask(&path).unwrap();
+        assert_eq!(
+            dataset.geo_transform().unwrap(),
+            [0.0, 30.0, 0.0, 60.0, 0.0, -30.0]
+        );
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n45\n45\n").unwrap();
+        let changed = capture_mask_file(&path).unwrap();
+        assert_ne!(
+            changed.effective_dataset_fingerprint,
+            baseline.effective_dataset_fingerprint
+        );
+
+        std::fs::write(&world_path, b"30\n0\n0\n-30\n15\n45\n").unwrap();
+        assert_eq!(capture_mask_file(&path).unwrap(), baseline);
+        std::fs::remove_file(&world_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mask_identity_binds_effective_grid_when_gdal_precedence_changes() {
+        struct ConfigGuard(&'static str);
+
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                let _ = gdal::config::clear_thread_local_config_option(self.0);
+            }
+        }
+
+        const OPTION: &str = "GDAL_GEOREF_SOURCES";
+        let _guard = ConfigGuard(OPTION);
+        let path = std::env::temp_dir().join(format!(
+            "dolphinrust_mask_georef_precedence_{}.tif",
+            std::process::id()
+        ));
+        let mut aux_path = path.as_os_str().to_os_string();
+        aux_path.push(".aux.xml");
+        let aux_path = PathBuf::from(aux_path);
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut dataset = driver
+            .create_with_band_type::<u8, _>(&path, 2, 2, 1)
+            .unwrap();
+        dataset
+            .set_geo_transform(&[0.0, 30.0, 0.0, 60.0, 0.0, -30.0])
+            .unwrap();
+        dataset
+            .set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(32611).unwrap())
+            .unwrap();
+        drop(dataset);
+        std::fs::write(
+            &aux_path,
+            br#"<PAMDataset>
+  <SRS dataAxisToSRSAxisMapping="1,2">EPSG:4326</SRS>
+  <GeoTransform>100, 2, 0, 200, 0, -2</GeoTransform>
+</PAMDataset>
+"#,
+        )
+        .unwrap();
+
+        gdal::config::set_thread_local_config_option(OPTION, "PAM,INTERNAL").unwrap();
+        let pam_first = capture_mask_file(&path).unwrap();
+        gdal::config::set_thread_local_config_option(OPTION, "INTERNAL,PAM").unwrap();
+        let internal_first = capture_mask_file(&path).unwrap();
+        assert_eq!(pam_first.fingerprint, internal_first.fingerprint);
+        assert_ne!(
+            pam_first.effective_dataset_fingerprint,
+            internal_first.effective_dataset_fingerprint
+        );
+
+        gdal::config::clear_thread_local_config_option(OPTION).unwrap();
+        std::fs::remove_file(aux_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn group_contracts_bind_masks_for_every_active_burst_before_cslc_io() {
+        let mask_path = std::env::temp_dir().join(format!(
+            "dolphinrust_group_mask_identity_{}.tif",
+            std::process::id()
+        ));
+        let geotransform = [0.0, 30.0, 0.0, 60.0, 0.0, -30.0];
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let a0 = PathBuf::from("missing_a_20230101.h5");
+        let b0 = PathBuf::from("missing_b_20230101.h5");
+        let a1 = PathBuf::from("missing_a_20230113.h5");
+        let b1 = PathBuf::from("missing_b_20230113.h5");
+        let mut cfg = DisplacementWorkflow {
+            cslc_file_list: vec![a0.clone(), b0.clone()],
+            ..Default::default()
+        };
+        let initial_groups =
+            BTreeMap::from([("a".into(), vec![0_usize]), ("b".into(), vec![1_usize])]);
+        let masks = BTreeMap::from([("a".into(), None), ("b".into(), Some(mask_path.clone()))]);
+        let previous = capture_input_groups(&cfg, &initial_groups, &masks).unwrap();
+        assert_eq!(previous.len(), 2, "crop-excluded groups must remain bound");
+
+        cfg.cslc_file_list = vec![a0, b0, a1, b1];
+        let updated_groups = BTreeMap::from([
+            ("a".into(), vec![0_usize, 2]),
+            ("b".into(), vec![1_usize, 3]),
+        ]);
+        validate_updated_input_groups(&previous, &cfg, &updated_groups, &masks).unwrap();
+        std::fs::remove_file(&mask_path).unwrap();
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 2_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let error =
+            validate_updated_input_groups(&previous, &cfg, &updated_groups, &masks).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("file or valid-pixel content changed"),
+            "{error}"
+        );
+        assert!(
+            cfg.cslc_file_list.iter().all(|path| !path.exists()),
+            "the contract must not need CSLC I/O"
+        );
+        std::fs::remove_file(mask_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_update_rejects_external_mask_sidecar_mutation_before_cslc_io() {
+        let mask_path = std::env::temp_dir().join(format!(
+            "dolphinrust_bounded_sidecar_identity_{}.tif",
+            std::process::id()
+        ));
+        let mut sidecar_path = mask_path.as_os_str().to_os_string();
+        sidecar_path.push(".msk");
+        let sidecar_path = PathBuf::from(sidecar_path);
+        let geotransform = [0.0, 30.0, 0.0, 60.0, 0.0, -30.0];
+        write_raster(
+            &mask_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        write_raster(
+            &sidecar_path,
+            Array2::from_elem((2, 2), 1_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let old_cslc = PathBuf::from("missing_cslc_20230101.h5");
+        let new_cslc = PathBuf::from("missing_cslc_20230113.h5");
+        let mut initial = DisplacementWorkflow {
+            cslc_file_list: vec![old_cslc.clone()],
+            layover_shadow_mask_files: vec![mask_path.clone()],
+            ..Default::default()
+        };
+        initial.output_options.bounds = Some((0.0, 0.0, 30.0, 30.0));
+        initial.output_options.bounds_epsg = Some(32611);
+        initial.output_options.epsg = Some(32611);
+        let initial_groups = workflow_groups(&initial).unwrap();
+        let initial_masks = resolve_layover_shadow_masks(
+            initial.input_options.input_type,
+            &initial_groups,
+            &initial.layover_shadow_mask_files,
+        )
+        .unwrap();
+        let state = DisplacementState {
+            input_groups: capture_input_groups(&initial, &initial_groups, &initial_masks).unwrap(),
+            bursts: Vec::new(),
+        };
+        let main_fingerprint = fingerprint_mask_file(&mask_path).unwrap();
+
+        std::fs::remove_file(&sidecar_path).unwrap();
+        write_raster(
+            &sidecar_path,
+            Array2::from_elem((2, 2), 2_u8).view(),
+            geotransform,
+            Some(32611),
+            Some(0.0),
+        )
+        .unwrap();
+        let mut updated = initial;
+        updated.cslc_file_list.push(new_cslc.clone());
+        let error = match update_displacement(&state, &updated) {
+            Ok(_) => panic!("external mask sidecar mutation must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("file or valid-pixel content changed"),
+            "{error}"
+        );
+        assert_eq!(fingerprint_mask_file(&mask_path).unwrap(), main_fingerprint);
+        assert!(!new_cslc.exists(), "fixture must fail before new-CSLC I/O");
+        std::fs::remove_file(sidecar_path).unwrap();
+        std::fs::remove_file(mask_path).unwrap();
     }
 
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the
@@ -4068,7 +7654,8 @@ mod tests {
         let days = vec![0.0, 12.0];
         let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
         let crlb = Array3::from_elem((2, 1, 1), 0.5);
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        let fit =
+            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
         assert!(fit.terms.seasonal_amplitude_rad.is_none());
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
@@ -4110,11 +7697,11 @@ mod tests {
         });
         let crlb = Array3::from_elem((days.len(), 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
-        cfg.timeseries_options.write_velocity_uncertainty = true;
         cfg.timeseries_options.velocity_seasonal = true;
         let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
 
-        let seasonal = fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), &model).unwrap();
+        let seasonal =
+            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
         assert!(
             (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
             "rate {} != {rate_per_year}",
@@ -4125,10 +7712,7 @@ mod tests {
             (recovered - amplitude).abs() < 1e-6,
             "amplitude {recovered}"
         );
-        assert!(
-            seasonal.sigma.is_some(),
-            "sigma follows write_velocity_uncertainty"
-        );
+        assert!(seasonal.sigma.is_none());
 
         cfg.timeseries_options.velocity_seasonal = false;
         let linear = fit_velocity(
@@ -4136,6 +7720,7 @@ mod tests {
             displacement.view(),
             &days,
             Some(&crlb),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -4144,6 +7729,15 @@ mod tests {
             "fixture must show the linear fit absorbing the cycle, got {}",
             linear.velocity[(0, 0)]
         );
+    }
+
+    #[test]
+    fn velocity_uncertainty_rejects_optional_time_function_models() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.velocity_seasonal = true;
+        let error = validate_config(&cfg).unwrap_err();
+        assert!(error.to_string().contains("linear temporal model"));
     }
 
     /// The bounded/tiled path re-fits through the same front door, so a configured
@@ -4162,6 +7756,7 @@ mod tests {
                 (0.01 * time + f64::from(time >= step_day) * 3.0) * scale
             }),
             vel_rad: Array2::zeros((4, 4)),
+            velocity_estimator: VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
             velocity_model: VelocityModel {
                 seasonal: false,
                 step_days: vec![step_day],
@@ -4172,6 +7767,7 @@ mod tests {
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -4187,8 +7783,10 @@ mod tests {
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
             velocity_sigma_rad: None,
+            velocity_diagnostics: None,
             interferogram_pairs: Vec::new(),
             unwrap_connected_components: Array3::zeros((0, 4, 4)),
+            production_covariance: None,
         };
         let target = BlockIndices {
             row_start: 1,

@@ -14,4 +14,10 @@ fixtures/*
 !fixtures/unwseam_ci_corr.npy
 !fixtures/unwseam_ci_oracle.npy
 !fixtures/unwseam_ci_conncomp.npy
+# Issue #50: compact pinned dolphin v0.35.0 layover/shadow-mask oracle.
+!fixtures/layover_shadow_mask_*.npy
+# Issue #100: compact forward dolphin v0.42.0 phase-similarity oracle (~39 KB
+# total) — committed so the metric and its neighbour-set are gated in CI rather
+# than skipped for want of a local fixture.
+!fixtures/similarity_*.npy
 __pycache__/

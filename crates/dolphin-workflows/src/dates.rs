@@ -42,7 +42,8 @@ pub fn parse_date(path: &Path, fmt: &str) -> Result<NaiveDate> {
 /// CSLC filenames in input order. The first element is always `0.0`.
 ///
 /// # Errors
-/// Returns `Err` if the list is empty or any filename carries no parseable date.
+/// Returns `Err` if the list is empty, any filename carries no parseable date,
+/// or the dates are not unique and strictly increasing in input order.
 pub fn decimal_days(paths: &[PathBuf], fmt: &str) -> Result<Vec<f64>> {
     let dates = paths
         .iter()
@@ -51,6 +52,15 @@ pub fn decimal_days(paths: &[PathBuf], fmt: &str) -> Result<Vec<f64>> {
     let first = *dates
         .first()
         .ok_or_else(|| anyhow!("empty cslc_file_list"))?;
+    if let Some(index) = dates.windows(2).position(|pair| pair[0] >= pair[1]) {
+        return Err(anyhow!(
+            "acquisition dates must be unique and strictly increasing in input order: {} then {} at indices {} and {}",
+            dates[index],
+            dates[index + 1],
+            index,
+            index + 1
+        ));
+    }
     Ok(dates
         .iter()
         .map(|d| (*d - first).num_days() as f64)
@@ -136,5 +146,31 @@ mod tests {
         ];
         let days = decimal_days(&files, "%Y%m%d").unwrap();
         assert_eq!(days, vec![0.0, 12.0, 24.0]);
+    }
+
+    #[test]
+    fn decimal_days_rejects_duplicate_acquisitions() {
+        let files = [
+            PathBuf::from("cslc_20221119_a.h5"),
+            PathBuf::from("cslc_20221119_b.h5"),
+        ];
+        let error = decimal_days(&files, "%Y%m%d").unwrap_err();
+        assert!(
+            error.to_string().contains("unique and strictly increasing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn decimal_days_rejects_non_increasing_acquisitions() {
+        let files = [
+            PathBuf::from("cslc_20221201.h5"),
+            PathBuf::from("cslc_20221119.h5"),
+        ];
+        let error = decimal_days(&files, "%Y%m%d").unwrap_err();
+        assert!(
+            error.to_string().contains("unique and strictly increasing"),
+            "{error}"
+        );
     }
 }

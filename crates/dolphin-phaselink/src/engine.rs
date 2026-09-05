@@ -13,9 +13,10 @@ use dolphin_core::config::ComputeBackend;
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use ndarray::{Array4, ArrayView3, ArrayView4};
 
+use crate::fused::link_fused_with_source_replay_support;
 use crate::{
     estimate_stack_covariance, link_fused, process_coherence_matrices, FusedEstimate, FusedParams,
-    StackEstimate,
+    SourceReplayEstimate, StackEstimate,
 };
 
 /// `Auto` uses the GPU at/above this output-pixel count (≈128²); below it, the
@@ -89,7 +90,7 @@ impl ComputeEngine {
     /// Sliding-window coherence over `stack`, on the resolved backend.
     ///
     /// # Errors
-    /// Returns `Err` if the covariance window exceeds the stack.
+    /// Returns `Err` if a stride is zero or the covariance window exceeds the stack.
     pub fn covariance(
         &self,
         stack: ArrayView3<Cf64>,
@@ -97,6 +98,9 @@ impl ComputeEngine {
         strides: Strides,
         neighbors: Option<ArrayView4<bool>>,
     ) -> Result<Array4<Cf64>, &'static str> {
+        if strides.y == 0 || strides.x == 0 {
+            return Err("covariance stride is zero");
+        }
         #[cfg(feature = "gpu")]
         {
             let (nslc, rows, cols) = stack.dim();
@@ -160,7 +164,8 @@ impl ComputeEngine {
     /// estimator + per-stage quality, producing the identical [`FusedEstimate`].
     ///
     /// # Errors
-    /// Returns `Err` if the covariance window exceeds the stack.
+    /// Returns `Err` if a stride is zero, the covariance window exceeds the
+    /// stack, or the fused input contract is invalid.
     pub fn link(
         &self,
         stack: ArrayView3<Cf64>,
@@ -169,6 +174,9 @@ impl ComputeEngine {
         neighbors: Option<ArrayView4<bool>>,
         params: FusedParams,
     ) -> Result<FusedEstimate, &'static str> {
+        if strides.y == 0 || strides.x == 0 {
+            return Err("phase-linking stride is zero");
+        }
         if params.compute_average_coherence && params.average_coherence_start_idx > stack.dim().0 {
             return Err("average coherence start exceeds stack depth");
         }
@@ -184,6 +192,46 @@ impl ComputeEngine {
             }
         }
         link_fused(stack, half, strides, neighbors, params)
+    }
+
+    /// Run the fixed CPU/f64 production support path and retain source-influence replay receipts.
+    ///
+    /// This opt-in path never falls back from GPU. Its
+    /// returned legacy estimate uses the same fused CPU pixel kernels as
+    /// [`Self::link`].
+    ///
+    /// # Errors
+    /// Returns an error if the resolved backend is GPU, or the underlying fused
+    /// geometry, realized SHP support, fixed native-validity mask, or branch
+    /// tolerance is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_with_source_replay(
+        &self,
+        stack: ArrayView3<Cf64>,
+        half: HalfWindow,
+        strides: Strides,
+        neighbors: Option<ArrayView4<bool>>,
+        params: FusedParams,
+        native_validity: ndarray::ArrayView2<bool>,
+        branch_tolerance: f64,
+    ) -> Result<SourceReplayEstimate, &'static str> {
+        if strides.y == 0 || strides.x == 0 {
+            return Err("phase-linking stride is zero");
+        }
+        let (nslc, rows, cols) = stack.dim();
+        let (out_rows, out_cols) = strides.out_shape((rows, cols));
+        if self.gpu_ready(out_rows * out_cols, nslc) {
+            return Err("source influence replay requires the CPU f64 backend");
+        }
+        link_fused_with_source_replay_support(
+            stack,
+            half,
+            strides,
+            neighbors,
+            params,
+            native_validity,
+            branch_tolerance,
+        )
     }
 
     /// Whether a GPU context exists and the resolved mode + problem size pick it.

@@ -44,6 +44,28 @@ fn defaults_match_dolphin() {
 }
 
 #[test]
+fn empirical_source_factor_defaults_are_frozen() {
+    let source = DisplacementWorkflow::default()
+        .phase_linking
+        .empirical_source_factor;
+    assert_eq!(source.half_window.y, 7);
+    assert_eq!(source.half_window.x, 14);
+    assert_eq!(source.shrinkage_alpha, 0.1);
+    assert_eq!(source.relative_diagonal_floor, 1e-8);
+}
+
+#[test]
+fn pinned_preprocess_default_matches_dolphin_v035() {
+    assert_eq!(
+        DisplacementWorkflow::default()
+            .unwrap_options
+            .preprocess_options
+            .interpolation_cor_threshold,
+        0.3
+    );
+}
+
+#[test]
 fn enum_yaml_values_match_dolphin() {
     assert_eq!(
         serde_yaml::to_string(&ShpMethod::Glrt).unwrap().trim(),
@@ -81,9 +103,27 @@ fn enum_yaml_values_match_dolphin() {
 #[test]
 fn default_config_round_trips() {
     let original = DisplacementWorkflow::default();
+    original.validate_supported_options().unwrap();
     let yaml = original.to_yaml().unwrap();
     let parsed = DisplacementWorkflow::from_yaml(&yaml).unwrap();
     assert_eq!(original, parsed);
+    parsed.validate_supported_options().unwrap();
+}
+
+#[test]
+fn compatibility_only_values_still_round_trip_before_runtime_validation() {
+    let mut original = DisplacementWorkflow::default();
+    original.worker_settings.threads_per_worker = 6;
+    original
+        .unwrap_options
+        .preprocess_options
+        .interpolation_cor_threshold = 0.4;
+
+    let yaml = original.to_yaml().unwrap();
+    let parsed = DisplacementWorkflow::from_yaml(&yaml).unwrap();
+    assert_eq!(parsed, original);
+    let error = parsed.validate_supported_options().unwrap_err().to_string();
+    assert!(error.contains("unwrap_options.preprocess_options.interpolation_cor_threshold"));
 }
 
 /// Forward divergence: `input_options.input_type` is dolphinRust-only. A legacy

@@ -13,6 +13,592 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CoreError, Result};
 use crate::types::{HalfWindow, Strides};
 
+/// Runtime disposition of one modeled public workflow-config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFieldDisposition {
+    /// The workflow reads the field on every applicable run.
+    Consumed {
+        /// Behavior contract that proves the production reader.
+        contract_id: &'static str,
+    },
+    /// The workflow reads the field only when its documented gate is enabled.
+    Conditional {
+        /// Behavior contract that proves the gated production reader.
+        contract_id: &'static str,
+        /// Config predicate under which the field affects runtime behavior.
+        gate: &'static str,
+    },
+    /// The field is modeled only so dolphin YAML can deserialize and round-trip.
+    CompatibilityOnly {
+        /// Why a non-default value is unsupported.
+        reason: &'static str,
+    },
+}
+
+/// One full YAML path and its audited runtime disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigFieldDispositionEntry {
+    /// Full path in serialized workflow YAML.
+    pub path: &'static str,
+    /// Audited runtime handling for the field.
+    pub disposition: ConfigFieldDisposition,
+}
+
+/// Named behavior contract referenced by the config-field disposition registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigBehaviorContract {
+    /// Stable contract identifier.
+    pub id: &'static str,
+    /// Production reader whose behavior the contract exercises.
+    pub reader: &'static str,
+    /// Test target that checks the behavior.
+    pub evidence: &'static str,
+}
+
+/// Checked behavior-contract catalog for consumed and conditional config fields.
+pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
+    ConfigBehaviorContract {
+        id: "CFG-NATIVE-MASK",
+        reader: "dolphin-workflows::displacement::restrict_publication_mask",
+        evidence: "dolphin-io::quality_mask::tests::native_quality_mask_respects_sensor_codes_and_all_subpixels",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-INPUT-READ",
+        reader: "dolphin-workflows::displacement::{source_layouts, read_burst_tile, acquisition_days, finish_displacement, scale_outputs}",
+        evidence: "dolphin-workflows::{displacement_contract, nisar_e2e_contract} and displacement nondefault-date-format mapping contract",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-BOUNDS-CROP",
+        reader: "dolphin-workflows::{crop::plan_bounds, displacement::{phase_link_tiled, sequential_config, resolve_burst_geo}}",
+        evidence: "dolphin-workflows::displacement_contract::bounded_target_trims_after_analysis_at_both_required_strides",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-PHASE-LINK",
+        reader: "dolphin-workflows::displacement::{phase_link_tiled, sequential_config, finish_displacement, apply_phase_bias}",
+        evidence: "dolphin-workflows::displacement workflow-to-sequential mapping and phase_bias_correction_runs_end_to_end contracts",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-COVARIANCE-OPERATOR",
+        reader: "dolphin-workflows::displacement::{sequential_config, run_displacement_with_output_policy}",
+        evidence: "dolphin-workflows global covariance operator opt-in and output-policy contracts",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-SHP-WIRING",
+        reader: "dolphin-workflows::{displacement::sequential_config, sequential::{shp_neighbors, link_and_compress}}",
+        evidence: "dolphin-workflows::displacement workflow-to-sequential mapping contract and shp_wiring_contract",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-LAYOVER-SHADOW",
+        reader: "dolphin-workflows::{burst::resolve_layover_shadow_masks, displacement::phase_link_tiled}",
+        evidence: "dolphin-workflows::{layover_shadow_mask_contract, multiburst_contract, nrt_incremental_contract, nrt_displacement_contract} and burst/displacement unit contracts",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-IFG-NETWORK",
+        reader: "dolphin-workflows::displacement::network",
+        evidence: "dolphin-workflows::displacement::tests::workflow_network_options_map_to_network_builder plus dolphin-timeseries::timeseries_contract::networks_match_oracle",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-UNWRAP-BACKEND",
+        reader: "dolphin-workflows::displacement::{unwrap_network, unwrap_backend, native_config, unwrap_config, tophu_config}",
+        evidence: "dolphin-workflows::displacement workflow-to-backend mapping contracts plus unwrap_backend_contract and unwrap_parallel_contract",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-UNWRAP-MASK",
+        reader: "dolphin-workflows::displacement::{unwrap_network, analysis_correlation, apply_phase_masks}",
+        evidence: "dolphin-workflows::displacement::tests::{aligned_mask_crs_mismatch_fails_explicitly, mask_is_not_read_when_zero_where_masked_is_false, terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms}",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-TIMESERIES",
+        reader: "dolphin-workflows::displacement::{finish_displacement, sequential_config, invert_time_series, fit_velocity, apply_loop_closure_qc}",
+        evidence: "dolphin-workflows::{displacement_contract::l2_uncertainty_products_are_opt_in_and_unit_aligned, multiburst_contract} and displacement reference/correlation/loop-closure unit contracts",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-VELOCITY-MODEL",
+        reader: "dolphin-workflows::displacement::{sequential_config, velocity_model, fit_velocity}",
+        evidence: "dolphin-workflows::displacement velocity-model contracts",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-TEMPORAL-UNCERTAINTY",
+        reader: "dolphin-workflows::temporal_covariance_product::write_temporal_covariance_products",
+        evidence: "dolphin-workflows::temporal_covariance_product_contract",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-CORRECTIONS",
+        reader: "dolphin-workflows::corrections::apply_corrections",
+        evidence: "dolphin-workflows::corrections contracts and geometry_provenance_contract",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-OUTPUT-VALIDITY",
+        reader: "dolphin-workflows::displacement::{emit_displacement, write_outputs}",
+        evidence: "dolphin-workflows::displacement_contract::{groundpulse_output_policy_preserves_arrays_and_emits_only_coherence, distinct_phase_linking_coherence_raster_is_written_when_enabled}",
+    },
+    ConfigBehaviorContract {
+        id: "CFG-COMPUTE-BACKEND",
+        reader: "dolphin-workflows::displacement::{configured_compute_backend, run_displacement_with_output_policy, run_displacement_resumable, update_displacement}",
+        evidence: "dolphin-workflows::displacement workflow-backend mapping contract plus dolphin-phaselink::engine_contract and dolphin-workflows::gpu_e2e_contract",
+    },
+];
+
+macro_rules! consumed {
+    ($path:literal, $contract_id:literal) => {
+        ConfigFieldDispositionEntry {
+            path: $path,
+            disposition: ConfigFieldDisposition::Consumed {
+                contract_id: $contract_id,
+            },
+        }
+    };
+}
+
+macro_rules! conditional {
+    ($path:literal, $contract_id:literal, $gate:literal) => {
+        ConfigFieldDispositionEntry {
+            path: $path,
+            disposition: ConfigFieldDisposition::Conditional {
+                contract_id: $contract_id,
+                gate: $gate,
+            },
+        }
+    };
+}
+
+macro_rules! compatibility_only {
+    ($path:literal, $reason:literal) => {
+        ConfigFieldDispositionEntry {
+            path: $path,
+            disposition: ConfigFieldDisposition::CompatibilityOnly { reason: $reason },
+        }
+    };
+}
+
+macro_rules! require_compatibility_default {
+    ($config:ident, $defaults:ident, $($field:ident).+) => {
+        ensure_compatibility_default(
+            stringify!($($field).+),
+            &$config.$($field).+,
+            &$defaults.$($field).+,
+        )?
+    };
+}
+
+/// Audited disposition of every public field in the modeled config tree.
+///
+/// The companion contract exhaustively destructures every config struct without
+/// `..`, checks these full YAML paths for exact coverage and uniqueness, and
+/// verifies every behavior-contract ID against [`CONFIG_BEHAVIOR_CONTRACTS`].
+pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
+    consumed!("input_options", "CFG-INPUT-READ"),
+    consumed!("cslc_file_list", "CFG-INPUT-READ"),
+    consumed!("output_options", "CFG-BOUNDS-CROP"),
+    compatibility_only!(
+        "ps_options",
+        "persistent-scatterer update inputs are not implemented"
+    ),
+    compatibility_only!(
+        "amplitude_dispersion_files",
+        "persistent-scatterer update inputs are not implemented"
+    ),
+    compatibility_only!(
+        "amplitude_mean_files",
+        "persistent-scatterer update inputs are not implemented"
+    ),
+    conditional!(
+        "layover_shadow_mask_files",
+        "CFG-LAYOVER-SHADOW",
+        "layover_shadow_mask_files is nonempty"
+    ),
+    consumed!("phase_linking", "CFG-PHASE-LINK"),
+    consumed!("interferogram_network", "CFG-IFG-NETWORK"),
+    consumed!("unwrap_options", "CFG-UNWRAP-BACKEND"),
+    consumed!("timeseries_options", "CFG-TIMESERIES"),
+    conditional!(
+        "correction_options",
+        "CFG-CORRECTIONS",
+        "correction_options.is_enabled() or geometry_files is nonempty"
+    ),
+    conditional!(
+        "mask_file",
+        "CFG-UNWRAP-MASK",
+        "unwrap_options.zero_where_masked and mask_file is set"
+    ),
+    consumed!("work_directory", "CFG-OUTPUT-VALIDITY"),
+    consumed!("worker_settings", "CFG-PHASE-LINK"),
+    compatibility_only!("log_file", "the Rust CLI configures logging independently"),
+    compatibility_only!(
+        "ps_options.amp_dispersion_threshold",
+        "persistent-scatterer selection and update inputs are not implemented"
+    ),
+    consumed!("phase_linking.ministack_size", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.max_num_compressed", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.output_reference_idx", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.half_window", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.use_evd", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.beta", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.zero_correlation_threshold", "CFG-PHASE-LINK"),
+    consumed!("phase_linking.shp_method", "CFG-SHP-WIRING"),
+    consumed!("phase_linking.shp_alpha", "CFG-SHP-WIRING"),
+    compatibility_only!(
+        "phase_linking.mask_input_ps",
+        "the workflow has no persistent-scatterer label input"
+    ),
+    compatibility_only!(
+        "phase_linking.baseline_lag",
+        "sequential phase linking does not implement StBAS lag filtering"
+    ),
+    consumed!("phase_linking.compressed_slc_plan", "CFG-PHASE-LINK"),
+    conditional!(
+        "phase_linking.empirical_source_factor",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.half_window",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.shrinkage_alpha",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.empirical_source_factor.relative_diagonal_floor",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.write_covariance_operator",
+        "CFG-COVARIANCE-OPERATOR",
+        "phase_linking.write_covariance_operator is true"
+    ),
+    conditional!(
+        "phase_linking.write_crlb",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_crlb is true"
+    ),
+    conditional!(
+        "phase_linking.write_closure_phase",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_closure_phase is true"
+    ),
+    conditional!(
+        "phase_linking.calc_average_coh",
+        "CFG-PHASE-LINK",
+        "phase_linking.calc_average_coh is true"
+    ),
+    conditional!(
+        "phase_linking.write_phase_similarity",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_phase_similarity is true"
+    ),
+    conditional!(
+        "phase_linking.phase_similarity_search_radius",
+        "CFG-PHASE-LINK",
+        "phase_linking.write_phase_similarity is true"
+    ),
+    conditional!(
+        "phase_linking.correct_phase_bias",
+        "CFG-PHASE-LINK",
+        "phase_linking.correct_phase_bias is true"
+    ),
+    conditional!(
+        "interferogram_network.reference_idx",
+        "CFG-IFG-NETWORK",
+        "interferogram_network.reference_idx is set"
+    ),
+    conditional!(
+        "interferogram_network.max_bandwidth",
+        "CFG-IFG-NETWORK",
+        "interferogram_network.max_bandwidth is set"
+    ),
+    conditional!(
+        "interferogram_network.max_temporal_baseline",
+        "CFG-IFG-NETWORK",
+        "interferogram_network.max_temporal_baseline is set"
+    ),
+    conditional!(
+        "interferogram_network.indexes",
+        "CFG-IFG-NETWORK",
+        "interferogram_network.indexes is set"
+    ),
+    compatibility_only!(
+        "timeseries_options.run_inversion",
+        "the Rust workflow always runs timeseries inversion"
+    ),
+    consumed!("timeseries_options.method", "CFG-TIMESERIES"),
+    conditional!(
+        "timeseries_options.reference_point",
+        "CFG-TIMESERIES",
+        "timeseries_options.reference_point is set"
+    ),
+    compatibility_only!(
+        "timeseries_options.run_velocity",
+        "the Rust workflow always estimates velocity"
+    ),
+    compatibility_only!(
+        "timeseries_options.apply_mask_to_timeseries",
+        "the Rust workflow always propagates its validity mask"
+    ),
+    consumed!("timeseries_options.correlation_threshold", "CFG-TIMESERIES"),
+    compatibility_only!(
+        "timeseries_options.block_shape",
+        "timeseries inversion is not configured through block scheduling"
+    ),
+    compatibility_only!(
+        "timeseries_options.num_parallel_blocks",
+        "timeseries inversion is not configured through block scheduling"
+    ),
+    conditional!(
+        "timeseries_options.use_coherence_weights",
+        "CFG-TIMESERIES",
+        "timeseries_options.use_coherence_weights is true"
+    ),
+    conditional!(
+        "timeseries_options.write_posterior_uncertainty",
+        "CFG-TIMESERIES",
+        "timeseries_options.method is l2 and write_posterior_uncertainty is true"
+    ),
+    conditional!(
+        "timeseries_options.write_velocity_uncertainty",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.write_velocity_uncertainty is true"
+    ),
+    conditional!(
+        "timeseries_options.temporal_uncertainty",
+        "CFG-TEMPORAL-UNCERTAINTY",
+        "timeseries_options.temporal_uncertainty.method is reml_covariance_parameter_adjusted_scalar"
+    ),
+    compatibility_only!(
+        "timeseries_options.correct_velocity_temporal_correlation",
+        "the scalar effective-sample-size multiplier is retained only for YAML compatibility; it is not a valid inferential slope correction"
+    ),
+    conditional!(
+        "timeseries_options.velocity_seasonal",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.velocity_seasonal is true"
+    ),
+    conditional!(
+        "timeseries_options.velocity_step_dates",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.velocity_step_dates is nonempty"
+    ),
+    conditional!(
+        "timeseries_options.mask_unwrap_loop_errors",
+        "CFG-TIMESERIES",
+        "timeseries_options.mask_unwrap_loop_errors is true"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.ntiles",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is native or snaphu"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.tile_overlap",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is snaphu"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.n_parallel_tiles",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is snaphu"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.init_method",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is snaphu; native requires the pinned default"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.cost",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is native or snaphu"
+    ),
+    compatibility_only!(
+        "unwrap_options.snaphu_options.single_tile_reoptimize",
+        "the SNAPHU wrapper has no post-tile re-optimization pass"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options.auto_tile",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is snaphu"
+    ),
+    conditional!(
+        "unwrap_options.tophu_options.ntiles",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is tophu"
+    ),
+    conditional!(
+        "unwrap_options.tophu_options.downsample_factor",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is tophu"
+    ),
+    conditional!(
+        "unwrap_options.tophu_options.init_method",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is tophu"
+    ),
+    conditional!(
+        "unwrap_options.tophu_options.cost",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is tophu"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options.alpha",
+        "pre-unwrap Goldstein filtering is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options.max_radius",
+        "pre-unwrap interpolation is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options.interpolation_cor_threshold",
+        "pre-unwrap interpolation is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options.interpolation_similarity_threshold",
+        "pre-unwrap interpolation is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options.zero_correlation_where_interpolating",
+        "pre-unwrap interpolation is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.run_unwrap",
+        "the Rust workflow always unwraps its interferogram network"
+    ),
+    compatibility_only!(
+        "unwrap_options.run_goldstein",
+        "pre-unwrap Goldstein filtering is not implemented"
+    ),
+    compatibility_only!(
+        "unwrap_options.run_interpolation",
+        "pre-unwrap interpolation is not implemented"
+    ),
+    consumed!("unwrap_options.unwrap_method", "CFG-UNWRAP-BACKEND"),
+    consumed!("unwrap_options.n_parallel_jobs", "CFG-UNWRAP-BACKEND"),
+    conditional!(
+        "unwrap_options.zero_where_masked",
+        "CFG-UNWRAP-MASK",
+        "unwrap_options.zero_where_masked is true and mask_file is set"
+    ),
+    compatibility_only!(
+        "unwrap_options.preprocess_options",
+        "pre-unwrap filtering and interpolation are not implemented"
+    ),
+    conditional!(
+        "unwrap_options.snaphu_options",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is native or snaphu"
+    ),
+    conditional!(
+        "unwrap_options.tophu_options",
+        "CFG-UNWRAP-BACKEND",
+        "unwrap_method is tophu"
+    ),
+    conditional!("input_options.acquisition_metadata", "CFG-INPUT-READ", "verified acquisition metadata is supplied"),
+    conditional!("input_options.apply_native_input_masks", "CFG-NATIVE-MASK", "input_options.apply_native_input_masks is true"),
+    consumed!("correction_options.acquisition_utc", "CFG-CORRECTIONS"),
+    conditional!("correction_options.nisar_geometry_group", "CFG-CORRECTIONS", "NISAR geometry is supplied"),
+    conditional!("correction_options.nisar_ellipsoidal_dem_file", "CFG-CORRECTIONS", "NISAR geometry is supplied"),
+    consumed!("input_options.input_type", "CFG-INPUT-READ"),
+    consumed!("input_options.subdataset", "CFG-INPUT-READ"),
+    consumed!("input_options.cslc_date_fmt", "CFG-INPUT-READ"),
+    consumed!("input_options.wavelength", "CFG-INPUT-READ"),
+    conditional!(
+        "correction_options.ionosphere_files",
+        "CFG-CORRECTIONS",
+        "correction_options.ionosphere_files is nonempty"
+    ),
+    conditional!(
+        "correction_options.troposphere_files",
+        "CFG-CORRECTIONS",
+        "correction_options.troposphere_files is nonempty"
+    ),
+    conditional!(
+        "correction_options.geometry_files",
+        "CFG-CORRECTIONS",
+        "correction_options.geometry_files is nonempty"
+    ),
+    conditional!(
+        "correction_options.dem_file",
+        "CFG-CORRECTIONS",
+        "troposphere_files is nonempty and dem_file is set"
+    ),
+    conditional!(
+        "correction_options.incidence_angle_deg",
+        "CFG-CORRECTIONS",
+        "ionosphere_files or troposphere_files is nonempty and geometry_files is empty"
+    ),
+    conditional!(
+        "correction_options.troposphere_variable",
+        "CFG-CORRECTIONS",
+        "correction_options.troposphere_files is nonempty"
+    ),
+    conditional!(
+        "correction_options.solid_earth_tide",
+        "CFG-CORRECTIONS",
+        "correction_options.solid_earth_tide is true"
+    ),
+    consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
+    conditional!(
+        "output_options.epsg",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds and output_options.epsg are set"
+    ),
+    conditional!(
+        "output_options.bounds",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds is set"
+    ),
+    conditional!(
+        "output_options.bounds_epsg",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds is set"
+    ),
+    compatibility_only!(
+        "output_options.add_overviews",
+        "the COG writer controls overview generation"
+    ),
+    compatibility_only!(
+        "output_options.overview_levels",
+        "the COG writer controls overview generation"
+    ),
+    compatibility_only!(
+        "worker_settings.gpu_enabled",
+        "worker_settings.compute_backend supersedes this dolphin field"
+    ),
+    consumed!("worker_settings.compute_backend", "CFG-COMPUTE-BACKEND"),
+    compatibility_only!(
+        "worker_settings.threads_per_worker",
+        "the Rust workflow does not set a per-worker thread environment"
+    ),
+    compatibility_only!(
+        "worker_settings.n_parallel_bursts",
+        "the Rust workflow does not schedule bursts through this field"
+    ),
+    consumed!("worker_settings.block_shape", "CFG-PHASE-LINK"),
+];
+
+fn ensure_compatibility_default<T>(path: &str, actual: &T, default: &T) -> Result<()>
+where
+    T: PartialEq + std::fmt::Debug,
+{
+    if actual == default {
+        return Ok(());
+    }
+    Err(CoreError::InvalidConfig(format!(
+        "{path} is modeled only for dolphin YAML compatibility and is not supported; expected the default {default:?}, got {actual:?}"
+    )))
+}
+
+fn ensure_supported_choice(path: &str, actual: &str, allowed: &[&str]) -> Result<()> {
+    if allowed.contains(&actual) {
+        return Ok(());
+    }
+    Err(CoreError::InvalidConfig(format!(
+        "{path} has unsupported value {actual:?}; expected one of {allowed:?}"
+    )))
+}
+
 /// SHP-selection statistical test. dolphin `ShpMethod`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -87,7 +673,8 @@ pub enum TimeseriesMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PsOptions {
-    /// Amplitude dispersion threshold to consider a pixel a PS.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// persistent-scatterer selection/update inputs are not implemented.
     pub amp_dispersion_threshold: f64,
 }
 
@@ -121,12 +708,19 @@ pub struct PhaseLinkingOptions {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
-    /// Set PS-labeled pixels to NaN during phase linking to avoid summing their phase.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// the workflow has no persistent-scatterer label input.
     pub mask_input_ps: bool,
-    /// StBAS lag: include only the nearest-N interferograms for phase linking.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// sequential phase linking does not implement StBAS lag filtering.
     pub baseline_lag: Option<i64>,
     /// Plan for which date each ministack's compressed SLC references.
     pub compressed_slc_plan: CompressedSlcPlan,
+    /// Frozen empirical proper-complex model used to resolve primitive source factors.
+    pub empirical_source_factor: EmpiricalSourceFactorOptions,
+    /// Persist the source-keyed sequential covariance replay operator. Off by
+    /// default and disconnected from downstream inference.
+    pub write_covariance_operator: bool,
     /// Write the Cramer-Rao lower bound raster.
     pub write_crlb: bool,
     /// Write the closure-phase raster.
@@ -134,6 +728,13 @@ pub struct PhaseLinkingOptions {
     /// Calculate average coherence magnitude per SLC date (dolphin
     /// `calc_average_coh`) and emit the distinct phase-linking-coherence raster.
     pub calc_average_coh: bool,
+    /// Compute the spatial phase-similarity quality raster (Wang et al. 2022
+    /// eq. 5, dolphin `similarity.median_similarity`) from the stitched linked
+    /// phase and emit `phase_similarity.tif`. Off by default.
+    pub write_phase_similarity: bool,
+    /// Neighbourhood radius in pixels for [`Self::write_phase_similarity`],
+    /// matching dolphin's `create_similarities` default.
+    pub phase_similarity_search_radius: usize,
     /// Apply the phase-bias / non-closure correction (Michaelides et al. 2022) to
     /// the linked-phase series before the interferogram network. **Off by default**
     /// (this leads Python dolphin, which has no such correction; enabling it changes
@@ -156,10 +757,36 @@ impl Default for PhaseLinkingOptions {
             mask_input_ps: false,
             baseline_lag: None,
             compressed_slc_plan: CompressedSlcPlan::default(),
+            empirical_source_factor: EmpiricalSourceFactorOptions::default(),
+            write_covariance_operator: false,
             write_crlb: true,
             write_closure_phase: false,
             calc_average_coh: false,
+            write_phase_similarity: false,
+            phase_similarity_search_radius: 7,
             correct_phase_bias: false,
+        }
+    }
+}
+
+/// Frozen source-centered empirical proper-complex factor configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmpiricalSourceFactorOptions {
+    /// Half-window of the canonical native support used for every source.
+    pub half_window: HalfWindow,
+    /// Shrinkage weight toward the empirical covariance diagonal.
+    pub shrinkage_alpha: f64,
+    /// Minimum component/pivot scale relative to the mean positive diagonal.
+    pub relative_diagonal_floor: f64,
+}
+
+impl Default for EmpiricalSourceFactorOptions {
+    fn default() -> Self {
+        Self {
+            half_window: HalfWindow { y: 7, x: 14 },
+            shrinkage_alpha: 0.1,
+            relative_diagonal_floor: 1e-8,
         }
     }
 }
@@ -182,36 +809,44 @@ pub struct InterferogramNetwork {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TimeseriesOptions {
-    /// Run the inversion step after unwrapping (if more than a single-reference network).
+    /// Dolphin YAML compatibility only; must remain `true` because the Rust
+    /// workflow always runs timeseries inversion.
     pub run_inversion: bool,
     /// Norm to use during timeseries inversion.
     pub method: TimeseriesMethod,
     /// Reference point (row, col); auto-selected if not provided.
     pub reference_point: Option<(usize, usize)>,
-    /// Run velocity estimation from the phase time series.
+    /// Dolphin YAML compatibility only; must remain `true` because the Rust
+    /// workflow always estimates velocity.
     pub run_velocity: bool,
-    /// Apply the mask to the output timeseries rasters.
+    /// Dolphin YAML compatibility only; must remain `true` because the Rust
+    /// workflow always propagates its validity mask.
     pub apply_mask_to_timeseries: bool,
     /// Pixels with correlation below this value are masked out.
     pub correlation_threshold: f64,
-    /// Size (rows, columns) of data blocks to load at a time.
+    /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub block_shape: (usize, usize),
-    /// Number of parallel blocks to process at once.
+    /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub num_parallel_blocks: usize,
-    /// Use CRLB-derived observation precision for L2 SBAS and velocity fits.
+    /// Use stitched CRLB-derived quality weights for L2 SBAS and legacy
+    /// point-only velocity fits. The sequential CRLB cube omits cross-date and
+    /// compressed-reference covariance, so it does not calibrate velocity
+    /// standard errors.
     pub use_coherence_weights: bool,
-    /// Emit L2 posterior displacement variance and residual RMS products.
+    /// Emit the diagonal-IFG L2 covariance approximation and network misclosure
+    /// products. Redundant interferograms share acquisitions, so network residual
+    /// DOF is algebraic diagnostics rather than independent empirical evidence.
     pub write_posterior_uncertainty: bool,
-    /// Emit velocity one-sigma uncertainty.
+    /// Emit the independent-residual conditional slope standard error and raw
+    /// temporal-fit diagnostics from the final corrected, spatially referenced
+    /// displacement series. This is not total or field-calibrated uncertainty.
     pub write_velocity_uncertainty: bool,
-    /// Inflate the velocity one-sigma by the AR(1) effective-sample-size factor
-    /// `sqrt((1+rho)/(1-rho))` (Zhang et al. 1997 / Agram & Zebker 2015), `rho`
-    /// the lag-1 autocorrelation of the velocity-fit residuals. InSAR series
-    /// carry temporally correlated noise, so the uncorrected sigma understates
-    /// the slope uncertainty. **Forward divergence from dolphin, opt-in and off
-    /// by default** — a larger sigma can flip a downstream risk-tier threshold,
-    /// so enabling it is the reviewed rollout. Requires
-    /// `write_velocity_uncertainty`.
+    /// Synthetic-validated temporal-covariance inference. Disabled by default
+    /// and fail-closed unless every immutable #54/#53 evidence artifact matches.
+    pub temporal_uncertainty: TemporalUncertaintyOptions,
+    /// Deprecated YAML compatibility field. A scalar effective-sample-size
+    /// multiplier is not a valid slope-variance correction for an irregular,
+    /// heteroskedastic series, so non-default values are rejected.
     pub correct_velocity_temporal_correlation: bool,
     /// Fit an annual sinusoid (period 365.25 d) jointly with the linear rate, so
     /// a real seasonal cycle (groundwater, thermal) is reported as an amplitude
@@ -253,10 +888,59 @@ impl Default for TimeseriesOptions {
             use_coherence_weights: true,
             write_posterior_uncertainty: false,
             write_velocity_uncertainty: false,
+            temporal_uncertainty: TemporalUncertaintyOptions::default(),
             correct_velocity_temporal_correlation: false,
             velocity_seasonal: false,
             velocity_step_dates: Vec::new(),
             mask_unwrap_loop_errors: false,
+        }
+    }
+}
+
+/// Production temporal-uncertainty estimator selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalUncertaintyMethod {
+    /// Preserve the legacy velocity products and emit no corrected inference.
+    #[default]
+    Disabled,
+    /// Issue #53 REML covariance-parameter-adjusted scalar estimator.
+    RemlCovarianceParameterAdjustedScalar,
+}
+
+/// Allocation cap for one persisted temporal factor block, matching the #54 producer cap.
+pub const TEMPORAL_FACTOR_BLOCK_READ_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+/// Producer payload budget reserved below the read cap for bounded HDF5 metadata.
+pub const TEMPORAL_FACTOR_BLOCK_METADATA_RESERVATION_BYTES: u64 = 1024 * 1024;
+
+/// Fail-closed paths and memory bounds for synthetic-validated temporal inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemporalUncertaintyOptions {
+    /// Selected corrected-inference method.
+    pub method: TemporalUncertaintyMethod,
+    /// Directory containing the immutable #53 synthetic result, observed
+    /// release-resource receipt, release binaries, and promotion manifest.
+    pub evidence_directory: Option<PathBuf>,
+    /// Directory containing the calibrated and independently reviewed #54 factor and manifest.
+    pub factor_directory: Option<PathBuf>,
+    /// Maximum target pixels admitted from one persisted factor block.
+    pub maximum_targets_per_block: usize,
+    /// Allocation cap for factor-block ID enumeration.
+    pub block_id_read_cap_bytes: u64,
+    /// Allocation cap for each bounded factor-block read.
+    pub factor_block_read_cap_bytes: u64,
+}
+
+impl Default for TemporalUncertaintyOptions {
+    fn default() -> Self {
+        Self {
+            method: TemporalUncertaintyMethod::Disabled,
+            evidence_directory: None,
+            factor_directory: None,
+            maximum_targets_per_block: 65_536,
+            block_id_read_cap_bytes: 4 * 1024 * 1024,
+            factor_block_read_cap_bytes: TEMPORAL_FACTOR_BLOCK_READ_CAP_BYTES,
         }
     }
 }
@@ -275,7 +959,8 @@ pub struct SnaphuOptions {
     pub init_method: String,
     /// SNAPHU statistical cost mode (`defo` or `smooth`).
     pub cost: String,
-    /// After multi-tile unwrapping, re-optimize the phase using a single tile.
+    /// Dolphin YAML compatibility only; must remain `false` because the SNAPHU
+    /// wrapper has no post-tile re-optimization pass.
     pub single_tile_reoptimize: bool,
     /// **dolphinRust-only, opt-in.** When set, derive `ntiles`/`n_parallel_tiles`
     /// from the grid size and available cores instead of the explicit values
@@ -329,15 +1014,20 @@ impl Default for TophuOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PreprocessOptions {
-    /// Adaptive-phase (Goldstein) filter exponent parameter.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// pre-unwrap Goldstein filtering is not implemented.
     pub alpha: f64,
-    /// Maximum radius (in pixels) to find scatterers during interpolation.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// pre-unwrap interpolation is not implemented.
     pub max_radius: usize,
-    /// Correlation threshold below which pixels are interpolated.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// pre-unwrap interpolation is not implemented.
     pub interpolation_cor_threshold: f64,
-    /// Similarity threshold below which pixels are interpolated.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// pre-unwrap interpolation is not implemented.
     pub interpolation_similarity_threshold: f64,
-    /// Zero out correlation at pixels that were interpolated.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// pre-unwrap interpolation is not implemented.
     pub zero_correlation_where_interpolating: bool,
 }
 
@@ -346,7 +1036,7 @@ impl Default for PreprocessOptions {
         Self {
             alpha: 0.5,
             max_radius: 51,
-            interpolation_cor_threshold: 0.25,
+            interpolation_cor_threshold: 0.3,
             interpolation_similarity_threshold: 0.3,
             zero_correlation_where_interpolating: false,
         }
@@ -358,11 +1048,14 @@ impl Default for PreprocessOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UnwrapOptions {
-    /// Run the unwrapping step after wrapped-phase estimation.
+    /// Dolphin YAML compatibility only; must remain `true` because the Rust
+    /// workflow always unwraps the interferogram network.
     pub run_unwrap: bool,
-    /// Run Goldstein filtering on the wrapped interferogram.
+    /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
+    /// Goldstein filtering is not implemented.
     pub run_goldstein: bool,
-    /// Run interpolation on the wrapped interferogram.
+    /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
+    /// interpolation is not implemented.
     pub run_interpolation: bool,
     /// Phase-unwrapping backend to dispatch to.
     pub unwrap_method: UnwrapMethod,
@@ -370,7 +1063,8 @@ pub struct UnwrapOptions {
     pub n_parallel_jobs: i64,
     /// Set wrapped phase/correlation to 0 where the mask is 0 before unwrapping.
     pub zero_where_masked: bool,
-    /// Goldstein-filter / interpolation preprocessing options.
+    /// Dolphin YAML compatibility container for unsupported pre-unwrap
+    /// filtering/interpolation options.
     pub preprocess_options: PreprocessOptions,
     /// SNAPHU subprocess options.
     pub snaphu_options: SnaphuOptions,
@@ -482,9 +1176,9 @@ pub struct CorrectionOptions {
     /// OPERA L4 tropospheric netCDF products (one per date). dolphinRust forward
     /// divergence (dolphin uses `dem_file` + RAiDER instead).
     pub troposphere_files: Vec<PathBuf>,
-    /// Line-of-sight geometry files for the correction computations. dolphin name
-    /// (carried for YAML round-trip; the delay projection uses
-    /// `incidence_angle_deg` when no geometry is resolved).
+    /// Line-of-sight geometry files resolved even in a geometry-only run and
+    /// used by correction computations when enabled. The delay projection uses
+    /// `incidence_angle_deg` when no geometry is resolved. dolphin name.
     pub geometry_files: Vec<PathBuf>,
     /// DEM file for tropospheric/topographic corrections (RAiDER path). dolphin name.
     pub dem_file: Option<PathBuf>,
@@ -539,15 +1233,18 @@ impl CorrectionOptions {
 pub struct OutputOptions {
     /// (x, y) strides (decimation factor) to apply while processing input.
     pub strides: Strides,
-    /// EPSG code of the output grid.
+    /// Optional bounded-run assertion that the source frame has this EPSG.
+    /// Output reprojection and missing-source-CRS fallback are not implemented.
     pub epsg: Option<u32>,
     /// Area of interest as [left, bottom, right, top] coordinates.
     pub bounds: Option<(f64, f64, f64, f64)>,
     /// EPSG code for the `bounds` coordinates.
     pub bounds_epsg: Option<u32>,
-    /// Add overviews to the output GeoTIFFs.
+    /// Dolphin YAML compatibility only; must remain at its default because the
+    /// COG writer owns overview generation.
     pub add_overviews: bool,
-    /// Overview levels to create (if `add_overviews`).
+    /// Dolphin YAML compatibility only; must remain at its default because the
+    /// COG writer owns overview generation.
     pub overview_levels: Vec<u32>,
 }
 
@@ -588,14 +1285,16 @@ pub enum ComputeBackend {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerSettings {
-    /// Use the GPU for processing (if available). dolphin parity; superseded by
-    /// `compute_backend` (kept so existing dolphin YAML deserializes unchanged).
+    /// Dolphin YAML compatibility only; must remain `false` because
+    /// `compute_backend` is the operational backend selector.
     pub gpu_enabled: bool,
     /// Compute backend selection for phase linking (`auto` / `cpu` / `gpu`).
     pub compute_backend: ComputeBackend,
-    /// Number of threads to use per worker.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// the Rust workflow does not set a per-worker thread environment.
     pub threads_per_worker: usize,
-    /// Number of spatial bursts to run in parallel for wrapped-phase estimation.
+    /// Dolphin YAML compatibility only; non-default values are rejected because
+    /// the Rust workflow does not schedule bursts through this field.
     pub n_parallel_bursts: usize,
     /// Size (rows, columns) of data blocks to load at a time.
     pub block_shape: (usize, usize),
@@ -623,13 +1322,16 @@ pub struct DisplacementWorkflow {
     pub cslc_file_list: Vec<PathBuf>,
     /// Output size/format/compression options.
     pub output_options: OutputOptions,
-    /// PS pixel-selection options.
+    /// Dolphin YAML compatibility container for unsupported PS update options.
     pub ps_options: PsOptions,
-    /// Existing amplitude-dispersion files (1 per SLC region) for PS update.
+    /// Dolphin YAML compatibility only; nonempty PS-update inputs are rejected.
     pub amplitude_dispersion_files: Vec<PathBuf>,
-    /// Existing amplitude-mean files (1 per SLC region) for PS update.
+    /// Dolphin YAML compatibility only; nonempty PS-update inputs are rejected.
     pub amplitude_mean_files: Vec<PathBuf>,
-    /// Layover/shadow binary masks (0 = layover/shadow, 1 = good pixel).
+    /// Single-band native-grid GTiff layover/shadow masks, one per active burst. Zero,
+    /// non-finite, raster nodata, and GDAL-invalid pixels are invalid; every
+    /// finite nonzero pixel is valid. Masks are resolved by OPERA burst ID and
+    /// applied before phase linking.
     pub layover_shadow_mask_files: Vec<PathBuf>,
     /// Phase-linking (wrapped-phase estimation) options.
     pub phase_linking: PhaseLinkingOptions,
@@ -647,7 +1349,8 @@ pub struct DisplacementWorkflow {
     pub work_directory: PathBuf,
     /// CPU/GPU and parallelism settings.
     pub worker_settings: WorkerSettings,
-    /// Path to the output log file (in addition to stderr).
+    /// Dolphin YAML compatibility only; the Rust CLI configures logging
+    /// independently and rejects a nonempty value.
     pub log_file: Option<PathBuf>,
 }
 
@@ -683,5 +1386,221 @@ impl DisplacementWorkflow {
     /// Serialize this workflow config to a YAML string.
     pub fn to_yaml(&self) -> Result<String> {
         serde_yaml::to_string(self).map_err(CoreError::from)
+    }
+
+    /// Reject modeled dolphin options whose non-default behavior is not implemented.
+    ///
+    /// Parsing and serialization intentionally remain permissive so a dolphin YAML
+    /// can round-trip. Workflow entry points call this guard before source or raster
+    /// I/O so compatibility-only values cannot be mistaken for operational settings.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::InvalidConfig`] naming the first unsupported full YAML
+    /// path, invalid backend choice, or config combination.
+    #[allow(clippy::too_many_lines)]
+    pub fn validate_supported_options(&self) -> Result<()> {
+        let defaults = Self::default();
+        if !matches!(
+            self.unwrap_options.unwrap_method,
+            UnwrapMethod::Native | UnwrapMethod::Snaphu | UnwrapMethod::Tophu
+        ) {
+            return Err(CoreError::InvalidConfig(format!(
+                "unwrap_options.unwrap_method {:?} is modeled for dolphin YAML compatibility but dolphinRust supports only native, snaphu, and tophu",
+                self.unwrap_options.unwrap_method
+            )));
+        }
+        match self.unwrap_options.unwrap_method {
+            UnwrapMethod::Native => {
+                ensure_compatibility_default(
+                    "unwrap_options.snaphu_options.init_method",
+                    &self.unwrap_options.snaphu_options.init_method,
+                    &defaults.unwrap_options.snaphu_options.init_method,
+                )?;
+                ensure_supported_choice(
+                    "unwrap_options.snaphu_options.cost",
+                    &self.unwrap_options.snaphu_options.cost,
+                    &["smooth", "defo"],
+                )?;
+            }
+            UnwrapMethod::Snaphu => {
+                ensure_supported_choice(
+                    "unwrap_options.snaphu_options.init_method",
+                    &self.unwrap_options.snaphu_options.init_method,
+                    &["mcf", "mst"],
+                )?;
+                ensure_supported_choice(
+                    "unwrap_options.snaphu_options.cost",
+                    &self.unwrap_options.snaphu_options.cost,
+                    &["smooth", "defo"],
+                )?;
+            }
+            UnwrapMethod::Tophu => {
+                ensure_supported_choice(
+                    "unwrap_options.tophu_options.init_method",
+                    &self.unwrap_options.tophu_options.init_method,
+                    &["mcf", "mst"],
+                )?;
+                ensure_supported_choice(
+                    "unwrap_options.tophu_options.cost",
+                    &self.unwrap_options.tophu_options.cost,
+                    &["smooth", "defo"],
+                )?;
+            }
+            UnwrapMethod::Icu
+            | UnwrapMethod::Phass
+            | UnwrapMethod::Spurt
+            | UnwrapMethod::Whirlwind => unreachable!("unsupported methods returned above"),
+        }
+        if self.output_options.epsg.is_some() && self.output_options.bounds.is_none() {
+            return Err(CoreError::InvalidConfig(
+                "output_options.epsg is supported only as a source-CRS consistency check when output_options.bounds is set; unbounded runs require sourced CSLC georeferencing".into(),
+            ));
+        }
+        if self.output_options.strides.y == 0 || self.output_options.strides.x == 0 {
+            return Err(CoreError::InvalidConfig(
+                "output_options.strides.y and output_options.strides.x must both be positive"
+                    .into(),
+            ));
+        }
+        if self.phase_linking.write_covariance_operator {
+            let source = &self.phase_linking.empirical_source_factor;
+            if source
+                .half_window
+                .y
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .is_none()
+                || source
+                    .half_window
+                    .x
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .is_none()
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.half_window support dimensions overflow usize".into(),
+                ));
+            }
+            if !(source.shrinkage_alpha.is_finite()
+                && 0.0 < source.shrinkage_alpha
+                && source.shrinkage_alpha <= 1.0)
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.shrinkage_alpha must be finite and in (0, 1]".into(),
+                ));
+            }
+            if !(source.relative_diagonal_floor.is_finite()
+                && 0.0 < source.relative_diagonal_floor
+                && source.relative_diagonal_floor <= 1.0)
+            {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.empirical_source_factor.relative_diagonal_floor must be finite and in (0, 1]".into(),
+                ));
+            }
+        }
+        if self.timeseries_options.write_posterior_uncertainty
+            && self.timeseries_options.method != TimeseriesMethod::L2
+        {
+            return Err(CoreError::InvalidConfig(
+                "timeseries_options.write_posterior_uncertainty requires timeseries_options.method: l2".into(),
+            ));
+        }
+        if self.timeseries_options.temporal_uncertainty.method
+            == TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
+        {
+            let temporal = &self.timeseries_options.temporal_uncertainty;
+            if temporal.evidence_directory.is_none() {
+                return Err(CoreError::InvalidConfig(
+                    "timeseries_options.temporal_uncertainty.evidence_directory is required for reml_covariance_parameter_adjusted_scalar".into(),
+                ));
+            }
+            if temporal.factor_directory.is_none() {
+                return Err(CoreError::InvalidConfig(
+                    "timeseries_options.temporal_uncertainty.factor_directory is required for reml_covariance_parameter_adjusted_scalar".into(),
+                ));
+            }
+            if self.timeseries_options.method != TimeseriesMethod::L2 {
+                return Err(CoreError::InvalidConfig(
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty requires timeseries_options.method: l2".into(),
+                ));
+            }
+            if !self.phase_linking.write_covariance_operator {
+                return Err(CoreError::InvalidConfig(
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty requires phase_linking.write_covariance_operator".into(),
+                ));
+            }
+            if self.timeseries_options.velocity_seasonal
+                || !self.timeseries_options.velocity_step_dates.is_empty()
+            {
+                return Err(CoreError::InvalidConfig(
+                    "reml_covariance_parameter_adjusted_scalar temporal uncertainty supports only the frozen linear temporal model".into(),
+                ));
+            }
+            if temporal.maximum_targets_per_block == 0
+                || temporal.block_id_read_cap_bytes == 0
+                || temporal.factor_block_read_cap_bytes == 0
+            {
+                return Err(CoreError::InvalidConfig(
+                    "temporal uncertainty memory and read caps must be positive".into(),
+                ));
+            }
+        }
+        require_compatibility_default!(
+            self,
+            defaults,
+            timeseries_options.correct_velocity_temporal_correlation
+        );
+        require_compatibility_default!(self, defaults, output_options.add_overviews);
+        require_compatibility_default!(self, defaults, output_options.overview_levels);
+        require_compatibility_default!(self, defaults, ps_options.amp_dispersion_threshold);
+        require_compatibility_default!(self, defaults, amplitude_dispersion_files);
+        require_compatibility_default!(self, defaults, amplitude_mean_files);
+        require_compatibility_default!(self, defaults, phase_linking.mask_input_ps);
+        require_compatibility_default!(self, defaults, phase_linking.baseline_lag);
+        require_compatibility_default!(self, defaults, unwrap_options.run_unwrap);
+        require_compatibility_default!(self, defaults, unwrap_options.run_goldstein);
+        require_compatibility_default!(self, defaults, unwrap_options.run_interpolation);
+        require_compatibility_default!(self, defaults, unwrap_options.preprocess_options.alpha);
+        require_compatibility_default!(
+            self,
+            defaults,
+            unwrap_options.preprocess_options.max_radius
+        );
+        require_compatibility_default!(
+            self,
+            defaults,
+            unwrap_options
+                .preprocess_options
+                .interpolation_cor_threshold
+        );
+        require_compatibility_default!(
+            self,
+            defaults,
+            unwrap_options
+                .preprocess_options
+                .interpolation_similarity_threshold
+        );
+        require_compatibility_default!(
+            self,
+            defaults,
+            unwrap_options
+                .preprocess_options
+                .zero_correlation_where_interpolating
+        );
+        require_compatibility_default!(
+            self,
+            defaults,
+            unwrap_options.snaphu_options.single_tile_reoptimize
+        );
+        require_compatibility_default!(self, defaults, timeseries_options.run_inversion);
+        require_compatibility_default!(self, defaults, timeseries_options.run_velocity);
+        require_compatibility_default!(self, defaults, timeseries_options.apply_mask_to_timeseries);
+        require_compatibility_default!(self, defaults, timeseries_options.block_shape);
+        require_compatibility_default!(self, defaults, timeseries_options.num_parallel_blocks);
+        require_compatibility_default!(self, defaults, worker_settings.gpu_enabled);
+        require_compatibility_default!(self, defaults, worker_settings.threads_per_worker);
+        require_compatibility_default!(self, defaults, worker_settings.n_parallel_bursts);
+        require_compatibility_default!(self, defaults, log_file);
+        Ok(())
     }
 }

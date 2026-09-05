@@ -9,7 +9,7 @@ date: **2026-06-16**. Reproduce with `validation/run.sh <speckle>`.
 | Component | Version | Role |
 |---|---|---|
 | Python `dolphin` | **0.35.0** (`e567e55`) | reference oracle (resolves Open question #1) |
-| Python `dolphin` | **0.42.0** | forward oracle — **only** for the v1.2.0 CRLB + closure layers (`oracle/.venv-v042`) |
+| Python `dolphin` | **0.42.0** | forward oracle — for the layers v0.35.0 predates: v1.2.0 CRLB + closure, and phase similarity (issue #100) (`oracle/.venv-v042`) |
 | dolphinRust | 1.0.0 | engine under test |
 | GDAL | 3.12.2 | raster I/O (both) |
 | HDF5 | 2.1.1 | CSLC read (both) |
@@ -71,6 +71,7 @@ dolphin v0.35.0 (`oracle/gen_*.py`). All green (`cargo test --workspace`, clippy
 | phase-linking EVD/EMI (`dolphin-phaselink`) | phaselink_contract | 7 | PASS (`\|⟨v,v_oracle⟩\|`>0.999, cov<1e-4) |
 | quality / temp_coh (`dolphin-phaselink`) | quality_contract | 6 | PASS |
 | CRLB σ + closure phase (`dolphin-phaselink`) | quality_v042_contract | 6 | PASS vs **v0.42.0** (σ + closure max \|Δ\| <1e-4; singular-Γ NaN matches) |
+| phase similarity (`dolphin-phaselink`) | similarity_contract | 7 | PASS vs **v0.42.0** (median/max max \|Δ\| <1e-5; neighbour offsets match exactly). Fixtures committed, so this gates in CI. |
 | SHP GLRT/KS (`dolphin-shp`) | shp_contract | 5 | PASS |
 | PS selection (`dolphin-ps`) | ps_contract | 4 | PASS |
 | ministack planner + sequential (`dolphin-stack`/`dolphin-workflows`) | planner_contract, sequential_contract | 3, 2 | PASS (incl. multi-ministack stitched temp_coh + concatenated CRLB/closure <1e-3 vs **v0.42.0**) |
@@ -1250,4 +1251,88 @@ Reproduce the four cases by varying `STRIDE_Y`, `STRIDE_X`, and `AVERAGE_COH` in
 ROWS=512 NSLC=16 ITERS=1 FUSED_ONLY=1 STRIDE_Y=3 STRIDE_X=6 AVERAGE_COH=1 \
   cargo run --release --example pl_bench -p dolphin-phaselink \
   --no-default-features --features no-gpu
+```
+
+## Velocity uncertainty contract correction (2026-08-23)
+
+The July/August sections that recommend an unweighted or over-determined posterior, describe
+that posterior as empirical, or apply the scalar effective-N correction contain superseded
+uncertainty interpretations. Their measured artifacts remain historical evidence.
+Interferograms share acquisition errors, so redundant edges do not add independent statistical
+observations. The sequential CRLB cube changes compressed ministack references without
+propagating their covariance or cross-date terms, so it is not a global per-date covariance
+matrix.
+
+The replacement is narrower:
+
+- deterministic corrections run before the final spatial reference;
+- acquisition 0 is treated as a structural gauge and excluded from stochastic fitting;
+- finite post-gauge dates are fit with unit relative precision;
+- enabling `write_velocity_uncertainty` therefore changes the point estimator as well as adding
+  evidence: the prior default is full-series stitched-CRLB-relative weighting with whole-pixel
+  unit fallback, while the enabled estimator is post-gauge unit-weighted. Estimator identity is
+  explicit and a consumer must compare both in a field canary before enabling it;
+- `velocity_sigma` is the independent-residual conditional slope SE from
+  `s^2 (X'X)^-1`, with `s^2 = SSE / (n_valid - 2)`;
+- exact-linear, rank-deficient, and zero-DOF fits retain any supported point estimate but report
+  the component unavailable;
+- missing post-gauge dates are excluded from the fit, classify cadence as `missing`, and disable
+  lag-1 diagnostics without automatically suppressing an otherwise supported IID component;
+- an uncertainty-enabled workflow rejects a missing or non-exact final spatial reference;
+- whole-frame and bounded automatic reference selection excludes mask-invalid or non-finite
+  displacement candidates;
+- lag-1 correlation, pair count, cadence, diagnostic inflation, and effective N are retained
+  without changing sigma;
+- the parameter-covariance diagonal under an independent-IFG error model and the stitched CRLB
+  remain quality/network diagnostics and carry no calibrated, empirical, corrected-temporal,
+  or total-uncertainty claim. Its spatial-reference propagation adds marginal target/reference
+  variances without their covariance and says so in artifact metadata.
+
+The analytic contracts cover closed-form slope SE, scale invariance of relative weights, no
+residual floor, gauge exclusion, exact final-reference abstention, CRLB invariance, cadence and
+missing-date states, negative raw correlation without deflation, bounded re-reference/refit,
+mask propagation, and output metadata. These are implementation contracts, not field
+calibration. dolphinRust #52 owns compressed-reference/cross-date covariance. #53 owns selection
+and preregistered coverage validation of any future temporal-covariance slope estimator.
+
+## Temporal covariance scorer /7 (2026-08-29)
+
+The frozen v5 temporal experiment remains a scientific no-go. Its preregistration, producer and
+scorer source, and no-go summary retain SHA-256 values `bf8a0cc9...`, `6684130b...`, and
+`0c885ac2...`. The v7 scorer uses a separate source identity. The v5 result remains frozen.
+
+`validation/score_temporal_covariance_synthetic_v7.py` provides three explicit modes:
+
+- `oracle_calibration` accepts the throwaway seed domain and produces a hash-bound receipt.
+- `candidate_evaluation` requires a passing calibration receipt, the same policy and producer
+  identities, and a verified disjoint seed-index range.
+- `forensic_v5` requires the frozen run manifest, run commit, and exact 24-cell, two-path,
+  1,050-seed schedule. It retains corrected diagnostic tables with certification and retroactive
+  certification disabled.
+
+`validation/temporal_covariance_scorer_policy_v7.json` is the sole certification-eligible policy.
+Other policies can produce diagnostic pass/fail receipts. They are excluded from calibration and
+candidate certification. The policy names the exact 24 scientific cells (`K=24`). It fixes
+familywise alpha at 0.05 and standardized bias tolerance at 0.05, then finds the minimum count from
+`K * 2 * P(T[n-1] > tolerance * sqrt(n)) <= alpha`. The minimum is 3,796 scored observations per
+cell. The throwaway contract uses exactly 5,000 attempts per cell. A count of 1,050 fails the
+count gate. Passing calibration checks the scorer instrument and oracle family.
+Temporal-estimator validation remains a separate, preregistered `candidate_evaluation` gate.
+
+Coverage, each method's 99 percent emission floor, and the 98 percent pairwise overlap floor use
+integer ratios. Each selected-versus-baseline row enforces both individual emission floors, uses
+its own emitted-seed intersection, and retains paired, selected-only, baseline-only, and neither
+counts.
+Candidate eligibility uses the selected-method cell rows and the baselines named in the policy.
+Other method rows remain diagnostic and are excluded from candidate eligibility.
+
+Every receipt retains compact cell, execution-path, and method rows with attempt and emission
+counts, bias moments, coverage counts, interval widths, interval scores, gate values, and failing
+gate names. It also binds the scorer source, certification-policy hash, source preregistration,
+run manifest, run commit, verified seed-index range, and calibration receipt where required.
+
+Run the deterministic contracts with:
+
+```sh
+python3 -m unittest validation.tests.test_temporal_covariance_scorer_v7
 ```

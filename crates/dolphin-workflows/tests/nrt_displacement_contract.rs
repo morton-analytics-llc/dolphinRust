@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use dolphin_core::config::DisplacementWorkflow;
+use dolphin_io::{read_cslc_shape, read_geotransform, write_raster};
 use dolphin_workflows::{run_displacement, run_displacement_resumable, update_displacement};
 use ndarray::{Array2, Array3};
 
@@ -68,12 +69,46 @@ fn georeferenced_config(label: &str) -> DisplacementWorkflow {
     cfg
 }
 
+fn configure_layover_shadow_mask(
+    cfg: &mut DisplacementWorkflow,
+    label: &str,
+) -> (PathBuf, Array2<u8>) {
+    let first_cslc = &cfg.cslc_file_list[0];
+    let subdataset = cfg.input_options.subdataset.as_deref().unwrap();
+    let shape = read_cslc_shape(first_cslc, subdataset).unwrap();
+    let geo = read_geotransform(first_cslc, subdataset).unwrap();
+    let mut values = Array2::from_elem(shape, 1_u8);
+    values
+        .slice_mut(ndarray::s![shape.0 - 3.., shape.1 - 3..])
+        .fill(0);
+    let path = cfg
+        .work_directory
+        .join(format!("layover_shadow_mask_{label}.tif"));
+    std::fs::create_dir_all(&cfg.work_directory).unwrap();
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    write_raster(
+        &path,
+        values.view(),
+        geo.geotransform,
+        Some(geo.epsg),
+        Some(0.0),
+    )
+    .unwrap();
+    cfg.layover_shadow_mask_files = vec![path.clone()];
+    (path, values)
+}
+
 fn max3(a: &Array3<f64>, b: &Array3<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim(), "layer shape mismatch");
     a.iter()
         .zip(b)
-        .filter(|(x, y)| x.is_finite() && y.is_finite())
-        .map(|(x, y)| (x - y).abs())
+        .map(|(x, y)| match (x.is_finite(), y.is_finite()) {
+            (true, true) => (x - y).abs(),
+            (false, false) => 0.0,
+            _ => panic!("layer finite/non-finite pattern mismatch: {x} vs {y}"),
+        })
         .fold(0.0, f64::max)
 }
 
@@ -81,8 +116,11 @@ fn max2(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim(), "layer shape mismatch");
     a.iter()
         .zip(b)
-        .filter(|(x, y)| x.is_finite() && y.is_finite())
-        .map(|(x, y)| (x - y).abs())
+        .map(|(x, y)| match (x.is_finite(), y.is_finite()) {
+            (true, true) => (x - y).abs(),
+            (false, false) => 0.0,
+            _ => panic!("layer finite/non-finite pattern mismatch: {x} vs {y}"),
+        })
         .fold(0.0, f64::max)
 }
 
@@ -97,8 +135,9 @@ fn incremental_displacement_matches_full_run() {
         eprintln!("skipping NRT displacement contract: no fixtures / snaphu");
         return;
     }
-    let base = georeferenced_config("incremental");
+    let mut base = georeferenced_config("incremental");
     assert!(base.cslc_file_list.len() >= 5, "fixture needs >=5 dates");
+    let (mask_path, mask_values) = configure_layover_shadow_mask(&mut base, "incremental");
 
     // Full run of the extended stack.
     let mut full_cfg = base.clone();
@@ -137,12 +176,51 @@ fn incremental_displacement_matches_full_run() {
         inc.reference_point, full.reference_point,
         "ref point matches"
     );
+    assert_eq!(inc.validity_mask, full.validity_mask, "validity mask");
+    assert!(
+        full.validity_mask.iter().any(|valid| !*valid),
+        "configured layover/shadow mask must invalidate output pixels"
+    );
     // Phase-linking is bit-identical and the downstream is deterministic (same
     // SNAPHU input → same output), so the products match to f64 round-off.
     assert!(dd < 1e-6, "displacement max|Δ| {dd}");
     assert!(dv < 1e-6, "velocity max|Δ| {dv}");
     assert!(dt < 1e-6, "temporal coherence max|Δ| {dt}");
     assert!(dc < 1e-6, "crlb max|Δ| {dc}");
+
+    // The persisted NRT state binds the native mask's path and valid-pixel
+    // content. Rewrite the same path, then append a nonexistent acquisition:
+    // the mask mutation must fail before the new CSLC is read.
+    let mut changed_mask = mask_values;
+    let last = (changed_mask.dim().0 - 1, changed_mask.dim().1 - 1);
+    changed_mask[last] = 1;
+    std::fs::remove_file(&mask_path).unwrap();
+    let geo = read_geotransform(
+        &init_cfg.cslc_file_list[0],
+        init_cfg.input_options.subdataset.as_deref().unwrap(),
+    )
+    .unwrap();
+    write_raster(
+        &mask_path,
+        changed_mask.view(),
+        geo.geotransform,
+        Some(geo.epsg),
+        Some(0.0),
+    )
+    .unwrap();
+    let mut changed_cfg = init_cfg.clone();
+    changed_cfg
+        .cslc_file_list
+        .push(changed_cfg.work_directory.join("cslc_20230118.h5"));
+    assert!(!changed_cfg.cslc_file_list.last().unwrap().exists());
+    let err = match update_displacement(&state, &changed_cfg) {
+        Ok(_) => panic!("expected a changed layover/shadow mask to be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        err.to_string().contains("valid-pixel content changed"),
+        "expected mask-content error before reading the missing CSLC, got: {err}"
+    );
 }
 
 /// An update that extends no burst (same file list) is rejected, not silently a
@@ -158,6 +236,7 @@ fn update_without_new_acquisitions_errors() {
     let mut cfg = georeferenced_config("noop");
     cfg.phase_linking.ministack_size = 2;
     cfg.work_directory = std::env::temp_dir().join("dolphinrust_nrt_noop");
+    configure_layover_shadow_mask(&mut cfg, "noop");
     cfg.cslc_file_list = cfg.cslc_file_list[..3].to_vec();
     let (_out, state) = run_displacement_resumable(&cfg).unwrap();
     let err = match update_displacement(&state, &cfg) {

@@ -1,5 +1,7 @@
 # Implementation plan: velocity scorer, v1.5.0, and atmospheric follow-up
 
+**Status:** complete 2026-09-03. T01-T04, T06, T07 implemented; T05 (GroundPulse submodule repin) landed separately - `../eo` pins v1.5.0 at `8a63fe2`.
+
 **Status:** approved for execution 2026-08-17.
 **Intake:** `md/intake/velocity-validation-release-atmosphere-2026-08-17.md`.
 **Order:** eo #419/#440 remains a separate operational incident; within this plan execute
@@ -28,8 +30,9 @@ the repository that will not own it.
   uncertainty semantics; #46's output policy is not yet in the changelog.
 - Workspace and internal crate versions remain `1.0.0`, which also feeds GroundPulse's
   reported Dolphin runtime identity. A tag alone would therefore be an incomplete release.
-- eo `origin/main` pins dolphinRust commit `fd107b7`. EO-359 is already closed. EO-316 is
-  open with a fresh production-replay criterion that the excluded EO-419/#440 incident blocks.
+- eo `origin/main` pins dolphinRust commit `fd107b7`. EO-359 is already closed. EO-316 was
+  closed as unnecessary as a separate tracker; EO-419 retains its fresh production-replay
+  criterion, with EO-440 as the current restart dependency.
 - The 52 matching OPERA L4 HRES objects total exactly 111,638,814,943 bytes in current CMR
   metadata. CMR advertises no server-side spatial subset. The existing Rust reader is
   horizontally windowed after local open; the 2018 frame maps to 6x5 source cells per height
@@ -93,8 +96,8 @@ the repository that will not own it.
   `git -C vendor/dolphinRust describe --exact-match --tags HEAD` to print `v1.5.0`.
 - Regenerate `crates/gp-dolphin/Cargo.lock`, run the worker identity/build checks, merge through
   green combined-tree CI, and monitor the post-merge workflow.
-- Do not close eo #316 or claim the tag is production-verified without the separate terminal
-  replay its live acceptance criteria require.
+- Do not reopen eo #316 or claim the tag is production-verified. EO-419 owns the separate
+  terminal replay and regression-residual provenance checks.
 
 ### R6 — one-number troposphere fetch decision (DR-TROPO-2018)
 
@@ -178,8 +181,8 @@ GitHub Release.
 
 **Files in eo:** `vendor/dolphinRust`, `crates/gp-dolphin/Cargo.lock` only unless an existing
 identity check requires a narrow generated receipt. Start from fresh `origin/main`, validate,
-open a ready PR, merge after green checks, and monitor post-merge Actions. Leave #316 open with
-the missing production-replay dependency stated.
+open a ready PR, merge after green checks, and monitor post-merge Actions. Record that #316 is
+already closed and that #419 retains the missing production-replay checks.
 
 ### T06 — land the no-fetch troposphere strategy
 
@@ -231,8 +234,8 @@ scripts/check-dolphin-build-identities.sh
 - v1.5.0 is a minor release because the range contains features and breaking output semantics.
 - The scorer exposes both disagreeing estimators and does not reconcile them.
 - EO-359 receives no action because it is already closed.
-- EO-316 remains open until its live production criterion is met; no issue state will imply a
-  replay that did not occur.
+- EO-316 receives no action because it is already closed as an unnecessary separate tracker;
+  EO-419 retains the production-replay criterion, and no pin/deploy state implies that replay.
 - #41 closes now because the live successor architecture excludes local dolphinRust code.
 - EO-419/#440 is the portfolio predecessor for production verification, but not an item in this
   plan.

@@ -19,7 +19,10 @@ import h5py
 import numpy as np
 from pyproj import Transformer
 
-from fetch_real import cohort_id, load_recipe, sha256_file
+if __package__:
+    from .fetch_real import cohort_id, load_recipe, sha256_file
+else:
+    from fetch_real import cohort_id, load_recipe, sha256_file
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "real_data"

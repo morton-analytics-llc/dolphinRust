@@ -1,0 +1,229 @@
+{
+  "schema": "dolphinrust.temporal_covariance.heldout_preregistration",
+  "schema_version": 1,
+  "cohort_id": "f53-06-outer-nonfresno-v1",
+  "status": "preregistered_metadata_only",
+  "outcomes_present": false,
+  "generation_id": "f53-06-v1",
+  "candidate_query": {
+    "query_digest": "dc4268d915af73dbab9d6cde90ffb8dbb5953d8df8841a0cd66d415fa534f74b",
+    "source": "catalog_metadata_only",
+    "required_fields": [
+      "burst_id",
+      "orbit_id",
+      "footprint_id",
+      "site_id",
+      "station_ids",
+      "date_start",
+      "date_end",
+      "epoch_count",
+      "metadata_hashes"
+    ],
+    "ordering": "candidate_id_lexical",
+    "bulk_fetch_allowed": false,
+    "outcome_fields_allowed": false,
+    "query": {
+      "source": "catalog_metadata_only",
+      "required_fields": ["burst_id", "orbit_id", "footprint_id", "site_id", "station_ids", "date_start", "date_end", "epoch_count", "metadata_hashes"],
+      "ordering": "candidate_id_lexical",
+      "bulk_fetch_allowed": false,
+      "outcome_fields_allowed": false
+    }
+  },
+  "exclusions": {
+    "site_ids": ["fresno"],
+    "station_ids": ["MMX1", "ICMX", "MXMX", "MXTM", "SSNX", "TNGF", "UJAL", "UNVA", "UTAC"],
+    "burst_ids": [
+      "T005_008704_IW1",
+      "T035_073270_IW1",
+      "T100_213486_IW2",
+      "T137_292316_IW3",
+      "T137_292329_IW1",
+      "T150_320250_IW3"
+    ],
+    "reason": "Fresno, MMX1, and the exposed five-burst/development data cannot enter the outer holdout"
+  },
+  "cluster_keys": ["burst_id", "orbit_id", "footprint_id", "site_id", "station_ids"],
+  "eligibility": {
+    "minimum_declared_epochs": 12,
+    "minimum_common_epochs": 12,
+    "strictly_increasing_dates": true,
+    "median_gap_days": [6, 18],
+    "maximum_gap_days": 36,
+    "same_frame": true,
+    "same_burst": true,
+    "station_pair_size": 2,
+    "pre_outcome_only": true
+  },
+  "attrition": {
+    "frozen_surplus_clusters": 20,
+    "replacement_allowed": true,
+    "replacement_policy": "primary_clusters_first_then_frozen_lexical_surplus_only",
+    "outcome_informed_replacement_allowed": false,
+    "allowed_codes": [
+      "insufficient_dates",
+      "unsupported_cadence",
+      "dates_not_strictly_increasing",
+      "difference_covariance_unavailable",
+      "difference_covariance_invalid",
+      "difference_covariance_uncalibrated",
+      "factor_identity_mismatch",
+      "gnss_solution_missing",
+      "gnss_covariance_missing",
+      "sourced_los_missing",
+      "sourced_los_invalid",
+      "gnss_los_projection_invalid",
+      "total_covariance_not_positive_definite",
+      "total_covariance_ill_conditioned",
+      "temporal_estimator_abstained"
+    ]
+  },
+  "power": {
+    "test": "one_sided_exact_cluster_binomial_noninferiority",
+    "familywise_alpha": 0.05,
+    "multiplicity": "holm_step_down_three_nominal_levels",
+    "holm_order": "ascending_p_value; stop after first non-rejection",
+    "planning_rule": "required_n_uses_the_worst_case_first_Holm_critical_value_familywise_alpha_divided_by_three",
+    "unacceptable_coverage_delta": 0.2,
+    "planning_coverage_delta": 0.05,
+    "minimum_power": 0.8,
+    "required_evaluable_clusters": {
+      "68": 96,
+      "90": 72,
+      "95": 62
+    },
+    "maximum_required_evaluable_clusters": 96
+  },
+  "field_scope": {
+    "estimand": "same_frame_insar_minus_gnss_station_pair_slope",
+    "levels": [68, 90, 95],
+    "target": 0.0,
+    "interval_center": "insar_slope_difference_minus_gnss_slope_difference",
+    "sensor_covariance": "independent_zero_cross_covariance",
+    "cluster_unit": "station_pair_burst_site",
+    "no_fresno": true
+  },
+  "factor_binding": {
+    "operation": "replay_reference_difference_covariance",
+    "input_operator": {
+      "method": "sequential_source_dag_v1",
+      "method_version": 1,
+      "schema_version": 1,
+      "artifact_hdf5": "phase_covariance_operator.h5",
+      "artifact_manifest": "phase_covariance_provenance.json",
+      "scope_calibration_status": "calibrated_scope_match"
+    },
+    "output_factor": {
+      "method": "reference_specific_influence_v1",
+      "method_version": 1,
+      "schema_version": 4,
+      "artifact_hdf5": "referenced_displacement_covariance_factor.h5",
+      "artifact_manifest": "referenced_displacement_covariance_provenance.json",
+      "calibration_status": "calibrated_scope_match"
+    },
+    "mode": "batch",
+    "reference_specific": true,
+    "stitched_burst_count": 1,
+    "marginal_rss_combination_allowed": false,
+    "scope_fields": [
+      "target_station_id", "control_station_id", "target_station_pixel", "control_station_pixel",
+      "schema_version", "method_version", "method", "calibration_scope",
+      "common_dates_sha256", "acquisition_days_sha256", "geotransform_sha256",
+      "window", "overlap", "distance", "reference_signature_sha256",
+      "source_replay_sha256", "l2_map_sha256", "mask_sha256", "source_model_sha256",
+      "effective_looks_sha256", "support_sha256", "correction_order_sha256",
+      "unwrap_branch_sha256", "burst_ownership_sha256", "runtime_resource_receipt_sha256",
+      "approximation_receipt_sha256", "resource_receipt_sha256", "review_receipt_sha256",
+      "method_manifest_sha256", "calibration_scope_sha256",
+      "burst_id", "grid_sha256", "units"
+    ]
+  },
+  "gnss_provenance": {
+    "coordinate_frame": "ENU",
+    "projection": "signed_ground_to_sensor_los_dot_enu",
+    "positive_direction": "toward_sensor",
+    "los_source": "run_specific_sourced_los_components",
+    "los_norm_tolerance": 0.00001,
+    "covariance_projection": "u_transpose_C_u",
+    "epoch_zero_reference_required": true,
+    "solution_outcome_blinded_at_freeze": true
+  },
+  "fixed_cube_binding": {
+    "contract_version": "fixed-cube-v1",
+    "velocity_estimator": "linear_post_gauge_unit_precision",
+    "inference_status": "conditional_only",
+    "geometry_source": "CSLC-S1-STATIC",
+    "geometry_provenance": "geometry_provenance.json",
+    "validity_mask_raster": "velocity_validity_mask.tif",
+    "displacement_units": "meters",
+    "reference_role": "control_station"
+  },
+  "estimator_binding": {
+    "binary": "temporal_covariance_batch",
+    "schema": "dolphinrust-temporal-covariance-batch/6",
+    "execution_path": "fixed_factor",
+    "method": "complete_refit_bootstrap",
+    "method_version": 1,
+    "baseline": "conditional_wls",
+    "bootstrap_replicates": 200,
+    "bootstrap_minimum_successes": 198,
+    "options": {
+      "reference_lag_days": 12.0,
+      "rho_min": 0.0,
+      "rho_max": 0.98,
+      "oracle_rho": 0.0,
+      "oracle_process_variance": 0.0,
+      "condition_limit": 1000000000000.0,
+      "minimum_dates": 12,
+      "bootstrap_replicates": 200,
+      "bootstrap_minimum_successes": 198,
+      "bootstrap_seed": 0,
+      "profile_max_expansions": 12,
+      "profile_max_iterations": 48,
+      "optimizer_max_iterations": 12,
+      "optimizer_tolerance": 0.0001,
+      "process_variance_min_ratio": 0.000001,
+      "process_variance_max_ratio": 1000000.0,
+      "minimum_profile_curvature": 0.000001,
+      "minimum_gap_days": 4.0,
+      "maximum_gap_days": 36.0
+    }
+  },
+  "execution": {
+    "run_plan_schema": "dolphinrust.temporal_covariance.heldout_run_plan/1",
+    "cluster_order": "all_primary_then_lexical_surplus_until_fill",
+    "result_directory": "validation/results/temporal_covariance/f53-06-v1",
+    "one_shot_ledger": "unblinding_ledger.json",
+    "scored_result": "temporal_covariance_heldout_result.json",
+    "resume_requires_exact_identity": true
+  },
+  "thresholds": {
+    "coverage_error_max": {
+      "68": 0.2,
+      "90": 0.2,
+      "95": 0.2
+    },
+    "proper_interval_score_must_improve": true,
+    "median_width_ratio_max": 2.0,
+    "minimum_emission_rate": 0.99
+  },
+  "receipt_hash_fields": [
+    "binary_sha256",
+    "scorer_sha256",
+    "preregistration_sha256",
+    "manifest_sha256",
+    "factor_scope_sha256",
+    "gnss_catalog_sha256",
+    "operator_sha256",
+    "operator_manifest_sha256",
+    "persisted_factor_sha256",
+    "persisted_factor_manifest_sha256",
+    "approximation_receipt_sha256",
+    "resource_receipt_sha256",
+    "calibration_scope_receipt_sha256",
+    "review_receipt_sha256"
+  ],
+  "emission_denominator": "primary_slots_plus_used_surplus_only",
+  "attrition_receipt_fields": ["attrited_primary_ids", "used_surplus_ids", "unused_surplus_ids", "reasons_by_cluster"],
+  "receipt_statuses": ["pass", "fail", "not_evaluable"]
+}

@@ -11,6 +11,7 @@ use dolphin_core::Strides;
 use dolphin_io::write_raster;
 use dolphin_workflows::{
     run_displacement, run_displacement_with_output_policy, DisplacementOutputPolicy,
+    VelocityEstimator,
 };
 use gdal::{Dataset, Metadata};
 use ndarray::{Array2, Array3};
@@ -89,6 +90,10 @@ fn end_to_end_displacement_matches_oracle() {
     let mut cfg = georeferenced_config("oracle");
     cfg.timeseries_options.use_coherence_weights = false;
     let out = run_displacement(&cfg).unwrap();
+    assert_eq!(
+        out.velocity_estimator,
+        VelocityEstimator::LinearFullSeriesUnitPrecision
+    );
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();
     let vel_o: Array2<f64> = ndarray_npy::read_npy(dir.join("disp_velocity.npy")).unwrap();
@@ -129,6 +134,55 @@ fn end_to_end_displacement_matches_oracle() {
         out.phase_linking_coherence.is_none(),
         "average coherence off by default"
     );
+}
+
+#[test]
+fn phase_similarity_raster_is_written_when_enabled() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping phase-similarity end-to-end: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg = georeferenced_config("phase_similarity");
+    cfg.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
+    cfg.phase_linking.write_phase_similarity = true;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_phase_similarity_e2e");
+    let out = run_displacement(&cfg).unwrap();
+
+    let similarity = out
+        .phase_similarity
+        .expect("write_phase_similarity enabled");
+    assert_eq!(similarity.dim(), out.temporal_coherence.dim());
+    // The metric is a mean cosine, so it is bounded on [-1, 1]; excluded pixels
+    // are NaN rather than an in-range sentinel that would read as real agreement.
+    assert!(similarity
+        .iter()
+        .all(|v| v.is_nan() || (-1.0..=1.0).contains(v)));
+    assert!(similarity.iter().any(|v| v.is_finite()), "all-NaN raster");
+    assert!(cfg.work_directory.join("phase_similarity.tif").exists());
+    assert_ne!(
+        similarity, out.temporal_coherence,
+        "spatial similarity and temporal coherence must be distinct metrics"
+    );
+}
+
+/// The layer is opt-in: nothing is computed or written unless it is enabled.
+#[test]
+fn phase_similarity_is_absent_by_default() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping phase-similarity default: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg = georeferenced_config("phase_similarity_off");
+    cfg.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_phase_similarity_off_e2e");
+    assert!(!cfg.phase_linking.write_phase_similarity);
+    let out = run_displacement(&cfg).unwrap();
+    assert!(out.phase_similarity.is_none());
+    assert!(!cfg.work_directory.join("phase_similarity.tif").exists());
 }
 
 #[test]
@@ -191,12 +245,20 @@ fn groundpulse_output_policy_preserves_arrays_and_emits_only_coherence() {
     assert_eq!(full_output.displacement, groundpulse_output.displacement);
     assert_eq!(full_output.velocity, groundpulse_output.velocity);
     assert_eq!(
+        full_output.velocity_estimator,
+        groundpulse_output.velocity_estimator
+    );
+    assert_eq!(
         full_output.velocity_mm_yr,
         groundpulse_output.velocity_mm_yr
     );
     assert_eq!(
         full_output.velocity_sigma,
         groundpulse_output.velocity_sigma
+    );
+    assert_eq!(
+        full_output.velocity_diagnostics,
+        groundpulse_output.velocity_diagnostics
     );
     assert_eq!(
         full_output.displacement_variance,
@@ -297,7 +359,8 @@ fn groundpulse_output_policy_preserves_arrays_and_emits_only_coherence() {
 }
 
 #[test]
-fn l2_uncertainty_products_are_opt_in_and_unit_aligned() {
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+fn l2_diagnostic_products_are_opt_in_and_unit_aligned() {
     let dir = fixtures();
     if !dir.join("disp_displacement.npy").exists() || !snaphu_available() {
         eprintln!("skipping uncertainty end-to-end: no fixtures / snaphu");
@@ -308,11 +371,26 @@ fn l2_uncertainty_products_are_opt_in_and_unit_aligned() {
     cfg.timeseries_options.write_posterior_uncertainty = true;
     cfg.timeseries_options.write_velocity_uncertainty = true;
     let out = run_displacement(&cfg).unwrap();
-    let variance = out.displacement_variance.expect("posterior variance");
-    let sigma = out.velocity_sigma.expect("velocity sigma");
+    assert_eq!(
+        out.velocity_estimator,
+        VelocityEstimator::LinearPostGaugeUnitPrecision
+    );
+    let variance = out
+        .displacement_variance
+        .expect("network parameter-covariance diagonal approximation");
+    let sigma = out
+        .velocity_sigma
+        .as_ref()
+        .expect("IID-conditional velocity component");
+    let diagnostics = out
+        .velocity_diagnostics
+        .as_ref()
+        .expect("velocity diagnostics");
     assert_eq!(variance.dim(), out.displacement.dim());
     assert_eq!(sigma.dim(), out.velocity.dim());
     assert!(variance.iter().any(|value| value.is_finite()));
+    assert_eq!(diagnostics.valid_date_count.dim(), out.velocity.dim());
+    assert_eq!(diagnostics.regression_dof.dim(), out.velocity.dim());
     assert!(cfg
         .work_directory
         .join("displacement_variance_00.tif")
@@ -331,9 +409,93 @@ fn l2_uncertainty_products_are_opt_in_and_unit_aligned() {
     assert!(out.timeseries_residual_rms.is_some());
     assert!(out.network_misclosure_rms.is_some());
     assert!(cfg.work_directory.join("velocity_sigma.tif").exists());
+    for name in [
+        "velocity_valid_date_count.tif",
+        "velocity_regression_rank.tif",
+        "velocity_regression_dof.tif",
+        "velocity_uncertainty_status.tif",
+        "velocity_lag1_rho.tif",
+        "velocity_correlation_pair_count.tif",
+        "velocity_cadence_status.tif",
+        "velocity_correlation_available.tif",
+        "velocity_diagnostic_inflation_factor.tif",
+        "velocity_diagnostic_effective_sample_size.tif",
+    ] {
+        assert!(cfg.work_directory.join(name).exists(), "missing {name}");
+    }
     assert!(cfg.work_directory.join("conncomp_00.tif").exists());
     let crlb = Dataset::open(cfg.work_directory.join("crlb_sigma_00.tif")).unwrap();
     assert_eq!(crlb.metadata_item("UNITTYPE", "").as_deref(), Some("rad"));
+    let velocity_sigma = Dataset::open(cfg.work_directory.join("velocity_sigma.tif")).unwrap();
+    let velocity_unit = if cfg.input_options.wavelength.is_some() {
+        "m/yr"
+    } else {
+        "rad/yr"
+    };
+    assert_eq!(
+        velocity_sigma.metadata_item("UNITTYPE", "").as_deref(),
+        Some(velocity_unit)
+    );
+    assert_eq!(
+        velocity_sigma
+            .metadata_item("UNCERTAINTY_COMPONENT", "")
+            .as_deref(),
+        Some("independent_residual_conditional")
+    );
+    assert_eq!(
+        velocity_sigma
+            .metadata_item("TEMPORAL_COVARIANCE", "")
+            .as_deref(),
+        Some("not_modeled")
+    );
+    assert_eq!(
+        velocity_sigma
+            .metadata_item("CALIBRATION_STATUS", "")
+            .as_deref(),
+        Some("uncalibrated_component")
+    );
+    let lag1 = Dataset::open(cfg.work_directory.join("velocity_lag1_rho.tif")).unwrap();
+    assert_eq!(
+        lag1.metadata_item("EVIDENCE_ROLE", "").as_deref(),
+        Some("diagnostic_only")
+    );
+    let status = Dataset::open(cfg.work_directory.join("velocity_uncertainty_status.tif")).unwrap();
+    assert!(status.rasterband(1).unwrap().no_data_value().is_none());
+    let network_variance =
+        Dataset::open(cfg.work_directory.join("displacement_variance_00.tif")).unwrap();
+    let variance_unit = if cfg.input_options.wavelength.is_some() {
+        "m^2"
+    } else {
+        "rad^2"
+    };
+    assert_eq!(
+        network_variance.metadata_item("UNITTYPE", "").as_deref(),
+        Some(variance_unit)
+    );
+    assert_eq!(
+        network_variance
+            .metadata_item("UNCERTAINTY_SCOPE", "")
+            .as_deref(),
+        Some("independent_ifg_parameter_covariance_diagonal_approximation")
+    );
+    assert_eq!(
+        network_variance
+            .metadata_item("IFG_ERROR_ASSUMPTION", "")
+            .as_deref(),
+        Some("independent")
+    );
+    assert_eq!(
+        network_variance
+            .metadata_item("CALIBRATION_STATUS", "")
+            .as_deref(),
+        Some("not_calibrated")
+    );
+    assert_eq!(
+        network_variance
+            .metadata_item("SPATIAL_COVARIANCE", "")
+            .as_deref(),
+        Some("target_reference_covariance_not_modeled")
+    );
 }
 
 /// Enabling the phase-bias correction (Michaelides 2022) runs end-to-end through
@@ -395,7 +557,6 @@ fn closure_layer_produced_when_enabled() {
 fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), label: &str) {
     let mut full = georeferenced_config(&format!("bounded_{label}"));
     full.output_options.strides = strides;
-    full.output_options.epsg = Some(32611);
     full.phase_linking.calc_average_coh = true;
     full.timeseries_options.reference_point =
         Some(((target.0 + target.1) / 2, (target.2 + target.3) / 2));
@@ -404,6 +565,7 @@ fn assert_bounded_case(strides: Strides, target: (usize, usize, usize, usize), l
     let gt = full_output.geotransform;
     let (row_start, row_stop, col_start, col_stop) = target;
     let mut bounded = full.clone();
+    bounded.output_options.epsg = Some(32611);
     bounded.output_options.bounds_epsg = Some(32611);
     bounded.output_options.bounds = Some((
         gt[0] + col_start as f64 * gt[1],

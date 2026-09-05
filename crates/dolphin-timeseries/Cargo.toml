@@ -15,10 +15,19 @@ readme = "README.md"
 dolphin-core.workspace = true
 ndarray.workspace = true
 faer.workspace = true
+pulp.workspace = true
 rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+statrs.workspace = true
 
 [dev-dependencies]
 ndarray-npy = { version = "0.9", default-features = false }
+dolphin-phaselink.workspace = true
+dolphin-workflows.workspace = true
+dolphin-io.workspace = true
+sha2.workspace = true
+libc = "0.2"
 
 [lints]
 workspace = true

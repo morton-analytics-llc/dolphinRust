@@ -1,0 +1,45 @@
+{
+  "schema": "dolphinrust-spatial-reference-covariance-contract/1",
+  "cases": [
+    {
+      "name": "independent",
+      "reference_output": 1,
+      "target_weights": [1.0, 0.0, 0.0],
+      "reference_weights": [0.0, 1.0, 0.0],
+      "expected_target_variance": 1.0,
+      "expected_reference_variance": 1.0,
+      "expected_cross_covariance": 0.0,
+      "expected_difference_variance": 2.0
+    },
+    {
+      "name": "positive",
+      "reference_output": 1,
+      "target_weights": [0.7071067811865476, 0.7071067811865476, 0.0],
+      "reference_weights": [0.7071067811865476, 0.0, 0.7071067811865476],
+      "expected_target_variance": 1.0,
+      "expected_reference_variance": 1.0,
+      "expected_cross_covariance": 0.5,
+      "expected_difference_variance": 1.0
+    },
+    {
+      "name": "negative",
+      "reference_output": 1,
+      "target_weights": [0.7071067811865476, 0.7071067811865476, 0.0],
+      "reference_weights": [-0.7071067811865476, 0.0, 0.7071067811865476],
+      "expected_target_variance": 1.0,
+      "expected_reference_variance": 1.0,
+      "expected_cross_covariance": -0.5,
+      "expected_difference_variance": 3.0
+    },
+    {
+      "name": "coincident",
+      "reference_output": 0,
+      "target_weights": [1.0, 0.0, 0.0],
+      "reference_weights": [1.0, 0.0, 0.0],
+      "expected_target_variance": 1.0,
+      "expected_reference_variance": 1.0,
+      "expected_cross_covariance": 1.0,
+      "expected_difference_variance": 0.0
+    }
+  ]
+}

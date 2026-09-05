@@ -99,20 +99,33 @@ cargo build --release
 # writes velocity.tif, temporal_coherence.tif, displacement_NN.tif (COGs) to work_directory
 # plus conncomp_NN.tif and crlb_sigma_NN.tif (CRLB σ, UNITTYPE=rad); optional products
 # include timeseries_residual_rms.tif (temporal fit residual) and velocity_sigma.tif;
-# L2 posterior output additionally writes displacement_variance_NN.tif and
+# L2 diagonal-network output additionally writes displacement_variance_NN.tif and
 # network_misclosure_rms.tif (SBAS network-inversion misclosure)
 ```
 
-The **CRLB σ** layer (`crlb_sigma`) is the per-pixel, per-date physical uncertainty (radians)
-of the phase-linking estimate, from the Fisher information of the coherence model — the input
-GroundPulse's `confidence_score` needs to weight a velocity by how well-determined it is. The
+The **CRLB σ** layer (`crlb_sigma`) is a per-ministack Fisher-information lower bound in
+radians. Sequential ministacks change compressed references without propagating reference or
+cross-date covariance, so the stitched cube is a phase-linking quality diagnostic rather than
+global per-date uncertainty and must not be used as calibrated GroundPulse confidence. The
 **closure-phase** layer (`closure_phase`, off by default) is the nearest-neighbour triplet
 non-closure diagnostic. Both are validated against a forward dolphin v0.42.0 oracle; see
 [docs/usage.md](docs/usage.md) §5 and [VALIDATION.md](VALIDATION.md).
 
+`phase_linking.write_covariance_operator: true` separately captures the implicit
+`sequential_source_dag_v1` replay operator as `phase_covariance_operator.h5`, with
+`phase_covariance_provenance.json` written last as its commit marker. The supported capture path
+is full-batch CPU/f64, Rect support, `AlwaysFirst`, output reference 0, and no phase-bias
+correction. It stores source-keyed replay state, not a dense date-by-date covariance cube. The
+CLI artifact has no proper-complex source model and is therefore marked
+`source_model_unavailable`; low-level replay requires a verified caller-supplied source resolver
+and factor model whose exact per-source numeric receipts match the artifact. Every artifact remains
+`uncalibrated` and
+`blocked_pending_issue_54_and_53`; GroundPulse output and resumable updates reject the option.
+
 L2 inversion uses CRLB-derived observation precision by default. Set
 `timeseries_options.use_coherence_weights: false` for legacy unweighted parity. Posterior
-and velocity uncertainty rasters are opt-in; posterior uncertainty is rejected for L1.
+and velocity uncertainty rasters are opt-in; the field named `write_posterior_uncertainty`
+emits an uncalibrated independent-IFG parameter-covariance diagonal and is rejected for L1.
 
 ## Quickstart — library
 

@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-cli"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-core"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "ndarray",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-corrections"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "dolphin-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-filtering"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-ingest"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "futures",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-io"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "gdal",
@@ -556,12 +556,13 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "num-complex",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "dolphin-phaselink"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "bytemuck",
  "dolphin-core",
@@ -572,13 +573,16 @@ dependencies = [
  "num-complex",
  "pollster",
  "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
  "tracing",
  "wgpu",
 ]
 
 [[package]]
 name = "dolphin-ps"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -589,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-shp"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "dolphin-phaselink",
@@ -602,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-stack"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "dolphin-core",
@@ -612,18 +616,27 @@ dependencies = [
 
 [[package]]
 name = "dolphin-timeseries"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
+ "dolphin-io",
+ "dolphin-phaselink",
+ "dolphin-workflows",
  "faer",
+ "libc",
  "ndarray",
  "ndarray-npy",
+ "pulp 0.18.22",
  "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "statrs",
 ]
 
 [[package]]
 name = "dolphin-unwrap"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "dolphin-core",
  "ndarray",
@@ -636,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "dolphin-workflows"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -652,6 +665,7 @@ dependencies = [
  "dolphin-timeseries",
  "dolphin-unwrap",
  "gdal",
+ "gdal-sys",
  "hdf5-metno",
  "libc",
  "ndarray",
@@ -661,6 +675,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
@@ -2918,6 +2933,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
