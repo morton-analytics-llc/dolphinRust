@@ -34,6 +34,73 @@ pub fn group_by_burst(files: &[PathBuf]) -> BTreeMap<String, Vec<usize>> {
     groups
 }
 
+/// Resolve verified spatial groups, rejecting partial or incompatible metadata.
+///
+/// # Errors
+/// Metadata must cover inputs exactly, preserve grids, and supply common ordered epochs.
+pub fn workflow_groups(
+    cfg: &dolphin_core::config::DisplacementWorkflow,
+) -> Result<BTreeMap<String, Vec<usize>>> {
+    use dolphin_core::config::InputType;
+    let metadata = &cfg.input_options.acquisition_metadata;
+    if metadata.is_empty() {
+        return Ok(group_by_burst(&cfg.cslc_file_list));
+    }
+    ensure!(
+        metadata.len() == cfg.cslc_file_list.len(),
+        "acquisition metadata must cover every input"
+    );
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, path) in cfg.cslc_file_list.iter().enumerate() {
+        let matching: Vec<_> = metadata.iter().filter(|m| m.path == *path).collect();
+        ensure!(
+            matching.len() == 1,
+            "each input needs exactly one acquisition metadata record"
+        );
+        let m = matching[0];
+        ensure!(
+            !m.spatial_group.is_empty() && !m.grid_id.is_empty(),
+            "spatial group and grid identity are required"
+        );
+        groups.entry(m.spatial_group.clone()).or_default().push(i);
+    }
+    ensure!(
+        cfg.input_options.input_type != InputType::NisarGslc || groups.len() == 1,
+        "NISAR requires one spatial group per run"
+    );
+    let mut common_dates = None;
+    for indices in groups.values() {
+        let records: Vec<_> = indices
+            .iter()
+            .map(|&i| {
+                metadata
+                    .iter()
+                    .find(|m| m.path == cfg.cslc_file_list[i])
+                    .ok_or_else(|| anyhow::anyhow!("missing acquisition metadata"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            records.iter().all(|m| m.grid_id == records[0].grid_id),
+            "spatial group changes grid identity"
+        );
+        let dates: Vec<_> = records.iter().map(|m| m.acquisition_utc).collect();
+        ensure!(
+            dates.windows(2).all(|w| w[0] < w[1]),
+            "acquisition UTC must be unique and increasing within each group"
+        );
+        let epoch_dates: Vec<_> = dates.iter().map(chrono::DateTime::date_naive).collect();
+        if let Some(expected) = &common_dates {
+            ensure!(
+                expected == &epoch_dates,
+                "spatial groups must share complete acquisition epochs"
+            );
+        } else {
+            common_dates = Some(epoch_dates);
+        }
+    }
+    Ok(groups)
+}
+
 /// Extract the `T###-######-IW#` burst id from a filename, if present.
 fn burst_id(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;

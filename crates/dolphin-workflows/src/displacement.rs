@@ -30,10 +30,10 @@ use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 
-use crate::burst::{burst_offset, frame_grid, group_by_burst, BurstGeo, FrameGrid};
+use crate::burst::{burst_offset, frame_grid, workflow_groups, BurstGeo, FrameGrid};
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::crop::{plan_bounds, BoundedPlan, BurstWindow};
-use crate::dates::{decimal_days, parse_date};
+use crate::dates::{acquisition_days, parse_date};
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
@@ -227,7 +227,7 @@ pub fn run_displacement_with_output_policy(
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     validate_uncertainty_options(cfg)?;
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
@@ -250,7 +250,7 @@ pub fn run_displacement_with_output_policy(
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
-/// inversion → reference → atmospheric corrections → velocity → write COGs.
+/// inversion → atmospheric corrections → reference → velocity → write COGs.
 /// Identical for a full run and an incremental update — both feed it the same
 /// per-burst phase-linking products, so both produce the same output.
 fn finish_displacement(
@@ -259,7 +259,7 @@ fn finish_displacement(
     crop: Option<&BoundedPlan>,
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     let days = bursts
         .first()
         .map(|b| b.days.clone())
@@ -321,20 +321,17 @@ fn finish_displacement(
             cfg.timeseries_options.correlation_threshold,
         )
     });
-    if let Some(point) = analysis_reference_point {
-        reference_to_point(&mut inversion.displacement, point);
-    }
-    // Atmospheric corrections subtract per-date delay from the inverted series,
-    // before velocity (opt-in; no-op when no correction files are configured).
     let date_files = first_burst_files(cfg, &groups);
     let corrections = timed("corrections", || {
-        apply_corrections(
-            &cfg.correction_options,
-            cfg.input_options.wavelength,
+        correct_and_reference(
+            cfg,
             &mut inversion.displacement,
             &date_files,
-            epsg.unwrap_or(0),
-            geotransform,
+            GeoInfo {
+                epsg: epsg.unwrap_or(0),
+                geotransform,
+            },
+            analysis_reference_point,
         )
     })?;
     let (velocity_model, fit) = frame_velocity(
@@ -445,6 +442,41 @@ fn invert_time_series(
     }
 }
 
+fn correct_and_reference(
+    cfg: &DisplacementWorkflow,
+    displacement: &mut Array3<f64>,
+    date_files: &[PathBuf],
+    geo: GeoInfo,
+    reference: Option<(usize, usize)>,
+) -> Result<CorrectionLayers> {
+    let mut options = cfg.correction_options.clone();
+    if !cfg.input_options.acquisition_metadata.is_empty() {
+        options.acquisition_utc = date_files
+            .iter()
+            .map(|path| {
+                cfg.input_options
+                    .acquisition_metadata
+                    .iter()
+                    .find(|m| m.path == *path)
+                    .map(|m| m.acquisition_utc)
+                    .context("missing verified acquisition UTC")
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+    let corrections = apply_corrections(
+        &options,
+        cfg.input_options.wavelength,
+        displacement,
+        date_files,
+        geo.epsg,
+        geo.geotransform,
+    )?;
+    if let Some(point) = reference {
+        reference_to_point(displacement, point);
+    }
+    Ok(corrections)
+}
+
 /// Weighted velocity and its one-sigma, applying the opt-in AR(1)
 /// temporal-correlation inflation when configured. The residual RMS is
 /// identical between the two branches (the correction rescales sigma, not the
@@ -495,7 +527,7 @@ struct VelocityFit {
 }
 
 /// The configured time-function model, with step dates resolved to decimal days
-/// from acquisition 0 — the same origin [`decimal_days`] gives the `days` the fit
+/// from acquisition 0 — the same origin [`acquisition_days`] gives the `days` the fit
 /// runs against. `date_files` is the first burst's files in date order.
 ///
 /// # Errors
@@ -514,7 +546,17 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
     let first = date_files
         .first()
         .context("velocity time-function model requires at least one acquisition")?;
-    let anchor = parse_date(first, &cfg.input_options.cslc_date_fmt)?;
+    let anchor = if cfg.input_options.acquisition_metadata.is_empty() {
+        parse_date(first, &cfg.input_options.cslc_date_fmt)?
+    } else {
+        cfg.input_options
+            .acquisition_metadata
+            .iter()
+            .find(|m| m.path == *first)
+            .context("missing acquisition UTC for velocity model")?
+            .acquisition_utc
+            .date_naive()
+    };
     let step_days = options
         .velocity_step_dates
         .iter()
@@ -1135,7 +1177,7 @@ fn link_one_burst(
     bounded: Option<BurstWindow>,
 ) -> Result<BurstLink> {
     let files = burst_files(cfg, idxs);
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+    let days = acquisition_days(&files, &cfg.input_options)
         .context("parsing acquisition dates from CSLC filenames")?;
     let subdataset = cfg
         .input_options
@@ -1660,7 +1702,7 @@ fn link_one_burst_resumable(
     burst_index: usize,
 ) -> Result<(BurstLink, SequentialState, BlockIndices)> {
     let files = burst_files(cfg, idxs);
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+    let days = acquisition_days(&files, &cfg.input_options)
         .context("parsing acquisition dates from CSLC filenames")?;
     let subdataset = cfg
         .input_options
@@ -1733,7 +1775,7 @@ pub fn run_displacement_resumable(
 ) -> Result<(DisplacementOutput, DisplacementState)> {
     validate_uncertainty_options(cfg)?;
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
@@ -1796,7 +1838,7 @@ pub fn update_displacement(
         return run_displacement_resumable(cfg);
     }
     let engine = ComputeEngine::new(cfg.worker_settings.compute_backend);
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     let layouts = source_layouts(cfg, &groups)?;
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
@@ -1868,7 +1910,7 @@ fn update_one_burst(
     let (out, seq) =
         update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine)
             .map_err(anyhow::Error::msg)?;
-    let days = decimal_days(&files, &cfg.input_options.cslc_date_fmt)
+    let days = acquisition_days(&files, &cfg.input_options)
         .context("parsing acquisition dates from CSLC filenames")?;
     let mut link = burst_link(
         cfg,
@@ -2629,7 +2671,8 @@ fn write_outputs(
 }
 
 /// The first burst's input files in date order (the dates the series is built on),
-/// used to time-stamp the IONEX lookup. Mirrors how `days` is taken from the first
+/// used to time-stamp frame corrections. For a multi-burst mosaic this retains
+/// the reference burst timing approximation. Mirrors how `days` is taken from the first
 /// burst; `groups` is a `BTreeMap`, so `.values().next()` is the first burst.
 fn first_burst_files(
     cfg: &DisplacementWorkflow,
@@ -3585,6 +3628,67 @@ mod tests {
             HalfWindow { y: 2, x: 4 },
             (18, 18),
         );
+    }
+
+    #[test]
+    fn atmospheric_correction_preserves_reference_and_known_velocity() {
+        for wavelength in [SENTINEL1_WAVELENGTH_M, 0.238403545] {
+            let dir =
+                std::env::temp_dir().join(format!("dolphin_reference_atmosphere_{wavelength}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let gt = [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0];
+            let mut cfg = DisplacementWorkflow::default();
+            cfg.input_options.wavelength = Some(wavelength);
+            cfg.correction_options.incidence_angle_deg = 0.0;
+            cfg.correction_options.troposphere_variable = "Band1".into();
+            let days = [0.0, 12.0, 24.0];
+            for t in 0..3 {
+                let path = dir.join(format!("delay_{t}.nc"));
+                let raster = dir.join(format!("delay_{t}.tif"));
+                let delay =
+                    Array2::from_shape_fn((3, 3), |(_, c)| 0.01 * t as f64 * (1.0 + c as f64));
+                write_raster(&raster, delay.view(), gt, Some(32611), None).unwrap();
+                let src = gdal::Dataset::open(&raster).unwrap();
+                src.create_copy(
+                    &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
+                    &path,
+                    &Default::default(),
+                )
+                .unwrap();
+                cfg.correction_options.troposphere_files.push(path);
+            }
+            let scale = -4.0 * std::f64::consts::PI / wavelength;
+            let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, _, c)| {
+                (0.008 * c as f64 * days[t + 1] / 365.25 + 0.01 * (t + 1) as f64 * (1.0 + c as f64))
+                    * scale
+            });
+            correct_and_reference(
+                &cfg,
+                &mut disp,
+                &[],
+                GeoInfo {
+                    epsg: 32611,
+                    geotransform: gt,
+                },
+                Some((1, 0)),
+            )
+            .unwrap();
+            assert!(disp
+                .slice(ndarray::s![.., 1, 0])
+                .iter()
+                .all(|v| v.abs() < 1e-12));
+            let fit = fit_velocity(
+                &cfg,
+                disp.view(),
+                &days,
+                Some(&Array3::from_elem((3, 3, 3), 1.0)),
+                &VelocityModel::default(),
+            )
+            .unwrap();
+            assert!((fit.velocity[(1, 2)] / scale - 0.016).abs() < 1e-8);
+            assert!(fit.residual_rms.unwrap().iter().all(|r| r.abs() < 1e-8));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// Contract: a noise-free phase series carrying a known LOS rate is recovered

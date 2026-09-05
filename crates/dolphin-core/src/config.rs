@@ -410,10 +410,25 @@ pub enum InputType {
     NisarGslc,
 }
 
-/// Input granule discovery. dolphin `InputOptions`.
+/// Verified acquisition identity independent of staged filenames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquisitionMetadata {
+    /// Local immutable input path.
+    pub path: PathBuf,
+    /// Verified acquisition time in UTC.
+    pub acquisition_utc: chrono::DateTime<chrono::Utc>,
+    /// Burst or frame, including orbit, frequency, and polarization identity.
+    pub spatial_group: String,
+    /// Stable source grid identity within this spatial group.
+    pub grid_id: String,
+}
+
+/// Input reader and verified acquisition metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputOptions {
+    /// Complete metadata for the input list; empty retains legacy filename parsing.
+    pub acquisition_metadata: Vec<AcquisitionMetadata>,
     /// Input-product reader to use (OPERA CSLC vs NISAR GSLC). Forward
     /// divergence from dolphin v0.35.0 (see [`InputType`]).
     pub input_type: InputType,
@@ -431,6 +446,7 @@ impl Default for InputOptions {
     fn default() -> Self {
         Self {
             input_type: InputType::default(),
+            acquisition_metadata: Vec::new(),
             subdataset: None,
             cslc_date_fmt: "%Y%m%d".into(),
             wavelength: None,
@@ -451,6 +467,12 @@ impl Default for InputOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CorrectionOptions {
+    /// Verified UTC in acquisition order; empty retains legacy filename time parsing.
+    pub acquisition_utc: Vec<chrono::DateTime<chrono::Utc>>,
+    /// NISAR radarGrid LOS cube group; absent uses OPERA STATIC geometry.
+    pub nisar_geometry_group: Option<String>,
+    /// DEM of ellipsoidal heights in meters for NISAR radarGrid interpolation.
+    pub nisar_ellipsoidal_dem_file: Option<PathBuf>,
     /// GNSS-derived IONEX TEC maps for ionospheric correction (one per date).
     /// Source: <https://cddis.nasa.gov/archive/gnss/products/ionex/>. dolphin name.
     pub ionosphere_files: Vec<PathBuf>,
@@ -483,6 +505,9 @@ pub struct CorrectionOptions {
 impl Default for CorrectionOptions {
     fn default() -> Self {
         Self {
+            acquisition_utc: Vec::new(),
+            nisar_geometry_group: None,
+            nisar_ellipsoidal_dem_file: None,
             ionosphere_files: Vec::new(),
             troposphere_files: Vec::new(),
             geometry_files: Vec::new(),

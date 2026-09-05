@@ -57,6 +57,41 @@ pub fn decimal_days(paths: &[PathBuf], fmt: &str) -> Result<Vec<f64>> {
         .collect())
 }
 
+/// Acquisition baselines using verified UTC, retaining filename dates for legacy configs.
+///
+/// # Errors
+/// Returns an error for missing or duplicate metadata or an empty input list.
+pub fn acquisition_days(
+    paths: &[PathBuf],
+    opts: &dolphin_core::config::InputOptions,
+) -> Result<Vec<f64>> {
+    if opts.acquisition_metadata.is_empty() {
+        return decimal_days(paths, &opts.cslc_date_fmt);
+    }
+    let dates = paths
+        .iter()
+        .map(|path| {
+            let records: Vec<_> = opts
+                .acquisition_metadata
+                .iter()
+                .filter(|m| m.path == *path)
+                .collect();
+            anyhow::ensure!(
+                records.len() == 1,
+                "input needs exactly one acquisition UTC record"
+            );
+            Ok(records[0].acquisition_utc)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = dates
+        .first()
+        .ok_or_else(|| anyhow!("empty cslc_file_list"))?;
+    Ok(dates
+        .iter()
+        .map(|d| (*d - *first).num_milliseconds() as f64 / 86_400_000.0)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
