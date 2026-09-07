@@ -56,6 +56,8 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "phase_linking.write_crlb",
     "phase_linking.write_closure_phase",
     "phase_linking.calc_average_coh",
+    "phase_linking.write_phase_similarity",
+    "phase_linking.phase_similarity_search_radius",
     "phase_linking.correct_phase_bias",
     "interferogram_network.reference_idx",
     "interferogram_network.max_bandwidth",
@@ -102,10 +104,15 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "unwrap_options.preprocess_options",
     "unwrap_options.snaphu_options",
     "unwrap_options.tophu_options",
+    "input_options.apply_native_input_masks",
+    "input_options.acquisition_metadata",
     "input_options.input_type",
     "input_options.subdataset",
     "input_options.cslc_date_fmt",
     "input_options.wavelength",
+    "correction_options.acquisition_utc",
+    "correction_options.nisar_geometry_group",
+    "correction_options.nisar_ellipsoidal_dem_file",
     "correction_options.ionosphere_files",
     "correction_options.troposphere_files",
     "correction_options.geometry_files",
@@ -184,9 +191,23 @@ fn audit_input(value: InputOptions, paths: &mut Vec<&'static str>) {
         InputOptions,
         paths,
         "input_options.",
-        [input_type, subdataset, cslc_date_fmt, wavelength,]
+        [
+            apply_native_input_masks,
+            acquisition_metadata,
+            input_type,
+            subdataset,
+            cslc_date_fmt,
+            wavelength,
+        ]
     );
-    let _ = (input_type, subdataset, cslc_date_fmt, wavelength);
+    let _ = (
+        apply_native_input_masks,
+        acquisition_metadata,
+        input_type,
+        subdataset,
+        cslc_date_fmt,
+        wavelength,
+    );
 }
 
 fn audit_output(value: OutputOptions, paths: &mut Vec<&'static str>) {
@@ -249,6 +270,8 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
             write_crlb,
             write_closure_phase,
             calc_average_coh,
+            write_phase_similarity,
+            phase_similarity_search_radius,
             correct_phase_bias,
         ]
     );
@@ -269,6 +292,8 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
         write_crlb,
         write_closure_phase,
         calc_average_coh,
+        write_phase_similarity,
+        phase_similarity_search_radius,
         correct_phase_bias,
     );
     audit_fields!(
@@ -436,6 +461,9 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
         paths,
         "correction_options.",
         [
+            acquisition_utc,
+            nisar_geometry_group,
+            nisar_ellipsoidal_dem_file,
             ionosphere_files,
             troposphere_files,
             geometry_files,
@@ -446,6 +474,9 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
         ]
     );
     let _ = (
+        acquisition_utc,
+        nisar_geometry_group,
+        nisar_ellipsoidal_dem_file,
         ionosphere_files,
         troposphere_files,
         geometry_files,

@@ -178,7 +178,15 @@ def generate_base_config(cslcs: list[Path], path: Path, work_directory: Path) ->
         str(path),
     ]
     subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
-    return load_yaml(path)
+    base = load_yaml(path)
+    # `dolphin config` writes threads_per_worker from its own host core count.
+    # dolphinRust models the field for YAML compatibility only and rejects any
+    # value but 1, threading its own work through rayon, so an unnormalized
+    # config fails the run outright. Rewriting it changes no dolphinRust
+    # behaviour.
+    base.setdefault("worker_settings", {})["threads_per_worker"] = 1
+    write_yaml(path, base)
+    return base
 
 
 def apply_network_override(base: dict[str, Any], max_bandwidth: int | None) -> None:

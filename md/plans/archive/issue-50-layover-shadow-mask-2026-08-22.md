@@ -1,5 +1,7 @@
 # Implementation plan: issue #50 layover/shadow masks and config accountability
 
+**Archived:** 2026-09-03. PR #51 merged as `be07c21`; issue #50 is closed. The status line below predates that merge.
+
 **Status:** implementation complete in unmerged PR #51; local and GitHub CI verification green
 2026-08-22.
 **Intake:** `md/intake/issue-50-layover-shadow-mask-2026-08-22.md`.

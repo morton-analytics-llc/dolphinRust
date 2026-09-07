@@ -73,13 +73,23 @@ pub enum EstimatorJvpError {
     NonFiniteDerivative,
 }
 
+/// Prepared branch state, carrying the EMI inverse in the variant that owns it so an
+/// `Emi` linearization without one is unrepresentable (issue #98).
+enum PreparedBranch {
+    Evd,
+    Emi {
+        beta: f64,
+        zero_correlation_threshold: f64,
+        gamma_inverse: Mat<f64>,
+    },
+}
+
 /// Fixed estimator state prepared once and reused across coherence directions.
 pub struct PhaseAngleLinearization {
     coherence: Array2<Cf64>,
-    branch: FixedEstimatorBranch,
+    branch: PreparedBranch,
     reference_idx: usize,
     branch_tolerance: f64,
-    gamma_inverse: Option<Mat<f64>>,
     values: Vec<f64>,
     vectors: Mat<c64>,
     selected: usize,
@@ -109,10 +119,10 @@ impl PhaseAngleLinearization {
             return Err(EstimatorJvpError::NonFiniteState);
         }
         let coherence = coherence.to_owned();
-        let (matrix, gamma_inverse) = match branch {
+        let (matrix, prepared_branch) = match branch {
             FixedEstimatorBranch::Evd => (
                 prepare_evd_matrix(coherence.view(), branch_tolerance)?,
-                None,
+                PreparedBranch::Evd,
             ),
             FixedEstimatorBranch::Emi {
                 beta,
@@ -124,7 +134,14 @@ impl PhaseAngleLinearization {
                     zero_correlation_threshold,
                     branch_tolerance,
                 )?;
-                (matrix, Some(gamma_inverse))
+                (
+                    matrix,
+                    PreparedBranch::Emi {
+                        beta,
+                        zero_correlation_threshold,
+                        gamma_inverse,
+                    },
+                )
             }
         };
         let (values, vectors) = selfadjoint_eig(&matrix);
@@ -141,10 +158,9 @@ impl PhaseAngleLinearization {
         }
         Ok(Self {
             coherence,
-            branch,
+            branch: prepared_branch,
             reference_idx,
             branch_tolerance,
-            gamma_inverse,
             values,
             vectors,
             selected,
@@ -163,24 +179,23 @@ impl PhaseAngleLinearization {
         if delta_coherence.iter().any(|value| !value.is_finite()) {
             return Err(EstimatorJvpError::NonFiniteState);
         }
-        let delta_matrix = match self.branch {
-            FixedEstimatorBranch::Evd => evd_delta_matrix(
+        let delta_matrix = match &self.branch {
+            PreparedBranch::Evd => evd_delta_matrix(
                 self.coherence.view(),
                 delta_coherence,
                 self.branch_tolerance,
             )?,
-            FixedEstimatorBranch::Emi {
+            PreparedBranch::Emi {
                 beta,
                 zero_correlation_threshold,
+                gamma_inverse,
             } => emi_delta_matrix(
                 self.coherence.view(),
                 delta_coherence,
-                beta,
-                zero_correlation_threshold,
+                *beta,
+                *zero_correlation_threshold,
                 self.branch_tolerance,
-                self.gamma_inverse
-                    .as_ref()
-                    .expect("prepared EMI linearization has an inverse"),
+                gamma_inverse,
             )?,
         };
         let mut delta_vector = Array1::zeros(self.coherence.nrows());

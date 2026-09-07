@@ -20,6 +20,7 @@ pub mod fused;
 pub mod gpu;
 pub mod phasebias;
 pub mod quality;
+pub mod similarity;
 pub mod source_influence;
 pub mod source_model;
 pub mod spatial_covariance;
@@ -50,6 +51,7 @@ pub use quality::{
     estimate_average_coherence, estimate_temp_coh, CompressionJvp, CompressionJvpError,
     CompressionReplayGrid, CompressionReplayStatus,
 };
+pub use similarity::{circle_offsets, estimate_phase_similarity, PhaseSimilaritySummary};
 pub use source_influence::{
     InfluenceDag, InfluenceError, InfluenceNode, NodeId, ParentEdge, ProperComplexFactor,
     SourceDefinition, SourceEdge, SourceId, SourceModelError, TemporalCoordinate,

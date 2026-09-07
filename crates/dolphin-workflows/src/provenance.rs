@@ -32,6 +32,7 @@ pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
 /// `temporal_coherence.tif`; relative to `work_directory`.
 const PHASE_LINKING_COHERENCE_KEY: &str = "phase_linking_coherence.tif";
+const PHASE_SIMILARITY_KEY: &str = "phase_similarity.tif";
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 const HEADING_SPREAD_GATE_DEG: f64 = 1.0;
@@ -78,6 +79,9 @@ pub struct GeometryProvenance {
     /// Artifact key of the phase-linking coherence raster, relative to
     /// `work_directory`; absent when `calc_average_coh` is disabled.
     pub phase_linking_coherence: Option<String>,
+    /// Artifact key of the spatial phase-similarity raster, relative to
+    /// `work_directory`; absent when `write_phase_similarity` is disabled.
+    pub phase_similarity: Option<String>,
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
@@ -242,6 +246,10 @@ pub fn assemble_geometry_provenance_with_coverage(
             .phase_linking
             .calc_average_coh
             .then(|| PHASE_LINKING_COHERENCE_KEY.into()),
+        phase_similarity: cfg
+            .phase_linking
+            .write_phase_similarity
+            .then(|| PHASE_SIMILARITY_KEY.into()),
         decomposition_geometry_complete: orbit_direction.is_some()
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()
@@ -629,20 +637,36 @@ fn incidence(
     }
     // A wrong-track/wrong-pass STATIC yields plausible incidence (up is
     // sign-insensitive) — cross-check its identity against the CSLC stack.
-    let consistency_note = match cslc.as_ref() {
-        Some(granules) => {
-            if let Err(reason) =
-                verify_static_consistency(&cfg.correction_options.geometry_files, granules)
-            {
-                return mark_absent(fields, FIELD, &reason);
-            }
-            None
+    let consistency_note = if cfg.input_options.input_type == InputType::NisarGslc {
+        if cfg
+            .correction_options
+            .geometry_files
+            .iter()
+            .any(|p| !cfg.cslc_file_list.contains(p))
+        {
+            return mark_absent(
+                fields,
+                FIELD,
+                "NISAR geometry must come from the immutable GSLC inputs",
+            );
         }
-        None => Some(
-            "consistency with CSLC stack unverified (CSLC identification unreadable); \
+        None
+    } else {
+        match cslc.as_ref() {
+            Some(granules) => {
+                if let Err(reason) =
+                    verify_static_consistency(&cfg.correction_options.geometry_files, granules)
+                {
+                    return mark_absent(fields, FIELD, &reason);
+                }
+                None
+            }
+            None => Some(
+                "consistency with CSLC stack unverified (CSLC identification unreadable); \
              decomposition gate is closed via the CSLC-derived fields anyway"
-                .to_string(),
-        ),
+                    .to_string(),
+            ),
+        }
     };
     let spread_note = (stats.std_deg > INCIDENCE_SPREAD_GATE_DEG).then(|| {
         format!(
@@ -664,7 +688,19 @@ fn incidence(
                 .iter()
                 .map(|p| granule_name(p))
                 .collect(),
-            source_keys: vec!["/data/los_east".into(), "/data/los_north".into()],
+            source_keys: cfg
+                .correction_options
+                .nisar_geometry_group
+                .as_ref()
+                .map_or_else(
+                    || vec!["/data/los_east".into(), "/data/los_north".into()],
+                    |group| {
+                        vec![
+                            format!("{group}/losUnitVectorX"),
+                            format!("{group}/losUnitVectorY"),
+                        ]
+                    },
+                ),
             method: "mean/std/min/max over finite pixels of degrees(acos(los_up)), \
                  up = +sqrt(1−e²−n²), on the resolved output grid"
                 .into(),

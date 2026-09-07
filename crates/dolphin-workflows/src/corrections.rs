@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use dolphin_core::config::CorrectionOptions;
 use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
@@ -72,6 +72,10 @@ pub fn apply_corrections(
     let wavelength =
         wavelength.context("atmospheric corrections require input_options.wavelength")?;
     let n_dates = bands + 1;
+    ensure!(
+        opts.acquisition_utc.is_empty() || opts.acquisition_utc.len() == n_dates,
+        "explicit acquisition UTC must cover every correction epoch"
+    );
     let freq = SPEED_OF_LIGHT / wavelength;
     let los = los_geometry.as_ref();
 
@@ -141,8 +145,19 @@ fn resolve_geometry(
         .geometry_files
         .iter()
         .map(|p| {
-            dolphin_io::geometry::read_los_layers_for_grid(p, "/data", target_geo, shape)
-                .context("reading bounded CSLC-S1-STATIC geometry")
+            if let Some(group) = &opts.nisar_geometry_group {
+                dolphin_io::geometry::read_nisar_los_layers_for_grid(
+                    p,
+                    group,
+                    target_geo,
+                    shape,
+                    opts.nisar_ellipsoidal_dem_file.as_deref(),
+                )
+                .context("reading bounded NISAR LOS cube geometry")
+            } else {
+                dolphin_io::geometry::read_los_layers_for_grid(p, "/data", target_geo, shape)
+                    .context("reading bounded CSLC-S1-STATIC geometry")
+            }
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
@@ -193,14 +208,19 @@ fn build_solid_earth_tide(
     let lonlat = LonLatGrid::from_corners(corners, rows, cols);
     let mut out = Array3::<f64>::zeros((date_files.len(), rows, cols));
     for (t, path) in date_files.iter().enumerate() {
-        let utc = acq_utc_datetime(path).with_context(|| {
-            format!(
-                "correction_options.solid_earth_tide needs each granule's acquisition time; \
+        let utc = opts
+            .acquisition_utc
+            .get(t)
+            .map(chrono::DateTime::naive_utc)
+            .or_else(|| acq_utc_datetime(path))
+            .with_context(|| {
+                format!(
+                    "correction_options.solid_earth_tide needs each granule's acquisition time; \
                  {} carries no YYYYMMDDThhmmss token. The tide is semidiurnal, so defaulting \
                  the time would be wrong by up to half a cycle",
-                path.display()
-            )
-        })?;
+                    path.display()
+                )
+            })?;
         out.index_axis_mut(Axis(0), t)
             .assign(&tide_range_delay_grid(utc, &lonlat, los));
     }
@@ -243,7 +263,13 @@ fn build_ionosphere(
     let inc_grid = los.map(LosGeometry::incidence_deg);
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, ionex_path) in opts.ionosphere_files.iter().enumerate() {
-        let utc_sec = date_files.get(t).map_or(43200.0, |p| acq_utc_sec(p));
+        let utc_sec = opts.acquisition_utc.get(t).map_or_else(
+            || date_files.get(t).map_or(43200.0, |p| acq_utc_sec(p)),
+            |utc| {
+                chrono::Timelike::num_seconds_from_midnight(utc) as f64
+                    + f64::from(chrono::Timelike::nanosecond(utc)) / 1e9
+            },
+        );
         let content = std::fs::read_to_string(ionex_path)
             .with_context(|| format!("reading IONEX {}", ionex_path.display()))?;
         let maps = read_ionex(&content).map_err(anyhow::Error::msg)?;
@@ -859,6 +885,24 @@ mod tests {
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
         let layers = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap();
 
+        let mut explicit = opts.clone();
+        explicit.acquisition_utc = files
+            .iter()
+            .map(|p| acq_utc_datetime(p).unwrap().and_utc())
+            .collect();
+        let opaque = vec![PathBuf::from("opaque-a.h5"), PathBuf::from("opaque-b.h5")];
+        let mut explicit_disp = Array3::<f64>::zeros((1, 3, 3));
+        let explicit_layers = apply_corrections(
+            &explicit,
+            Some(0.055),
+            &mut explicit_disp,
+            &opaque,
+            32610,
+            gt,
+        )
+        .unwrap();
+        assert_eq!(explicit_disp, disp);
+        assert_eq!(explicit_layers.solid_earth_tide, layers.solid_earth_tide);
         let tide = layers.solid_earth_tide.expect("tide layer");
         assert_eq!(tide.dim(), (2, 3, 3));
         let peak = tide.iter().fold(0.0_f64, |m, v| m.max(v.abs()));

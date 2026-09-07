@@ -15,15 +15,10 @@ height bands needed by the frame after a granule is local. Remote HDF5 chunk and
 reads can amplify that logical window to a large fraction of the object, so cell count is
 not a transfer estimate.
 
-No L4 object was fetched and no range-read probe was run for this strategy. Until the probe
-below succeeds, the conservative gate is:
-
-```text
-projected_total_transfer_bytes=111638814943
-```
-
-That fallback is a no-go for the cohort fetch. A successful probe may replace it with one
-lower integer; no other estimate authorizes the fetch.
+**Superseded 2026-09-03 by the probe result below.** The fallback gate this section set,
+`projected_total_transfer_bytes=111638814943`, was never a measurement — it was the
+whole-object penalty standing in until someone ran the probe. The probe has now run and
+replaced it with a measured integer.
 
 ## Known quantities
 
@@ -126,3 +121,68 @@ troposphere residual result.
 - [OPERA L4 TROPO product specification](https://d2pn8kiwq2w21t.cloudfront.net/documents/OPERA_TROPO_CalVal_Product_Spec.pdf)
 - [GDAL netCDF driver](https://gdal.org/en/stable/drivers/raster/netcdf.html)
 - [GDAL virtual file systems](https://gdal.org/en/stable/user/virtual_file_systems.html)
+
+## Probe result — 2026-09-03
+
+Run against the exact granule this strategy names. Range requests are honored (HTTP 206,
+CloudFront-signed URL after one authenticated redirect); auth is the `GP_EARTHDATA_TOKEN`
+bearer, not `~/.netrc`, which is stale.
+
+```text
+projected_total_transfer_bytes=68794097
+```
+
+**0.069 GB against the 111.639 GB fallback — 1,623x smaller.** The cohort fetch is a go.
+
+| Quantity | Value |
+|---|---:|
+| `probe_transfer_bytes` (metered, all response bodies) | 1,277,952 |
+| Range requests | 78 |
+| Read block size (GDAL `/vsicurl` default) | 16,384 |
+| Half-object no-go threshold | 1,073,924,958 |
+| Frame terrain range (Copernicus 30 m DEM, windowed read) | 2217.65 - 2298.48 m |
+| Bracketing `height` indices | 35, 36, 37 (2081.09 / 2261.80 / 2452.99 m) |
+| Staged window | 3 lat x 5 lon x 3 heights, both variables |
+| Staged file size | 14,752 bytes |
+
+Extrapolation per the gate formula, using the cohort's largest object size:
+`ceil(1277952 * 52 * 2223500438 / 2147849917) = 68794097`.
+
+**Why it collapsed.** The delay variables are `(time, height, lat, lon)` = `(1, 145, 2560,
+5120)` float32, gzip, **chunked `(1, 64, 64, 64)`**. The frame window and its three
+bracketing height bands fall inside a handful of chunks, so the transfer is chunk-bound,
+not object-bound. That also means the number is insensitive to the exact window: this probe
+staged 3x5 cells where the strategy anticipated 6x5, and both land in the same chunks.
+
+**Verification.** Staged-vs-remote comparison is bit-identical for `time`, `height`,
+`latitude`, `longitude`, `hydrostatic_delay` and `wet_delay` — values, `_FillValue` masks
+and units — with `spatial_ref` (EPSG:4326) preserved. The window strictly covers the frame
+bounds and the height bands strictly bracket the terrain, both asserted rather than assumed.
+Recovered delays are physically sensible for Mexico City in January: hydrostatic
+1.7109-1.7888 m, wet 0.0667-0.0959 m.
+
+All four required contracts pass:
+
+```text
+troposphere::tests::bounded_l4_read_is_native_windowed_and_resamples_exactly ... ok
+corrections::tests::delay_interpolates_to_terrain_elevation ... ok
+corrections::tests::bracketing_levels_cover_the_terrain_range ... ok
+corrections::tests::build_troposphere_warps_4326_onto_utm_frame ... ok
+```
+
+**Caveats on the number.** It is measured under a 16 KiB block cache; a client using a
+larger read block would transfer more. Terrain here needs only 3 of 145 height levels and
+they fall inside one 64-level chunk — a frame whose terrain straddles a height-chunk
+boundary would roughly double the per-epoch cost, which the 52x extrapolation does not
+model. Both leave the result orders of magnitude inside the fallback.
+
+Reproduce:
+
+```sh
+source validation/creds.sh
+oracle/.venv/bin/python validation/probe_l4_tropo_transfer.py
+oracle/.venv/bin/python validation/probe_l4_tropo_stage_verify.py
+```
+
+This result authorizes the cohort transfer. It does not run the 2018 cohort or claim a
+troposphere residual result.

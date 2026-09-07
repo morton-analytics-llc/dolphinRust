@@ -1,5 +1,7 @@
 # Implementation plan: open-issue code fixes
 
+**Status:** implemented and verified; merged to `main` in PR #97 (`bd0a825`, 2026-08-30). Closed #94, #95, and #96. Shipped in v1.6.0.
+
 **Intake:** `md/intake/open-issues-code-fixes-2026-08-29.md`
 
 **Design:** `md/design/open-issues-code-fixes-2026-08-29.md`

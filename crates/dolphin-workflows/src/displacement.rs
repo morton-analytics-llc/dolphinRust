@@ -44,7 +44,7 @@ use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 use sha2::{Digest, Sha256};
 
 use crate::burst::{
-    burst_offset, frame_grid, group_by_burst, resolve_layover_shadow_masks, BurstGeo, FrameGrid,
+    burst_offset, frame_grid, resolve_layover_shadow_masks, workflow_groups, BurstGeo, FrameGrid,
 };
 use crate::corrections::{apply_corrections, CorrectionLayers};
 use crate::covariance_artifact::{
@@ -58,7 +58,7 @@ use crate::cslc_covariance_source::{
     CSLC_COVARIANCE_SOURCE_MODEL_VERSION, CSLC_COVARIANCE_SOURCE_PROVIDER,
     CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
-use crate::dates::{decimal_days, parse_date};
+use crate::dates::parse_date;
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
@@ -198,6 +198,11 @@ pub struct DisplacementOutput {
     /// Mean coherence-matrix magnitude across real acquisitions, distinct from
     /// estimator-fit temporal coherence. `None` unless `calc_average_coh` is on.
     pub phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial neighbour-phase agreement per pixel (Wang et al. 2022 eq. 5),
+    /// `(rows, cols)`. A distinct QA signal from the temporal/coherence layers:
+    /// it falls at phase discontinuities and on isolated scatterers. `Some` only
+    /// when `phase_linking.write_phase_similarity` is set.
+    pub phase_similarity: Option<Array2<f64>>,
     /// Pixels with complete temporal input support after burst mosaicking and trim.
     pub validity_mask: Array2<bool>,
     /// Per-ministack marginal CRLB phase-estimate σ (radians), stitched as
@@ -345,7 +350,7 @@ pub fn run_displacement_with_output_policy(
             || output_policy == DisplacementOutputPolicy::Full,
         "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
     );
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -406,7 +411,7 @@ fn finish_displacement(
     output_policy: DisplacementOutputPolicy,
     covariance_replay: Option<ProductionCovarianceReplayContext>,
 ) -> Result<DisplacementOutput> {
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     let days = bursts
         .first()
         .map(|b| b.days.clone())
@@ -420,6 +425,19 @@ fn finish_displacement(
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
+    // Spatial neighbour-phase agreement, computed on the stitched linked phase
+    // (single-reference ifgs) the way dolphin runs `create_similarities` on its
+    // stitched rasters, not per-burst.
+    let phase_similarity = cfg.phase_linking.write_phase_similarity.then(|| {
+        timed("phase_similarity", || {
+            dolphin_phaselink::estimate_phase_similarity(
+                pl.view(),
+                cfg.phase_linking.phase_similarity_search_radius,
+                dolphin_phaselink::PhaseSimilaritySummary::Median,
+                Some(validity_mask.view()),
+            )
+        })
+    });
     let temporal_coherence = stitched.temp_coh;
     let epsg = (stitched.geo.epsg != 0).then_some(stitched.geo.epsg);
     let geotransform = stitched.geo.geotransform;
@@ -477,13 +495,15 @@ fn finish_displacement(
         correct_then_reference(
             &mut inversion.displacement,
             |displacement| {
-                apply_corrections(
-                    &cfg.correction_options,
-                    cfg.input_options.wavelength,
+                correct_and_reference(
+                    cfg,
                     displacement,
                     &date_files,
-                    epsg.unwrap_or(0),
-                    geotransform,
+                    GeoInfo {
+                        epsg: epsg.unwrap_or(0),
+                        geotransform,
+                    },
+                    None,
                 )
             },
             |displacement| {
@@ -561,6 +581,7 @@ fn finish_displacement(
         validity_mask,
         burst_coverage,
         phase_linking_coherence: stitched.phase_linking_coherence,
+        phase_similarity,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
         corrections,
@@ -712,6 +733,41 @@ fn invert_time_series(
     Ok(products)
 }
 
+fn correct_and_reference(
+    cfg: &DisplacementWorkflow,
+    displacement: &mut Array3<f64>,
+    date_files: &[PathBuf],
+    geo: GeoInfo,
+    reference: Option<(usize, usize)>,
+) -> Result<CorrectionLayers> {
+    let mut options = cfg.correction_options.clone();
+    if !cfg.input_options.acquisition_metadata.is_empty() {
+        options.acquisition_utc = date_files
+            .iter()
+            .map(|path| {
+                cfg.input_options
+                    .acquisition_metadata
+                    .iter()
+                    .find(|m| m.path == *path)
+                    .map(|m| m.acquisition_utc)
+                    .context("missing verified acquisition UTC")
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+    let corrections = apply_corrections(
+        &options,
+        cfg.input_options.wavelength,
+        displacement,
+        date_files,
+        geo.epsg,
+        geo.geotransform,
+    )?;
+    if let Some(point) = reference {
+        reference_to_point(displacement, point);
+    }
+    Ok(corrections)
+}
+
 /// Optional velocity time-function terms, in the same phase units (rad) as the
 /// velocity fit — except `seasonal_phase_days`, which is days. Empty unless
 /// `timeseries_options.velocity_seasonal` / `velocity_step_dates` are configured.
@@ -742,7 +798,7 @@ struct VelocityFit {
 }
 
 /// The configured time-function model, with step dates resolved to decimal days
-/// from acquisition 0 — the same origin [`decimal_days`] gives the `days` the fit
+/// from acquisition 0 — the same origin [`acquisition_days`] gives the `days` the fit
 /// runs against. `date_files` is the first burst's files in date order.
 ///
 /// # Errors
@@ -761,7 +817,17 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
     let first = date_files
         .first()
         .context("velocity time-function model requires at least one acquisition")?;
-    let anchor = parse_date(first, &cfg.input_options.cslc_date_fmt)?;
+    let anchor = if cfg.input_options.acquisition_metadata.is_empty() {
+        parse_date(first, &cfg.input_options.cslc_date_fmt)?
+    } else {
+        cfg.input_options
+            .acquisition_metadata
+            .iter()
+            .find(|m| m.path == *first)
+            .context("missing acquisition UTC for velocity model")?
+            .acquisition_utc
+            .date_naive()
+    };
     let step_days = options
         .velocity_step_dates
         .iter()
@@ -1060,6 +1126,8 @@ struct SpatialProducts {
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
     phase_linking_coherence: Option<Array2<f64>>,
+    /// Spatial phase-similarity quality raster, if enabled.
+    phase_similarity: Option<Array2<f64>>,
     crlb_sigma: Option<Array3<f64>>,
     closure_phase: Option<Array3<f64>>,
     corrections: CorrectionLayers,
@@ -1081,6 +1149,81 @@ struct SpatialProducts {
     production_covariance: Option<ProductionCovarianceState>,
 }
 
+fn restrict_publication_mask(
+    cfg: &DisplacementWorkflow,
+    geo: GeoInfo,
+    validity: &mut Array2<bool>,
+    reference: Option<(usize, usize)>,
+) -> Result<()> {
+    if let Some(path) = &cfg.mask_file {
+        let mask =
+            read_aligned_raster_window::<f64>(path, geo.geotransform, geo.epsg, validity.dim())?;
+        ndarray::Zip::from(&mut *validity)
+            .and(&mask)
+            .for_each(|valid, &value| *valid &= value == 1.0);
+    }
+    if cfg.input_options.apply_native_input_masks {
+        let nisar = cfg.input_options.input_type == InputType::NisarGslc;
+        let files = if nisar {
+            &cfg.cslc_file_list
+        } else {
+            &cfg.correction_options.geometry_files
+        };
+        anyhow::ensure!(
+            !files.is_empty(),
+            "native input masks require immutable sensor mask sources"
+        );
+        let dataset = if nisar {
+            let subdataset = cfg
+                .input_options
+                .subdataset
+                .as_deref()
+                .context("NISAR mask requires explicit polarization subdataset")?;
+            format!(
+                "{}/mask",
+                subdataset
+                    .rsplit_once('/')
+                    .context("invalid NISAR subdataset")?
+                    .0
+            )
+        } else {
+            "/data/layover_shadow_mask".to_owned()
+        };
+        let mut coverage = Array2::from_elem(validity.dim(), false);
+        for path in files {
+            let (good, covered) = dolphin_io::quality_mask::read_native_quality_mask(
+                path,
+                &dataset,
+                nisar,
+                geo,
+                validity.dim(),
+            )?;
+            ndarray::Zip::from(&mut *validity)
+                .and(&mut coverage)
+                .and(&good)
+                .and(&covered)
+                .for_each(|valid, any, &good, &covered| {
+                    *any |= covered;
+                    if covered {
+                        *valid &= good;
+                    } else if nisar {
+                        *valid = false;
+                    }
+                });
+        }
+        ndarray::Zip::from(&mut *validity)
+            .and(&coverage)
+            .for_each(|valid, &covered| *valid &= covered);
+    }
+    if let Some(point) = reference {
+        anyhow::ensure!(
+            validity.get(point).copied().unwrap_or(false),
+            "reference pixel is excluded by publication quality masks"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_displacement(
     cfg: &DisplacementWorkflow,
@@ -1093,6 +1236,16 @@ fn emit_displacement(
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
+    spatial.apply_validity_mask();
+    restrict_publication_mask(
+        cfg,
+        GeoInfo {
+            epsg: epsg.unwrap_or(0),
+            geotransform: spatial.geotransform,
+        },
+        &mut spatial.validity_mask,
+        spatial.reference_point,
+    )?;
     if let Some(covariance) = spatial.production_covariance.as_mut() {
         covariance.correction_order_digest = correction_order_digest(
             &cfg.correction_options,
@@ -1110,7 +1263,6 @@ fn emit_displacement(
             cfg.timeseries_options.mask_unwrap_loop_errors,
         );
     }
-    spatial.apply_validity_mask();
     if let (Some(variance), Some(point)) = (
         spatial.posterior_variance_rad.as_mut(),
         spatial.reference_point,
@@ -1141,6 +1293,7 @@ fn emit_displacement(
             .len()
             .saturating_sub(spatial.disp_rad.dim().0),
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
+        phase_similarity: spatial.phase_similarity.as_ref(),
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -1245,6 +1398,7 @@ fn emit_displacement(
         unwrap_connected_components: spatial.unwrap_connected_components,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
+        phase_similarity: spatial.phase_similarity,
         validity_mask: spatial.validity_mask,
         crlb_sigma: cfg
             .phase_linking
@@ -3178,7 +3332,7 @@ fn burst_files(cfg: &DisplacementWorkflow, idxs: &[usize]) -> Vec<PathBuf> {
 }
 
 fn acquisition_days(cfg: &DisplacementWorkflow, files: &[PathBuf]) -> Result<Vec<f64>> {
-    decimal_days(files, &cfg.input_options.cslc_date_fmt)
+    crate::dates::acquisition_days(files, &cfg.input_options)
         .context("parsing acquisition dates from CSLC filenames")
 }
 
@@ -3186,6 +3340,9 @@ fn validate_common_burst_dates(
     cfg: &DisplacementWorkflow,
     groups: &BTreeMap<String, Vec<usize>>,
 ) -> Result<()> {
+    if !cfg.input_options.acquisition_metadata.is_empty() {
+        return workflow_groups(cfg).map(|_| ());
+    }
     let mut axes = Vec::with_capacity(groups.len());
     for (id, indices) in groups {
         let files = burst_files(cfg, indices);
@@ -3344,7 +3501,7 @@ pub fn run_displacement_resumable(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
     );
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -3431,7 +3588,7 @@ pub fn update_displacement(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is unsupported for resumable updates"
     );
-    let groups = group_by_burst(&cfg.cslc_file_list);
+    let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
         cfg.input_options.input_type,
@@ -4498,6 +4655,9 @@ fn write_outputs(
     if let Some(coherence) = quality.phase_linking_coherence {
         write_f32("phase_linking_coherence.tif", coherence.view())?;
     }
+    if let Some(similarity) = quality.phase_similarity {
+        write_f32("phase_similarity.tif", similarity.view())?;
+    }
     write_bands(&write_f32, displacement, "displacement")?;
     if let Some(crlb) = quality.crlb_sigma {
         for band in 0..crlb.dim().0 {
@@ -4570,7 +4730,8 @@ fn write_outputs(
 }
 
 /// The first burst's input files in date order (the dates the series is built on),
-/// used to time-stamp the IONEX lookup. Mirrors how `days` is taken from the first
+/// used to time-stamp frame corrections. For a multi-burst mosaic this retains
+/// the reference burst timing approximation. Mirrors how `days` is taken from the first
 /// burst; `groups` is a `BTreeMap`, so `.values().next()` is the first burst.
 fn first_burst_files(
     cfg: &DisplacementWorkflow,
@@ -4636,6 +4797,7 @@ struct QualityLayers<'a> {
     /// `n_interferograms - (n_dates - 1)`.
     network_residual_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
+    phase_similarity: Option<&'a Array2<f64>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
     displacement_variance: Option<&'a Array3<f64>>,
@@ -4674,6 +4836,27 @@ fn write_bands(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_masks_restrict_support_and_reject_masked_reference() {
+        let path = std::env::temp_dir().join("configured_publication_mask.tif");
+        let geo = GeoInfo {
+            epsg: 32611,
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+        };
+        let mask = ndarray::arr2(&[[1u8, 0], [1, 1]]);
+        write_raster(&path, mask.view(), geo.geotransform, Some(geo.epsg), None).unwrap();
+        let cfg = DisplacementWorkflow {
+            mask_file: Some(path.clone()),
+            ..Default::default()
+        };
+        let mut valid = Array2::from_elem((2, 2), true);
+        restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
+        assert_eq!(valid, mask.mapv(|v| v == 1));
+        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 1))).is_err());
+        std::fs::remove_file(path).unwrap();
+        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).is_err());
+    }
+
     use super::*;
     use dolphin_core::config::{CompressedSlcPlan, InterferogramNetwork, ShpMethod};
     use dolphin_core::{HalfWindow, Strides};
@@ -4910,6 +5093,7 @@ mod tests {
             validity_mask,
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
+            phase_similarity: None,
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -5042,6 +5226,7 @@ mod tests {
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5104,6 +5289,7 @@ mod tests {
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5632,6 +5818,7 @@ mod tests {
             QualityLayers {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
+                phase_similarity: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: None,
@@ -6283,6 +6470,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn atmospheric_correction_preserves_reference_and_known_velocity() {
+        for wavelength in [SENTINEL1_WAVELENGTH_M, 0.238403545] {
+            let dir =
+                std::env::temp_dir().join(format!("dolphin_reference_atmosphere_{wavelength}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let gt = [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0];
+            let mut cfg = DisplacementWorkflow::default();
+            cfg.input_options.wavelength = Some(wavelength);
+            cfg.correction_options.incidence_angle_deg = 0.0;
+            cfg.correction_options.troposphere_variable = "Band1".into();
+            let days = [0.0, 12.0, 24.0];
+            for t in 0..3 {
+                let path = dir.join(format!("delay_{t}.nc"));
+                let raster = dir.join(format!("delay_{t}.tif"));
+                let delay =
+                    Array2::from_shape_fn((3, 3), |(_, c)| 0.01 * t as f64 * (1.0 + c as f64));
+                write_raster(&raster, delay.view(), gt, Some(32611), None).unwrap();
+                let src = gdal::Dataset::open(&raster).unwrap();
+                src.create_copy(
+                    &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
+                    &path,
+                    &Default::default(),
+                )
+                .unwrap();
+                cfg.correction_options.troposphere_files.push(path);
+            }
+            let scale = -4.0 * std::f64::consts::PI / wavelength;
+            let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, _, c)| {
+                (0.008 * c as f64 * days[t + 1] / 365.25 + 0.01 * (t + 1) as f64 * (1.0 + c as f64))
+                    * scale
+            });
+            correct_and_reference(
+                &cfg,
+                &mut disp,
+                &[],
+                GeoInfo {
+                    epsg: 32611,
+                    geotransform: gt,
+                },
+                Some((1, 0)),
+            )
+            .unwrap();
+            assert!(disp
+                .slice(ndarray::s![.., 1, 0])
+                .iter()
+                .all(|v| v.abs() < 1e-12));
+            let fit = fit_velocity(
+                &cfg,
+                disp.view(),
+                &days,
+                Some(&Array3::from_elem((3, 3, 3), 1.0)),
+                Some((1, 0)),
+                &VelocityModel::default(),
+            )
+            .unwrap();
+            assert!((fit.velocity[(1, 2)] / scale - 0.016).abs() < 1e-8);
+            assert!(fit.residual_rms.unwrap().iter().all(|r| r.abs() < 1e-8));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     /// Contract: a noise-free phase series carrying a known LOS rate is recovered
     /// as exactly that rate in mm/yr, using the real temporal baselines — not the
     /// old hardcoded 12-day cadence. Exercises `velocity_of` + `mm_per_rad`, the
@@ -6406,6 +6655,7 @@ mod tests {
                 QualityLayers {
                     network_residual_dof: dof,
                     phase_linking_coherence: None,
+                    phase_similarity: None,
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
                     displacement_variance: Some(&variance),
@@ -6579,6 +6829,7 @@ mod tests {
             validity_mask: Array2::from_elem((2, 2), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -6608,6 +6859,7 @@ mod tests {
             QualityLayers {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
+                phase_similarity: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: scaled.displacement_variance.as_ref(),
@@ -7296,7 +7548,7 @@ mod tests {
         initial.output_options.bounds = Some((0.0, 0.0, 30.0, 30.0));
         initial.output_options.bounds_epsg = Some(32611);
         initial.output_options.epsg = Some(32611);
-        let initial_groups = group_by_burst(&initial.cslc_file_list);
+        let initial_groups = workflow_groups(&initial).unwrap();
         let initial_masks = resolve_layover_shadow_masks(
             initial.input_options.input_type,
             &initial_groups,
@@ -7515,6 +7767,7 @@ mod tests {
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
+            phase_similarity: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {

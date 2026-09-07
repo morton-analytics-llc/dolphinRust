@@ -1,0 +1,81 @@
+{
+  "measured_utc": "2026-09-03T18:59:38Z",
+  "dolphinrust_version": "dolphin 1.6.0",
+  "stack": "validation/real_data/gps_mmx1_2018/cropped/mmx1_2018_los_common/cslc",
+  "burst_id": "T005-008704-IW1",
+  "dates": 15,
+  "date_range": [
+    "20180106",
+    "20180506"
+  ],
+  "rows": 936,
+  "cols": 4197,
+  "megapixels": 3.928,
+  "half_window_xy": [
+    11,
+    5
+  ],
+  "strides_xy": [
+    6,
+    3
+  ],
+  "machine": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "cpu": "Apple M2 Pro",
+    "physical_cores": "12",
+    "logical_cores": "12",
+    "memory_gib": 32.0,
+    "rayon_threads": "default (all cores)"
+  },
+  "cold_wall_s": 20.525125709013082,
+  "wall_s": 20.008106895489618,
+  "peak_rss_gib": 0.7046890258789062,
+  "reps": 3,
+  "all_wall_s": [
+    20.525125709013082,
+    19.902539125061594,
+    20.113674665917642
+  ],
+  "stages": [
+    {
+      "stage": "phase_linking",
+      "elapsed_s": 2.691354354
+    },
+    {
+      "stage": "stitch",
+      "elapsed_s": 1.8125e-06
+    },
+    {
+      "stage": "geometry_precheck",
+      "elapsed_s": 6.645499999999999e-06
+    },
+    {
+      "stage": "network",
+      "elapsed_s": 7.2504999999999994e-06
+    },
+    {
+      "stage": "unwrap",
+      "elapsed_s": 15.2253075
+    },
+    {
+      "stage": "loop_closure",
+      "elapsed_s": 1.125e-06
+    },
+    {
+      "stage": "timeseries",
+      "elapsed_s": 0.4490966665
+    },
+    {
+      "stage": "corrections",
+      "elapsed_s": 0.008738833500000001
+    },
+    {
+      "stage": "velocity",
+      "elapsed_s": 0.0332377915
+    },
+    {
+      "stage": "write",
+      "elapsed_s": 1.4353515625000002
+    }
+  ]
+}

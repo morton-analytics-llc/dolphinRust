@@ -137,6 +137,55 @@ fn end_to_end_displacement_matches_oracle() {
 }
 
 #[test]
+fn phase_similarity_raster_is_written_when_enabled() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping phase-similarity end-to-end: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg = georeferenced_config("phase_similarity");
+    cfg.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
+    cfg.phase_linking.write_phase_similarity = true;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_phase_similarity_e2e");
+    let out = run_displacement(&cfg).unwrap();
+
+    let similarity = out
+        .phase_similarity
+        .expect("write_phase_similarity enabled");
+    assert_eq!(similarity.dim(), out.temporal_coherence.dim());
+    // The metric is a mean cosine, so it is bounded on [-1, 1]; excluded pixels
+    // are NaN rather than an in-range sentinel that would read as real agreement.
+    assert!(similarity
+        .iter()
+        .all(|v| v.is_nan() || (-1.0..=1.0).contains(v)));
+    assert!(similarity.iter().any(|v| v.is_finite()), "all-NaN raster");
+    assert!(cfg.work_directory.join("phase_similarity.tif").exists());
+    assert_ne!(
+        similarity, out.temporal_coherence,
+        "spatial similarity and temporal coherence must be distinct metrics"
+    );
+}
+
+/// The layer is opt-in: nothing is computed or written unless it is enabled.
+#[test]
+fn phase_similarity_is_absent_by_default() {
+    let dir = fixtures();
+    let config = dir.join("disp/config.yaml");
+    if !dir.join("disp_displacement.npy").exists() || !config.exists() || !snaphu_available() {
+        eprintln!("skipping phase-similarity default: no fixtures / snaphu");
+        return;
+    }
+    let mut cfg = georeferenced_config("phase_similarity_off");
+    cfg.unwrap_options.unwrap_method = dolphin_core::config::UnwrapMethod::Snaphu;
+    cfg.work_directory = std::env::temp_dir().join("dolphinrust_phase_similarity_off_e2e");
+    assert!(!cfg.phase_linking.write_phase_similarity);
+    let out = run_displacement(&cfg).unwrap();
+    assert!(out.phase_similarity.is_none());
+    assert!(!cfg.work_directory.join("phase_similarity.tif").exists());
+}
+
+#[test]
 fn distinct_phase_linking_coherence_raster_is_written_when_enabled() {
     let dir = fixtures();
     let config = dir.join("disp/config.yaml");

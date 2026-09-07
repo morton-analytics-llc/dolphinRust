@@ -226,3 +226,311 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// Read bounded NISAR LOS geometry, interpolating a radarGrid cube at verified
+/// ellipsoidal DEM heights.
+///
+/// # Errors
+/// Rejects missing DEM, unsupported CRS/grid alignment, nodata, incomplete
+/// coverage, and heights outside the source cube. Never extrapolates.
+pub fn read_nisar_los_layers_for_grid(
+    path: &Path,
+    group: &str,
+    target_geo: GeoInfo,
+    target_shape: (usize, usize),
+    ellipsoidal_dem: Option<&Path>,
+) -> Result<Option<LosLayers>> {
+    use crate::error::IoError;
+    let geo = crate::nisar::read_nisar_geotransform(path, &format!("{group}/losUnitVectorX"))?;
+    if geo.epsg != target_geo.epsg {
+        return Err(IoError::Geo("NISAR LOS and target CRS differ".into()));
+    }
+    let file = hdf5::File::open(path)?;
+    let x = file
+        .dataset(&format!("{group}/xCoordinates"))?
+        .read_raw::<f64>()?;
+    let y = file
+        .dataset(&format!("{group}/yCoordinates"))?
+        .read_raw::<f64>()?;
+    let east_ds = file.dataset(&format!("{group}/losUnitVectorX"))?;
+    let north_ds = file.dataset(&format!("{group}/losUnitVectorY"))?;
+    let shape = east_ds.shape();
+    let heights = file
+        .dataset(&format!("{group}/heightAboveEllipsoid"))?
+        .read_raw::<f64>()?;
+    if heights.len() < 2
+        || heights.iter().any(|v| !v.is_finite())
+        || heights.windows(2).any(|w| w[0] >= w[1])
+        || shape != north_ds.shape()
+        || shape != [heights.len(), y.len(), x.len()]
+    {
+        return Err(IoError::Shape("invalid NISAR LOS height dimensions".into()));
+    }
+    let dem = read_ellipsoidal_dem(
+        ellipsoidal_dem.ok_or_else(|| {
+            IoError::Geo("NISAR radarGrid requires a verified ellipsoidal DEM".into())
+        })?,
+        target_geo,
+        target_shape,
+    )?;
+    let min_height = dem.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_height = dem.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if min_height < heights[0] || max_height > heights[heights.len() - 1] {
+        return Err(IoError::Geo(
+            "ellipsoidal DEM height lies outside NISAR LOS cube".into(),
+        ));
+    }
+    let h0 = heights
+        .partition_point(|h| *h < min_height)
+        .saturating_sub(1);
+    let h1 = (heights.partition_point(|h| *h <= max_height) + 1).min(heights.len());
+    let (rows, cols, offset) = nisar_xy_window(&x, &y, geo, target_geo, target_shape)?;
+    let read = |ds: &hdf5::Dataset| -> Result<ndarray::Array3<f64>> {
+        Ok(ds.read_slice::<f64, _, ndarray::Ix3>(s![h0..h1, rows.clone(), cols.clone()])?)
+    };
+    let east = read(&east_ds)?;
+    let north = read(&north_ds)?;
+    if east
+        .iter()
+        .zip(north.iter())
+        .any(|(&e, &n)| !e.is_finite() || !n.is_finite() || e * e + n * n >= 1.0)
+    {
+        return Err(IoError::Geo(
+            "NISAR LOS has invalid or non-upward unit vectors".into(),
+        ));
+    }
+    let interpolate = |source: &ndarray::Array3<f64>| {
+        Array2::from_shape_fn(target_shape, |(r, c)| {
+            let sy = offset.0 + r as f64 * target_geo.geotransform[5] / geo.geotransform[5];
+            let sx = offset.1 + c as f64 * target_geo.geotransform[1] / geo.geotransform[1];
+            let (lo_y, lo_x) = (sy.floor() as usize, sx.floor() as usize);
+            let (hi_y, hi_x) = (
+                (lo_y + 1).min(source.dim().1 - 1),
+                (lo_x + 1).min(source.dim().2 - 1),
+            );
+            let (wy, wx) = (sy - lo_y as f64, sx - lo_x as f64);
+            let h = heights
+                .partition_point(|v| *v <= dem[(r, c)])
+                .saturating_sub(1);
+            let hi_h = (h + 1).min(heights.len() - 1);
+            let wh = if h == hi_h {
+                0.0
+            } else {
+                (dem[(r, c)] - heights[h]) / (heights[hi_h] - heights[h])
+            };
+            let bilinear = |height: usize| {
+                (1.0 - wy)
+                    * ((1.0 - wx) * source[(height - h0, lo_y, lo_x)]
+                        + wx * source[(height - h0, lo_y, hi_x)])
+                    + wy * ((1.0 - wx) * source[(height - h0, hi_y, lo_x)]
+                        + wx * source[(height - h0, hi_y, hi_x)])
+            };
+            (1.0 - wh) * bilinear(h) + wh * bilinear(hi_h)
+        })
+    };
+    Ok(Some(LosLayers {
+        east: interpolate(&east),
+        north: interpolate(&north),
+        geo: target_geo,
+    }))
+}
+
+type NisarWindow = (std::ops::Range<usize>, std::ops::Range<usize>, (f64, f64));
+
+fn nisar_xy_window(
+    x: &[f64],
+    y: &[f64],
+    geo: GeoInfo,
+    target_geo: GeoInfo,
+    shape: (usize, usize),
+) -> Result<NisarWindow> {
+    use crate::error::IoError;
+    let sg = geo.geotransform;
+    let tg = target_geo.geotransform;
+    if sg[1] <= 0.0
+        || sg[5] >= 0.0
+        || tg[1] <= 0.0
+        || tg[5] >= 0.0
+        || tg[2] != 0.0
+        || tg[4] != 0.0
+        || x.windows(2)
+            .any(|w| !w[0].is_finite() || ((w[1] - w[0]) - sg[1]).abs() > 1e-6)
+        || y.windows(2)
+            .any(|w| !w[0].is_finite() || ((w[1] - w[0]) - sg[5]).abs() > 1e-6)
+    {
+        return Err(IoError::Geo(
+            "NISAR LOS coordinates must form a regular north-up grid".into(),
+        ));
+    }
+    let col0 = (tg[0] + 0.5 * tg[1] - x[0]) / sg[1];
+    let row0 = (tg[3] + 0.5 * tg[5] - y[0]) / sg[5];
+    let col1 = col0 + shape.1.saturating_sub(1) as f64 * tg[1] / sg[1];
+    let row1 = row0 + shape.0.saturating_sub(1) as f64 * tg[5] / sg[5];
+    if [col0, row0, col1, row1].iter().any(|v| !v.is_finite())
+        || col0 < 0.0
+        || row0 < 0.0
+        || col1 > (x.len() - 1) as f64
+        || row1 > (y.len() - 1) as f64
+    {
+        return Err(IoError::Geo(
+            "NISAR LOS does not cover target pixel centers".into(),
+        ));
+    }
+    let (c0, r0) = (col0.floor() as usize, row0.floor() as usize);
+    let (c1, r1) = (
+        (col1.ceil() as usize + 1).min(x.len()),
+        (row1.ceil() as usize + 1).min(y.len()),
+    );
+    Ok((r0..r1, c0..c1, (row0 - r0 as f64, col0 - c0 as f64)))
+}
+
+fn read_ellipsoidal_dem(path: &Path, geo: GeoInfo, shape: (usize, usize)) -> Result<Array2<f64>> {
+    use crate::error::IoError;
+    let dataset = gdal::Dataset::open(path)?;
+    let sg = dataset.geo_transform()?;
+    let tg = geo.geotransform;
+    if dataset.spatial_ref()?.auth_code()? != geo.epsg as i32
+        || sg[2] != 0.0
+        || sg[4] != 0.0
+        || sg[1] <= 0.0
+        || sg[5] >= 0.0
+    {
+        return Err(IoError::Geo(
+            "ellipsoidal DEM must share the target CRS and north-up grid".into(),
+        ));
+    }
+    let window = [
+        (tg[0] - sg[0]) / sg[1],
+        (tg[3] - sg[3]) / sg[5],
+        shape.1 as f64 * tg[1] / sg[1],
+        shape.0 as f64 * tg[5] / sg[5],
+    ];
+    if window
+        .iter()
+        .any(|v| !v.is_finite() || *v < 0.0 || (*v - v.round()).abs() > 1e-6)
+        || window[2] < 1.0
+        || window[3] < 1.0
+    {
+        return Err(IoError::Geo(
+            "ellipsoidal DEM target boundaries must align to source pixels".into(),
+        ));
+    }
+    let offset = (window[0] as isize, window[1] as isize);
+    let size = (window[2] as usize, window[3] as usize);
+    if window[0] + window[2] > dataset.raster_size().0 as f64
+        || window[1] + window[3] > dataset.raster_size().1 as f64
+    {
+        return Err(IoError::Geo("ellipsoidal DEM does not cover target".into()));
+    }
+    let band = dataset.rasterband(1)?;
+    let nodata = band.no_data_value();
+    // Check source support before interpolation; GDAL otherwise interpolates around nodata.
+    let source = band.read_as::<f64>(offset, size, size, None)?;
+    if source
+        .data()
+        .iter()
+        .any(|v| !v.is_finite() || nodata == Some(*v))
+    {
+        return Err(IoError::Geo(
+            "ellipsoidal DEM contains nodata in target".into(),
+        ));
+    }
+    let values = band.read_as::<f64>(
+        offset,
+        size,
+        (shape.1, shape.0),
+        Some(gdal::raster::ResampleAlg::Bilinear),
+    )?;
+    Array2::from_shape_vec(shape, values.data().to_vec()).map_err(|e| IoError::Shape(e.to_string()))
+}
+
+#[cfg(test)]
+mod nisar_tests {
+    use super::*;
+    #[test]
+    fn nisar_cube_uses_ellipsoidal_height_and_rejects_missing_dem() {
+        let _guard = crate::test_hdf5_lock::guard();
+        let dir = std::env::temp_dir().join("dolphin_nisar_los_height_contract");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gslc.h5");
+        let dem = dir.join("ellipsoidal.tif");
+        let group = "/science/LSAR/GSLC/metadata/radarGrid";
+        let geo = GeoInfo {
+            epsg: 32611,
+            geotransform: [500_000.0, 30.0, 0.0, 4_200_000.0, 0.0, -30.0],
+        };
+        {
+            let f = hdf5::File::create(&path).unwrap();
+            let g = f.create_group(group).unwrap();
+            g.new_dataset_builder()
+                .with_data(&[500_015.0, 500_045.0, 500_075.0])
+                .create("xCoordinates")
+                .unwrap();
+            g.new_dataset_builder()
+                .with_data(&[4_199_985.0, 4_199_955.0, 4_199_925.0])
+                .create("yCoordinates")
+                .unwrap();
+            g.new_dataset_builder()
+                .with_data(&[0.0_f64, 1000.0])
+                .create("heightAboveEllipsoid")
+                .unwrap();
+            g.new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611)
+                .unwrap();
+            let east = ndarray::Array3::from_shape_fn((2, 3, 3), |(h, r, c)| {
+                0.3_f64 + h as f64 * 0.1 + r as f64 * 0.01 + c as f64 * 0.02
+            });
+            g.new_dataset_builder()
+                .with_data(east.view())
+                .create("losUnitVectorX")
+                .unwrap();
+            g.new_dataset_builder()
+                .with_data(ndarray::Array3::from_elem((2, 3, 3), 0.1_f64).view())
+                .create("losUnitVectorY")
+                .unwrap();
+        }
+        crate::write_raster(
+            &dem,
+            Array2::from_elem((3, 3), 250.0_f64).view(),
+            geo.geotransform,
+            Some(32611),
+            None,
+        )
+        .unwrap();
+        let layers = read_nisar_los_layers_for_grid(&path, group, geo, (3, 3), Some(&dem))
+            .unwrap()
+            .unwrap();
+        assert!((layers.east[(1, 1)] - 0.355).abs() < 1e-12);
+        let shifted = GeoInfo {
+            epsg: 32611,
+            geotransform: [500_015.0, 30.0, 0.0, 4_199_985.0, 0.0, -30.0],
+        };
+        let shifted_dem = dir.join("shifted-dem.tif");
+        crate::write_raster(
+            &shifted_dem,
+            Array2::from_elem((2, 2), 250.0_f64).view(),
+            shifted.geotransform,
+            Some(32611),
+            None,
+        )
+        .unwrap();
+        let interpolated =
+            read_nisar_los_layers_for_grid(&path, group, shifted, (2, 2), Some(&shifted_dem))
+                .unwrap()
+                .unwrap();
+        assert!((interpolated.east[(0, 0)] - 0.34).abs() < 1e-12);
+        assert!(read_nisar_los_layers_for_grid(&path, group, geo, (3, 3), None).is_err());
+        crate::write_raster(
+            &dem,
+            Array2::from_elem((3, 3), 1250.0_f64).view(),
+            geo.geotransform,
+            Some(32611),
+            None,
+        )
+        .unwrap();
+        assert!(read_nisar_los_layers_for_grid(&path, group, geo, (3, 3), Some(&dem)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

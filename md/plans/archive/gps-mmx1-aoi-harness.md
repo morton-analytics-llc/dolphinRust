@@ -1,5 +1,7 @@
 # Implementation plan: MMX1/ICMX GNSS ground-truth harness
 
+**Archived:** 2026-09-03. The plan's own status below stands: contracts and preflight were implemented 2026-07-09, and the remaining full-CSLC acquisition never ran for lack of disk headroom. The GNSS validation path it opened is now carried by `validation/gps_ground_truth.py` and the 2023 cohort harness, so the outstanding tasks are superseded rather than pending.
+
 **Status:** implemented 2026-07-09; synthetic contracts and live acquisition
 preflight pass. Full CSLC acquisition and the two real pipeline runs remain
 unexecuted because the host has insufficient safe free-disk headroom.
