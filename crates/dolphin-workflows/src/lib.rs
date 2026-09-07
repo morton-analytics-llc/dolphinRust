@@ -7,6 +7,7 @@
 //! (`config/`) and the burst-parallel executor.
 #![warn(missing_docs)]
 
+pub mod baseline;
 pub mod burst;
 pub mod corrections;
 pub mod covariance_artifact;
@@ -25,6 +26,7 @@ pub mod temporal_covariance_product;
 pub mod tiling;
 pub mod unwrap_backend;
 
+pub use baseline::{orbit_pair_baseline, pair_baseline, PairBaseline};
 pub use covariance_artifact::{
     admit_covariance_artifact_disk, admit_covariance_artifact_disk_with_identity_index,
     covariance_artifact_disk_bytes, covariance_artifact_disk_bytes_with_identity_index,
