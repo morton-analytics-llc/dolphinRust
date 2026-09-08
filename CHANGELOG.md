@@ -6,6 +6,26 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Breaking changes
+- **Acquisition identity and correction UTC are now explicit contracts** (PR #117, eo PR #534).
+  `InputOptions.acquisition_metadata` carries verified acquisition UTC, `spatial_group`
+  (burst/frame incl. orbit, frequency, polarization) and `grid_id` per input, and
+  `CorrectionOptions.acquisition_utc` carries the verified UTC used by the
+  corrected-before-reference path; empty lists retain legacy filename parsing. Velocity is
+  derived from the corrected, consistently referenced series. Multiburst ionosphere/tide runs
+  whose spatial groups have unequal UTC are rejected (`temporal corrections require identical
+  UTC across spatial groups`) pending per-burst correction evaluation.
+- **Native sensor quality masks gate publication.** `InputOptions.apply_native_input_masks`
+  requires the sensor's native mask (OPERA STATIC `0=good`; NISAR GSLC subswath IDs
+  `1..254=good`) at publish time; every native subpixel must pass and partially covered output
+  pixels fail closed (`dolphin_io::read_native_quality_mask`). A reference pixel excluded by the
+  publication masks is an error before publication, not a silent NaN series.
+- **NISAR uses native radarGrid LOS geometry.** `CorrectionOptions.nisar_geometry_group` selects
+  the GSLC LOS cube and `nisar_ellipsoidal_dem_file` supplies ellipsoidal heights for its
+  interpolation; a NISAR run without a verified ellipsoidal DEM is rejected. OPERA runs are
+  unchanged (STATIC geometry). Existing covariance exports, velocity diagnostics, and per-burst
+  mask handling are preserved.
+
 ### Added
 - **Per-pair perpendicular/parallel baseline** (issue #101). `dolphin_workflows::pair_baseline`
   computes the along-track-corrected perpendicular and parallel (range) baseline between two
