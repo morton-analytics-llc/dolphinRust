@@ -35,8 +35,8 @@ use dolphin_timeseries::{
     estimate_velocity_with_model, estimate_velocity_with_uncertainty, get_incidence_matrix,
     invert_stack, invert_stack_l1, invert_stack_with_uncertainty, loop_closure_qc,
     mask_failed_loops, network_triplets, reference_to_point, select_reference_point, L1Config,
-    LoopClosureQc, NetworkConfig, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
-    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    LoopClosureQc, NetworkConfig, RelaxationTerm, VelocityCadenceStatus, VelocityModel,
+    VelocityUncertaintyStatus, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -776,12 +776,14 @@ fn correct_and_reference(
 
 /// Optional velocity time-function terms, in the same phase units (rad) as the
 /// velocity fit — except `seasonal_phase_days`, which is days. Empty unless
-/// `timeseries_options.velocity_seasonal` / `velocity_step_dates` are configured.
+/// `timeseries_options.velocity_seasonal` / `velocity_step_dates` /
+/// `velocity_relaxation` are configured.
 #[derive(Debug, Clone, Default)]
 struct VelocityTerms {
     seasonal_amplitude_rad: Option<Array2<f64>>,
     seasonal_phase_days: Option<Array2<f64>>,
     step_magnitude_rad: Vec<Array2<f64>>,
+    relaxation_amplitude_rad: Vec<Array2<f64>>,
 }
 
 /// Rate, one-sigma, and optional time-function terms in one place, so the
@@ -803,21 +805,27 @@ struct VelocityFit {
     terms: VelocityTerms,
 }
 
-/// The configured time-function model, with step dates resolved to decimal days
-/// from acquisition 0 — the same origin [`acquisition_days`] gives the `days` the fit
-/// runs against. `date_files` is the first burst's files in date order.
+/// The configured time-function model, with step dates and relaxation onsets
+/// resolved to decimal days from acquisition 0 — the same origin
+/// [`acquisition_days`] gives the `days` the fit runs against. `date_files` is the
+/// first burst's files in date order.
 ///
 /// # Errors
-/// Returns `Err` if a step date is not `YYYY-MM-DD` or the acquisition-0 date is
-/// unparseable. A step the user asked for and did not get is a wrong answer, not
-/// a degraded one, so this fails the run rather than dropping the term.
+/// Returns `Err` if a step or onset date is not `YYYY-MM-DD`, a relaxation time
+/// constant is not positive and finite, or the acquisition-0 date is unparseable.
+/// A term the user asked for and did not get is a wrong answer, not a degraded
+/// one, so this fails the run rather than dropping the term.
 fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<VelocityModel> {
     let options = &cfg.timeseries_options;
     let model = VelocityModel {
         seasonal: options.velocity_seasonal,
         step_days: Vec::new(),
+        relaxation: Vec::new(),
     };
-    if model.is_linear() && options.velocity_step_dates.is_empty() {
+    if model.is_linear()
+        && options.velocity_step_dates.is_empty()
+        && options.velocity_relaxation.is_empty()
+    {
         return Ok(model);
     }
     let first = date_files
@@ -834,18 +842,36 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
             .acquisition_utc
             .date_naive()
     };
+    let days_from_anchor = |field: &str, raw: &str| -> Result<f64> {
+        let date = chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+            .with_context(|| format!("timeseries_options.{field}: {raw:?} is not YYYY-MM-DD"))?;
+        Ok((date - anchor).num_days() as f64)
+    };
     let step_days = options
         .velocity_step_dates
         .iter()
-        .map(|raw| {
-            let date =
-                chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").with_context(|| {
-                    format!("timeseries_options.velocity_step_dates: {raw:?} is not YYYY-MM-DD")
-                })?;
-            Ok((date - anchor).num_days() as f64)
-        })
+        .map(|raw| days_from_anchor("velocity_step_dates", raw))
         .collect::<Result<Vec<f64>>>()?;
-    Ok(VelocityModel { step_days, ..model })
+    let relaxation = options
+        .velocity_relaxation
+        .iter()
+        .map(|term| {
+            anyhow::ensure!(
+                term.tau_days.is_finite() && term.tau_days > 0.0,
+                "timeseries_options.velocity_relaxation: tau_days must be positive and finite, got {}",
+                term.tau_days
+            );
+            Ok(RelaxationTerm {
+                onset_days: days_from_anchor("velocity_relaxation", &term.onset_date)?,
+                tau_days: term.tau_days,
+            })
+        })
+        .collect::<Result<Vec<RelaxationTerm>>>()?;
+    Ok(VelocityModel {
+        step_days,
+        relaxation,
+        ..model
+    })
 }
 
 /// Every emitted layer scaled from LOS phase (rad) to displacement units, kept
@@ -860,6 +886,7 @@ struct ScaledOutputs {
     velocity_sigma: Option<Array2<f64>>,
     seasonal_amplitude: Option<Array2<f64>>,
     step_magnitude: Vec<Array2<f64>>,
+    relaxation_amplitude: Vec<Array2<f64>>,
 }
 
 fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> ScaledOutputs {
@@ -867,8 +894,7 @@ fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> Scale
         .input_options
         .wavelength
         .map_or(1.0, |w| -w / (4.0 * std::f64::consts::PI));
-    let (seasonal_amplitude, step_magnitude) =
-        scale_velocity_terms(&spatial.velocity_terms, phase_to_disp);
+    let scaled_terms = scale_velocity_terms(&spatial.velocity_terms, phase_to_disp);
     ScaledOutputs {
         displacement: spatial.disp_rad.mapv(|phase| phase * phase_to_disp),
         velocity: spatial.vel_rad.mapv(|rate| rate * phase_to_disp),
@@ -892,29 +918,34 @@ fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> Scale
             .velocity_sigma_rad
             .as_ref()
             .map(|v| v.mapv(|value| value * phase_to_disp.abs())),
-        seasonal_amplitude,
-        step_magnitude,
+        seasonal_amplitude: scaled_terms.seasonal_amplitude_rad,
+        step_magnitude: scaled_terms.step_magnitude_rad,
+        relaxation_amplitude: scaled_terms.relaxation_amplitude_rad,
     }
 }
 
-/// Seasonal amplitude and step magnitudes from phase (rad) to displacement units.
-/// Both are series quantities, so they take the same factor as displacement
-/// itself; amplitude is an unsigned magnitude, a step is signed. The seasonal peak
-/// day needs no scaling — it is already days.
-fn scale_velocity_terms(
-    terms: &VelocityTerms,
-    phase_to_disp: f64,
-) -> (Option<Array2<f64>>, Vec<Array2<f64>>) {
-    let amplitude = terms
-        .seasonal_amplitude_rad
-        .as_ref()
-        .map(|values| values.mapv(|value| value * phase_to_disp.abs()));
-    let steps = terms
-        .step_magnitude_rad
-        .iter()
-        .map(|values| values.mapv(|value| value * phase_to_disp))
-        .collect();
-    (amplitude, steps)
+/// Seasonal amplitude, step magnitudes, and relaxation amplitudes from phase
+/// (rad) to displacement units, returned in the same container so the caller
+/// cannot pair them up wrong. All are series quantities, so they take the same
+/// factor as displacement itself; the seasonal amplitude is unsigned, a step and a
+/// relaxation are signed. The seasonal peak day needs no scaling — it is already
+/// days — and is carried through unchanged.
+fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTerms {
+    let signed = |layers: &[Array2<f64>]| -> Vec<Array2<f64>> {
+        layers
+            .iter()
+            .map(|values| values.mapv(|value| value * phase_to_disp))
+            .collect()
+    };
+    VelocityTerms {
+        seasonal_amplitude_rad: terms
+            .seasonal_amplitude_rad
+            .as_ref()
+            .map(|values| values.mapv(|value| value * phase_to_disp.abs())),
+        seasonal_phase_days: terms.seasonal_phase_days.clone(),
+        step_magnitude_rad: signed(&terms.step_magnitude_rad),
+        relaxation_amplitude_rad: signed(&terms.relaxation_amplitude_rad),
+    }
 }
 
 /// Loop-closure QC on the unwrapped network, then the SBAS solve. The QC runs
@@ -1129,6 +1160,7 @@ fn fit_post_gauge_velocity_with_model(
             seasonal_amplitude_rad: output.seasonal_amplitude,
             seasonal_phase_days: output.seasonal_phase_days,
             step_magnitude_rad: output.step_magnitude,
+            relaxation_amplitude_rad: output.relaxation_amplitude,
         },
     }
 }
@@ -1157,6 +1189,7 @@ fn fit_velocity_with_model(
             seasonal_amplitude_rad: output.seasonal_amplitude,
             seasonal_phase_days: output.seasonal_phase_days,
             step_magnitude_rad: output.step_magnitude,
+            relaxation_amplitude_rad: output.relaxation_amplitude,
         },
     }
 }
@@ -1356,6 +1389,7 @@ fn emit_displacement(
             seasonal_amplitude: scaled.seasonal_amplitude.as_ref(),
             seasonal_phase_days: spatial.velocity_terms.seasonal_phase_days.as_ref(),
             step_magnitude: &scaled.step_magnitude,
+            relaxation_amplitude: &scaled.relaxation_amplitude,
         },
         loop_closure: spatial.loop_closure.as_ref(),
     };
@@ -1576,6 +1610,9 @@ impl SpatialProducts {
         for layer in &mut self.velocity_terms.step_magnitude_rad {
             mask2_f64(layer, mask);
         }
+        for layer in &mut self.velocity_terms.relaxation_amplitude_rad {
+            mask2_f64(layer, mask);
+        }
         if let Some(qc) = self.loop_closure.as_mut() {
             mask2_f64(&mut qc.bad_loop_count, mask);
             mask2_f64(&mut qc.evaluable_loop_count, mask);
@@ -1684,6 +1721,11 @@ impl SpatialProducts {
             .map(|layer| trim2(&layer, target));
         self.velocity_terms.step_magnitude_rad =
             std::mem::take(&mut self.velocity_terms.step_magnitude_rad)
+                .iter()
+                .map(|layer| trim2(layer, target))
+                .collect();
+        self.velocity_terms.relaxation_amplitude_rad =
+            std::mem::take(&mut self.velocity_terms.relaxation_amplitude_rad)
                 .iter()
                 .map(|layer| trim2(layer, target))
                 .collect();
@@ -4738,6 +4780,17 @@ fn write_outputs(
     for (k, step) in quality.velocity_terms.step_magnitude.iter().enumerate() {
         write_f32(&format!("velocity_step_{k:02}.tif"), step.view())?;
     }
+    for (k, relaxation) in quality
+        .velocity_terms
+        .relaxation_amplitude
+        .iter()
+        .enumerate()
+    {
+        write_f32(
+            &format!("velocity_relaxation_{k:02}.tif"),
+            relaxation.view(),
+        )?;
+    }
     if let Some(qc) = quality.loop_closure {
         write_f32("loop_closure_bad_count.tif", qc.bad_loop_count.view())?;
         write_f32(
@@ -4859,6 +4912,7 @@ struct VelocityTermLayers<'a> {
     seasonal_amplitude: Option<&'a Array2<f64>>,
     seasonal_phase_days: Option<&'a Array2<f64>>,
     step_magnitude: &'a [Array2<f64>],
+    relaxation_amplitude: &'a [Array2<f64>],
 }
 
 /// Write each band of a `(bands, rows, cols)` layer as `{prefix}_NN.tif`.
@@ -4898,7 +4952,9 @@ mod tests {
     }
 
     use super::*;
-    use dolphin_core::config::{CompressedSlcPlan, InterferogramNetwork, ShpMethod};
+    use dolphin_core::config::{
+        CompressedSlcPlan, InterferogramNetwork, ShpMethod, VelocityRelaxation,
+    };
     use dolphin_core::{HalfWindow, Strides};
 
     #[test]
@@ -5123,6 +5179,7 @@ mod tests {
                     Array2::from_elem((2, 2), 3.0),
                     Array2::from_elem((2, 2), 4.0),
                 ],
+                relaxation_amplitude_rad: vec![Array2::from_elem((2, 2), 5.0)],
             },
             loop_closure: Some(LoopClosureQc {
                 bad_loop_count: Array2::from_elem((2, 2), 1.0),
@@ -5205,6 +5262,11 @@ mod tests {
             assert!(products
                 .velocity_terms
                 .step_magnitude_rad
+                .iter()
+                .all(|layer| layer[(row, col)].is_nan()));
+            assert!(products
+                .velocity_terms
+                .relaxation_amplitude_rad
                 .iter()
                 .all(|layer| layer[(row, col)].is_nan()));
             let loop_closure = products.loop_closure.as_ref().unwrap();
@@ -5757,6 +5819,7 @@ mod tests {
         let seasonal = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let fit = fit_velocity(
             &cfg,
@@ -7758,6 +7821,44 @@ mod tests {
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
 
+    /// Relaxation onsets resolve against acquisition 0 like step dates, and the
+    /// time constant passes through unchanged (issue #102).
+    #[test]
+    fn relaxation_terms_resolve_onset_and_tau() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.velocity_relaxation = vec![VelocityRelaxation {
+            onset_date: "2023-03-05".into(),
+            tau_days: 45.0,
+        }];
+        let files = dated_files(&["20230104", "20230609"]);
+        let model = velocity_model(&cfg, &files).unwrap();
+        assert!(!model.is_linear());
+        assert_eq!(
+            model.relaxation,
+            vec![RelaxationTerm {
+                onset_days: 60.0,
+                tau_days: 45.0,
+            }]
+        );
+    }
+
+    /// A relaxation with a non-positive time constant is not a model, so the run
+    /// fails instead of fitting a degenerate column.
+    #[test]
+    fn non_positive_relaxation_tau_fails_the_run() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.velocity_relaxation = vec![VelocityRelaxation {
+            onset_date: "2023-03-05".into(),
+            tau_days: 0.0,
+        }];
+        let error = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap_err();
+        assert!(error.to_string().contains("tau_days"), "{error}");
+        cfg.timeseries_options.velocity_relaxation[0].onset_date = "05/03/2023".into();
+        cfg.timeseries_options.velocity_relaxation[0].tau_days = 45.0;
+        let error = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap_err();
+        assert!(error.to_string().contains("velocity_relaxation"), "{error}");
+    }
+
     /// Step dates are resolved against acquisition 0, the same origin `days` uses.
     #[test]
     fn step_dates_resolve_to_days_from_acquisition_zero() {
@@ -7849,6 +7950,7 @@ mod tests {
             velocity_model: VelocityModel {
                 seasonal: false,
                 step_days: vec![step_day],
+                relaxation: Vec::new(),
             },
             loop_closure: None,
             velocity_terms: VelocityTerms::default(),

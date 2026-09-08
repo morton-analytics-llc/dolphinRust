@@ -6,6 +6,16 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Exponential relaxation term in the velocity time-function model** (issue #102).
+  `timeseries_options.velocity_relaxation: [{onset_date, tau_days}]` adds one
+  `H(t − t₀)·(1 − exp(−(t − t₀)/τ))` column per entry to the joint WLS fit alongside the
+  rate, seasonal, and step terms — post-seismic relaxation or aquifer recovery no longer
+  aliases into the reported rate. Emits `velocity_relaxation_NN.tif` (asymptotic amplitude,
+  displacement units) in list order. Onset and time constant are inputs, never fitted; a
+  non-positive `tau_days` fails validation. Default empty; the linear/seasonal/step paths
+  are unchanged with the term unset.
+
 ### Fixed
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
