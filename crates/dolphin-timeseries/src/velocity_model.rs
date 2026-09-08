@@ -23,6 +23,10 @@
 //! and neither is justified before the seasonal/step terms have been used on
 //! real data.
 
+use crate::inversion::{
+    correlation_diagnostics, pixel_layer, velocity_cadence_status, PixelCorrelationDiagnostics,
+    VelocityCadenceStatus, VelocityUncertaintyStatus,
+};
 use faer::prelude::SpSolver;
 use faer::{Mat, Side};
 use ndarray::{Array2, ArrayView3};
@@ -90,6 +94,27 @@ pub struct VelocityModelOutput {
     pub sigma: Array2<f64>,
     /// Regression residual root-mean-square in series units.
     pub residual_rms: Array2<f64>,
+    /// Number of dates with finite observations and positive finite precision.
+    pub valid_date_count: Array2<u32>,
+    /// Per-pixel weighted design-matrix rank over every configured column. A
+    /// design whose normal matrix fails to factor is reported at most `n_terms - 1`.
+    pub rank: Array2<u32>,
+    /// Residual degrees of freedom, `valid_date_count - rank`.
+    pub regression_dof: Array2<u32>,
+    /// Availability and interpretation of [`Self::sigma`].
+    pub uncertainty_status: Array2<VelocityUncertaintyStatus>,
+    /// Raw lag-one correlation of standardized residuals, including negative values.
+    pub lag1_rho: Array2<f64>,
+    /// Number of adjacent residual pairs used for [`Self::lag1_rho`].
+    pub correlation_pair_count: Array2<u32>,
+    /// Exact cadence classification for the valid date sequence.
+    pub cadence_status: Array2<VelocityCadenceStatus>,
+    /// Whether all requirements for the lag-one diagnostics were met.
+    pub correlation_available: Array2<bool>,
+    /// Diagnostic-only `sqrt(n / n_effective)`; it does not rescale [`Self::sigma`].
+    pub diagnostic_inflation_factor: Array2<f64>,
+    /// Diagnostic-only effective sample size clamped to `[1, n]`.
+    pub diagnostic_effective_sample_size: Array2<f64>,
     /// `hypot(a, b)` of the annual `a·sin + b·cos` pair, series units — the
     /// peak-to-mean seasonal amplitude. `None` unless [`VelocityModel::seasonal`].
     pub seasonal_amplitude: Option<Array2<f64>>,
@@ -101,12 +126,19 @@ pub struct VelocityModelOutput {
     pub step_magnitude: Vec<Array2<f64>>,
 }
 
-/// Fitted parameters and diagnostics for one pixel; all non-finite when the
-/// weighted normal equations are singular or the pixel has too few valid epochs.
+/// Fitted parameters and diagnostics for one pixel; the estimates are all
+/// non-finite when the weighted normal equations are singular or the pixel has
+/// too few valid epochs, while the support counts and statuses stay reportable.
 struct PixelModelFit {
     parameters: Vec<f64>,
     sigma_per_year: f64,
     residual_rms: f64,
+    valid_date_count: u32,
+    rank: u32,
+    regression_dof: u32,
+    uncertainty_status: VelocityUncertaintyStatus,
+    cadence_status: VelocityCadenceStatus,
+    correlation: PixelCorrelationDiagnostics,
 }
 
 /// Joint weighted least-squares fit of the rate and the configured optional
@@ -135,7 +167,10 @@ pub fn estimate_velocity_with_model(
     let design: Vec<Vec<f64>> = x.iter().map(|&t| model.basis_row(t)).collect();
     let fits: Vec<PixelModelFit> = (0..rows * cols)
         .into_par_iter()
-        .map(|idx| pixel_model_fit(&design, series, precisions, (idx / cols, idx % cols), model))
+        .map(|idx| {
+            let pixel = (idx / cols, idx % cols);
+            pixel_model_fit(x, &design, series, precisions, pixel, model)
+        })
         .collect();
 
     let layer = |value: &dyn Fn(&PixelModelFit) -> f64| {
@@ -147,6 +182,16 @@ pub fn estimate_velocity_with_model(
         velocity: layer(&|fit| fit.parameters[1] * DAYS_PER_YEAR),
         sigma: layer(&|fit| fit.sigma_per_year),
         residual_rms: layer(&|fit| fit.residual_rms),
+        valid_date_count: pixel_layer(&fits, rows, cols, |fit| fit.valid_date_count),
+        rank: pixel_layer(&fits, rows, cols, |fit| fit.rank),
+        regression_dof: pixel_layer(&fits, rows, cols, |fit| fit.regression_dof),
+        uncertainty_status: pixel_layer(&fits, rows, cols, |fit| fit.uncertainty_status),
+        lag1_rho: layer(&|fit| fit.correlation.lag1_rho),
+        correlation_pair_count: pixel_layer(&fits, rows, cols, |fit| fit.correlation.pair_count),
+        cadence_status: pixel_layer(&fits, rows, cols, |fit| fit.cadence_status),
+        correlation_available: pixel_layer(&fits, rows, cols, |fit| fit.correlation.available),
+        diagnostic_inflation_factor: layer(&|fit| fit.correlation.inflation_factor),
+        diagnostic_effective_sample_size: layer(&|fit| fit.correlation.effective_sample_size),
         seasonal_amplitude: model
             .seasonal
             .then(|| layer(&|fit| fit.parameters[2].hypot(fit.parameters[3]))),
@@ -168,6 +213,7 @@ fn seasonal_peak_day(a: f64, b: f64) -> f64 {
 }
 
 fn pixel_model_fit(
+    x: &[f64],
     design: &[Vec<f64>],
     series: ArrayView3<f64>,
     precisions: Option<ArrayView3<f64>>,
@@ -178,32 +224,38 @@ fn pixel_model_fit(
     let precision = |t: usize| {
         let p = precisions.map_or(1.0, |ps| ps[(t, pixel.0, pixel.1)]);
         let y = series[(t, pixel.0, pixel.1)];
-        match p.is_finite() && p > 0.0 && y.is_finite() {
+        match x[t].is_finite() && p.is_finite() && p > 0.0 && y.is_finite() {
             true => p,
             false => 0.0,
         }
     };
     let valid: Vec<usize> = (0..design.len()).filter(|&t| precision(t) > 0.0).collect();
-    // A fit with no residual degrees of freedom reproduces the data exactly and
-    // reports a meaningless zero sigma; require at least one.
-    if valid.len() <= n {
-        return singular_fit(n);
-    }
+    let support = FitSupport {
+        valid_date_count: u32::try_from(valid.len()).unwrap_or(u32::MAX),
+        cadence_status: velocity_cadence_status(x, &valid),
+    };
     let normal = Mat::from_fn(n, n, |i, j| {
         valid
             .iter()
             .map(|&t| design[t][i] * precision(t) * design[t][j])
             .sum::<f64>()
     });
+    // A fit with no residual degrees of freedom reproduces the data exactly and
+    // reports a meaningless zero sigma; require at least one.
+    if valid.len() <= n {
+        return singular_fit(n, support, valid.len().min(n));
+    }
+    let Ok(llt) = normal.cholesky(Side::Lower) else {
+        // The factorization failed, so the weighted design is not full rank; the
+        // eigenvalue count is capped so the status and the rank cannot disagree.
+        return singular_fit(n, support, numerical_rank(&normal).min(n - 1));
+    };
     let rhs = Mat::from_fn(n, 1, |i, _| {
         valid
             .iter()
             .map(|&t| design[t][i] * precision(t) * series[(t, pixel.0, pixel.1)])
             .sum::<f64>()
     });
-    let Ok(llt) = normal.cholesky(Side::Lower) else {
-        return singular_fit(n);
-    };
     let beta = llt.solve(rhs);
     let parameters: Vec<f64> = (0..n).map(|i| beta[(i, 0)]).collect();
 
@@ -220,28 +272,90 @@ fn pixel_model_fit(
         .map(|(&t, r)| precision(t) * r * r)
         .sum();
     let residual_sse: f64 = residuals.iter().map(|r| r * r).sum();
-    let residual_scale = weighted_sse / (valid.len() - n) as f64;
+    let regression_dof = (valid.len() - n) as u32;
+    let residual_scale = weighted_sse / f64::from(regression_dof);
     // Rate variance is the (1,1) entry of the inverted normal matrix; solving
     // against e1 costs one back-substitution instead of a full inverse.
     let unit_rate = Mat::from_fn(n, 1, |i, _| f64::from(i == 1));
     let rate_variance = llt.solve(unit_rate)[(1, 0)] * residual_scale;
-    let sigma_per_year = match rate_variance.is_finite() && rate_variance > 0.0 {
+    let uncertainty_available = residual_scale.is_finite()
+        && residual_scale > 0.0
+        && rate_variance.is_finite()
+        && rate_variance > 0.0;
+    let sigma_per_year = match uncertainty_available {
         true => rate_variance.sqrt() * DAYS_PER_YEAR,
         false => f64::NAN,
     };
+    let uncertainty_status = match uncertainty_available {
+        true => VelocityUncertaintyStatus::IidConditional,
+        false => VelocityUncertaintyStatus::Unavailable,
+    };
+    let standardized_residuals: Vec<f64> = match uncertainty_available {
+        true => valid
+            .iter()
+            .zip(&residuals)
+            .map(|(&t, r)| precision(t).sqrt() * r / residual_scale.sqrt())
+            .collect(),
+        false => Vec::new(),
+    };
+    let correlation = correlation_diagnostics(
+        &standardized_residuals,
+        uncertainty_status,
+        support.cadence_status,
+        support.valid_date_count,
+    );
 
     PixelModelFit {
         parameters,
         sigma_per_year,
         residual_rms: (residual_sse / valid.len() as f64).sqrt(),
+        valid_date_count: support.valid_date_count,
+        rank: u32::try_from(n).unwrap_or(u32::MAX),
+        regression_dof,
+        uncertainty_status,
+        cadence_status: support.cadence_status,
+        correlation,
     }
 }
 
-fn singular_fit(n: usize) -> PixelModelFit {
+/// Per-pixel support facts that are reportable whether or not the fit succeeds.
+#[derive(Clone, Copy)]
+struct FitSupport {
+    valid_date_count: u32,
+    cadence_status: VelocityCadenceStatus,
+}
+
+/// Count of eigenvalues of the symmetric normal matrix above a relative floor.
+fn numerical_rank(normal: &Mat<f64>) -> usize {
+    let eigenvalues = normal.selfadjoint_eigenvalues(Side::Lower);
+    let largest = eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    let floor = largest * normal.nrows() as f64 * f64::EPSILON;
+    eigenvalues
+        .iter()
+        .filter(|&&value| value.is_finite() && value > floor)
+        .count()
+}
+
+fn singular_fit(n: usize, support: FitSupport, rank: usize) -> PixelModelFit {
+    let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+    let uncertainty_status = VelocityUncertaintyStatus::Unavailable;
     PixelModelFit {
         parameters: vec![f64::NAN; n],
         sigma_per_year: f64::NAN,
         residual_rms: f64::NAN,
+        valid_date_count: support.valid_date_count,
+        rank,
+        regression_dof: support.valid_date_count.saturating_sub(rank),
+        uncertainty_status,
+        cadence_status: support.cadence_status,
+        correlation: correlation_diagnostics(
+            &[],
+            uncertainty_status,
+            support.cadence_status,
+            support.valid_date_count,
+        ),
     }
 }
 
@@ -481,6 +595,121 @@ mod tests {
             }
         }
         assert_eq!(out.velocity.len_of(Axis(0)), 2);
+    }
+
+    /// Contract (issue #115): the seasonal fit's rate sigma is the IID-conditional
+    /// standard error of the rate column — exactly linear in the residual scale,
+    /// invariant to a common precision factor, with `dof = n - 4` and the same
+    /// support/cadence diagnostics the linear path reports.
+    #[test]
+    fn seasonal_rate_sigma_is_iid_conditional_with_full_diagnostics() {
+        let days = sample_days();
+        let omega = std::f64::consts::TAU / DAYS_PER_YEAR;
+        // Deterministic zero-mean "noise" that no basis column can absorb.
+        let noise = |k: usize| ((k * 7919) % 13) as f64 - 6.0;
+        let series_at = |scale: f64| -> Vec<f64> {
+            days.iter()
+                .enumerate()
+                .map(|(k, &t)| {
+                    -12.0 * t / DAYS_PER_YEAR + 5.0 * (omega * t).cos() + scale * noise(k)
+                })
+                .collect()
+        };
+        let model = VelocityModel {
+            seasonal: true,
+            step_days: Vec::new(),
+        };
+        let (unit, precisions) = one_pixel(&series_at(1.0));
+        let (doubled, _) = one_pixel(&series_at(2.0));
+        let scaled_precisions = precisions.mapv(|p| p * 37.0);
+
+        let base =
+            estimate_velocity_with_model(&days, unit.view(), Some(precisions.view()), &model);
+        let noisier =
+            estimate_velocity_with_model(&days, doubled.view(), Some(precisions.view()), &model);
+        let reweighted = estimate_velocity_with_model(
+            &days,
+            unit.view(),
+            Some(scaled_precisions.view()),
+            &model,
+        );
+        let unweighted = estimate_velocity_with_model(&days, unit.view(), None, &model);
+
+        let sigma = base.sigma[(0, 0)];
+        assert!(sigma.is_finite() && sigma > 0.0);
+        assert!(
+            (noisier.sigma[(0, 0)] - 2.0 * sigma).abs() < 1e-9 * sigma,
+            "linear in scale"
+        );
+        assert!(
+            (reweighted.sigma[(0, 0)] - sigma).abs() < 1e-9 * sigma,
+            "precision-invariant"
+        );
+        assert!(
+            (unweighted.sigma[(0, 0)] - sigma).abs() < 1e-9 * sigma,
+            "unit == None"
+        );
+        assert_eq!(base.valid_date_count[(0, 0)], 122);
+        assert_eq!(base.rank[(0, 0)], 4);
+        assert_eq!(base.regression_dof[(0, 0)], 118);
+        assert_eq!(
+            base.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::IidConditional
+        );
+        assert_eq!(
+            base.cadence_status[(0, 0)],
+            VelocityCadenceStatus::RegularContiguous
+        );
+        assert!(base.correlation_available[(0, 0)]);
+        assert_eq!(base.correlation_pair_count[(0, 0)], 121);
+        assert!(base.lag1_rho[(0, 0)].is_finite());
+    }
+
+    /// A zero series (the spatial reference pixel) has zero residual scale: the
+    /// rate is reported, the sigma abstains — matching the linear path's rule.
+    #[test]
+    fn zero_series_reports_rate_but_abstains_on_sigma() {
+        let days = sample_days();
+        let (series, precisions) = one_pixel(&vec![0.0; days.len()]);
+        let model = VelocityModel {
+            seasonal: true,
+            step_days: Vec::new(),
+        };
+        let out =
+            estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
+        assert_eq!(out.velocity[(0, 0)], 0.0);
+        assert!(out.sigma[(0, 0)].is_nan());
+        assert_eq!(out.rank[(0, 0)], 4);
+        assert_eq!(out.regression_dof[(0, 0)], 118);
+        assert_eq!(
+            out.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::Unavailable
+        );
+        assert!(!out.correlation_available[(0, 0)]);
+    }
+
+    /// A step epoch before every acquisition duplicates the intercept column: the
+    /// design is rank deficient and reports it, rather than a full rank it lacks.
+    #[test]
+    fn collinear_step_reports_deficient_rank() {
+        let days = sample_days();
+        let values: Vec<f64> = days.iter().map(|&t| 0.5 * t + 1.0).collect();
+        let (series, precisions) = one_pixel(&values);
+        let model = VelocityModel {
+            seasonal: false,
+            step_days: vec![-1.0],
+        };
+        let out =
+            estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
+        assert!(out.velocity[(0, 0)].is_nan());
+        assert!(out.sigma[(0, 0)].is_nan());
+        assert_eq!(out.valid_date_count[(0, 0)], 122);
+        assert_eq!(out.rank[(0, 0)], 2);
+        assert_eq!(out.regression_dof[(0, 0)], 120);
+        assert_eq!(
+            out.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::Unavailable
+        );
     }
 
     #[test]

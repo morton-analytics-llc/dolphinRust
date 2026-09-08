@@ -124,6 +124,10 @@ pub enum VelocityEstimator {
     /// Finite post-gauge dates, ordinary least squares. This is selected when
     /// the IID-conditional velocity component is enabled.
     LinearPostGaugeUnitPrecision,
+    /// Finite post-gauge dates with configured seasonal/step terms, ordinary
+    /// least squares. This is selected when the IID-conditional velocity
+    /// component is enabled alongside a time-function model.
+    TimeFunctionPostGaugeUnitPrecision,
     /// Full reconstructed series with configured seasonal/step terms and unit
     /// relative precision.
     TimeFunctionFullSeriesUnitPrecision,
@@ -140,6 +144,7 @@ impl VelocityEstimator {
                 "linear_full_series_stitched_crlb_with_unit_fallback"
             }
             Self::LinearPostGaugeUnitPrecision => "linear_post_gauge_unit_precision",
+            Self::TimeFunctionPostGaugeUnitPrecision => "time_function_post_gauge_unit_precision",
             Self::TimeFunctionFullSeriesUnitPrecision => "time_function_full_series_unit_precision",
             Self::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback => {
                 "time_function_full_series_stitched_crlb_with_unit_fallback"
@@ -256,7 +261,8 @@ pub struct DisplacementOutput {
 pub struct VelocityTemporalDiagnostics {
     /// Number of finite post-gauge dates used by the fit.
     pub valid_date_count: Array2<u32>,
-    /// Rank of the intercept-plus-slope design.
+    /// Rank of the temporal design: intercept, rate, and any configured
+    /// seasonal/step columns.
     pub regression_rank: Array2<u32>,
     /// Residual degrees of freedom, `valid_date_count - regression_rank`.
     pub regression_dof: Array2<u32>,
@@ -996,10 +1002,6 @@ fn fit_velocity(
 ) -> Result<VelocityFit> {
     let options = &cfg.timeseries_options;
     if options.write_velocity_uncertainty {
-        anyhow::ensure!(
-            model.is_linear(),
-            "velocity uncertainty is validated only for the linear temporal model"
-        );
         let reference = reference_point
             .context("velocity uncertainty requires a final spatial reference point")?;
         anyhow::ensure!(
@@ -1015,6 +1017,14 @@ fn fit_velocity(
         let series = series_with_reference(displacement);
         let post_gauge = series.slice(s![1.., .., ..]);
         let precision = post_gauge.mapv(|value| f64::from(value.is_finite()));
+        if !model.is_linear() {
+            return Ok(fit_post_gauge_velocity_with_model(
+                &days[1..],
+                post_gauge,
+                precision.view(),
+                model,
+            ));
+        }
         let output = estimate_velocity_with_diagnostics(&days[1..], post_gauge, precision.view());
         return Ok(VelocityFit {
             velocity: output.velocity,
@@ -1088,8 +1098,44 @@ fn fit_velocity(
     })
 }
 
-/// The joint seasonal/step fit. Conditional standard-error output is currently
-/// restricted to the linear path, so this returns point estimates and residuals.
+/// The joint seasonal/step fit on the finite post-gauge dates with unit relative
+/// precision — the time-function counterpart of the linear IID-conditional
+/// component, emitting the same sigma and temporal-fit diagnostics.
+fn fit_post_gauge_velocity_with_model(
+    days: &[f64],
+    post_gauge: ArrayView3<f64>,
+    precision: ArrayView3<f64>,
+    model: &VelocityModel,
+) -> VelocityFit {
+    let output = estimate_velocity_with_model(days, post_gauge, Some(precision), model);
+    VelocityFit {
+        velocity: output.velocity,
+        estimator: VelocityEstimator::TimeFunctionPostGaugeUnitPrecision,
+        sigma: Some(output.sigma),
+        diagnostics: Some(VelocityTemporalDiagnostics {
+            valid_date_count: output.valid_date_count,
+            regression_rank: output.rank,
+            regression_dof: output.regression_dof,
+            uncertainty_status: output.uncertainty_status,
+            lag1_rho: output.lag1_rho,
+            correlation_pair_count: output.correlation_pair_count,
+            cadence_status: output.cadence_status,
+            correlation_available: output.correlation_available,
+            diagnostic_inflation_factor: output.diagnostic_inflation_factor,
+            diagnostic_effective_sample_size: output.diagnostic_effective_sample_size,
+        }),
+        residual_rms: Some(output.residual_rms),
+        terms: VelocityTerms {
+            seasonal_amplitude_rad: output.seasonal_amplitude,
+            seasonal_phase_days: output.seasonal_phase_days,
+            step_magnitude_rad: output.step_magnitude,
+        },
+    }
+}
+
+/// The joint seasonal/step fit on the full reconstructed series. Conditional
+/// standard-error output is gated by `write_velocity_uncertainty` and lives on
+/// the post-gauge path, so this returns point estimates and residuals.
 fn fit_velocity_with_model(
     days: &[f64],
     series: ArrayView3<f64>,
@@ -3700,12 +3746,6 @@ fn update_one_burst(
 
 fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
     cfg.validate_supported_options()?;
-    anyhow::ensure!(
-        !cfg.timeseries_options.write_velocity_uncertainty
-            || (!cfg.timeseries_options.velocity_seasonal
-                && cfg.timeseries_options.velocity_step_dates.is_empty()),
-        "timeseries_options.write_velocity_uncertainty is validated only for the linear temporal model"
-    );
     if cfg.phase_linking.write_covariance_operator {
         anyhow::ensure!(
             cfg.phase_linking.max_num_compressed > 0,
@@ -5690,6 +5730,64 @@ mod tests {
         assert_eq!(
             diagnostics.uncertainty_status[(0, 0)],
             VelocityUncertaintyStatus::IidConditional
+        );
+        assert_eq!(
+            diagnostics.cadence_status[(0, 0)],
+            VelocityCadenceStatus::RegularContiguous
+        );
+    }
+
+    /// Issue #115: the IID-conditional component is available with a seasonal
+    /// model — same post-gauge unit-precision gauge, sigma from the rate column of
+    /// the joint fit, full diagnostics, and the spatial reference still abstains.
+    #[test]
+    fn velocity_uncertainty_is_emitted_for_the_seasonal_model() {
+        let days: Vec<f64> = (0..13).map(|t| f64::from(t) * 36.0).collect();
+        let omega = std::f64::consts::TAU / 365.25;
+        let displacement = Array3::from_shape_fn((12, 1, 2), |(t, _, col)| match col {
+            0 => {
+                let day = days[t + 1];
+                0.01 * day + 0.5 * (omega * day).cos() + ((t * 5) % 3) as f64 * 0.1
+            }
+            _ => 0.0,
+        });
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.velocity_seasonal = true;
+        let seasonal = VelocityModel {
+            seasonal: true,
+            step_days: Vec::new(),
+        };
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            None,
+            Some((0, 1)),
+            &seasonal,
+        )
+        .unwrap();
+
+        assert!(validate_config(&cfg).is_ok());
+        assert_eq!(
+            fit.estimator,
+            VelocityEstimator::TimeFunctionPostGaugeUnitPrecision
+        );
+        let sigma = fit.sigma.as_ref().unwrap();
+        assert!(sigma[(0, 0)].is_finite() && sigma[(0, 0)] > 0.0);
+        assert!(sigma[(0, 1)].is_nan(), "the spatial reference must abstain");
+        assert!(fit.terms.seasonal_amplitude_rad.is_some());
+        let diagnostics = fit.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.valid_date_count[(0, 0)], 12);
+        assert_eq!(diagnostics.regression_rank[(0, 0)], 4);
+        assert_eq!(diagnostics.regression_dof[(0, 0)], 8);
+        assert_eq!(
+            diagnostics.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::IidConditional
+        );
+        assert_eq!(
+            diagnostics.uncertainty_status[(0, 1)],
+            VelocityUncertaintyStatus::Unavailable
         );
         assert_eq!(
             diagnostics.cadence_status[(0, 0)],
@@ -7729,15 +7827,6 @@ mod tests {
             "fixture must show the linear fit absorbing the cycle, got {}",
             linear.velocity[(0, 0)]
         );
-    }
-
-    #[test]
-    fn velocity_uncertainty_rejects_optional_time_function_models() {
-        let mut cfg = DisplacementWorkflow::default();
-        cfg.timeseries_options.write_velocity_uncertainty = true;
-        cfg.timeseries_options.velocity_seasonal = true;
-        let error = validate_config(&cfg).unwrap_err();
-        assert!(error.to_string().contains("linear temporal model"));
     }
 
     /// The bounded/tiled path re-fits through the same front door, so a configured
