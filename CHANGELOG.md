@@ -6,6 +6,14 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Per-pair perpendicular/parallel baseline** (issue #101). `dolphin_workflows::pair_baseline`
+  computes the along-track-corrected perpendicular and parallel (range) baseline between two
+  satellite ECEF states imaging a common ground target, matching dolphin's along-track-shift
+  correction (`baseline.py` PR #681, ISCE2 issue #137 lineage). `orbit_pair_baseline` sources it
+  directly from two `CslcOrbit`s and a target lon/lat, reusing the orbit ingest already built for
+  geometry provenance. Standalone diagnostic — not wired into phase-linking/inversion.
+
 ### Changed
 - **`PhaseAngleLinearization`'s EMI inverse is now unrepresentable instead of `expect`ed**
   (issue #98). The prepared branch state folds the EMI regularized-gamma inverse into the
