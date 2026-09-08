@@ -59,4 +59,6 @@ pub use temporal_covariance_batch::{
     TemporalFactorScalarBatchMetrics, TemporalFactorScalarBatchReport, TemporalFactorScalarPair,
     TEMPORAL_FACTOR_SCALAR_MAX_WORKER_SCRATCH_BYTES,
 };
-pub use velocity_model::{estimate_velocity_with_model, VelocityModel, VelocityModelOutput};
+pub use velocity_model::{
+    estimate_velocity_with_model, RelaxationTerm, VelocityModel, VelocityModelOutput,
+};

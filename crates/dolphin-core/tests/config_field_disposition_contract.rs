@@ -78,6 +78,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "timeseries_options.correct_velocity_temporal_correlation",
     "timeseries_options.velocity_seasonal",
     "timeseries_options.velocity_step_dates",
+    "timeseries_options.velocity_relaxation",
     "timeseries_options.mask_unwrap_loop_errors",
     "unwrap_options.snaphu_options.ntiles",
     "unwrap_options.snaphu_options.tile_overlap",
@@ -339,6 +340,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
             correct_velocity_temporal_correlation,
             velocity_seasonal,
             velocity_step_dates,
+            velocity_relaxation,
             mask_unwrap_loop_errors,
         ]
     );
@@ -358,6 +360,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
         correct_velocity_temporal_correlation,
         velocity_seasonal,
         velocity_step_dates,
+        velocity_relaxation,
         mask_unwrap_loop_errors,
     );
 }

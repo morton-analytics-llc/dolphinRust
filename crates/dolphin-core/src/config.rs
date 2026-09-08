@@ -383,6 +383,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.velocity_step_dates is nonempty"
     ),
     conditional!(
+        "timeseries_options.velocity_relaxation",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.velocity_relaxation is nonempty"
+    ),
+    conditional!(
         "timeseries_options.mask_unwrap_loop_errors",
         "CFG-TIMESERIES",
         "timeseries_options.mask_unwrap_loop_errors is true"
@@ -863,6 +868,13 @@ pub struct TimeseriesOptions {
     /// detected from the data: a step whose timing is fitted is a different
     /// (nonlinear) estimator with its own failure modes. Empty by default.
     pub velocity_step_dates: Vec<String>,
+    /// Exponential relaxation terms `A·(1 − exp(−(t − t₀)/τ))` fitted jointly with
+    /// the linear rate after a supplied onset — post-seismic relaxation, aquifer
+    /// recovery. Each entry adds one basis column and emits
+    /// `velocity_relaxation_NN.tif` (the asymptotic amplitude `A`) in list order.
+    /// Onset and time constant are **inputs**, never fitted: jointly estimating
+    /// them is a nonlinear problem out of scope here (issue #102). Empty by default.
+    pub velocity_relaxation: Vec<VelocityRelaxation>,
     /// Close every triangle in the **unwrapped** interferogram network before the
     /// SBAS solve and blank pixels whose loops miss closure by more than half a
     /// cycle — a 2π unwrap error, which the wrapped closure-phase layer cannot
@@ -892,9 +904,19 @@ impl Default for TimeseriesOptions {
             correct_velocity_temporal_correlation: false,
             velocity_seasonal: false,
             velocity_step_dates: Vec::new(),
+            velocity_relaxation: Vec::new(),
             mask_unwrap_loop_errors: false,
         }
     }
+}
+
+/// One exponential relaxation term of the velocity time-function model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VelocityRelaxation {
+    /// Onset date (`YYYY-MM-DD`) of the relaxation, resolved against acquisition 0.
+    pub onset_date: String,
+    /// Relaxation time constant in days; must be positive and finite.
+    pub tau_days: f64,
 }
 
 /// Production temporal-uncertainty estimator selection.
@@ -1531,6 +1553,7 @@ impl DisplacementWorkflow {
             }
             if self.timeseries_options.velocity_seasonal
                 || !self.timeseries_options.velocity_step_dates.is_empty()
+                || !self.timeseries_options.velocity_relaxation.is_empty()
             {
                 return Err(CoreError::InvalidConfig(
                     "reml_covariance_parameter_adjusted_scalar temporal uncertainty supports only the frozen linear temporal model".into(),

@@ -121,8 +121,10 @@ work_directory: /out           # outputs are written here
 The complete config tree, with every field documented, is the rustdoc for
 `dolphin_core::config::DisplacementWorkflow` (`cargo doc --no-deps -p dolphin-core --open`).
 
-`write_velocity_uncertainty: true` works with the linear model and with `velocity_seasonal: true`
-or non-empty `velocity_step_dates`; with a time-function model the reported `velocity_sigma` is
+`write_velocity_uncertainty: true` works with the linear model and with `velocity_seasonal: true`,
+non-empty `velocity_step_dates`, or non-empty `velocity_relaxation` (each entry
+`{onset_date: YYYY-MM-DD, tau_days: τ}` adds an `A·(1 − exp(−(t − t₀)/τ))` column and emits
+`velocity_relaxation_NN.tif`); with a time-function model the reported `velocity_sigma` is
 the IID-conditional standard error of the rate column of the joint fit, and
 `velocity_regression_rank` counts every configured column. Enabling it
 also changes the point estimator from the full-series fit using stitched-CRLB relative precision

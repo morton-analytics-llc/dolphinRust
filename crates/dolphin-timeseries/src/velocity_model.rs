@@ -16,12 +16,12 @@
 //! [`VelocityModel::is_linear`] the caller stays on the existing degree-1
 //! functions — there is no "linear through the general path" to drift.
 //!
-//! Basis, in column order: `[1, t, (sin ωt, cos ωt)?, H(t − t_k)…]` with
-//! `ω = 2π/365.25 d⁻¹` and `H` the Heaviside step. Post-seismic
-//! (exponential/logarithmic) relaxation is **not** here: it needs a relaxation
-//! time constant, which is a fitted nonlinear parameter or another config knob,
-//! and neither is justified before the seasonal/step terms have been used on
-//! real data.
+//! Basis, in column order:
+//! `[1, t, (sin ωt, cos ωt)?, H(t − t_k)…, H(t − t_j)·(1 − exp(−(t − t_j)/τ_j))…]`
+//! with `ω = 2π/365.25 d⁻¹` and `H` the Heaviside step. The last group is the
+//! post-seismic / aquifer-recovery relaxation term (issue #102): its onset `t_j`
+//! and time constant `τ_j` are **inputs**, like the step epochs — fitting them
+//! jointly is a nonlinear problem with its own failure modes and is out of scope.
 
 use crate::inversion::{
     correlation_diagnostics, pixel_layer, velocity_cadence_status, PixelCorrelationDiagnostics,
@@ -47,6 +47,29 @@ pub struct VelocityModel {
     /// from acquisition 0). One extra basis column each; the epoch is an input,
     /// never detected from the data.
     pub step_days: Vec<f64>,
+    /// Exponential relaxation terms, one basis column each, in the same units and
+    /// origin as `x`. Onset and time constant are inputs, never fitted.
+    pub relaxation: Vec<RelaxationTerm>,
+}
+
+/// One exponential relaxation basis function
+/// `H(t − onset) · (1 − exp(−(t − onset) / tau))`: zero before the onset, rising
+/// toward the fitted amplitude with time constant `tau_days`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelaxationTerm {
+    /// Onset in decimal days from acquisition 0.
+    pub onset_days: f64,
+    /// Relaxation time constant in days; must be positive.
+    pub tau_days: f64,
+}
+
+impl RelaxationTerm {
+    fn basis(&self, t: f64) -> f64 {
+        match t >= self.onset_days {
+            true => 1.0 - (-(t - self.onset_days) / self.tau_days).exp(),
+            false => 0.0,
+        }
+    }
 }
 
 impl VelocityModel {
@@ -54,12 +77,12 @@ impl VelocityModel {
     /// existing degree-1 estimators, which this path does not attempt to replace.
     #[must_use]
     pub fn is_linear(&self) -> bool {
-        !self.seasonal && self.step_days.is_empty()
+        !self.seasonal && self.step_days.is_empty() && self.relaxation.is_empty()
     }
 
     /// Number of fitted parameters: intercept + rate + optional terms.
     fn n_terms(&self) -> usize {
-        2 + 2 * usize::from(self.seasonal) + self.step_days.len()
+        self.relaxation_offset() + self.relaxation.len()
     }
 
     /// One row of the design matrix at time `t`.
@@ -71,12 +94,18 @@ impl VelocityModel {
             row.push(omega_t.cos());
         }
         row.extend(self.step_days.iter().map(|&step| f64::from(t >= step)));
+        row.extend(self.relaxation.iter().map(|term| term.basis(t)));
         row
     }
 
     /// Column index of the first step term.
     fn step_offset(&self) -> usize {
         2 + 2 * usize::from(self.seasonal)
+    }
+
+    /// Column index of the first relaxation term.
+    fn relaxation_offset(&self) -> usize {
+        self.step_offset() + self.step_days.len()
     }
 }
 
@@ -124,6 +153,9 @@ pub struct VelocityModelOutput {
     /// Fitted magnitude of each configured step, series units, in `step_days`
     /// order. Empty when no step is configured.
     pub step_magnitude: Vec<Array2<f64>>,
+    /// Fitted asymptotic amplitude of each configured relaxation, series units,
+    /// in `relaxation` order. Empty when no relaxation is configured.
+    pub relaxation_amplitude: Vec<Array2<f64>>,
 }
 
 /// Fitted parameters and diagnostics for one pixel; the estimates are all
@@ -178,6 +210,7 @@ pub fn estimate_velocity_with_model(
     };
     let parameter = |i: usize| layer(&move |fit: &PixelModelFit| fit.parameters[i]);
     let offset = model.step_offset();
+    let relaxation_offset = model.relaxation_offset();
     VelocityModelOutput {
         velocity: layer(&|fit| fit.parameters[1] * DAYS_PER_YEAR),
         sigma: layer(&|fit| fit.sigma_per_year),
@@ -200,6 +233,9 @@ pub fn estimate_velocity_with_model(
             .then(|| layer(&|fit| seasonal_peak_day(fit.parameters[2], fit.parameters[3]))),
         step_magnitude: (0..model.step_days.len())
             .map(|k| parameter(offset + k))
+            .collect(),
+        relaxation_amplitude: (0..model.relaxation.len())
+            .map(|k| parameter(relaxation_offset + k))
             .collect(),
     }
 }
@@ -395,6 +431,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -445,6 +482,7 @@ mod tests {
             let model = VelocityModel {
                 seasonal: true,
                 step_days: Vec::new(),
+                relaxation: Vec::new(),
             };
             let seasonal =
                 estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -478,6 +516,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: false,
             step_days: vec![step_day],
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -511,6 +550,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: vec![step_day],
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -538,6 +578,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -563,6 +604,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -583,6 +625,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -618,6 +661,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let (unit, precisions) = one_pixel(&series_at(1.0));
         let (doubled, _) = one_pixel(&series_at(2.0));
@@ -674,6 +718,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: true,
             step_days: Vec::new(),
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -698,6 +743,7 @@ mod tests {
         let model = VelocityModel {
             seasonal: false,
             step_days: vec![-1.0],
+            relaxation: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -706,6 +752,80 @@ mod tests {
         assert_eq!(out.valid_date_count[(0, 0)], 122);
         assert_eq!(out.rank[(0, 0)], 2);
         assert_eq!(out.regression_dof[(0, 0)], 120);
+        assert_eq!(
+            out.uncertainty_status[(0, 0)],
+            VelocityUncertaintyStatus::Unavailable
+        );
+    }
+
+    /// Contract (issue #102): a noiseless series built from a known rate plus an
+    /// exponential relaxation `A·(1 − exp(−(t − t0)/τ))` after a supplied onset
+    /// returns the rate and amplitude that built it, and the linear-only fit on the
+    /// same series is measurably wrong — the relaxation aliases into its slope.
+    #[test]
+    fn recovers_known_relaxation_without_biasing_the_rate() {
+        let days = sample_days();
+        let (rate_per_year, amplitude, onset, tau) = (-4.0, 30.0, 400.0, 90.0);
+        let values: Vec<f64> = days
+            .iter()
+            .map(|&t| {
+                let relaxed = match t >= onset {
+                    true => amplitude * (1.0 - (-(t - onset) / tau).exp()),
+                    false => 0.0,
+                };
+                rate_per_year * t / DAYS_PER_YEAR + relaxed
+            })
+            .collect();
+        let (series, precisions) = one_pixel(&values);
+        let model = VelocityModel {
+            relaxation: vec![RelaxationTerm {
+                onset_days: onset,
+                tau_days: tau,
+            }],
+            ..VelocityModel::default()
+        };
+        let out =
+            estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
+        assert!(
+            (out.velocity[(0, 0)] - rate_per_year).abs() < 1e-8,
+            "rate {} != {rate_per_year}",
+            out.velocity[(0, 0)]
+        );
+        assert!(
+            (out.relaxation_amplitude[0][(0, 0)] - amplitude).abs() < 1e-8,
+            "amplitude {} != {amplitude}",
+            out.relaxation_amplitude[0][(0, 0)]
+        );
+        assert!(out.residual_rms[(0, 0)] < 1e-8);
+        assert_eq!(out.rank[(0, 0)], 3);
+
+        let linear = estimate_velocity_with_uncertainty(&days, series.view(), precisions.view());
+        let linear_error = (linear.velocity[(0, 0)] - rate_per_year).abs();
+        assert!(
+            linear_error > 5.0,
+            "linear-only fit must absorb the relaxation into its rate; error was {linear_error}"
+        );
+    }
+
+    /// The relaxation column is exactly zero before its onset, so a relaxation
+    /// whose onset falls after every acquisition is a collinear-with-nothing zero
+    /// column: rank deficient and reported as such, not a silent full-rank fit.
+    #[test]
+    fn relaxation_after_the_last_acquisition_is_rank_deficient() {
+        let days = sample_days();
+        let values: Vec<f64> = days.iter().map(|&t| 0.5 * t + 1.0).collect();
+        let (series, precisions) = one_pixel(&values);
+        let model = VelocityModel {
+            relaxation: vec![RelaxationTerm {
+                onset_days: days[days.len() - 1] + 1.0,
+                tau_days: 30.0,
+            }],
+            ..VelocityModel::default()
+        };
+        let out =
+            estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
+        assert!(out.velocity[(0, 0)].is_nan());
+        assert_eq!(out.rank[(0, 0)], 2);
         assert_eq!(
             out.uncertainty_status[(0, 0)],
             VelocityUncertaintyStatus::Unavailable
