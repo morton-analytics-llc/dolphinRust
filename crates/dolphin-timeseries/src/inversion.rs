@@ -676,7 +676,12 @@ pub fn estimate_velocity_with_diagnostics(
         .map(|idx| {
             let fit =
                 velocity_pixel_uncertainty_fit(x, series, precisions, (idx / cols, idx % cols));
-            let correlation = correlation_diagnostics(&fit);
+            let correlation = correlation_diagnostics(
+                &fit.standardized_residuals,
+                fit.uncertainty_status,
+                fit.cadence_status,
+                fit.valid_date_count,
+            );
             PixelVelocityDiagnostics { fit, correlation }
         })
         .collect();
@@ -723,7 +728,7 @@ pub fn estimate_velocity_with_precisions(
     Array2::from_shape_vec((rows, cols), values).expect("velocity shape")
 }
 
-fn pixel_layer<T, U: Copy>(
+pub(crate) fn pixel_layer<T, U: Copy>(
     values: &[T],
     rows: usize,
     cols: usize,
@@ -746,12 +751,14 @@ struct PixelUncertaintyFit {
     standardized_residuals: Vec<f64>,
 }
 
-struct PixelCorrelationDiagnostics {
-    lag1_rho: f64,
-    pair_count: u32,
-    available: bool,
-    inflation_factor: f64,
-    effective_sample_size: f64,
+/// Diagnostic-only lag-one residual correlation summaries for one pixel; shared
+/// with the time-function fit so both temporal models report the same evidence.
+pub(crate) struct PixelCorrelationDiagnostics {
+    pub(crate) lag1_rho: f64,
+    pub(crate) pair_count: u32,
+    pub(crate) available: bool,
+    pub(crate) inflation_factor: f64,
+    pub(crate) effective_sample_size: f64,
 }
 
 struct PixelVelocityDiagnostics {
@@ -861,7 +868,7 @@ fn velocity_pixel_uncertainty_fit(
     }
 }
 
-fn velocity_cadence_status(x: &[f64], indices: &[usize]) -> VelocityCadenceStatus {
+pub(crate) fn velocity_cadence_status(x: &[f64], indices: &[usize]) -> VelocityCadenceStatus {
     if indices.len() < 2 {
         return VelocityCadenceStatus::Unavailable;
     }
@@ -878,7 +885,14 @@ fn velocity_cadence_status(x: &[f64], indices: &[usize]) -> VelocityCadenceStatu
     VelocityCadenceStatus::RegularContiguous
 }
 
-fn correlation_diagnostics(fit: &PixelUncertaintyFit) -> PixelCorrelationDiagnostics {
+/// Lag-one correlation of the standardized residuals, gated on an available
+/// IID-conditional fit over a regular, contiguous cadence with at least four dates.
+pub(crate) fn correlation_diagnostics(
+    standardized_residuals: &[f64],
+    uncertainty_status: VelocityUncertaintyStatus,
+    cadence_status: VelocityCadenceStatus,
+    valid_date_count: u32,
+) -> PixelCorrelationDiagnostics {
     let unavailable = || PixelCorrelationDiagnostics {
         lag1_rho: f64::NAN,
         pair_count: 0,
@@ -886,21 +900,19 @@ fn correlation_diagnostics(fit: &PixelUncertaintyFit) -> PixelCorrelationDiagnos
         inflation_factor: f64::NAN,
         effective_sample_size: f64::NAN,
     };
-    let n = fit.standardized_residuals.len();
-    if fit.uncertainty_status != VelocityUncertaintyStatus::IidConditional
-        || fit.cadence_status != VelocityCadenceStatus::RegularContiguous
+    let n = standardized_residuals.len();
+    if uncertainty_status != VelocityUncertaintyStatus::IidConditional
+        || cadence_status != VelocityCadenceStatus::RegularContiguous
         || n < 4
-        || n != fit.valid_date_count as usize
-        || fit
-            .standardized_residuals
+        || n != valid_date_count as usize
+        || standardized_residuals
             .iter()
             .any(|value| !value.is_finite())
     {
         return unavailable();
     }
-    let mean = fit.standardized_residuals.iter().sum::<f64>() / n as f64;
-    let centered: Vec<f64> = fit
-        .standardized_residuals
+    let mean = standardized_residuals.iter().sum::<f64>() / n as f64;
+    let centered: Vec<f64> = standardized_residuals
         .iter()
         .map(|residual| residual - mean)
         .collect();

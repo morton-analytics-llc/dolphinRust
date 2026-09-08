@@ -6,6 +6,16 @@ All notable changes to dolphinRust are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
+  (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
+  error of its rate column plus the same temporal-fit diagnostics as the linear path;
+  `velocity_regression_rank` counts every configured column and a design that fails to
+  factor reports its numerical rank. New estimator `time_function_post_gauge_unit_precision`
+  names the path in `velocity_estimator` / `VELOCITY_ESTIMATOR`. The GNSS harness's
+  `--velocity-seasonal --score` combination, previously `not_evaluable` for want of
+  `velocity_sigma.tif`, now scores.
+
 ### Breaking changes
 - **Acquisition identity and correction UTC are now explicit contracts** (PR #117, eo PR #534).
   `InputOptions.acquisition_metadata` carries verified acquisition UTC, `spatial_group`
