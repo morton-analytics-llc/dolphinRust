@@ -31,12 +31,12 @@ use dolphin_phaselink::{
 };
 use dolphin_stack::MiniStackPlanner;
 use dolphin_timeseries::{
-    build_network, estimate_velocity, estimate_velocity_with_diagnostics,
-    estimate_velocity_with_model, estimate_velocity_with_uncertainty, get_incidence_matrix,
-    invert_stack, invert_stack_l1, invert_stack_with_uncertainty, loop_closure_qc,
-    mask_failed_loops, network_triplets, reference_to_point, select_reference_point, L1Config,
-    LoopClosureQc, NetworkConfig, RelaxationTerm, VelocityCadenceStatus, VelocityModel,
-    VelocityUncertaintyStatus, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    build_network, estimate_velocity_with_diagnostics, estimate_velocity_with_model,
+    estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
+    invert_stack_with_uncertainty, loop_closure_qc, mask_failed_loops, network_triplets,
+    reference_to_point, select_reference_point, L1Config, LoopClosureQc, NetworkConfig,
+    RelaxationTerm, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
+    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -114,41 +114,18 @@ pub enum StitchError {
 /// Point estimator used for the emitted linear velocity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VelocityEstimator {
-    /// Full reconstructed series, ordinary least squares.
-    LinearFullSeriesUnitPrecision,
-    /// Full reconstructed series, weighted by stitched-CRLB-derived relative
-    /// precision where every date has a finite bound, with unit precision for
-    /// an entire pixel otherwise. The stitched CRLB is not global calibrated
-    /// covariance.
-    LinearFullSeriesStitchedCrlbWithUnitFallback,
-    /// Finite post-gauge dates, ordinary least squares. This is selected when
-    /// the IID-conditional velocity component is enabled.
+    /// Finite post-gauge dates, ordinary least squares.
     LinearPostGaugeUnitPrecision,
     /// Finite post-gauge dates with configured seasonal/step terms, ordinary
-    /// least squares. This is selected when the IID-conditional velocity
-    /// component is enabled alongside a time-function model.
+    /// least squares.
     TimeFunctionPostGaugeUnitPrecision,
-    /// Full reconstructed series with configured seasonal/step terms and unit
-    /// relative precision.
-    TimeFunctionFullSeriesUnitPrecision,
-    /// Full reconstructed series with configured seasonal/step terms and
-    /// stitched-CRLB-derived relative precision with whole-pixel unit fallback.
-    TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
 }
 
 impl VelocityEstimator {
     pub(crate) const fn metadata_value(self) -> &'static str {
         match self {
-            Self::LinearFullSeriesUnitPrecision => "linear_full_series_unit_precision",
-            Self::LinearFullSeriesStitchedCrlbWithUnitFallback => {
-                "linear_full_series_stitched_crlb_with_unit_fallback"
-            }
             Self::LinearPostGaugeUnitPrecision => "linear_post_gauge_unit_precision",
             Self::TimeFunctionPostGaugeUnitPrecision => "time_function_post_gauge_unit_precision",
-            Self::TimeFunctionFullSeriesUnitPrecision => "time_function_full_series_unit_precision",
-            Self::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback => {
-                "time_function_full_series_stitched_crlb_with_unit_fallback"
-            }
         }
     }
 }
@@ -572,7 +549,6 @@ fn finish_displacement(
         cfg,
         inversion.displacement.view(),
         &days,
-        stitched.crlb_sigma.as_ref(),
         analysis_reference_point,
         &date_files,
     )?;
@@ -1012,121 +988,111 @@ fn frame_velocity(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     days: &[f64],
-    crlb_sigma: Option<&Array3<f64>>,
     reference_point: Option<(usize, usize)>,
     date_files: &[PathBuf],
 ) -> Result<(VelocityModel, VelocityFit)> {
     let model = velocity_model(cfg, date_files)?;
     let fit = timed("velocity", || {
-        fit_velocity(cfg, displacement, days, crlb_sigma, reference_point, &model)
+        fit_velocity(cfg, displacement, days, reference_point, &model)
     })?;
     Ok((model, fit))
 }
 
+/// The velocity point estimate is the post-gauge, unit-precision fit on every
+/// path (issue #123). `write_velocity_uncertainty` gates the sigma layer and the
+/// temporal diagnostics — it never selects a different estimator, and
+/// `use_coherence_weights` no longer reaches this fit at all: the stitched CRLB
+/// has no empirical scale in a single-reference network, so weighting by it let a
+/// few nominally precise epochs carry the rate.
 fn fit_velocity(
     cfg: &DisplacementWorkflow,
     displacement: ArrayView3<f64>,
     days: &[f64],
-    crlb_sigma: Option<&Array3<f64>>,
     reference_point: Option<(usize, usize)>,
     model: &VelocityModel,
 ) -> Result<VelocityFit> {
-    let options = &cfg.timeseries_options;
-    if options.write_velocity_uncertainty {
-        let reference = reference_point
-            .context("velocity uncertainty requires a final spatial reference point")?;
-        anyhow::ensure!(
-            displacement
-                .axis_iter(Axis(0))
-                .all(|band| band[reference] == 0.0),
-            "velocity uncertainty requires an exact zero at the final spatial reference"
-        );
-        anyhow::ensure!(
-            days.len() == displacement.dim().0 + 1,
-            "velocity dates do not match the displacement series"
-        );
-        let series = series_with_reference(displacement);
-        let post_gauge = series.slice(s![1.., .., ..]);
-        let precision = post_gauge.mapv(|value| f64::from(value.is_finite()));
-        if !model.is_linear() {
-            return Ok(fit_post_gauge_velocity_with_model(
-                &days[1..],
-                post_gauge,
-                precision.view(),
-                model,
-            ));
-        }
-        let output = estimate_velocity_with_diagnostics(&days[1..], post_gauge, precision.view());
-        return Ok(VelocityFit {
-            velocity: output.velocity,
-            estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
-            sigma: Some(output.sigma),
-            diagnostics: Some(VelocityTemporalDiagnostics {
-                valid_date_count: output.valid_date_count,
-                regression_rank: output.rank,
-                regression_dof: output.regression_dof,
-                uncertainty_status: output.uncertainty_status,
-                lag1_rho: output.lag1_rho,
-                correlation_pair_count: output.correlation_pair_count,
-                cadence_status: output.cadence_status,
-                correlation_available: output.correlation_available,
-                diagnostic_inflation_factor: output.diagnostic_inflation_factor,
-                diagnostic_effective_sample_size: output.diagnostic_effective_sample_size,
-            }),
-            residual_rms: Some(output.residual_rms),
-            terms: VelocityTerms::default(),
-        });
-    }
-    if !options.use_coherence_weights && model.is_linear() {
-        // The cheapest path: no precision, no fit statistics at all. Computing a
-        // residual here would mean fitting a second, otherwise-unneeded model per
-        // pixel just to report it, so this path stays a rate-only estimate,
-        // matching `sigma`'s existing `None` rule.
-        return Ok(VelocityFit {
-            velocity: velocity_of(displacement, days),
-            estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
-            sigma: None,
-            diagnostics: None,
-            residual_rms: None,
-            terms: VelocityTerms::default(),
-        });
-    }
-    let series = series_with_reference(displacement);
-    if !options.use_coherence_weights {
-        return Ok(fit_velocity_with_model(
-            days,
-            series.view(),
-            None,
+    anyhow::ensure!(
+        days.len() == displacement.dim().0 + 1,
+        "velocity dates do not match the displacement series"
+    );
+    // The gauge date is the series' own zero by construction; the fit is over the
+    // dates that carry evidence.
+    let post_gauge_days = &days[1..];
+    let precision = displacement.mapv(|value| f64::from(value.is_finite()));
+    if !cfg.timeseries_options.write_velocity_uncertainty {
+        return Ok(point_estimate_only(
+            post_gauge_days,
+            displacement,
+            precision.view(),
             model,
-            VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
         ));
     }
-    let sigma = crlb_sigma
-        .context("velocity weighting requires internally computed CRLB")?
-        .view();
-    let valid = uncertainty_valid(sigma);
-    let precision = date_precisions(sigma, valid.view());
+    let reference =
+        reference_point.context("velocity uncertainty requires a final spatial reference point")?;
+    anyhow::ensure!(
+        displacement
+            .axis_iter(Axis(0))
+            .all(|band| band[reference] == 0.0),
+        "velocity uncertainty requires an exact zero at the final spatial reference"
+    );
     if !model.is_linear() {
-        return Ok(fit_velocity_with_model(
-            days,
-            series.view(),
-            Some(precision.view()),
+        return Ok(fit_post_gauge_velocity_with_model(
+            post_gauge_days,
+            displacement,
+            precision.view(),
             model,
-            VelocityEstimator::TimeFunctionFullSeriesStitchedCrlbWithUnitFallback,
         ));
     }
-    // Same underlying per-pixel fit as `estimate_velocity_with_precisions`
-    // (velocity is bit-identical); the uncertainty variant is used instead so
-    // the residual it already computes is not thrown away.
-    let output = estimate_velocity_with_uncertainty(days, series.view(), precision.view());
+    let output =
+        estimate_velocity_with_diagnostics(post_gauge_days, displacement, precision.view());
     Ok(VelocityFit {
         velocity: output.velocity,
-        estimator: VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback,
+        estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+        sigma: Some(output.sigma),
+        diagnostics: Some(VelocityTemporalDiagnostics {
+            valid_date_count: output.valid_date_count,
+            regression_rank: output.rank,
+            regression_dof: output.regression_dof,
+            uncertainty_status: output.uncertainty_status,
+            lag1_rho: output.lag1_rho,
+            correlation_pair_count: output.correlation_pair_count,
+            cadence_status: output.cadence_status,
+            correlation_available: output.correlation_available,
+            diagnostic_inflation_factor: output.diagnostic_inflation_factor,
+            diagnostic_effective_sample_size: output.diagnostic_effective_sample_size,
+        }),
+        residual_rms: Some(output.residual_rms),
+        terms: VelocityTerms::default(),
+    })
+}
+
+/// The same post-gauge unit-precision fit without the sigma layer or the
+/// correlation diagnostics. The velocity is bit-identical to the gated path —
+/// both run the one shared per-pixel weighted fit.
+fn point_estimate_only(
+    post_gauge_days: &[f64],
+    displacement: ArrayView3<f64>,
+    precision: ArrayView3<f64>,
+    model: &VelocityModel,
+) -> VelocityFit {
+    if !model.is_linear() {
+        return fit_velocity_with_model(
+            post_gauge_days,
+            displacement,
+            Some(precision),
+            model,
+            VelocityEstimator::TimeFunctionPostGaugeUnitPrecision,
+        );
+    }
+    let output = estimate_velocity_with_uncertainty(post_gauge_days, displacement, precision);
+    VelocityFit {
+        velocity: output.velocity,
+        estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
         sigma: None,
         diagnostics: None,
         residual_rms: Some(output.residual_rms),
         terms: VelocityTerms::default(),
-    })
+    }
 }
 
 /// The joint seasonal/step fit on the finite post-gauge dates with unit relative
@@ -1584,7 +1550,6 @@ impl SpatialProducts {
             cfg,
             self.disp_rad.view(),
             days,
-            self.crlb_sigma.as_ref(),
             Some(global),
             &self.velocity_model,
         )
@@ -4489,21 +4454,6 @@ fn mm_per_rad(wavelength: Option<f64>) -> f64 {
     -wavelength.unwrap_or(SENTINEL1_WAVELENGTH_M) / (4.0 * std::f64::consts::PI) * 1000.0
 }
 
-/// Linear velocity (rad/yr) from the phase displacement series, fitting against
-/// the real acquisition `days` (date 0 = 0 reference).
-fn velocity_of(displacement: ArrayView3<f64>, days: &[f64]) -> Array2<f64> {
-    let series = series_with_reference(displacement);
-    estimate_velocity(days, series.view(), None)
-}
-
-fn series_with_reference(displacement: ArrayView3<f64>) -> Array3<f64> {
-    let (nd, rows, cols) = displacement.dim();
-    Array3::from_shape_fn((nd + 1, rows, cols), |(t, r, c)| match t {
-        0 => 0.0,
-        _ => displacement[(t - 1, r, c)],
-    })
-}
-
 /// Propagate an independent-pixel approximation through spatial referencing.
 /// The selected reference is identically zero; every other pixel receives the
 /// reference pixel's temporal variance in quadrature.
@@ -4549,17 +4499,6 @@ fn interferogram_precisions(
     Array3::from_shape_fn((pairs.len(), rows, cols), |(k, r, c)| {
         let (i, j) = pairs[k];
         let variance = sigma[(i, r, c)].powi(2) + sigma[(j, r, c)].powi(2);
-        match valid[(r, c)] && variance.is_finite() {
-            true => 1.0 / variance.max(1e-12),
-            false => UNIFORM_PRECISION,
-        }
-    })
-}
-
-fn date_precisions(sigma: ArrayView3<f64>, valid: ArrayView2<bool>) -> Array3<f64> {
-    let (dates, rows, cols) = sigma.dim();
-    Array3::from_shape_fn((dates, rows, cols), |(date, r, c)| {
-        let variance = sigma[(date, r, c)] * sigma[(date, r, c)];
         match valid[(r, c)] && variance.is_finite() {
             true => 1.0 / variance.max(1e-12),
             false => UNIFORM_PRECISION,
@@ -5207,7 +5146,7 @@ mod tests {
         let mut products = SpatialProducts {
             disp_rad: displacement,
             vel_rad: velocity,
-            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms {
                 seasonal_amplitude_rad: Some(Array2::from_elem((2, 2), 1.0)),
@@ -5353,7 +5292,7 @@ mod tests {
                 date as f64 + row as f64 * 0.1 + col as f64 * 0.01
             }),
             vel_rad: Array2::zeros((6, 8)),
-            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: Some(LoopClosureQc {
@@ -5420,7 +5359,7 @@ mod tests {
         let mut products = SpatialProducts {
             disp_rad: displacement,
             vel_rad: Array2::zeros((4, 4)),
-            velocity_estimator: VelocityEstimator::LinearFullSeriesUnitPrecision,
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
@@ -5750,7 +5689,6 @@ mod tests {
             &cfg,
             series.view(),
             &days,
-            None,
             Some((0, 1)),
             &VelocityModel::default(),
         )
@@ -5791,38 +5729,16 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let linear = VelocityModel::default();
-        let crlb = Array3::from_shape_fn((6, 1, 2), |(date, _, col)| {
-            0.01 + (date * 2 + col) as f64 * 100.0
-        });
-        let without_crlb = fit_velocity(
-            &cfg,
-            displacement.view(),
-            &days,
-            None,
-            Some((0, 1)),
-            &linear,
-        )
-        .unwrap();
-        let with_crlb = fit_velocity(
-            &cfg,
-            displacement.view(),
-            &days,
-            Some(&crlb),
-            Some((0, 1)),
-            &linear,
-        )
-        .unwrap();
+        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &linear).unwrap();
 
-        assert_eq!(without_crlb.velocity, with_crlb.velocity);
         assert_eq!(
-            without_crlb.estimator,
+            fit.estimator,
             VelocityEstimator::LinearPostGaugeUnitPrecision
         );
-        let sigma = without_crlb.sigma.as_ref().unwrap();
-        assert_eq!(sigma[(0, 0)], with_crlb.sigma.as_ref().unwrap()[(0, 0)]);
+        let sigma = fit.sigma.as_ref().unwrap();
         assert!(sigma[(0, 0)].is_finite());
         assert!(sigma[(0, 1)].is_nan(), "the spatial reference must abstain");
-        let diagnostics = without_crlb.diagnostics.as_ref().unwrap();
+        let diagnostics = fit.diagnostics.as_ref().unwrap();
         assert_eq!(diagnostics.valid_date_count[(0, 0)], 5);
         assert_eq!(diagnostics.regression_rank[(0, 0)], 2);
         assert_eq!(diagnostics.regression_dof[(0, 0)], 3);
@@ -5858,15 +5774,7 @@ mod tests {
             step_days: Vec::new(),
             relaxation: Vec::new(),
         };
-        let fit = fit_velocity(
-            &cfg,
-            displacement.view(),
-            &days,
-            None,
-            Some((0, 1)),
-            &seasonal,
-        )
-        .unwrap();
+        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &seasonal).unwrap();
 
         assert!(validate_config(&cfg).is_ok());
         assert_eq!(
@@ -5895,49 +5803,121 @@ mod tests {
         );
     }
 
+    /// Fit through the production front door — these contracts are about the
+    /// rate the pipeline actually emits, not a bare solver call.
+    fn fitted_velocity(disp: ArrayView3<f64>, days: &[f64]) -> Array2<f64> {
+        fit_velocity(
+            &DisplacementWorkflow::default(),
+            disp,
+            days,
+            None,
+            &VelocityModel::default(),
+        )
+        .unwrap()
+        .velocity
+    }
+
+    fn seasonal_model() -> VelocityModel {
+        VelocityModel {
+            seasonal: true,
+            step_days: Vec::new(),
+            relaxation: Vec::new(),
+        }
+    }
+
+    /// Issue #123: `write_velocity_uncertainty` gates the sigma layer, nothing
+    /// else. The fixture is the one that used to expose the estimator migration —
+    /// a served rate that moved by more than 1 rad/yr between the two paths — so
+    /// a regression to flag-dependent estimator selection fails here loudly.
     #[test]
-    fn enabling_velocity_uncertainty_names_and_can_change_the_point_estimator() {
+    fn velocity_uncertainty_flag_gates_sigma_without_moving_the_point_estimate() {
         let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
         let target = [10.0, 11.0, 12.0, 13.0, 14.0];
         let displacement = Array3::from_shape_fn((5, 1, 2), |(date, _, col)| match col {
             0 => target[date],
             _ => 0.0,
         });
-        let crlb = Array3::from_elem((6, 1, 2), 1.0);
+        for model in [VelocityModel::default(), seasonal_model()] {
+            let mut cfg = DisplacementWorkflow::default();
+            let point_only =
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+
+            cfg.timeseries_options.write_velocity_uncertainty = true;
+            let with_sigma =
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+
+            assert_eq!(point_only.estimator, with_sigma.estimator);
+            assert_eq!(point_only.velocity, with_sigma.velocity);
+            assert!(point_only.sigma.is_none());
+            assert!(with_sigma.sigma.is_some());
+        }
+    }
+
+    /// The emitted estimator is post-gauge unit-precision on both paths, under
+    /// both temporal models — the identity eo persists and
+    /// `validate_fixed_cube_semantics` pins.
+    #[test]
+    fn the_point_estimator_is_always_post_gauge_unit_precision() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(date, _, col)| match col {
+            0 => 10.0 + date as f64,
+            _ => 0.0,
+        });
+        for (model, expected) in [
+            (
+                VelocityModel::default(),
+                VelocityEstimator::LinearPostGaugeUnitPrecision,
+            ),
+            (
+                seasonal_model(),
+                VelocityEstimator::TimeFunctionPostGaugeUnitPrecision,
+            ),
+        ] {
+            let mut cfg = DisplacementWorkflow::default();
+            for uncertainty in [false, true] {
+                cfg.timeseries_options.write_velocity_uncertainty = uncertainty;
+                let fit =
+                    fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                assert_eq!(fit.estimator, expected, "uncertainty={uncertainty}");
+            }
+        }
+    }
+
+    /// `use_coherence_weights` still governs interferogram precision upstream, but
+    /// it no longer reaches the velocity fit: the CRLB has no empirical scale in a
+    /// single-reference network, so weighting by it was letting a few nominally
+    /// precise epochs carry the rate.
+    #[test]
+    fn coherence_weights_no_longer_reach_the_velocity_fit() {
+        let days: Vec<f64> = (0..6).map(|t| f64::from(t) * 12.0).collect();
+        let target = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let displacement = Array3::from_shape_fn((5, 1, 2), |(date, _, col)| match col {
+            0 => target[date],
+            _ => 0.0,
+        });
         let mut cfg = DisplacementWorkflow::default();
-        let default_fit = fit_velocity(
+        cfg.timeseries_options.use_coherence_weights = true;
+        let weighted = fit_velocity(
             &cfg,
             displacement.view(),
             &days,
-            Some(&crlb),
             Some((0, 1)),
             &VelocityModel::default(),
         )
         .unwrap();
 
-        cfg.timeseries_options.write_velocity_uncertainty = true;
-        let evidence_fit = fit_velocity(
+        cfg.timeseries_options.use_coherence_weights = false;
+        let unweighted = fit_velocity(
             &cfg,
             displacement.view(),
             &days,
-            Some(&crlb),
             Some((0, 1)),
             &VelocityModel::default(),
         )
         .unwrap();
 
-        assert_eq!(
-            default_fit.estimator,
-            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
-        );
-        assert_eq!(
-            evidence_fit.estimator,
-            VelocityEstimator::LinearPostGaugeUnitPrecision
-        );
-        assert!(
-            (default_fit.velocity[(0, 0)] - evidence_fit.velocity[(0, 0)]).abs() > 1.0,
-            "the fixture must expose the served-rate migration"
-        );
+        assert_eq!(weighted.estimator, unweighted.estimator);
+        assert_eq!(weighted.velocity, unweighted.velocity);
     }
 
     /// Issue #34: a NaN CRLB is a missing *bound*, not evidence the data is bad.
@@ -5953,18 +5933,7 @@ mod tests {
         let valid = uncertainty_valid(sigma.view());
         assert_eq!(valid, ndarray::array![[true, false]]);
 
-        let precision = date_precisions(sigma.view(), valid.view());
-        assert!(
-            precision
-                .iter()
-                .all(|value| value.is_finite() && *value > 0.0),
-            "no weight may be zero or non-finite: {precision:?}"
-        );
         // The bounded pixel keeps 1/sigma^2; the unbounded one goes uniform.
-        assert!((precision[(0, 0, 0)] - 0.25).abs() < 1e-12);
-        assert!((precision[(0, 0, 1)] - 1.0).abs() < 1e-12);
-        assert!((precision[(1, 0, 1)] - 1.0).abs() < 1e-12);
-
         let pairs = [(0, 1)];
         let ifg = interferogram_precisions(sigma.view(), &pairs, valid.view());
         assert!(
@@ -5975,15 +5944,10 @@ mod tests {
     }
 
     #[test]
-    fn mixed_crlb_validity_is_named_as_a_whole_pixel_unit_fallback_policy() {
+    fn velocity_estimator_identity_reaches_the_raster_metadata() {
         let days = [0.0, 12.0, 24.0, 36.0];
         let values = [5.0, 1.0, 8.0];
         let displacement = Array3::from_shape_fn((3, 1, 2), |(date, _, _)| values[date]);
-        let mut sigma = Array3::from_shape_fn((4, 1, 2), |(date, _, _)| match date {
-            0 | 2 => 0.5,
-            _ => 10.0,
-        });
-        sigma[(2, 0, 1)] = f64::NAN;
         let cfg = DisplacementWorkflow {
             work_directory: std::env::temp_dir().join("dolphin_mixed_velocity_precision"),
             ..Default::default()
@@ -5993,18 +5957,14 @@ mod tests {
             &cfg,
             displacement.view(),
             &days,
-            Some(&sigma),
             None,
             &VelocityModel::default(),
         )
         .unwrap();
         assert_eq!(
             fit.estimator,
-            VelocityEstimator::LinearFullSeriesStitchedCrlbWithUnitFallback
+            VelocityEstimator::LinearPostGaugeUnitPrecision
         );
-        let uniform = velocity_of(displacement.view(), &days);
-        assert!((fit.velocity[(0, 1)] - uniform[(0, 1)]).abs() < 1e-9);
-        assert!((fit.velocity[(0, 0)] - uniform[(0, 0)]).abs() > 1.0);
 
         let connected_components = Array3::<u32>::zeros((0, 1, 2));
         write_outputs(
@@ -6036,7 +5996,7 @@ mod tests {
         let dataset = gdal::Dataset::open(cfg.work_directory.join("velocity.tif")).unwrap();
         assert_eq!(
             dataset.metadata_item("VELOCITY_ESTIMATOR", "").as_deref(),
-            Some("linear_full_series_stitched_crlb_with_unit_fallback")
+            Some("linear_post_gauge_unit_precision")
         );
         let _ = std::fs::remove_dir_all(&cfg.work_directory);
     }
@@ -6052,13 +6012,13 @@ mod tests {
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let model = VelocityModel::default();
 
-        let missing = fit_velocity(&cfg, displacement.view(), &days, None, None, &model)
+        let missing = fit_velocity(&cfg, displacement.view(), &days, None, &model)
             .err()
             .expect("missing reference must fail");
         assert!(missing.to_string().contains("spatial reference point"));
 
         displacement[(1, 0, 1)] = f64::NAN;
-        let nonzero = fit_velocity(&cfg, displacement.view(), &days, None, Some((0, 1)), &model)
+        let nonzero = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model)
             .err()
             .expect("nonzero reference must fail");
         assert!(nonzero.to_string().contains("exact zero"));
@@ -6719,7 +6679,6 @@ mod tests {
                 &cfg,
                 disp.view(),
                 &days,
-                Some(&Array3::from_elem((3, 3, 3), 1.0)),
                 Some((1, 0)),
                 &VelocityModel::default(),
             )
@@ -6749,7 +6708,7 @@ mod tests {
             .collect();
         let disp = Array3::from_shape_fn((bands.len(), 1, 1), |(t, _, _)| bands[t]);
 
-        let vel_rad = velocity_of(disp.view(), &days);
+        let vel_rad = fitted_velocity(disp.view(), &days);
         let got_mm_yr = vel_rad[(0, 0)] * mm_per_rad(Some(wavelength));
         assert!(
             (got_mm_yr - injected_mm_yr).abs() < 1e-6,
@@ -6775,7 +6734,7 @@ mod tests {
             .map(|&d| rate_m_yr * (d / 365.25) * phase_per_m)
             .collect();
         let disp = Array3::from_shape_fn((bands.len(), 1, 1), |(t, _, _)| bands[t]);
-        let vel_rad = velocity_of(disp.view(), &days);
+        let vel_rad = fitted_velocity(disp.view(), &days);
 
         let got_nisar = vel_rad[(0, 0)] * mm_per_rad(Some(NISAR_WAVELENGTH_M));
         assert!(
@@ -6802,7 +6761,7 @@ mod tests {
                 .map(|&d| phase_per_yr * d / 365.25)
                 .collect();
             let disp = Array3::from_shape_fn((bands.len(), 1, 1), |(t, _, _)| bands[t]);
-            velocity_of(disp.view(), days)[(0, 0)]
+            fitted_velocity(disp.view(), days)[(0, 0)]
         };
         let v12 = mk(&[0.0, 12.0, 24.0, 36.0]);
         let v6 = mk(&[0.0, 6.0, 12.0, 18.0]);
@@ -7851,9 +7810,7 @@ mod tests {
 
         let days = vec![0.0, 12.0];
         let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
-        let crlb = Array3::from_elem((2, 1, 1), 0.5);
-        let fit =
-            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
+        let fit = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
         assert!(fit.terms.seasonal_amplitude_rad.is_none());
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
@@ -7931,13 +7888,11 @@ mod tests {
             let time = days[t + 1];
             rate_per_year * time / 365.25 + amplitude * ((omega * time).cos() - 1.0)
         });
-        let crlb = Array3::from_elem((days.len(), 1, 1), 0.5);
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.velocity_seasonal = true;
         let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
 
-        let seasonal =
-            fit_velocity(&cfg, displacement.view(), &days, Some(&crlb), None, &model).unwrap();
+        let seasonal = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
         assert!(
             (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
             "rate {} != {rate_per_year}",
@@ -7955,7 +7910,6 @@ mod tests {
             &cfg,
             displacement.view(),
             &days,
-            Some(&crlb),
             None,
             &VelocityModel::default(),
         )
@@ -7983,7 +7937,7 @@ mod tests {
                 (0.01 * time + f64::from(time >= step_day) * 3.0) * scale
             }),
             vel_rad: Array2::zeros((4, 4)),
-            velocity_estimator: VelocityEstimator::TimeFunctionFullSeriesUnitPrecision,
+            velocity_estimator: VelocityEstimator::TimeFunctionPostGaugeUnitPrecision,
             velocity_model: VelocityModel {
                 seasonal: false,
                 step_days: vec![step_day],

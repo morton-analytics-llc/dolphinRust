@@ -37,6 +37,23 @@ All notable changes to dolphinRust are documented here. The format follows
   `velocity_sigma.tif`, now scores.
 
 ### Breaking changes
+- **The velocity point estimator is now post-gauge unit-precision on every path** (issue
+  #123). `timeseries_options.write_velocity_uncertainty` used to *select* the estimator as a
+  side effect of asking for a sigma layer: with it off the pipeline emitted a full-series fit
+  weighted by the stitched CRLB, with it on a post-gauge unit-precision fit. A default-config
+  `velocity.tif` and the GNSS validation harness's `velocity.tif` were therefore different
+  estimators, and the harness was validating one the default pipeline never produced. The
+  flag now gates `velocity_sigma.tif` and the temporal diagnostics only; the point estimate
+  is identical either way. `use_coherence_weights` no longer reaches the velocity fit at all
+  (it still governs L2 SBAS interferogram precision) — a single-reference network is exactly
+  determined, so the CRLB weights carry no empirical scale for a rate, and under a seasonal
+  model they moved the MMX1−ICMX GNSS residual by 7 mm/yr on the strength of a few
+  nominally precise epochs.
+
+  **`velocity.tif` changes value for any config that did not already set
+  `write_velocity_uncertainty: true`.** `VELOCITY_ESTIMATOR` becomes
+  `linear_post_gauge_unit_precision` or `time_function_post_gauge_unit_precision`; the four
+  `*full_series*` estimator identities are removed rather than left unreachable.
 - **Acquisition identity and correction UTC are now explicit contracts** (PR #117, eo PR #534).
   `InputOptions.acquisition_metadata` carries verified acquisition UTC, `spatial_group`
   (burst/frame incl. orbit, frequency, polarization) and `grid_id` per input, and
