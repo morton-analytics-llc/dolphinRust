@@ -1,8 +1,17 @@
 # Can the GNSS truth set settle the 17–19 mm/yr residual?
 
-**Date:** 2026-09-10 · **Commit:** `b1e11e5` · **Cohort:** `gps_mmx1_2018`, burst
-`T005_008704_IW1`, 52 epochs · **Continues:**
+**Date:** 2026-09-10 · **Commit:** `064ab0f` (post-#123) · **Cohort:** `gps_mmx1_2018`,
+burst `T005_008704_IW1`, 52 epochs, fixture `mmx1_2018_los_common`, seasonal model, native
+backend, no troposphere · **Continues:**
 [`gps-mmx1-2018-troposphere-result.md`](gps-mmx1-2018-troposphere-result.md)
+
+> **Result (2026-09-10, same day):** the sweep was run. The residual is a **station-local
+> additive term of order 10 mm/yr**. It is not point-vs-pixel sampling (0.08–0.70 mm/yr), not
+> a smooth ramp (a 2.9 km pair disagrees *more* than an 11 km pair), and not a scale error
+> (the residual is flat at 9–19 mm/yr against signals from 15 to 255 mm/yr). Whether the
+> station-local term sits on the InSAR side or the GNSS side is still open and needs the 80 m
+> control pair. Full numbers in [Results](#results) below; the sections before it are the
+> design and still describe what was run.
 
 ## The question
 
@@ -130,9 +139,143 @@ That run should happen **after #123 merges**, not before: #123 changes which est
 `velocity.tif` carries, so a sweep on current main would be stale on arrival. #123's own
 acceptance requires re-running the GNSS A/B anyway. One run serves both.
 
+## Results
+
+Run on `064ab0f`, `mmx1_2018_los_common`, seasonal, native, no troposphere. 26 minutes at
+full resolution over 52 epochs. The cropped fixture was already on disk, so no refetch was
+needed for this half.
+
+### #123's acceptance check: the harness numbers did not move
+
+`write_velocity_uncertainty` was already set by the harness, so decoupling the estimator must
+leave its output untouched. It does:
+
+| | 2026-09-08 (pre-#123) | now (post-#123) |
+|---|---:|---:|
+| `difference_raster_mm_yr` | −18.9444 | **−18.94442** |
+| MAE / RMSE (mm) | 9.034 / 11.244 | 9.0339 / 11.2444 |
+| correlation / TLS slope | 0.9908 / 1.0997 | 0.99077 / 1.09972 |
+| seasonal amplitude MMX1 / ICMX (mm) | 33.66 / 29.88 | 33.656 / 29.880 |
+
+That is the check that #123 landed as a **default** fix and not as a silent change to the
+harness. Issue #123 acceptance item 4 is satisfied.
+
+### The truth set is thinner than the recipe suggests
+
+Of the LOS fixture's five stations, only three pass the recipe's own
+`minimum_gnss_fraction: 0.9` gate in 2018. Seven of the ten pairs are `not_evaluable`, and
+every failure is GNSS-side coverage, not InSAR:
+
+| station | 2018 common-GNSS fraction | usable |
+|---|---:|:--:|
+| MMX1, ICMX, MXMX | 0.90–0.92 | yes |
+| MXTM | 0.808 | no |
+| UNVA | 0.442 | no |
+
+**Three stations means two independent differential series.** A tilt/ramp plane has three
+parameters, so with three stations the plane fits by construction and tests nothing. That
+alone answers part of the original question: the LOS fixture as scored *cannot* run the
+baseline test. The nine-station frame is not a nice-to-have.
+
+### Point-vs-pixel sampling: ruled out
+
+`window_stats` fitted at each window size, converted to a rate:
+
+| station | 1×1 | 3×3 | 5×5 | 7×7 | spread | 5×5 within-window sd |
+|---|---:|---:|---:|---:|---:|---:|
+| ICMX | 168.73 | 168.95 | 168.96 | 168.95 | **0.23** | 0.41 mm |
+| MMX1 | −92.23 | −92.82 | −92.93 | −92.80 | **0.70** | 0.48 mm |
+| MXMX | 178.19 | 178.13 | 178.12 | 178.11 | **0.08** | 0.20 mm |
+
+(mm/yr unless noted.) The InSAR field is flat to well under 1 mm/yr across a 7×7 patch at
+every station. Representativeness error is **2–4% of the residual**, not an explanation for
+it. This was the hypothesis the Mexico City gradient literature made most plausible, and the
+data rejects it.
+
+### The residual is station-local, not a field
+
+Solving the pair table for per-station residuals (zero-mean gauge, since only differences are
+observable):
+
+| station | residual | east | north |
+|---|---:|---:|---:|
+| ICMX | **+10.06** | −3.43 km | −1.93 km |
+| MMX1 | **−9.48** | +7.32 km | +0.97 km |
+| MXMX | **−0.58** | −3.89 km | +0.95 km |
+
+The pair table is explained by these per-station numbers to R² = 0.9975, misfit RMS
+**0.598 mm/yr** — so these are genuine per-station quantities and not pair-specific noise
+from each pair's differing epoch support. Per-station spread is 8.0 mm/yr.
+
+Two structural facts follow, and both are negative results:
+
+**It does not scale with baseline.** A smooth ramp would grow with distance. It does not:
+
+| pair | baseline | residual (raster) |
+|---|---:|---:|
+| ICMX–MXMX | **2.92 km** | **+11.23** |
+| ICMX–MMX1 | 11.13 km | +18.94 |
+| MMX1–MXMX | 11.21 km | −9.51 |
+
+The shortest pair carries a residual comparable to the longest. A ramp is not the shape of
+this.
+
+**It does not scale with signal.** The residual is roughly flat in absolute terms while the
+signal it sits on varies by 16×:
+
+| pair | GNSS signal | residual (raster) | as % of signal |
+|---|---:|---:|---:|
+| ICMX–MMX1 | 240.83 | +18.94 | 7.9% |
+| MMX1–MXMX | −254.56 | −9.51 | 3.7% |
+| ICMX–MXMX | −15.53 | +11.23 | **72%** |
+
+A wavelength or LOS-projection scale error would be a constant *percentage*. This is closer
+to a constant *offset* of order 10 mm/yr per station.
+
+### The estimator choice is itself worth 3–7 mm/yr
+
+The harness reports two InSAR rates per pair — OLS on the displacement series over common
+GNSS epochs, and the difference of `velocity.tif` at the two station pixels. They disagree
+substantially on the same run:
+
+| pair | raster | series | gap |
+|---|---:|---:|---:|
+| ICMX–MMX1 | +18.94 | +22.36 | 3.42 |
+| ICMX–MXMX | +11.23 | +7.33 | 3.90 |
+| MMX1–MXMX | −9.51 | −16.56 | **7.05** |
+
+Up to 7 mm/yr of the 17–19 mm/yr is internal to how the rate is fitted from the *same*
+displacement product — a third of the number under investigation, before any physics. Any
+future statement of the residual has to name which estimator it means. This is the same class
+of problem #123 just fixed one level down.
+
+## Verdict
+
+The residual is a **station-local additive term of order 10 mm/yr**, plus up to 7 mm/yr of
+estimator choice. Ruled out by this run: point-vs-pixel sampling, a smooth spatial ramp, and
+a multiplicative scale error. Troposphere and plate motion were already out.
+
+What remains, and what separates them:
+
+- **Real local ground motion** differing between monuments — entirely plausible in a basin
+  where rates vary 3–4× between adjacent sites.
+- **A station-local error on the InSAR side** — unwrapping or reference handling at specific
+  pixels.
+- **A station-local error on the GNSS side** — monument motion, or the ENU→LOS projection.
+
+The 80 m SSNX–TNGF pair separates the GNSS side from the rest, because at that separation
+real differential ground motion is negligible. The nine-station frame supplies both that pair
+and enough degrees of freedom for the plane test that three stations cannot support.
+
 ## Disposition
 
-- **Scheduled:** issue #126 — pair sweep, 80 m control, window-sweep readout.
-- **Not scheduled:** any further hypothesis tested against 17–19 mm/yr until the sweep says
-  what that number is made of.
-- **Corrected:** MMX1–ICMX is 11.13 km, not 13 km.
+- **Done:** pair sweep and window-sweep readout on the LOS fixture; #123 acceptance item 4.
+- **In progress:** the nine-station frame, rebuilt by bounded remote range-read (the parent
+  crop was deleted but its manifest and the acquisition catalogue both survive; ~31 MB read
+  per 260 MB product).
+- **Scheduled:** issue #126 — 80 m control pair, plane test with real degrees of freedom.
+- **Not scheduled:** any further hypothesis tested against a single number for the residual
+  until the estimator gap above is stated alongside it.
+- **Corrected:** MMX1–ICMX is 11.13 km, not 13 km. The SSNX/TNGF 5×5 windows do **not**
+  overlap (cols 1068–1072 vs 1083–1087 at 5 m posting), so that pair measures GNSS *and*
+  InSAR error together, not the GNSS floor alone.

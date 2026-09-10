@@ -1,0 +1,81 @@
+{
+  "cohort_id": "gps_mmx1_2018",
+  "fixture": "mmx1_2018_los_common",
+  "engine": "native",
+  "stations": [
+    "ICMX",
+    "MMX1",
+    "MXMX",
+    "MXTM",
+    "UNVA"
+  ],
+  "pairs_attempted": 10,
+  "pairs_scored": 3,
+  "independent_differential_series": 4,
+  "pairs": {
+    "ICMX-MMX1": {
+      "status": "scored",
+      "rmse_mm": 11.244389857154244,
+      "correlation": 0.9907744254992935,
+      "tls_slope": 1.0997223015658772,
+      "insar_velocity_mm_yr": 263.19302923649167,
+      "gnss_velocity_mm_yr": 240.8304850697603,
+      "difference_mm_yr": 22.362544166731368,
+      "insar_velocity_raster_mm_yr": 259.77490097284317,
+      "difference_raster_mm_yr": 18.94441590308287,
+      "common_gnss_fraction": 0.9230769230769231
+    },
+    "ICMX-MXMX": {
+      "status": "scored",
+      "rmse_mm": 6.609555869597198,
+      "correlation": 0.3001118254607965,
+      "tls_slope": 0.8183362372951211,
+      "insar_velocity_mm_yr": -8.19231743996584,
+      "gnss_velocity_mm_yr": -15.524835343368888,
+      "difference_mm_yr": 7.332517903403048,
+      "insar_velocity_raster_mm_yr": -4.2906254529953,
+      "difference_raster_mm_yr": 11.234209890373588,
+      "common_gnss_fraction": 0.9230769230769231
+    },
+    "ICMX-MXTM": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.808 is below 0.900"
+    },
+    "ICMX-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.900"
+    },
+    "MMX1-MXMX": {
+      "status": "scored",
+      "rmse_mm": 11.750764066465255,
+      "correlation": 0.9897846103114236,
+      "tls_slope": 1.0743837281045128,
+      "insar_velocity_mm_yr": -271.1195994642011,
+      "gnss_velocity_mm_yr": -254.56032525192492,
+      "difference_mm_yr": -16.559274212276165,
+      "insar_velocity_raster_mm_yr": -264.06552642583847,
+      "difference_raster_mm_yr": -9.505201173913548,
+      "common_gnss_fraction": 0.9038461538461539
+    },
+    "MMX1-MXTM": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.808 is below 0.900"
+    },
+    "MMX1-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.900"
+    },
+    "MXMX-MXTM": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.846 is below 0.900"
+    },
+    "MXMX-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.900"
+    },
+    "MXTM-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.404 is below 0.900"
+    }
+  }
+}
