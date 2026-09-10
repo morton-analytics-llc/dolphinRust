@@ -1232,7 +1232,6 @@ fn restrict_publication_mask(
     cfg: &DisplacementWorkflow,
     geo: GeoInfo,
     validity: &mut Array2<bool>,
-    reference: Option<(usize, usize)>,
 ) -> Result<()> {
     if let Some(path) = &cfg.mask_file {
         let mask =
@@ -1294,12 +1293,6 @@ fn restrict_publication_mask(
             .and(&coverage)
             .for_each(|valid, &covered| *valid &= covered);
     }
-    if let Some(point) = reference {
-        anyhow::ensure!(
-            validity.get(point).copied().unwrap_or(false),
-            "reference pixel is excluded by publication quality masks"
-        );
-    }
     Ok(())
 }
 
@@ -1323,8 +1316,34 @@ fn emit_displacement(
             geotransform: spatial.geotransform,
         },
         &mut spatial.validity_mask,
-        spatial.reference_point,
     )?;
+    // The datum must survive the publication quality masks: every published velocity is
+    // relative to the reference pixel, so a reference sitting in layover/shadow — or
+    // outside the native STATIC coverage — makes the whole field untrustworthy. The
+    // reference is chosen from coherence alone, before these masks exist, so it can land
+    // on a pixel they later exclude. Re-select among pixels that survive them and
+    // re-reference, rather than failing a run that has already done all its work.
+    if spatial
+        .reference_point
+        .is_none_or(|point| !spatial.validity_mask.get(point).copied().unwrap_or(false))
+    {
+        let mut quality = spatial.temporal_coherence.clone();
+        ndarray::Zip::from(&mut quality)
+            .and(&spatial.validity_mask)
+            .for_each(|value, &valid| {
+                if !valid {
+                    *value = 0.0;
+                }
+            });
+        let point = select_reference_point(
+            quality.view(),
+            cfg.timeseries_options.correlation_threshold,
+        )
+        .context(
+            "no pixel surviving the publication quality masks meets the configured reference coherence threshold",
+        )?;
+        spatial.rereference_to(point, &days, cfg)?;
+    }
     if let Some(covariance) = spatial.production_covariance.as_mut() {
         covariance.correction_order_digest = correction_order_digest(
             &cfg.correction_options,
@@ -1547,6 +1566,42 @@ fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenanc
 }
 
 impl SpatialProducts {
+    /// Move the datum to `global` and re-fit velocity through the same front door, so
+    /// every path that re-references produces a consistent time function. Re-referencing
+    /// shifts every date's displacement, which shifts the temporal-fit residual too; the
+    /// network misclosure is unaffected (it is computed upstream, from the inversion,
+    /// before re-referencing).
+    fn rereference_to(
+        &mut self,
+        global: (usize, usize),
+        days: &[f64],
+        cfg: &DisplacementWorkflow,
+    ) -> Result<()> {
+        reference_to_point(&mut self.disp_rad, global);
+        // Re-fit through the same front door as the whole-frame path, so the
+        // configured time-function model cannot reach one and not the other.
+        let fit = fit_velocity(
+            cfg,
+            self.disp_rad.view(),
+            days,
+            self.crlb_sigma.as_ref(),
+            Some(global),
+            &self.velocity_model,
+        )
+        .context("velocity re-fit after re-referencing")?;
+        self.vel_rad = fit.velocity;
+        self.velocity_estimator = fit.estimator;
+        self.velocity_sigma_rad = fit.sigma;
+        self.velocity_diagnostics = fit.diagnostics;
+        // Re-referencing shifts every date's displacement, which shifts the
+        // temporal-fit residual too; the network misclosure is unaffected (it
+        // is computed upstream, from the inversion, before re-referencing).
+        self.timeseries_residual_rad = fit.residual_rms;
+        self.velocity_terms = fit.terms;
+        self.reference_point = Some(global);
+        Ok(())
+    }
+
     fn apply_validity_mask(&mut self) {
         ndarray::Zip::from(&mut self.validity_mask)
             .and(&self.vel_rad)
@@ -1684,28 +1739,8 @@ impl SpatialProducts {
                 "bounded target has no displacement-valid pixel meeting the configured reference coherence threshold",
             )?;
             let global = (target.row_start + local.0, target.col_start + local.1);
-            reference_to_point(&mut self.disp_rad, global);
-            // Re-fit through the same front door as the whole-frame path, so the
-            // configured time-function model cannot reach one and not the other.
-            let fit = fit_velocity(
-                cfg,
-                self.disp_rad.view(),
-                days,
-                self.crlb_sigma.as_ref(),
-                Some(global),
-                &self.velocity_model,
-            )
-            .context("bounded velocity re-fit after re-referencing")?;
-            self.vel_rad = fit.velocity;
-            self.velocity_estimator = fit.estimator;
-            self.velocity_sigma_rad = fit.sigma;
-            self.velocity_diagnostics = fit.diagnostics;
-            // Re-referencing shifts every date's displacement, which shifts the
-            // temporal-fit residual too; the network misclosure is unaffected (it
-            // is computed upstream, from the inversion, before re-referencing).
-            self.timeseries_residual_rad = fit.residual_rms;
-            self.velocity_terms = fit.terms;
-            self.reference_point = Some(global);
+            self.rereference_to(global, days, cfg)
+                .context("bounded velocity re-fit after re-referencing")?;
         }
         self.disp_rad = trim3(&self.disp_rad, target);
         self.vel_rad = trim2(&self.vel_rad, target);
@@ -4931,7 +4966,7 @@ fn write_bands(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn publication_masks_restrict_support_and_reject_masked_reference() {
+    fn publication_masks_restrict_support() {
         let path = std::env::temp_dir().join("configured_publication_mask.tif");
         let geo = GeoInfo {
             epsg: 32611,
@@ -4944,11 +4979,13 @@ mod tests {
             ..Default::default()
         };
         let mut valid = Array2::from_elem((2, 2), true);
-        restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).unwrap();
+        restrict_publication_mask(&cfg, geo, &mut valid).unwrap();
         assert_eq!(valid, mask.mapv(|v| v == 1));
-        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 1))).is_err());
+        // A reference pixel excluded here is no longer an error: `emit_displacement`
+        // re-selects the datum among the pixels that survive these masks.
         std::fs::remove_file(path).unwrap();
-        assert!(restrict_publication_mask(&cfg, geo, &mut valid, Some((0, 0))).is_err());
+        // A missing mask raster is still a hard error.
+        assert!(restrict_publication_mask(&cfg, geo, &mut valid).is_err());
     }
 
     use super::*;
