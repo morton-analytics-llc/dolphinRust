@@ -92,7 +92,7 @@ fn end_to_end_displacement_matches_oracle() {
     let out = run_displacement(&cfg).unwrap();
     assert_eq!(
         out.velocity_estimator,
-        VelocityEstimator::LinearFullSeriesUnitPrecision
+        VelocityEstimator::LinearPostGaugeUnitPrecision
     );
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();

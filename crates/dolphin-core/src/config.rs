@@ -833,10 +833,11 @@ pub struct TimeseriesOptions {
     pub block_shape: (usize, usize),
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub num_parallel_blocks: usize,
-    /// Use stitched CRLB-derived quality weights for L2 SBAS and legacy
-    /// point-only velocity fits. The sequential CRLB cube omits cross-date and
-    /// compressed-reference covariance, so it does not calibrate velocity
-    /// standard errors.
+    /// Use stitched CRLB-derived quality weights for the L2 SBAS interferogram
+    /// inversion. It does **not** reach the velocity fit (issue #123): the
+    /// sequential CRLB cube omits cross-date and compressed-reference covariance,
+    /// and a single-reference network is exactly determined, so those weights
+    /// carry no empirical scale for a rate.
     pub use_coherence_weights: bool,
     /// Emit the diagonal-IFG L2 covariance approximation and network misclosure
     /// products. Redundant interferograms share acquisitions, so network residual
@@ -845,6 +846,8 @@ pub struct TimeseriesOptions {
     /// Emit the independent-residual conditional slope standard error and raw
     /// temporal-fit diagnostics from the final corrected, spatially referenced
     /// displacement series. This is not total or field-calibrated uncertainty.
+    /// It gates those output layers only — the velocity point estimate is the
+    /// same post-gauge unit-precision fit either way (issue #123).
     pub write_velocity_uncertainty: bool,
     /// Synthetic-validated temporal-covariance inference. Disabled by default
     /// and fail-closed unless every immutable #54/#53 evidence artifact matches.
