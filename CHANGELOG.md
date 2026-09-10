@@ -7,6 +7,16 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **DEM identity in geometry provenance** (issue #118, eo #483). `geometry_provenance.json`
+  now records `dem_grid_spacing_x` / `dem_grid_spacing_y` (from the DEM's own affine
+  geotransform), `dem_grid_spacing_units` (the DEM CRS's unit name — `degree` or `metre`,
+  so a spacing is never unit-ambiguous), and `dem_vertical_datum` (the vertical CRS name,
+  e.g. `EGM96 height`). Read from whichever elevation raster the run configures
+  (`correction_options.dem_file`, falling back to `nisar_ellipsoidal_dem_file`). Nothing is
+  inferred: a DEM with no vertical CRS leaves `dem_vertical_datum` null with an explicit
+  absent reason rather than asserting ellipsoidal heights, and no DEM at all marks all four
+  fields absent. Schema bumped to `dolphinrust-geometry-provenance/5`, method version
+  `5.0.0`; the fixed-cube semantic gate in `temporal_covariance_product` pins the new pair.
 - **Exponential relaxation term in the velocity time-function model** (issue #102).
   `timeseries_options.velocity_relaxation: [{onset_date, tau_days}]` adds one
   `H(t − t₀)·(1 − exp(−(t − t₀)/τ))` column per entry to the joint WLS fit alongside the

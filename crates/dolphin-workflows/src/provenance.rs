@@ -25,8 +25,8 @@ use crate::crop::ProcessingBoundsProvenance;
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/4";
-const METHOD_VERSION: &str = "4.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/5";
+const METHOD_VERSION: &str = "5.0.0";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
@@ -50,7 +50,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/4`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/5`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -76,6 +76,20 @@ pub struct GeometryProvenance {
     pub native_azimuth_spacing_m: Option<f64>,
     /// Zero-doppler mid-time seconds-of-day (UTC), mean across granules.
     pub acquisition_time_of_day_utc_s: Option<f64>,
+    /// DEM pixel width, in the units of the DEM's own horizontal CRS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dem_grid_spacing_x: Option<f64>,
+    /// DEM pixel height (magnitude), same units as [`Self::dem_grid_spacing_x`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dem_grid_spacing_y: Option<f64>,
+    /// CRS unit the DEM grid spacings are expressed in (e.g. `degree`, `metre`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dem_grid_spacing_units: Option<String>,
+    /// Vertical CRS name carried by the DEM (e.g. `EGM96 height`), when it has
+    /// one. Never inferred: a DEM with no vertical CRS leaves this absent rather
+    /// than asserting ellipsoidal heights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dem_vertical_datum: Option<String>,
     /// Artifact key of the phase-linking coherence raster, relative to
     /// `work_directory`; absent when `calc_average_coh` is disabled.
     pub phase_linking_coherence: Option<String>,
@@ -218,6 +232,7 @@ pub fn assemble_geometry_provenance_with_coverage(
     let native_range_spacing_m = range_spacing(&cslc, &mut fields);
     let native_azimuth_spacing_m = azimuth_spacing(&cslc, &mut fields);
     let acquisition_time_of_day_utc_s = time_of_day(&cslc, &mut fields);
+    let dem = dem_identity(cfg, &mut fields);
     let incidence = incidence(cfg, los, &cslc, &mut fields);
 
     for (field, prov) in &fields {
@@ -242,6 +257,10 @@ pub fn assemble_geometry_provenance_with_coverage(
         native_range_spacing_m,
         native_azimuth_spacing_m,
         acquisition_time_of_day_utc_s,
+        dem_grid_spacing_x: dem.grid_spacing_x,
+        dem_grid_spacing_y: dem.grid_spacing_y,
+        dem_grid_spacing_units: dem.grid_spacing_units,
+        dem_vertical_datum: dem.vertical_datum,
         phase_linking_coherence: cfg
             .phase_linking
             .calc_average_coh
@@ -285,6 +304,21 @@ const CSLC_FIELDS: [&str; 5] = [
 ];
 
 const ORBIT_EPHEMERIS_FIELD: &[&str] = &["orbit_ephemeris_class"];
+
+/// Fields read from the run's DEM raster.
+const DEM_FIELDS: [&str; 4] = [
+    "dem_grid_spacing_x",
+    "dem_grid_spacing_y",
+    "dem_grid_spacing_units",
+    "dem_vertical_datum",
+];
+
+/// The DEM subset that comes from the geotransform + horizontal CRS together.
+const DEM_GRID_FIELDS: &[&str] = &[
+    "dem_grid_spacing_x",
+    "dem_grid_spacing_y",
+    "dem_grid_spacing_units",
+];
 
 /// `Sourced` entry with no raw value or note (the common case).
 fn sourced(source_files: Vec<String>, source_keys: Vec<String>, method: &str) -> FieldProvenance {
@@ -428,6 +462,129 @@ fn orbit_ephemeris_class(
         },
     );
     Some(class.into())
+}
+
+/// DEM identity read from the configured elevation raster itself.
+#[derive(Default)]
+struct DemIdentity {
+    grid_spacing_x: Option<f64>,
+    grid_spacing_y: Option<f64>,
+    grid_spacing_units: Option<String>,
+    vertical_datum: Option<String>,
+}
+
+/// Grid spacing and vertical CRS of the run's DEM, read from the file's own
+/// geotransform and spatial reference. `dem_file` wins when both DEM paths are
+/// set; the NISAR ellipsoidal DEM is the fallback so a NISAR run is not blank.
+fn dem_identity(
+    cfg: &DisplacementWorkflow,
+    fields: &mut BTreeMap<String, FieldProvenance>,
+) -> DemIdentity {
+    let options = &cfg.correction_options;
+    let Some(path) = options
+        .dem_file
+        .as_ref()
+        .or(options.nisar_ellipsoidal_dem_file.as_ref())
+    else {
+        mark_absent::<()>(
+            fields,
+            &DEM_FIELDS,
+            "no DEM configured (correction_options.dem_file and \
+             correction_options.nisar_ellipsoidal_dem_file are both unset)",
+        );
+        return DemIdentity::default();
+    };
+    let name = granule_name(path);
+    let grid = match read_dem_grid(path) {
+        Ok(grid) => grid,
+        Err(reason) => {
+            mark_absent::<()>(fields, &DEM_FIELDS, &format!("DEM {name}: {reason}"));
+            return DemIdentity::default();
+        }
+    };
+    for field in DEM_GRID_FIELDS {
+        fields.insert(
+            (*field).into(),
+            sourced(
+                vec![name.clone()],
+                vec!["GDAL:geotransform".into(), "GDAL:spatial_ref".into()],
+                "pixel width/height from the affine geotransform; unit name from the DEM's own CRS",
+            ),
+        );
+    }
+    let Some(vertical_datum) = grid.vertical_datum else {
+        mark_absent::<()>(
+            fields,
+            &["dem_vertical_datum"],
+            &format!("DEM {name}: no vertical CRS on the file's spatial reference"),
+        );
+        return DemIdentity {
+            grid_spacing_x: Some(grid.spacing_x),
+            grid_spacing_y: Some(grid.spacing_y),
+            grid_spacing_units: Some(grid.units),
+            vertical_datum: None,
+        };
+    };
+    fields.insert(
+        "dem_vertical_datum".into(),
+        FieldProvenance::Sourced {
+            source_files: vec![name],
+            source_keys: vec!["GDAL:spatial_ref/VERT_CS".into()],
+            method: "vertical CRS name of the DEM's compound spatial reference".into(),
+            raw_value: Some(vertical_datum.clone()),
+            note: None,
+        },
+    );
+    DemIdentity {
+        grid_spacing_x: Some(grid.spacing_x),
+        grid_spacing_y: Some(grid.spacing_y),
+        grid_spacing_units: Some(grid.units),
+        vertical_datum: Some(vertical_datum),
+    }
+}
+
+struct DemGrid {
+    spacing_x: f64,
+    spacing_y: f64,
+    units: String,
+    vertical_datum: Option<String>,
+}
+
+/// Open the DEM and read its grid spacing, CRS unit name, and vertical CRS name.
+/// Every failure is a reason string; nothing here is defaulted.
+fn read_dem_grid(path: &Path) -> Result<DemGrid, String> {
+    let dataset = gdal::Dataset::open(path).map_err(|error| format!("unreadable ({error})"))?;
+    let geotransform = dataset
+        .geo_transform()
+        .map_err(|error| format!("no geotransform ({error})"))?;
+    let spatial_ref = dataset
+        .spatial_ref()
+        .map_err(|error| format!("no spatial reference ({error})"))?;
+    let units = dem_units(&spatial_ref).ok_or_else(|| {
+        "spatial reference is neither projected nor geographic, so the grid spacing has no \
+         nameable unit"
+            .to_string()
+    })?;
+    Ok(DemGrid {
+        spacing_x: geotransform[1].abs(),
+        spacing_y: geotransform[5].abs(),
+        units,
+        vertical_datum: spatial_ref
+            .get_attr_value("VERT_CS", 0)
+            .ok()
+            .flatten()
+            .filter(|name| !name.is_empty()),
+    })
+}
+
+fn dem_units(spatial_ref: &gdal::spatial_ref::SpatialRef) -> Option<String> {
+    match spatial_ref.is_projected() {
+        true => spatial_ref.linear_units_name(),
+        false => spatial_ref
+            .is_geographic()
+            .then(|| spatial_ref.angular_units_name())
+            .flatten(),
+    }
 }
 
 /// `/identification/orbit_pass_direction`, case-insensitive, all granules agreeing.
