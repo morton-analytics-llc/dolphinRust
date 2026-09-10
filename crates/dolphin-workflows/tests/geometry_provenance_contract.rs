@@ -124,7 +124,7 @@ fn real_metadata_sample_maps_to_exported_fields() {
     assert_eq!(source_keys, &["/metadata/orbit/orbit_type"]);
     let decoded: GeometryProvenance =
         serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/4");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
     assert_eq!(decoded.orbit_ephemeris_class.as_deref(), Some("precise"));
     assert!(matches!(
         decoded.geometry_provenance.fields.get("orbit_ephemeris_class"),
@@ -194,7 +194,7 @@ fn coverage_v3_round_trips_without_identifiers() {
     let json = serde_json::to_string(&provenance).unwrap();
     let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/4");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
     assert_eq!(decoded.input_coverage, Some(coverage));
     for forbidden in [
         "source_path",
@@ -600,6 +600,105 @@ fn plausible_los() -> LosGeometry {
         east: Array2::from_elem((8, 8), 0.62),
         north: Array2::from_elem((8, 8), -0.11),
         up: Array2::from_elem((8, 8), (1.0_f64 - 0.62 * 0.62 - 0.11 * 0.11).sqrt()),
+    }
+}
+
+const DEM_SPACING_DEG: f64 = 0.000_25;
+
+const DEM_FIELDS: [&str; 4] = [
+    "dem_grid_spacing_x",
+    "dem_grid_spacing_y",
+    "dem_grid_spacing_units",
+    "dem_vertical_datum",
+];
+
+/// Synthetic single-band DEM with a known geotransform and CRS. EPSG 9707 is
+/// `WGS 84 + EGM96 height` — a compound CRS whose vertical component is what the
+/// DEM-identity fields must read.
+fn write_dem(path: &Path, epsg: u32) {
+    let _ = std::fs::remove_file(path);
+    dolphin_io::write_raster(
+        path,
+        Array2::<f32>::zeros((8, 8)).view(),
+        [-99.5, DEM_SPACING_DEG, 0.0, 19.5, 0.0, -DEM_SPACING_DEG],
+        Some(epsg),
+        None,
+    )
+    .unwrap();
+}
+
+fn cfg_with_dem(dem: &Path) -> DisplacementWorkflow {
+    let mut cfg = cfg_with_inputs(&[fixtures().join("geomprov_ci_cslc.h5")]);
+    cfg.correction_options.dem_file = Some(dem.to_path_buf());
+    cfg
+}
+
+/// Contract: a DEM carrying a vertical CRS yields sourced grid spacing and the
+/// vertical datum name read from the file — never inferred from the filename.
+#[test]
+fn dem_with_vertical_crs_sources_spacing_and_datum() {
+    let dem = std::env::temp_dir().join("dolphin_geomprov_dem_compound.tif");
+    write_dem(&dem, 9707);
+    let cfg = cfg_with_dem(&dem);
+
+    let _hdf5 = hdf5_guard();
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.dem_grid_spacing_x, Some(DEM_SPACING_DEG));
+    assert_eq!(prov.dem_grid_spacing_y, Some(DEM_SPACING_DEG));
+    assert_eq!(prov.dem_grid_spacing_units.as_deref(), Some("degree"));
+    assert_eq!(prov.dem_vertical_datum.as_deref(), Some("EGM96 height"));
+    for field in DEM_FIELDS {
+        assert!(sourced(&prov, field), "{field} not sourced");
+    }
+    let Some(FieldProvenance::Sourced { source_files, .. }) =
+        prov.geometry_provenance.fields.get("dem_vertical_datum")
+    else {
+        panic!("dem_vertical_datum not sourced");
+    };
+    assert_eq!(source_files, &["dolphin_geomprov_dem_compound.tif"]);
+}
+
+/// Contract: a DEM with no vertical CRS keeps its grid spacing sourced and marks
+/// the datum explicitly absent rather than defaulting it to an ellipsoidal claim.
+#[test]
+fn dem_without_vertical_crs_leaves_the_datum_absent() {
+    let dem = std::env::temp_dir().join("dolphin_geomprov_dem_horizontal.tif");
+    write_dem(&dem, 4326);
+    let cfg = cfg_with_dem(&dem);
+
+    let _hdf5 = hdf5_guard();
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.dem_grid_spacing_x, Some(DEM_SPACING_DEG));
+    assert_eq!(prov.dem_grid_spacing_units.as_deref(), Some("degree"));
+    assert!(sourced(&prov, "dem_grid_spacing_x"));
+    assert_eq!(prov.dem_vertical_datum, None);
+    assert!(
+        absent_reason(&prov, "dem_vertical_datum").contains("no vertical CRS"),
+        "reason: {}",
+        absent_reason(&prov, "dem_vertical_datum")
+    );
+}
+
+/// Contract: no DEM configured leaves every DEM field null with an explicit
+/// reason — never silently omitted.
+#[test]
+fn no_dem_configured_marks_every_dem_field_absent() {
+    let _hdf5 = hdf5_guard();
+    let cfg = cfg_with_inputs(&[fixtures().join("geomprov_ci_cslc.h5")]);
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.dem_grid_spacing_x, None);
+    assert_eq!(prov.dem_grid_spacing_y, None);
+    assert_eq!(prov.dem_grid_spacing_units, None);
+    assert_eq!(prov.dem_vertical_datum, None);
+    for field in DEM_FIELDS {
+        assert!(
+            absent_reason(&prov, field).contains("no DEM configured"),
+            "{field}: {}",
+            absent_reason(&prov, field)
+        );
     }
 }
 

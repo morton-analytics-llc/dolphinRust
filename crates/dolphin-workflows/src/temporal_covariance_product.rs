@@ -2527,8 +2527,8 @@ fn validate_geometry_provenance(
         receipt.valid_pixels,
     )?;
     ensure!(
-        provenance.schema == "dolphinrust-geometry-provenance/4"
-            && provenance.method_version == "4.0.0"
+        provenance.schema == "dolphinrust-geometry-provenance/5"
+            && provenance.method_version == "5.0.0"
             && provenance.decomposition_geometry_complete
             && provenance
                 .orbit_direction
@@ -6384,8 +6384,8 @@ mod tests {
         )
         .unwrap();
         let valid_geometry_provenance = br#"{
-            "schema":"dolphinrust-geometry-provenance/4",
-            "method_version":"4.0.0",
+            "schema":"dolphinrust-geometry-provenance/5",
+            "method_version":"5.0.0",
             "orbit_direction":"ascending",
             "incidence_angle_deg":30.0,
             "incidence_angle_spread_deg":0.0,
@@ -6408,7 +6408,7 @@ mod tests {
                 "valid_fraction":1.0
             },
             "geometry_provenance":{
-                "method_version":"4.0.0",
+                "method_version":"5.0.0",
                 "fields":{
                     "orbit_direction":{
                         "status":"sourced",
@@ -6474,7 +6474,7 @@ mod tests {
         .is_err());
         std::fs::write(
             directory.join("geometry_provenance.json"),
-            br#"{"schema":"dolphinrust-geometry-provenance/4","decomposition_geometry_complete":false}"#,
+            br#"{"schema":"dolphinrust-geometry-provenance/5","decomposition_geometry_complete":false}"#,
         )
         .unwrap();
         assert!(

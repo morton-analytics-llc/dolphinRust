@@ -19,8 +19,8 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/4",
-  "method_version": "4.0.0",
+  "schema": "dolphinrust-geometry-provenance/5",
+  "method_version": "5.0.0",
   "orbit_direction": "descending",
   "orbit_ephemeris_class": "precise",
   "incidence_angle_deg": 39.27,
@@ -31,6 +31,10 @@ Two surfaces, one type:
   "native_range_spacing_m": 2.329562114715323,
   "native_azimuth_spacing_m": 14.06,
   "acquisition_time_of_day_utc_s": 50428.5,
+  "dem_grid_spacing_x": 0.0002777777777777778,
+  "dem_grid_spacing_y": 0.0002777777777777778,
+  "dem_grid_spacing_units": "degree",
+  "dem_vertical_datum": "EGM96 height",
   "phase_linking_coherence": "phase_linking_coherence.tif",
   "decomposition_geometry_complete": true,
   "input_coverage": {
