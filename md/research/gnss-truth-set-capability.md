@@ -249,33 +249,108 @@ displacement product — a third of the number under investigation, before any p
 future statement of the residual has to name which estimator it means. This is the same class
 of problem #123 just fixed one level down.
 
+## The plane test, and why the 80 m control cannot be run
+
+Re-scoring the same LOS run at a 0.80 epoch-coverage gate admits MXTM (0.865) alongside the
+three stations clearing 0.90. Four stations is the minimum that leaves the tilt/ramp plane
+any degrees of freedom at all, so this is the first time the test could actually be run.
+
+Per-station residuals (zero-mean gauge), pair table explained to R² = 0.9938, misfit RMS
+0.978 mm/yr:
+
+| station | residual mm/yr | east | north |
+|---|---:|---:|---:|
+| ICMX | +7.71 | −7.62 km | −3.64 km |
+| MMX1 | −11.51 | +3.13 km | −0.73 km |
+| MXMX | −2.05 | −8.08 km | −0.76 km |
+| MXTM | +5.84 | +12.56 km | +5.13 km |
+
+The decision rule was fixed in code before these numbers existed — an F test on the two slope
+terms at p < 0.05, validated against a synthetic tilt (recovered exactly) and synthetic
+station-local noise (correctly rejected):
+
+```
+east gradient  −0.512 mm/yr per km      R² = 0.0884
+north gradient +1.501 mm/yr per km      F(2,1) = 0.05, p = 0.9548
+                                        →  no gradient — station-local
+```
+
+**No gradient.** A plane explains 9% of the station field. With dof = 1 the test is weak
+against a *small* tilt, so this rules out a ramp large enough to matter, not every conceivable
+one. Combined with the baseline evidence above — the 2.92 km pair carrying as much residual
+as the 11 km pairs — the station-local reading stands.
+
+The window sweep extended to MXTM shows it sits in a locally rougher patch than the others
+(spread 2.62 mm/yr, within-window sd 2.04 mm, against 0.08–0.70 and 0.20–0.48 elsewhere).
+That is still well under its residual contribution, so sampling remains ruled out, but MXTM
+is the one station where it is not negligible.
+
+### The 80 m control is not obtainable from this cohort
+
+This corrects the design above and issue #126. A wider crop does not reach SSNX and TNGF —
+**burst `t005_008704_iw1` has no data at those pixels at all.**
+
+Cropping a western sub-frame (1375×1229, six stations) and inspecting the CSLC directly:
+
+| station | 5×5 nonzero |
+|---|---:|
+| ICMX | 100.0% |
+| MXMX | 100.0% |
+| UTAC | **0.0%** |
+| SSNX | **0.0%** |
+| TNGF | **0.0%** |
+| UJAL | **0.0%** |
+
+A Sentinel-1 burst is a parallelogram, not a rectangle. SSNX, TNGF, UJAL and UTAC all sit
+inside the burst's bounding box and outside its footprint — UTAC is only 2.55 km from ICMX
+and still empty. The pipeline said so itself before any of this: *"los geometry coverage:
+1298792 frame pixels (76.9%) fall outside the supplied CSLC-S1-STATIC coverage"*.
+
+That is why the recipe carries two fixtures. `mmx1_2018_los_common` is the five stations
+inside the burst; `mmx1_2018_common` is the nine-station cohort for GNSS-side work, and was
+never a frame the InSAR could score. Reading the second as "four more stations we already
+have" was the error in the design above.
+
+Measuring the 80 m pair needs the **neighbouring burst's own 52-granule stack**, not a wider
+window on this one — a multi-burst cohort, not a crop.
+
 ## Verdict
 
 The residual is a **station-local additive term of order 10 mm/yr**, plus up to 7 mm/yr of
-estimator choice. Ruled out by this run: point-vs-pixel sampling, a smooth spatial ramp, and
-a multiplicative scale error. Troposphere and plate motion were already out.
+estimator choice. Ruled out: point-vs-pixel sampling, a smooth spatial ramp (now tested, not
+assumed), and a multiplicative scale error. Troposphere and plate motion were already out.
 
-What remains, and what separates them:
+What remains, and unchanged by this run:
 
-- **Real local ground motion** differing between monuments — entirely plausible in a basin
-  where rates vary 3–4× between adjacent sites.
+- **Real local ground motion** differing between monuments — plausible where rates vary 3–4×
+  between adjacent sites.
 - **A station-local error on the InSAR side** — unwrapping or reference handling at specific
   pixels.
 - **A station-local error on the GNSS side** — monument motion, or the ENU→LOS projection.
 
-The 80 m SSNX–TNGF pair separates the GNSS side from the rest, because at that separation
-real differential ground motion is negligible. The nine-station frame supplies both that pair
-and enough degrees of freedom for the plane test that three stations cannot support.
+Separating the GNSS side from the other two still needs a near-zero-baseline pair, and this
+cohort cannot supply one. That is now a data-acquisition question, not an analysis question.
+
+## What this cost, so the next attempt is cheaper
+
+- The nine-station frame reached **12.53 GB resident within nine seconds** and was OOM-killed
+  five times on a 34 GB machine shared with other work. `worker_settings.block_shape` does not
+  help: it tiles phase-linking, while the allocation is the eager stack load. 1959×5269×52
+  complex64 is 4.3 GB of raw stack before any working set.
+- `remote_hdf5_crop.py` copies only the data arrays and grid (5 datasets). A fixture the
+  pipeline can run needs `identification` and `metadata` too (141). Grafting them from the
+  same remote product is cheap; discovering the gap after a long run would not have been.
+- A bounded range-read rebuilt the frame for ~1.6 GB of transfer against 13.5 GB of full
+  products, using a manifest whose parent crop had been deleted. That part worked well and is
+  worth reusing.
 
 ## Disposition
 
-- **Done:** pair sweep and window-sweep readout on the LOS fixture; #123 acceptance item 4.
-- **In progress:** the nine-station frame, rebuilt by bounded remote range-read (the parent
-  crop was deleted but its manifest and the acquisition catalogue both survive; ~31 MB read
-  per 260 MB product).
-- **Scheduled:** issue #126 — 80 m control pair, plane test with real degrees of freedom.
+- **Done:** pair sweep at both gates, window-sweep readout, the plane test with dof = 1, and
+  #123 acceptance item 4 (harness numbers unmoved).
+- **Blocked, needs data:** the 80 m control. Requires the neighbouring burst's CSLC stack.
+- **Out of scope here:** a multi-burst cohort. Sized as a new piece of work, not a crop.
 - **Not scheduled:** any further hypothesis tested against a single number for the residual
-  until the estimator gap above is stated alongside it.
-- **Corrected:** MMX1–ICMX is 11.13 km, not 13 km. The SSNX/TNGF 5×5 windows do **not**
-  overlap (cols 1068–1072 vs 1083–1087 at 5 m posting), so that pair measures GNSS *and*
-  InSAR error together, not the GNSS floor alone.
+  until the estimator gap is stated alongside it.
+- **Corrected:** MMX1–ICMX is 11.13 km, not 13 km. `mmx1_2018_common` is not an InSAR-scorable
+  frame. The SSNX/TNGF window-overlap question is moot — there is no data at either pixel.

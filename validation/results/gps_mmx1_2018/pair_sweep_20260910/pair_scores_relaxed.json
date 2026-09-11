@@ -1,0 +1,105 @@
+{
+  "cohort_id": "gps_mmx1_2018",
+  "fixture": "mmx1_2018_los_common",
+  "engine": "native",
+  "stations": [
+    "ICMX",
+    "MMX1",
+    "MXMX",
+    "MXTM",
+    "UNVA"
+  ],
+  "pairs_attempted": 10,
+  "pairs_scored": 6,
+  "independent_differential_series": 4,
+  "pairs": {
+    "ICMX-MMX1": {
+      "status": "scored",
+      "rmse_mm": 11.244389857154244,
+      "correlation": 0.9907744254992935,
+      "tls_slope": 1.0997223015658772,
+      "insar_velocity_mm_yr": 263.19302923649167,
+      "gnss_velocity_mm_yr": 240.8304850697603,
+      "difference_mm_yr": 22.362544166731368,
+      "insar_velocity_raster_mm_yr": 259.77490097284317,
+      "difference_raster_mm_yr": 18.94441590308287,
+      "common_gnss_fraction": 0.9230769230769231
+    },
+    "ICMX-MXMX": {
+      "status": "scored",
+      "rmse_mm": 6.609555869597198,
+      "correlation": 0.3001118254607965,
+      "tls_slope": 0.8183362372951211,
+      "insar_velocity_mm_yr": -8.19231743996584,
+      "gnss_velocity_mm_yr": -15.524835343368888,
+      "difference_mm_yr": 7.332517903403048,
+      "insar_velocity_raster_mm_yr": -4.2906254529953,
+      "difference_raster_mm_yr": 11.234209890373588,
+      "common_gnss_fraction": 0.9230769230769231
+    },
+    "ICMX-MXTM": {
+      "status": "scored",
+      "rmse_mm": 46.05115305951742,
+      "correlation": 0.9102377120405842,
+      "tls_slope": 1.2042414116254527,
+      "insar_velocity_mm_yr": 239.71938634085052,
+      "gnss_velocity_mm_yr": 215.0640598606677,
+      "difference_mm_yr": 24.655326480182822,
+      "insar_velocity_raster_mm_yr": 215.73993563652039,
+      "difference_raster_mm_yr": 0.6758757758526883,
+      "common_gnss_fraction": 0.8076923076923077
+    },
+    "ICMX-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.800"
+    },
+    "MMX1-MXMX": {
+      "status": "scored",
+      "rmse_mm": 11.750764066465255,
+      "correlation": 0.9897846103114236,
+      "tls_slope": 1.0743837281045128,
+      "insar_velocity_mm_yr": -271.1195994642011,
+      "gnss_velocity_mm_yr": -254.56032525192492,
+      "difference_mm_yr": -16.559274212276165,
+      "insar_velocity_raster_mm_yr": -264.06552642583847,
+      "difference_raster_mm_yr": -9.505201173913548,
+      "common_gnss_fraction": 0.9038461538461539
+    },
+    "MMX1-MXTM": {
+      "status": "scored",
+      "rmse_mm": 45.77722048350144,
+      "correlation": -0.06192215497796811,
+      "tls_slope": -36.22131854182216,
+      "insar_velocity_mm_yr": -24.21269609606359,
+      "gnss_velocity_mm_yr": -26.458414914246895,
+      "difference_mm_yr": 2.245718818183306,
+      "insar_velocity_raster_mm_yr": -44.034965336322784,
+      "difference_raster_mm_yr": -17.57655042207589,
+      "common_gnss_fraction": 0.8076923076923077
+    },
+    "MMX1-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.800"
+    },
+    "MXMX-MXTM": {
+      "status": "scored",
+      "rmse_mm": 45.154786266449186,
+      "correlation": 0.9137633498404388,
+      "tls_slope": 1.1993318068997552,
+      "insar_velocity_mm_yr": 252.0512854352718,
+      "gnss_velocity_mm_yr": 226.50262661406677,
+      "difference_mm_yr": 25.548658821205038,
+      "insar_velocity_raster_mm_yr": 220.0305610895157,
+      "difference_raster_mm_yr": -6.472065524551084,
+      "common_gnss_fraction": 0.8461538461538461
+    },
+    "MXMX-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.442 is below 0.800"
+    },
+    "MXTM-UNVA": {
+      "status": "not_evaluable",
+      "reason": "common GNSS availability 0.404 is below 0.800"
+    }
+  }
+}
