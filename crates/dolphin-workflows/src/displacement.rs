@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use crate::burst::{
     burst_offset, frame_grid, resolve_layover_shadow_masks, workflow_groups, BurstGeo, FrameGrid,
 };
-use crate::corrections::{apply_corrections, CorrectionLayers};
+use crate::corrections::{apply_corrections, apply_corrections_with_ownership, CorrectionLayers};
 use crate::covariance_artifact::{
     finalize_covariance_artifact, preflight_covariance_artifact_disk_with_identity_index,
     CovarianceArtifactDiskAdmission, CovarianceArtifactManifest, CovarianceArtifactTransaction,
@@ -411,7 +411,11 @@ fn finish_displacement(
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
     let stitched = timed("stitch", || {
-        stitch_bursts(bursts, cfg.phase_linking.write_covariance_operator)
+        stitch_bursts(
+            bursts,
+            cfg.phase_linking.write_covariance_operator,
+            cfg.correction_options.is_enabled() && groups.len() > 1,
+        )
     })?;
     let validity_mask = stitched.validity_mask;
     let burst_coverage = stitched.coverage;
@@ -498,6 +502,7 @@ fn finish_displacement(
                         geotransform,
                     },
                     None,
+                    stitched.ownership.as_ref().map(|owners| owners.view()),
                 )
             },
             |displacement| {
@@ -732,6 +737,7 @@ fn correct_and_reference(
     date_files: &[PathBuf],
     geo: GeoInfo,
     reference: Option<(usize, usize)>,
+    ownership: Option<ArrayView3<'_, u32>>,
 ) -> Result<CorrectionLayers> {
     let mut options = cfg.correction_options.clone();
     if !cfg.input_options.acquisition_metadata.is_empty() {
@@ -747,22 +753,49 @@ fn correct_and_reference(
             })
             .collect::<Result<Vec<_>>>()?;
     }
-    if options.is_enabled() {
-        for reference_utc in &options.acquisition_utc {
-            anyhow::ensure!(cfg.input_options.acquisition_metadata.iter()
-                .filter(|record| record.acquisition_utc.date_naive() == reference_utc.date_naive())
-                .all(|record| record.acquisition_utc == *reference_utc),
-                "spatial groups have different acquisition UTC; per-group atmospheric support is unresolved");
-        }
-    }
-    let corrections = apply_corrections(
-        &options,
-        cfg.input_options.wavelength,
-        displacement,
-        date_files,
-        geo.epsg,
-        geo.geotransform,
-    )?;
+    let corrections = if let Some(ownership) = ownership.filter(|_| options.is_enabled()) {
+        let groups = workflow_groups(cfg)?;
+        let group_options = groups
+            .values()
+            .enumerate()
+            .map(|(index, indices)| {
+                let files = burst_files(cfg, indices);
+                let mut options = options.clone();
+                options.acquisition_utc = files
+                    .iter()
+                    .map(|path| {
+                        cfg.input_options
+                            .acquisition_metadata
+                            .iter()
+                            .find(|record| record.path == *path)
+                            .map(|record| record.acquisition_utc)
+                            .or_else(|| {
+                                crate::corrections::acq_utc_datetime(path)
+                                    .map(|time| time.and_utc())
+                            })
+                            .context("missing actual spatial-group acquisition UTC")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((u32::try_from(index)?, options, files))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        apply_corrections_with_ownership(
+            &group_options,
+            cfg.input_options.wavelength,
+            displacement,
+            ownership,
+            geo,
+        )?
+    } else {
+        apply_corrections(
+            &options,
+            cfg.input_options.wavelength,
+            displacement,
+            date_files,
+            geo.epsg,
+            geo.geotransform,
+        )?
+    };
     if let Some(point) = reference {
         reference_to_point(displacement, point);
     }
@@ -3920,13 +3953,17 @@ struct Stitched {
 /// Mosaic the per-burst phase-linking products onto the frame grid. A single
 /// burst is returned as-is (identity path).
 #[allow(clippy::too_many_lines)]
-fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) -> Result<Stitched> {
+fn stitch_bursts(
+    mut bursts: Vec<BurstLink>,
+    retain_covariance_lineage: bool,
+    retain_correction_ownership: bool,
+) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
         let b = bursts.remove(0);
         let owner =
             u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
-        let ownership = retain_covariance_lineage.then(|| {
+        let ownership = (retain_covariance_lineage || retain_correction_ownership).then(|| {
             b.pl.mapv(|value| {
                 if value.re.is_finite() && value.im.is_finite() {
                     owner
@@ -3972,7 +4009,7 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) ->
     );
     let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
-    let mut ownership = retain_covariance_lineage
+    let mut ownership = (retain_covariance_lineage || retain_correction_ownership)
         .then(|| Array3::<u32>::from_elem((nslc, frame.rows, frame.cols), NO_BURST_OWNER));
     let mut seam_rotations = retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
     let mut burst_output_mappings =
@@ -4977,44 +5014,6 @@ fn write_bands(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn timed_corrections_reject_unresolved_group_acquisition_times() {
-        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
-            .unwrap()
-            .to_utc();
-        let mut cfg = DisplacementWorkflow::default();
-        cfg.correction_options
-            .troposphere_epochs
-            .push(dolphin_core::config::TroposphereEpoch {
-                path: "unread.nc".into(),
-                epoch: utc,
-            });
-        cfg.input_options.acquisition_metadata = [0, 1]
-            .into_iter()
-            .map(|index| dolphin_core::config::AcquisitionMetadata {
-                path: format!("group{index}.h5").into(),
-                acquisition_utc: utc + chrono::Duration::seconds(index),
-                spatial_group: format!("group{index}"),
-                grid_id: "grid".into(),
-            })
-            .collect();
-        let error = correct_and_reference(
-            &cfg,
-            &mut Array3::zeros((1, 1, 1)),
-            &["group0.h5".into()],
-            GeoInfo {
-                epsg: 4326,
-                geotransform: [0.0; 6],
-            },
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("different acquisition UTC"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn publication_components_require_each_band_reference_membership() {
         let components = ndarray::array![[[1, 2, 1, 0]], [[8, 8, 9, 8]]];
         let mut mask = Array2::from_elem((1, 4), true);
@@ -5176,7 +5175,7 @@ mod tests {
         second.temp_coh[(0, 0)] = f64::NAN;
         second.validity_mask[(0, 0)] = false;
         second.coverage.burst_index = 1;
-        let stitched = stitch_bursts(vec![first, second], true).unwrap();
+        let stitched = stitch_bursts(vec![first, second], true, false).unwrap();
         assert_eq!(stitched.pl[(0, 0, 0)], expected);
         assert!(stitched.temp_coh[(0, 0)].is_finite());
         assert!(stitched.validity_mask[(0, 0)]);
@@ -5197,8 +5196,11 @@ mod tests {
 
     #[test]
     fn disabled_covariance_capture_does_not_retain_frame_lineage() {
-        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false).unwrap();
+        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false, false).unwrap();
         assert!(stitched.ownership.is_none());
+        let corrected = stitch_bursts(vec![seam_burst(0.0, 0.9)], false, true).unwrap();
+        assert!(corrected.ownership.is_some());
+        assert!(corrected.burst_output_mappings.is_none());
         assert!(stitched.seam_rotations.is_none());
     }
 
@@ -6793,6 +6795,7 @@ mod tests {
                     geotransform: gt,
                 },
                 Some((1, 0)),
+                None,
             )
             .unwrap();
             assert!(disp

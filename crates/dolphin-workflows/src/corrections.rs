@@ -105,6 +105,103 @@ pub fn apply_corrections(
     })
 }
 
+/// Apply per-group acquisition times using the same date-wise source ownership as stitching.
+pub(crate) fn apply_corrections_with_ownership(
+    groups: &[(u32, CorrectionOptions, Vec<PathBuf>)],
+    wavelength: Option<f64>,
+    displacement: &mut Array3<f64>,
+    ownership: ndarray::ArrayView3<'_, u32>,
+    geo: GeoInfo,
+) -> Result<CorrectionLayers> {
+    let (bands, rows, cols) = displacement.dim();
+    ensure!(
+        ownership.dim() == (bands + 1, rows, cols),
+        "correction ownership shape mismatch"
+    );
+    let opts = &groups
+        .first()
+        .context("missing correction spatial groups")?
+        .1;
+    let wavelength = wavelength.context("corrections require wavelength")?;
+    let los_geometry = resolve_geometry(opts, geo.epsg, geo.geotransform, (rows, cols))?;
+    let mut combined = CorrectionLayers {
+        ionosphere: None,
+        troposphere: None,
+        solid_earth_tide: None,
+        los_geometry,
+    };
+    for (owner, options, files) in groups {
+        let mut bounds = (rows, cols, 0, 0);
+        for ((_, row, col), value) in ownership.indexed_iter() {
+            if value == owner {
+                bounds.0 = bounds.0.min(row);
+                bounds.1 = bounds.1.min(col);
+                bounds.2 = bounds.2.max(row + 1);
+                bounds.3 = bounds.3.max(col + 1);
+            }
+        }
+        let (r0, c0, r1, c1) = bounds;
+        if r0 >= r1 || c0 >= c1 {
+            continue;
+        }
+        ensure!(
+            options.acquisition_utc.len() == bands + 1,
+            "spatial group acquisition UTC axis mismatch"
+        );
+        let mut gt = geo.geotransform;
+        gt[0] += c0 as f64 * gt[1] + r0 as f64 * gt[2];
+        gt[3] += c0 as f64 * gt[4] + r0 as f64 * gt[5];
+        let local_geo = GeoInfo {
+            epsg: geo.epsg,
+            geotransform: gt,
+        };
+        let shape = (r1 - r0, c1 - c0);
+        let local_los = combined.los_geometry.as_ref().map(|los| LosGeometry {
+            east: los.east.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+            north: los.north.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+            up: los.up.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+        });
+        let ionosphere = build_ionosphere(
+            options,
+            files,
+            bands + 1,
+            shape,
+            local_geo,
+            SPEED_OF_LIGHT / wavelength,
+            local_los.as_ref(),
+        )?;
+        let troposphere =
+            build_troposphere(options, bands + 1, shape, gt, geo.epsg, local_los.as_ref())?;
+        let tide = build_solid_earth_tide(options, files, shape, local_geo, local_los.as_ref())?;
+        for (destination, source) in [
+            (&mut combined.ionosphere, ionosphere),
+            (&mut combined.troposphere, troposphere),
+            (&mut combined.solid_earth_tide, tide),
+        ] {
+            if let Some(source) = source {
+                let destination = destination
+                    .get_or_insert_with(|| Array3::from_elem((bands + 1, rows, cols), f64::NAN));
+                for ((date, row, col), value) in source.indexed_iter() {
+                    if ownership[(date, row + r0, col + c0)] == *owner {
+                        destination[(date, row + r0, col + c0)] = *value;
+                    }
+                }
+            }
+        }
+    }
+    let total = sum_layers(
+        [
+            combined.ionosphere.as_ref(),
+            combined.troposphere.as_ref(),
+            combined.solid_earth_tide.as_ref(),
+        ],
+        bands + 1,
+        (rows, cols),
+    );
+    subtract_delay(displacement, total.view(), wavelength)?;
+    Ok(combined)
+}
+
 /// Resolve the configured LOS geometry and discard it, purely to fail early.
 ///
 /// Geometry is otherwise resolved in the corrections stage, which runs *after*
@@ -228,7 +325,7 @@ fn build_solid_earth_tide(
 }
 
 /// Full acquisition UTC from a granule name's `YYYYMMDDThhmmss` token.
-fn acq_utc_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+pub(crate) fn acq_utc_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let name = path.file_name().and_then(|s| s.to_str())?;
     let chars: Vec<char> = name.chars().collect();
     chars.windows(15).find_map(|w| {
@@ -594,6 +691,76 @@ fn resample_to_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn correction_epochs_follow_date_varying_burst_owner() {
+        let _hdf5 = hdf5_guard();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!("dolphin-owner-tropo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dem = dir.join("dem.nc");
+        let geometry = dir.join("static.h5");
+        let gt = [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0];
+        write_4326_netcdf(&dem, &Array2::from_elem((3, 3), 500.0), gt);
+        write_uniform_static(&geometry, 30.0, gt, (3, 3));
+        hdf5::File::open_rw(&geometry)
+            .unwrap()
+            .dataset("/data/projection")
+            .unwrap()
+            .write_scalar(&4326_i64)
+            .unwrap();
+        let options = CorrectionOptions {
+            troposphere_epochs: vec![
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem),
+            geometry_files: vec![geometry],
+            ..Default::default()
+        };
+        let groups: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|owner| {
+                let mut options = options.clone();
+                options.acquisition_utc = [0, 60, 120]
+                    .map(|minutes| utc + chrono::Duration::minutes(minutes + 30 * i64::from(owner)))
+                    .to_vec();
+                (owner, options, vec![PathBuf::from("unused"); 3])
+            })
+            .collect();
+        let owners = ndarray::array![[[0, 1]], [[1, 0]], [[0, 1]]];
+        for wavelength in [0.05546576, 0.238403545] {
+            let mut displacement = Array3::zeros((2, 1, 2));
+            let output = apply_corrections_with_ownership(
+                &groups,
+                Some(wavelength),
+                &mut displacement,
+                owners.view(),
+                GeoInfo {
+                    epsg: 4326,
+                    geotransform: [-0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
+                },
+            )
+            .unwrap();
+            let meters =
+                displacement.mapv(|phase| -wavelength * phase / (4.0 * std::f64::consts::PI));
+            assert!((meters[(0, 0, 0)] + 0.825 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!((meters[(0, 0, 1)] + 0.275 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!(
+                (output.troposphere.unwrap()[(0, 0, 1)] - 1.925 / 30_f64.to_radians().cos()).abs()
+                    < 1e-7
+            );
+        }
+    }
+
     #[test]
     fn timed_troposphere_combines_height_time_and_los() {
         use dolphin_core::config::TroposphereEpoch;
