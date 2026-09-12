@@ -518,6 +518,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.troposphere_files is nonempty"
     ),
+    conditional!("correction_options.troposphere_epochs", "CFG-CORRECTIONS", "timed TROPO inputs are supplied"),
     conditional!(
         "correction_options.geometry_files",
         "CFG-CORRECTIONS",
@@ -1176,6 +1177,15 @@ impl Default for InputOptions {
     }
 }
 
+/// Staged OPERA TROPO input with its verified valid UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TroposphereEpoch {
+    /// Immutable local product path.
+    pub path: PathBuf,
+    /// Product valid UTC, not production or download time.
+    pub epoch: chrono::DateTime<chrono::Utc>,
+}
+
 /// Auxiliary atmospheric-correction options. dolphin `CorrectionOptions`
 /// (`ionosphere_files`, `geometry_files`, `dem_file`). Corrections are **opt-in**:
 /// with every file list empty (the default) the displacement output is unchanged.
@@ -1201,6 +1211,9 @@ pub struct CorrectionOptions {
     /// OPERA L4 tropospheric netCDF products (one per date). dolphinRust forward
     /// divergence (dolphin uses `dem_file` + RAiDER instead).
     pub troposphere_files: Vec<PathBuf>,
+    /// Strictly ordered OPERA TROPO epochs bracketing all acquisition UTCs.
+    /// Mutually exclusive with legacy per-date `troposphere_files`.
+    pub troposphere_epochs: Vec<TroposphereEpoch>,
     /// Line-of-sight geometry files resolved even in a geometry-only run and
     /// used by correction computations when enabled. The delay projection uses
     /// `incidence_angle_deg` when no geometry is resolved. dolphin name.
@@ -1232,6 +1245,7 @@ impl Default for CorrectionOptions {
             nisar_ellipsoidal_dem_file: None,
             ionosphere_files: Vec::new(),
             troposphere_files: Vec::new(),
+            troposphere_epochs: Vec::new(),
             geometry_files: Vec::new(),
             dem_file: None,
             incidence_angle_deg: 37.0,
@@ -1248,6 +1262,7 @@ impl CorrectionOptions {
     pub fn is_enabled(&self) -> bool {
         !self.ionosphere_files.is_empty()
             || !self.troposphere_files.is_empty()
+            || !self.troposphere_epochs.is_empty()
             || self.solid_earth_tide
     }
 }

@@ -263,17 +263,20 @@ fn build_ionosphere(
     let inc_grid = los.map(LosGeometry::incidence_deg);
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, ionex_path) in opts.ionosphere_files.iter().enumerate() {
-        let utc_sec = opts.acquisition_utc.get(t).map_or_else(
-            || date_files.get(t).map_or(43200.0, |p| acq_utc_sec(p)),
-            |utc| {
-                chrono::Timelike::num_seconds_from_midnight(utc) as f64
-                    + f64::from(chrono::Timelike::nanosecond(utc)) / 1e9
-            },
-        );
+        let utc = opts
+            .acquisition_utc
+            .get(t)
+            .copied()
+            .or_else(|| {
+                date_files
+                    .get(t)
+                    .and_then(|path| acq_utc_datetime(path).map(|value| value.and_utc()))
+            })
+            .context("ionospheric correction requires full acquisition UTC")?;
         let content = std::fs::read_to_string(ionex_path)
             .with_context(|| format!("reading IONEX {}", ionex_path.display()))?;
         let maps = read_ionex(&content).map_err(anyhow::Error::msg)?;
-        let vtec = maps.value(utc_sec, lat, lon);
+        let vtec = maps.value(utc, lat, lon)?;
         let layer = iono_delay_layer(
             vtec,
             freq,
@@ -302,6 +305,32 @@ fn iono_delay_layer(
     }
 }
 
+fn troposphere_bracket(
+    epochs: &[dolphin_core::config::TroposphereEpoch],
+    utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(usize, usize, f64)> {
+    ensure!(
+        !epochs.is_empty() && epochs.windows(2).all(|p| p[0].epoch < p[1].epoch),
+        "TROPO epochs must strictly increase"
+    );
+    ensure!(
+        utc >= epochs[0].epoch && utc <= epochs[epochs.len() - 1].epoch,
+        "acquisition outside TROPO temporal coverage"
+    );
+    let upper = epochs.partition_point(|entry| entry.epoch < utc);
+    if epochs[upper].epoch == utc {
+        return Ok((upper, upper, 0.0));
+    }
+    let lower = upper - 1;
+    let seconds = (utc - epochs[lower].epoch)
+        .num_microseconds()
+        .context("TROPO interval overflow")? as f64;
+    let span = (epochs[upper].epoch - epochs[lower].epoch)
+        .num_microseconds()
+        .context("TROPO span overflow")? as f64;
+    Ok((lower, upper, seconds / span))
+}
+
 /// Build the per-date tropospheric delay grid by resampling each OPERA L4 netCDF
 /// onto the frame grid.
 fn build_troposphere(
@@ -312,8 +341,56 @@ fn build_troposphere(
     epsg: u32,
     los: Option<&LosGeometry>,
 ) -> Result<Option<Array3<f64>>> {
-    if opts.troposphere_files.is_empty() {
+    if opts.troposphere_files.is_empty() && opts.troposphere_epochs.is_empty() {
         return Ok(None);
+    }
+    ensure!(
+        opts.troposphere_files.is_empty() || opts.troposphere_epochs.is_empty(),
+        "choose timed TROPO inputs or legacy per-date inputs, not both"
+    );
+    if !opts.troposphere_epochs.is_empty() {
+        ensure!(
+            opts.acquisition_utc.len() == n_dates,
+            "timed TROPO requires every acquisition UTC"
+        );
+        ensure!(
+            opts.dem_file.is_some() && los.is_some(),
+            "timed TROPO requires ellipsoidal terrain and per-pixel LOS"
+        );
+        let terrain =
+            load_terrain(opts, gt, epsg, (rows, cols))?.context("missing TROPO terrain")?;
+        let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
+        ensure!(
+            slant.iter().all(|v| v.is_finite() && *v >= 1.0),
+            "invalid TROPO LOS projection"
+        );
+        let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
+        let mut cached = std::collections::BTreeMap::new();
+        for (t, utc) in opts.acquisition_utc.iter().enumerate() {
+            let (lower, upper, weight) = troposphere_bracket(&opts.troposphere_epochs, *utc)?;
+            cached.retain(|index, _| *index == lower || *index == upper);
+            for index in [lower, upper] {
+                if let std::collections::btree_map::Entry::Vacant(entry) = cached.entry(index) {
+                    entry.insert(tropo_at_terrain(
+                        &opts.troposphere_epochs[index].path,
+                        "total",
+                        gt,
+                        epsg,
+                        (rows, cols),
+                        &terrain,
+                    )?);
+                }
+            }
+            let mut layer = out.index_axis_mut(Axis(0), t);
+            ndarray::Zip::from(&mut layer)
+                .and(&cached[&lower])
+                .and(&cached[&upper])
+                .and(&slant)
+                .for_each(|value, &a, &b, &projection| {
+                    *value = (a * (1.0 - weight) + b * weight) * projection
+                });
+        }
+        return Ok(Some(out));
     }
     anyhow::ensure!(
         opts.troposphere_files.len() == n_dates,
@@ -376,10 +453,25 @@ fn tropo_at_terrain(
         other => vec![other],
     };
     let levels = height_levels(nc, vars[0]).map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(!levels.is_empty(), "L4 granule reports no height levels");
+    anyhow::ensure!(
+        !levels.is_empty()
+            && levels.iter().all(|v| v.is_finite())
+            && levels.windows(2).all(|p| p[0] < p[1]),
+        "L4 height levels must be finite and strictly increasing"
+    );
+    anyhow::ensure!(
+        terrain
+            .iter()
+            .all(|h| h.is_finite() && *h >= levels[0] && *h <= levels[levels.len() - 1]),
+        "terrain is missing or outside L4 height coverage"
+    );
     let (lo, hi) = bracketing_levels(&levels, terrain);
     let mut total = Array2::<f64>::zeros(shape);
     for name in vars {
+        anyhow::ensure!(
+            height_levels(nc, name)? == levels,
+            "tropospheric variables have different height coordinates"
+        );
         let mut planes = Vec::with_capacity(hi - lo + 1);
         for level in lo..=hi {
             let grid = read_l4_level_for_grid(nc, name, level, gt, epsg, shape)
@@ -388,6 +480,10 @@ fn tropo_at_terrain(
         }
         total += &interpolate_to_terrain(&levels[lo..=hi], &planes, terrain);
     }
+    anyhow::ensure!(
+        total.iter().all(|v| v.is_finite()),
+        "missing terrain interpolation support"
+    );
     Ok(total)
 }
 
@@ -411,7 +507,10 @@ fn interpolate_to_terrain(
 ) -> Array2<f64> {
     Array2::from_shape_fn(terrain.dim(), |ix| {
         let h = terrain[ix];
-        if levels.len() == 1 || !h.is_finite() {
+        if !h.is_finite() || h < levels[0] || h > levels[levels.len() - 1] {
+            return f64::NAN;
+        }
+        if levels.len() == 1 {
             return planes[0][ix];
         }
         let upper = levels
@@ -426,6 +525,12 @@ fn interpolate_to_terrain(
         } else {
             0.0
         };
+        if weight == 0.0 {
+            return planes[lower][ix];
+        }
+        if weight == 1.0 {
+            return planes[upper][ix];
+        }
         planes[lower][ix] * (1.0 - weight) + planes[upper][ix] * weight
     })
 }
@@ -487,35 +592,111 @@ fn resample_to_frame(
     }
 }
 
-/// Seconds-of-day from a granule name's `…YYYYMMDDThhmmss…` stamp, else noon
-/// (43200 s) when no time token is present (e.g. a date-only synthetic name).
-fn acq_utc_sec(path: &Path) -> f64 {
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return 43200.0;
-    };
-    let chars: Vec<char> = name.chars().collect();
-    chars
-        .windows(15)
-        .find_map(parse_time_token)
-        .unwrap_or(43200.0)
-}
-
-/// Parse `YYYYMMDDThhmmss` (15 chars) → seconds of day, if the window matches.
-fn parse_time_token(w: &[char]) -> Option<f64> {
-    if w[8] != 'T'
-        || w.iter()
-            .enumerate()
-            .any(|(i, c)| i != 8 && !c.is_ascii_digit())
-    {
-        return None;
-    }
-    let n =
-        |a: usize, b: usize| -> f64 { w[a..b].iter().collect::<String>().parse().unwrap_or(0.0) };
-    Some(n(9, 11) * 3600.0 + n(11, 13) * 60.0 + n(13, 15))
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_troposphere_combines_height_time_and_los() {
+        use dolphin_core::config::TroposphereEpoch;
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T23:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dem =
+            std::env::temp_dir().join(format!("dolphin-timed-tropo-dem-{}.nc", std::process::id()));
+        write_4326_netcdf(
+            &dem,
+            &Array2::from_elem((3, 3), 500.0),
+            [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0],
+        );
+        let opts = CorrectionOptions {
+            acquisition_utc: vec![
+                utc,
+                utc + chrono::Duration::minutes(90),
+                utc + chrono::Duration::hours(3),
+            ],
+            troposphere_epochs: vec![
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem.clone()),
+            ..Default::default()
+        };
+        let los = LosGeometry {
+            east: Array2::from_elem((1, 1), 0.6),
+            north: Array2::zeros((1, 1)),
+            up: Array2::from_elem((1, 1), 0.8),
+        };
+        let layers = build_troposphere(
+            &opts,
+            3,
+            (1, 1),
+            [0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
+            4326,
+            Some(&los),
+        )
+        .unwrap()
+        .unwrap();
+        for (index, expected) in [2.0625, 3.09375, 4.125].into_iter().enumerate() {
+            assert!((layers[(index, 0, 0)] - expected).abs() < 1e-10);
+        }
+        for wavelength in [0.05546576, 0.238403545] {
+            let mut displacement = Array3::zeros((2, 1, 1));
+            subtract_delay(&mut displacement, layers.view(), wavelength).unwrap();
+            let meters_per_radian = -wavelength / (4.0 * std::f64::consts::PI);
+            assert!((displacement[(0, 0, 0)] * meters_per_radian + 1.03125).abs() < 1e-10);
+            assert!((displacement[(1, 0, 0)] * meters_per_radian + 2.0625).abs() < 1e-10);
+        }
+        std::fs::remove_file(dem).unwrap();
+    }
+
+    #[test]
+    fn troposphere_time_brackets_are_dated_and_closed() {
+        use dolphin_core::config::TroposphereEpoch;
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T23:00:00Z")
+            .unwrap()
+            .to_utc();
+        let epochs = vec![
+            TroposphereEpoch {
+                path: "a.nc".into(),
+                epoch: start,
+            },
+            TroposphereEpoch {
+                path: "b.nc".into(),
+                epoch: start + chrono::Duration::hours(3),
+            },
+        ];
+        assert_eq!(troposphere_bracket(&epochs, start).unwrap(), (0, 0, 0.0));
+        assert_eq!(
+            troposphere_bracket(&epochs, epochs[1].epoch).unwrap(),
+            (1, 1, 0.0)
+        );
+        assert_eq!(
+            troposphere_bracket(&epochs, start + chrono::Duration::minutes(90)).unwrap(),
+            (0, 1, 0.5)
+        );
+        assert!(troposphere_bracket(&epochs, start - chrono::Duration::seconds(1)).is_err());
+        assert!(troposphere_bracket(&epochs, start + chrono::Duration::days(1)).is_err());
+        assert!(troposphere_bracket(&[epochs[0].clone(), epochs[0].clone()], start).is_err());
+    }
+
+    #[test]
+    fn terrain_interpolation_rejects_missing_and_outside_support() {
+        let levels = [0.0, 1000.0];
+        let planes = vec![ndarray::array![[2.0]], ndarray::array![[1.0]]];
+        for height in [f64::NAN, -1.0, 1001.0] {
+            assert!(
+                interpolate_to_terrain(&levels, &planes, &ndarray::array![[height]])[(0, 0)]
+                    .is_nan()
+            );
+        }
+    }
+
     /// Issue #38: a pixel's delay must come from its terrain elevation, not the
     /// granule's lowest level. Linear between bracketing levels, exact at a knot.
     #[test]
@@ -788,15 +969,6 @@ mod tests {
                 || format!("{err:#}").contains("static_geometry.h5"),
             "expected contextual geometry read error, got: {err:#}"
         );
-    }
-
-    /// Time token parsing: OPERA-style stamp → seconds of day; date-only → noon.
-    #[test]
-    fn parses_acquisition_time() {
-        let opera = Path::new("OPERA_L2_CSLC-S1_T027_20230914T132417Z_x.h5");
-        let want = 13.0 * 3600.0 + 24.0 * 60.0 + 17.0;
-        assert!((acq_utc_sec(opera) - want).abs() < 1e-9);
-        assert!((acq_utc_sec(Path::new("cslc_20221119.h5")) - 43200.0).abs() < 1e-9);
     }
 
     /// The tide needs the whole timestamp, not just the seconds of day, and a
