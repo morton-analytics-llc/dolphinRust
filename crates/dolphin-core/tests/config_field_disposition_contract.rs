@@ -116,6 +116,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "correction_options.nisar_ellipsoidal_dem_file",
     "correction_options.ionosphere_files",
     "correction_options.troposphere_files",
+    "correction_options.troposphere_epochs",
     "correction_options.geometry_files",
     "correction_options.dem_file",
     "correction_options.incidence_angle_deg",

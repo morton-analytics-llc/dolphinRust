@@ -130,8 +130,19 @@ impl VelocityEstimator {
     }
 }
 
+/// Publication eligibility and executed closure QC, not scientific qualification.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PublicationQuality {
+    /// Previously eligible pixels excluded by component membership.
+    pub component_rejected_pixels: usize,
+    /// disabled, unavailable_no_triangles, or evaluated.
+    pub closure_qc_status: &'static str,
+}
+
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
 pub struct DisplacementOutput {
+    /// Actual publication mask and QC evidence.
+    pub publication_quality: PublicationQuality,
     /// Per-date cumulative displacement, `(n_dates-1, rows, cols)`, referenced
     /// to acquisition 0. Units are meters when `input_options.wavelength` is set,
     /// otherwise radians of wrapped LOS phase.
@@ -736,6 +747,14 @@ fn correct_and_reference(
             })
             .collect::<Result<Vec<_>>>()?;
     }
+    if options.is_enabled() {
+        for reference_utc in &options.acquisition_utc {
+            anyhow::ensure!(cfg.input_options.acquisition_metadata.iter()
+                .filter(|record| record.acquisition_utc.date_naive() == reference_utc.date_naive())
+                .all(|record| record.acquisition_utc == *reference_utc),
+                "spatial groups have different acquisition UTC; per-group atmospheric support is unresolved");
+        }
+    }
     let corrections = apply_corrections(
         &options,
         cfg.input_options.wavelength,
@@ -1262,6 +1281,32 @@ fn restrict_publication_mask(
     Ok(())
 }
 
+fn restrict_component_mask(
+    mask: &mut Array2<bool>,
+    components: ndarray::ArrayView3<'_, u32>,
+    interferogram_count: usize,
+    reference: Option<(usize, usize)>,
+) -> Result<()> {
+    anyhow::ensure!(
+        components.dim() == (interferogram_count, mask.nrows(), mask.ncols()),
+        "connected-component dimensions do not match the publication grid and network"
+    );
+    anyhow::ensure!(
+        interferogram_count > 0,
+        "publication requires unwrap connected components"
+    );
+    for band in components.axis_iter(Axis(0)) {
+        let label = reference.map(|point| band.get(point).copied().unwrap_or(0));
+        anyhow::ensure!(label != Some(0), "reference has no connected component");
+        ndarray::Zip::from(&mut *mask)
+            .and(band)
+            .for_each(|valid, &component| {
+                *valid &= component != 0 && label.is_none_or(|value| value == component);
+            });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_displacement(
     cfg: &DisplacementWorkflow,
@@ -1283,6 +1328,13 @@ fn emit_displacement(
         },
         &mut spatial.validity_mask,
     )?;
+    let eligible_before_components = spatial.validity_mask.iter().filter(|&&valid| valid).count();
+    restrict_component_mask(
+        &mut spatial.validity_mask,
+        spatial.unwrap_connected_components.view(),
+        spatial.interferogram_pairs.len(),
+        None,
+    )?;
     // The datum must survive the publication quality masks: every published velocity is
     // relative to the reference pixel, so a reference sitting in layover/shadow — or
     // outside the native STATIC coverage — makes the whole field untrustworthy. The
@@ -1293,16 +1345,10 @@ fn emit_displacement(
         .reference_point
         .is_none_or(|point| !spatial.validity_mask.get(point).copied().unwrap_or(false))
     {
-        let mut quality = spatial.temporal_coherence.clone();
-        ndarray::Zip::from(&mut quality)
-            .and(&spatial.validity_mask)
-            .for_each(|value, &valid| {
-                if !valid {
-                    *value = 0.0;
-                }
-            });
-        let point = select_reference_point(
-            quality.view(),
+        let point = select_valid_reference_point(
+            spatial.temporal_coherence.view(),
+            spatial.validity_mask.view(),
+            spatial.disp_rad.view(),
             cfg.timeseries_options.correlation_threshold,
         )
         .context(
@@ -1310,6 +1356,24 @@ fn emit_displacement(
         )?;
         spatial.rereference_to(point, &days, cfg)?;
     }
+    restrict_component_mask(
+        &mut spatial.validity_mask,
+        spatial.unwrap_connected_components.view(),
+        spatial.interferogram_pairs.len(),
+        spatial.reference_point,
+    )?;
+    let publication_quality = PublicationQuality {
+        component_rejected_pixels: eligible_before_components
+            - spatial.validity_mask.iter().filter(|&&valid| valid).count(),
+        closure_qc_status: if !cfg.timeseries_options.mask_unwrap_loop_errors {
+            "disabled"
+        } else if spatial.loop_closure.is_some() {
+            "evaluated"
+        } else {
+            "unavailable_no_triangles"
+        },
+    };
+    spatial.apply_validity_mask();
     if let Some(covariance) = spatial.production_covariance.as_mut() {
         covariance.correction_order_digest = correction_order_digest(
             &cfg.correction_options,
@@ -1450,6 +1514,7 @@ fn emit_displacement(
         }
     })?;
     Ok(DisplacementOutput {
+        publication_quality,
         displacement: scaled.displacement,
         velocity: scaled.velocity,
         velocity_estimator: spatial.velocity_estimator,
@@ -1581,6 +1646,9 @@ impl SpatialProducts {
         mask2_f64(&mut self.vel_rad, mask);
         mask2_f64(&mut self.temporal_coherence, mask);
         if let Some(layer) = self.phase_linking_coherence.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.phase_similarity.as_mut() {
             mask2_f64(layer, mask);
         }
         if let Some(layer) = self.crlb_sigma.as_mut() {
@@ -1733,6 +1801,10 @@ impl SpatialProducts {
         self.validity_mask = trim2(&self.validity_mask, target);
         self.phase_linking_coherence = self
             .phase_linking_coherence
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.phase_similarity = self
+            .phase_similarity
             .take()
             .map(|layer| trim2(&layer, target));
         self.crlb_sigma = self.crlb_sigma.take().map(|layer| trim3(&layer, target));
@@ -4905,6 +4977,56 @@ fn write_bands(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn timed_corrections_reject_unresolved_group_acquisition_times() {
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.correction_options
+            .troposphere_epochs
+            .push(dolphin_core::config::TroposphereEpoch {
+                path: "unread.nc".into(),
+                epoch: utc,
+            });
+        cfg.input_options.acquisition_metadata = [0, 1]
+            .into_iter()
+            .map(|index| dolphin_core::config::AcquisitionMetadata {
+                path: format!("group{index}.h5").into(),
+                acquisition_utc: utc + chrono::Duration::seconds(index),
+                spatial_group: format!("group{index}"),
+                grid_id: "grid".into(),
+            })
+            .collect();
+        let error = correct_and_reference(
+            &cfg,
+            &mut Array3::zeros((1, 1, 1)),
+            &["group0.h5".into()],
+            GeoInfo {
+                epsg: 4326,
+                geotransform: [0.0; 6],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("different acquisition UTC"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn publication_components_require_each_band_reference_membership() {
+        let components = ndarray::array![[[1, 2, 1, 0]], [[8, 8, 9, 8]]];
+        let mut mask = Array2::from_elem((1, 4), true);
+        restrict_component_mask(&mut mask, components.view(), 2, None).unwrap();
+        assert_eq!(mask, ndarray::array![[true, true, true, false]]);
+        restrict_component_mask(&mut mask, components.view(), 2, Some((0, 0))).unwrap();
+        assert_eq!(mask, ndarray::array![[true, false, false, false]]);
+        assert!(restrict_component_mask(&mut mask, components.view(), 1, None).is_err());
+        assert!(restrict_component_mask(&mut mask, components.view(), 2, Some((0, 3))).is_err());
+    }
+
+    #[test]
     fn publication_masks_restrict_support() {
         let path = std::env::temp_dir().join("configured_publication_mask.tif");
         let geo = GeoInfo {
@@ -5166,7 +5288,7 @@ mod tests {
             validity_mask,
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
-            phase_similarity: None,
+            phase_similarity: Some(Array2::from_elem((2, 2), 1.0)),
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -5211,6 +5333,7 @@ mod tests {
             assert!(!products.validity_mask[(row, col)]);
             assert!(products.vel_rad[(row, col)].is_nan());
             assert!(products.temporal_coherence[(row, col)].is_nan());
+            assert!(products.phase_similarity.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.phase_linking_coherence.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
@@ -5304,7 +5427,7 @@ mod tests {
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
-            phase_similarity: None,
+            phase_similarity: Some(Array2::from_elem((6, 8), 0.75)),
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5334,6 +5457,7 @@ mod tests {
         cfg.timeseries_options.write_velocity_uncertainty = true;
         products.trim(target, &[0.0, 12.0, 24.0], &cfg).unwrap();
         products.apply_validity_mask();
+        assert_eq!(products.phase_similarity.as_ref().unwrap().dim(), (3, 4));
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
         assert!(products

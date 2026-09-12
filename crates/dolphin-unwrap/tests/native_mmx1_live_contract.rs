@@ -102,12 +102,21 @@ fn per_component_disagreement(
 }
 
 #[test]
+#[ignore = "requires MMX1 common-frame fixture; run explicitly with --ignored"]
 fn production_tiles_match_snaphu_on_mmx1_final_epoch() {
     let dir = fixture_dir();
     let pair = dir.join("pair_0011");
-    if !pair.join("ifg.c8").exists() {
-        eprintln!("skipping MMX1 live parity: run the gps_mmx1 common-frame harness first");
-        return;
+    for required in [
+        pair.join("ifg.c8"),
+        dir.join("corr.f4"),
+        pair.join("unw.f4"),
+        pair.join("conncomp.u4"),
+    ] {
+        assert!(
+            required.is_file(),
+            "required MMX1 fixture missing: {}",
+            required.display()
+        );
     }
 
     let ifg = read_ifg(&pair.join("ifg.c8"));
