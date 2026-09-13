@@ -477,12 +477,50 @@ fn finish_displacement(
             epsg,
         )
     })?;
+    let closure_reference = if cfg.timeseries_options.mask_unwrap_loop_errors
+        && !network_triplets(&pairs).is_empty()
+    {
+        let mut eligible = validity_mask.clone();
+        restrict_component_mask(
+            &mut eligible,
+            unwrap.connected_components.view(),
+            pairs.len(),
+            None,
+        )?;
+        if let Some(plan) = crop {
+            let target = plan.target_in_analysis;
+            for ((row, col), valid) in eligible.indexed_iter_mut() {
+                *valid &= row >= target.row_start
+                    && row < target.row_stop
+                    && col >= target.col_start
+                    && col < target.col_stop;
+            }
+        }
+        let reference = configured_reference
+            .or_else(|| {
+                select_valid_reference_point(
+                    temporal_coherence.view(),
+                    eligible.view(),
+                    unwrap.unwrapped.view(),
+                    cfg.timeseries_options.correlation_threshold,
+                )
+            })
+            .context("loop closure requires a finite common reference with nonzero components")?;
+        anyhow::ensure!(
+            reference_pixel_is_valid(eligible.view(), unwrap.unwrapped.view(), reference),
+            "loop closure reference has invalid unwrapped support"
+        );
+        Some(reference)
+    } else {
+        None
+    };
     let (mut inversion, loop_closure) = solve_time_series(
         cfg,
         unwrap.unwrapped,
         &pairs,
         stitched.crlb_sigma.as_ref(),
         cfg.phase_linking.write_covariance_operator,
+        closure_reference,
     )?;
     // Atmospheric corrections subtract per-date delay from the inverted series
     // before the final spatial reference and velocity. Reference selection runs
@@ -985,9 +1023,10 @@ fn solve_time_series(
     pairs: &[(usize, usize)],
     crlb_sigma: Option<&Array3<f64>>,
     retain_fixed_l2_inputs: bool,
+    closure_reference: Option<(usize, usize)>,
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
-        apply_loop_closure_qc(cfg, &mut dphi_rad, pairs)
+        apply_loop_closure_qc(cfg, &mut dphi_rad, pairs, closure_reference)
     });
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
@@ -1010,6 +1049,7 @@ fn apply_loop_closure_qc(
     cfg: &DisplacementWorkflow,
     dphi_rad: &mut Array3<f64>,
     pairs: &[(usize, usize)],
+    reference: Option<(usize, usize)>,
 ) -> Option<LoopClosureQc> {
     if !cfg.timeseries_options.mask_unwrap_loop_errors {
         return None;
@@ -1023,7 +1063,23 @@ fn apply_loop_closure_qc(
         );
         return None;
     }
+    // Independent IFG roots can differ by whole cycles. Test spatially
+    // referenced closure, then restore the original inversion observations.
+    let offsets = reference.map(|point| {
+        dphi_rad
+            .outer_iter()
+            .map(|band| band[point])
+            .collect::<Vec<_>>()
+    });
+    if let Some(point) = reference {
+        reference_to_point(dphi_rad, point);
+    }
     let qc = loop_closure_qc(dphi_rad.view(), pairs, DEFAULT_CLOSURE_TOLERANCE_CYCLES);
+    if let Some(offsets) = offsets {
+        for (mut band, offset) in dphi_rad.outer_iter_mut().zip(offsets) {
+            band.mapv_inplace(|value| value + offset);
+        }
+    }
     let masked = qc.bad_loop_count.iter().filter(|&&n| n > 0.0).count();
     tracing::info!(
         stage = "loop_closure",
@@ -5124,6 +5180,50 @@ mod tests {
     }
 
     #[test]
+    fn fresh_network_closure_is_invariant_to_interferogram_gauge() {
+        let mut cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join(format!(
+                "dolphin_closure_gauge_contract_{}",
+                std::process::id()
+            )),
+            ..DisplacementWorkflow::default()
+        };
+        cfg.cslc_file_list = dated_files(&["20230101", "20230113", "20230125", "20230206"]);
+        cfg.interferogram_network.max_bandwidth = Some(2);
+        cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.reference_point = Some((0, 0));
+        let mut burst = seam_burst(0.0, 0.9);
+        burst.pl = Array3::from_shape_fn((4, 3, 3), |(date, row, _)| {
+            Cf64::from_polar(1.0, date as f64 * (2.0 + row as f64 * 0.1))
+        });
+        burst.days = vec![0.0, 12.0, 24.0, 36.0];
+        burst.coverage.acquisition_count = 4;
+        let out = finish_displacement(
+            &cfg,
+            vec![burst],
+            None,
+            DisplacementOutputPolicy::Full,
+            None,
+        )
+        .expect("consistent spatial gradients must survive arbitrary IFG phase gauges");
+        assert!(out.velocity_mm_yr.iter().all(|value| value.is_finite()));
+        for ((date, row, _), value) in out.displacement.indexed_iter() {
+            assert!(
+                (value + (date + 1) as f64 * row as f64 * 0.1).abs() < 1e-5,
+                "date={date} row={row} value={value}"
+            );
+        }
+        let qc =
+            gdal::Dataset::open(cfg.work_directory.join("loop_closure_bad_count.tif")).unwrap();
+        let count = qc.rasterband(1).unwrap().read_band_as::<f64>().unwrap();
+        assert!(count.data().iter().all(|&n| n == 0.0));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    #[test]
     fn multiburst_leveling_removes_injected_phase_offset() {
         let frame = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
             Cf64::from_polar(1.0, date as f64 * 0.2)
@@ -5212,7 +5312,7 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
         let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
-        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true).unwrap();
+        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true, None).unwrap();
         assert!(qc.is_some());
         let retained = inversion.fixed_l2_inputs.unwrap();
         assert!(retained.pixel_map((0, 0)).is_ok());
@@ -7880,7 +7980,7 @@ mod tests {
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).is_none());
         assert_eq!(dphi, original);
     }
 
@@ -7894,7 +7994,7 @@ mod tests {
         let pairs = vec![(0, 1), (0, 2), (0, 3)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).is_none());
         assert_eq!(dphi, original);
     }
 
@@ -7912,10 +8012,34 @@ mod tests {
         });
         dphi[(2, 1, 1)] += std::f64::consts::TAU;
 
-        let qc = apply_loop_closure_qc(&cfg, &mut dphi, &pairs).expect("qc ran");
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).expect("qc ran");
         assert!(qc.bad_loop_count[(1, 1)] > 0.0);
         assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
         assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn referenced_closure_preserves_observations_and_masks_local_cycles() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let mut phases = Array3::from_shape_fn((3, 1, 3), |(band, _, col)| {
+            [1.0, 2.0, 1.0][band] * col as f64 * 0.2 + [0.0, std::f64::consts::TAU, 0.0][band]
+        });
+        phases[(2, 0, 2)] += std::f64::consts::TAU;
+        let original = phases.clone();
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, &pairs, Some((0, 0))).unwrap();
+        for col in 0..2 {
+            assert_eq!(qc.bad_loop_count[(0, col)], 0.0);
+            for band in 0..3 {
+                assert!((phases[(band, 0, col)] - original[(band, 0, col)]).abs() < 1e-12);
+            }
+        }
+        assert!(qc.bad_loop_count[(0, 2)] > 0.0);
+        assert!(phases
+            .slice(s![.., 0, 2])
+            .iter()
+            .all(|value| value.is_nan()));
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
