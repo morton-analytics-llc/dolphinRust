@@ -1931,6 +1931,7 @@ pub(crate) fn correction_order_digest(
     hash_optional_array(&mut digest, layers.ionosphere.as_ref());
     hash_optional_array(&mut digest, layers.troposphere.as_ref());
     hash_optional_array(&mut digest, layers.solid_earth_tide.as_ref());
+    hash_optional_array(&mut digest, layers.plate_motion.as_ref());
     Ok(digest.finalize().into())
 }
 
@@ -2205,6 +2206,7 @@ mod tests {
             troposphere: None,
             los_geometry: None,
             solid_earth_tide: None,
+            plate_motion: None,
         };
         let base = correction_order_digest(&options, Some(0.056), &layers).unwrap();
         let changed_wavelength = correction_order_digest(&options, Some(0.055), &layers).unwrap();

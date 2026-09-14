@@ -543,6 +543,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.solid_earth_tide is true"
     ),
+    conditional!(
+        "correction_options.plate_motion_model",
+        "CFG-CORRECTIONS",
+        "correction_options.plate_motion_model is set"
+    ),
     consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
     conditional!(
         "output_options.epsg",
@@ -1222,6 +1227,14 @@ pub struct CorrectionOptions {
     /// displacement vector and projecting it into line of sight needs the full
     /// LOS unit vector, which the scalar `incidence_angle_deg` cannot supply.
     pub solid_earth_tide: bool,
+    /// Subtract rigid tectonic plate motion (issue #103): a plate name
+    /// resolved against dolphinRust's built-in ITRF2014 PMM table, or an
+    /// explicit Euler pole. Like `solid_earth_tide` this needs **no external
+    /// data file** — only the acquisition time and per-pixel LOS geometry —
+    /// and requires `geometry_files` for the same reason (projecting a 3-D
+    /// rigid-rotation velocity into line of sight needs the full LOS unit
+    /// vector). dolphinRust-only forward divergence, **unset by default**.
+    pub plate_motion_model: Option<PlateMotionModel>,
 }
 
 impl Default for CorrectionOptions {
@@ -1237,19 +1250,44 @@ impl Default for CorrectionOptions {
             incidence_angle_deg: 37.0,
             troposphere_variable: "total".into(),
             solid_earth_tide: false,
+            plate_motion_model: None,
         }
     }
 }
 
 impl CorrectionOptions {
-    /// Whether any correction is enabled (any correction file supplied, or the
-    /// file-free solid-earth-tide flag set).
+    /// Whether any correction is enabled (any correction file supplied, or one
+    /// of the file-free flags set).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.ionosphere_files.is_empty()
             || !self.troposphere_files.is_empty()
             || self.solid_earth_tide
+            || self.plate_motion_model.is_some()
     }
+}
+
+/// `correction_options.plate_motion_model` selector: either a named plate,
+/// resolved against dolphinRust's built-in ITRF2014 PMM table
+/// (`dolphin_corrections::plate_motion::ITRF2014_PMM`), or an explicit Euler
+/// pole that bypasses the named-plate table entirely (e.g. for a newer ITRF
+/// realization's published values, or a locally fit pole). Untagged: a bare
+/// YAML string is a plate name, a mapping with the three `omega_*` keys is an
+/// explicit pole.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlateMotionModel {
+    /// A plate name, e.g. `"NorthAmerica"` — matched case/space-insensitively.
+    Plate(String),
+    /// An explicit Cartesian Euler pole, milliarcseconds/year.
+    EulerPole {
+        /// X-axis angular-velocity component, mas/yr.
+        omega_x_mas_per_year: f64,
+        /// Y-axis angular-velocity component, mas/yr.
+        omega_y_mas_per_year: f64,
+        /// Z-axis angular-velocity component, mas/yr.
+        omega_z_mas_per_year: f64,
+    },
 }
 
 /// Output grid + raster options. dolphin `OutputOptions`.
