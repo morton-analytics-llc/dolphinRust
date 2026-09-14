@@ -125,6 +125,24 @@ Entry format:
   default (dolphin has no NSBAS equivalent).
 - **Added**: 2026-09-01 by scheduled scout run
 
+### D14 — Full DEM identity (dataset, DSM/DTM, vertical accuracy, validity epoch) in provenance
+- **Source**: inbound (cross-repo signal, `../eo`#483 — Table 5 processing-provenance
+  audit, DEM sub-items not closed by #118)
+- **Issue**: #131 (enhancement-labeled, NOT yet backlog-ready)
+- **Re-entry gate**: a real production run needs this field surfaced in a customer-facing
+  or compliance report (GroundPulse's report generator has a concrete field to populate),
+  forcing the config-vs-eo-side design question below to get answered — or eo's own #483
+  gets a maintainer ruling on where DEM product identity should be authored/carried.
+- **Design sketch**: none yet — depends on the gate; candidate shapes are (a) a new
+  `CorrectionOptions.dem_product` struct (`name`, `dsm_or_dtm`, `vertical_accuracy_m`,
+  `validity_epoch`) passed through verbatim into `GeometryProvenance`, or (b) no
+  dolphinRust change at all — eo carries DEM product identity in its own
+  `DolphinBuildIdentityV1` keyed by the DEM file path/hash instead. Grid spacing and
+  vertical datum (the fields recoverable from the raster's own geotransform/CRS) already
+  shipped in #118 — this entry is only the remaining, non-derivable product-metadata
+  fields.
+- **Added**: 2026-09-14 by scheduled scout run
+
 ## SHIPPED
 
 ### D6 — Expose orbit ephemeris class (POE/RESORB) for processing provenance
