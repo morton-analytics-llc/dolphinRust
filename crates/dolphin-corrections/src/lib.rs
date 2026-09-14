@@ -16,6 +16,11 @@
 //!   but real ground motion; modelled as an equivalent range delay so it goes
 //!   through the same subtraction. Needs no external data file, only the
 //!   acquisition time and per-pixel LOS geometry.
+//! - [`plate_motion`] — rigid tectonic plate motion (ITRF2014 PMM Euler poles).
+//!   Also real ground motion, not a propagation delay; modelled as an
+//!   equivalent range-rate delay that accumulates linearly over the stack.
+//!   Needs no external data file, only the acquisition time and per-pixel LOS
+//!   geometry, like [`solid_earth_tide`].
 //!
 //! See `CLAUDE.md` in this crate for the delay math.
 #![warn(missing_docs)]
@@ -24,6 +29,7 @@ pub mod apply;
 pub mod error;
 pub mod geometry;
 pub mod ionosphere;
+pub mod plate_motion;
 pub mod raider;
 pub mod solid_earth_tide;
 pub mod troposphere;
@@ -32,5 +38,9 @@ pub use apply::subtract_delay;
 pub use error::{CorrectionError, Result};
 pub use geometry::{resolve_los_geometry, LosGeometry};
 pub use ionosphere::{read_ionex, vtec_to_range_delay, IonexMaps, K_IONO, SPEED_OF_LIGHT};
+pub use plate_motion::{
+    plate_by_name, plate_motion_range_delay_rate_grid, resolve_euler_pole, EulerPoleVector,
+    ITRF2014_PMM,
+};
 pub use solid_earth_tide::{tide_displacement_enu, tide_range_delay_grid, LonLatGrid};
 pub use troposphere::{read_l4_netcdf, resample_bilinear, DelayGrid};

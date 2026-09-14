@@ -40,6 +40,17 @@ All notable changes to dolphinRust are documented here. The format follows
   absent reason rather than asserting ellipsoidal heights, and no DEM at all marks all four
   fields absent. Schema bumped to `dolphinrust-geometry-provenance/5`, method version
   `5.0.0`; the fixed-cube semantic gate in `temporal_covariance_product` pins the new pair.
+- **Rigid tectonic plate-motion LOS correction** (issue #103). New
+  `correction_options.plate_motion_model` — a plate name (e.g. `"NorthAmerica"`, matched
+  case/space-insensitively against a built-in ITRF2014 PMM Euler-pole table) or an explicit
+  `{omega_x_mas_per_year, omega_y_mas_per_year, omega_z_mas_per_year}` pole — subtracts the
+  plate's rigid rotational velocity (`v = ω × r`, projected into line of sight, accumulated
+  linearly over the stack) from displacement, the same way `solid_earth_tide` does for lunisolar
+  tides: no external data file, needs `geometry_files` for the full LOS unit vector, opt-in
+  and unset by default. Ships ITRF2014 PMM (Altamimi et al. 2017) rather than the newer
+  ITRF2020 PMM the originating issue named — see `dolphin_corrections::plate_motion` module
+  docs for why. `EulerPole` is always available for a caller with verified ITRF2020 (or other)
+  values.
 - **Exponential relaxation term in the velocity time-function model** (issue #102).
   `timeseries_options.velocity_relaxation: [{onset_date, tau_days}]` adds one
   `H(t − t₀)·(1 − exp(−(t − t₀)/τ))` column per entry to the joint WLS fit alongside the
