@@ -113,8 +113,10 @@ pub fn network_triplets(pairs: &[(usize, usize)]) -> Vec<Triplet> {
 ///
 /// `unwrapped` is `(n_ifgs, rows, cols)` in radians, indexed to match `pairs`.
 /// The residual of triangle `(i,j),(j,k),(i,k)` is
-/// `φ_ij + φ_jk − φ_ik`, which a correctly unwrapped network closes to ~0; an
-/// unwrap error of `n` cycles in any one member drives it to `±2πn`.
+/// `φ_ij + φ_jk − φ_ik`, which a correctly unwrapped network closes to a whole
+/// number of cycles shared by every pixel (the members' independent unwrap
+/// roots); that shared part is removed per loop before judging, and an unwrap
+/// error of `n` cycles in any one member at a pixel then drives it to `±2πn`.
 /// `tolerance_cycles` is the fraction of a cycle allowed before the loop is
 /// called bad (see [`DEFAULT_CLOSURE_TOLERANCE_CYCLES`]).
 #[must_use]
@@ -126,12 +128,16 @@ pub fn loop_closure_qc(
     let (_, rows, cols) = unwrapped.dim();
     let triplets = network_triplets(pairs);
     let tolerance = tolerance_cycles * std::f64::consts::TAU;
+    let roots: Vec<f64> = triplets
+        .par_iter()
+        .map(|triplet| triangle_root(unwrapped, triplet))
+        .collect();
 
     let per_pixel: Vec<(f64, f64, f64)> = (0..rows * cols)
         .into_par_iter()
         .map(|index| {
             let (row, col) = (index / cols, index % cols);
-            pixel_loop_stats(unwrapped, &triplets, (row, col), tolerance)
+            pixel_loop_stats(unwrapped, &triplets, &roots, (row, col), tolerance)
         })
         .collect();
     let layer = |pick: fn(&(f64, f64, f64)) -> f64| {
@@ -144,19 +150,47 @@ pub fn loop_closure_qc(
     }
 }
 
-/// `(bad, evaluable, worst_residual_cycles)` for one pixel.
+fn triangle_residual(unwrapped: ArrayView3<f64>, triplet: &Triplet, (row, col): (usize, usize)) -> f64 {
+    unwrapped[(triplet.early, row, col)] + unwrapped[(triplet.late, row, col)]
+        - unwrapped[(triplet.span, row, col)]
+}
+
+/// The integer-cycle part of a loop that every pixel shares. Each interferogram
+/// is unwrapped independently and carries an arbitrary `2πn` root; the roots of
+/// a triangle's three members do not cancel, so a consistent stack closes to a
+/// whole number of cycles rather than to zero. That number is the rounded median
+/// of the loop's finite residuals — a property of the loop, not of any one pixel,
+/// so a reference pixel's own unwrap error can never be charged to the rest of
+/// the frame. Loops with no finite residual contribute no root.
+fn triangle_root(unwrapped: ArrayView3<f64>, triplet: &Triplet) -> f64 {
+    let (_, rows, cols) = unwrapped.dim();
+    let mut residuals: Vec<f64> = (0..rows)
+        .flat_map(|row| (0..cols).map(move |col| (row, col)))
+        .map(|point| triangle_residual(unwrapped, triplet, point))
+        .filter(|residual| residual.is_finite())
+        .collect();
+    if residuals.is_empty() {
+        return 0.0;
+    }
+    let middle = residuals.len() / 2;
+    let (_, median, _) = residuals.select_nth_unstable_by(middle, |a, b| a.total_cmp(b));
+    (*median / std::f64::consts::TAU).round() * std::f64::consts::TAU
+}
+
+/// `(bad, evaluable, worst_residual_cycles)` for one pixel, after removing each
+/// loop's shared integer-cycle root.
 fn pixel_loop_stats(
     unwrapped: ArrayView3<f64>,
     triplets: &[Triplet],
+    roots: &[f64],
     (row, col): (usize, usize),
     tolerance: f64,
 ) -> (f64, f64, f64) {
     let mut bad = 0.0;
     let mut evaluable = 0.0;
     let mut worst = f64::NAN;
-    for triplet in triplets {
-        let residual = unwrapped[(triplet.early, row, col)] + unwrapped[(triplet.late, row, col)]
-            - unwrapped[(triplet.span, row, col)];
+    for (triplet, root) in triplets.iter().zip(roots) {
+        let residual = triangle_residual(unwrapped, triplet, (row, col)) - root;
         if !residual.is_finite() {
             continue;
         }
@@ -316,6 +350,31 @@ mod tests {
             .slice(ndarray::s![.., 0, 0])
             .iter()
             .all(|v| v.is_finite()));
+    }
+
+    /// Each interferogram is unwrapped independently, so it carries its own
+    /// integer-cycle root. Those roots do not cancel around a triangle, and no
+    /// pixel is a trustworthy reference for removing them: the common part of
+    /// every loop must come from the loop itself, never from one pixel.
+    #[test]
+    fn per_interferogram_roots_flag_only_the_local_error() {
+        let (pairs, mut unwrapped) = consistent_network();
+        for (k, root) in [1.0, -2.0, 3.0, 0.0, 1.0].into_iter().enumerate() {
+            unwrapped
+                .index_axis_mut(ndarray::Axis(0), k)
+                .mapv_inplace(|v| v + root * std::f64::consts::TAU);
+        }
+        unwrapped[(1, 2, 2)] += std::f64::consts::TAU;
+        let qc = loop_closure_qc(unwrapped.view(), &pairs, DEFAULT_CLOSURE_TOLERANCE_CYCLES);
+        let flagged: Vec<(usize, usize)> = qc
+            .failed_mask()
+            .indexed_iter()
+            .filter(|(_, &bad)| bad)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(flagged, vec![(2, 2)], "roots are common to every pixel and must not be counted");
+        assert!((qc.worst_residual_cycles[(2, 2)] - 1.0).abs() < 1e-12);
+        assert!(qc.worst_residual_cycles[(0, 0)] < 1e-12);
     }
 
     /// A sub-cycle residual (real noise, not an unwrap error) is not flagged.

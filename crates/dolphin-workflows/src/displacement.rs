@@ -8042,6 +8042,32 @@ mod tests {
             .all(|value| value.is_nan()));
     }
 
+    /// The reference pixel is not exempt from unwrap errors. When it carries one,
+    /// referencing every interferogram to it charged that error to every other
+    /// pixel's loops (T013-026608-IW2, 2026-09-14: 41,835 of 41,850 pixels masked).
+    /// Only the pixel with the error may be flagged.
+    #[test]
+    fn closure_does_not_inherit_the_reference_pixels_error() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let phase = [0.0, 1.3, 2.9];
+        let mut phases = Array3::from_shape_fn((pairs.len(), 2, 3), |(k, _, col)| {
+            let (i, j) = pairs[k];
+            phase[j] - phase[i] + col as f64 * 0.1 + [0.0, std::f64::consts::TAU, 0.0][k]
+        });
+        phases[(2, 0, 0)] += std::f64::consts::TAU;
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, &pairs, Some((0, 0))).unwrap();
+        let flagged: Vec<(usize, usize)> = qc
+            .failed_mask()
+            .indexed_iter()
+            .filter(|(_, &bad)| bad)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(flagged, vec![(0, 0)]);
+        assert!(phases.slice(s![.., 1, 2]).iter().all(|v| v.is_finite()));
+    }
+
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
         dates
             .iter()
