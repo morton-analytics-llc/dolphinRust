@@ -393,6 +393,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.mask_unwrap_loop_errors is true"
     ),
     conditional!(
+        "timeseries_options.write_cycle_step_diagnostics",
+        "CFG-TIMESERIES",
+        "timeseries_options.write_cycle_step_diagnostics is true"
+    ),
+    conditional!(
         "unwrap_options.snaphu_options.ntiles",
         "CFG-UNWRAP-BACKEND",
         "unwrap_method is native or snaphu"
@@ -893,6 +898,14 @@ pub struct TimeseriesOptions {
     /// `max_temporal_baseline`. Emits `loop_closure_bad_count.tif` and
     /// `loop_closure_worst_cycles.tif`. See issue #24.
     pub mask_unwrap_loop_errors: bool,
+    /// Write the per-date phase-step diagnostic rasters computed on the inverted
+    /// series before corrections and the spatial reference: one
+    /// `junction_step_cycles_NN.tif` per ministack boundary (each pixel's step
+    /// across the boundary minus its connected component's median, in cycles).
+    /// The frame statistics behind them are always recorded in
+    /// `geometry_provenance.json` (`ministack_junctions`); this flag gates the
+    /// rasters only. **Off by default.**
+    pub write_cycle_step_diagnostics: bool,
 }
 
 impl Default for TimeseriesOptions {
@@ -915,6 +928,7 @@ impl Default for TimeseriesOptions {
             velocity_step_dates: Vec::new(),
             velocity_relaxation: Vec::new(),
             mask_unwrap_loop_errors: false,
+            write_cycle_step_diagnostics: false,
         }
     }
 }

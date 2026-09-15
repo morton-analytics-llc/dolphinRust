@@ -16,6 +16,7 @@ pub mod cslc_covariance_source;
 pub mod dates;
 pub mod displacement;
 pub mod fixed_cube;
+pub mod phase_steps;
 pub mod provenance;
 pub mod sequential;
 pub mod sequential_covariance;
