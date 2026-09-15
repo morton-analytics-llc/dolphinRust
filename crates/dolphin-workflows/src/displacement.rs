@@ -1828,6 +1828,14 @@ impl SpatialProducts {
                 .and(epoch)
                 .for_each(|valid, &displacement| *valid &= (displacement as f32).is_finite());
         }
+        // Pixels outside every STATIC granule carry NaN geometry. With atmospheric
+        // corrections on, `1/up` NaNs their displacement and the rows above catch
+        // them; a geometry-only run needs the intersection stated.
+        if let Some(geometry) = self.corrections.los_geometry.as_ref() {
+            ndarray::Zip::from(&mut self.validity_mask)
+                .and(&geometry.up)
+                .for_each(|valid, &up| *valid &= up.is_finite());
+        }
         let mask = &self.validity_mask;
         mask3_f64(&mut self.disp_rad, mask);
         mask2_f64(&mut self.vel_rad, mask);
@@ -6619,6 +6627,39 @@ mod tests {
             out.geometry_provenance.outside_static_fraction,
             Some(2.0 / 16.0)
         );
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// A geometry-only run (no atmospheric correction to NaN the displacement at
+    /// pixels without LOS) still publishes with the outside-STATIC pixels masked:
+    /// geometry finiteness is part of the validity mask, so the fixed-cube writer
+    /// never sees a valid pixel with non-finite geometry.
+    #[test]
+    fn geometry_only_run_masks_outside_static_pixels_before_publication() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_geometry_only_outside_static_{}",
+            std::process::id()
+        ));
+        let outside = [(0, 0), (3, 3)];
+        let products = geometry_masked_products(&outside, &[]);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::Full,
+        )
+        .expect("outside-STATIC pixels are masked, not a write-time error");
+        for (point, &valid) in out.validity_mask.indexed_iter() {
+            assert_eq!(valid, !outside.contains(&point), "validity at {point:?}");
+        }
+        assert!(out.velocity[(0, 0)].is_nan() && out.velocity[(3, 3)].is_nan());
+        assert!(cfg
+            .work_directory
+            .join("velocity_validity_mask.tif")
+            .is_file());
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
