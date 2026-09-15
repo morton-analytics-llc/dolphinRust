@@ -1445,6 +1445,13 @@ fn emit_displacement(
         .loop_closure
         .as_ref()
         .map(|qc| qc.failed_mask().iter().filter(|&&bad| bad).count());
+    // Likewise the geometry: after the mask, NaN `up` marks every masked pixel,
+    // not only those outside the STATIC granule.
+    let outside_static = spatial
+        .corrections
+        .los_geometry
+        .as_ref()
+        .map(LosGeometry::outside_static);
     spatial.apply_validity_mask();
     restrict_publication_mask(
         cfg,
@@ -1625,6 +1632,7 @@ fn emit_displacement(
     let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
+        outside_static,
         crop.map(|plan| plan.provenance.clone()),
         Some(input_coverage),
     );
@@ -6521,6 +6529,96 @@ mod tests {
             }
             SpatialReferenceStatus::Selected => panic!("no reference can exist"),
         }
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// A 4×4 frame with `outside` pixels NaN in the LOS geometry (outside every
+    /// STATIC granule) and `masked` more with a non-finite velocity; every velocity
+    /// and displacement is finite elsewhere.
+    fn geometry_masked_products(
+        outside: &[(usize, usize)],
+        masked: &[(usize, usize)],
+    ) -> SpatialProducts {
+        let mut up = Array2::from_elem((4, 4), 0.8);
+        let mut east = Array2::from_elem((4, 4), 0.6);
+        for &point in outside {
+            up[point] = f64::NAN;
+            east[point] = f64::NAN;
+        }
+        let mut velocity = Array2::from_elem((4, 4), 0.1);
+        for &point in masked {
+            velocity[point] = f64::NAN;
+        }
+        SpatialProducts {
+            disp_rad: Array3::from_shape_fn((2, 4, 4), |(date, row, col)| {
+                0.1 * (date + 1) as f64 + 0.01 * (row * 4 + col) as f64
+            }),
+            vel_rad: velocity,
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
+            temporal_coherence: Array2::from_elem((4, 4), 0.9),
+            validity_mask: Array2::from_elem((4, 4), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            phase_similarity: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: Some(LosGeometry {
+                    east,
+                    north: Array2::zeros((4, 4)),
+                    up,
+                }),
+            },
+            geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            reference_point: None,
+            posterior_variance_rad: None,
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: None,
+            velocity_diagnostics: None,
+            interferogram_pairs: vec![(0, 1), (1, 2), (0, 2)],
+            unwrap_connected_components: Array3::from_elem((3, 4, 4), 1),
+            production_covariance: None,
+        }
+    }
+
+    /// The provenance's outside-STATIC count is the resolver's, taken before the
+    /// validity mask NaNs the geometry at every pixel it masks: two pixels outside
+    /// the granule and ten more masked for a non-finite velocity report two.
+    #[test]
+    fn outside_static_provenance_counts_only_the_resolver_mask() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_outside_static_count_{}",
+            std::process::id()
+        ));
+        let outside = [(0, 0), (3, 3)];
+        let masked: Vec<(usize, usize)> = (0..16)
+            .map(|index| (index / 4, index % 4))
+            .filter(|point| !outside.contains(point))
+            .take(10)
+            .collect();
+        let products = geometry_masked_products(&outside, &masked);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::GroundPulse,
+        )
+        .unwrap();
+        assert_eq!(out.geometry_provenance.outside_static_pixel_count, Some(2));
+        assert_eq!(
+            out.geometry_provenance.outside_static_fraction,
+            Some(2.0 / 16.0)
+        );
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 

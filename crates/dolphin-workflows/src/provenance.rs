@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 use dolphin_core::config::{DisplacementWorkflow, InputType};
+use dolphin_corrections::geometry::OutsideStatic;
 use dolphin_corrections::LosGeometry;
 use dolphin_io::{
     read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, read_cslc_orbit_type,
@@ -221,14 +222,25 @@ pub fn assemble_geometry_provenance_with_bounds(
     los: Option<&LosGeometry>,
     processing_bounds: Option<ProcessingBoundsProvenance>,
 ) -> GeometryProvenance {
-    assemble_geometry_provenance_with_coverage(cfg, los, processing_bounds, None)
+    assemble_geometry_provenance_with_coverage(
+        cfg,
+        los,
+        los.map(LosGeometry::outside_static),
+        processing_bounds,
+        None,
+    )
 }
 
 /// Assemble geometry plus identifier-free input-coverage provenance.
+///
+/// `outside_static` is the resolver's count, taken before the publication
+/// validity mask NaNs the geometry at every pixel it masks; deriving it from
+/// `los` here would count those too.
 #[must_use]
 pub fn assemble_geometry_provenance_with_coverage(
     cfg: &DisplacementWorkflow,
     los: Option<&LosGeometry>,
+    outside_static: Option<OutsideStatic>,
     processing_bounds: Option<ProcessingBoundsProvenance>,
     input_coverage: Option<InputCoverageProvenance>,
 ) -> GeometryProvenance {
@@ -261,8 +273,8 @@ pub fn assemble_geometry_provenance_with_coverage(
         incidence_angle_spread_deg: incidence.map(|s| s.std_deg),
         incidence_angle_min_deg: incidence.map(|s| s.min_deg),
         incidence_angle_max_deg: incidence.map(|s| s.max_deg),
-        outside_static_pixel_count: los.map(|l| l.outside_static().pixel_count),
-        outside_static_fraction: los.map(|l| l.outside_static().fraction),
+        outside_static_pixel_count: outside_static.map(|outside| outside.pixel_count),
+        outside_static_fraction: outside_static.map(|outside| outside.fraction),
         heading_deg,
         native_range_spacing_m,
         native_azimuth_spacing_m,
