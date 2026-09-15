@@ -135,8 +135,33 @@ impl VelocityEstimator {
 pub struct PublicationQuality {
     /// Previously eligible pixels excluded by component membership.
     pub component_rejected_pixels: usize,
+    /// Eligible pixels each interferogram's component membership rejected on
+    /// its own, indexed like `interferogram_pairs`. With a reference, a pixel
+    /// must share the reference's label in every band, so one interferogram
+    /// that unwrapped as two regions removes the far side for every date; this
+    /// is where that shows. A pixel rejected by several bands counts in each.
+    pub component_rejected_per_band: Vec<usize>,
+    /// The band that rejected the most pixels, `None` when none rejected any.
+    pub component_worst_band: Option<usize>,
+    /// Whether the published series carries a final spatial reference.
+    pub spatial_reference: SpatialReferenceStatus,
     /// disabled, unavailable_no_triangles, or evaluated.
     pub closure_qc_status: &'static str,
+}
+
+/// The final spatial reference of a published product.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SpatialReferenceStatus {
+    /// The series and velocity are relative to `reference_point`.
+    Selected,
+    /// No displacement-valid pixel survived the publication masks, so nothing
+    /// could serve as the datum: the product is published entirely as nodata,
+    /// with the reason, rather than failing the run.
+    Unavailable {
+        /// What emptied the eligible set, with the counts behind it.
+        reason: String,
+    },
 }
 
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
@@ -507,24 +532,13 @@ fn finish_displacement(
                 )
             },
             |displacement| {
-                if let Some(point) = configured_reference {
-                    anyhow::ensure!(
-                        reference_pixel_is_valid(validity_mask.view(), displacement, point),
-                        "timeseries_options.reference_point has non-finite corrected displacement"
-                    );
-                    return Ok(Some(point));
-                }
-                let selected = select_valid_reference_point(
+                final_spatial_reference(
+                    cfg,
+                    configured_reference,
                     temporal_coherence.view(),
                     validity_mask.view(),
                     displacement,
-                    cfg.timeseries_options.correlation_threshold,
-                );
-                anyhow::ensure!(
-                    selected.is_some() || !cfg.timeseries_options.write_velocity_uncertainty,
-                    "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
-                );
-                Ok(selected)
+                )
             },
         )
     })?;
@@ -596,6 +610,48 @@ fn finish_displacement(
         production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
+}
+
+/// The configured reference, checked against the corrected series, else the
+/// best displacement-valid pixel meeting the coherence threshold. Velocity
+/// uncertainty needs that datum, so its absence fails the run — unless no
+/// displacement-valid pixel is left at all (the loop-closure gate can mask a
+/// whole frame), in which case there is nothing to reference and the product
+/// goes on to publish as unavailable rather than die.
+fn final_spatial_reference(
+    cfg: &DisplacementWorkflow,
+    configured_reference: Option<(usize, usize)>,
+    temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+) -> Result<Option<(usize, usize)>> {
+    if let Some(point) = configured_reference {
+        anyhow::ensure!(
+            reference_pixel_is_valid(validity_mask, displacement, point),
+            "timeseries_options.reference_point has non-finite corrected displacement"
+        );
+        return Ok(Some(point));
+    }
+    let selected = select_valid_reference_point(
+        temporal_coherence,
+        validity_mask,
+        displacement,
+        cfg.timeseries_options.correlation_threshold,
+    );
+    if selected.is_none() && cfg.timeseries_options.write_velocity_uncertainty {
+        let any_displacement_valid = validity_mask
+            .indexed_iter()
+            .any(|(point, _)| reference_pixel_is_valid(validity_mask, displacement, point));
+        anyhow::ensure!(
+            !any_displacement_valid,
+            "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
+        );
+        tracing::warn!(
+            stage = "reference",
+            "no displacement-valid pixel remains; the product will publish without a spatial reference"
+        );
+    }
+    Ok(selected)
 }
 
 fn correct_then_reference(
@@ -1090,14 +1146,20 @@ fn fit_velocity(
             model,
         ));
     }
-    let reference =
-        reference_point.context("velocity uncertainty requires a final spatial reference point")?;
-    anyhow::ensure!(
-        displacement
-            .axis_iter(Axis(0))
-            .all(|band| band[reference] == 0.0),
-        "velocity uncertainty requires an exact zero at the final spatial reference"
-    );
+    match reference_point {
+        Some(reference) => anyhow::ensure!(
+            displacement
+                .axis_iter(Axis(0))
+                .all(|band| band[reference] == 0.0),
+            "velocity uncertainty requires an exact zero at the final spatial reference"
+        ),
+        // A series with no finite value has nothing to reference; the fit below
+        // reports every pixel unavailable, which is the truthful product.
+        None => anyhow::ensure!(
+            displacement.iter().all(|value| !value.is_finite()),
+            "velocity uncertainty requires a final spatial reference point"
+        ),
+    }
     if !model.is_linear() {
         return Ok(fit_post_gauge_velocity_with_model(
             post_gauge_days,
@@ -1325,12 +1387,16 @@ fn restrict_publication_mask(
     Ok(())
 }
 
+/// Keep only pixels with a component in every interferogram — the reference's
+/// component, when there is one. Returns, per band, how many of the pixels
+/// eligible on entry that band alone rejected; a pixel rejected by several
+/// bands counts in each, so the worst band is visible whatever the band order.
 fn restrict_component_mask(
     mask: &mut Array2<bool>,
     components: ndarray::ArrayView3<'_, u32>,
     interferogram_count: usize,
     reference: Option<(usize, usize)>,
-) -> Result<()> {
+) -> Result<Vec<usize>> {
     anyhow::ensure!(
         components.dim() == (interferogram_count, mask.nrows(), mask.ncols()),
         "connected-component dimensions do not match the publication grid and network"
@@ -1339,16 +1405,23 @@ fn restrict_component_mask(
         interferogram_count > 0,
         "publication requires unwrap connected components"
     );
+    let eligible = mask.clone();
+    let mut rejected_per_band = Vec::with_capacity(interferogram_count);
     for band in components.axis_iter(Axis(0)) {
         let label = reference.map(|point| band.get(point).copied().unwrap_or(0));
         anyhow::ensure!(label != Some(0), "reference has no connected component");
+        let mut rejected = 0;
         ndarray::Zip::from(&mut *mask)
+            .and(&eligible)
             .and(band)
-            .for_each(|valid, &component| {
-                *valid &= component != 0 && label.is_none_or(|value| value == component);
+            .for_each(|valid, &was_eligible, &component| {
+                let keep = component != 0 && label.is_none_or(|value| value == component);
+                rejected += usize::from(was_eligible && !keep);
+                *valid &= keep;
             });
+        rejected_per_band.push(rejected);
     }
-    Ok(())
+    Ok(rejected_per_band)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1363,6 +1436,11 @@ fn emit_displacement(
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
+    // Counted before the validity mask blanks the QC layers at the pixels it masked.
+    let closure_masked = spatial
+        .loop_closure
+        .as_ref()
+        .map(|qc| qc.failed_mask().iter().filter(|&&bad| bad).count());
     spatial.apply_validity_mask();
     restrict_publication_mask(
         cfg,
@@ -1373,7 +1451,7 @@ fn emit_displacement(
         &mut spatial.validity_mask,
     )?;
     let eligible_before_components = spatial.validity_mask.iter().filter(|&&valid| valid).count();
-    restrict_component_mask(
+    let mut component_rejected_per_band = restrict_component_mask(
         &mut spatial.validity_mask,
         spatial.unwrap_connected_components.view(),
         spatial.interferogram_pairs.len(),
@@ -1385,30 +1463,83 @@ fn emit_displacement(
     // reference is chosen from coherence alone, before these masks exist, so it can land
     // on a pixel they later exclude. Re-select among pixels that survive them and
     // re-reference, rather than failing a run that has already done all its work.
-    if spatial
+    let spatial_reference = if spatial
         .reference_point
         .is_none_or(|point| !spatial.validity_mask.get(point).copied().unwrap_or(false))
     {
-        let point = select_valid_reference_point(
+        let selected = select_valid_reference_point(
             spatial.temporal_coherence.view(),
             spatial.validity_mask.view(),
             spatial.disp_rad.view(),
             cfg.timeseries_options.correlation_threshold,
-        )
-        .context(
-            "no pixel surviving the publication quality masks meets the configured reference coherence threshold",
-        )?;
-        spatial.rereference_to(point, &days, cfg)?;
-    }
-    restrict_component_mask(
+        );
+        match selected {
+            Some(point) => {
+                spatial.rereference_to(point, &days, cfg)?;
+                SpatialReferenceStatus::Selected
+            }
+            None => {
+                // Pixels survive but none meets the threshold: still a configuration
+                // failure. Nothing survives at all: a product with nothing to reference,
+                // published as such (T035-073278-IW1, 2026-09-15: the loop-closure gate
+                // masked 156,429 of 156,429 pixels and the run died here instead).
+                anyhow::ensure!(
+                    !spatial.validity_mask.iter().any(|&valid| valid),
+                    "no pixel surviving the publication quality masks meets the configured reference coherence threshold"
+                );
+                let analysed = spatial.validity_mask.len();
+                let component_rejected: usize = component_rejected_per_band.iter().sum();
+                let closure = closure_masked.map_or(String::new(), |masked| {
+                    format!("; loop closure masked {masked} of {analysed} analysed pixels")
+                });
+                let reason = format!(
+                    "no displacement-valid pixel survives the publication masks \
+                     ({eligible_before_components} of {analysed} analysed pixels were eligible \
+                     before component membership, which rejected {component_rejected}{closure})"
+                );
+                tracing::warn!(
+                    stage = "publication",
+                    reason,
+                    "publishing without a spatial reference"
+                );
+                SpatialReferenceStatus::Unavailable { reason }
+            }
+        }
+    } else {
+        SpatialReferenceStatus::Selected
+    };
+    let referenced_rejections = restrict_component_mask(
         &mut spatial.validity_mask,
         spatial.unwrap_connected_components.view(),
         spatial.interferogram_pairs.len(),
         spatial.reference_point,
     )?;
+    for (total, rejected) in component_rejected_per_band
+        .iter_mut()
+        .zip(referenced_rejections)
+    {
+        *total += rejected;
+    }
+    let component_worst_band = component_rejected_per_band
+        .iter()
+        .enumerate()
+        .filter(|(_, &rejected)| rejected > 0)
+        .max_by_key(|(_, &rejected)| rejected)
+        .map(|(band, _)| band);
+    tracing::info!(
+        stage = "publication",
+        component_rejected_pixels = eligible_before_components
+            - spatial.validity_mask.iter().filter(|&&valid| valid).count(),
+        worst_band = ?component_worst_band,
+        worst_band_pair = ?component_worst_band.map(|band| spatial.interferogram_pairs[band]),
+        "eligible pixels rejected by each interferogram's component membership: {component_rejected_per_band:?}"
+    );
     let publication_quality = PublicationQuality {
         component_rejected_pixels: eligible_before_components
             - spatial.validity_mask.iter().filter(|&&valid| valid).count(),
+        component_rejected_per_band,
+        component_worst_band,
+        spatial_reference,
         closure_qc_status: if !cfg.timeseries_options.mask_unwrap_loop_errors {
             "disabled"
         } else if spatial.loop_closure.is_some() {
@@ -5032,10 +5163,17 @@ mod tests {
     fn publication_components_require_each_band_reference_membership() {
         let components = ndarray::array![[[1, 2, 1, 0]], [[8, 8, 9, 8]]];
         let mut mask = Array2::from_elem((1, 4), true);
-        restrict_component_mask(&mut mask, components.view(), 2, None).unwrap();
+        let rejected = restrict_component_mask(&mut mask, components.view(), 2, None).unwrap();
         assert_eq!(mask, ndarray::array![[true, true, true, false]]);
-        restrict_component_mask(&mut mask, components.view(), 2, Some((0, 0))).unwrap();
+        assert_eq!(rejected, vec![1, 0], "only band 0 has an unlabelled pixel");
+        let rejected =
+            restrict_component_mask(&mut mask, components.view(), 2, Some((0, 0))).unwrap();
         assert_eq!(mask, ndarray::array![[true, false, false, false]]);
+        assert_eq!(
+            rejected,
+            vec![1, 1],
+            "each band rejects one eligible pixel on its own"
+        );
         assert!(restrict_component_mask(&mut mask, components.view(), 1, None).is_err());
         assert!(restrict_component_mask(&mut mask, components.view(), 2, Some((0, 3))).is_err());
     }
@@ -6249,6 +6387,136 @@ mod tests {
             .connected_components
             .indexed_iter()
             .any(|((_, row, col), &label)| validity[(row, col)] && label != 0));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// With no finite displacement anywhere there is nothing to reference; the
+    /// uncertainty fit still runs and reports every pixel unavailable instead of
+    /// failing the run. A finite series without a reference is still an error.
+    #[test]
+    fn velocity_uncertainty_without_a_reference_needs_an_empty_series() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let empty = Array3::from_elem((3, 2, 2), f64::NAN);
+        let fit = fit_velocity(&cfg, empty.view(), &days, None, &VelocityModel::default())
+            .expect("an empty series publishes as unavailable");
+        assert!(fit.velocity.iter().all(|v| v.is_nan()));
+        assert!(fit.sigma.expect("sigma layer").iter().all(|v| v.is_nan()));
+        assert!(fit
+            .diagnostics
+            .expect("diagnostics")
+            .uncertainty_status
+            .iter()
+            .all(|&status| status == VelocityUncertaintyStatus::Unavailable));
+
+        let mut finite = empty;
+        finite[(0, 1, 1)] = 0.2;
+        let error = fit_velocity(&cfg, finite.view(), &days, None, &VelocityModel::default())
+            .err()
+            .expect("a finite series still needs its reference");
+        assert!(error
+            .to_string()
+            .contains("requires a final spatial reference point"));
+    }
+
+    /// The final reference is required for velocity uncertainty while any
+    /// displacement-valid pixel exists; once none does, its absence is a typed
+    /// outcome for publication rather than a terminal failure.
+    #[test]
+    fn final_reference_is_unavailable_only_when_nothing_is_displacement_valid() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.correlation_threshold = 0.5;
+        let coherence = Array2::from_elem((2, 2), 0.3);
+        let validity = Array2::from_elem((2, 2), true);
+        let finite = Array3::zeros((2, 2, 2));
+        let error =
+            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), finite.view())
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a displacement-valid final spatial reference"));
+
+        let empty = Array3::from_elem((2, 2, 2), f64::NAN);
+        let selected =
+            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), empty.view())
+                .unwrap();
+        assert_eq!(selected, None);
+    }
+
+    /// A frame the loop-closure gate masked entirely publishes as an unavailable
+    /// product with the reason in its provenance, rather than dying on the
+    /// reference selection.
+    #[test]
+    fn fully_masked_frame_publishes_as_unavailable_with_provenance() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_unavailable_product_{}",
+            std::process::id()
+        ));
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let products = SpatialProducts {
+            disp_rad: Array3::from_elem((2, 2, 2), f64::NAN),
+            vel_rad: Array2::from_elem((2, 2), f64::NAN),
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_elem((2, 2), 1.0),
+                evaluable_loop_count: Array2::from_elem((2, 2), 1.0),
+                worst_residual_cycles: Array2::from_elem((2, 2), 1.0),
+            }),
+            temporal_coherence: Array2::from_elem((2, 2), 0.9),
+            validity_mask: Array2::from_elem((2, 2), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            phase_similarity: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+            reference_point: None,
+            posterior_variance_rad: None,
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: Some(Array2::from_elem((2, 2), f64::NAN)),
+            velocity_diagnostics: None,
+            interferogram_pairs: pairs.clone(),
+            unwrap_connected_components: Array3::from_elem((3, 2, 2), 1),
+            production_covariance: None,
+        };
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::GroundPulse,
+        )
+        .expect("a fully masked frame publishes rather than fails");
+        assert_eq!(out.reference_point, None);
+        assert!(out.validity_mask.iter().all(|&valid| !valid));
+        let quality = &out.publication_quality;
+        assert_eq!(quality.closure_qc_status, "evaluated");
+        assert_eq!(quality.component_rejected_per_band, vec![0, 0, 0]);
+        assert_eq!(quality.component_worst_band, None);
+        match &quality.spatial_reference {
+            SpatialReferenceStatus::Unavailable { reason } => {
+                assert!(
+                    reason.contains("loop closure masked 4 of 4"),
+                    "reason should name the closure mask: {reason}"
+                );
+            }
+            SpatialReferenceStatus::Selected => panic!("no reference can exist"),
+        }
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
