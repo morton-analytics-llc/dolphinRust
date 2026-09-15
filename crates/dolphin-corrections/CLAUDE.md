@@ -23,7 +23,14 @@ modelling + raster subtraction, no solver.
   always scale to the *configured* λ, never a C-band constant. IONEX is coarse
   (2.5°×5°), so VTEC is sampled once at the frame centre per date (`grid_centroid_lonlat`
   → lon/lat; acquisition time-of-day from the granule name) and projected to a uniform
-  delay grid.
+  delay grid. **IONEX rules (typed `IonexError`, `ionosphere.rs`):** map times are the
+  `EPOCH OF CURRENT MAP` records, never `first + n·INTERVAL`; they must strictly increase
+  and match the header's `EPOCH OF FIRST/LAST MAP` (`EpochOrder` / `EpochMismatch`); an
+  acquisition outside `[first, last]` is `TemporalCoverage`, never an extrapolation; a raw
+  `9999` cell is missing before the `EXPONENT` scaling (never `999.9` TECU); and any
+  positive trilinear weight on a missing cell makes the sample `MissingTec`, not a number.
+  Contract fixture: `tests/fixtures/IGS0OPSFIN_20230010000_01D_02H_GIM.maps01_13.INX`
+  (two genuine IGS GIM maps; its COMMENT records list the source lines kept).
 
 - **Troposphere (non-dispersive).** Same delay in meters for L- and C-band. Primary
   source: the public OPERA L4 tropospheric netCDF (DISP-S1-aligned), read via GDAL's
