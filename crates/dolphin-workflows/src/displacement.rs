@@ -517,6 +517,7 @@ fn finish_displacement(
     let (mut inversion, loop_closure) = solve_time_series(
         cfg,
         unwrap.unwrapped,
+        unwrap.connected_components.view(),
         &pairs,
         stitched.crlb_sigma.as_ref(),
         cfg.phase_linking.write_covariance_operator,
@@ -1020,13 +1021,20 @@ fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTe
 fn solve_time_series(
     cfg: &DisplacementWorkflow,
     mut dphi_rad: Array3<f64>,
+    connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
     crlb_sigma: Option<&Array3<f64>>,
     retain_fixed_l2_inputs: bool,
     closure_reference: Option<(usize, usize)>,
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
-        apply_loop_closure_qc(cfg, &mut dphi_rad, pairs, closure_reference)
+        apply_loop_closure_qc(
+            cfg,
+            &mut dphi_rad,
+            connected_components,
+            pairs,
+            closure_reference,
+        )
     });
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
@@ -1048,6 +1056,7 @@ fn solve_time_series(
 fn apply_loop_closure_qc(
     cfg: &DisplacementWorkflow,
     dphi_rad: &mut Array3<f64>,
+    connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
     reference: Option<(usize, usize)>,
 ) -> Option<LoopClosureQc> {
@@ -1074,7 +1083,12 @@ fn apply_loop_closure_qc(
     if let Some(point) = reference {
         reference_to_point(dphi_rad, point);
     }
-    let qc = loop_closure_qc(dphi_rad.view(), pairs, DEFAULT_CLOSURE_TOLERANCE_CYCLES);
+    let qc = loop_closure_qc(
+        dphi_rad.view(),
+        connected_components,
+        pairs,
+        DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    );
     if let Some(offsets) = offsets {
         for (mut band, offset) in dphi_rad.outer_iter_mut().zip(offsets) {
             band.mapv_inplace(|value| value + offset);
@@ -5312,7 +5326,9 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
         let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
-        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true, None).unwrap();
+        let components = Array3::from_elem(dphi.dim(), 1);
+        let (inversion, qc) =
+            solve_time_series(&cfg, dphi, components.view(), &pairs, None, true, None).unwrap();
         assert!(qc.is_some());
         let retained = inversion.fixed_l2_inputs.unwrap();
         assert!(retained.pixel_map((0, 0)).is_ok());
@@ -7980,7 +7996,8 @@ mod tests {
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).is_none());
+        let components = one_component(&dphi);
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs, None).is_none());
         assert_eq!(dphi, original);
     }
 
@@ -7994,7 +8011,8 @@ mod tests {
         let pairs = vec![(0, 1), (0, 2), (0, 3)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).is_none());
+        let components = one_component(&dphi);
+        assert!(apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs, None).is_none());
         assert_eq!(dphi, original);
     }
 
@@ -8011,8 +8029,10 @@ mod tests {
             phase[j] - phase[i]
         });
         dphi[(2, 1, 1)] += std::f64::consts::TAU;
+        let components = one_component(&dphi);
 
-        let qc = apply_loop_closure_qc(&cfg, &mut dphi, &pairs, None).expect("qc ran");
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs, None)
+            .expect("qc ran");
         assert!(qc.bad_loop_count[(1, 1)] > 0.0);
         assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
         assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
@@ -8028,7 +8048,9 @@ mod tests {
         });
         phases[(2, 0, 2)] += std::f64::consts::TAU;
         let original = phases.clone();
-        let qc = apply_loop_closure_qc(&cfg, &mut phases, &pairs, Some((0, 0))).unwrap();
+        let components = one_component(&phases);
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs, Some((0, 0)))
+            .unwrap();
         for col in 0..2 {
             assert_eq!(qc.bad_loop_count[(0, col)], 0.0);
             for band in 0..3 {
@@ -8057,7 +8079,9 @@ mod tests {
             phase[j] - phase[i] + col as f64 * 0.1 + [0.0, std::f64::consts::TAU, 0.0][k]
         });
         phases[(2, 0, 0)] += std::f64::consts::TAU;
-        let qc = apply_loop_closure_qc(&cfg, &mut phases, &pairs, Some((0, 0))).unwrap();
+        let components = one_component(&phases);
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs, Some((0, 0)))
+            .unwrap();
         let flagged: Vec<(usize, usize)> = qc
             .failed_mask()
             .indexed_iter()
@@ -8066,6 +8090,11 @@ mod tests {
             .collect();
         assert_eq!(flagged, vec![(0, 0)]);
         assert!(phases.slice(s![.., 1, 2]).iter().all(|v| v.is_finite()));
+    }
+
+    /// Every interferogram unwrapped as one connected component.
+    fn one_component(unwrapped: &Array3<f64>) -> Array3<u32> {
+        Array3::from_elem(unwrapped.dim(), 1)
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
