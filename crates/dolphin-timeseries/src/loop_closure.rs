@@ -526,6 +526,42 @@ mod tests {
         assert!(!qc.failed_mask()[(1, 1)]);
     }
 
+    /// Masked pixels are zero-filled before unwrapping and close every loop to
+    /// exactly zero. When they are the majority they would pin a frame-wide
+    /// median to that zero; carrying no label, they are outside every root and
+    /// the valid minority keeps its own.
+    #[test]
+    fn masked_majority_does_not_pin_the_root() {
+        let (pairs, mut unwrapped) = consistent_network();
+        let mut components = one_component(&unwrapped);
+        for (k, root) in [1.0, -2.0, 3.0, 0.0, 1.0].into_iter().enumerate() {
+            unwrapped
+                .index_axis_mut(ndarray::Axis(0), k)
+                .mapv_inplace(|v| v + root * std::f64::consts::TAU);
+        }
+        // Six of nine pixels are masked: zero phase, no component.
+        for (row, col) in (0..3).flat_map(|row| (0..3).map(move |col| (row, col))) {
+            if row + col < 3 {
+                unwrapped.slice_mut(ndarray::s![.., row, col]).fill(0.0);
+                components.slice_mut(ndarray::s![.., row, col]).fill(0);
+            }
+        }
+        let qc = loop_closure_qc(
+            unwrapped.view(),
+            components.view(),
+            &pairs,
+            DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+        );
+        assert!(
+            !qc.failed_mask().iter().any(|&bad| bad),
+            "{:?}",
+            qc.bad_loop_count
+        );
+        assert_eq!(qc.evaluable_loop_count[(0, 0)], 0.0);
+        assert!(qc.evaluable_loop_count[(2, 2)] > 0.0);
+        assert!(qc.worst_residual_cycles[(2, 2)] < 1e-12);
+    }
+
     /// A sub-cycle residual (real noise, not an unwrap error) is not flagged.
     #[test]
     fn sub_cycle_noise_is_not_an_unwrap_error() {

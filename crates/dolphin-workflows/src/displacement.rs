@@ -1823,17 +1823,7 @@ impl SpatialProducts {
             mask2_f64(&mut geometry.north, mask);
             mask2_f64(&mut geometry.up, mask);
         }
-        ndarray::Zip::from(self.unwrap_connected_components.axis_iter_mut(Axis(0))).for_each(
-            |mut band| {
-                ndarray::Zip::from(&mut band)
-                    .and(mask)
-                    .for_each(|value, &valid| {
-                        if !valid {
-                            *value = 0;
-                        }
-                    });
-            },
-        );
+        mask3_value(&mut self.unwrap_connected_components, mask, 0);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3484,12 +3474,16 @@ fn mask2_value<T: Clone>(values: &mut Array2<T>, mask: &Array2<bool>, fill: T) {
 }
 
 fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
+    mask3_value(values, mask, f64::NAN);
+}
+
+fn mask3_value<T: Clone>(values: &mut Array3<T>, mask: &Array2<bool>, fill: T) {
     for mut band in values.axis_iter_mut(Axis(0)) {
         ndarray::Zip::from(&mut band)
             .and(mask)
             .for_each(|value, &valid| {
                 if !valid {
-                    *value = f64::NAN;
+                    *value = fill.clone();
                 }
             });
     }
@@ -4434,36 +4428,46 @@ fn unwrap_network(
             }
         });
     let apply_configured_mask = cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some();
-    let has_invalid_phase_link_pixel = validity_mask.iter().any(|valid| !*valid);
-    let masked_phase = (has_invalid_phase_link_pixel || apply_configured_mask).then(|| {
-        apply_phase_masks(
-            pl,
-            validity_mask,
-            apply_configured_mask.then_some(correlation.view()),
-        )
-    });
+    let support = unwrap_support(
+        validity_mask,
+        apply_configured_mask.then_some(correlation.view()),
+    );
+    let masked_phase = support
+        .iter()
+        .any(|&kept| !kept)
+        .then(|| apply_phase_masks(pl, support.view()));
     let backend = unwrap_backend(cfg, (rows, cols));
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
     let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
-    match masked_phase.as_ref() {
+    let mut output = match masked_phase.as_ref() {
         Some(values) => pool
             .install(|| backend.unwrap_network(values.view(), pairs, correlation.view(), &scratch)),
         None => pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch)),
-    }
+    }?;
+    // A zero-filled pixel reaches the unwrapper as flat phase and can come back
+    // labelled; the loop-closure roots key on labels and would take its zero
+    // residual as evidence, so no pixel off support keeps a component.
+    mask3_value(&mut output.connected_components, &support, 0);
+    Ok(output)
 }
 
-fn apply_phase_masks(
-    pl: ArrayView3<Cf64>,
+/// Pixels that reach the unwrapper with their phase-linked value: those the
+/// phase-link marked valid and, when the configured mask is applied, those it
+/// keeps. Every other pixel is zero-filled before unwrapping.
+fn unwrap_support(
     phase_link_validity: ArrayView2<bool>,
     configured_mask: Option<ArrayView2<f32>>,
-) -> Array3<Cf64> {
+) -> Array2<bool> {
+    Array2::from_shape_fn(phase_link_validity.dim(), |point| {
+        phase_link_validity[point] && configured_mask.is_none_or(|mask| mask[point] != 0.0)
+    })
+}
+
+fn apply_phase_masks(pl: ArrayView3<Cf64>, support: ArrayView2<bool>) -> Array3<Cf64> {
     let mut values = pl.to_owned();
-    for ((row, col), &valid) in phase_link_validity.indexed_iter() {
-        let configured_invalid = configured_mask
-            .as_ref()
-            .is_some_and(|mask| mask[(row, col)] == 0.0);
-        if !valid || configured_invalid {
+    for ((row, col), &kept) in support.indexed_iter() {
+        if !kept {
             values.slice_mut(s![.., row, col]).fill(Cf64::new(0.0, 0.0));
         }
     }
@@ -6266,6 +6270,47 @@ mod tests {
         assert!(nonzero.to_string().contains("exact zero"));
     }
 
+    /// Zero-filled pixels are flat phase to the unwrapper and may come back with
+    /// a component; the closure roots key on labels, so nothing off support keeps one.
+    #[test]
+    fn unwrap_output_carries_no_label_off_support() {
+        let mut cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join(format!(
+                "dolphin_unwrap_support_labels_{}",
+                std::process::id()
+            )),
+            ..DisplacementWorkflow::default()
+        };
+        cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let pl = Array3::from_shape_fn((3, 4, 4), |(date, row, col)| {
+            Cf64::from_polar(1.0, date as f64 * (0.3 + 0.05 * (row + col) as f64))
+        });
+        // More than half the grid is off support.
+        let validity = Array2::from_shape_fn((4, 4), |(row, col)| row < 2 && col < 3);
+        let output = unwrap_network(
+            &cfg,
+            pl.view(),
+            &pairs,
+            Array2::from_elem((4, 4), 0.95).view(),
+            validity.view(),
+            [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            Some(32611),
+        )
+        .unwrap();
+        for ((_, row, col), &label) in output.connected_components.indexed_iter() {
+            assert!(
+                validity[(row, col)] || label == 0,
+                "label {label} at ({row}, {col})"
+            );
+        }
+        assert!(output
+            .connected_components
+            .indexed_iter()
+            .any(|((_, row, col), &label)| validity[(row, col)] && label != 0));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
     #[test]
     fn spatial_reference_variance_includes_reference_pixel() {
         let mut variance = Array3::from_shape_vec((1, 1, 3), vec![1.0, 4.0, 9.0]).unwrap();
@@ -6281,7 +6326,9 @@ mod tests {
         let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
         let validity = ndarray::array![[true, true], [false, true]];
         let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
-        let masked = apply_phase_masks(phase.view(), validity.view(), Some(mask.view()));
+        let support = unwrap_support(validity.view(), Some(mask.view()));
+        assert_eq!(support, ndarray::array![[true, false], [false, true]]);
+        let masked = apply_phase_masks(phase.view(), support.view());
         assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(0, 1, 0)], Cf64::new(0.0, 0.0));
