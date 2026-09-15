@@ -1722,23 +1722,12 @@ fn emit_displacement(
                         spatial.geotransform,
                     )?;
                 }
-                if cfg.timeseries_options.temporal_uncertainty.method
-                    == dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
-                {
-                    anyhow::ensure!(
-                        spatial.corrections.los_geometry.is_some(),
-                        "corrected temporal inference requires a completed fixed-cube receipt"
-                    );
-                    let displacement_rasters =
-                        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
-                    crate::temporal_covariance_product::write_temporal_covariance_products(
-                        &cfg.work_directory,
-                        &displacement_rasters,
-                        &days,
-                        &cfg.timeseries_options.temporal_uncertainty,
-                    )?;
-                }
-                Ok(())
+                write_temporal_products_if_referenced(
+                    cfg,
+                    &publication_quality.spatial_reference,
+                    &days,
+                    spatial.corrections.los_geometry.is_some(),
+                )
             }
             DisplacementOutputPolicy::GroundPulse => {
                 std::fs::create_dir_all(&cfg.work_directory)?;
@@ -1788,6 +1777,44 @@ fn emit_displacement(
         los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
+}
+
+/// Corrected temporal inference (REML) is scoped to the fixed-cube receipt's
+/// reference point. A product published without a spatial reference has none,
+/// so the stage is skipped with the reason rather than failing a run whose
+/// products are already on disk.
+fn write_temporal_products_if_referenced(
+    cfg: &DisplacementWorkflow,
+    spatial_reference: &SpatialReferenceStatus,
+    days: &[f64],
+    geometry_present: bool,
+) -> Result<()> {
+    if cfg.timeseries_options.temporal_uncertainty.method
+        != dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
+    {
+        return Ok(());
+    }
+    if let SpatialReferenceStatus::Unavailable { reason } = spatial_reference {
+        tracing::warn!(
+            stage = "temporal_uncertainty",
+            reason,
+            "skipping corrected temporal inference: the product has no spatial reference"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        geometry_present,
+        "corrected temporal inference requires a completed fixed-cube receipt"
+    );
+    let displacement_rasters =
+        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
+    crate::temporal_covariance_product::write_temporal_covariance_products(
+        &cfg.work_directory,
+        &displacement_rasters,
+        days,
+        &cfg.timeseries_options.temporal_uncertainty,
+    )?;
+    Ok(())
 }
 
 fn temporal_product_displacement_rasters(
@@ -6742,6 +6769,39 @@ mod tests {
             unwrap_connected_components: Array3::from_elem((3, 4, 4), 1),
             production_covariance: None,
         }
+    }
+
+    /// Corrected temporal inference (REML) is scoped to the fixed-cube receipt's
+    /// reference. A product published without a spatial reference has none, so
+    /// the temporal stage is skipped with the reason logged, instead of the run
+    /// dying there after the "publishing without a spatial reference" warning.
+    #[test]
+    fn unavailable_product_skips_corrected_temporal_inference() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_unavailable_skips_temporal_{}",
+            std::process::id()
+        ));
+        cfg.timeseries_options.temporal_uncertainty.method =
+            dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar;
+        let masked: Vec<(usize, usize)> = (0..16).map(|index| (index / 4, index % 4)).collect();
+        let products = geometry_masked_products(&[], &masked);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::Full,
+        )
+        .expect("an unavailable product skips the temporal stage rather than failing");
+        assert!(matches!(
+            out.publication_quality.spatial_reference,
+            SpatialReferenceStatus::Unavailable { .. }
+        ));
+        assert_eq!(out.reference_point, None);
+        assert!(cfg.work_directory.join("velocity.tif").is_file());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
     /// The provenance's outside-STATIC count is the resolver's, taken before the
