@@ -59,6 +59,9 @@ use crate::cslc_covariance_source::{
     CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 use crate::dates::parse_date;
+use crate::phase_steps::{
+    junction_epochs, junction_steps, step_components, JunctionProvenance, JunctionStep,
+};
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
@@ -510,6 +513,17 @@ fn finish_displacement(
         stitched.crlb_sigma.as_ref(),
         cfg.phase_linking.write_covariance_operator,
     )?;
+    // Per-date step diagnostics belong here, on the raw inverted series: the
+    // corrections would smear an integer step and the spatial reference would
+    // add one pixel's own step to every other pixel's.
+    let junctions = timed("phase_steps", || {
+        junction_diagnostics(
+            cfg,
+            inversion.displacement.view(),
+            unwrap.connected_components.view(),
+            &pairs,
+        )
+    })?;
     // Atmospheric corrections subtract per-date delay from the inverted series
     // before the final spatial reference and velocity. Reference selection runs
     // on the corrected series so it cannot choose a high-coherence pixel whose
@@ -591,6 +605,7 @@ fn finish_displacement(
         velocity_model,
         velocity_terms: fit.terms,
         loop_closure,
+        junctions,
         temporal_coherence,
         validity_mask,
         burst_coverage,
@@ -1040,6 +1055,48 @@ fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTe
 /// Loop-closure QC on the unwrapped network, then the SBAS solve. The QC runs
 /// first because a 2π unwrap error is a confident wrong number in the solve, and
 /// it is invisible to the wrapped closure-phase layer (#24).
+const JUNCTION_STEP_NOTE: &str = "Per-pixel phase step from the last date of one ministack to the \
+first of the next, on the inverted series before corrections and the spatial reference, minus \
+the median step of the pixel's unwrap connected component. Its fractional part is the wrapped \
+linked-phase step; a whole number of cycles is the unwrapper's integer. Diagnostic only.";
+
+/// The per-pixel step across every ministack boundary on the raw inverted
+/// series (E4, 2026-09-15). The boundaries come from the same planner that
+/// sequenced phase linking, so they are the junctions the compressed-SLC chain
+/// actually crossed; a single ministack yields no entries.
+fn junction_diagnostics(
+    cfg: &DisplacementWorkflow,
+    series: ArrayView3<f64>,
+    connected_components: ArrayView3<u32>,
+    pairs: &[(usize, usize)],
+) -> Result<Vec<JunctionStep>> {
+    let n_dates = series.dim().0 + 1;
+    let plan = MiniStackPlanner {
+        num_slc: n_dates,
+        max_num_compressed: cfg.phase_linking.max_num_compressed,
+        output_reference_idx: isize::try_from(cfg.phase_linking.output_reference_idx.unwrap_or(0))
+            .context("phase_linking.output_reference_idx exceeds isize")?,
+        compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
+    }
+    .plan(cfg.phase_linking.ministack_size)
+    .map_err(anyhow::Error::msg)?;
+    let epochs = junction_epochs(&plan);
+    let components = step_components(pairs, connected_components, series);
+    let junctions = junction_steps(series, components.view(), &epochs);
+    for junction in &junctions {
+        tracing::info!(
+            stage = "phase_steps",
+            epoch = junction.summary.epoch,
+            evaluable = junction.summary.evaluable_pixels,
+            over_half_cycle = junction.summary.fraction_over_half_cycle,
+            integer_cycle = junction.summary.fraction_integer_cycle,
+            linked_over_quarter = junction.summary.fraction_linked_over_quarter_cycle,
+            "ministack junction step"
+        );
+    }
+    Ok(junctions)
+}
+
 fn solve_time_series(
     cfg: &DisplacementWorkflow,
     mut dphi_rad: Array3<f64>,
@@ -1296,6 +1353,8 @@ struct SpatialProducts {
     velocity_model: VelocityModel,
     velocity_terms: VelocityTerms,
     loop_closure: Option<LoopClosureQc>,
+    /// Per-pixel step across each ministack boundary (E4), analysis frame.
+    junctions: Vec<JunctionStep>,
     temporal_coherence: Array2<f64>,
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
@@ -1627,15 +1686,27 @@ fn emit_displacement(
             relaxation_amplitude: &scaled.relaxation_amplitude,
         },
         loop_closure: spatial.loop_closure.as_ref(),
+        junction_steps: cfg
+            .timeseries_options
+            .write_cycle_step_diagnostics
+            .then_some(spatial.junctions.as_slice()),
     };
     let input_coverage = summarize_input_coverage(&spatial);
-    let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
+    let mut geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
         outside_static,
         crop.map(|plan| plan.provenance.clone()),
         Some(input_coverage),
     );
+    geometry_provenance.ministack_junctions = Some(JunctionProvenance {
+        ministack_size: cfg.phase_linking.ministack_size,
+        junctions: spatial
+            .junctions
+            .iter()
+            .map(|junction| junction.summary.clone())
+            .collect(),
+    });
     timed("write", || -> Result<()> {
         match output_policy {
             DisplacementOutputPolicy::Full => {
@@ -1864,6 +1935,9 @@ impl SpatialProducts {
         if let Some(layer) = self.velocity_sigma_rad.as_mut() {
             mask2_f64(layer, mask);
         }
+        for junction in &mut self.junctions {
+            mask2_f64(&mut junction.step_cycles, mask);
+        }
         if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
             mask2_value(&mut diagnostics.valid_date_count, mask, 0);
             mask2_value(&mut diagnostics.regression_rank, mask, 0);
@@ -2028,6 +2102,9 @@ impl SpatialProducts {
             qc.bad_loop_count = trim2(&qc.bad_loop_count, target);
             qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
             qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
+        }
+        for junction in &mut self.junctions {
+            junction.step_cycles = trim2(&junction.step_cycles, target);
         }
         self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
         if let Some(covariance) = self.production_covariance.as_mut() {
@@ -5047,6 +5124,13 @@ fn write_outputs(
             qc.worst_residual_cycles.view(),
         )?;
     }
+    for junction in quality.junction_steps.unwrap_or_default() {
+        write_f32_with_metadata(
+            &format!("junction_step_cycles_{:02}.tif", junction.summary.epoch),
+            junction.step_cycles.view(),
+            &[("UNITTYPE", "cycles"), ("DESCRIPTION", JUNCTION_STEP_NOTE)],
+        )?;
+    }
     if let Some(variance) = quality.displacement_variance {
         for band in 0..variance.dim().0 {
             write_raster_with_metadata(
@@ -5153,6 +5237,9 @@ struct QualityLayers<'a> {
     velocity_terms: VelocityTermLayers<'a>,
     /// Post-unwrap loop-closure QC, present only when the gate ran.
     loop_closure: Option<&'a LoopClosureQc>,
+    /// Ministack-junction step rasters, present only when
+    /// `write_cycle_step_diagnostics` is set.
+    junction_steps: Option<&'a [JunctionStep]>,
 }
 
 /// Emitted form of [`VelocityTerms`], already scaled to displacement units.
@@ -5340,6 +5427,74 @@ mod tests {
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
+    /// The ministack boundaries the planner crossed are diagnosed on the raw
+    /// inverted series and always recorded in the provenance; the per-junction
+    /// rasters are opt-in.
+    #[test]
+    fn ministack_junction_steps_reach_provenance_and_opt_in_rasters() {
+        let run = |write_rasters: bool| {
+            let mut cfg = DisplacementWorkflow {
+                work_directory: std::env::temp_dir().join(format!(
+                    "dolphin_junction_steps_{write_rasters}_{}",
+                    std::process::id()
+                )),
+                ..DisplacementWorkflow::default()
+            };
+            cfg.cslc_file_list = dated_files(&["20230101", "20230113", "20230125", "20230206"]);
+            cfg.interferogram_network.max_bandwidth = Some(2);
+            cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+            cfg.timeseries_options.use_coherence_weights = false;
+            cfg.timeseries_options.reference_point = Some((0, 0));
+            cfg.phase_linking.ministack_size = 2;
+            cfg.timeseries_options.write_cycle_step_diagnostics = write_rasters;
+            let mut burst = seam_burst(0.0, 0.9);
+            burst.pl = Array3::from_shape_fn((4, 3, 3), |(date, row, _)| {
+                Cf64::from_polar(1.0, date as f64 * (2.0 + row as f64 * 0.1))
+            });
+            burst.days = vec![0.0, 12.0, 24.0, 36.0];
+            burst.coverage.acquisition_count = 4;
+            let out = finish_displacement(
+                &cfg,
+                vec![burst],
+                None,
+                DisplacementOutputPolicy::Full,
+                None,
+            )
+            .unwrap();
+            (cfg, out)
+        };
+        let (cfg, out) = run(false);
+        let junctions = out
+            .geometry_provenance
+            .ministack_junctions
+            .expect("junction statistics are always recorded");
+        assert_eq!(junctions.ministack_size, 2);
+        let epochs: Vec<usize> = junctions.junctions.iter().map(|j| j.epoch).collect();
+        assert_eq!(
+            epochs,
+            vec![2],
+            "four dates in ministacks of two cross one boundary"
+        );
+        assert_eq!(junctions.junctions[0].evaluable_pixels, 9);
+        assert_eq!(junctions.junctions[0].fraction_over_quarter_cycle, 0.0);
+        assert_eq!(junctions.junctions[0].fraction_integer_cycle, 0.0);
+        assert!(!cfg
+            .work_directory
+            .join("junction_step_cycles_02.tif")
+            .exists());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+
+        let (cfg, _) = run(true);
+        let raster =
+            dolphin_io::read_raster::<f32>(&cfg.work_directory.join("junction_step_cycles_02.tif"))
+                .unwrap();
+        assert_eq!(raster.data.dim(), (3, 3));
+        // The row gradient of 0.1 rad/date puts every pixel within 0.02 cycle
+        // of the component median.
+        assert!(raster.data.iter().all(|value| value.abs() < 0.02));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
     #[test]
     fn multiburst_leveling_removes_injected_phase_offset() {
         let frame = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
@@ -5505,6 +5660,7 @@ mod tests {
                 evaluable_loop_count: Array2::from_elem((2, 2), 2.0),
                 worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
             }),
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
@@ -5644,6 +5800,7 @@ mod tests {
                 evaluable_loop_count: Array2::from_elem((6, 8), 2.0),
                 worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
             }),
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
@@ -5708,6 +5865,7 @@ mod tests {
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
@@ -6332,6 +6490,7 @@ mod tests {
                 connected_components: &connected_components,
                 velocity_terms: VelocityTermLayers::default(),
                 loop_closure: None,
+                junction_steps: None,
             },
             Some(32611),
             [0.0, 30.0, 0.0, 30.0, 0.0, -30.0],
@@ -6489,6 +6648,7 @@ mod tests {
                 evaluable_loop_count: Array2::from_elem((2, 2), 1.0),
                 worst_residual_cycles: Array2::from_elem((2, 2), 1.0),
             }),
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((2, 2), 0.9),
             validity_mask: Array2::from_elem((2, 2), true),
             burst_coverage: Vec::new(),
@@ -6566,6 +6726,7 @@ mod tests {
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
@@ -7467,6 +7628,7 @@ mod tests {
                     connected_components: &conncomp,
                     velocity_terms: VelocityTermLayers::default(),
                     loop_closure: None,
+                    junction_steps: None,
                 },
                 Some(32614),
                 gt,
@@ -7626,6 +7788,7 @@ mod tests {
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
+            junctions: Vec::new(),
             temporal_coherence: Array2::from_elem((2, 2), 0.9),
             validity_mask: Array2::from_elem((2, 2), true),
             burst_coverage: Vec::new(),
@@ -7671,6 +7834,7 @@ mod tests {
                 connected_components: &spatial.unwrap_connected_components,
                 velocity_terms: VelocityTermLayers::default(),
                 loop_closure: None,
+                junction_steps: None,
             },
             Some(32614),
             spatial.geotransform,
@@ -8648,6 +8812,7 @@ mod tests {
                 relaxation: Vec::new(),
             },
             loop_closure: None,
+            junctions: Vec::new(),
             velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),

@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
+  after `solve_time_series`, before corrections and the spatial reference — each pixel's
+  phase step from the last date of one ministack to the first of the next, minus the median
+  step of its unwrap connected component, in cycles. Frame statistics per boundary (fraction
+  of pixels over 0.25 / 0.5 / 0.75 cycle, the share that rounds to a whole cycle, and the
+  share whose wrapped step exceeds a quarter cycle) are always written to
+  `geometry_provenance.json` as `ministack_junctions`; the new
+  `timeseries_options.write_cycle_step_diagnostics` (off by default) also writes one
+  `junction_step_cycles_NN.tif` per boundary. In a closure-exact network the wrapped
+  linked-phase step is exactly the fractional part of this step, so the split separates a
+  phase-linking junction defect from an unwrap integer without a second layer.
 - **DEM identity in geometry provenance** (issue #118, eo #483). `geometry_provenance.json`
   now records `dem_grid_spacing_x` / `dem_grid_spacing_y` (from the DEM's own affine
   geotransform), `dem_grid_spacing_units` (the DEM CRS's unit name — `degree` or `metre`,
