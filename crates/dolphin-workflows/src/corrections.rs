@@ -401,7 +401,7 @@ fn build_ionosphere(
             .context("ionospheric correction requires full acquisition UTC")?;
         let content = std::fs::read_to_string(ionex_path)
             .with_context(|| format!("reading IONEX {}", ionex_path.display()))?;
-        let maps = read_ionex(&content).map_err(anyhow::Error::msg)?;
+        let maps = read_ionex(&content)?;
         let vtec = maps.value(utc, lat, lon)?;
         let layer = iono_delay_layer(
             vtec,
@@ -1036,6 +1036,7 @@ mod tests {
 
     use super::*;
     use dolphin_corrections::geometry::resolve_los_geometry;
+    use dolphin_corrections::ionosphere::IonexError;
     use dolphin_io::read_los_layers;
     use ndarray::Array3;
 
@@ -1377,6 +1378,42 @@ mod tests {
         assert!((los.incidence_deg()[(1, 1)] - 34.0).abs() < 1e-3);
         assert_eq!(disp, original, "geometry-only must not touch displacement");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A malformed IONEX file reaches the caller as the typed `IonexError`, not
+    /// a flattened message, so the failure class stays inspectable.
+    #[test]
+    fn malformed_ionex_keeps_its_typed_error() {
+        let dir =
+            std::env::temp_dir().join(format!("dolphin-malformed-ionex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ionex = dir.join("garbage.INX");
+        std::fs::write(&ionex, "not an ionex file\n").unwrap();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let opts = CorrectionOptions {
+            ionosphere_files: vec![ionex.clone(), ionex],
+            acquisition_utc: vec![utc, utc + chrono::Duration::days(12)],
+            ..Default::default()
+        };
+        let mut displacement = Array3::<f64>::zeros((1, 1, 1));
+        let err = apply_corrections(
+            &opts,
+            Some(0.05546576),
+            &mut displacement,
+            &[],
+            4326,
+            [0.0, 1.0, 0.0, 1.0, 0.0, -1.0],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<IonexError>().is_some()),
+            "expected a typed IonexError in the chain, got: {err:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A missing geometry file surfaces a contextual error (not a panic), naming the

@@ -1079,7 +1079,7 @@ fn solve_time_series(
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
         apply_loop_closure_qc(cfg, &mut dphi_rad, connected_components, pairs)
-    });
+    })?;
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
         invert_time_series(
@@ -1100,14 +1100,17 @@ fn solve_time_series(
 /// loop's shared integer-cycle root is removed per unwrap component inside
 /// `loop_closure_qc`, and referencing to a pixel first would only add that
 /// pixel's sub-cycle noise to every residual.
+///
+/// # Errors
+/// If the connected-component labels are not the shape of the unwrapped stack.
 fn apply_loop_closure_qc(
     cfg: &DisplacementWorkflow,
     dphi_rad: &mut Array3<f64>,
     connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
-) -> Option<LoopClosureQc> {
+) -> Result<Option<LoopClosureQc>> {
     if !cfg.timeseries_options.mask_unwrap_loop_errors {
-        return None;
+        return Ok(None);
     }
     if network_triplets(pairs).is_empty() {
         tracing::warn!(
@@ -1116,14 +1119,14 @@ fn apply_loop_closure_qc(
              triangles (single-reference?) — nothing to check; set \
              interferogram_network.max_bandwidth or max_temporal_baseline"
         );
-        return None;
+        return Ok(None);
     }
     let qc = loop_closure_qc(
         dphi_rad.view(),
         connected_components,
         pairs,
         DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-    );
+    )?;
     let masked = qc.bad_loop_count.iter().filter(|&&n| n > 0.0).count();
     tracing::info!(
         stage = "loop_closure",
@@ -1135,7 +1138,7 @@ fn apply_loop_closure_qc(
         "masked pixels whose unwrapped loops did not close"
     );
     mask_failed_loops(dphi_rad, &qc);
-    Some(qc)
+    Ok(Some(qc))
 }
 
 /// Resolve the configured time-function model and fit the whole-frame velocity.
@@ -1493,7 +1496,9 @@ fn emit_displacement(
         .as_ref()
         .map(|qc| qc.failed_mask().iter().filter(|&&bad| bad).count());
     // Likewise the geometry: after the mask, NaN `up` marks every masked pixel,
-    // not only those outside the STATIC granule.
+    // not only those outside the STATIC granule. With output bounds set,
+    // `spatial.trim` has already cropped the geometry, so the count and
+    // fraction are over the published grid, not the analysis grid.
     let outside_static = spatial
         .corrections
         .los_geometry
@@ -8607,7 +8612,11 @@ mod tests {
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
         let components = one_component(&dphi);
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs).is_none());
+        assert!(
+            apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(dphi, original);
     }
 
@@ -8622,7 +8631,11 @@ mod tests {
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
         let components = one_component(&dphi);
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs).is_none());
+        assert!(
+            apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(dphi, original);
     }
 
@@ -8641,7 +8654,9 @@ mod tests {
         dphi[(2, 1, 1)] += std::f64::consts::TAU;
         let components = one_component(&dphi);
 
-        let qc = apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs).expect("qc ran");
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+            .unwrap()
+            .expect("qc ran");
         assert!(qc.bad_loop_count[(1, 1)] > 0.0);
         assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
         assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
@@ -8663,7 +8678,9 @@ mod tests {
         });
         phases[(2, 0, 0)] += std::f64::consts::TAU;
         let components = one_component(&phases);
-        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs).unwrap();
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs)
+            .unwrap()
+            .unwrap();
         let flagged: Vec<(usize, usize)> = qc
             .failed_mask()
             .indexed_iter()
@@ -8689,7 +8706,9 @@ mod tests {
         });
         phases[(1, 0, 0)] += 0.4 * std::f64::consts::TAU;
         let components = one_component(&phases);
-        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs).unwrap();
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs)
+            .unwrap()
+            .unwrap();
         assert!((qc.worst_residual_cycles[(0, 0)] - 0.4).abs() < 1e-12);
         for (index, &worst) in qc.worst_residual_cycles.indexed_iter() {
             if index != (0, 0) {

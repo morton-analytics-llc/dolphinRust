@@ -76,7 +76,29 @@ pub struct Triplet {
     pub span: usize,
 }
 
+/// The connected-component labels are not the shape of the unwrapped stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopClosureShapeError {
+    /// Shape of the unwrapped stack, `(n_ifgs, rows, cols)`.
+    pub unwrapped: (usize, usize, usize),
+    /// Shape of the connected-component labels.
+    pub connected_components: (usize, usize, usize),
+}
+
+impl std::fmt::Display for LoopClosureShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "connected-component labels {:?} must match the unwrapped stack {:?}",
+            self.connected_components, self.unwrapped
+        )
+    }
+}
+
+impl std::error::Error for LoopClosureShapeError {}
+
 /// Per-pixel loop-closure QC over the unwrapped network.
+#[derive(Debug)]
 pub struct LoopClosureQc {
     /// Number of loops through each pixel that failed to close, `(rows, cols)`.
     /// `0` where every loop closed; NaN input counts as a non-failure, since a
@@ -151,20 +173,21 @@ pub fn network_triplets(pairs: &[(usize, usize)]) -> Vec<Triplet> {
 /// `tolerance_cycles` is the fraction of a cycle allowed before the loop is
 /// called bad (see [`DEFAULT_CLOSURE_TOLERANCE_CYCLES`]).
 ///
-/// # Panics
-/// If `connected_components` is not the shape of `unwrapped`.
-#[must_use]
+/// # Errors
+/// [`LoopClosureShapeError`] if `connected_components` is not the shape of
+/// `unwrapped`.
 pub fn loop_closure_qc(
     unwrapped: ArrayView3<f64>,
     connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
     tolerance_cycles: f64,
-) -> LoopClosureQc {
-    assert_eq!(
-        connected_components.dim(),
-        unwrapped.dim(),
-        "connected-component labels must match the unwrapped stack"
-    );
+) -> Result<LoopClosureQc, LoopClosureShapeError> {
+    if connected_components.dim() != unwrapped.dim() {
+        return Err(LoopClosureShapeError {
+            unwrapped: unwrapped.dim(),
+            connected_components: connected_components.dim(),
+        });
+    }
     let (_, rows, cols) = unwrapped.dim();
     let triplets = network_triplets(pairs);
     let tolerance = tolerance_cycles * std::f64::consts::TAU;
@@ -194,7 +217,7 @@ pub fn loop_closure_qc(
     let layer = |pick: fn(&PixelLoopStats) -> f64| {
         Array2::from_shape_fn((rows, cols), |(r, c)| pick(&per_pixel[r * cols + c]))
     };
-    LoopClosureQc {
+    Ok(LoopClosureQc {
         bad_loop_count: layer(|stats| stats.bad),
         evaluable_loop_count: layer(|stats| stats.evaluable),
         worst_residual_cycles: layer(|stats| stats.worst_residual_cycles),
@@ -203,7 +226,7 @@ pub fn loop_closure_qc(
             .filter(|stats| stats.evaluable == 0.0 && stats.withheld_small_triple)
             .count(),
         small_root_triples,
-    }
+    })
 }
 
 /// The component labels of a loop's three members at one pixel.
@@ -394,6 +417,7 @@ mod tests {
             pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
         )
+        .unwrap()
     }
 
     /// A nearest-2 network on 4 dates has closed triangles; a single-reference
@@ -551,7 +575,8 @@ mod tests {
             components.view(),
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-        );
+        )
+        .unwrap();
         assert!(
             !clean.failed_mask().iter().any(|&bad| bad),
             "a component-wide cycle offset is a root, not an error: {:?}",
@@ -566,6 +591,7 @@ mod tests {
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
         )
+        .unwrap()
         .failed_mask()
         .indexed_iter()
         .filter(|(_, &bad)| bad)
@@ -586,7 +612,8 @@ mod tests {
             components.view(),
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-        );
+        )
+        .unwrap();
         let full = qc.evaluable_loop_count[(0, 0)];
         assert!(qc.evaluable_loop_count[(1, 1)] < full);
         assert_eq!(qc.bad_loop_count[(1, 1)], 0.0);
@@ -618,7 +645,8 @@ mod tests {
             components.view(),
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-        );
+        )
+        .unwrap();
         assert!(
             !qc.failed_mask().iter().any(|&bad| bad),
             "{:?}",
@@ -648,7 +676,8 @@ mod tests {
             components.view(),
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-        );
+        )
+        .unwrap();
         assert!(
             !qc.failed_mask().iter().any(|&bad| bad),
             "an unjudged pixel is never flagged: {:?}",
@@ -687,7 +716,8 @@ mod tests {
             components.view(),
             &pairs,
             DEFAULT_CLOSURE_TOLERANCE_CYCLES,
-        );
+        )
+        .unwrap();
         let flagged: Vec<(usize, usize)> = qc
             .failed_mask()
             .indexed_iter()
@@ -697,6 +727,24 @@ mod tests {
         assert_eq!(flagged, correct.to_vec());
         assert_eq!(qc.unjudged_small_triple_pixels, 0);
         assert_eq!(qc.small_root_triples, 0);
+    }
+
+    /// Labels of the wrong shape are a caller error reported as a value, not a
+    /// panic in library code.
+    #[test]
+    fn mismatched_label_shape_is_an_error_not_a_panic() {
+        let (pairs, unwrapped) = consistent_network();
+        let components = Array3::<u32>::ones((pairs.len(), SIDE, SIDE - 1));
+        let error = loop_closure_qc(
+            unwrapped.view(),
+            components.view(),
+            &pairs,
+            DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+        )
+        .unwrap_err();
+        assert_eq!(error.unwrapped, (pairs.len(), SIDE, SIDE));
+        assert_eq!(error.connected_components, (pairs.len(), SIDE, SIDE - 1));
+        assert!(error.to_string().contains("must match the unwrapped stack"));
     }
 
     /// A sub-cycle residual (real noise, not an unwrap error) is not flagged.
