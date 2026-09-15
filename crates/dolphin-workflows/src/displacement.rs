@@ -588,6 +588,7 @@ fn finish_displacement(
         inversion.displacement.view(),
         &days,
         analysis_reference_point,
+        validity_mask.view(),
         &date_files,
     )?;
     let spatial = SpatialProducts {
@@ -646,19 +647,41 @@ fn final_spatial_reference(
         cfg.timeseries_options.correlation_threshold,
     );
     if selected.is_none() && cfg.timeseries_options.write_velocity_uncertainty {
-        let any_displacement_valid = validity_mask
-            .indexed_iter()
-            .any(|(point, _)| reference_pixel_is_valid(validity_mask, displacement, point));
+        let referenceable = referenceable_pixel_count(Some(validity_mask), displacement);
         anyhow::ensure!(
-            !any_displacement_valid,
-            "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
+            referenceable == 0,
+            "velocity uncertainty requires a displacement-valid final spatial reference meeting \
+             the coherence threshold ({referenceable} of {} analysed pixels are \
+             displacement-valid; none meets it)",
+            validity_mask.len()
         );
         tracing::warn!(
             stage = "reference",
-            "no displacement-valid pixel remains; the product will publish without a spatial reference"
+            analysed_pixels = validity_mask.len(),
+            "no pixel is valid on every date; the product will publish without a spatial reference"
         );
     }
     Ok(selected)
+}
+
+/// Pixels that can carry the spatial reference: inside the validity mask (when
+/// one is given) and finite on every date. The reference stage and the
+/// velocity fit both decide "nothing to reference, publish as unavailable" on
+/// this count reaching zero, so neither can admit a frame the other refuses.
+fn referenceable_pixel_count(
+    validity_mask: Option<ArrayView2<bool>>,
+    displacement: ArrayView3<f64>,
+) -> usize {
+    let (_, rows, cols) = displacement.dim();
+    (0..rows)
+        .flat_map(|row| (0..cols).map(move |col| (row, col)))
+        .filter(|&point| {
+            validity_mask.is_none_or(|mask| mask[point])
+                && displacement
+                    .axis_iter(Axis(0))
+                    .all(|band| band[point].is_finite())
+        })
+        .count()
 }
 
 fn correct_then_reference(
@@ -1121,11 +1144,19 @@ fn frame_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     reference_point: Option<(usize, usize)>,
+    validity_mask: ArrayView2<bool>,
     date_files: &[PathBuf],
 ) -> Result<(VelocityModel, VelocityFit)> {
     let model = velocity_model(cfg, date_files)?;
     let fit = timed("velocity", || {
-        fit_velocity(cfg, displacement, days, reference_point, &model)
+        fit_velocity(
+            cfg,
+            displacement,
+            days,
+            reference_point,
+            Some(validity_mask),
+            &model,
+        )
     })?;
     Ok((model, fit))
 }
@@ -1141,6 +1172,7 @@ fn fit_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     reference_point: Option<(usize, usize)>,
+    validity_mask: Option<ArrayView2<bool>>,
     model: &VelocityModel,
 ) -> Result<VelocityFit> {
     anyhow::ensure!(
@@ -1166,12 +1198,18 @@ fn fit_velocity(
                 .all(|band| band[reference] == 0.0),
             "velocity uncertainty requires an exact zero at the final spatial reference"
         ),
-        // A series with no finite value has nothing to reference; the fit below
-        // reports every pixel unavailable, which is the truthful product.
-        None => anyhow::ensure!(
-            displacement.iter().all(|value| !value.is_finite()),
-            "velocity uncertainty requires a final spatial reference point"
-        ),
+        // A series with no referenceable pixel has nothing to reference; the
+        // fit below reports every pixel unavailable, which is the truthful
+        // product. Same predicate as `final_spatial_reference`.
+        None => {
+            let referenceable = referenceable_pixel_count(validity_mask, displacement);
+            anyhow::ensure!(
+                referenceable == 0,
+                "velocity uncertainty requires a final spatial reference point ({referenceable} \
+                 of {} pixels are valid on every date)",
+                displacement.dim().1 * displacement.dim().2
+            );
+        }
     }
     if !model.is_linear() {
         return Ok(fit_post_gauge_velocity_with_model(
@@ -1820,6 +1858,7 @@ impl SpatialProducts {
             self.disp_rad.view(),
             days,
             Some(global),
+            Some(self.validity_mask.view()),
             &self.velocity_model,
         )
         .context("velocity re-fit after re-referencing")?;
@@ -6059,6 +6098,7 @@ mod tests {
             series.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -6098,7 +6138,15 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let linear = VelocityModel::default();
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &linear).unwrap();
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some((0, 1)),
+            None,
+            &linear,
+        )
+        .unwrap();
 
         assert_eq!(
             fit.estimator,
@@ -6143,7 +6191,15 @@ mod tests {
             step_days: Vec::new(),
             relaxation: Vec::new(),
         };
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &seasonal).unwrap();
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some((0, 1)),
+            None,
+            &seasonal,
+        )
+        .unwrap();
 
         assert!(validate_config(&cfg).is_ok());
         assert_eq!(
@@ -6180,6 +6236,7 @@ mod tests {
             disp,
             days,
             None,
+            None,
             &VelocityModel::default(),
         )
         .unwrap()
@@ -6209,11 +6266,11 @@ mod tests {
         for model in [VelocityModel::default(), seasonal_model()] {
             let mut cfg = DisplacementWorkflow::default();
             let point_only =
-                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model).unwrap();
 
             cfg.timeseries_options.write_velocity_uncertainty = true;
             let with_sigma =
-                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model).unwrap();
 
             assert_eq!(point_only.estimator, with_sigma.estimator);
             assert_eq!(point_only.velocity, with_sigma.velocity);
@@ -6246,7 +6303,8 @@ mod tests {
             for uncertainty in [false, true] {
                 cfg.timeseries_options.write_velocity_uncertainty = uncertainty;
                 let fit =
-                    fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                    fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model)
+                        .unwrap();
                 assert_eq!(fit.estimator, expected, "uncertainty={uncertainty}");
             }
         }
@@ -6271,6 +6329,7 @@ mod tests {
             displacement.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -6281,6 +6340,7 @@ mod tests {
             displacement.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -6326,6 +6386,7 @@ mod tests {
             &cfg,
             displacement.view(),
             &days,
+            None,
             None,
             &VelocityModel::default(),
         )
@@ -6381,13 +6442,13 @@ mod tests {
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let model = VelocityModel::default();
 
-        let missing = fit_velocity(&cfg, displacement.view(), &days, None, &model)
+        let missing = fit_velocity(&cfg, displacement.view(), &days, None, None, &model)
             .err()
             .expect("missing reference must fail");
         assert!(missing.to_string().contains("spatial reference point"));
 
         displacement[(1, 0, 1)] = f64::NAN;
-        let nonzero = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model)
+        let nonzero = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model)
             .err()
             .expect("nonzero reference must fail");
         assert!(nonzero.to_string().contains("exact zero"));
@@ -6434,17 +6495,25 @@ mod tests {
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
-    /// With no finite displacement anywhere there is nothing to reference; the
+    /// With no pixel finite on every date there is nothing to reference; the
     /// uncertainty fit still runs and reports every pixel unavailable instead of
-    /// failing the run. A finite series without a reference is still an error.
+    /// failing the run. A referenceable pixel without a reference is still an
+    /// error.
     #[test]
     fn velocity_uncertainty_without_a_reference_needs_an_empty_series() {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let days = [0.0, 12.0, 24.0, 36.0];
         let empty = Array3::from_elem((3, 2, 2), f64::NAN);
-        let fit = fit_velocity(&cfg, empty.view(), &days, None, &VelocityModel::default())
-            .expect("an empty series publishes as unavailable");
+        let fit = fit_velocity(
+            &cfg,
+            empty.view(),
+            &days,
+            None,
+            None,
+            &VelocityModel::default(),
+        )
+        .expect("an empty series publishes as unavailable");
         assert!(fit.velocity.iter().all(|v| v.is_nan()));
         assert!(fit.sigma.expect("sigma layer").iter().all(|v| v.is_nan()));
         assert!(fit
@@ -6455,13 +6524,66 @@ mod tests {
             .all(|&status| status == VelocityUncertaintyStatus::Unavailable));
 
         let mut finite = empty;
-        finite[(0, 1, 1)] = 0.2;
-        let error = fit_velocity(&cfg, finite.view(), &days, None, &VelocityModel::default())
-            .err()
-            .expect("a finite series still needs its reference");
+        finite.slice_mut(s![.., 1, 1]).fill(0.2);
+        let error = fit_velocity(
+            &cfg,
+            finite.view(),
+            &days,
+            None,
+            None,
+            &VelocityModel::default(),
+        )
+        .err()
+        .expect("a finite series still needs its reference");
         assert!(error
             .to_string()
             .contains("requires a final spatial reference point"));
+    }
+
+    /// Every pixel finite on some dates and NaN on others, or finite everywhere
+    /// but masked: nothing can carry the reference, so the reference stage and
+    /// the velocity fit must agree that the product publishes as unavailable,
+    /// rather than the first warning and the second dying.
+    #[test]
+    fn partially_finite_frame_publishes_as_unavailable() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let coherence = Array2::from_elem((2, 2), 0.9);
+        let mut validity = Array2::from_elem((2, 2), true);
+        // Each pixel is NaN on a different date and finite on the others.
+        let mut displacement = Array3::from_shape_fn((3, 2, 2), |(date, row, col)| {
+            match date == (row * 2 + col) % 3 {
+                true => f64::NAN,
+                false => 0.1 * (date + 1) as f64,
+            }
+        });
+        for masked_finite in [false, true] {
+            if masked_finite {
+                // A pixel finite on every date but outside the validity mask.
+                displacement.slice_mut(s![.., 1, 1]).fill(0.2);
+                validity[(1, 1)] = false;
+            }
+            let selected = final_spatial_reference(
+                &cfg,
+                None,
+                coherence.view(),
+                validity.view(),
+                displacement.view(),
+            )
+            .expect("no referenceable pixel is unavailable, not an error");
+            assert_eq!(selected, None);
+            let fit = fit_velocity(
+                &cfg,
+                displacement.view(),
+                &days,
+                selected,
+                Some(validity.view()),
+                &VelocityModel::default(),
+            )
+            .expect("the frame publishes as unavailable (masked_finite={masked_finite})");
+            assert!(fit.sigma.is_some());
+        }
     }
 
     /// The final reference is required for velocity uncertainty while any
@@ -7350,6 +7472,7 @@ mod tests {
                 disp.view(),
                 &days,
                 Some((1, 0)),
+                None,
                 &VelocityModel::default(),
             )
             .unwrap();
@@ -8540,7 +8663,7 @@ mod tests {
 
         let days = vec![0.0, 12.0];
         let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
-        let fit = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
+        let fit = fit_velocity(&cfg, displacement.view(), &days, None, None, &model).unwrap();
         assert!(fit.terms.seasonal_amplitude_rad.is_none());
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
@@ -8622,7 +8745,7 @@ mod tests {
         cfg.timeseries_options.velocity_seasonal = true;
         let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
 
-        let seasonal = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
+        let seasonal = fit_velocity(&cfg, displacement.view(), &days, None, None, &model).unwrap();
         assert!(
             (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
             "rate {} != {rate_per_year}",
@@ -8640,6 +8763,7 @@ mod tests {
             &cfg,
             displacement.view(),
             &days,
+            None,
             None,
             &VelocityModel::default(),
         )
