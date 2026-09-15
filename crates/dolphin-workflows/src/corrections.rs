@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use dolphin_core::config::CorrectionOptions;
-use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
+use dolphin_corrections::geometry::{
+    resolve_los_geometry_with_options, LosCoverageOptions, LosGeometry,
+    DEFAULT_MAX_OUTSIDE_STATIC_FRACTION,
+};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::solid_earth_tide::{tide_range_delay_grid, LonLatGrid};
 use dolphin_corrections::subtract_delay;
@@ -279,7 +282,14 @@ fn resolve_geometry(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    Ok(Some(resolve_los_geometry(&layers, gt, epsg, shape)?))
+    let coverage = LosCoverageOptions {
+        max_outside_static_fraction: opts
+            .max_outside_static_fraction
+            .unwrap_or(DEFAULT_MAX_OUTSIDE_STATIC_FRACTION),
+    };
+    Ok(Some(resolve_los_geometry_with_options(
+        &layers, gt, epsg, shape, coverage,
+    )?))
 }
 
 /// Sum the present delay layers (any may be absent) into one `(n_dates, rows,
@@ -1004,6 +1014,7 @@ mod tests {
     }
 
     use super::*;
+    use dolphin_corrections::geometry::resolve_los_geometry;
     use dolphin_io::read_los_layers;
     use ndarray::Array3;
 
@@ -1206,6 +1217,41 @@ mod tests {
             let tol = 1e-6 * b.abs().max(1.0);
             assert!((a - b).abs() < tol, "iono {a} vs {b}");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `correction_options.max_outside_static_fraction` reaches the resolver: the
+    /// 0.3% corridor-edge case (a 1000×100 frame whose one STATIC granule stops
+    /// three rows short) resolves under the default gate and is refused under a
+    /// configured 0.1% one, with the outside pixels masked and counted.
+    #[test]
+    fn configured_outside_static_gate_reaches_the_resolver() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_static_outside_gate_{}.h5",
+            std::process::id()
+        ));
+        write_uniform_static(&path, 34.0, gt, (997, 100));
+        let default_gate = CorrectionOptions {
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let los = resolve_geometry(&default_gate, 32610, gt, (1000, 100))
+            .expect("0.3% outside resolves under the default gate")
+            .expect("geometry configured");
+        assert_eq!(los.outside_static().pixel_count, 300);
+
+        let tight_gate = CorrectionOptions {
+            max_outside_static_fraction: Some(0.001),
+            ..default_gate
+        };
+        let err = resolve_geometry(&tight_gate, 32610, gt, (1000, 100))
+            .expect_err("0.3% outside is refused under a 0.1% gate");
+        assert!(
+            format!("{err:#}").contains("max_outside_static_fraction"),
+            "expected the coverage gate, got: {err:#}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

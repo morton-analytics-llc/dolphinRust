@@ -544,6 +544,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.solid_earth_tide is true"
     ),
+    conditional!(
+        "correction_options.max_outside_static_fraction",
+        "CFG-CORRECTIONS",
+        "correction_options.geometry_files is nonempty"
+    ),
     consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
     conditional!(
         "output_options.epsg",
@@ -1235,6 +1240,11 @@ pub struct CorrectionOptions {
     /// displacement vector and projecting it into line of sight needs the full
     /// LOS unit vector, which the scalar `incidence_angle_deg` cannot supply.
     pub solid_earth_tide: bool,
+    /// Largest fraction of the frame that may fall outside every supplied
+    /// CSLC-S1-STATIC granule before the run is refused; pixels outside are masked
+    /// to nodata and counted in the geometry provenance either way. `None` uses
+    /// the resolver default (0.10). dolphinRust-only.
+    pub max_outside_static_fraction: Option<f64>,
 }
 
 impl Default for CorrectionOptions {
@@ -1251,6 +1261,7 @@ impl Default for CorrectionOptions {
             incidence_angle_deg: 37.0,
             troposphere_variable: "total".into(),
             solid_earth_tide: false,
+            max_outside_static_fraction: None,
         }
     }
 }
