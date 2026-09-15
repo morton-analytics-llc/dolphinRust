@@ -24,7 +24,7 @@ pub use inversion::{
 };
 pub use loop_closure::{
     loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, Triplet,
-    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    DEFAULT_CLOSURE_TOLERANCE_CYCLES, MIN_ROOT_PIXELS,
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};

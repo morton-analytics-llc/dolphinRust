@@ -147,6 +147,12 @@ pub struct PublicationQuality {
     pub spatial_reference: SpatialReferenceStatus,
     /// disabled, unavailable_no_triangles, or evaluated.
     pub closure_qc_status: &'static str,
+    /// Analysed pixels the closure QC left unjudged because a loop through them
+    /// fell in a component triple below `MIN_ROOT_PIXELS`; `None` unless it ran.
+    pub closure_unjudged_small_triple_pixels: Option<usize>,
+    /// Component triples, over every loop, too small to contribute a root;
+    /// `None` unless the closure QC ran.
+    pub closure_small_root_triples: Option<usize>,
 }
 
 /// The final spatial reference of a published product.
@@ -1100,6 +1106,9 @@ fn apply_loop_closure_qc(
         stage = "loop_closure",
         masked_pixels = masked,
         pixels = qc.bad_loop_count.len(),
+        unjudged_small_triple_pixels = qc.unjudged_small_triple_pixels,
+        small_root_triples = qc.small_root_triples,
+        min_root_pixels = dolphin_timeseries::MIN_ROOT_PIXELS,
         "masked pixels whose unwrapped loops did not close"
     );
     mask_failed_loops(dphi_rad, &qc);
@@ -1558,6 +1567,14 @@ fn emit_displacement(
         } else {
             "unavailable_no_triangles"
         },
+        closure_unjudged_small_triple_pixels: spatial
+            .loop_closure
+            .as_ref()
+            .map(|qc| qc.unjudged_small_triple_pixels),
+        closure_small_root_triples: spatial
+            .loop_closure
+            .as_ref()
+            .map(|qc| qc.small_root_triples),
     };
     spatial.apply_validity_mask();
     if let Some(covariance) = spatial.production_covariance.as_mut() {
@@ -5428,7 +5445,10 @@ mod tests {
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
-        let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
+        // 16 pixels (the root floor) closing exactly, and one whose spanning
+        // interferogram carries a cycle error the loop QC masks.
+        let mut dphi = Array3::from_shape_fn((3, 4, 4), |(band, _, _)| (band + 1) as f64);
+        dphi[(2, 0, 1)] = 10.0;
         let components = Array3::from_elem(dphi.dim(), 1);
         let (inversion, qc) =
             solve_time_series(&cfg, dphi, components.view(), &pairs, None, true).unwrap();
@@ -5504,6 +5524,8 @@ mod tests {
                 bad_loop_count: Array2::from_elem((2, 2), 1.0),
                 evaluable_loop_count: Array2::from_elem((2, 2), 2.0),
                 worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
             }),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
@@ -5643,6 +5665,8 @@ mod tests {
                 bad_loop_count: Array2::from_shape_fn((6, 8), |(row, col)| (row * 10 + col) as f64),
                 evaluable_loop_count: Array2::from_elem((6, 8), 2.0),
                 worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
             }),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
@@ -6488,6 +6512,8 @@ mod tests {
                 bad_loop_count: Array2::from_elem((2, 2), 1.0),
                 evaluable_loop_count: Array2::from_elem((2, 2), 1.0),
                 worst_residual_cycles: Array2::from_elem((2, 2), 1.0),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
             }),
             temporal_coherence: Array2::from_elem((2, 2), 0.9),
             validity_mask: Array2::from_elem((2, 2), true),
@@ -8425,7 +8451,7 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
         let phase = [0.0, 1.3, 2.9];
-        let mut dphi = Array3::from_shape_fn((pairs.len(), 2, 2), |(k, _, _)| {
+        let mut dphi = Array3::from_shape_fn((pairs.len(), 4, 4), |(k, _, _)| {
             let (i, j) = pairs[k];
             phase[j] - phase[i]
         });
@@ -8448,7 +8474,7 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
         let phase = [0.0, 1.3, 2.9];
-        let mut phases = Array3::from_shape_fn((pairs.len(), 2, 3), |(k, _, col)| {
+        let mut phases = Array3::from_shape_fn((pairs.len(), 4, 5), |(k, _, col)| {
             let (i, j) = pairs[k];
             phase[j] - phase[i] + col as f64 * 0.1 + [0.0, std::f64::consts::TAU, 0.0][k]
         });
@@ -8474,7 +8500,7 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
         let phase = [0.0, 1.3, 2.9];
-        let mut phases = Array3::from_shape_fn((pairs.len(), 2, 3), |(k, _, _)| {
+        let mut phases = Array3::from_shape_fn((pairs.len(), 4, 4), |(k, _, _)| {
             let (i, j) = pairs[k];
             phase[j] - phase[i]
         });

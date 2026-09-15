@@ -34,6 +34,20 @@
 //! and a free prefilter (label 0 is already-unreliable). They carry no cross-
 //! interferogram information, so they cannot supply the *detection* — that needs
 //! the loop residual here.
+//!
+//! # Limit: the root is a majority vote
+//!
+//! Each loop's integer-cycle root is the rounded median of the residuals over
+//! the pixels sharing a component triple, so a triple in which **more than half
+//! the pixels carry the same `n`-cycle error takes that error as its root**:
+//! the wrong majority passes and the correct minority is flagged. The gate
+//! cannot tell a component-wide root from a component-wide error; nothing in
+//! a closed loop can. [`MIN_ROOT_PIXELS`] bounds how small such a majority can
+//! be (a 1- or 2-pixel triple would otherwise validate itself — two pixels
+//! `[0, 2π]` have an upper median of `2π`, which flags the *correct* one) but
+//! does not remove the limit: 9 wrong pixels of 16 still become the root.
+//! Triples below the floor contribute no root; their pixels are unjudged, not
+//! graded, and counted in [`LoopClosureQc::unjudged_small_triple_pixels`].
 
 use ndarray::{Array2, Array3, ArrayView3};
 use rayon::prelude::*;
@@ -44,6 +58,11 @@ use std::collections::HashMap;
 /// a single unwrap error contributes a full `2π`. Half a cycle is the natural
 /// midpoint and is what puts a pixel on the wrong side of the nearest integer.
 pub const DEFAULT_CLOSURE_TOLERANCE_CYCLES: f64 = 0.5;
+
+/// Fewest finite residuals a component triple needs before its median is
+/// trusted as the loop's root. Below this the triple contributes no root and
+/// its pixels are unjudged (see the module header).
+pub const MIN_ROOT_PIXELS: usize = 16;
 
 /// A closed triangle in the interferogram network: the indices, into the
 /// interferogram list, of the pairs `(i,j)`, `(j,k)` and `(i,k)`.
@@ -70,6 +89,13 @@ pub struct LoopClosureQc {
     /// Largest absolute loop residual at each pixel, in cycles. NaN where no
     /// loop was evaluable.
     pub worst_residual_cycles: Array2<f64>,
+    /// Pixels with no evaluable loop because at least one of their loops fell
+    /// in a component triple below [`MIN_ROOT_PIXELS`]. Counted on the analysed
+    /// grid, before any crop or publication mask.
+    pub unjudged_small_triple_pixels: usize,
+    /// Component triples, over every loop, that had fewer than
+    /// [`MIN_ROOT_PIXELS`] finite residuals and so contributed no root.
+    pub small_root_triples: usize,
 }
 
 impl LoopClosureQc {
@@ -147,7 +173,11 @@ pub fn loop_closure_qc(
         .map(|triplet| triangle_roots(unwrapped, connected_components, triplet))
         .collect();
 
-    let per_pixel: Vec<(f64, f64, f64)> = (0..rows * cols)
+    let small_root_triples = roots
+        .iter()
+        .map(|loop_roots| loop_roots.values().filter(|root| root.is_none()).count())
+        .sum();
+    let per_pixel: Vec<PixelLoopStats> = (0..rows * cols)
         .into_par_iter()
         .map(|index| {
             let (row, col) = (index / cols, index % cols);
@@ -161,21 +191,37 @@ pub fn loop_closure_qc(
             )
         })
         .collect();
-    let layer = |pick: fn(&(f64, f64, f64)) -> f64| {
+    let layer = |pick: fn(&PixelLoopStats) -> f64| {
         Array2::from_shape_fn((rows, cols), |(r, c)| pick(&per_pixel[r * cols + c]))
     };
     LoopClosureQc {
-        bad_loop_count: layer(|stats| stats.0),
-        evaluable_loop_count: layer(|stats| stats.1),
-        worst_residual_cycles: layer(|stats| stats.2),
+        bad_loop_count: layer(|stats| stats.bad),
+        evaluable_loop_count: layer(|stats| stats.evaluable),
+        worst_residual_cycles: layer(|stats| stats.worst_residual_cycles),
+        unjudged_small_triple_pixels: per_pixel
+            .iter()
+            .filter(|stats| stats.evaluable == 0.0 && stats.withheld_small_triple)
+            .count(),
+        small_root_triples,
     }
 }
 
 /// The component labels of a loop's three members at one pixel.
 type ComponentKey = [u32; 3];
 
-/// One loop's integer-cycle root per component triple, in radians.
-type ComponentRoots = HashMap<ComponentKey, f64>;
+/// One loop's integer-cycle root per component triple, in radians; `None` for
+/// a triple with fewer than [`MIN_ROOT_PIXELS`] finite residuals.
+type ComponentRoots = HashMap<ComponentKey, Option<f64>>;
+
+/// One pixel's loop verdicts.
+struct PixelLoopStats {
+    bad: f64,
+    evaluable: f64,
+    worst_residual_cycles: f64,
+    /// At least one loop through the pixel was withheld because its component
+    /// triple fell below [`MIN_ROOT_PIXELS`].
+    withheld_small_triple: bool,
+}
 
 fn triangle_residual(
     unwrapped: ArrayView3<f64>,
@@ -209,8 +255,9 @@ fn component_key(
 /// components an interferogram split into. It is the rounded median of the
 /// finite residuals over the pixels sharing the triple — a property of the
 /// loop and the components, not of any one pixel, so a reference pixel's own
-/// unwrap error can never be charged to the rest of the frame. Triples with no
-/// finite residual, and any pixel with a label-0 member, contribute no root.
+/// unwrap error can never be charged to the rest of the frame. Triples with
+/// fewer than [`MIN_ROOT_PIXELS`] finite residuals, and any pixel with a
+/// label-0 member, contribute no root.
 fn triangle_roots(
     unwrapped: ArrayView3<f64>,
     connected_components: ArrayView3<u32>,
@@ -229,7 +276,11 @@ fn triangle_roots(
     }
     residuals
         .into_iter()
-        .map(|(key, mut values)| (key, rounded_median_cycles(&mut values)))
+        .map(|(key, mut values)| {
+            let root =
+                (values.len() >= MIN_ROOT_PIXELS).then(|| rounded_median_cycles(&mut values));
+            (key, root)
+        })
         .collect()
 }
 
@@ -241,8 +292,8 @@ fn rounded_median_cycles(values: &mut [f64]) -> f64 {
     (*median / std::f64::consts::TAU).round() * std::f64::consts::TAU
 }
 
-/// `(bad, evaluable, worst_residual_cycles)` for one pixel, after removing each
-/// loop's integer-cycle root for the component triple the pixel belongs to.
+/// One pixel's verdicts, after removing each loop's integer-cycle root for the
+/// component triple the pixel belongs to.
 fn pixel_loop_stats(
     unwrapped: ArrayView3<f64>,
     connected_components: ArrayView3<u32>,
@@ -250,15 +301,21 @@ fn pixel_loop_stats(
     roots: &[ComponentRoots],
     (row, col): (usize, usize),
     tolerance: f64,
-) -> (f64, f64, f64) {
+) -> PixelLoopStats {
     let mut bad = 0.0;
     let mut evaluable = 0.0;
     let mut worst = f64::NAN;
+    let mut withheld_small_triple = false;
     for (triplet, loop_roots) in triplets.iter().zip(roots) {
-        let Some(root) = component_key(connected_components, triplet, (row, col))
+        let root = match component_key(connected_components, triplet, (row, col))
             .and_then(|key| loop_roots.get(&key))
-        else {
-            continue;
+        {
+            Some(Some(root)) => *root,
+            Some(None) => {
+                withheld_small_triple = true;
+                continue;
+            }
+            None => continue,
         };
         let residual = triangle_residual(unwrapped, triplet, (row, col)) - root;
         if !residual.is_finite() {
@@ -272,7 +329,12 @@ fn pixel_loop_stats(
         };
         bad += f64::from(residual.abs() > tolerance);
     }
-    (bad, evaluable, worst)
+    PixelLoopStats {
+        bad,
+        evaluable,
+        worst_residual_cycles: worst,
+        withheld_small_triple,
+    }
 }
 
 /// Blank every interferogram at pixels where a loop failed to close, so a bad
@@ -296,6 +358,10 @@ mod tests {
     use super::*;
     use crate::network::{build_network, NetworkConfig};
 
+    /// Grid side of the test frame: 49 pixels, so one component clears
+    /// [`MIN_ROOT_PIXELS`] and so does each half when a test splits it.
+    const SIDE: usize = 7;
+
     /// A nearest-2 network on 4 dates and the true (unwrapped) phase of a linear
     /// ramp, so every loop closes exactly.
     fn consistent_network() -> (Vec<(usize, usize)>, Array3<f64>) {
@@ -309,7 +375,7 @@ mod tests {
         );
         // True per-date phase; every ifg is the difference, so loops close to 0.
         let phase = [0.0, 1.3, 2.9, 4.1];
-        let unwrapped = Array3::from_shape_fn((pairs.len(), 3, 3), |(k, _, _)| {
+        let unwrapped = Array3::from_shape_fn((pairs.len(), SIDE, SIDE), |(k, _, _)| {
             let (i, j) = pairs[k];
             phase[j] - phase[i]
         });
@@ -474,10 +540,11 @@ mod tests {
     fn split_interferogram_flags_only_the_local_error() {
         let (pairs, mut unwrapped) = consistent_network();
         let mut components = one_component(&unwrapped);
-        // Interferogram 1 splits: the bottom row is its own component, one cycle up.
-        for col in 0..3 {
-            unwrapped[(1, 2, col)] += std::f64::consts::TAU;
-            components[(1, 2, col)] = 2;
+        // Interferogram 1 splits: the bottom three rows (21 pixels) are their own
+        // component, one cycle up.
+        for (row, col) in (4..SIDE).flat_map(|row| (0..SIDE).map(move |col| (row, col))) {
+            unwrapped[(1, row, col)] += std::f64::consts::TAU;
+            components[(1, row, col)] = 2;
         }
         let clean = loop_closure_qc(
             unwrapped.view(),
@@ -539,9 +606,9 @@ mod tests {
                 .index_axis_mut(ndarray::Axis(0), k)
                 .mapv_inplace(|v| v + root * std::f64::consts::TAU);
         }
-        // Six of nine pixels are masked: zero phase, no component.
-        for (row, col) in (0..3).flat_map(|row| (0..3).map(move |col| (row, col))) {
-            if row + col < 3 {
+        // 28 of 49 pixels are masked: zero phase, no component.
+        for (row, col) in (0..SIDE).flat_map(|row| (0..SIDE).map(move |col| (row, col))) {
+            if row + col < SIDE {
                 unwrapped.slice_mut(ndarray::s![.., row, col]).fill(0.0);
                 components.slice_mut(ndarray::s![.., row, col]).fill(0);
             }
@@ -558,8 +625,78 @@ mod tests {
             qc.bad_loop_count
         );
         assert_eq!(qc.evaluable_loop_count[(0, 0)], 0.0);
-        assert!(qc.evaluable_loop_count[(2, 2)] > 0.0);
-        assert!(qc.worst_residual_cycles[(2, 2)] < 1e-12);
+        assert!(qc.evaluable_loop_count[(6, 6)] > 0.0);
+        assert!(qc.worst_residual_cycles[(6, 6)] < 1e-12);
+    }
+
+    /// A component triple with two pixels has no trustworthy median: `[0, 2π]`
+    /// has an upper median of `2π`, which would make the error the root and
+    /// flag the correct pixel. Below [`MIN_ROOT_PIXELS`] the triple contributes
+    /// no root, both pixels are unjudged rather than graded, and the counts say
+    /// so.
+    #[test]
+    fn a_two_pixel_triple_is_unjudged_not_graded() {
+        let (pairs, mut unwrapped) = consistent_network();
+        let mut components = one_component(&unwrapped);
+        for ifg in 0..pairs.len() {
+            components[(ifg, 0, 0)] = 2;
+            components[(ifg, 0, 1)] = 2;
+        }
+        unwrapped[(1, 0, 1)] += std::f64::consts::TAU;
+        let qc = loop_closure_qc(
+            unwrapped.view(),
+            components.view(),
+            &pairs,
+            DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+        );
+        assert!(
+            !qc.failed_mask().iter().any(|&bad| bad),
+            "an unjudged pixel is never flagged: {:?}",
+            qc.bad_loop_count
+        );
+        assert_eq!(qc.evaluable_loop_count[(0, 0)], 0.0);
+        assert_eq!(qc.evaluable_loop_count[(0, 1)], 0.0);
+        assert!(qc.worst_residual_cycles[(0, 1)].is_nan());
+        assert!(qc.evaluable_loop_count[(3, 3)] > 0.0);
+        assert_eq!(qc.unjudged_small_triple_pixels, 2);
+        assert_eq!(qc.small_root_triples, network_triplets(&pairs).len());
+    }
+
+    /// The documented limit: at the floor, a 16-pixel triple in which 9 pixels
+    /// share the same one-cycle error takes that error as its root, passes the
+    /// nine and flags the seven correct pixels. The floor bounds how small a
+    /// self-validating majority can be; it does not remove the limit.
+    #[test]
+    fn a_majority_error_at_the_floor_becomes_the_root() {
+        let (pairs, mut unwrapped) = consistent_network();
+        let mut components = one_component(&unwrapped);
+        let triple: Vec<(usize, usize)> = (0..MIN_ROOT_PIXELS)
+            .map(|index| (index / SIDE, index % SIDE))
+            .collect();
+        for ifg in 0..pairs.len() {
+            for &(row, col) in &triple {
+                components[(ifg, row, col)] = 2;
+            }
+        }
+        let (wrong, correct) = triple.split_at(9);
+        for &(row, col) in wrong {
+            unwrapped[(0, row, col)] += std::f64::consts::TAU;
+        }
+        let qc = loop_closure_qc(
+            unwrapped.view(),
+            components.view(),
+            &pairs,
+            DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+        );
+        let flagged: Vec<(usize, usize)> = qc
+            .failed_mask()
+            .indexed_iter()
+            .filter(|(_, &bad)| bad)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(flagged, correct.to_vec());
+        assert_eq!(qc.unjudged_small_triple_pixels, 0);
+        assert_eq!(qc.small_root_triples, 0);
     }
 
     /// A sub-cycle residual (real noise, not an unwrap error) is not flagged.
