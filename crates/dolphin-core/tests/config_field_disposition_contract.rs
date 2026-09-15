@@ -905,3 +905,25 @@ fn invalid_empirical_source_factor_fails_before_covariance_source_io() {
         "{error}"
     );
 }
+
+/// `correction_options.max_outside_static_fraction` is a fraction of the frame:
+/// NaN, negative, and above one are config errors before any raster I/O; the
+/// bounds and `None` (the resolver default) pass.
+#[test]
+fn outside_static_fraction_must_be_a_fraction() {
+    for invalid in [f64::NAN, -0.1, 1.5, f64::INFINITY] {
+        let mut config = DisplacementWorkflow::default();
+        config.correction_options.max_outside_static_fraction = Some(invalid);
+        let error = config.validate_supported_options().unwrap_err().to_string();
+        assert!(
+            error.contains("correction_options.max_outside_static_fraction"),
+            "{invalid}: {error}"
+        );
+        assert!(error.contains("[0, 1]"), "{invalid}: {error}");
+    }
+    for valid in [None, Some(0.0), Some(0.003), Some(1.0)] {
+        let mut config = DisplacementWorkflow::default();
+        config.correction_options.max_outside_static_fraction = valid;
+        config.validate_supported_options().unwrap();
+    }
+}

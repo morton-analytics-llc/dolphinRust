@@ -1243,7 +1243,8 @@ pub struct CorrectionOptions {
     /// Largest fraction of the frame that may fall outside every supplied
     /// CSLC-S1-STATIC granule before the run is refused; pixels outside are masked
     /// to nodata and counted in the geometry provenance either way. `None` uses
-    /// the resolver default (0.10). dolphinRust-only.
+    /// the resolver default (0.10); a value must lie in `[0, 1]`
+    /// (`validate_supported_options`). dolphinRust-only.
     pub max_outside_static_fraction: Option<f64>,
 }
 
@@ -1512,6 +1513,13 @@ impl DisplacementWorkflow {
                 "output_options.strides.y and output_options.strides.x must both be positive"
                     .into(),
             ));
+        }
+        if let Some(fraction) = self.correction_options.max_outside_static_fraction {
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "correction_options.max_outside_static_fraction must be in [0, 1], got {fraction}"
+                )));
+            }
         }
         if self.phase_linking.write_covariance_operator {
             let source = &self.phase_linking.empirical_source_factor;
