@@ -67,6 +67,14 @@ pub struct GeometryProvenance {
     pub incidence_angle_min_deg: Option<f64>,
     /// Maximum per-pixel incidence, degrees.
     pub incidence_angle_max_deg: Option<f64>,
+    /// Frame pixels outside every supplied CSLC-S1-STATIC granule, masked to
+    /// nodata in every product (never interpolated); present when LOS resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_static_pixel_count: Option<usize>,
+    /// `outside_static_pixel_count / frame_pixels`; the run is refused above the
+    /// resolver's `max_outside_static_fraction` gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_static_fraction: Option<f64>,
     /// Platform-velocity azimuth in the scene-center ENU frame, degrees clockwise
     /// from geographic north, `[0, 360)`.
     pub heading_deg: Option<f64>,
@@ -253,6 +261,8 @@ pub fn assemble_geometry_provenance_with_coverage(
         incidence_angle_spread_deg: incidence.map(|s| s.std_deg),
         incidence_angle_min_deg: incidence.map(|s| s.min_deg),
         incidence_angle_max_deg: incidence.map(|s| s.max_deg),
+        outside_static_pixel_count: los.map(|l| l.outside_static().pixel_count),
+        outside_static_fraction: los.map(|l| l.outside_static().fraction),
         heading_deg,
         native_range_spacing_m,
         native_azimuth_spacing_m,

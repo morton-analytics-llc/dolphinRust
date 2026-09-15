@@ -13,7 +13,14 @@
 //! fills out-of-coverage frame pixels with exactly `0`, so a frame pixel is *valid*
 //! iff `east != 0 || north != 0`. For Sentinel-1 (ellipsoidal incidence ≈ 30–46°) a
 //! valid pixel always has a substantial `e` or `n`, so `(0, 0)` uniquely marks fill.
-//! Partial coverage is a hard error — never a silent 0°/nadir pixel.
+//!
+//! Frame pixels no granule covers are **masked**: NaN in every component, so they
+//! are nodata in every downstream product and never a silent 0°/nadir pixel. The
+//! count and fraction are reported ([`LosGeometry::outside_static`]) for the
+//! geometry provenance, and the run is refused only when the fraction exceeds
+//! [`LosCoverageOptions::max_outside_static_fraction`] — a corridor frame that runs
+//! a few hundred pixels past its burst's STATIC is an edge; a third of the frame
+//! without geometry is a wrong or missing granule.
 
 use dolphin_io::{GeoInfo, LosLayers};
 use ndarray::{Array2, Zip};
@@ -21,8 +28,42 @@ use ndarray::{Array2, Zip};
 use crate::error::{CorrectionError, Result};
 use crate::troposphere::{warp_to_frame, DelayGrid};
 
+/// Default [`LosCoverageOptions::max_outside_static_fraction`]. Set from the three
+/// frames eo observed against a single per-burst STATIC granule: 0.3% and 0.6%
+/// outside are corridor frames running an edge strip past the granule and are
+/// masked; 31.4% outside is a third of the frame with no geometry — a wrong or
+/// missing granule, not an edge — and is refused. 10% sits well clear of both.
+pub const DEFAULT_MAX_OUTSIDE_STATIC_FRACTION: f64 = 0.10;
+
+/// How much of the frame may fall outside every supplied CSLC-S1-STATIC granule
+/// before [`resolve_los_geometry_with_options`] refuses the run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LosCoverageOptions {
+    /// Refuse when `outside_pixels / frame_pixels` exceeds this (strictly above).
+    /// Below it the outside pixels are masked to NaN and reported, not refused.
+    pub max_outside_static_fraction: f64,
+}
+
+impl Default for LosCoverageOptions {
+    fn default() -> Self {
+        Self {
+            max_outside_static_fraction: DEFAULT_MAX_OUTSIDE_STATIC_FRACTION,
+        }
+    }
+}
+
+/// Frame pixels outside every supplied STATIC granule (masked to NaN).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutsideStatic {
+    /// Number of masked frame pixels.
+    pub pixel_count: usize,
+    /// `pixel_count / frame_pixels`; `0.0` for an empty frame.
+    pub fraction: f64,
+}
+
 /// Per-pixel LOS unit-vector components on the frame grid. `up` is derived as
 /// `+sqrt(max(0, 1 - east² - north²))`; the incidence angle is [`Self::incidence_deg`].
+/// Pixels outside every supplied STATIC granule are NaN in all three components.
 #[derive(Debug, Clone)]
 pub struct LosGeometry {
     /// East component of the ground→sensor LOS unit vector, `(rows, cols)`.
@@ -34,6 +75,22 @@ pub struct LosGeometry {
 }
 
 impl LosGeometry {
+    /// Count and fraction of frame pixels masked as outside every supplied STATIC
+    /// granule (NaN `up`). Feeds the `outside_static_pixel_count` /
+    /// `outside_static_fraction` geometry-provenance fields.
+    #[must_use]
+    pub fn outside_static(&self) -> OutsideStatic {
+        let pixel_count = self.up.iter().filter(|u| u.is_nan()).count();
+        let fraction = match self.up.len() {
+            0 => 0.0,
+            total => pixel_count as f64 / total as f64,
+        };
+        OutsideStatic {
+            pixel_count,
+            fraction,
+        }
+    }
+
     /// Per-pixel ellipsoidal incidence angle in degrees, `acos(up)·180/π` —
     /// character-identical to dolphin `atmosphere/ionosphere.py`. This is the angle
     /// the atmospheric zenith→slant `1/cos` mapping uses.
@@ -42,10 +99,9 @@ impl LosGeometry {
         self.up.mapv(|u| u.acos().to_degrees())
     }
 
-    /// Spatial statistics of the ellipsoidal incidence angle over finite pixels
-    /// (full frame coverage is already enforced by [`resolve_los_geometry`], so the
-    /// finite filter is defensive, not load-bearing). `None` when no pixel is
-    /// finite. Std is the population std (numpy `ddof=0`).
+    /// Spatial statistics of the ellipsoidal incidence angle over finite pixels —
+    /// pixels outside the STATIC coverage are NaN and excluded. `None` when no
+    /// pixel is finite. Std is the population std (numpy `ddof=0`).
     #[must_use]
     pub fn incidence_stats(&self) -> Option<IncidenceStats> {
         let inc = self.incidence_deg();
@@ -90,21 +146,43 @@ const OVERLAP_AGREEMENT_GATE_DEG: f64 = 1.0;
 /// bilinear seam ring and carries no usable statistic.
 const MIN_OVERLAP_PIXELS: usize = 32;
 
-/// Resolve per-pixel LOS geometry onto the frame grid from one-or-more per-burst
-/// CSLC-S1-STATIC granules. Each granule is reprojected onto `(dst_gt, dst_epsg,
-/// shape)` and mosaicked (first covered burst wins); coverage over the whole frame
-/// is required, and granules that overlap must agree there.
+/// [`resolve_los_geometry_with_options`] under [`LosCoverageOptions::default`].
 ///
 /// # Errors
-/// [`CorrectionError::GeometryCoverage`] if `layers` is empty or any frame pixel is
-/// left uncovered; [`CorrectionError::GeometryOverlapMismatch`] if overlapping
-/// granules carry materially different LOS;
-/// [`CorrectionError::Gdal`]/[`CorrectionError::Shape`] on warp failure.
+/// As [`resolve_los_geometry_with_options`].
 pub fn resolve_los_geometry(
     layers: &[LosLayers],
     dst_gt: [f64; 6],
     dst_epsg: u32,
     shape: (usize, usize),
+) -> Result<LosGeometry> {
+    resolve_los_geometry_with_options(
+        layers,
+        dst_gt,
+        dst_epsg,
+        shape,
+        LosCoverageOptions::default(),
+    )
+}
+
+/// Resolve per-pixel LOS geometry onto the frame grid from one-or-more per-burst
+/// CSLC-S1-STATIC granules. Each granule is reprojected onto `(dst_gt, dst_epsg,
+/// shape)` and mosaicked (first covered burst wins); granules that overlap must
+/// agree there. Frame pixels no granule covers are masked to NaN and counted
+/// ([`LosGeometry::outside_static`]); the run is refused only when their fraction
+/// exceeds `options.max_outside_static_fraction`.
+///
+/// # Errors
+/// [`CorrectionError::GeometryCoverage`] if `layers` is empty or the outside
+/// fraction exceeds the gate; [`CorrectionError::GeometryOverlapMismatch`] if
+/// overlapping granules carry materially different LOS;
+/// [`CorrectionError::Gdal`]/[`CorrectionError::Shape`] on warp failure.
+pub fn resolve_los_geometry_with_options(
+    layers: &[LosLayers],
+    dst_gt: [f64; 6],
+    dst_epsg: u32,
+    shape: (usize, usize),
+    options: LosCoverageOptions,
 ) -> Result<LosGeometry> {
     if layers.is_empty() {
         return Err(CorrectionError::GeometryCoverage(
@@ -121,9 +199,12 @@ pub fn resolve_los_geometry(
         disagreement_deg.extend(overlap_disagreement_deg(&east, &north, &covered, &e, &n));
         fill_uncovered(&mut east, &mut north, &mut covered, &e, &n);
     }
-    ensure_full_coverage(&covered)?;
+    ensure_coverage_within_gate(&covered, options)?;
     ensure_overlap_agreement(&mut disagreement_deg)?;
-    let up = derive_up(&east, &north);
+    let mut up = derive_up(&east, &north);
+    for component in [&mut east, &mut north, &mut up] {
+        mask_uncovered(component, &covered);
+    }
     Ok(LosGeometry { east, north, up })
 }
 
@@ -224,17 +305,34 @@ fn ensure_overlap_agreement(diffs: &mut [f64]) -> Result<()> {
     )))
 }
 
-/// Error if any frame pixel is uncovered by every supplied granule.
-fn ensure_full_coverage(covered: &Array2<bool>) -> Result<()> {
+/// Error if the fraction of frame pixels uncovered by every supplied granule
+/// exceeds the gate (strictly above); at or below it the pixels are masked instead.
+fn ensure_coverage_within_gate(covered: &Array2<bool>, options: LosCoverageOptions) -> Result<()> {
     let uncovered = covered.iter().filter(|&&c| !c).count();
     if uncovered == 0 {
         return Ok(());
     }
-    let frac = 100.0 * uncovered as f64 / covered.len() as f64;
+    let fraction = uncovered as f64 / covered.len() as f64;
+    if fraction <= options.max_outside_static_fraction {
+        return Ok(());
+    }
     Err(CorrectionError::GeometryCoverage(format!(
-        "{uncovered} frame pixels ({frac:.1}%) fall outside the supplied CSLC-S1-STATIC \
-         coverage; supply the per-burst STATIC granules covering the frame"
+        "{uncovered} frame pixels ({:.1}%) fall outside the supplied CSLC-S1-STATIC \
+         coverage, above the {:.1}% gate (max_outside_static_fraction); supply the \
+         per-burst STATIC granules covering the frame",
+        100.0 * fraction,
+        100.0 * options.max_outside_static_fraction
     )))
+}
+
+/// NaN every pixel no granule covers, so it is nodata downstream rather than a
+/// `(0, 0, 1)` nadir vector.
+fn mask_uncovered(component: &mut Array2<f64>, covered: &Array2<bool>) {
+    Zip::from(component).and(covered).for_each(|value, &cov| {
+        if !cov {
+            *value = f64::NAN;
+        }
+    });
 }
 
 /// Up component of the unit LOS vector: `+sqrt(max(0, 1 - e² - n²))`.
@@ -283,8 +381,8 @@ mod tests {
         assert!((los.east[(r, c)] - e).abs() < 1e-6 && (los.north[(r, c)] - n).abs() < 1e-6);
     }
 
-    /// Bar #4: a frame that extends beyond the STATIC footprint is a hard coverage
-    /// error, never a silent 0°/nadir fill.
+    /// Bar #4: a frame that lies almost entirely beyond the STATIC footprint is a
+    /// hard coverage error (far above the gate), never a silent 0°/nadir fill.
     #[test]
     fn partial_coverage_is_error() {
         let src_gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
@@ -304,16 +402,21 @@ mod tests {
         assert!(matches!(err, CorrectionError::GeometryCoverage(_)));
     }
 
-    /// Regression: an interior nodata (0,0) hole with no other burst to fill it is a
-    /// hard coverage error — the guard must reject it, not emit a 0°/nadir pixel.
+    /// Regression: an interior nodata (0,0) hole with no other burst to fill it is
+    /// masked to NaN and counted (1 of 36, below the gate) — never a 0°/nadir pixel.
     #[test]
-    fn interior_nodata_hole_is_error() {
+    fn interior_nodata_hole_is_masked() {
         let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
         let mut layer = constant_layer((6, 6), -0.30, -0.45, gt, 32614);
         layer.east[(3, 3)] = 0.0;
         layer.north[(3, 3)] = 0.0;
-        let err = resolve_los_geometry(&[layer], gt, 32614, (6, 6)).unwrap_err();
-        assert!(matches!(err, CorrectionError::GeometryCoverage(_)), "{err}");
+        let los = resolve_los_geometry(&[layer], gt, 32614, (6, 6)).unwrap();
+        assert!(
+            los.up[(3, 3)].is_nan() && los.east[(3, 3)].is_nan(),
+            "hole masked"
+        );
+        assert!((los.up[(3, 4)] - (1.0_f64 - 0.09 - 0.2025).sqrt()).abs() < 1e-9);
+        assert_eq!(los.outside_static().pixel_count, 1);
     }
 
     /// Asc/desc is encoded in the signed LOS vector: flipping the azimuth by 180°
@@ -395,5 +498,123 @@ mod tests {
         let b = constant_layer((8, 8), -0.302, -0.451, gt, 32614);
         let los = resolve_los_geometry(&[a, b], gt, 32614, (8, 8)).unwrap();
         assert!((los.east[(4, 4)] - (-0.30)).abs() < 1e-6);
+    }
+
+    /// A `rows × cols` frame whose single STATIC granule covers every row except
+    /// the last `outside_rows` — the eo corridor-frame case, where the frame runs
+    /// past the one granule staged for the burst. Outside count is `outside_rows·cols`.
+    fn frame_past_granule(
+        rows: usize,
+        cols: usize,
+        outside_rows: usize,
+    ) -> (Vec<LosLayers>, [f64; 6]) {
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        let layer = constant_layer((rows - outside_rows, cols), -0.30, -0.45, gt, 32614);
+        (vec![layer], gt)
+    }
+
+    /// Resolve a 1000×100 frame with `outside_rows` rows past the granule under
+    /// the default gate.
+    fn resolve_past_granule(outside_rows: usize) -> Result<LosGeometry> {
+        let (layers, gt) = frame_past_granule(1000, 100, outside_rows);
+        resolve_los_geometry(&layers, gt, 32614, (1000, 100))
+    }
+
+    /// Masked pixels are NaN in every component (nodata downstream, never a
+    /// 0°/nadir pixel), covered pixels keep their LOS, and the count/fraction
+    /// report exactly the out-of-granule pixels.
+    fn assert_masked(los: &LosGeometry, outside_rows: usize, fraction: f64) {
+        let outside = los.outside_static();
+        assert_eq!(outside.pixel_count, outside_rows * 100, "count");
+        assert!(
+            (outside.fraction - fraction).abs() < 1e-12,
+            "fraction {}",
+            outside.fraction
+        );
+        let first_outside = 1000 - outside_rows;
+        for c in [0, 50, 99] {
+            let inside = (first_outside - 1, c);
+            assert!(
+                (los.east[inside] - (-0.30)).abs() < 1e-6,
+                "inside east {inside:?}"
+            );
+            assert!(los.up[inside].is_finite(), "inside up {inside:?}");
+            let out = (first_outside, c);
+            assert!(
+                los.east[out].is_nan() && los.north[out].is_nan() && los.up[out].is_nan(),
+                "{out:?} masked"
+            );
+            assert!(los.up[(999, c)].is_nan(), "last row masked");
+        }
+        let stats = los
+            .incidence_stats()
+            .expect("stats over the covered pixels");
+        assert!(
+            stats.mean_deg.is_finite() && stats.std_deg < 1e-9,
+            "{stats:?}"
+        );
+    }
+
+    /// eo held-out block t137_292324_iw1: 0.3% of the frame past the single STATIC
+    /// granule (227 of ~75,000 real pixels). Masked, counted, not refused.
+    #[test]
+    fn edge_sliver_is_masked_not_refused() {
+        let los = resolve_past_granule(3).expect("0.3% outside must resolve");
+        assert_masked(&los, 3, 0.003);
+    }
+
+    /// eo calibration block t144_308004_iw1: 0.6% outside (1,315 pixels). Masked.
+    #[test]
+    fn small_edge_strip_is_masked_not_refused() {
+        let los = resolve_past_granule(6).expect("0.6% outside must resolve");
+        assert_masked(&los, 6, 0.006);
+    }
+
+    /// eo calibration block t137_292338_iw2: 31.4% outside (28,323 pixels) — a
+    /// third of the frame without geometry is a wrong/missing-granule condition,
+    /// refused under the default gate with the fraction in the message; a caller
+    /// that raises the gate gets the masked geometry with the same count.
+    #[test]
+    fn third_of_frame_outside_is_refused_by_default() {
+        let err = resolve_past_granule(314).expect_err("31.4% outside must refuse");
+        assert!(matches!(err, CorrectionError::GeometryCoverage(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("31400") && msg.contains("31.4%"), "{msg}");
+
+        let (layers, gt) = frame_past_granule(1000, 100, 314);
+        let options = LosCoverageOptions {
+            max_outside_static_fraction: 0.5,
+        };
+        let los = resolve_los_geometry_with_options(&layers, gt, 32614, (1000, 100), options)
+            .expect("raised gate admits the frame");
+        assert_masked(&los, 314, 0.314);
+    }
+
+    /// The gate refuses strictly *above* the configured fraction: a frame exactly
+    /// at the gate resolves, one just past it is refused. Default is 10%.
+    #[test]
+    fn refuses_only_above_the_configured_fraction() {
+        assert!((LosCoverageOptions::default().max_outside_static_fraction - 0.10).abs() < 1e-12);
+        let (layers, gt) = frame_past_granule(1000, 100, 3);
+        let at_gate = LosCoverageOptions {
+            max_outside_static_fraction: 0.003,
+        };
+        resolve_los_geometry_with_options(&layers, gt, 32614, (1000, 100), at_gate)
+            .expect("fraction equal to the gate resolves");
+        let below_gate = LosCoverageOptions {
+            max_outside_static_fraction: 0.0029,
+        };
+        let err = resolve_los_geometry_with_options(&layers, gt, 32614, (1000, 100), below_gate)
+            .expect_err("fraction above the gate refuses");
+        assert!(matches!(err, CorrectionError::GeometryCoverage(_)), "{err}");
+    }
+
+    /// A fully covered frame reports zero outside pixels.
+    #[test]
+    fn full_coverage_reports_zero_outside() {
+        let los = resolve_past_granule(0).unwrap();
+        let outside = los.outside_static();
+        assert_eq!(outside.pixel_count, 0);
+        assert_eq!(outside.fraction, 0.0);
     }
 }

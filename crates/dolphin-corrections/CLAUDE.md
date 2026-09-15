@@ -69,8 +69,16 @@ modelling + raster subtraction, no solver.
   **Nodata rule matches dolphin (`nodata=0`):** every
   component is reprojected via `warp_to_frame` (GDAL fills off-coverage with exactly 0), so a
   frame pixel is valid iff `east≠0 || north≠0` and finite; for S1 (incidence 30–46°) a valid
-  pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Partial coverage is a
-  **hard `GeometryCoverage` error, never a silent 0°/nadir pixel.** The resolved
+  pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Frame pixels no granule
+  covers are **masked** — NaN in all three components, so nodata in every downstream product,
+  never interpolated and never a silent 0°/nadir pixel — and counted
+  (`LosGeometry::outside_static` → provenance `outside_static_pixel_count` /
+  `outside_static_fraction`). The run is refused (`GeometryCoverage`) only when the outside
+  fraction exceeds `LosCoverageOptions::max_outside_static_fraction` (default 10%,
+  `DEFAULT_MAX_OUTSIDE_STATIC_FRACTION`): eo's corridor frames ran 0.3% and 0.6% past the one
+  STATIC granule staged per burst (an edge strip, masked), while 31.4% outside is a third of
+  the frame with no geometry — a wrong or missing granule, refused. `resolve_los_geometry`
+  uses the default; `resolve_los_geometry_with_options` takes the gate. The resolved
   `LosGeometry{east,north,up}` is also the front door for the GPS ENU→LOS harness
   (`d_los = d_e·east + d_n·north + d_u·up`, ground→sensor). Design + deferrals (iono ground→shell
   mapping, seam nearest-resample): `md/design/per-pixel-los-geometry.md`.
