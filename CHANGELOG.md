@@ -18,6 +18,18 @@ All notable changes to dolphinRust are documented here. The format follows
   `junction_step_cycles_NN.tif` per boundary. In a closure-exact network the wrapped
   linked-phase step is exactly the fractional part of this step, so the split separates a
   phase-linking junction defect from an unwrap integer without a second layer.
+- **Per-date integer-cycle step detector** (E4, 2026-09-15; `dolphin-timeseries::cycle_steps`).
+  On the same raw inverted series, for each date and pixel: the residual of the pixel's step
+  against the median step of its same-component neighbours in a 5×5 window; a residual within
+  0.25 cycle of a non-zero whole cycle is a detected step. Closure-consistent integer
+  inconsistencies are invisible to the loop QC (every loop closed on block 1) but visible
+  here. Nothing is corrected: `cycle_step_flag.tif` (per-pixel count of detected steps,
+  also `DisplacementOutput::cycle_step_flag` and
+  `PublicationQuality::cycle_step_flagged_pixels`) lets the host mask or annotate, and
+  `geometry_provenance.json` records the rule parameters and per-date fractions (flagged,
+  still-offset, and over-half-cycle) as `cycle_steps`. With
+  `timeseries_options.write_cycle_step_diagnostics` the per-date `cycle_step_NN.tif` are
+  written too.
 - **DEM identity in geometry provenance** (issue #118, eo #483). `geometry_provenance.json`
   now records `dem_grid_spacing_x` / `dem_grid_spacing_y` (from the DEM's own affine
   geotransform), `dem_grid_spacing_units` (the DEM CRS's unit name — `degree` or `metre`,

@@ -16,6 +16,7 @@
 //! integer part is what the unwrapper added. A separate wrapped layer would
 //! carry nothing more, so the summary splits the two instead.
 
+use dolphin_timeseries::CycleStepDateSummary;
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,23 @@ pub struct JunctionProvenance {
     pub ministack_size: usize,
     /// One entry per boundary, in acquisition order; empty for a single ministack.
     pub junctions: Vec<JunctionStepSummary>,
+}
+
+/// Per-date integer-cycle step provenance: the detector's rule parameters, the
+/// per-date frame fractions, and how many analysis-frame pixels carry at least
+/// one detected step (the per-pixel counts are `cycle_step_flag.tif`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CycleStepProvenance {
+    /// Neighbourhood half-width in pixels.
+    pub half_window: usize,
+    /// How close to a whole cycle a residual must be to count.
+    pub tolerance_cycles: f64,
+    /// Fewest same-component finite neighbours before a pixel is judged.
+    pub min_neighbours: usize,
+    /// Analysis-frame pixels with at least one detected step.
+    pub flagged_pixels: usize,
+    /// One entry per step index, in acquisition order.
+    pub per_date: Vec<CycleStepDateSummary>,
 }
 
 /// Acquisition indices at which a new ministack starts: `real_start` of every

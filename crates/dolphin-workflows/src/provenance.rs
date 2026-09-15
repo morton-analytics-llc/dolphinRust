@@ -22,7 +22,7 @@ use dolphin_io::{
 use serde::{Deserialize, Serialize};
 
 use crate::crop::ProcessingBoundsProvenance;
-use crate::phase_steps::JunctionProvenance;
+use crate::phase_steps::{CycleStepProvenance, JunctionProvenance};
 
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
@@ -120,6 +120,10 @@ pub struct GeometryProvenance {
     /// only for products assembled without an inverted series.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ministack_junctions: Option<JunctionProvenance>,
+    /// Per-date integer-cycle steps detected inside connected components on the
+    /// same raw series, summarized over the analysis frame (E4, 2026-09-15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_steps: Option<CycleStepProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
 }
@@ -304,6 +308,7 @@ pub fn assemble_geometry_provenance_with_coverage(
         processing_bounds,
         input_coverage,
         ministack_junctions: None,
+        cycle_steps: None,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,
