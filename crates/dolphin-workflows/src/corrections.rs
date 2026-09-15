@@ -20,7 +20,7 @@ use dolphin_corrections::troposphere::{
     read_l4_total_for_grid, read_raster_for_grid, resample_bilinear, warp_to_frame, DelayGrid,
 };
 use dolphin_io::{grid_centroid_lonlat, GeoInfo};
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3, ArrayView2, Axis};
 
 /// Per-date correction delay layers (meters, `(n_dates, rows, cols)`), returned
 /// for the typed API and per-band COG output.
@@ -44,7 +44,9 @@ pub struct CorrectionLayers {
 ///
 /// `date_files` are the per-date input granules (one per acquisition, in date
 /// order) used to time-stamp the IONEX lookup; `epsg`/`gt` georeference the frame
-/// grid. Returns the per-date delay layers for output.
+/// grid. `support` is the validity mask: terrain and geometry must be finite
+/// there, and may be nodata anywhere else. `None` requires the whole grid.
+/// Returns the per-date delay layers for output.
 ///
 /// # Errors
 /// Returns `Err` if corrections are enabled without a wavelength, if a correction
@@ -56,8 +58,13 @@ pub fn apply_corrections(
     date_files: &[PathBuf],
     epsg: u32,
     gt: [f64; 6],
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<CorrectionLayers> {
     let (bands, rows, cols) = disp_rad.dim();
+    ensure!(
+        support.is_none_or(|mask| mask.dim() == (rows, cols)),
+        "correction support shape differs from the displacement grid"
+    );
     // LOS geometry is resolved independently of the atmospheric opt-in: a
     // geometry-only config (for the GPS harness) needs it even with no iono/tropo.
     let los_geometry = resolve_geometry(opts, epsg, gt, (rows, cols))?;
@@ -84,7 +91,7 @@ pub fn apply_corrections(
         geotransform: gt,
     };
     let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), geo, freq, los)?;
-    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los)?;
+    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los, support)?;
     let solid_earth_tide = build_solid_earth_tide(opts, date_files, (rows, cols), geo, los)?;
 
     let total = sum_layers(
@@ -112,11 +119,13 @@ pub(crate) fn apply_corrections_with_ownership(
     displacement: &mut Array3<f64>,
     ownership: ndarray::ArrayView3<'_, u32>,
     geo: GeoInfo,
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<CorrectionLayers> {
     let (bands, rows, cols) = displacement.dim();
     ensure!(
-        ownership.dim() == (bands + 1, rows, cols),
-        "correction ownership shape mismatch"
+        ownership.dim() == (bands + 1, rows, cols)
+            && support.is_none_or(|mask| mask.dim() == (rows, cols)),
+        "correction ownership or support shape mismatch"
     );
     let opts = &groups
         .first()
@@ -170,8 +179,18 @@ pub(crate) fn apply_corrections_with_ownership(
             SPEED_OF_LIGHT / wavelength,
             local_los.as_ref(),
         )?;
-        let troposphere =
-            build_troposphere(options, bands + 1, shape, gt, geo.epsg, local_los.as_ref())?;
+        let local_support = support
+            .as_ref()
+            .map(|m| m.slice(ndarray::s![r0..r1, c0..c1]));
+        let troposphere = build_troposphere(
+            options,
+            bands + 1,
+            shape,
+            gt,
+            geo.epsg,
+            local_los.as_ref(),
+            local_support,
+        )?;
         let tide = build_solid_earth_tide(options, files, shape, local_geo, local_los.as_ref())?;
         for (destination, source) in [
             (&mut combined.ionosphere, ionosphere),
@@ -437,6 +456,7 @@ fn build_troposphere(
     gt: [f64; 6],
     epsg: u32,
     los: Option<&LosGeometry>,
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Option<Array3<f64>>> {
     if opts.troposphere_files.is_empty() && opts.troposphere_epochs.is_empty() {
         return Ok(None);
@@ -454,11 +474,11 @@ fn build_troposphere(
             opts.dem_file.is_some() && los.is_some(),
             "timed TROPO requires ellipsoidal terrain and per-pixel LOS"
         );
-        let terrain =
-            load_terrain(opts, gt, epsg, (rows, cols))?.context("missing TROPO terrain")?;
+        let terrain = load_terrain(opts, gt, epsg, (rows, cols), support)?
+            .context("missing TROPO terrain")?;
         let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
         ensure!(
-            slant.iter().all(|v| v.is_finite() && *v >= 1.0),
+            holds_on_support(&slant, support, |v| v.is_finite() && v >= 1.0),
             "invalid TROPO LOS projection"
         );
         let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
@@ -475,6 +495,7 @@ fn build_troposphere(
                         epsg,
                         (rows, cols),
                         &terrain,
+                        support,
                     )?);
                 }
             }
@@ -501,13 +522,19 @@ fn build_troposphere(
     // delay must be taken at its terrain elevation; reading level 0 (-500 m)
     // over-corrects by ~2x at 2 km (issue #38). A DEM is therefore required
     // whenever the granule is height-resolved.
-    let terrain = load_terrain(opts, gt, epsg, (rows, cols))?;
+    let terrain = load_terrain(opts, gt, epsg, (rows, cols), support)?;
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
         let band = match terrain.as_ref() {
-            Some(dem) => {
-                tropo_at_terrain(nc, &opts.troposphere_variable, gt, epsg, (rows, cols), dem)?
-            }
+            Some(dem) => tropo_at_terrain(
+                nc,
+                &opts.troposphere_variable,
+                gt,
+                epsg,
+                (rows, cols),
+                dem,
+                support,
+            )?,
             None => {
                 let grid =
                     read_tropo_for_grid(nc, &opts.troposphere_variable, gt, epsg, (rows, cols))?;
@@ -520,23 +547,43 @@ fn build_troposphere(
 }
 
 /// Terrain elevation on the frame grid, or `None` when no DEM is configured.
+/// The DEM on the frame grid. Terrain must be finite on `support`; a nodata
+/// pixel off it stands as NaN and yields a NaN delay there, which the validity
+/// mask already excludes from the product.
 fn load_terrain(
     opts: &CorrectionOptions,
     gt: [f64; 6],
     epsg: u32,
     shape: (usize, usize),
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Option<Array2<f64>>> {
     let Some(dem) = opts.dem_file.as_ref() else {
         return Ok(None);
     };
     let grid = read_raster_for_grid(dem, gt, epsg, shape).map_err(anyhow::Error::msg)?;
-    let frame = resample_to_frame(&grid, gt, epsg, shape)?;
-    ensure_finite_coverage(&frame).map_err(anyhow::Error::msg)?;
+    let frame = resample_terrain_to_frame(&grid, gt, epsg, shape)?;
+    ensure!(
+        holds_on_support(&frame, support, f64::is_finite),
+        "terrain has nodata on valid support"
+    );
     Ok(Some(frame))
 }
 
+/// Whether `ok` holds at every pixel of `support` — at every pixel when there
+/// is no support mask.
+fn holds_on_support(
+    values: &Array2<f64>,
+    support: Option<ArrayView2<'_, bool>>,
+    ok: impl Fn(f64) -> bool,
+) -> bool {
+    values
+        .indexed_iter()
+        .all(|(index, &value)| support.is_some_and(|mask| !mask[index]) || ok(value))
+}
+
 /// Delay at each pixel's terrain elevation, linearly interpolated between the
-/// two bracketing height levels of the L4 granule.
+/// two bracketing height levels of the L4 granule. Terrain must be finite and
+/// inside the granule's height range on `support`; elsewhere the delay is NaN.
 fn tropo_at_terrain(
     nc: &Path,
     var: &str,
@@ -544,6 +591,7 @@ fn tropo_at_terrain(
     epsg: u32,
     shape: (usize, usize),
     terrain: &Array2<f64>,
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Array2<f64>> {
     let vars: Vec<&str> = match var {
         "total" => vec!["hydrostatic_delay", "wet_delay"],
@@ -557,9 +605,9 @@ fn tropo_at_terrain(
         "L4 height levels must be finite and strictly increasing"
     );
     anyhow::ensure!(
-        terrain
-            .iter()
-            .all(|h| h.is_finite() && *h >= levels[0] && *h <= levels[levels.len() - 1]),
+        holds_on_support(terrain, support, |h| h.is_finite()
+            && h >= levels[0]
+            && h <= levels[levels.len() - 1]),
         "terrain is missing or outside L4 height coverage"
     );
     let (lo, hi) = bracketing_levels(&levels, terrain);
@@ -578,7 +626,7 @@ fn tropo_at_terrain(
         total += &interpolate_to_terrain(&levels[lo..=hi], &planes, terrain);
     }
     anyhow::ensure!(
-        total.iter().all(|v| v.is_finite()),
+        holds_on_support(&total, support, f64::is_finite),
         "missing terrain interpolation support"
     );
     Ok(total)
@@ -672,18 +720,28 @@ fn resample_to_frame(
     frame_epsg: u32,
     shape: (usize, usize),
 ) -> Result<ndarray::Array2<f64>> {
-    let (rows, cols) = shape;
+    let output = resample_terrain_to_frame(grid, gt, frame_epsg, shape)?;
+    ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
+    Ok(output)
+}
+
+/// [`resample_to_frame`] without the whole-grid finiteness gate: DEM nodata is
+/// judged on the validity support by the caller, not here.
+fn resample_terrain_to_frame(
+    grid: &DelayGrid,
+    gt: [f64; 6],
+    frame_epsg: u32,
+    shape: (usize, usize),
+) -> Result<ndarray::Array2<f64>> {
     match grid.epsg {
-        Some(e) if e == frame_epsg => {
-            let output = resample_bilinear(grid.data.view(), grid.geotransform, gt, (rows, cols));
-            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
-            Ok(output)
-        }
+        Some(e) if e == frame_epsg => Ok(resample_bilinear(
+            grid.data.view(),
+            grid.geotransform,
+            gt,
+            shape,
+        )),
         _ if grid.srs_wkt.is_some() || grid.epsg.is_some() => {
-            let output =
-                warp_to_frame(grid, gt, frame_epsg, (rows, cols)).map_err(anyhow::Error::msg)?;
-            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
-            Ok(output)
+            warp_to_frame(grid, gt, frame_epsg, shape).map_err(anyhow::Error::msg)
         }
         _ => Err(dolphin_corrections::CorrectionError::NoSourceCrs.into()),
     }
@@ -748,6 +806,7 @@ mod tests {
                     epsg: 4326,
                     geotransform: [-0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
                 },
+                None,
             )
             .unwrap();
             let meters =
@@ -806,6 +865,7 @@ mod tests {
             [0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
             4326,
             Some(&los),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -820,6 +880,56 @@ mod tests {
             assert!((displacement[(1, 0, 0)] * meters_per_radian + 2.0625).abs() < 1e-10);
         }
         std::fs::remove_file(dem).unwrap();
+    }
+
+    /// A DEM nodata pixel is judged on the validity support: off it, the delay
+    /// there is NaN and the run goes on; on it, the run still fails closed.
+    #[test]
+    fn terrain_nodata_off_support_stands_as_nan() {
+        let _hdf5 = hdf5_guard();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let gt = [-0.5, 1.0, 0.0, 1.5, 0.0, -1.0];
+        let terrain = ndarray::array![[500.0, f64::NAN]];
+        let support = ndarray::array![[true, false]];
+        let delay = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            Some(support.view()),
+        )
+        .expect("nodata off support is not an error");
+        assert!(delay[(0, 0)].is_finite());
+        assert!(delay[(0, 1)].is_nan());
+
+        let whole_grid = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            None,
+        )
+        .unwrap_err();
+        assert!(whole_grid
+            .to_string()
+            .contains("outside L4 height coverage"));
+        let on_support = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            Some(ndarray::array![[true, true]].view()),
+        )
+        .unwrap_err();
+        assert!(on_support
+            .to_string()
+            .contains("outside L4 height coverage"));
     }
 
     #[test]
@@ -950,7 +1060,7 @@ mod tests {
             incidence_angle_deg: 0.0, // slant = 1, so zenith delay lands unscaled
             ..Default::default()
         };
-        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610, None)
+        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610, None, None)
             .unwrap()
             .expect("troposphere layers present");
 
@@ -992,6 +1102,7 @@ mod tests {
             &[],
             32610,
             [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            None,
         )
         .unwrap();
         assert!(layers.ionosphere.is_none() && layers.troposphere.is_none());
@@ -1006,7 +1117,8 @@ mod tests {
             ..Default::default()
         };
         let mut disp = Array3::<f64>::zeros((1, 1, 1));
-        let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
+        let err =
+            apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6], None).unwrap_err();
         assert!(err.to_string().contains("wavelength"));
     }
 
@@ -1112,7 +1224,7 @@ mod tests {
         };
         let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, r, c)| (t + r + c) as f64);
         let original = disp.clone();
-        let layers = apply_corrections(&opts, None, &mut disp, &[], 32610, gt).unwrap();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32610, gt, None).unwrap();
 
         assert!(layers.ionosphere.is_none() && layers.troposphere.is_none());
         let los = layers.los_geometry.expect("geometry present");
@@ -1130,7 +1242,8 @@ mod tests {
             ..Default::default()
         };
         let mut disp = Array3::<f64>::zeros((1, 2, 2));
-        let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
+        let err =
+            apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6], None).unwrap_err();
         assert!(
             err.to_string().contains("CSLC-S1-STATIC geometry")
                 || format!("{err:#}").contains("static_geometry.h5"),
@@ -1156,7 +1269,7 @@ mod tests {
         assert!(!opts.is_enabled());
         let mut disp = Array3::from_shape_fn((2, 2, 2), |(t, r, c)| (t + r + c) as f64);
         let original = disp.clone();
-        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6]).unwrap();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6], None).unwrap();
         assert!(layers.solid_earth_tide.is_none());
         assert_eq!(disp, original);
     }
@@ -1172,7 +1285,8 @@ mod tests {
         let mut disp = Array3::<f64>::zeros((1, 2, 2));
         let gt = [500_000.0, 60.0, 0.0, 2_150_000.0, 0.0, -60.0];
         let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("geometry_files"),
             "expected the geometry requirement, got: {err:#}"
@@ -1194,7 +1308,8 @@ mod tests {
         };
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
         let files = vec![PathBuf::from("cslc_20230104.h5")];
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("semidiurnal"),
             "expected the timestamp requirement, got: {err:#}"
@@ -1222,7 +1337,8 @@ mod tests {
             PathBuf::from("OPERA_L2_CSLC-S1_T005_20230116T124053Z_x.h5"),
         ];
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
-        let layers = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap();
+        let layers =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap();
 
         let mut explicit = opts.clone();
         explicit.acquisition_utc = files
@@ -1238,6 +1354,7 @@ mod tests {
             &opaque,
             32610,
             gt,
+            None,
         )
         .unwrap();
         assert_eq!(explicit_disp, disp);
