@@ -529,6 +529,7 @@ fn finish_displacement(
                     },
                     None,
                     stitched.ownership.as_ref().map(|owners| owners.view()),
+                    validity_mask.view(),
                 )
             },
             |displacement| {
@@ -795,6 +796,7 @@ fn correct_and_reference(
     geo: GeoInfo,
     reference: Option<(usize, usize)>,
     ownership: Option<ArrayView3<'_, u32>>,
+    support: ArrayView2<'_, bool>,
 ) -> Result<CorrectionLayers> {
     let mut options = cfg.correction_options.clone();
     if !cfg.input_options.acquisition_metadata.is_empty() {
@@ -842,6 +844,7 @@ fn correct_and_reference(
             displacement,
             ownership,
             geo,
+            Some(support),
         )?
     } else {
         apply_corrections(
@@ -851,6 +854,7 @@ fn correct_and_reference(
             date_files,
             geo.epsg,
             geo.geotransform,
+            Some(support),
         )?
     };
     if let Some(point) = reference {
@@ -7158,6 +7162,7 @@ mod tests {
                 (0.008 * c as f64 * days[t + 1] / 365.25 + 0.01 * (t + 1) as f64 * (1.0 + c as f64))
                     * scale
             });
+            let support = Array2::from_elem((disp.dim().1, disp.dim().2), true);
             correct_and_reference(
                 &cfg,
                 &mut disp,
@@ -7168,6 +7173,7 @@ mod tests {
                 },
                 Some((1, 0)),
                 None,
+                support.view(),
             )
             .unwrap();
             assert!(disp
