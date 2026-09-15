@@ -458,7 +458,8 @@ fn troposphere_bracket(
 }
 
 /// Build the per-date tropospheric delay grid by resampling each OPERA L4 netCDF
-/// onto the frame grid.
+/// onto the frame grid. Terrain and LOS projection are judged on `support`
+/// narrowed to finite geometry ([`geometry_support`]).
 fn build_troposphere(
     opts: &CorrectionOptions,
     n_dates: usize,
@@ -475,6 +476,8 @@ fn build_troposphere(
         opts.troposphere_files.is_empty() || opts.troposphere_epochs.is_empty(),
         "choose timed TROPO inputs or legacy per-date inputs, not both"
     );
+    let support = geometry_support(support, los);
+    let support = support.as_ref().map(Array2::view);
     if !opts.troposphere_epochs.is_empty() {
         ensure!(
             opts.acquisition_utc.len() == n_dates,
@@ -688,6 +691,24 @@ fn interpolate_to_terrain(
         }
         planes[lower][ix] * (1.0 - weight) + planes[upper][ix] * weight
     })
+}
+
+/// The validity support narrowed to pixels with finite LOS geometry; without
+/// per-pixel geometry the caller's support stands. The phase-link mask knows
+/// nothing of the STATIC footprint: a pixel outside every granule is admitted by
+/// the coverage gate and masked at publication, but it has no slant factor and,
+/// when the DEM stops at the granule edge, no terrain either — so terrain and
+/// projection are judged only where geometry exists.
+fn geometry_support(
+    support: Option<ArrayView2<'_, bool>>,
+    los: Option<&LosGeometry>,
+) -> Option<Array2<bool>> {
+    let Some(geometry) = los else {
+        return support.map(|mask| mask.to_owned());
+    };
+    Some(Array2::from_shape_fn(geometry.up.dim(), |index| {
+        support.is_none_or(|mask| mask[index]) && geometry.up[index].is_finite()
+    }))
 }
 
 /// Per-pixel zenith→slant factor `1/cos(incidence)`: `1/up` from geometry when
@@ -1218,6 +1239,85 @@ mod tests {
             assert!((a - b).abs() < tol, "iono {a} vs {b}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A frame the coverage gate admits (0.3% outside the one STATIC granule) runs
+    /// timed TROPO instead of being refused: the phase-link support is narrowed to
+    /// finite geometry before the terrain and LOS-projection checks, and the
+    /// outside pixels come out as NaN delay for the validity mask to drop.
+    #[test]
+    fn outside_static_pixels_do_not_refuse_timed_troposphere() {
+        let _hdf5 = hdf5_guard();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!(
+            "dolphin-outside-static-tropo-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dem = dir.join("dem.nc");
+        let geometry = dir.join("static.h5");
+        let gt = [0.0, 1.0 / 1024.0, 0.0, 1.0, 0.0, -1.0 / 1024.0];
+        let (rows, cols) = (1000, 2);
+        write_4326_netcdf(
+            &dem,
+            &Array2::from_elem((3, 3), 500.0),
+            [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0],
+        );
+        write_uniform_static(&geometry, 34.0, gt, (rows - 3, cols));
+        hdf5::File::open_rw(&geometry)
+            .unwrap()
+            .dataset("/data/projection")
+            .unwrap()
+            .write_scalar(&4326_i64)
+            .unwrap();
+        let opts = CorrectionOptions {
+            acquisition_utc: vec![
+                utc,
+                utc + chrono::Duration::minutes(90),
+                utc + chrono::Duration::hours(3),
+            ],
+            troposphere_epochs: vec![
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem),
+            geometry_files: vec![geometry],
+            ..Default::default()
+        };
+        let support = Array2::from_elem((rows, cols), true);
+        let mut displacement = Array3::zeros((2, rows, cols));
+        let layers = apply_corrections(
+            &opts,
+            Some(0.05546576),
+            &mut displacement,
+            &[],
+            4326,
+            gt,
+            Some(support.view()),
+        )
+        .expect("0.3% outside STATIC runs timed TROPO instead of being refused");
+        let los = layers.los_geometry.expect("geometry configured");
+        assert_eq!(los.outside_static().pixel_count, 3 * cols);
+        let troposphere = layers.troposphere.expect("timed TROPO built");
+        for row in 0..rows {
+            let inside = row < rows - 3;
+            assert_eq!(
+                troposphere[(0, row, 0)].is_finite(),
+                inside,
+                "row {row}: delay finite only inside the STATIC footprint"
+            );
+            assert_eq!(displacement[(0, row, 0)].is_finite(), inside);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `correction_options.max_outside_static_fraction` reaches the resolver: the
