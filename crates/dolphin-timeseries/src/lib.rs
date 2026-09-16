@@ -6,6 +6,7 @@
 //! Block-parallel.
 #![warn(missing_docs)]
 
+pub mod cycle_steps;
 pub mod inversion;
 pub mod loop_closure;
 pub mod network;
@@ -15,6 +16,10 @@ pub mod temporal_covariance;
 mod temporal_covariance_batch;
 pub mod velocity_model;
 
+pub use cycle_steps::{
+    detect_cycle_steps, CycleStepDateSummary, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
+    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, MIN_CYCLE_STEP_NEIGHBOURS,
+};
 pub use inversion::{
     estimate_velocity, estimate_velocity_with_diagnostics, estimate_velocity_with_precisions,
     estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
@@ -23,8 +28,8 @@ pub use inversion::{
     VelocityUncertaintyStatus,
 };
 pub use loop_closure::{
-    loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, Triplet,
-    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, LoopClosureShapeError,
+    Triplet, DEFAULT_CLOSURE_TOLERANCE_CYCLES, MIN_ROOT_PIXELS,
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};

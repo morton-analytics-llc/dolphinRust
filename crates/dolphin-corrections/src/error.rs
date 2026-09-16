@@ -14,9 +14,6 @@ pub enum CorrectionError {
     /// dolphin-io failure (raster read/write).
     #[error(transparent)]
     DolphinIo(#[from] dolphin_io::IoError),
-    /// Malformed IONEX TEC file.
-    #[error("ionex parse: {0}")]
-    Ionex(String),
     /// Array-shape mismatch between a correction layer and the frame grid.
     #[error("shape: {0}")]
     Shape(String),

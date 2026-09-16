@@ -80,6 +80,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "timeseries_options.velocity_step_dates",
     "timeseries_options.velocity_relaxation",
     "timeseries_options.mask_unwrap_loop_errors",
+    "timeseries_options.write_cycle_step_diagnostics",
     "unwrap_options.snaphu_options.ntiles",
     "unwrap_options.snaphu_options.tile_overlap",
     "unwrap_options.snaphu_options.n_parallel_tiles",
@@ -116,12 +117,14 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "correction_options.nisar_ellipsoidal_dem_file",
     "correction_options.ionosphere_files",
     "correction_options.troposphere_files",
+    "correction_options.troposphere_epochs",
     "correction_options.geometry_files",
     "correction_options.dem_file",
     "correction_options.incidence_angle_deg",
     "correction_options.troposphere_variable",
     "correction_options.solid_earth_tide",
     "correction_options.plate_motion_model",
+    "correction_options.max_outside_static_fraction",
     "output_options.strides",
     "output_options.epsg",
     "output_options.bounds",
@@ -343,6 +346,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
             velocity_step_dates,
             velocity_relaxation,
             mask_unwrap_loop_errors,
+            write_cycle_step_diagnostics,
         ]
     );
     let _ = (
@@ -363,6 +367,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
         velocity_step_dates,
         velocity_relaxation,
         mask_unwrap_loop_errors,
+        write_cycle_step_diagnostics,
     );
 }
 
@@ -470,12 +475,14 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
             nisar_ellipsoidal_dem_file,
             ionosphere_files,
             troposphere_files,
+            troposphere_epochs,
             geometry_files,
             dem_file,
             incidence_angle_deg,
             troposphere_variable,
             solid_earth_tide,
             plate_motion_model,
+            max_outside_static_fraction,
         ]
     );
     let _ = (
@@ -484,12 +491,14 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
         nisar_ellipsoidal_dem_file,
         ionosphere_files,
         troposphere_files,
+        troposphere_epochs,
         geometry_files,
         dem_file,
         incidence_angle_deg,
         troposphere_variable,
         solid_earth_tide,
         plate_motion_model,
+        max_outside_static_fraction,
     );
 }
 
@@ -901,4 +910,26 @@ fn invalid_empirical_source_factor_fails_before_covariance_source_io() {
         error.contains("empirical_source_factor.shrinkage_alpha"),
         "{error}"
     );
+}
+
+/// `correction_options.max_outside_static_fraction` is a fraction of the frame:
+/// NaN, negative, and above one are config errors before any raster I/O; the
+/// bounds and `None` (the resolver default) pass.
+#[test]
+fn outside_static_fraction_must_be_a_fraction() {
+    for invalid in [f64::NAN, -0.1, 1.5, f64::INFINITY] {
+        let mut config = DisplacementWorkflow::default();
+        config.correction_options.max_outside_static_fraction = Some(invalid);
+        let error = config.validate_supported_options().unwrap_err().to_string();
+        assert!(
+            error.contains("correction_options.max_outside_static_fraction"),
+            "{invalid}: {error}"
+        );
+        assert!(error.contains("[0, 1]"), "{invalid}: {error}");
+    }
+    for valid in [None, Some(0.0), Some(0.003), Some(1.0)] {
+        let mut config = DisplacementWorkflow::default();
+        config.correction_options.max_outside_static_fraction = valid;
+        config.validate_supported_options().unwrap();
+    }
 }

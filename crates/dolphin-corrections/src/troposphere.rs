@@ -618,10 +618,10 @@ mod tests {
     /// `OPERA_L4_REAL`) and confirm the total zenith delay is physically plausible.
     /// Ignored unless the env var is set.
     #[test]
+    #[ignore = "requires staged real-source input; run explicitly with --ignored"]
     fn real_opera_l4_total_is_physical() {
-        let Ok(path) = std::env::var("OPERA_L4_REAL") else {
-            return;
-        };
+        let path = std::env::var("OPERA_L4_REAL")
+            .expect("OPERA_L4_REAL must identify the staged real-source input");
         let grid = read_l4_total(std::path::Path::new(&path)).expect("read real L4 total");
         // Real-product facts (band 1 = first time step): a large global lat/lon
         // grid; the product CRS may carry no EPSG authority code.
