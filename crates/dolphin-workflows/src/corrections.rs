@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use dolphin_core::config::CorrectionOptions;
-use dolphin_corrections::geometry::{resolve_los_geometry, LosGeometry};
+use dolphin_corrections::geometry::{
+    resolve_los_geometry_with_options, LosCoverageOptions, LosGeometry,
+    DEFAULT_MAX_OUTSIDE_STATIC_FRACTION,
+};
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
 use dolphin_corrections::solid_earth_tide::{tide_range_delay_grid, LonLatGrid};
 use dolphin_corrections::subtract_delay;
@@ -20,7 +23,7 @@ use dolphin_corrections::troposphere::{
     read_l4_total_for_grid, read_raster_for_grid, resample_bilinear, warp_to_frame, DelayGrid,
 };
 use dolphin_io::{grid_centroid_lonlat, GeoInfo};
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3, ArrayView2, Axis};
 
 /// Per-date correction delay layers (meters, `(n_dates, rows, cols)`), returned
 /// for the typed API and per-band COG output.
@@ -44,7 +47,9 @@ pub struct CorrectionLayers {
 ///
 /// `date_files` are the per-date input granules (one per acquisition, in date
 /// order) used to time-stamp the IONEX lookup; `epsg`/`gt` georeference the frame
-/// grid. Returns the per-date delay layers for output.
+/// grid. `support` is the validity mask: terrain and geometry must be finite
+/// there, and may be nodata anywhere else. `None` requires the whole grid.
+/// Returns the per-date delay layers for output.
 ///
 /// # Errors
 /// Returns `Err` if corrections are enabled without a wavelength, if a correction
@@ -56,8 +61,13 @@ pub fn apply_corrections(
     date_files: &[PathBuf],
     epsg: u32,
     gt: [f64; 6],
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<CorrectionLayers> {
     let (bands, rows, cols) = disp_rad.dim();
+    ensure!(
+        support.is_none_or(|mask| mask.dim() == (rows, cols)),
+        "correction support shape differs from the displacement grid"
+    );
     // LOS geometry is resolved independently of the atmospheric opt-in: a
     // geometry-only config (for the GPS harness) needs it even with no iono/tropo.
     let los_geometry = resolve_geometry(opts, epsg, gt, (rows, cols))?;
@@ -84,7 +94,7 @@ pub fn apply_corrections(
         geotransform: gt,
     };
     let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), geo, freq, los)?;
-    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los)?;
+    let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los, support)?;
     let solid_earth_tide = build_solid_earth_tide(opts, date_files, (rows, cols), geo, los)?;
 
     let total = sum_layers(
@@ -103,6 +113,115 @@ pub fn apply_corrections(
         solid_earth_tide,
         los_geometry,
     })
+}
+
+/// Apply per-group acquisition times using the same date-wise source ownership as stitching.
+pub(crate) fn apply_corrections_with_ownership(
+    groups: &[(u32, CorrectionOptions, Vec<PathBuf>)],
+    wavelength: Option<f64>,
+    displacement: &mut Array3<f64>,
+    ownership: ndarray::ArrayView3<'_, u32>,
+    geo: GeoInfo,
+    support: Option<ArrayView2<'_, bool>>,
+) -> Result<CorrectionLayers> {
+    let (bands, rows, cols) = displacement.dim();
+    ensure!(
+        ownership.dim() == (bands + 1, rows, cols)
+            && support.is_none_or(|mask| mask.dim() == (rows, cols)),
+        "correction ownership or support shape mismatch"
+    );
+    let opts = &groups
+        .first()
+        .context("missing correction spatial groups")?
+        .1;
+    let wavelength = wavelength.context("corrections require wavelength")?;
+    let los_geometry = resolve_geometry(opts, geo.epsg, geo.geotransform, (rows, cols))?;
+    let mut combined = CorrectionLayers {
+        ionosphere: None,
+        troposphere: None,
+        solid_earth_tide: None,
+        los_geometry,
+    };
+    for (owner, options, files) in groups {
+        let mut bounds = (rows, cols, 0, 0);
+        for ((_, row, col), value) in ownership.indexed_iter() {
+            if value == owner {
+                bounds.0 = bounds.0.min(row);
+                bounds.1 = bounds.1.min(col);
+                bounds.2 = bounds.2.max(row + 1);
+                bounds.3 = bounds.3.max(col + 1);
+            }
+        }
+        let (r0, c0, r1, c1) = bounds;
+        if r0 >= r1 || c0 >= c1 {
+            continue;
+        }
+        ensure!(
+            options.acquisition_utc.len() == bands + 1,
+            "spatial group acquisition UTC axis mismatch"
+        );
+        let mut gt = geo.geotransform;
+        gt[0] += c0 as f64 * gt[1] + r0 as f64 * gt[2];
+        gt[3] += c0 as f64 * gt[4] + r0 as f64 * gt[5];
+        let local_geo = GeoInfo {
+            epsg: geo.epsg,
+            geotransform: gt,
+        };
+        let shape = (r1 - r0, c1 - c0);
+        let local_los = combined.los_geometry.as_ref().map(|los| LosGeometry {
+            east: los.east.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+            north: los.north.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+            up: los.up.slice(ndarray::s![r0..r1, c0..c1]).to_owned(),
+        });
+        let ionosphere = build_ionosphere(
+            options,
+            files,
+            bands + 1,
+            shape,
+            local_geo,
+            SPEED_OF_LIGHT / wavelength,
+            local_los.as_ref(),
+        )?;
+        let local_support = support
+            .as_ref()
+            .map(|m| m.slice(ndarray::s![r0..r1, c0..c1]));
+        let troposphere = build_troposphere(
+            options,
+            bands + 1,
+            shape,
+            gt,
+            geo.epsg,
+            local_los.as_ref(),
+            local_support,
+        )?;
+        let tide = build_solid_earth_tide(options, files, shape, local_geo, local_los.as_ref())?;
+        for (destination, source) in [
+            (&mut combined.ionosphere, ionosphere),
+            (&mut combined.troposphere, troposphere),
+            (&mut combined.solid_earth_tide, tide),
+        ] {
+            if let Some(source) = source {
+                let destination = destination
+                    .get_or_insert_with(|| Array3::from_elem((bands + 1, rows, cols), f64::NAN));
+                for ((date, row, col), value) in source.indexed_iter() {
+                    if ownership[(date, row + r0, col + c0)] == *owner {
+                        destination[(date, row + r0, col + c0)] = *value;
+                    }
+                }
+            }
+        }
+    }
+    let total = sum_layers(
+        [
+            combined.ionosphere.as_ref(),
+            combined.troposphere.as_ref(),
+            combined.solid_earth_tide.as_ref(),
+        ],
+        bands + 1,
+        (rows, cols),
+    );
+    subtract_delay(displacement, total.view(), wavelength)?;
+    Ok(combined)
 }
 
 /// Resolve the configured LOS geometry and discard it, purely to fail early.
@@ -163,7 +282,14 @@ fn resolve_geometry(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    Ok(Some(resolve_los_geometry(&layers, gt, epsg, shape)?))
+    let coverage = LosCoverageOptions {
+        max_outside_static_fraction: opts
+            .max_outside_static_fraction
+            .unwrap_or(DEFAULT_MAX_OUTSIDE_STATIC_FRACTION),
+    };
+    Ok(Some(resolve_los_geometry_with_options(
+        &layers, gt, epsg, shape, coverage,
+    )?))
 }
 
 /// Sum the present delay layers (any may be absent) into one `(n_dates, rows,
@@ -228,7 +354,7 @@ fn build_solid_earth_tide(
 }
 
 /// Full acquisition UTC from a granule name's `YYYYMMDDThhmmss` token.
-fn acq_utc_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+pub(crate) fn acq_utc_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let name = path.file_name().and_then(|s| s.to_str())?;
     let chars: Vec<char> = name.chars().collect();
     chars.windows(15).find_map(|w| {
@@ -263,17 +389,20 @@ fn build_ionosphere(
     let inc_grid = los.map(LosGeometry::incidence_deg);
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, ionex_path) in opts.ionosphere_files.iter().enumerate() {
-        let utc_sec = opts.acquisition_utc.get(t).map_or_else(
-            || date_files.get(t).map_or(43200.0, |p| acq_utc_sec(p)),
-            |utc| {
-                chrono::Timelike::num_seconds_from_midnight(utc) as f64
-                    + f64::from(chrono::Timelike::nanosecond(utc)) / 1e9
-            },
-        );
+        let utc = opts
+            .acquisition_utc
+            .get(t)
+            .copied()
+            .or_else(|| {
+                date_files
+                    .get(t)
+                    .and_then(|path| acq_utc_datetime(path).map(|value| value.and_utc()))
+            })
+            .context("ionospheric correction requires full acquisition UTC")?;
         let content = std::fs::read_to_string(ionex_path)
             .with_context(|| format!("reading IONEX {}", ionex_path.display()))?;
-        let maps = read_ionex(&content).map_err(anyhow::Error::msg)?;
-        let vtec = maps.value(utc_sec, lat, lon);
+        let maps = read_ionex(&content)?;
+        let vtec = maps.value(utc, lat, lon)?;
         let layer = iono_delay_layer(
             vtec,
             freq,
@@ -302,8 +431,35 @@ fn iono_delay_layer(
     }
 }
 
+fn troposphere_bracket(
+    epochs: &[dolphin_core::config::TroposphereEpoch],
+    utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(usize, usize, f64)> {
+    ensure!(
+        !epochs.is_empty() && epochs.windows(2).all(|p| p[0].epoch < p[1].epoch),
+        "TROPO epochs must strictly increase"
+    );
+    ensure!(
+        utc >= epochs[0].epoch && utc <= epochs[epochs.len() - 1].epoch,
+        "acquisition outside TROPO temporal coverage"
+    );
+    let upper = epochs.partition_point(|entry| entry.epoch < utc);
+    if epochs[upper].epoch == utc {
+        return Ok((upper, upper, 0.0));
+    }
+    let lower = upper - 1;
+    let seconds = (utc - epochs[lower].epoch)
+        .num_microseconds()
+        .context("TROPO interval overflow")? as f64;
+    let span = (epochs[upper].epoch - epochs[lower].epoch)
+        .num_microseconds()
+        .context("TROPO span overflow")? as f64;
+    Ok((lower, upper, seconds / span))
+}
+
 /// Build the per-date tropospheric delay grid by resampling each OPERA L4 netCDF
-/// onto the frame grid.
+/// onto the frame grid. Terrain and LOS projection are judged on `support`
+/// narrowed to finite geometry ([`geometry_support`]).
 fn build_troposphere(
     opts: &CorrectionOptions,
     n_dates: usize,
@@ -311,9 +467,61 @@ fn build_troposphere(
     gt: [f64; 6],
     epsg: u32,
     los: Option<&LosGeometry>,
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Option<Array3<f64>>> {
-    if opts.troposphere_files.is_empty() {
+    if opts.troposphere_files.is_empty() && opts.troposphere_epochs.is_empty() {
         return Ok(None);
+    }
+    ensure!(
+        opts.troposphere_files.is_empty() || opts.troposphere_epochs.is_empty(),
+        "choose timed TROPO inputs or legacy per-date inputs, not both"
+    );
+    let support = geometry_support(support, los);
+    let support = support.as_ref().map(Array2::view);
+    if !opts.troposphere_epochs.is_empty() {
+        ensure!(
+            opts.acquisition_utc.len() == n_dates,
+            "timed TROPO requires every acquisition UTC"
+        );
+        ensure!(
+            opts.dem_file.is_some() && los.is_some(),
+            "timed TROPO requires ellipsoidal terrain and per-pixel LOS"
+        );
+        let terrain = load_terrain(opts, gt, epsg, (rows, cols), support)?
+            .context("missing TROPO terrain")?;
+        let slant = slant_grid(opts.incidence_angle_deg, los, (rows, cols));
+        ensure!(
+            holds_on_support(&slant, support, |v| v.is_finite() && v >= 1.0),
+            "invalid TROPO LOS projection"
+        );
+        let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
+        let mut cached = std::collections::BTreeMap::new();
+        for (t, utc) in opts.acquisition_utc.iter().enumerate() {
+            let (lower, upper, weight) = troposphere_bracket(&opts.troposphere_epochs, *utc)?;
+            cached.retain(|index, _| *index == lower || *index == upper);
+            for index in [lower, upper] {
+                if let std::collections::btree_map::Entry::Vacant(entry) = cached.entry(index) {
+                    entry.insert(tropo_at_terrain(
+                        &opts.troposphere_epochs[index].path,
+                        "total",
+                        gt,
+                        epsg,
+                        (rows, cols),
+                        &terrain,
+                        support,
+                    )?);
+                }
+            }
+            let mut layer = out.index_axis_mut(Axis(0), t);
+            ndarray::Zip::from(&mut layer)
+                .and(&cached[&lower])
+                .and(&cached[&upper])
+                .and(&slant)
+                .for_each(|value, &a, &b, &projection| {
+                    *value = (a * (1.0 - weight) + b * weight) * projection
+                });
+        }
+        return Ok(Some(out));
     }
     anyhow::ensure!(
         opts.troposphere_files.len() == n_dates,
@@ -327,13 +535,19 @@ fn build_troposphere(
     // delay must be taken at its terrain elevation; reading level 0 (-500 m)
     // over-corrects by ~2x at 2 km (issue #38). A DEM is therefore required
     // whenever the granule is height-resolved.
-    let terrain = load_terrain(opts, gt, epsg, (rows, cols))?;
+    let terrain = load_terrain(opts, gt, epsg, (rows, cols), support)?;
     let mut out = Array3::<f64>::zeros((n_dates, rows, cols));
     for (t, nc) in opts.troposphere_files.iter().enumerate() {
         let band = match terrain.as_ref() {
-            Some(dem) => {
-                tropo_at_terrain(nc, &opts.troposphere_variable, gt, epsg, (rows, cols), dem)?
-            }
+            Some(dem) => tropo_at_terrain(
+                nc,
+                &opts.troposphere_variable,
+                gt,
+                epsg,
+                (rows, cols),
+                dem,
+                support,
+            )?,
             None => {
                 let grid =
                     read_tropo_for_grid(nc, &opts.troposphere_variable, gt, epsg, (rows, cols))?;
@@ -346,23 +560,43 @@ fn build_troposphere(
 }
 
 /// Terrain elevation on the frame grid, or `None` when no DEM is configured.
+/// The DEM on the frame grid. Terrain must be finite on `support`; a nodata
+/// pixel off it stands as NaN and yields a NaN delay there, which the validity
+/// mask already excludes from the product.
 fn load_terrain(
     opts: &CorrectionOptions,
     gt: [f64; 6],
     epsg: u32,
     shape: (usize, usize),
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Option<Array2<f64>>> {
     let Some(dem) = opts.dem_file.as_ref() else {
         return Ok(None);
     };
     let grid = read_raster_for_grid(dem, gt, epsg, shape).map_err(anyhow::Error::msg)?;
-    let frame = resample_to_frame(&grid, gt, epsg, shape)?;
-    ensure_finite_coverage(&frame).map_err(anyhow::Error::msg)?;
+    let frame = resample_terrain_to_frame(&grid, gt, epsg, shape)?;
+    ensure!(
+        holds_on_support(&frame, support, f64::is_finite),
+        "terrain has nodata on valid support"
+    );
     Ok(Some(frame))
 }
 
+/// Whether `ok` holds at every pixel of `support` — at every pixel when there
+/// is no support mask.
+fn holds_on_support(
+    values: &Array2<f64>,
+    support: Option<ArrayView2<'_, bool>>,
+    ok: impl Fn(f64) -> bool,
+) -> bool {
+    values
+        .indexed_iter()
+        .all(|(index, &value)| support.is_some_and(|mask| !mask[index]) || ok(value))
+}
+
 /// Delay at each pixel's terrain elevation, linearly interpolated between the
-/// two bracketing height levels of the L4 granule.
+/// two bracketing height levels of the L4 granule. Terrain must be finite and
+/// inside the granule's height range on `support`; elsewhere the delay is NaN.
 fn tropo_at_terrain(
     nc: &Path,
     var: &str,
@@ -370,16 +604,32 @@ fn tropo_at_terrain(
     epsg: u32,
     shape: (usize, usize),
     terrain: &Array2<f64>,
+    support: Option<ArrayView2<'_, bool>>,
 ) -> Result<Array2<f64>> {
     let vars: Vec<&str> = match var {
         "total" => vec!["hydrostatic_delay", "wet_delay"],
         other => vec![other],
     };
     let levels = height_levels(nc, vars[0]).map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(!levels.is_empty(), "L4 granule reports no height levels");
+    anyhow::ensure!(
+        !levels.is_empty()
+            && levels.iter().all(|v| v.is_finite())
+            && levels.windows(2).all(|p| p[0] < p[1]),
+        "L4 height levels must be finite and strictly increasing"
+    );
+    anyhow::ensure!(
+        holds_on_support(terrain, support, |h| h.is_finite()
+            && h >= levels[0]
+            && h <= levels[levels.len() - 1]),
+        "terrain is missing or outside L4 height coverage"
+    );
     let (lo, hi) = bracketing_levels(&levels, terrain);
     let mut total = Array2::<f64>::zeros(shape);
     for name in vars {
+        anyhow::ensure!(
+            height_levels(nc, name)? == levels,
+            "tropospheric variables have different height coordinates"
+        );
         let mut planes = Vec::with_capacity(hi - lo + 1);
         for level in lo..=hi {
             let grid = read_l4_level_for_grid(nc, name, level, gt, epsg, shape)
@@ -388,6 +638,10 @@ fn tropo_at_terrain(
         }
         total += &interpolate_to_terrain(&levels[lo..=hi], &planes, terrain);
     }
+    anyhow::ensure!(
+        holds_on_support(&total, support, f64::is_finite),
+        "missing terrain interpolation support"
+    );
     Ok(total)
 }
 
@@ -411,7 +665,10 @@ fn interpolate_to_terrain(
 ) -> Array2<f64> {
     Array2::from_shape_fn(terrain.dim(), |ix| {
         let h = terrain[ix];
-        if levels.len() == 1 || !h.is_finite() {
+        if !h.is_finite() || h < levels[0] || h > levels[levels.len() - 1] {
+            return f64::NAN;
+        }
+        if levels.len() == 1 {
             return planes[0][ix];
         }
         let upper = levels
@@ -426,8 +683,32 @@ fn interpolate_to_terrain(
         } else {
             0.0
         };
+        if weight == 0.0 {
+            return planes[lower][ix];
+        }
+        if weight == 1.0 {
+            return planes[upper][ix];
+        }
         planes[lower][ix] * (1.0 - weight) + planes[upper][ix] * weight
     })
+}
+
+/// The validity support narrowed to pixels with finite LOS geometry; without
+/// per-pixel geometry the caller's support stands. The phase-link mask knows
+/// nothing of the STATIC footprint: a pixel outside every granule is admitted by
+/// the coverage gate and masked at publication, but it has no slant factor and,
+/// when the DEM stops at the granule edge, no terrain either — so terrain and
+/// projection are judged only where geometry exists.
+fn geometry_support(
+    support: Option<ArrayView2<'_, bool>>,
+    los: Option<&LosGeometry>,
+) -> Option<Array2<bool>> {
+    let Some(geometry) = los else {
+        return support.map(|mask| mask.to_owned());
+    };
+    Some(Array2::from_shape_fn(geometry.up.dim(), |index| {
+        support.is_none_or(|mask| mask[index]) && geometry.up[index].is_finite()
+    }))
 }
 
 /// Per-pixel zenith→slant factor `1/cos(incidence)`: `1/up` from geometry when
@@ -470,52 +751,260 @@ fn resample_to_frame(
     frame_epsg: u32,
     shape: (usize, usize),
 ) -> Result<ndarray::Array2<f64>> {
-    let (rows, cols) = shape;
+    let output = resample_terrain_to_frame(grid, gt, frame_epsg, shape)?;
+    ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
+    Ok(output)
+}
+
+/// [`resample_to_frame`] without the whole-grid finiteness gate: DEM nodata is
+/// judged on the validity support by the caller, not here.
+fn resample_terrain_to_frame(
+    grid: &DelayGrid,
+    gt: [f64; 6],
+    frame_epsg: u32,
+    shape: (usize, usize),
+) -> Result<ndarray::Array2<f64>> {
     match grid.epsg {
-        Some(e) if e == frame_epsg => {
-            let output = resample_bilinear(grid.data.view(), grid.geotransform, gt, (rows, cols));
-            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
-            Ok(output)
-        }
+        Some(e) if e == frame_epsg => Ok(resample_bilinear(
+            grid.data.view(),
+            grid.geotransform,
+            gt,
+            shape,
+        )),
         _ if grid.srs_wkt.is_some() || grid.epsg.is_some() => {
-            let output =
-                warp_to_frame(grid, gt, frame_epsg, (rows, cols)).map_err(anyhow::Error::msg)?;
-            ensure_finite_coverage(&output).map_err(anyhow::Error::msg)?;
-            Ok(output)
+            warp_to_frame(grid, gt, frame_epsg, shape).map_err(anyhow::Error::msg)
         }
         _ => Err(dolphin_corrections::CorrectionError::NoSourceCrs.into()),
     }
 }
 
-/// Seconds-of-day from a granule name's `…YYYYMMDDThhmmss…` stamp, else noon
-/// (43200 s) when no time token is present (e.g. a date-only synthetic name).
-fn acq_utc_sec(path: &Path) -> f64 {
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return 43200.0;
-    };
-    let chars: Vec<char> = name.chars().collect();
-    chars
-        .windows(15)
-        .find_map(parse_time_token)
-        .unwrap_or(43200.0)
-}
-
-/// Parse `YYYYMMDDThhmmss` (15 chars) → seconds of day, if the window matches.
-fn parse_time_token(w: &[char]) -> Option<f64> {
-    if w[8] != 'T'
-        || w.iter()
-            .enumerate()
-            .any(|(i, c)| i != 8 && !c.is_ascii_digit())
-    {
-        return None;
-    }
-    let n =
-        |a: usize, b: usize| -> f64 { w[a..b].iter().collect::<String>().parse().unwrap_or(0.0) };
-    Some(n(9, 11) * 3600.0 + n(11, 13) * 60.0 + n(13, 15))
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn correction_epochs_follow_date_varying_burst_owner() {
+        let _hdf5 = hdf5_guard();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!("dolphin-owner-tropo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dem = dir.join("dem.nc");
+        let geometry = dir.join("static.h5");
+        let gt = [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0];
+        write_4326_netcdf(&dem, &Array2::from_elem((3, 3), 500.0), gt);
+        write_uniform_static(&geometry, 30.0, gt, (3, 3));
+        hdf5::File::open_rw(&geometry)
+            .unwrap()
+            .dataset("/data/projection")
+            .unwrap()
+            .write_scalar(&4326_i64)
+            .unwrap();
+        let options = CorrectionOptions {
+            troposphere_epochs: vec![
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem),
+            geometry_files: vec![geometry],
+            ..Default::default()
+        };
+        let groups: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|owner| {
+                let mut options = options.clone();
+                options.acquisition_utc = [0, 60, 120]
+                    .map(|minutes| utc + chrono::Duration::minutes(minutes + 30 * i64::from(owner)))
+                    .to_vec();
+                (owner, options, vec![PathBuf::from("unused"); 3])
+            })
+            .collect();
+        let owners = ndarray::array![[[0, 1]], [[1, 0]], [[0, 1]]];
+        for wavelength in [0.05546576, 0.238403545] {
+            let mut displacement = Array3::zeros((2, 1, 2));
+            let output = apply_corrections_with_ownership(
+                &groups,
+                Some(wavelength),
+                &mut displacement,
+                owners.view(),
+                GeoInfo {
+                    epsg: 4326,
+                    geotransform: [-0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
+                },
+                None,
+            )
+            .unwrap();
+            let meters =
+                displacement.mapv(|phase| -wavelength * phase / (4.0 * std::f64::consts::PI));
+            assert!((meters[(0, 0, 0)] + 0.825 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!((meters[(0, 0, 1)] + 0.275 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!(
+                (output.troposphere.unwrap()[(0, 0, 1)] - 1.925 / 30_f64.to_radians().cos()).abs()
+                    < 1e-7
+            );
+        }
+    }
+
+    #[test]
+    fn timed_troposphere_combines_height_time_and_los() {
+        use dolphin_core::config::TroposphereEpoch;
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T23:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dem =
+            std::env::temp_dir().join(format!("dolphin-timed-tropo-dem-{}.nc", std::process::id()));
+        write_4326_netcdf(
+            &dem,
+            &Array2::from_elem((3, 3), 500.0),
+            [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0],
+        );
+        let opts = CorrectionOptions {
+            acquisition_utc: vec![
+                utc,
+                utc + chrono::Duration::minutes(90),
+                utc + chrono::Duration::hours(3),
+            ],
+            troposphere_epochs: vec![
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem.clone()),
+            ..Default::default()
+        };
+        let los = LosGeometry {
+            east: Array2::from_elem((1, 1), 0.6),
+            north: Array2::zeros((1, 1)),
+            up: Array2::from_elem((1, 1), 0.8),
+        };
+        let layers = build_troposphere(
+            &opts,
+            3,
+            (1, 1),
+            [0.5, 1.0, 0.0, 1.5, 0.0, -1.0],
+            4326,
+            Some(&los),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        for (index, expected) in [2.0625, 3.09375, 4.125].into_iter().enumerate() {
+            assert!((layers[(index, 0, 0)] - expected).abs() < 1e-10);
+        }
+        for wavelength in [0.05546576, 0.238403545] {
+            let mut displacement = Array3::zeros((2, 1, 1));
+            subtract_delay(&mut displacement, layers.view(), wavelength).unwrap();
+            let meters_per_radian = -wavelength / (4.0 * std::f64::consts::PI);
+            assert!((displacement[(0, 0, 0)] * meters_per_radian + 1.03125).abs() < 1e-10);
+            assert!((displacement[(1, 0, 0)] * meters_per_radian + 2.0625).abs() < 1e-10);
+        }
+        std::fs::remove_file(dem).unwrap();
+    }
+
+    /// A DEM nodata pixel is judged on the validity support: off it, the delay
+    /// there is NaN and the run goes on; on it, the run still fails closed.
+    #[test]
+    fn terrain_nodata_off_support_stands_as_nan() {
+        let _hdf5 = hdf5_guard();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let gt = [-0.5, 1.0, 0.0, 1.5, 0.0, -1.0];
+        let terrain = ndarray::array![[500.0, f64::NAN]];
+        let support = ndarray::array![[true, false]];
+        let delay = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            Some(support.view()),
+        )
+        .expect("nodata off support is not an error");
+        assert!(delay[(0, 0)].is_finite());
+        assert!(delay[(0, 1)].is_nan());
+
+        let whole_grid = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            None,
+        )
+        .unwrap_err();
+        assert!(whole_grid
+            .to_string()
+            .contains("outside L4 height coverage"));
+        let on_support = tropo_at_terrain(
+            &fixtures.join("tropo_lower.nc"),
+            "total",
+            gt,
+            4326,
+            (1, 2),
+            &terrain,
+            Some(ndarray::array![[true, true]].view()),
+        )
+        .unwrap_err();
+        assert!(on_support
+            .to_string()
+            .contains("outside L4 height coverage"));
+    }
+
+    #[test]
+    fn troposphere_time_brackets_are_dated_and_closed() {
+        use dolphin_core::config::TroposphereEpoch;
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T23:00:00Z")
+            .unwrap()
+            .to_utc();
+        let epochs = vec![
+            TroposphereEpoch {
+                path: "a.nc".into(),
+                epoch: start,
+            },
+            TroposphereEpoch {
+                path: "b.nc".into(),
+                epoch: start + chrono::Duration::hours(3),
+            },
+        ];
+        assert_eq!(troposphere_bracket(&epochs, start).unwrap(), (0, 0, 0.0));
+        assert_eq!(
+            troposphere_bracket(&epochs, epochs[1].epoch).unwrap(),
+            (1, 1, 0.0)
+        );
+        assert_eq!(
+            troposphere_bracket(&epochs, start + chrono::Duration::minutes(90)).unwrap(),
+            (0, 1, 0.5)
+        );
+        assert!(troposphere_bracket(&epochs, start - chrono::Duration::seconds(1)).is_err());
+        assert!(troposphere_bracket(&epochs, start + chrono::Duration::days(1)).is_err());
+        assert!(troposphere_bracket(&[epochs[0].clone(), epochs[0].clone()], start).is_err());
+    }
+
+    #[test]
+    fn terrain_interpolation_rejects_missing_and_outside_support() {
+        let levels = [0.0, 1000.0];
+        let planes = vec![ndarray::array![[2.0]], ndarray::array![[1.0]]];
+        for height in [f64::NAN, -1.0, 1001.0] {
+            assert!(
+                interpolate_to_terrain(&levels, &planes, &ndarray::array![[height]])[(0, 0)]
+                    .is_nan()
+            );
+        }
+    }
+
     /// Issue #38: a pixel's delay must come from its terrain elevation, not the
     /// granule's lowest level. Linear between bracketing levels, exact at a knot.
     #[test]
@@ -546,6 +1035,8 @@ mod tests {
     }
 
     use super::*;
+    use dolphin_corrections::geometry::resolve_los_geometry;
+    use dolphin_corrections::ionosphere::IonexError;
     use dolphin_io::read_los_layers;
     use ndarray::Array3;
 
@@ -602,7 +1093,7 @@ mod tests {
             incidence_angle_deg: 0.0, // slant = 1, so zenith delay lands unscaled
             ..Default::default()
         };
-        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610, None)
+        let layers = build_troposphere(&opts, 2, (rows, cols), dst_gt, 32610, None, None)
             .unwrap()
             .expect("troposphere layers present");
 
@@ -644,6 +1135,7 @@ mod tests {
             &[],
             32610,
             [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            None,
         )
         .unwrap();
         assert!(layers.ionosphere.is_none() && layers.troposphere.is_none());
@@ -658,7 +1150,8 @@ mod tests {
             ..Default::default()
         };
         let mut disp = Array3::<f64>::zeros((1, 1, 1));
-        let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
+        let err =
+            apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6], None).unwrap_err();
         assert!(err.to_string().contains("wavelength"));
     }
 
@@ -749,6 +1242,120 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A frame the coverage gate admits (0.3% outside the one STATIC granule) runs
+    /// timed TROPO instead of being refused: the phase-link support is narrowed to
+    /// finite geometry before the terrain and LOS-projection checks, and the
+    /// outside pixels come out as NaN delay for the validity mask to drop.
+    #[test]
+    fn outside_static_pixels_do_not_refuse_timed_troposphere() {
+        let _hdf5 = hdf5_guard();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!(
+            "dolphin-outside-static-tropo-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dem = dir.join("dem.nc");
+        let geometry = dir.join("static.h5");
+        let gt = [0.0, 1.0 / 1024.0, 0.0, 1.0, 0.0, -1.0 / 1024.0];
+        let (rows, cols) = (1000, 2);
+        write_4326_netcdf(
+            &dem,
+            &Array2::from_elem((3, 3), 500.0),
+            [-0.5, 1.0, 0.0, 2.5, 0.0, -1.0],
+        );
+        write_uniform_static(&geometry, 34.0, gt, (rows - 3, cols));
+        hdf5::File::open_rw(&geometry)
+            .unwrap()
+            .dataset("/data/projection")
+            .unwrap()
+            .write_scalar(&4326_i64)
+            .unwrap();
+        let opts = CorrectionOptions {
+            acquisition_utc: vec![
+                utc,
+                utc + chrono::Duration::minutes(90),
+                utc + chrono::Duration::hours(3),
+            ],
+            troposphere_epochs: vec![
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_lower.nc"),
+                    epoch: utc,
+                },
+                dolphin_core::config::TroposphereEpoch {
+                    path: fixtures.join("tropo_upper.nc"),
+                    epoch: utc + chrono::Duration::hours(3),
+                },
+            ],
+            dem_file: Some(dem),
+            geometry_files: vec![geometry],
+            ..Default::default()
+        };
+        let support = Array2::from_elem((rows, cols), true);
+        let mut displacement = Array3::zeros((2, rows, cols));
+        let layers = apply_corrections(
+            &opts,
+            Some(0.05546576),
+            &mut displacement,
+            &[],
+            4326,
+            gt,
+            Some(support.view()),
+        )
+        .expect("0.3% outside STATIC runs timed TROPO instead of being refused");
+        let los = layers.los_geometry.expect("geometry configured");
+        assert_eq!(los.outside_static().pixel_count, 3 * cols);
+        let troposphere = layers.troposphere.expect("timed TROPO built");
+        for row in 0..rows {
+            let inside = row < rows - 3;
+            assert_eq!(
+                troposphere[(0, row, 0)].is_finite(),
+                inside,
+                "row {row}: delay finite only inside the STATIC footprint"
+            );
+            assert_eq!(displacement[(0, row, 0)].is_finite(), inside);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `correction_options.max_outside_static_fraction` reaches the resolver: the
+    /// 0.3% corridor-edge case (a 1000×100 frame whose one STATIC granule stops
+    /// three rows short) resolves under the default gate and is refused under a
+    /// configured 0.1% one, with the outside pixels masked and counted.
+    #[test]
+    fn configured_outside_static_gate_reaches_the_resolver() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_static_outside_gate_{}.h5",
+            std::process::id()
+        ));
+        write_uniform_static(&path, 34.0, gt, (997, 100));
+        let default_gate = CorrectionOptions {
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let los = resolve_geometry(&default_gate, 32610, gt, (1000, 100))
+            .expect("0.3% outside resolves under the default gate")
+            .expect("geometry configured");
+        assert_eq!(los.outside_static().pixel_count, 300);
+
+        let tight_gate = CorrectionOptions {
+            max_outside_static_fraction: Some(0.001),
+            ..default_gate
+        };
+        let err = resolve_geometry(&tight_gate, 32610, gt, (1000, 100))
+            .expect_err("0.3% outside is refused under a 0.1% gate");
+        assert!(
+            format!("{err:#}").contains("max_outside_static_fraction"),
+            "expected the coverage gate, got: {err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Bar #5: a geometry-only config (no iono/tropo, no wavelength) still resolves
     /// and returns `LosGeometry`, leaving displacement untouched — proves the gate
     /// decoupling from `is_enabled()`/wavelength.
@@ -764,13 +1371,49 @@ mod tests {
         };
         let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, r, c)| (t + r + c) as f64);
         let original = disp.clone();
-        let layers = apply_corrections(&opts, None, &mut disp, &[], 32610, gt).unwrap();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32610, gt, None).unwrap();
 
         assert!(layers.ionosphere.is_none() && layers.troposphere.is_none());
         let los = layers.los_geometry.expect("geometry present");
         assert!((los.incidence_deg()[(1, 1)] - 34.0).abs() < 1e-3);
         assert_eq!(disp, original, "geometry-only must not touch displacement");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A malformed IONEX file reaches the caller as the typed `IonexError`, not
+    /// a flattened message, so the failure class stays inspectable.
+    #[test]
+    fn malformed_ionex_keeps_its_typed_error() {
+        let dir =
+            std::env::temp_dir().join(format!("dolphin-malformed-ionex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ionex = dir.join("garbage.INX");
+        std::fs::write(&ionex, "not an ionex file\n").unwrap();
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let opts = CorrectionOptions {
+            ionosphere_files: vec![ionex.clone(), ionex],
+            acquisition_utc: vec![utc, utc + chrono::Duration::days(12)],
+            ..Default::default()
+        };
+        let mut displacement = Array3::<f64>::zeros((1, 1, 1));
+        let err = apply_corrections(
+            &opts,
+            Some(0.05546576),
+            &mut displacement,
+            &[],
+            4326,
+            [0.0, 1.0, 0.0, 1.0, 0.0, -1.0],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<IonexError>().is_some()),
+            "expected a typed IonexError in the chain, got: {err:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A missing geometry file surfaces a contextual error (not a panic), naming the
@@ -782,21 +1425,13 @@ mod tests {
             ..Default::default()
         };
         let mut disp = Array3::<f64>::zeros((1, 2, 2));
-        let err = apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6]).unwrap_err();
+        let err =
+            apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6], None).unwrap_err();
         assert!(
             err.to_string().contains("CSLC-S1-STATIC geometry")
                 || format!("{err:#}").contains("static_geometry.h5"),
             "expected contextual geometry read error, got: {err:#}"
         );
-    }
-
-    /// Time token parsing: OPERA-style stamp → seconds of day; date-only → noon.
-    #[test]
-    fn parses_acquisition_time() {
-        let opera = Path::new("OPERA_L2_CSLC-S1_T027_20230914T132417Z_x.h5");
-        let want = 13.0 * 3600.0 + 24.0 * 60.0 + 17.0;
-        assert!((acq_utc_sec(opera) - want).abs() < 1e-9);
-        assert!((acq_utc_sec(Path::new("cslc_20221119.h5")) - 43200.0).abs() < 1e-9);
     }
 
     /// The tide needs the whole timestamp, not just the seconds of day, and a
@@ -817,7 +1452,7 @@ mod tests {
         assert!(!opts.is_enabled());
         let mut disp = Array3::from_shape_fn((2, 2, 2), |(t, r, c)| (t + r + c) as f64);
         let original = disp.clone();
-        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6]).unwrap();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6], None).unwrap();
         assert!(layers.solid_earth_tide.is_none());
         assert_eq!(disp, original);
     }
@@ -833,7 +1468,8 @@ mod tests {
         let mut disp = Array3::<f64>::zeros((1, 2, 2));
         let gt = [500_000.0, 60.0, 0.0, 2_150_000.0, 0.0, -60.0];
         let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("geometry_files"),
             "expected the geometry requirement, got: {err:#}"
@@ -855,7 +1491,8 @@ mod tests {
         };
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
         let files = vec![PathBuf::from("cslc_20230104.h5")];
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("semidiurnal"),
             "expected the timestamp requirement, got: {err:#}"
@@ -883,7 +1520,8 @@ mod tests {
             PathBuf::from("OPERA_L2_CSLC-S1_T005_20230116T124053Z_x.h5"),
         ];
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
-        let layers = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap();
+        let layers =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap();
 
         let mut explicit = opts.clone();
         explicit.acquisition_utc = files
@@ -899,6 +1537,7 @@ mod tests {
             &opaque,
             32610,
             gt,
+            None,
         )
         .unwrap();
         assert_eq!(explicit_disp, disp);

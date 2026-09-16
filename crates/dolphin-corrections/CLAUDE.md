@@ -23,7 +23,14 @@ modelling + raster subtraction, no solver.
   always scale to the *configured* λ, never a C-band constant. IONEX is coarse
   (2.5°×5°), so VTEC is sampled once at the frame centre per date (`grid_centroid_lonlat`
   → lon/lat; acquisition time-of-day from the granule name) and projected to a uniform
-  delay grid.
+  delay grid. **IONEX rules (typed `IonexError`, `ionosphere.rs`):** map times are the
+  `EPOCH OF CURRENT MAP` records, never `first + n·INTERVAL`; they must strictly increase
+  and match the header's `EPOCH OF FIRST/LAST MAP` (`EpochOrder` / `EpochMismatch`); an
+  acquisition outside `[first, last]` is `TemporalCoverage`, never an extrapolation; a raw
+  `9999` cell is missing before the `EXPONENT` scaling (never `999.9` TECU); and any
+  positive trilinear weight on a missing cell makes the sample `MissingTec`, not a number.
+  Contract fixture: `tests/fixtures/IGS0OPSFIN_20230010000_01D_02H_GIM.maps01_13.INX`
+  (two genuine IGS GIM maps; its COMMENT records list the source lines kept).
 
 - **Troposphere (non-dispersive).** Same delay in meters for L- and C-band. Primary
   source: the public OPERA L4 tropospheric netCDF (DISP-S1-aligned), read via GDAL's
@@ -69,8 +76,16 @@ modelling + raster subtraction, no solver.
   **Nodata rule matches dolphin (`nodata=0`):** every
   component is reprojected via `warp_to_frame` (GDAL fills off-coverage with exactly 0), so a
   frame pixel is valid iff `east≠0 || north≠0` and finite; for S1 (incidence 30–46°) a valid
-  pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Partial coverage is a
-  **hard `GeometryCoverage` error, never a silent 0°/nadir pixel.** The resolved
+  pixel always has a substantial e/n, so `(0,0)` uniquely marks fill. Frame pixels no granule
+  covers are **masked** — NaN in all three components, so nodata in every downstream product,
+  never interpolated and never a silent 0°/nadir pixel — and counted
+  (`LosGeometry::outside_static` → provenance `outside_static_pixel_count` /
+  `outside_static_fraction`). The run is refused (`GeometryCoverage`) only when the outside
+  fraction exceeds `LosCoverageOptions::max_outside_static_fraction` (default 10%,
+  `DEFAULT_MAX_OUTSIDE_STATIC_FRACTION`): eo's corridor frames ran 0.3% and 0.6% past the one
+  STATIC granule staged per burst (an edge strip, masked), while 31.4% outside is a third of
+  the frame with no geometry — a wrong or missing granule, refused. `resolve_los_geometry`
+  uses the default; `resolve_los_geometry_with_options` takes the gate. The resolved
   `LosGeometry{east,north,up}` is also the front door for the GPS ENU→LOS harness
   (`d_los = d_e·east + d_n·north + d_u·up`, ground→sensor). Design + deferrals (iono ground→shell
   mapping, seam nearest-resample): `md/design/per-pixel-los-geometry.md`.

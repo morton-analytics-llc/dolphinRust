@@ -1,0 +1,13 @@
+netcdf tropo_upper {
+dimensions: height=2; lat=3; lon=3;
+variables:
+ double height(height); height:units="m";
+ double lat(lat); lat:units="degrees_north";
+ double lon(lon); lon:units="degrees_east";
+ double hydrostatic_delay(height,lat,lon); hydrostatic_delay:units="m";
+ double wet_delay(height,lat,lon); wet_delay:units="m";
+data:
+ height=0,1000; lat=0,1,2; lon=0,1,2;
+ hydrostatic_delay=4,4,4,4,4,4,4,4,4,2,2,2,2,2,2,2,2,2;
+ wet_delay=0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.2,0.2,0.2,0.2,0.2,0.2,0.2,0.2,0.2;
+}

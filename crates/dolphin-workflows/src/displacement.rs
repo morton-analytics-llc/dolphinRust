@@ -38,6 +38,10 @@ use dolphin_timeseries::{
     RelaxationTerm, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
     DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
+use dolphin_timeseries::{
+    detect_cycle_steps, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
+    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, MIN_CYCLE_STEP_NEIGHBOURS,
+};
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
@@ -46,7 +50,7 @@ use sha2::{Digest, Sha256};
 use crate::burst::{
     burst_offset, frame_grid, resolve_layover_shadow_masks, workflow_groups, BurstGeo, FrameGrid,
 };
-use crate::corrections::{apply_corrections, CorrectionLayers};
+use crate::corrections::{apply_corrections, apply_corrections_with_ownership, CorrectionLayers};
 use crate::covariance_artifact::{
     finalize_covariance_artifact, preflight_covariance_artifact_disk_with_identity_index,
     CovarianceArtifactDiskAdmission, CovarianceArtifactManifest, CovarianceArtifactTransaction,
@@ -59,6 +63,10 @@ use crate::cslc_covariance_source::{
     CSLC_COVARIANCE_SOURCE_PROVIDER_VERSION,
 };
 use crate::dates::parse_date;
+use crate::phase_steps::{
+    junction_epochs, junction_steps, step_components, CycleStepProvenance, JunctionProvenance,
+    JunctionStep,
+};
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
     INPUT_COVERAGE_POLICY_VERSION,
@@ -130,8 +138,54 @@ impl VelocityEstimator {
     }
 }
 
+/// Publication eligibility and executed closure QC, not scientific qualification.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PublicationQuality {
+    /// Previously eligible pixels excluded by component membership.
+    pub component_rejected_pixels: usize,
+    /// Eligible pixels each interferogram's component membership rejected on
+    /// its own, indexed like `interferogram_pairs`. With a reference, a pixel
+    /// must share the reference's label in every band, so one interferogram
+    /// that unwrapped as two regions removes the far side for every date; this
+    /// is where that shows. A pixel rejected by several bands counts in each.
+    pub component_rejected_per_band: Vec<usize>,
+    /// The band that rejected the most pixels, `None` when none rejected any.
+    pub component_worst_band: Option<usize>,
+    /// Whether the published series carries a final spatial reference.
+    pub spatial_reference: SpatialReferenceStatus,
+    /// disabled, unavailable_no_triangles, or evaluated.
+    pub closure_qc_status: &'static str,
+    /// Analysed pixels the closure QC left unjudged because a loop through them
+    /// fell in a component triple below `MIN_ROOT_PIXELS`; `None` unless it ran.
+    pub closure_unjudged_small_triple_pixels: Option<usize>,
+    /// Component triples, over every loop, too small to contribute a root;
+    /// `None` unless the closure QC ran.
+    pub closure_small_root_triples: Option<usize>,
+    /// Published pixels carrying at least one detected whole-cycle step
+    /// against their neighbours (E4); the per-pixel counts are
+    /// [`DisplacementOutput::cycle_step_flag`].
+    pub cycle_step_flagged_pixels: usize,
+}
+
+/// The final spatial reference of a published product.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SpatialReferenceStatus {
+    /// The series and velocity are relative to `reference_point`.
+    Selected,
+    /// No displacement-valid pixel survived the publication masks, so nothing
+    /// could serve as the datum: the product is published entirely as nodata,
+    /// with the reason, rather than failing the run.
+    Unavailable {
+        /// What emptied the eligible set, with the counts behind it.
+        reason: String,
+    },
+}
+
 /// Displacement pipeline outputs (in-memory mirror of the written rasters).
 pub struct DisplacementOutput {
+    /// Actual publication mask and QC evidence.
+    pub publication_quality: PublicationQuality,
     /// Per-date cumulative displacement, `(n_dates-1, rows, cols)`, referenced
     /// to acquisition 0. Units are meters when `input_options.wavelength` is set,
     /// otherwise radians of wrapped LOS phase.
@@ -187,6 +241,12 @@ pub struct DisplacementOutput {
     pub phase_similarity: Option<Array2<f64>>,
     /// Pixels with complete temporal input support after burst mosaicking and trim.
     pub validity_mask: Array2<bool>,
+    /// Number of dates at which the pixel's step differed from its connected
+    /// component's neighbourhood by a whole number of cycles, `(rows, cols)`;
+    /// `0` where none was detected or the pixel is unpublished. Detected on the
+    /// raw inverted series and never corrected: a mask or annotation input for
+    /// the host, written as `cycle_step_flag.tif`.
+    pub cycle_step_flag: Array2<u32>,
     /// Per-ministack marginal CRLB phase-estimate σ (radians), stitched as
     /// `(n_dates, rows, cols)`. Band 0 is a structural gauge zero and later
     /// ministacks use changing compressed references; cross-date covariance is
@@ -400,7 +460,11 @@ fn finish_displacement(
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
     let stitched = timed("stitch", || {
-        stitch_bursts(bursts, cfg.phase_linking.write_covariance_operator)
+        stitch_bursts(
+            bursts,
+            cfg.phase_linking.write_covariance_operator,
+            cfg.correction_options.is_enabled() && groups.len() > 1,
+        )
     })?;
     let validity_mask = stitched.validity_mask;
     let burst_coverage = stitched.coverage;
@@ -465,10 +529,22 @@ fn finish_displacement(
     let (mut inversion, loop_closure) = solve_time_series(
         cfg,
         unwrap.unwrapped,
+        unwrap.connected_components.view(),
         &pairs,
         stitched.crlb_sigma.as_ref(),
         cfg.phase_linking.write_covariance_operator,
     )?;
+    // Per-date step diagnostics belong here, on the raw inverted series: the
+    // corrections would smear an integer step and the spatial reference would
+    // add one pixel's own step to every other pixel's.
+    let phase_steps = timed("phase_steps", || {
+        phase_step_diagnostics(
+            cfg,
+            inversion.displacement.view(),
+            unwrap.connected_components.view(),
+            &pairs,
+        )
+    })?;
     // Atmospheric corrections subtract per-date delay from the inverted series
     // before the final spatial reference and velocity. Reference selection runs
     // on the corrected series so it cannot choose a high-coherence pixel whose
@@ -487,27 +563,18 @@ fn finish_displacement(
                         geotransform,
                     },
                     None,
+                    stitched.ownership.as_ref().map(|owners| owners.view()),
+                    validity_mask.view(),
                 )
             },
             |displacement| {
-                if let Some(point) = configured_reference {
-                    anyhow::ensure!(
-                        reference_pixel_is_valid(validity_mask.view(), displacement, point),
-                        "timeseries_options.reference_point has non-finite corrected displacement"
-                    );
-                    return Ok(Some(point));
-                }
-                let selected = select_valid_reference_point(
+                final_spatial_reference(
+                    cfg,
+                    configured_reference,
                     temporal_coherence.view(),
                     validity_mask.view(),
                     displacement,
-                    cfg.timeseries_options.correlation_threshold,
-                );
-                anyhow::ensure!(
-                    selected.is_some() || !cfg.timeseries_options.write_velocity_uncertainty,
-                    "velocity uncertainty requires a displacement-valid final spatial reference meeting the coherence threshold"
-                );
-                Ok(selected)
+                )
             },
         )
     })?;
@@ -550,6 +617,7 @@ fn finish_displacement(
         inversion.displacement.view(),
         &days,
         analysis_reference_point,
+        validity_mask.view(),
         &date_files,
     )?;
     let spatial = SpatialProducts {
@@ -559,6 +627,8 @@ fn finish_displacement(
         velocity_model,
         velocity_terms: fit.terms,
         loop_closure,
+        junctions: phase_steps.junctions,
+        cycle_steps: phase_steps.cycle_steps,
         temporal_coherence,
         validity_mask,
         burst_coverage,
@@ -579,6 +649,70 @@ fn finish_displacement(
         production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
+}
+
+/// The configured reference, checked against the corrected series, else the
+/// best displacement-valid pixel meeting the coherence threshold. Velocity
+/// uncertainty needs that datum, so its absence fails the run — unless no
+/// displacement-valid pixel is left at all (the loop-closure gate can mask a
+/// whole frame), in which case there is nothing to reference and the product
+/// goes on to publish as unavailable rather than die.
+fn final_spatial_reference(
+    cfg: &DisplacementWorkflow,
+    configured_reference: Option<(usize, usize)>,
+    temporal_coherence: ArrayView2<f64>,
+    validity_mask: ArrayView2<bool>,
+    displacement: ArrayView3<f64>,
+) -> Result<Option<(usize, usize)>> {
+    if let Some(point) = configured_reference {
+        anyhow::ensure!(
+            reference_pixel_is_valid(validity_mask, displacement, point),
+            "timeseries_options.reference_point has non-finite corrected displacement"
+        );
+        return Ok(Some(point));
+    }
+    let selected = select_valid_reference_point(
+        temporal_coherence,
+        validity_mask,
+        displacement,
+        cfg.timeseries_options.correlation_threshold,
+    );
+    if selected.is_none() && cfg.timeseries_options.write_velocity_uncertainty {
+        let referenceable = referenceable_pixel_count(Some(validity_mask), displacement);
+        anyhow::ensure!(
+            referenceable == 0,
+            "velocity uncertainty requires a displacement-valid final spatial reference meeting \
+             the coherence threshold ({referenceable} of {} analysed pixels are \
+             displacement-valid; none meets it)",
+            validity_mask.len()
+        );
+        tracing::warn!(
+            stage = "reference",
+            analysed_pixels = validity_mask.len(),
+            "no pixel is valid on every date; the product will publish without a spatial reference"
+        );
+    }
+    Ok(selected)
+}
+
+/// Pixels that can carry the spatial reference: inside the validity mask (when
+/// one is given) and finite on every date. The reference stage and the
+/// velocity fit both decide "nothing to reference, publish as unavailable" on
+/// this count reaching zero, so neither can admit a frame the other refuses.
+fn referenceable_pixel_count(
+    validity_mask: Option<ArrayView2<bool>>,
+    displacement: ArrayView3<f64>,
+) -> usize {
+    let (_, rows, cols) = displacement.dim();
+    (0..rows)
+        .flat_map(|row| (0..cols).map(move |col| (row, col)))
+        .filter(|&point| {
+            validity_mask.is_none_or(|mask| mask[point])
+                && displacement
+                    .axis_iter(Axis(0))
+                    .all(|band| band[point].is_finite())
+        })
+        .count()
 }
 
 fn correct_then_reference(
@@ -721,6 +855,8 @@ fn correct_and_reference(
     date_files: &[PathBuf],
     geo: GeoInfo,
     reference: Option<(usize, usize)>,
+    ownership: Option<ArrayView3<'_, u32>>,
+    support: ArrayView2<'_, bool>,
 ) -> Result<CorrectionLayers> {
     let mut options = cfg.correction_options.clone();
     if !cfg.input_options.acquisition_metadata.is_empty() {
@@ -736,14 +872,51 @@ fn correct_and_reference(
             })
             .collect::<Result<Vec<_>>>()?;
     }
-    let corrections = apply_corrections(
-        &options,
-        cfg.input_options.wavelength,
-        displacement,
-        date_files,
-        geo.epsg,
-        geo.geotransform,
-    )?;
+    let corrections = if let Some(ownership) = ownership.filter(|_| options.is_enabled()) {
+        let groups = workflow_groups(cfg)?;
+        let group_options = groups
+            .values()
+            .enumerate()
+            .map(|(index, indices)| {
+                let files = burst_files(cfg, indices);
+                let mut options = options.clone();
+                options.acquisition_utc = files
+                    .iter()
+                    .map(|path| {
+                        cfg.input_options
+                            .acquisition_metadata
+                            .iter()
+                            .find(|record| record.path == *path)
+                            .map(|record| record.acquisition_utc)
+                            .or_else(|| {
+                                crate::corrections::acq_utc_datetime(path)
+                                    .map(|time| time.and_utc())
+                            })
+                            .context("missing actual spatial-group acquisition UTC")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((u32::try_from(index)?, options, files))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        apply_corrections_with_ownership(
+            &group_options,
+            cfg.input_options.wavelength,
+            displacement,
+            ownership,
+            geo,
+            Some(support),
+        )?
+    } else {
+        apply_corrections(
+            &options,
+            cfg.input_options.wavelength,
+            displacement,
+            date_files,
+            geo.epsg,
+            geo.geotransform,
+            Some(support),
+        )?
+    };
     if let Some(point) = reference {
         reference_to_point(displacement, point);
     }
@@ -927,16 +1100,101 @@ fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTe
 /// Loop-closure QC on the unwrapped network, then the SBAS solve. The QC runs
 /// first because a 2π unwrap error is a confident wrong number in the solve, and
 /// it is invisible to the wrapped closure-phase layer (#24).
+const JUNCTION_STEP_NOTE: &str = "Per-pixel phase step from the last date of one ministack to the \
+first of the next, on the inverted series before corrections and the spatial reference, minus \
+the median step of the pixel's unwrap connected component. Its fractional part is the wrapped \
+linked-phase step; a whole number of cycles is the unwrapper's integer. Diagnostic only.";
+
+const CYCLE_STEP_FLAG_NOTE: &str = "Number of dates at which the pixel's phase step into the date \
+differed from the median step of its unwrap connected component within a 5x5 neighbourhood by a \
+whole number of cycles (within 0.25 cycle), on the inverted series before corrections and the \
+spatial reference. 0 = none detected or unpublished. Never corrected; a mask or annotation input.";
+
+const CYCLE_STEP_NOTE: &str =
+    "Detected whole-cycle step of the pixel into this acquisition against \
+the median step of its unwrap connected component within a 5x5 neighbourhood, in cycles; 0 = none \
+detected or not judged. File index NN is the acquisition index the step lands on.";
+
+/// Per-date step diagnostics on the raw inverted series (E4, 2026-09-15).
+struct PhaseStepProducts {
+    junctions: Vec<JunctionStep>,
+    cycle_steps: CycleStepDetection,
+}
+
+/// The per-pixel step across every ministack boundary, and the per-date
+/// whole-cycle step detector, both on the raw inverted series (E4,
+/// 2026-09-15). The boundaries come from the same planner that sequenced
+/// phase linking, so they are the junctions the compressed-SLC chain actually
+/// crossed; a single ministack yields no junction entries.
+fn phase_step_diagnostics(
+    cfg: &DisplacementWorkflow,
+    series: ArrayView3<f64>,
+    connected_components: ArrayView3<u32>,
+    pairs: &[(usize, usize)],
+) -> Result<PhaseStepProducts> {
+    let n_dates = series.dim().0 + 1;
+    let plan = MiniStackPlanner {
+        num_slc: n_dates,
+        max_num_compressed: cfg.phase_linking.max_num_compressed,
+        output_reference_idx: isize::try_from(cfg.phase_linking.output_reference_idx.unwrap_or(0))
+            .context("phase_linking.output_reference_idx exceeds isize")?,
+        compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
+    }
+    .plan(cfg.phase_linking.ministack_size)
+    .map_err(anyhow::Error::msg)?;
+    let epochs = junction_epochs(&plan);
+    let components = step_components(pairs, connected_components, series);
+    let junctions = junction_steps(series, components.view(), &epochs);
+    for junction in &junctions {
+        tracing::info!(
+            stage = "phase_steps",
+            epoch = junction.summary.epoch,
+            evaluable = junction.summary.evaluable_pixels,
+            over_half_cycle = junction.summary.fraction_over_half_cycle,
+            integer_cycle = junction.summary.fraction_integer_cycle,
+            linked_over_quarter = junction.summary.fraction_linked_over_quarter_cycle,
+            "ministack junction step"
+        );
+    }
+    let cycle_steps = detect_cycle_steps(
+        series,
+        components.view(),
+        DEFAULT_CYCLE_STEP_HALF_WINDOW,
+        DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+    );
+    let flagged_pixels = cycle_steps
+        .step_count
+        .iter()
+        .filter(|&&count| count > 0)
+        .count();
+    let worst = cycle_steps
+        .per_date
+        .iter()
+        .max_by(|a, b| a.flagged_fraction.total_cmp(&b.flagged_fraction));
+    tracing::info!(
+        stage = "phase_steps",
+        flagged_pixels,
+        worst_epoch = worst.map(|date| date.epoch),
+        worst_flagged_fraction = worst.map(|date| date.flagged_fraction),
+        "whole-cycle steps against the neighbourhood"
+    );
+    Ok(PhaseStepProducts {
+        junctions,
+        cycle_steps,
+    })
+}
+
 fn solve_time_series(
     cfg: &DisplacementWorkflow,
     mut dphi_rad: Array3<f64>,
+    connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
     crlb_sigma: Option<&Array3<f64>>,
     retain_fixed_l2_inputs: bool,
 ) -> Result<(InversionProducts, Option<LoopClosureQc>)> {
     let loop_closure = timed("loop_closure", || {
-        apply_loop_closure_qc(cfg, &mut dphi_rad, pairs)
-    });
+        apply_loop_closure_qc(cfg, &mut dphi_rad, connected_components, pairs)
+    })?;
     let incidence = get_incidence_matrix(pairs);
     let inversion = timed("timeseries", || {
         invert_time_series(
@@ -953,14 +1211,21 @@ fn solve_time_series(
 
 /// Run the opt-in post-unwrap loop-closure QC and blank the failing pixels.
 /// Returns the QC layers for output, or `None` when the gate is off or the
-/// network has no loops to close.
+/// network has no loops to close. The QC needs no spatial reference: each
+/// loop's shared integer-cycle root is removed per unwrap component inside
+/// `loop_closure_qc`, and referencing to a pixel first would only add that
+/// pixel's sub-cycle noise to every residual.
+///
+/// # Errors
+/// If the connected-component labels are not the shape of the unwrapped stack.
 fn apply_loop_closure_qc(
     cfg: &DisplacementWorkflow,
     dphi_rad: &mut Array3<f64>,
+    connected_components: ArrayView3<u32>,
     pairs: &[(usize, usize)],
-) -> Option<LoopClosureQc> {
+) -> Result<Option<LoopClosureQc>> {
     if !cfg.timeseries_options.mask_unwrap_loop_errors {
-        return None;
+        return Ok(None);
     }
     if network_triplets(pairs).is_empty() {
         tracing::warn!(
@@ -969,18 +1234,26 @@ fn apply_loop_closure_qc(
              triangles (single-reference?) — nothing to check; set \
              interferogram_network.max_bandwidth or max_temporal_baseline"
         );
-        return None;
+        return Ok(None);
     }
-    let qc = loop_closure_qc(dphi_rad.view(), pairs, DEFAULT_CLOSURE_TOLERANCE_CYCLES);
+    let qc = loop_closure_qc(
+        dphi_rad.view(),
+        connected_components,
+        pairs,
+        DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    )?;
     let masked = qc.bad_loop_count.iter().filter(|&&n| n > 0.0).count();
     tracing::info!(
         stage = "loop_closure",
         masked_pixels = masked,
         pixels = qc.bad_loop_count.len(),
+        unjudged_small_triple_pixels = qc.unjudged_small_triple_pixels,
+        small_root_triples = qc.small_root_triples,
+        min_root_pixels = dolphin_timeseries::MIN_ROOT_PIXELS,
         "masked pixels whose unwrapped loops did not close"
     );
     mask_failed_loops(dphi_rad, &qc);
-    Some(qc)
+    Ok(Some(qc))
 }
 
 /// Resolve the configured time-function model and fit the whole-frame velocity.
@@ -989,11 +1262,19 @@ fn frame_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     reference_point: Option<(usize, usize)>,
+    validity_mask: ArrayView2<bool>,
     date_files: &[PathBuf],
 ) -> Result<(VelocityModel, VelocityFit)> {
     let model = velocity_model(cfg, date_files)?;
     let fit = timed("velocity", || {
-        fit_velocity(cfg, displacement, days, reference_point, &model)
+        fit_velocity(
+            cfg,
+            displacement,
+            days,
+            reference_point,
+            Some(validity_mask),
+            &model,
+        )
     })?;
     Ok((model, fit))
 }
@@ -1009,6 +1290,7 @@ fn fit_velocity(
     displacement: ArrayView3<f64>,
     days: &[f64],
     reference_point: Option<(usize, usize)>,
+    validity_mask: Option<ArrayView2<bool>>,
     model: &VelocityModel,
 ) -> Result<VelocityFit> {
     anyhow::ensure!(
@@ -1027,14 +1309,26 @@ fn fit_velocity(
             model,
         ));
     }
-    let reference =
-        reference_point.context("velocity uncertainty requires a final spatial reference point")?;
-    anyhow::ensure!(
-        displacement
-            .axis_iter(Axis(0))
-            .all(|band| band[reference] == 0.0),
-        "velocity uncertainty requires an exact zero at the final spatial reference"
-    );
+    match reference_point {
+        Some(reference) => anyhow::ensure!(
+            displacement
+                .axis_iter(Axis(0))
+                .all(|band| band[reference] == 0.0),
+            "velocity uncertainty requires an exact zero at the final spatial reference"
+        ),
+        // A series with no referenceable pixel has nothing to reference; the
+        // fit below reports every pixel unavailable, which is the truthful
+        // product. Same predicate as `final_spatial_reference`.
+        None => {
+            let referenceable = referenceable_pixel_count(validity_mask, displacement);
+            anyhow::ensure!(
+                referenceable == 0,
+                "velocity uncertainty requires a final spatial reference point ({referenceable} \
+                 of {} pixels are valid on every date)",
+                displacement.dim().1 * displacement.dim().2
+            );
+        }
+    }
     if !model.is_linear() {
         return Ok(fit_post_gauge_velocity_with_model(
             post_gauge_days,
@@ -1167,6 +1461,10 @@ struct SpatialProducts {
     velocity_model: VelocityModel,
     velocity_terms: VelocityTerms,
     loop_closure: Option<LoopClosureQc>,
+    /// Per-pixel step across each ministack boundary (E4), analysis frame.
+    junctions: Vec<JunctionStep>,
+    /// Per-date whole-cycle steps against the neighbourhood (E4), analysis frame.
+    cycle_steps: CycleStepDetection,
     temporal_coherence: Array2<f64>,
     validity_mask: Array2<bool>,
     burst_coverage: Vec<BurstCoverageProvenance>,
@@ -1262,6 +1560,43 @@ fn restrict_publication_mask(
     Ok(())
 }
 
+/// Keep only pixels with a component in every interferogram — the reference's
+/// component, when there is one. Returns, per band, how many of the pixels
+/// eligible on entry that band alone rejected; a pixel rejected by several
+/// bands counts in each, so the worst band is visible whatever the band order.
+fn restrict_component_mask(
+    mask: &mut Array2<bool>,
+    components: ndarray::ArrayView3<'_, u32>,
+    interferogram_count: usize,
+    reference: Option<(usize, usize)>,
+) -> Result<Vec<usize>> {
+    anyhow::ensure!(
+        components.dim() == (interferogram_count, mask.nrows(), mask.ncols()),
+        "connected-component dimensions do not match the publication grid and network"
+    );
+    anyhow::ensure!(
+        interferogram_count > 0,
+        "publication requires unwrap connected components"
+    );
+    let eligible = mask.clone();
+    let mut rejected_per_band = Vec::with_capacity(interferogram_count);
+    for band in components.axis_iter(Axis(0)) {
+        let label = reference.map(|point| band.get(point).copied().unwrap_or(0));
+        anyhow::ensure!(label != Some(0), "reference has no connected component");
+        let mut rejected = 0;
+        ndarray::Zip::from(&mut *mask)
+            .and(&eligible)
+            .and(band)
+            .for_each(|valid, &was_eligible, &component| {
+                let keep = component != 0 && label.is_none_or(|value| value == component);
+                rejected += usize::from(was_eligible && !keep);
+                *valid &= keep;
+            });
+        rejected_per_band.push(rejected);
+    }
+    Ok(rejected_per_band)
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_displacement(
     cfg: &DisplacementWorkflow,
@@ -1274,6 +1609,26 @@ fn emit_displacement(
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
     }
+    // Counted before the validity mask blanks the QC layers at the pixels it masked.
+    let cycle_step_flagged_analysis_pixels = spatial
+        .cycle_steps
+        .step_count
+        .iter()
+        .filter(|&&count| count > 0)
+        .count();
+    let closure_masked = spatial
+        .loop_closure
+        .as_ref()
+        .map(|qc| qc.failed_mask().iter().filter(|&&bad| bad).count());
+    // Likewise the geometry: after the mask, NaN `up` marks every masked pixel,
+    // not only those outside the STATIC granule. With output bounds set,
+    // `spatial.trim` has already cropped the geometry, so the count and
+    // fraction are over the published grid, not the analysis grid.
+    let outside_static = spatial
+        .corrections
+        .los_geometry
+        .as_ref()
+        .map(LosGeometry::outside_static);
     spatial.apply_validity_mask();
     restrict_publication_mask(
         cfg,
@@ -1283,33 +1638,119 @@ fn emit_displacement(
         },
         &mut spatial.validity_mask,
     )?;
+    let eligible_before_components = spatial.validity_mask.iter().filter(|&&valid| valid).count();
+    let mut component_rejected_per_band = restrict_component_mask(
+        &mut spatial.validity_mask,
+        spatial.unwrap_connected_components.view(),
+        spatial.interferogram_pairs.len(),
+        None,
+    )?;
     // The datum must survive the publication quality masks: every published velocity is
     // relative to the reference pixel, so a reference sitting in layover/shadow — or
     // outside the native STATIC coverage — makes the whole field untrustworthy. The
     // reference is chosen from coherence alone, before these masks exist, so it can land
     // on a pixel they later exclude. Re-select among pixels that survive them and
     // re-reference, rather than failing a run that has already done all its work.
-    if spatial
+    let spatial_reference = if spatial
         .reference_point
         .is_none_or(|point| !spatial.validity_mask.get(point).copied().unwrap_or(false))
     {
-        let mut quality = spatial.temporal_coherence.clone();
-        ndarray::Zip::from(&mut quality)
-            .and(&spatial.validity_mask)
-            .for_each(|value, &valid| {
-                if !valid {
-                    *value = 0.0;
-                }
-            });
-        let point = select_reference_point(
-            quality.view(),
+        let selected = select_valid_reference_point(
+            spatial.temporal_coherence.view(),
+            spatial.validity_mask.view(),
+            spatial.disp_rad.view(),
             cfg.timeseries_options.correlation_threshold,
-        )
-        .context(
-            "no pixel surviving the publication quality masks meets the configured reference coherence threshold",
-        )?;
-        spatial.rereference_to(point, &days, cfg)?;
+        );
+        match selected {
+            Some(point) => {
+                spatial.rereference_to(point, &days, cfg)?;
+                SpatialReferenceStatus::Selected
+            }
+            None => {
+                // Pixels survive but none meets the threshold: still a configuration
+                // failure. Nothing survives at all: a product with nothing to reference,
+                // published as such (T035-073278-IW1, 2026-09-15: the loop-closure gate
+                // masked 156,429 of 156,429 pixels and the run died here instead).
+                anyhow::ensure!(
+                    !spatial.validity_mask.iter().any(|&valid| valid),
+                    "no pixel surviving the publication quality masks meets the configured reference coherence threshold"
+                );
+                let analysed = spatial.validity_mask.len();
+                let component_rejected: usize = component_rejected_per_band.iter().sum();
+                let closure = closure_masked.map_or(String::new(), |masked| {
+                    format!("; loop closure masked {masked} of {analysed} analysed pixels")
+                });
+                let reason = format!(
+                    "no displacement-valid pixel survives the publication masks \
+                     ({eligible_before_components} of {analysed} analysed pixels were eligible \
+                     before component membership, which rejected {component_rejected}{closure})"
+                );
+                tracing::warn!(
+                    stage = "publication",
+                    reason,
+                    "publishing without a spatial reference"
+                );
+                SpatialReferenceStatus::Unavailable { reason }
+            }
+        }
+    } else {
+        SpatialReferenceStatus::Selected
+    };
+    let referenced_rejections = restrict_component_mask(
+        &mut spatial.validity_mask,
+        spatial.unwrap_connected_components.view(),
+        spatial.interferogram_pairs.len(),
+        spatial.reference_point,
+    )?;
+    for (total, rejected) in component_rejected_per_band
+        .iter_mut()
+        .zip(referenced_rejections)
+    {
+        *total += rejected;
     }
+    let component_worst_band = component_rejected_per_band
+        .iter()
+        .enumerate()
+        .filter(|(_, &rejected)| rejected > 0)
+        .max_by_key(|(_, &rejected)| rejected)
+        .map(|(band, _)| band);
+    tracing::info!(
+        stage = "publication",
+        component_rejected_pixels = eligible_before_components
+            - spatial.validity_mask.iter().filter(|&&valid| valid).count(),
+        worst_band = ?component_worst_band,
+        worst_band_pair = ?component_worst_band.map(|band| spatial.interferogram_pairs[band]),
+        "eligible pixels rejected by each interferogram's component membership: {component_rejected_per_band:?}"
+    );
+    spatial.apply_validity_mask();
+    let publication_quality = PublicationQuality {
+        component_rejected_pixels: eligible_before_components
+            - spatial.validity_mask.iter().filter(|&&valid| valid).count(),
+        component_rejected_per_band,
+        component_worst_band,
+        spatial_reference,
+        closure_qc_status: if !cfg.timeseries_options.mask_unwrap_loop_errors {
+            "disabled"
+        } else if spatial.loop_closure.is_some() {
+            "evaluated"
+        } else {
+            "unavailable_no_triangles"
+        },
+        closure_unjudged_small_triple_pixels: spatial
+            .loop_closure
+            .as_ref()
+            .map(|qc| qc.unjudged_small_triple_pixels),
+        closure_small_root_triples: spatial
+            .loop_closure
+            .as_ref()
+            .map(|qc| qc.small_root_triples),
+        cycle_step_flagged_pixels: spatial
+            .cycle_steps
+            .step_count
+            .iter()
+            .filter(|&&count| count > 0)
+            .count(),
+    };
     if let Some(covariance) = spatial.production_covariance.as_mut() {
         covariance.correction_order_digest = correction_order_digest(
             &cfg.correction_options,
@@ -1377,14 +1818,39 @@ fn emit_displacement(
             relaxation_amplitude: &scaled.relaxation_amplitude,
         },
         loop_closure: spatial.loop_closure.as_ref(),
+        junction_steps: cfg
+            .timeseries_options
+            .write_cycle_step_diagnostics
+            .then_some(spatial.junctions.as_slice()),
+        cycle_step_flag: Some(&spatial.cycle_steps.step_count),
+        cycle_steps: cfg
+            .timeseries_options
+            .write_cycle_step_diagnostics
+            .then_some(&spatial.cycle_steps.steps),
     };
     let input_coverage = summarize_input_coverage(&spatial);
-    let geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
+    let mut geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
+        outside_static,
         crop.map(|plan| plan.provenance.clone()),
         Some(input_coverage),
     );
+    geometry_provenance.ministack_junctions = Some(JunctionProvenance {
+        ministack_size: cfg.phase_linking.ministack_size,
+        junctions: spatial
+            .junctions
+            .iter()
+            .map(|junction| junction.summary.clone())
+            .collect(),
+    });
+    geometry_provenance.cycle_steps = Some(CycleStepProvenance {
+        half_window: DEFAULT_CYCLE_STEP_HALF_WINDOW,
+        tolerance_cycles: DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+        min_neighbours: MIN_CYCLE_STEP_NEIGHBOURS,
+        flagged_pixels: cycle_step_flagged_analysis_pixels,
+        per_date: spatial.cycle_steps.per_date.clone(),
+    });
     timed("write", || -> Result<()> {
         match output_policy {
             DisplacementOutputPolicy::Full => {
@@ -1416,23 +1882,12 @@ fn emit_displacement(
                         spatial.geotransform,
                     )?;
                 }
-                if cfg.timeseries_options.temporal_uncertainty.method
-                    == dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
-                {
-                    anyhow::ensure!(
-                        spatial.corrections.los_geometry.is_some(),
-                        "corrected temporal inference requires a completed fixed-cube receipt"
-                    );
-                    let displacement_rasters =
-                        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
-                    crate::temporal_covariance_product::write_temporal_covariance_products(
-                        &cfg.work_directory,
-                        &displacement_rasters,
-                        &days,
-                        &cfg.timeseries_options.temporal_uncertainty,
-                    )?;
-                }
-                Ok(())
+                write_temporal_products_if_referenced(
+                    cfg,
+                    &publication_quality.spatial_reference,
+                    &days,
+                    spatial.corrections.los_geometry.is_some(),
+                )
             }
             DisplacementOutputPolicy::GroundPulse => {
                 std::fs::create_dir_all(&cfg.work_directory)?;
@@ -1450,6 +1905,7 @@ fn emit_displacement(
         }
     })?;
     Ok(DisplacementOutput {
+        publication_quality,
         displacement: scaled.displacement,
         velocity: scaled.velocity,
         velocity_estimator: spatial.velocity_estimator,
@@ -1465,6 +1921,7 @@ fn emit_displacement(
         phase_linking_coherence: spatial.phase_linking_coherence,
         phase_similarity: spatial.phase_similarity,
         validity_mask: spatial.validity_mask,
+        cycle_step_flag: spatial.cycle_steps.step_count,
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -1481,6 +1938,44 @@ fn emit_displacement(
         los_geometry: spatial.corrections.los_geometry,
         geometry_provenance,
     })
+}
+
+/// Corrected temporal inference (REML) is scoped to the fixed-cube receipt's
+/// reference point. A product published without a spatial reference has none,
+/// so the stage is skipped with the reason rather than failing a run whose
+/// products are already on disk.
+fn write_temporal_products_if_referenced(
+    cfg: &DisplacementWorkflow,
+    spatial_reference: &SpatialReferenceStatus,
+    days: &[f64],
+    geometry_present: bool,
+) -> Result<()> {
+    if cfg.timeseries_options.temporal_uncertainty.method
+        != dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar
+    {
+        return Ok(());
+    }
+    if let SpatialReferenceStatus::Unavailable { reason } = spatial_reference {
+        tracing::warn!(
+            stage = "temporal_uncertainty",
+            reason,
+            "skipping corrected temporal inference: the product has no spatial reference"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        geometry_present,
+        "corrected temporal inference requires a completed fixed-cube receipt"
+    );
+    let displacement_rasters =
+        temporal_product_displacement_rasters(&cfg.work_directory, days.len())?;
+    crate::temporal_covariance_product::write_temporal_covariance_products(
+        &cfg.work_directory,
+        &displacement_rasters,
+        days,
+        &cfg.timeseries_options.temporal_uncertainty,
+    )?;
+    Ok(())
 }
 
 fn temporal_product_displacement_rasters(
@@ -1551,6 +2046,7 @@ impl SpatialProducts {
             self.disp_rad.view(),
             days,
             Some(global),
+            Some(self.validity_mask.view()),
             &self.velocity_model,
         )
         .context("velocity re-fit after re-referencing")?;
@@ -1576,11 +2072,22 @@ impl SpatialProducts {
                 .and(epoch)
                 .for_each(|valid, &displacement| *valid &= (displacement as f32).is_finite());
         }
+        // Pixels outside every STATIC granule carry NaN geometry. With atmospheric
+        // corrections on, `1/up` NaNs their displacement and the rows above catch
+        // them; a geometry-only run needs the intersection stated.
+        if let Some(geometry) = self.corrections.los_geometry.as_ref() {
+            ndarray::Zip::from(&mut self.validity_mask)
+                .and(&geometry.up)
+                .for_each(|valid, &up| *valid &= up.is_finite());
+        }
         let mask = &self.validity_mask;
         mask3_f64(&mut self.disp_rad, mask);
         mask2_f64(&mut self.vel_rad, mask);
         mask2_f64(&mut self.temporal_coherence, mask);
         if let Some(layer) = self.phase_linking_coherence.as_mut() {
+            mask2_f64(layer, mask);
+        }
+        if let Some(layer) = self.phase_similarity.as_mut() {
             mask2_f64(layer, mask);
         }
         if let Some(layer) = self.crlb_sigma.as_mut() {
@@ -1601,6 +2108,11 @@ impl SpatialProducts {
         if let Some(layer) = self.velocity_sigma_rad.as_mut() {
             mask2_f64(layer, mask);
         }
+        for junction in &mut self.junctions {
+            mask2_f64(&mut junction.step_cycles, mask);
+        }
+        mask3_value(&mut self.cycle_steps.steps, mask, 0);
+        mask2_value(&mut self.cycle_steps.step_count, mask, 0);
         if let Some(diagnostics) = self.velocity_diagnostics.as_mut() {
             mask2_value(&mut diagnostics.valid_date_count, mask, 0);
             mask2_value(&mut diagnostics.regression_rank, mask, 0);
@@ -1652,17 +2164,7 @@ impl SpatialProducts {
             mask2_f64(&mut geometry.north, mask);
             mask2_f64(&mut geometry.up, mask);
         }
-        ndarray::Zip::from(self.unwrap_connected_components.axis_iter_mut(Axis(0))).for_each(
-            |mut band| {
-                ndarray::Zip::from(&mut band)
-                    .and(mask)
-                    .for_each(|value, &valid| {
-                        if !valid {
-                            *value = 0;
-                        }
-                    });
-            },
-        );
+        mask3_value(&mut self.unwrap_connected_components, mask, 0);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1735,6 +2237,10 @@ impl SpatialProducts {
             .phase_linking_coherence
             .take()
             .map(|layer| trim2(&layer, target));
+        self.phase_similarity = self
+            .phase_similarity
+            .take()
+            .map(|layer| trim2(&layer, target));
         self.crlb_sigma = self.crlb_sigma.take().map(|layer| trim3(&layer, target));
         self.closure_phase = self.closure_phase.take().map(|layer| trim3(&layer, target));
         self.posterior_variance_rad = self
@@ -1772,6 +2278,11 @@ impl SpatialProducts {
             qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
             qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
         }
+        for junction in &mut self.junctions {
+            junction.step_cycles = trim2(&junction.step_cycles, target);
+        }
+        self.cycle_steps.steps = trim3(&self.cycle_steps.steps, target);
+        self.cycle_steps.step_count = trim2(&self.cycle_steps.step_count, target);
         self.unwrap_connected_components = trim3(&self.unwrap_connected_components, target);
         if let Some(covariance) = self.production_covariance.as_mut() {
             covariance.trim(target);
@@ -3309,12 +3820,16 @@ fn mask2_value<T: Clone>(values: &mut Array2<T>, mask: &Array2<bool>, fill: T) {
 }
 
 fn mask3_f64(values: &mut Array3<f64>, mask: &Array2<bool>) {
+    mask3_value(values, mask, f64::NAN);
+}
+
+fn mask3_value<T: Clone>(values: &mut Array3<T>, mask: &Array2<bool>, fill: T) {
     for mut band in values.axis_iter_mut(Axis(0)) {
         ndarray::Zip::from(&mut band)
             .and(mask)
             .for_each(|value, &valid| {
                 if !valid {
-                    *value = f64::NAN;
+                    *value = fill.clone();
                 }
             });
     }
@@ -3848,13 +4363,17 @@ struct Stitched {
 /// Mosaic the per-burst phase-linking products onto the frame grid. A single
 /// burst is returned as-is (identity path).
 #[allow(clippy::too_many_lines)]
-fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) -> Result<Stitched> {
+fn stitch_bursts(
+    mut bursts: Vec<BurstLink>,
+    retain_covariance_lineage: bool,
+    retain_correction_ownership: bool,
+) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
     if bursts.len() == 1 {
         let b = bursts.remove(0);
         let owner =
             u32::try_from(b.coverage.burst_index).context("source burst index exceeds u32")?;
-        let ownership = retain_covariance_lineage.then(|| {
+        let ownership = (retain_covariance_lineage || retain_correction_ownership).then(|| {
             b.pl.mapv(|value| {
                 if value.re.is_finite() && value.im.is_finite() {
                     owner
@@ -3900,7 +4419,7 @@ fn stitch_bursts(mut bursts: Vec<BurstLink>, retain_covariance_lineage: bool) ->
     );
     let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
-    let mut ownership = retain_covariance_lineage
+    let mut ownership = (retain_covariance_lineage || retain_correction_ownership)
         .then(|| Array3::<u32>::from_elem((nslc, frame.rows, frame.cols), NO_BURST_OWNER));
     let mut seam_rotations = retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
     let mut burst_output_mappings =
@@ -4255,36 +4774,46 @@ fn unwrap_network(
             }
         });
     let apply_configured_mask = cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some();
-    let has_invalid_phase_link_pixel = validity_mask.iter().any(|valid| !*valid);
-    let masked_phase = (has_invalid_phase_link_pixel || apply_configured_mask).then(|| {
-        apply_phase_masks(
-            pl,
-            validity_mask,
-            apply_configured_mask.then_some(correlation.view()),
-        )
-    });
+    let support = unwrap_support(
+        validity_mask,
+        apply_configured_mask.then_some(correlation.view()),
+    );
+    let masked_phase = support
+        .iter()
+        .any(|&kept| !kept)
+        .then(|| apply_phase_masks(pl, support.view()));
     let backend = unwrap_backend(cfg, (rows, cols));
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
     let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
-    match masked_phase.as_ref() {
+    let mut output = match masked_phase.as_ref() {
         Some(values) => pool
             .install(|| backend.unwrap_network(values.view(), pairs, correlation.view(), &scratch)),
         None => pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch)),
-    }
+    }?;
+    // A zero-filled pixel reaches the unwrapper as flat phase and can come back
+    // labelled; the loop-closure roots key on labels and would take its zero
+    // residual as evidence, so no pixel off support keeps a component.
+    mask3_value(&mut output.connected_components, &support, 0);
+    Ok(output)
 }
 
-fn apply_phase_masks(
-    pl: ArrayView3<Cf64>,
+/// Pixels that reach the unwrapper with their phase-linked value: those the
+/// phase-link marked valid and, when the configured mask is applied, those it
+/// keeps. Every other pixel is zero-filled before unwrapping.
+fn unwrap_support(
     phase_link_validity: ArrayView2<bool>,
     configured_mask: Option<ArrayView2<f32>>,
-) -> Array3<Cf64> {
+) -> Array2<bool> {
+    Array2::from_shape_fn(phase_link_validity.dim(), |point| {
+        phase_link_validity[point] && configured_mask.is_none_or(|mask| mask[point] != 0.0)
+    })
+}
+
+fn apply_phase_masks(pl: ArrayView3<Cf64>, support: ArrayView2<bool>) -> Array3<Cf64> {
     let mut values = pl.to_owned();
-    for ((row, col), &valid) in phase_link_validity.indexed_iter() {
-        let configured_invalid = configured_mask
-            .as_ref()
-            .is_some_and(|mask| mask[(row, col)] == 0.0);
-        if !valid || configured_invalid {
+    for ((row, col), &kept) in support.indexed_iter() {
+        if !kept {
             values.slice_mut(s![.., row, col]).fill(Cf64::new(0.0, 0.0));
         }
     }
@@ -4772,6 +5301,37 @@ fn write_outputs(
             qc.worst_residual_cycles.view(),
         )?;
     }
+    for junction in quality.junction_steps.unwrap_or_default() {
+        write_f32_with_metadata(
+            &format!("junction_step_cycles_{:02}.tif", junction.summary.epoch),
+            junction.step_cycles.view(),
+            &[("UNITTYPE", "cycles"), ("DESCRIPTION", JUNCTION_STEP_NOTE)],
+        )?;
+    }
+    if let Some(flag) = quality.cycle_step_flag {
+        write_raster_with_metadata(
+            &dir.join("cycle_step_flag.tif"),
+            flag.view(),
+            gt,
+            epsg,
+            None,
+            &[("UNITTYPE", "count"), ("DESCRIPTION", CYCLE_STEP_FLAG_NOTE)],
+        )?;
+    }
+    for (k, band) in quality
+        .cycle_steps
+        .into_iter()
+        .flat_map(|steps| steps.axis_iter(Axis(0)).enumerate())
+    {
+        write_raster_with_metadata(
+            &dir.join(format!("cycle_step_{:02}.tif", k + 1)),
+            band.mapv(i16::from).view(),
+            gt,
+            epsg,
+            None,
+            &[("UNITTYPE", "cycles"), ("DESCRIPTION", CYCLE_STEP_NOTE)],
+        )?;
+    }
     if let Some(variance) = quality.displacement_variance {
         for band in 0..variance.dim().0 {
             write_raster_with_metadata(
@@ -4878,6 +5438,14 @@ struct QualityLayers<'a> {
     velocity_terms: VelocityTermLayers<'a>,
     /// Post-unwrap loop-closure QC, present only when the gate ran.
     loop_closure: Option<&'a LoopClosureQc>,
+    /// Ministack-junction step rasters, present only when
+    /// `write_cycle_step_diagnostics` is set.
+    junction_steps: Option<&'a [JunctionStep]>,
+    /// Per-pixel count of detected whole-cycle steps; always written.
+    cycle_step_flag: Option<&'a Array2<u32>>,
+    /// Per-date detected steps, present only when `write_cycle_step_diagnostics`
+    /// is set.
+    cycle_steps: Option<&'a Array3<i8>>,
 }
 
 /// Emitted form of [`VelocityTerms`], already scaled to displacement units.
@@ -4904,6 +5472,25 @@ fn write_bands(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_components_require_each_band_reference_membership() {
+        let components = ndarray::array![[[1, 2, 1, 0]], [[8, 8, 9, 8]]];
+        let mut mask = Array2::from_elem((1, 4), true);
+        let rejected = restrict_component_mask(&mut mask, components.view(), 2, None).unwrap();
+        assert_eq!(mask, ndarray::array![[true, true, true, false]]);
+        assert_eq!(rejected, vec![1, 0], "only band 0 has an unlabelled pixel");
+        let rejected =
+            restrict_component_mask(&mut mask, components.view(), 2, Some((0, 0))).unwrap();
+        assert_eq!(mask, ndarray::array![[true, false, false, false]]);
+        assert_eq!(
+            rejected,
+            vec![1, 1],
+            "each band rejects one eligible pixel on its own"
+        );
+        assert!(restrict_component_mask(&mut mask, components.view(), 1, None).is_err());
+        assert!(restrict_component_mask(&mut mask, components.view(), 2, Some((0, 3))).is_err());
+    }
+
     #[test]
     fn publication_masks_restrict_support() {
         let path = std::env::temp_dir().join("configured_publication_mask.tif");
@@ -5003,6 +5590,143 @@ mod tests {
     }
 
     #[test]
+    fn fresh_network_closure_is_invariant_to_interferogram_gauge() {
+        let mut cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join(format!(
+                "dolphin_closure_gauge_contract_{}",
+                std::process::id()
+            )),
+            ..DisplacementWorkflow::default()
+        };
+        cfg.cslc_file_list = dated_files(&["20230101", "20230113", "20230125", "20230206"]);
+        cfg.interferogram_network.max_bandwidth = Some(2);
+        cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+        cfg.timeseries_options.use_coherence_weights = false;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.reference_point = Some((0, 0));
+        let mut burst = seam_burst(0.0, 0.9);
+        burst.pl = Array3::from_shape_fn((4, 3, 3), |(date, row, _)| {
+            Cf64::from_polar(1.0, date as f64 * (2.0 + row as f64 * 0.1))
+        });
+        burst.days = vec![0.0, 12.0, 24.0, 36.0];
+        burst.coverage.acquisition_count = 4;
+        let out = finish_displacement(
+            &cfg,
+            vec![burst],
+            None,
+            DisplacementOutputPolicy::Full,
+            None,
+        )
+        .expect("consistent spatial gradients must survive arbitrary IFG phase gauges");
+        assert!(out.velocity_mm_yr.iter().all(|value| value.is_finite()));
+        for ((date, row, _), value) in out.displacement.indexed_iter() {
+            assert!(
+                (value + (date + 1) as f64 * row as f64 * 0.1).abs() < 1e-5,
+                "date={date} row={row} value={value}"
+            );
+        }
+        let qc =
+            gdal::Dataset::open(cfg.work_directory.join("loop_closure_bad_count.tif")).unwrap();
+        let count = qc.rasterband(1).unwrap().read_band_as::<f64>().unwrap();
+        assert!(count.data().iter().all(|&n| n == 0.0));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// The ministack boundaries the planner crossed are diagnosed on the raw
+    /// inverted series and always recorded in the provenance; the per-junction
+    /// rasters are opt-in.
+    #[test]
+    fn ministack_junction_steps_reach_provenance_and_opt_in_rasters() {
+        let run = |write_rasters: bool| {
+            let mut cfg = DisplacementWorkflow {
+                work_directory: std::env::temp_dir().join(format!(
+                    "dolphin_junction_steps_{write_rasters}_{}",
+                    std::process::id()
+                )),
+                ..DisplacementWorkflow::default()
+            };
+            cfg.cslc_file_list = dated_files(&["20230101", "20230113", "20230125", "20230206"]);
+            cfg.interferogram_network.max_bandwidth = Some(2);
+            cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+            cfg.timeseries_options.use_coherence_weights = false;
+            cfg.timeseries_options.reference_point = Some((0, 0));
+            cfg.phase_linking.ministack_size = 2;
+            cfg.timeseries_options.write_cycle_step_diagnostics = write_rasters;
+            let mut burst = seam_burst(0.0, 0.9);
+            burst.pl = Array3::from_shape_fn((4, 3, 3), |(date, row, _)| {
+                Cf64::from_polar(1.0, date as f64 * (2.0 + row as f64 * 0.1))
+            });
+            burst.days = vec![0.0, 12.0, 24.0, 36.0];
+            burst.coverage.acquisition_count = 4;
+            let out = finish_displacement(
+                &cfg,
+                vec![burst],
+                None,
+                DisplacementOutputPolicy::Full,
+                None,
+            )
+            .unwrap();
+            (cfg, out)
+        };
+        let (cfg, out) = run(false);
+        let junctions = out
+            .geometry_provenance
+            .ministack_junctions
+            .expect("junction statistics are always recorded");
+        assert_eq!(junctions.ministack_size, 2);
+        let epochs: Vec<usize> = junctions.junctions.iter().map(|j| j.epoch).collect();
+        assert_eq!(
+            epochs,
+            vec![2],
+            "four dates in ministacks of two cross one boundary"
+        );
+        assert_eq!(junctions.junctions[0].evaluable_pixels, 9);
+        assert_eq!(junctions.junctions[0].fraction_over_quarter_cycle, 0.0);
+        assert_eq!(junctions.junctions[0].fraction_integer_cycle, 0.0);
+        assert!(!cfg
+            .work_directory
+            .join("junction_step_cycles_02.tif")
+            .exists());
+        let cycle_steps = out
+            .geometry_provenance
+            .cycle_steps
+            .expect("cycle-step statistics are always recorded");
+        assert_eq!(cycle_steps.flagged_pixels, 0);
+        assert_eq!(cycle_steps.half_window, DEFAULT_CYCLE_STEP_HALF_WINDOW);
+        let epochs: Vec<usize> = cycle_steps.per_date.iter().map(|d| d.epoch).collect();
+        assert_eq!(epochs, vec![1, 2, 3]);
+        // A 3x3 frame leaves every pixel at least four same-component
+        // neighbours, so every step index judges the whole frame.
+        assert!(cycle_steps.per_date.iter().all(|d| d.evaluable_pixels == 9));
+        assert_eq!(out.publication_quality.cycle_step_flagged_pixels, 0);
+        assert_eq!(out.cycle_step_flag, Array2::<u32>::zeros((3, 3)));
+        let flag = dolphin_io::read_raster::<u32>(&cfg.work_directory.join("cycle_step_flag.tif"))
+            .unwrap();
+        assert_eq!(flag.data, Array2::<u32>::zeros((3, 3)));
+        assert!(!cfg.work_directory.join("cycle_step_02.tif").exists());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+
+        let (cfg, _) = run(true);
+        let raster =
+            dolphin_io::read_raster::<f32>(&cfg.work_directory.join("junction_step_cycles_02.tif"))
+                .unwrap();
+        assert_eq!(raster.data.dim(), (3, 3));
+        // The row gradient of 0.1 rad/date puts every pixel within 0.02 cycle
+        // of the component median.
+        assert!(raster.data.iter().all(|value| value.abs() < 0.02));
+        for epoch in 1..=3 {
+            let steps = dolphin_io::read_raster::<i16>(
+                &cfg.work_directory
+                    .join(format!("cycle_step_{epoch:02}.tif")),
+            )
+            .unwrap();
+            assert_eq!(steps.data, Array2::<i16>::zeros((3, 3)));
+        }
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    #[test]
     fn multiburst_leveling_removes_injected_phase_offset() {
         let frame = Array3::from_shape_fn((2, 3, 3), |(date, _, _)| {
             Cf64::from_polar(1.0, date as f64 * 0.2)
@@ -5054,7 +5778,7 @@ mod tests {
         second.temp_coh[(0, 0)] = f64::NAN;
         second.validity_mask[(0, 0)] = false;
         second.coverage.burst_index = 1;
-        let stitched = stitch_bursts(vec![first, second], true).unwrap();
+        let stitched = stitch_bursts(vec![first, second], true, false).unwrap();
         assert_eq!(stitched.pl[(0, 0, 0)], expected);
         assert!(stitched.temp_coh[(0, 0)].is_finite());
         assert!(stitched.validity_mask[(0, 0)]);
@@ -5075,8 +5799,11 @@ mod tests {
 
     #[test]
     fn disabled_covariance_capture_does_not_retain_frame_lineage() {
-        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false).unwrap();
+        let stitched = stitch_bursts(vec![seam_burst(0.0, 0.9)], false, false).unwrap();
         assert!(stitched.ownership.is_none());
+        let corrected = stitch_bursts(vec![seam_burst(0.0, 0.9)], false, true).unwrap();
+        assert!(corrected.ownership.is_some());
+        assert!(corrected.burst_output_mappings.is_none());
         assert!(stitched.seam_rotations.is_none());
     }
 
@@ -5087,8 +5814,13 @@ mod tests {
         cfg.timeseries_options.use_coherence_weights = false;
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
-        let dphi = Array3::from_shape_vec((3, 1, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 10.0]).unwrap();
-        let (inversion, qc) = solve_time_series(&cfg, dphi, &pairs, None, true).unwrap();
+        // 16 pixels (the root floor) closing exactly, and one whose spanning
+        // interferogram carries a cycle error the loop QC masks.
+        let mut dphi = Array3::from_shape_fn((3, 4, 4), |(band, _, _)| (band + 1) as f64);
+        dphi[(2, 0, 1)] = 10.0;
+        let components = Array3::from_elem(dphi.dim(), 1);
+        let (inversion, qc) =
+            solve_time_series(&cfg, dphi, components.view(), &pairs, None, true).unwrap();
         assert!(qc.is_some());
         let retained = inversion.fixed_l2_inputs.unwrap();
         assert!(retained.pixel_map((0, 0)).is_ok());
@@ -5161,12 +5893,16 @@ mod tests {
                 bad_loop_count: Array2::from_elem((2, 2), 1.0),
                 evaluable_loop_count: Array2::from_elem((2, 2), 2.0),
                 worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
             }),
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(2, 2),
             temporal_coherence: Array2::from_elem((2, 2), 1.0),
             validity_mask,
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
-            phase_similarity: None,
+            phase_similarity: Some(Array2::from_elem((2, 2), 1.0)),
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -5211,6 +5947,7 @@ mod tests {
             assert!(!products.validity_mask[(row, col)]);
             assert!(products.vel_rad[(row, col)].is_nan());
             assert!(products.temporal_coherence[(row, col)].is_nan());
+            assert!(products.phase_similarity.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.phase_linking_coherence.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.network_misclosure_rad.as_ref().unwrap()[(row, col)].is_nan());
             assert!(products.timeseries_residual_rad.as_ref().unwrap()[(row, col)].is_nan());
@@ -5299,12 +6036,16 @@ mod tests {
                 bad_loop_count: Array2::from_shape_fn((6, 8), |(row, col)| (row * 10 + col) as f64),
                 evaluable_loop_count: Array2::from_elem((6, 8), 2.0),
                 worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
             }),
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(6, 8),
             temporal_coherence: Array2::from_elem((6, 8), 0.9),
             validity_mask: Array2::from_elem((6, 8), true),
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
-            phase_similarity: None,
+            phase_similarity: Some(Array2::from_elem((6, 8), 0.75)),
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -5334,6 +6075,7 @@ mod tests {
         cfg.timeseries_options.write_velocity_uncertainty = true;
         products.trim(target, &[0.0, 12.0, 24.0], &cfg).unwrap();
         products.apply_validity_mask();
+        assert_eq!(products.phase_similarity.as_ref().unwrap().dim(), (3, 4));
         let reference = products.reference_point.expect("target reference");
         assert!(reference.0 < 3 && reference.1 < 4);
         assert!(products
@@ -5363,6 +6105,8 @@ mod tests {
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(4, 4),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),
             burst_coverage: Vec::new(),
@@ -5690,6 +6434,7 @@ mod tests {
             series.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -5729,7 +6474,15 @@ mod tests {
         let mut cfg = DisplacementWorkflow::default();
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let linear = VelocityModel::default();
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &linear).unwrap();
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some((0, 1)),
+            None,
+            &linear,
+        )
+        .unwrap();
 
         assert_eq!(
             fit.estimator,
@@ -5774,7 +6527,15 @@ mod tests {
             step_days: Vec::new(),
             relaxation: Vec::new(),
         };
-        let fit = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &seasonal).unwrap();
+        let fit = fit_velocity(
+            &cfg,
+            displacement.view(),
+            &days,
+            Some((0, 1)),
+            None,
+            &seasonal,
+        )
+        .unwrap();
 
         assert!(validate_config(&cfg).is_ok());
         assert_eq!(
@@ -5811,6 +6572,7 @@ mod tests {
             disp,
             days,
             None,
+            None,
             &VelocityModel::default(),
         )
         .unwrap()
@@ -5840,11 +6602,11 @@ mod tests {
         for model in [VelocityModel::default(), seasonal_model()] {
             let mut cfg = DisplacementWorkflow::default();
             let point_only =
-                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model).unwrap();
 
             cfg.timeseries_options.write_velocity_uncertainty = true;
             let with_sigma =
-                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model).unwrap();
 
             assert_eq!(point_only.estimator, with_sigma.estimator);
             assert_eq!(point_only.velocity, with_sigma.velocity);
@@ -5877,7 +6639,8 @@ mod tests {
             for uncertainty in [false, true] {
                 cfg.timeseries_options.write_velocity_uncertainty = uncertainty;
                 let fit =
-                    fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model).unwrap();
+                    fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model)
+                        .unwrap();
                 assert_eq!(fit.estimator, expected, "uncertainty={uncertainty}");
             }
         }
@@ -5902,6 +6665,7 @@ mod tests {
             displacement.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -5912,6 +6676,7 @@ mod tests {
             displacement.view(),
             &days,
             Some((0, 1)),
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -5958,6 +6723,7 @@ mod tests {
             displacement.view(),
             &days,
             None,
+            None,
             &VelocityModel::default(),
         )
         .unwrap();
@@ -5987,6 +6753,9 @@ mod tests {
                 connected_components: &connected_components,
                 velocity_terms: VelocityTermLayers::default(),
                 loop_closure: None,
+                junction_steps: None,
+                cycle_step_flag: None,
+                cycle_steps: None,
             },
             Some(32611),
             [0.0, 30.0, 0.0, 30.0, 0.0, -30.0],
@@ -6012,16 +6781,410 @@ mod tests {
         cfg.timeseries_options.write_velocity_uncertainty = true;
         let model = VelocityModel::default();
 
-        let missing = fit_velocity(&cfg, displacement.view(), &days, None, &model)
+        let missing = fit_velocity(&cfg, displacement.view(), &days, None, None, &model)
             .err()
             .expect("missing reference must fail");
         assert!(missing.to_string().contains("spatial reference point"));
 
         displacement[(1, 0, 1)] = f64::NAN;
-        let nonzero = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), &model)
+        let nonzero = fit_velocity(&cfg, displacement.view(), &days, Some((0, 1)), None, &model)
             .err()
             .expect("nonzero reference must fail");
         assert!(nonzero.to_string().contains("exact zero"));
+    }
+
+    /// Zero-filled pixels are flat phase to the unwrapper and may come back with
+    /// a component; the closure roots key on labels, so nothing off support keeps one.
+    #[test]
+    fn unwrap_output_carries_no_label_off_support() {
+        let mut cfg = DisplacementWorkflow {
+            work_directory: std::env::temp_dir().join(format!(
+                "dolphin_unwrap_support_labels_{}",
+                std::process::id()
+            )),
+            ..DisplacementWorkflow::default()
+        };
+        cfg.unwrap_options.unwrap_method = UnwrapMethod::Native;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let pl = Array3::from_shape_fn((3, 4, 4), |(date, row, col)| {
+            Cf64::from_polar(1.0, date as f64 * (0.3 + 0.05 * (row + col) as f64))
+        });
+        // More than half the grid is off support.
+        let validity = Array2::from_shape_fn((4, 4), |(row, col)| row < 2 && col < 3);
+        let output = unwrap_network(
+            &cfg,
+            pl.view(),
+            &pairs,
+            Array2::from_elem((4, 4), 0.95).view(),
+            validity.view(),
+            [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            Some(32611),
+        )
+        .unwrap();
+        for ((_, row, col), &label) in output.connected_components.indexed_iter() {
+            assert!(
+                validity[(row, col)] || label == 0,
+                "label {label} at ({row}, {col})"
+            );
+        }
+        assert!(output
+            .connected_components
+            .indexed_iter()
+            .any(|((_, row, col), &label)| validity[(row, col)] && label != 0));
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// With no pixel finite on every date there is nothing to reference; the
+    /// uncertainty fit still runs and reports every pixel unavailable instead of
+    /// failing the run. A referenceable pixel without a reference is still an
+    /// error.
+    #[test]
+    fn velocity_uncertainty_without_a_reference_needs_an_empty_series() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let empty = Array3::from_elem((3, 2, 2), f64::NAN);
+        let fit = fit_velocity(
+            &cfg,
+            empty.view(),
+            &days,
+            None,
+            None,
+            &VelocityModel::default(),
+        )
+        .expect("an empty series publishes as unavailable");
+        assert!(fit.velocity.iter().all(|v| v.is_nan()));
+        assert!(fit.sigma.expect("sigma layer").iter().all(|v| v.is_nan()));
+        assert!(fit
+            .diagnostics
+            .expect("diagnostics")
+            .uncertainty_status
+            .iter()
+            .all(|&status| status == VelocityUncertaintyStatus::Unavailable));
+
+        let mut finite = empty;
+        finite.slice_mut(s![.., 1, 1]).fill(0.2);
+        let error = fit_velocity(
+            &cfg,
+            finite.view(),
+            &days,
+            None,
+            None,
+            &VelocityModel::default(),
+        )
+        .err()
+        .expect("a finite series still needs its reference");
+        assert!(error
+            .to_string()
+            .contains("requires a final spatial reference point"));
+    }
+
+    /// Every pixel finite on some dates and NaN on others, or finite everywhere
+    /// but masked: nothing can carry the reference, so the reference stage and
+    /// the velocity fit must agree that the product publishes as unavailable,
+    /// rather than the first warning and the second dying.
+    #[test]
+    fn partially_finite_frame_publishes_as_unavailable() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        let days = [0.0, 12.0, 24.0, 36.0];
+        let coherence = Array2::from_elem((2, 2), 0.9);
+        let mut validity = Array2::from_elem((2, 2), true);
+        // Each pixel is NaN on a different date and finite on the others.
+        let mut displacement = Array3::from_shape_fn((3, 2, 2), |(date, row, col)| {
+            match date == (row * 2 + col) % 3 {
+                true => f64::NAN,
+                false => 0.1 * (date + 1) as f64,
+            }
+        });
+        for masked_finite in [false, true] {
+            if masked_finite {
+                // A pixel finite on every date but outside the validity mask.
+                displacement.slice_mut(s![.., 1, 1]).fill(0.2);
+                validity[(1, 1)] = false;
+            }
+            let selected = final_spatial_reference(
+                &cfg,
+                None,
+                coherence.view(),
+                validity.view(),
+                displacement.view(),
+            )
+            .expect("no referenceable pixel is unavailable, not an error");
+            assert_eq!(selected, None);
+            let fit = fit_velocity(
+                &cfg,
+                displacement.view(),
+                &days,
+                selected,
+                Some(validity.view()),
+                &VelocityModel::default(),
+            )
+            .expect("the frame publishes as unavailable (masked_finite={masked_finite})");
+            assert!(fit.sigma.is_some());
+        }
+    }
+
+    /// The final reference is required for velocity uncertainty while any
+    /// displacement-valid pixel exists; once none does, its absence is a typed
+    /// outcome for publication rather than a terminal failure.
+    #[test]
+    fn final_reference_is_unavailable_only_when_nothing_is_displacement_valid() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.correlation_threshold = 0.5;
+        let coherence = Array2::from_elem((2, 2), 0.3);
+        let validity = Array2::from_elem((2, 2), true);
+        let finite = Array3::zeros((2, 2, 2));
+        let error =
+            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), finite.view())
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a displacement-valid final spatial reference"));
+
+        let empty = Array3::from_elem((2, 2, 2), f64::NAN);
+        let selected =
+            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), empty.view())
+                .unwrap();
+        assert_eq!(selected, None);
+    }
+
+    /// A frame the loop-closure gate masked entirely publishes as an unavailable
+    /// product with the reason in its provenance, rather than dying on the
+    /// reference selection.
+    #[test]
+    fn fully_masked_frame_publishes_as_unavailable_with_provenance() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_unavailable_product_{}",
+            std::process::id()
+        ));
+        cfg.timeseries_options.write_velocity_uncertainty = true;
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (1, 2), (0, 2)];
+        let products = SpatialProducts {
+            disp_rad: Array3::from_elem((2, 2, 2), f64::NAN),
+            vel_rad: Array2::from_elem((2, 2), f64::NAN),
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: Some(LoopClosureQc {
+                bad_loop_count: Array2::from_elem((2, 2), 1.0),
+                evaluable_loop_count: Array2::from_elem((2, 2), 1.0),
+                worst_residual_cycles: Array2::from_elem((2, 2), 1.0),
+                unjudged_small_triple_pixels: 0,
+                small_root_triples: 0,
+            }),
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(2, 2),
+            temporal_coherence: Array2::from_elem((2, 2), 0.9),
+            validity_mask: Array2::from_elem((2, 2), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            phase_similarity: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: None,
+            },
+            geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
+            reference_point: None,
+            posterior_variance_rad: None,
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: Some(Array2::from_elem((2, 2), f64::NAN)),
+            velocity_diagnostics: None,
+            interferogram_pairs: pairs.clone(),
+            unwrap_connected_components: Array3::from_elem((3, 2, 2), 1),
+            production_covariance: None,
+        };
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::GroundPulse,
+        )
+        .expect("a fully masked frame publishes rather than fails");
+        assert_eq!(out.reference_point, None);
+        assert!(out.validity_mask.iter().all(|&valid| !valid));
+        let quality = &out.publication_quality;
+        assert_eq!(quality.closure_qc_status, "evaluated");
+        assert_eq!(quality.component_rejected_per_band, vec![0, 0, 0]);
+        assert_eq!(quality.component_worst_band, None);
+        match &quality.spatial_reference {
+            SpatialReferenceStatus::Unavailable { reason } => {
+                assert!(
+                    reason.contains("loop closure masked 4 of 4"),
+                    "reason should name the closure mask: {reason}"
+                );
+            }
+            SpatialReferenceStatus::Selected => panic!("no reference can exist"),
+        }
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// A 4×4 frame with `outside` pixels NaN in the LOS geometry (outside every
+    /// STATIC granule) and `masked` more with a non-finite velocity; every velocity
+    /// and displacement is finite elsewhere.
+    fn geometry_masked_products(
+        outside: &[(usize, usize)],
+        masked: &[(usize, usize)],
+    ) -> SpatialProducts {
+        let mut up = Array2::from_elem((4, 4), 0.8);
+        let mut east = Array2::from_elem((4, 4), 0.6);
+        for &point in outside {
+            up[point] = f64::NAN;
+            east[point] = f64::NAN;
+        }
+        let mut velocity = Array2::from_elem((4, 4), 0.1);
+        for &point in masked {
+            velocity[point] = f64::NAN;
+        }
+        SpatialProducts {
+            disp_rad: Array3::from_shape_fn((2, 4, 4), |(date, row, col)| {
+                0.1 * (date + 1) as f64 + 0.01 * (row * 4 + col) as f64
+            }),
+            vel_rad: velocity,
+            velocity_estimator: VelocityEstimator::LinearPostGaugeUnitPrecision,
+            velocity_model: VelocityModel::default(),
+            velocity_terms: VelocityTerms::default(),
+            loop_closure: None,
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(4, 4),
+            temporal_coherence: Array2::from_elem((4, 4), 0.9),
+            validity_mask: Array2::from_elem((4, 4), true),
+            burst_coverage: Vec::new(),
+            phase_linking_coherence: None,
+            phase_similarity: None,
+            crlb_sigma: None,
+            closure_phase: None,
+            corrections: CorrectionLayers {
+                ionosphere: None,
+                troposphere: None,
+                solid_earth_tide: None,
+                los_geometry: Some(LosGeometry {
+                    east,
+                    north: Array2::zeros((4, 4)),
+                    up,
+                }),
+            },
+            geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
+            reference_point: None,
+            posterior_variance_rad: None,
+            network_misclosure_rad: None,
+            timeseries_residual_rad: None,
+            velocity_sigma_rad: None,
+            velocity_diagnostics: None,
+            interferogram_pairs: vec![(0, 1), (1, 2), (0, 2)],
+            unwrap_connected_components: Array3::from_elem((3, 4, 4), 1),
+            production_covariance: None,
+        }
+    }
+
+    /// Corrected temporal inference (REML) is scoped to the fixed-cube receipt's
+    /// reference. A product published without a spatial reference has none, so
+    /// the temporal stage is skipped with the reason logged, instead of the run
+    /// dying there after the "publishing without a spatial reference" warning.
+    #[test]
+    fn unavailable_product_skips_corrected_temporal_inference() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_unavailable_skips_temporal_{}",
+            std::process::id()
+        ));
+        cfg.timeseries_options.temporal_uncertainty.method =
+            dolphin_core::config::TemporalUncertaintyMethod::RemlCovarianceParameterAdjustedScalar;
+        let masked: Vec<(usize, usize)> = (0..16).map(|index| (index / 4, index % 4)).collect();
+        let products = geometry_masked_products(&[], &masked);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::Full,
+        )
+        .expect("an unavailable product skips the temporal stage rather than failing");
+        assert!(matches!(
+            out.publication_quality.spatial_reference,
+            SpatialReferenceStatus::Unavailable { .. }
+        ));
+        assert_eq!(out.reference_point, None);
+        assert!(cfg.work_directory.join("velocity.tif").is_file());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// The provenance's outside-STATIC count is the resolver's, taken before the
+    /// validity mask NaNs the geometry at every pixel it masks: two pixels outside
+    /// the granule and ten more masked for a non-finite velocity report two.
+    #[test]
+    fn outside_static_provenance_counts_only_the_resolver_mask() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_outside_static_count_{}",
+            std::process::id()
+        ));
+        let outside = [(0, 0), (3, 3)];
+        let masked: Vec<(usize, usize)> = (0..16)
+            .map(|index| (index / 4, index % 4))
+            .filter(|point| !outside.contains(point))
+            .take(10)
+            .collect();
+        let products = geometry_masked_products(&outside, &masked);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::GroundPulse,
+        )
+        .unwrap();
+        assert_eq!(out.geometry_provenance.outside_static_pixel_count, Some(2));
+        assert_eq!(
+            out.geometry_provenance.outside_static_fraction,
+            Some(2.0 / 16.0)
+        );
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// A geometry-only run (no atmospheric correction to NaN the displacement at
+    /// pixels without LOS) still publishes with the outside-STATIC pixels masked:
+    /// geometry finiteness is part of the validity mask, so the fixed-cube writer
+    /// never sees a valid pixel with non-finite geometry.
+    #[test]
+    fn geometry_only_run_masks_outside_static_pixels_before_publication() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_geometry_only_outside_static_{}",
+            std::process::id()
+        ));
+        let outside = [(0, 0), (3, 3)];
+        let products = geometry_masked_products(&outside, &[]);
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            None,
+            products,
+            DisplacementOutputPolicy::Full,
+        )
+        .expect("outside-STATIC pixels are masked, not a write-time error");
+        for (point, &valid) in out.validity_mask.indexed_iter() {
+            assert_eq!(valid, !outside.contains(&point), "validity at {point:?}");
+        }
+        assert!(out.velocity[(0, 0)].is_nan() && out.velocity[(3, 3)].is_nan());
+        assert!(cfg
+            .work_directory
+            .join("velocity_validity_mask.tif")
+            .is_file());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
     #[test]
@@ -6039,7 +7202,9 @@ mod tests {
         let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
         let validity = ndarray::array![[true, true], [false, true]];
         let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
-        let masked = apply_phase_masks(phase.view(), validity.view(), Some(mask.view()));
+        let support = unwrap_support(validity.view(), Some(mask.view()));
+        assert_eq!(support, ndarray::array![[true, false], [false, true]]);
+        let masked = apply_phase_masks(phase.view(), support.view());
         assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(1, 0, 1)], Cf64::new(0.0, 0.0));
         assert_eq!(masked[(0, 1, 0)], Cf64::new(0.0, 0.0));
@@ -6660,6 +7825,7 @@ mod tests {
                 (0.008 * c as f64 * days[t + 1] / 365.25 + 0.01 * (t + 1) as f64 * (1.0 + c as f64))
                     * scale
             });
+            let support = Array2::from_elem((disp.dim().1, disp.dim().2), true);
             correct_and_reference(
                 &cfg,
                 &mut disp,
@@ -6669,6 +7835,8 @@ mod tests {
                     geotransform: gt,
                 },
                 Some((1, 0)),
+                None,
+                support.view(),
             )
             .unwrap();
             assert!(disp
@@ -6680,6 +7848,7 @@ mod tests {
                 disp.view(),
                 &days,
                 Some((1, 0)),
+                None,
                 &VelocityModel::default(),
             )
             .unwrap();
@@ -6823,6 +7992,9 @@ mod tests {
                     connected_components: &conncomp,
                     velocity_terms: VelocityTermLayers::default(),
                     loop_closure: None,
+                    junction_steps: None,
+                    cycle_step_flag: None,
+                    cycle_steps: None,
                 },
                 Some(32614),
                 gt,
@@ -6982,6 +8154,8 @@ mod tests {
             velocity_model: VelocityModel::default(),
             velocity_terms: VelocityTerms::default(),
             loop_closure: None,
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(2, 2),
             temporal_coherence: Array2::from_elem((2, 2), 0.9),
             validity_mask: Array2::from_elem((2, 2), true),
             burst_coverage: Vec::new(),
@@ -7027,6 +8201,9 @@ mod tests {
                 connected_components: &spatial.unwrap_connected_components,
                 velocity_terms: VelocityTermLayers::default(),
                 loop_closure: None,
+                junction_steps: None,
+                cycle_step_flag: None,
+                cycle_steps: None,
             },
             Some(32614),
             spatial.geotransform,
@@ -7753,7 +8930,12 @@ mod tests {
         let pairs = vec![(0, 1), (1, 2), (0, 2)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        let components = one_component(&dphi);
+        assert!(
+            apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(dphi, original);
     }
 
@@ -7767,7 +8949,12 @@ mod tests {
         let pairs = vec![(0, 1), (0, 2), (0, 3)];
         let mut dphi = Array3::from_shape_fn((3, 2, 2), |(k, _, _)| k as f64);
         let original = dphi.clone();
-        assert!(apply_loop_closure_qc(&cfg, &mut dphi, &pairs).is_none());
+        let components = one_component(&dphi);
+        assert!(
+            apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(dphi, original);
     }
 
@@ -7779,16 +8966,80 @@ mod tests {
         cfg.timeseries_options.mask_unwrap_loop_errors = true;
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
         let phase = [0.0, 1.3, 2.9];
-        let mut dphi = Array3::from_shape_fn((pairs.len(), 2, 2), |(k, _, _)| {
+        let mut dphi = Array3::from_shape_fn((pairs.len(), 4, 4), |(k, _, _)| {
             let (i, j) = pairs[k];
             phase[j] - phase[i]
         });
         dphi[(2, 1, 1)] += std::f64::consts::TAU;
+        let components = one_component(&dphi);
 
-        let qc = apply_loop_closure_qc(&cfg, &mut dphi, &pairs).expect("qc ran");
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+            .unwrap()
+            .expect("qc ran");
         assert!(qc.bad_loop_count[(1, 1)] > 0.0);
         assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
         assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
+    }
+
+    /// No pixel is exempt from unwrap errors. Referencing every interferogram to
+    /// one pixel before closure charged that pixel's error to every other pixel's
+    /// loops (T013-026608-IW2, 2026-09-14: 41,835 of 41,850 pixels masked). Only
+    /// the pixel with the error may be flagged, whatever its position.
+    #[test]
+    fn closure_does_not_inherit_the_reference_pixels_error() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let phase = [0.0, 1.3, 2.9];
+        let mut phases = Array3::from_shape_fn((pairs.len(), 4, 5), |(k, _, col)| {
+            let (i, j) = pairs[k];
+            phase[j] - phase[i] + col as f64 * 0.1 + [0.0, std::f64::consts::TAU, 0.0][k]
+        });
+        phases[(2, 0, 0)] += std::f64::consts::TAU;
+        let components = one_component(&phases);
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs)
+            .unwrap()
+            .unwrap();
+        let flagged: Vec<(usize, usize)> = qc
+            .failed_mask()
+            .indexed_iter()
+            .filter(|(_, &bad)| bad)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(flagged, vec![(0, 0)]);
+        assert!(phases.slice(s![.., 1, 2]).iter().all(|v| v.is_finite()));
+    }
+
+    /// Closure is judged on the observations as unwrapped. Subtracting a
+    /// reference pixel first added that pixel's sub-cycle noise to every other
+    /// pixel's residual; without it, noise at one pixel stays at that pixel.
+    #[test]
+    fn one_pixels_noise_stays_out_of_every_other_residual() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let phase = [0.0, 1.3, 2.9];
+        let mut phases = Array3::from_shape_fn((pairs.len(), 4, 4), |(k, _, _)| {
+            let (i, j) = pairs[k];
+            phase[j] - phase[i]
+        });
+        phases[(1, 0, 0)] += 0.4 * std::f64::consts::TAU;
+        let components = one_component(&phases);
+        let qc = apply_loop_closure_qc(&cfg, &mut phases, components.view(), &pairs)
+            .unwrap()
+            .unwrap();
+        assert!((qc.worst_residual_cycles[(0, 0)] - 0.4).abs() < 1e-12);
+        for (index, &worst) in qc.worst_residual_cycles.indexed_iter() {
+            if index != (0, 0) {
+                assert!(worst < 1e-12, "{index:?} carries {worst} cycles");
+            }
+        }
+        assert!(phases.iter().all(|v| v.is_finite()));
+    }
+
+    /// Every interferogram unwrapped as one connected component.
+    fn one_component(unwrapped: &Array3<f64>) -> Array3<u32> {
+        Array3::from_elem(unwrapped.dim(), 1)
     }
 
     fn dated_files(dates: &[&str]) -> Vec<PathBuf> {
@@ -7810,7 +9061,7 @@ mod tests {
 
         let days = vec![0.0, 12.0];
         let displacement = Array3::from_shape_fn((1, 1, 1), |_| 0.5);
-        let fit = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
+        let fit = fit_velocity(&cfg, displacement.view(), &days, None, None, &model).unwrap();
         assert!(fit.terms.seasonal_amplitude_rad.is_none());
         assert!(fit.terms.step_magnitude_rad.is_empty());
     }
@@ -7892,7 +9143,7 @@ mod tests {
         cfg.timeseries_options.velocity_seasonal = true;
         let model = velocity_model(&cfg, &dated_files(&["20230104"])).unwrap();
 
-        let seasonal = fit_velocity(&cfg, displacement.view(), &days, None, &model).unwrap();
+        let seasonal = fit_velocity(&cfg, displacement.view(), &days, None, None, &model).unwrap();
         assert!(
             (seasonal.velocity[(0, 0)] - rate_per_year).abs() < 1e-6,
             "rate {} != {rate_per_year}",
@@ -7910,6 +9161,7 @@ mod tests {
             &cfg,
             displacement.view(),
             &days,
+            None,
             None,
             &VelocityModel::default(),
         )
@@ -7944,6 +9196,8 @@ mod tests {
                 relaxation: Vec::new(),
             },
             loop_closure: None,
+            junctions: Vec::new(),
+            cycle_steps: CycleStepDetection::unjudged(4, 4),
             velocity_terms: VelocityTerms::default(),
             temporal_coherence: Array2::from_elem((4, 4), 0.9),
             validity_mask: Array2::from_elem((4, 4), true),

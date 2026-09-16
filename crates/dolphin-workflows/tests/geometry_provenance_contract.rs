@@ -189,6 +189,7 @@ fn coverage_v3_round_trips_without_identifiers() {
         &DisplacementWorkflow::default(),
         None,
         None,
+        None,
         Some(coverage.clone()),
     );
     let json = serde_json::to_string(&provenance).unwrap();

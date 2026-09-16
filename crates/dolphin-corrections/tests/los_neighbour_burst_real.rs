@@ -2,16 +2,19 @@
 //! needs.
 //!
 //! The three-station GNSS frame (`mmx1_icmx_mxtx_common`, burst `T005_008704_IW1`)
-//! extends past burst 008704's valid LOS, so resolving geometry from 008704 alone is
-//! a coverage error; adding the along-track neighbour 008705 — whose burst is by
-//! definition not in the CSLC stack — completes it. This gate proves both halves on
+//! extends past burst 008704's valid LOS, so resolving geometry from 008704 alone
+//! leaves pixels outside STATIC coverage (a coverage error under a zero gate);
+//! adding the along-track neighbour 008705 — whose burst is by definition not in
+//! the CSLC stack — completes it. This gate proves both halves on
 //! the real granules and measures the overlap agreement the relaxed provenance rule
 //! now rests on. Skips (passes as a no-op) when the local real fixtures are absent,
 //! mirroring the other real-data gates.
 
 use std::path::Path;
 
-use dolphin_corrections::geometry::resolve_los_geometry;
+use dolphin_corrections::geometry::{
+    resolve_los_geometry, resolve_los_geometry_with_options, LosCoverageOptions,
+};
 use dolphin_corrections::troposphere::{warp_to_frame, DelayGrid};
 use dolphin_corrections::CorrectionError;
 use dolphin_io::{read_geotransform, read_los_layers, LosLayers};
@@ -50,12 +53,16 @@ fn neighbour_burst_static_completes_coverage_and_agrees_in_overlap() {
     let neighbour_layers = read_los_layers(&neighbour, "/data").expect("read 008705 LOS");
 
     // Half 1: the processed burst alone does not cover the frame — this is the
-    // shortfall that made the STATIC identity rule bite.
-    let err = resolve_los_geometry(
+    // shortfall that made the STATIC identity rule bite. A zero gate keeps it an
+    // error regardless of how small the uncovered strip is.
+    let err = resolve_los_geometry_with_options(
         std::slice::from_ref(&own_layers),
         geo.geotransform,
         geo.epsg,
         shape,
+        LosCoverageOptions {
+            max_outside_static_fraction: 0.0,
+        },
     )
     .expect_err("008704 alone unexpectedly covered the whole frame");
     assert!(

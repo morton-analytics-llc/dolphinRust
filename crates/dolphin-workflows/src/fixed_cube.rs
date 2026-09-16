@@ -106,7 +106,7 @@ pub fn write_fixed_cube_bundle(
     epsg: Option<u32>,
     geotransform: [f64; 6],
 ) -> Result<FixedCubeReceipt> {
-    validate_geometry(geometry, validity_mask.dim())?;
+    validate_geometry(geometry, validity_mask)?;
 
     let dir = &cfg.work_directory;
     std::fs::create_dir_all(dir)?;
@@ -290,7 +290,8 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn validate_geometry(geometry: &LosGeometry, shape: (usize, usize)) -> Result<()> {
+fn validate_geometry(geometry: &LosGeometry, validity_mask: ArrayView2<'_, bool>) -> Result<()> {
+    let shape = validity_mask.dim();
     ensure!(
         geometry.east.dim() == shape,
         "LOS east shape does not match fixed cube"
@@ -304,12 +305,12 @@ fn validate_geometry(geometry: &LosGeometry, shape: (usize, usize)) -> Result<()
         "LOS up shape does not match fixed cube"
     );
     ensure!(
-        geometry
-            .east
-            .iter()
-            .chain(geometry.north.iter())
-            .chain(geometry.up.iter())
-            .all(|value| value.is_finite()),
+        validity_mask.indexed_iter().all(|(index, &valid)| {
+            !valid
+                || (geometry.east[index].is_finite()
+                    && geometry.north[index].is_finite()
+                    && geometry.up[index].is_finite())
+        }),
         "fixed-cube LOS geometry contains non-finite values"
     );
     Ok(())
@@ -330,6 +331,23 @@ mod tests {
     use ndarray::array;
 
     #[test]
+    fn los_geometry_rejects_nonfinite_values_on_valid_support() {
+        for component in 0..3 {
+            let mut geometry = dolphin_corrections::LosGeometry {
+                east: array![[0.5]],
+                north: array![[0.0]],
+                up: array![[3.0_f64.sqrt() / 2.0]],
+            };
+            match component {
+                0 => geometry.east[(0, 0)] = f64::NAN,
+                1 => geometry.north[(0, 0)] = f64::NAN,
+                _ => geometry.up[(0, 0)] = f64::NAN,
+            }
+            assert!(super::validate_geometry(&geometry, array![[true]].view()).is_err());
+        }
+    }
+
+    #[test]
     fn epoch_digest_is_stable_for_exact_float_bytes() {
         assert_eq!(sha256_days(&[0.0, 12.0]), sha256_days(&[0.0, 12.0]));
         assert_ne!(sha256_days(&[0.0, 12.0]), sha256_days(&[0.0, 13.0]));
@@ -348,9 +366,9 @@ mod tests {
             ..DisplacementWorkflow::default()
         };
         let geometry = dolphin_corrections::LosGeometry {
-            east: array![[0.5], [0.5]],
-            north: array![[0.0], [0.0]],
-            up: array![[3.0_f64.sqrt() / 2.0], [3.0_f64.sqrt() / 2.0]],
+            east: array![[0.5], [f64::NAN]],
+            north: array![[0.0], [f64::NAN]],
+            up: array![[3.0_f64.sqrt() / 2.0], [f64::NAN]],
         };
         super::write_fixed_cube_bundle(
             &workflow,

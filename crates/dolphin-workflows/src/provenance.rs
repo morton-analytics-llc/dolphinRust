@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 use dolphin_core::config::{DisplacementWorkflow, InputType};
+use dolphin_corrections::geometry::OutsideStatic;
 use dolphin_corrections::LosGeometry;
 use dolphin_io::{
     read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, read_cslc_orbit_type,
@@ -21,6 +22,7 @@ use dolphin_io::{
 use serde::{Deserialize, Serialize};
 
 use crate::crop::ProcessingBoundsProvenance;
+use crate::phase_steps::{CycleStepProvenance, JunctionProvenance};
 
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
@@ -67,6 +69,14 @@ pub struct GeometryProvenance {
     pub incidence_angle_min_deg: Option<f64>,
     /// Maximum per-pixel incidence, degrees.
     pub incidence_angle_max_deg: Option<f64>,
+    /// Frame pixels outside every supplied CSLC-S1-STATIC granule, masked to
+    /// nodata in every product (never interpolated); present when LOS resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_static_pixel_count: Option<usize>,
+    /// `outside_static_pixel_count / frame_pixels`; the run is refused above the
+    /// resolver's `max_outside_static_fraction` gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_static_fraction: Option<f64>,
     /// Platform-velocity azimuth in the scene-center ENU frame, degrees clockwise
     /// from geographic north, `[0, 360)`.
     pub heading_deg: Option<f64>,
@@ -105,6 +115,15 @@ pub struct GeometryProvenance {
     /// Aggregate, identifier-free receipt for temporal input coverage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_coverage: Option<InputCoverageProvenance>,
+    /// Per-pixel step across each ministack boundary, summarized over the
+    /// analysis frame before the publication masks (E4, 2026-09-15). Absent
+    /// only for products assembled without an inverted series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ministack_junctions: Option<JunctionProvenance>,
+    /// Per-date integer-cycle steps detected inside connected components on the
+    /// same raw series, summarized over the analysis frame (E4, 2026-09-15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_steps: Option<CycleStepProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
 }
@@ -213,14 +232,25 @@ pub fn assemble_geometry_provenance_with_bounds(
     los: Option<&LosGeometry>,
     processing_bounds: Option<ProcessingBoundsProvenance>,
 ) -> GeometryProvenance {
-    assemble_geometry_provenance_with_coverage(cfg, los, processing_bounds, None)
+    assemble_geometry_provenance_with_coverage(
+        cfg,
+        los,
+        los.map(LosGeometry::outside_static),
+        processing_bounds,
+        None,
+    )
 }
 
 /// Assemble geometry plus identifier-free input-coverage provenance.
+///
+/// `outside_static` is the resolver's count, taken before the publication
+/// validity mask NaNs the geometry at every pixel it masks; deriving it from
+/// `los` here would count those too.
 #[must_use]
 pub fn assemble_geometry_provenance_with_coverage(
     cfg: &DisplacementWorkflow,
     los: Option<&LosGeometry>,
+    outside_static: Option<OutsideStatic>,
     processing_bounds: Option<ProcessingBoundsProvenance>,
     input_coverage: Option<InputCoverageProvenance>,
 ) -> GeometryProvenance {
@@ -253,6 +283,8 @@ pub fn assemble_geometry_provenance_with_coverage(
         incidence_angle_spread_deg: incidence.map(|s| s.std_deg),
         incidence_angle_min_deg: incidence.map(|s| s.min_deg),
         incidence_angle_max_deg: incidence.map(|s| s.max_deg),
+        outside_static_pixel_count: outside_static.map(|outside| outside.pixel_count),
+        outside_static_fraction: outside_static.map(|outside| outside.fraction),
         heading_deg,
         native_range_spacing_m,
         native_azimuth_spacing_m,
@@ -275,6 +307,8 @@ pub fn assemble_geometry_provenance_with_coverage(
             && incidence_ok,
         processing_bounds,
         input_coverage,
+        ministack_junctions: None,
+        cycle_steps: None,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,

@@ -393,6 +393,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.mask_unwrap_loop_errors is true"
     ),
     conditional!(
+        "timeseries_options.write_cycle_step_diagnostics",
+        "CFG-TIMESERIES",
+        "timeseries_options.write_cycle_step_diagnostics is true"
+    ),
+    conditional!(
         "unwrap_options.snaphu_options.ntiles",
         "CFG-UNWRAP-BACKEND",
         "unwrap_method is native or snaphu"
@@ -518,6 +523,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.troposphere_files is nonempty"
     ),
+    conditional!("correction_options.troposphere_epochs", "CFG-CORRECTIONS", "timed TROPO inputs are supplied"),
     conditional!(
         "correction_options.geometry_files",
         "CFG-CORRECTIONS",
@@ -542,6 +548,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "correction_options.solid_earth_tide",
         "CFG-CORRECTIONS",
         "correction_options.solid_earth_tide is true"
+    ),
+    conditional!(
+        "correction_options.max_outside_static_fraction",
+        "CFG-CORRECTIONS",
+        "correction_options.geometry_files is nonempty"
     ),
     consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
     conditional!(
@@ -887,6 +898,14 @@ pub struct TimeseriesOptions {
     /// `max_temporal_baseline`. Emits `loop_closure_bad_count.tif` and
     /// `loop_closure_worst_cycles.tif`. See issue #24.
     pub mask_unwrap_loop_errors: bool,
+    /// Write the per-date phase-step diagnostic rasters computed on the inverted
+    /// series before corrections and the spatial reference: one
+    /// `junction_step_cycles_NN.tif` per ministack boundary (each pixel's step
+    /// across the boundary minus its connected component's median, in cycles).
+    /// The frame statistics behind them are always recorded in
+    /// `geometry_provenance.json` (`ministack_junctions`); this flag gates the
+    /// rasters only. **Off by default.**
+    pub write_cycle_step_diagnostics: bool,
 }
 
 impl Default for TimeseriesOptions {
@@ -909,6 +928,7 @@ impl Default for TimeseriesOptions {
             velocity_step_dates: Vec::new(),
             velocity_relaxation: Vec::new(),
             mask_unwrap_loop_errors: false,
+            write_cycle_step_diagnostics: false,
         }
     }
 }
@@ -1176,6 +1196,15 @@ impl Default for InputOptions {
     }
 }
 
+/// Staged OPERA TROPO input with its verified valid UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TroposphereEpoch {
+    /// Immutable local product path.
+    pub path: PathBuf,
+    /// Product valid UTC, not production or download time.
+    pub epoch: chrono::DateTime<chrono::Utc>,
+}
+
 /// Auxiliary atmospheric-correction options. dolphin `CorrectionOptions`
 /// (`ionosphere_files`, `geometry_files`, `dem_file`). Corrections are **opt-in**:
 /// with every file list empty (the default) the displacement output is unchanged.
@@ -1201,6 +1230,9 @@ pub struct CorrectionOptions {
     /// OPERA L4 tropospheric netCDF products (one per date). dolphinRust forward
     /// divergence (dolphin uses `dem_file` + RAiDER instead).
     pub troposphere_files: Vec<PathBuf>,
+    /// Strictly ordered OPERA TROPO epochs bracketing all acquisition UTCs.
+    /// Mutually exclusive with legacy per-date `troposphere_files`.
+    pub troposphere_epochs: Vec<TroposphereEpoch>,
     /// Line-of-sight geometry files resolved even in a geometry-only run and
     /// used by correction computations when enabled. The delay projection uses
     /// `incidence_angle_deg` when no geometry is resolved. dolphin name.
@@ -1222,6 +1254,12 @@ pub struct CorrectionOptions {
     /// displacement vector and projecting it into line of sight needs the full
     /// LOS unit vector, which the scalar `incidence_angle_deg` cannot supply.
     pub solid_earth_tide: bool,
+    /// Largest fraction of the frame that may fall outside every supplied
+    /// CSLC-S1-STATIC granule before the run is refused; pixels outside are masked
+    /// to nodata and counted in the geometry provenance either way. `None` uses
+    /// the resolver default (0.10); a value must lie in `[0, 1]`
+    /// (`validate_supported_options`). dolphinRust-only.
+    pub max_outside_static_fraction: Option<f64>,
 }
 
 impl Default for CorrectionOptions {
@@ -1232,11 +1270,13 @@ impl Default for CorrectionOptions {
             nisar_ellipsoidal_dem_file: None,
             ionosphere_files: Vec::new(),
             troposphere_files: Vec::new(),
+            troposphere_epochs: Vec::new(),
             geometry_files: Vec::new(),
             dem_file: None,
             incidence_angle_deg: 37.0,
             troposphere_variable: "total".into(),
             solid_earth_tide: false,
+            max_outside_static_fraction: None,
         }
     }
 }
@@ -1248,6 +1288,7 @@ impl CorrectionOptions {
     pub fn is_enabled(&self) -> bool {
         !self.ionosphere_files.is_empty()
             || !self.troposphere_files.is_empty()
+            || !self.troposphere_epochs.is_empty()
             || self.solid_earth_tide
     }
 }
@@ -1486,6 +1527,13 @@ impl DisplacementWorkflow {
                 "output_options.strides.y and output_options.strides.x must both be positive"
                     .into(),
             ));
+        }
+        if let Some(fraction) = self.correction_options.max_outside_static_fraction {
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "correction_options.max_outside_static_fraction must be in [0, 1], got {fraction}"
+                )));
+            }
         }
         if self.phase_linking.write_covariance_operator {
             let source = &self.phase_linking.empirical_source_factor;
