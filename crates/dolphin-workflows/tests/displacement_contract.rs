@@ -96,7 +96,21 @@ fn end_to_end_displacement_matches_oracle() {
     );
 
     let disp_o: Array3<f64> = ndarray_npy::read_npy(dir.join("disp_displacement.npy")).unwrap();
-    let vel_o: Array2<f64> = ndarray_npy::read_npy(dir.join("disp_velocity.npy")).unwrap();
+    // The historical velocity fixture includes the synthetic zero gauge epoch.
+    // Fit the independent displacement oracle over its observed epochs, matching
+    // LinearPostGaugeUnitPrecision. gen_displacement.py fixes the cadence at 12 days.
+    let (epochs, rows, cols) = disp_o.dim();
+    let days = (1..=epochs).map(|i| i as f64 * 12.0).collect::<Vec<_>>();
+    let mean_day = days.iter().sum::<f64>() / epochs as f64;
+    let sum_squares = days.iter().map(|day| (day - mean_day).powi(2)).sum::<f64>();
+    let vel_o = Array2::from_shape_fn((rows, cols), |(row, col)| {
+        days.iter()
+            .enumerate()
+            .map(|(epoch, day)| (day - mean_day) * disp_o[[epoch, row, col]])
+            .sum::<f64>()
+            / sum_squares
+            * 365.25
+    });
 
     assert_eq!(out.displacement.dim(), disp_o.dim(), "displacement shape");
     let derr = out

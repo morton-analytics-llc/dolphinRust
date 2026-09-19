@@ -7,8 +7,10 @@ modelling + raster subtraction, no solver.
 
 ## Domain
 
-- **Range delay → displacement units.** Every correction produces a per-acquisition
-  **range delay in meters** on the frame grid. The apply stage subtracts the delay
+- **Physical terms → apparent LOS displacement.** Workflow correction builders produce
+  per-acquisition **meters toward the sensor** on the frame grid. Tropospheric
+  path excess is negated; tide is positive ENU·LOS; ionospheric phase advance stays
+  positive. The apply stage subtracts the apparent displacement
   *relative to acquisition 0* (the series' own reference) from the LOS-phase series via
   `φ = d · (-4π/λ)` — the inverse of the pipeline's `phase → displacement` factor
   `-λ/4π` — so corrected displacement = `measured − relative_delay` exactly. Needs
@@ -46,8 +48,9 @@ modelling + raster subtraction, no solver.
 
 - **Solid earth tide (`solid_earth_tide.rs`, issue #21).** Not a propagation delay — real
   lunisolar ground motion — but it enters a repeat-pass measurement the same way, so it is
-  expressed as an **equivalent range delay** (`−(Δr · l̂)`, `l̂` ground→sensor) and summed with
-  iono/tropo before `subtract_delay`. IERS 2010 §7.1.1 step-1 degree-2 in-phase,
+  computed as an **equivalent range delay** (`−(Δr · l̂)`, `l̂` ground→sensor). The
+  workflow negates that range effect before summing it with the signed iono/tropo
+  apparent displacements for `subtract_delay`. IERS 2010 §7.1.1 step-1 degree-2 in-phase,
   `h₂ = 0.6078`, `l₂ = 0.0847`, with Astronomical-Almanac low-precision Sun/Moon ephemerides
   (mean equinox of date, so precession cancels against GMST rather than accumulating).
   **Needs no external file** — only the granule's `YYYYMMDDThhmmss` and per-pixel LOS — so

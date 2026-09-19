@@ -1,19 +1,21 @@
-//! Subtract a per-date atmospheric range delay from the LOS-phase displacement
+//! Subtract per-date apparent LOS corrections from the LOS-phase displacement
 //! time series.
 //!
 //! The displacement series `disp_rad` is `(n_dates-1, rows, cols)` in radians of
 //! LOS phase, referenced to acquisition 0. The delay stack `delay_m` is
-//! `(n_dates, rows, cols)` range delay in meters, one band per acquisition. The
+//! `(n_dates, rows, cols)` apparent displacement in meters toward the sensor. The
 //! correction applied to band `t` (acquisition `t+1`) is the delay **relative to
 //! acquisition 0** — the series' own reference — converted to phase by
 //! `φ = d · (-4π/λ)`, the inverse of the pipeline's `phase → displacement` factor
 //! `-λ/4π`, so the corrected displacement is exactly `measured − relative_delay`.
+//! Callers normalize physical terms: negative path excess for troposphere,
+//! positive ENU·LOS for tide, positive apparent phase advance for ionosphere.
 
 use ndarray::{Array3, ArrayView3, Axis};
 
 use crate::error::{CorrectionError, Result};
 
-/// Subtract the per-date atmospheric range delay (referenced to acquisition 0)
+/// Subtract per-date apparent LOS displacement (referenced to acquisition 0)
 /// from the displacement series, in place.
 ///
 /// # Errors
@@ -86,6 +88,34 @@ mod tests {
         let delay = Array3::from_elem((3, 2, 2), 2.7);
         subtract_delay(&mut disp, delay.view(), LAMBDA).unwrap();
         assert_eq!(disp, original);
+    }
+
+    #[test]
+    fn combined_physical_terms_recover_motion_at_both_wavelengths() {
+        let tropo = [2.0, 2.03, 1.99];
+        let tide_toward = [0.08, -0.04, 0.06];
+        let iono_advance = [0.10, 0.12, 0.09];
+        for wavelength in [0.055_465_76, LAMBDA] {
+            let meters_per_radian = -wavelength / (4.0 * std::f64::consts::PI);
+            let mut measured = Array3::from_shape_fn((2, 1, 1), |(band, _, _)| {
+                let date = band + 1;
+                let motion = 0.003 * date as f64;
+                (motion - (tropo[date] - tropo[0])
+                    + (tide_toward[date] - tide_toward[0])
+                    + (iono_advance[date] - iono_advance[0]))
+                    / meters_per_radian
+            });
+            let corrections = Array3::from_shape_fn((3, 1, 1), |(date, _, _)| {
+                -tropo[date] + tide_toward[date] + iono_advance[date]
+            });
+            subtract_delay(&mut measured, corrections.view(), wavelength).unwrap();
+            for band in 0..2 {
+                assert!(
+                    (measured[(band, 0, 0)] * meters_per_radian - 0.003 * (band + 1) as f64).abs()
+                        < 1e-12
+                );
+            }
+        }
     }
 
     /// Non-positive wavelength is rejected (can't convert meters to phase).

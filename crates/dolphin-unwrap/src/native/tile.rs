@@ -12,9 +12,9 @@
 //!   1. partition the grid into **regions** — maximal 4-connected sets of
 //!      reliable (coherent) pixels owned by the *same* tile core, so a coherent
 //!      component spanning several tiles becomes one region per tile;
-//!   2. across every tile seam, each reliable adjacent pixel pair votes for the
-//!      integer-cycle offset that makes the two tiles' values agree, weighted by
-//!      edge coherence;
+//!   2. across each tile seam, adjacent regions vote for the integer-cycle
+//!      offset using both tiles' estimates at shared pixels, weighted by edge
+//!      coherence; within one tile, masked-region bridges retain gradient votes;
 //!   3. assign one integer offset per region by propagating the consensus
 //!      differences along a **maximum-reliability spanning forest** of the
 //!      region-adjacency graph — optimal on the acyclic region backbone, and the
@@ -72,7 +72,7 @@ pub fn unwrap_tiled(
     let owner = Ownership::build(rows, cols, &solved);
     let mut regions = segment_regions(&reliable, &owner);
     grow_regions(&mut regions.label, &owner, regrow);
-    let offsets = reconcile(psi, corr, &owner, &regions);
+    let offsets = reconcile(psi, corr, &owner, &regions, &solved);
     compose(&owner, &regions, &offsets)
 }
 
@@ -273,8 +273,14 @@ struct Seam {
 
 /// Assign one integer-cycle offset per region by propagating consensus seam
 /// differences along a maximum-reliability spanning forest.
-fn reconcile(psi: &Array2<f64>, corr: ArrayView2<f32>, own: &Ownership, reg: &Regions) -> Vec<i64> {
-    let seams = collect_seams(psi, corr, own, &reg.label);
+fn reconcile(
+    psi: &Array2<f64>,
+    corr: ArrayView2<f32>,
+    own: &Ownership,
+    reg: &Regions,
+    tiles: &[Tile],
+) -> Vec<i64> {
+    let seams = collect_seams(psi, corr, own, &reg.label, tiles);
     spanning_offsets(reg.sizes.len(), &seams)
 }
 
@@ -290,24 +296,40 @@ fn collect_seams(
     corr: ArrayView2<f32>,
     own: &Ownership,
     label: &Array2<u32>,
+    tiles: &[Tile],
 ) -> Vec<Seam> {
     let (rows, cols) = psi.dim();
     let mut votes = Votes::new();
-    // o[r] - o[s] making val[q]+2pi o[s] - (val[p]+2pi o[r]) == wrap(psi_q - psi_p).
+    // Cross-tile gauges come from shared pixels; same-tile bridges retain
+    // the adjacent wrapped-gradient constraint.
     let mut tally = |p: (usize, usize), q: (usize, usize)| {
         let (r, s) = (label[p], label[q]);
         if s == 0 || s == r {
             return;
         }
-        let grad = wrap_to_pi(psi[q] - psi[p]);
-        let d_rs = (((own.val[q] - own.val[p]) - grad) / TAU).round() as i64;
         let w = corr[p].min(corr[q]) as f64;
-        let (lo, hi, diff) = if r < s { (r, s, d_rs) } else { (s, r, -d_rs) };
-        *votes
-            .entry((lo, hi))
-            .or_default()
-            .entry(diff)
-            .or_insert(0.0) += w;
+        let samples = if own.owner[p] == own.owner[q] {
+            let grad = wrap_to_pi(psi[q] - psi[p]);
+            [Some((((own.val[q] - own.val[p]) - grad) / TAU, w)), None]
+        } else {
+            let left = &tiles[own.owner[p] as usize];
+            let right = &tiles[own.owner[q] as usize];
+            [p, q].map(|(row, col)| {
+                let difference = (right.unwrapped[(row - right.win_r.0, col - right.win_c.0)]
+                    - left.unwrapped[(row - left.win_r.0, col - left.win_c.0)])
+                    / TAU;
+                difference.is_finite().then_some((difference, w * 0.5))
+            })
+        };
+        for (difference, weight) in samples.into_iter().flatten() {
+            let d_rs = difference.round() as i64;
+            let (lo, hi, diff) = if r < s { (r, s, d_rs) } else { (s, r, -d_rs) };
+            *votes
+                .entry((lo, hi))
+                .or_default()
+                .entry(diff)
+                .or_insert(0.0) += weight;
+        }
     };
     let cells = (0..rows).flat_map(|i| (0..cols).map(move |j| (i, j)));
     for (i, j) in cells.filter(|&p| label[p] != 0) {
@@ -479,6 +501,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlap_preserves_consistent_tiles_across_an_aliased_boundary() {
+        let truth = Array2::from_shape_fn(
+            (5, 4),
+            |(row, col)| {
+                if col < 2 {
+                    0.0
+                } else {
+                    2.0 * row as f64
+                }
+            },
+        );
+        let psi = truth.mapv(wrap_to_pi);
+        let corr = Array2::from_elem(truth.dim(), 1.0_f32);
+        for gauge in [7.0, -4.0] {
+            let tiles = vec![
+                Tile {
+                    win_r: (0, 5),
+                    win_c: (0, 3),
+                    core_r: (0, 5),
+                    core_c: (0, 2),
+                    unwrapped: truth.slice(ndarray::s![.., ..3]).to_owned(),
+                },
+                Tile {
+                    win_r: (0, 5),
+                    win_c: (1, 4),
+                    core_r: (0, 5),
+                    core_c: (2, 4),
+                    unwrapped: truth.slice(ndarray::s![.., 1..]).mapv(|v| v + gauge * TAU),
+                },
+            ];
+            let own = Ownership::build(5, 4, &tiles);
+            let regions = segment_regions(&Array2::from_elem(truth.dim(), true), &own);
+            let offsets = reconcile(&psi, corr.view(), &own, &regions, &tiles);
+            let output = compose(&own, &regions, &offsets);
+            assert!(
+                output
+                    .iter()
+                    .zip(&truth)
+                    .all(|(a, b)| (a - b).abs() < 1e-12),
+                "stitching must preserve tiles that already agree over their shared pixels"
+            );
+        }
+    }
+
+    #[test]
     fn equal_weight_seam_votes_prefer_smaller_cycle_offset() {
         // Two regions split by a vertical seam; row 0 votes diff=0, row 1
         // votes diff=1 (val jump of TAU), equal coherence weight — the tied
@@ -492,7 +559,7 @@ mod tests {
         };
         let label = Array2::from_shape_vec((2, 2), vec![1u32, 2, 1, 2]).unwrap();
 
-        let seams = collect_seams(&psi, corr.view(), &own, &label);
+        let seams = collect_seams(&psi, corr.view(), &own, &label, &[]);
 
         assert_eq!(seams.len(), 1);
         assert_eq!((seams[0].lo, seams[0].hi), (1, 2));

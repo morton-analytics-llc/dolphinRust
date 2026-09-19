@@ -269,18 +269,18 @@ pub struct DisplacementOutput {
     /// configured `timeseries_options.reference_point`, else the auto-selected
     /// center-of-mass point, or `None` if no coherent pixel was found.
     pub reference_point: Option<(usize, usize)>,
-    /// Per-date ionospheric range delay (meters), `(n_dates, rows, cols)`, that was
+    /// Per-date ionospheric phase advance (meters toward sensor), `(n_dates, rows, cols)`, that was
     /// subtracted from the series. `None` unless `correction_options.ionosphere_files`
     /// were supplied. The dominant L-band atmospheric term (`1/f²`-scaled).
     pub ionosphere_delay: Option<Array3<f64>>,
-    /// Per-date tropospheric range delay (meters), `(n_dates, rows, cols)`, that was
-    /// subtracted from the series. `None` unless `correction_options.troposphere_files`
-    /// were supplied.
+    /// Per-date negative tropospheric path excess (meters toward sensor), `(n_dates, rows, cols)`, that was
+    /// subtracted from the series relative to acquisition 0. `None` unless timed
+    /// or per-date tropospheric inputs were supplied.
     pub troposphere_delay: Option<Array3<f64>>,
-    /// Per-date solid-earth-tide equivalent range delay (meters), `(n_dates, rows,
-    /// cols)`, that was subtracted from the series. `None` unless
+    /// Per-date solid-earth-tide ENU·LOS displacement (meters toward sensor),
+    /// `(n_dates, rows, cols)`, subtracted relative to acquisition 0. `None` unless
     /// `correction_options.solid_earth_tide` was set. Not a propagation delay —
-    /// real lunisolar ground motion, expressed as the range change it causes.
+    /// real lunisolar ground motion projected toward the sensor.
     pub solid_earth_tide_delay: Option<Array3<f64>>,
     /// Per-pixel LOS unit-vector geometry (east/north/up) on the output grid. `None`
     /// unless `correction_options.geometry_files` (CSLC-S1-STATIC) were supplied. The
@@ -5375,7 +5375,7 @@ fn first_burst_files(
         .unwrap_or_default()
 }
 
-/// Write the per-date correction-delay layers (meters) as `{kind}_NN.tif` COGs.
+/// Write per-date apparent LOS corrections (meters toward sensor) as `{kind}_NN.tif` COGs.
 fn write_correction_outputs(
     cfg: &DisplacementWorkflow,
     corrections: &CorrectionLayers,
@@ -7822,7 +7822,7 @@ mod tests {
             }
             let scale = -4.0 * std::f64::consts::PI / wavelength;
             let mut disp = Array3::from_shape_fn((2, 3, 3), |(t, _, c)| {
-                (0.008 * c as f64 * days[t + 1] / 365.25 + 0.01 * (t + 1) as f64 * (1.0 + c as f64))
+                (0.008 * c as f64 * days[t + 1] / 365.25 - 0.01 * (t + 1) as f64 * (1.0 + c as f64))
                     * scale
             });
             let support = Array2::from_elem((disp.dim().1, disp.dim().2), true);

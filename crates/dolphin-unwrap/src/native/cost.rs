@@ -39,5 +39,32 @@ pub fn edge_costs(corr: ArrayView2<f32>, _mode: CostMode) -> (Array2<i64>, Array
 fn precision(a: f32, b: f32) -> i64 {
     let g = (0.5 * (a as f64 + b as f64)).clamp(0.0, GAMMA_MAX);
     let prec = g * g / (1.0 - g * g);
-    (prec.max(MIN_WEIGHT) * SCALE).round() as i64
+    (prec * SCALE).max(MIN_WEIGHT).round() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::simplex::MinCostFlow;
+    use super::precision;
+
+    #[test]
+    fn integer_floor_preserves_scaled_phase_precision() {
+        assert_eq!(precision(0.2, 0.2), 417);
+        assert_eq!(precision(0.6, 0.6), 5625);
+        assert!(precision(0.6, 0.6) < precision(0.9, 0.9));
+        assert_eq!(precision(0.0, 0.0), 1);
+        assert_eq!(precision(-0.2, -0.2), 1);
+        assert_eq!(precision(1.0, 1.0), precision(0.99, 0.99));
+    }
+
+    #[test]
+    fn residue_pair_uses_longer_less_coherent_route() {
+        let mut flow = MinCostFlow::new(3);
+        flow.set_supply(0, 1);
+        flow.set_supply(2, -1);
+        flow.add_arc(0, 2, precision(0.6, 0.6), 1);
+        flow.add_arc(0, 1, precision(0.2, 0.2), 1);
+        flow.add_arc(1, 2, precision(0.2, 0.2), 1);
+        assert_eq!(flow.solve().expect("balanced residue pair"), vec![0, 1, 1]);
+    }
 }
