@@ -466,9 +466,15 @@ fn finish_displacement(
             cfg.correction_options.is_enabled() && groups.len() > 1,
         )
     })?;
-    let validity_mask = stitched.validity_mask;
+    let mut validity_mask = stitched.validity_mask;
     let burst_coverage = stitched.coverage;
     let mut pl = stitched.pl;
+    for ((row, col), valid) in validity_mask.indexed_iter_mut() {
+        *valid &= pl
+            .slice(s![.., row, col])
+            .iter()
+            .all(|z| z.is_finite() && z.norm_sqr() > 0.0);
+    }
     if cfg.phase_linking.correct_phase_bias {
         apply_phase_bias(&mut pl, stitched.closure_phase.as_ref())?;
     }
@@ -2301,6 +2307,8 @@ struct BurstLink {
     pl: Array3<Cf64>,
     /// Temporal coherence `(out_rows, out_cols)`.
     temp_coh: Array2<f64>,
+    ministack_lengths: Vec<usize>,
+    ministack_temporal_coherence: Vec<Array2<f64>>,
     /// Distinct phase-linking coherence `(out_rows, out_cols)`, if enabled.
     phase_linking_coherence: Option<Array2<f64>>,
     /// Per-date CRLB σ `(n_dates, out_rows, out_cols)`, if enabled.
@@ -3649,6 +3657,8 @@ fn offset_geotransform(gt: [f64; 6], row: usize, col: usize) -> [f64; 6] {
 struct TiledOutput {
     cpx: Array3<Cf64>,
     temp_coh: Array2<f64>,
+    ministack_lengths: Vec<usize>,
+    ministack_temporal_coherence: Vec<Array2<f64>>,
     phase_linking_coherence: Option<Array2<f64>>,
     crlb: Option<Array3<f64>>,
     closure: Option<Array3<f64>>,
@@ -3667,6 +3677,8 @@ impl TiledOutput {
         Self {
             cpx: Array3::from_elem((nslc, or, oc), Cf64::new(f64::NAN, f64::NAN)),
             temp_coh: Array2::from_elem((or, oc), f64::NAN),
+            ministack_lengths: Vec::new(),
+            ministack_temporal_coherence: Vec::new(),
             phase_linking_coherence: want_average_coherence
                 .then(|| Array2::from_elem((or, oc), f64::NAN)),
             crlb: want_crlb.then(|| Array3::from_elem((nslc, or, oc), f64::NAN)),
@@ -3686,6 +3698,30 @@ impl TiledOutput {
             l.0 + h <= lor && l.1 + w <= loc,
             "tile kernel output smaller than its written region"
         );
+        if self.ministack_lengths.is_empty() {
+            self.ministack_lengths = out.ministack_lengths.clone();
+            self.ministack_temporal_coherence = out
+                .ministack_temporal_coherence
+                .iter()
+                .map(|_| Array2::from_elem(self.out_shape, f64::NAN))
+                .collect();
+        }
+        anyhow::ensure!(
+            self.ministack_lengths == out.ministack_lengths,
+            "phase-link tiles have differing ministack partitions"
+        );
+        anyhow::ensure!(
+            self.ministack_temporal_coherence.len() == out.ministack_temporal_coherence.len(),
+            "phase-link tile coherence layers differ from its partition"
+        );
+        for (dst, src) in self
+            .ministack_temporal_coherence
+            .iter_mut()
+            .zip(&out.ministack_temporal_coherence)
+        {
+            dst.slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
+                .assign(&src.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
+        }
         assign_block3(&mut self.cpx, &out.cpx_phase, g, l, (h, w));
         self.temp_coh
             .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
@@ -3726,6 +3762,8 @@ impl TiledOutput {
             cpx_phase: self.cpx,
             compressed_slcs: Vec::new(),
             temporal_coherence: self.temp_coh,
+            ministack_lengths: self.ministack_lengths,
+            ministack_temporal_coherence: self.ministack_temporal_coherence,
             phase_linking_coherence: self.phase_linking_coherence,
             crlb_sigma: self.crlb,
             closure_phase: self.closure,
@@ -3782,6 +3820,8 @@ fn burst_link(
     Ok(BurstLink {
         pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
+        ministack_lengths: out.ministack_lengths,
+        ministack_temporal_coherence: out.ministack_temporal_coherence,
         phase_linking_coherence: out.phase_linking_coherence,
         crlb_sigma: out.crlb_sigma,
         closure_phase: out.closure_phase,
@@ -4369,6 +4409,21 @@ fn stitch_bursts(
     retain_correction_ownership: bool,
 ) -> Result<Stitched> {
     anyhow::ensure!(!bursts.is_empty(), "no bursts to stitch");
+    let block_lengths = bursts[0].ministack_lengths.clone();
+    for burst in &bursts {
+        anyhow::ensure!(
+            !block_lengths.is_empty()
+                && block_lengths.iter().all(|&length| length > 0)
+                && burst.ministack_lengths == block_lengths
+                && block_lengths.iter().sum::<usize>() == burst.pl.dim().0
+                && burst.ministack_temporal_coherence.len() == block_lengths.len()
+                && burst
+                    .ministack_temporal_coherence
+                    .iter()
+                    .all(|layer| layer.dim() == burst.temp_coh.dim()),
+            "burst coherence layers differ from the phase ministack partition"
+        );
+    }
     if bursts.len() == 1 {
         let b = bursts.remove(0);
         let owner =
@@ -4419,6 +4474,14 @@ fn stitch_bursts(
     );
     let mut temp_coh = Array2::<f64>::from_elem((frame.rows, frame.cols), f64::NAN);
     let mut covered = Array2::<bool>::from_elem((frame.rows, frame.cols), false);
+    let mut block_quality: Vec<_> = block_lengths
+        .iter()
+        .map(|_| Array2::from_elem((frame.rows, frame.cols), f64::NAN))
+        .collect();
+    let mut mixed_quality: Vec<_> = block_lengths
+        .iter()
+        .map(|_| Array2::from_elem((frame.rows, frame.cols), false))
+        .collect();
     let mut ownership = (retain_covariance_lineage || retain_correction_ownership)
         .then(|| Array3::<u32>::from_elem((nslc, frame.rows, frame.cols), NO_BURST_OWNER));
     let mut seam_rotations = retain_covariance_lineage.then(|| Vec::with_capacity(bursts.len()));
@@ -4455,13 +4518,48 @@ fn stitch_bursts(
                 shape: (b.pl.dim().1, b.pl.dim().2),
             });
         }
+        let mut start = 0;
+        for (block, &length) in block_lengths.iter().enumerate() {
+            for row in 0..b.pl.dim().1 {
+                for col in 0..b.pl.dim().2 {
+                    let count =
+                        b.pl.slice(s![start..start + length, row, col])
+                            .iter()
+                            .filter(|z| z.re.is_finite() && z.im.is_finite())
+                            .count();
+                    let point = (off.0 + row, off.1 + col);
+                    if count == length {
+                        block_quality[block][point] =
+                            b.ministack_temporal_coherence[block][(row, col)];
+                        mixed_quality[block][point] = false;
+                    } else if count != 0 {
+                        block_quality[block][point] = f64::NAN;
+                        mixed_quality[block][point] = true;
+                    }
+                }
+            }
+            start += length;
+        }
         match ownership.as_mut() {
             Some(ownership) => {
                 paste3_finite_complex_with_owner(&mut pl, ownership, &b.pl, off, owner);
             }
             None => paste3_finite_complex(&mut pl, &b.pl, off),
         }
-        paste2_finite(&mut temp_coh, &b.temp_coh, off);
+        for (point, quality) in temp_coh.indexed_iter_mut() {
+            let (sum, count) = block_quality
+                .iter()
+                .map(|layer| layer[point])
+                .filter(|value| value.is_finite())
+                .fold((0.0, 0usize), |(sum, count), value| {
+                    (sum + value, count + 1)
+                });
+            *quality = if mixed_quality.iter().any(|mixed| mixed[point]) || count == 0 {
+                f64::NAN
+            } else {
+                sum / count as f64
+            };
+        }
         let (rows, cols) = b.temp_coh.dim();
         let mut target = covered.slice_mut(s![off.0..off.0 + rows, off.1..off.1 + cols]);
         ndarray::Zip::from(&mut target)
@@ -5565,6 +5663,8 @@ mod tests {
                 Cf64::from_polar(1.0, date as f64 * 0.2 + phase_offset)
             }),
             temp_coh: Array2::from_elem((3, 3), coherence),
+            ministack_lengths: vec![2],
+            ministack_temporal_coherence: vec![Array2::from_elem((3, 3), coherence)],
             phase_linking_coherence: None,
             crlb_sigma: None,
             closure_phase: None,
@@ -5611,6 +5711,7 @@ mod tests {
         });
         burst.days = vec![0.0, 12.0, 24.0, 36.0];
         burst.coverage.acquisition_count = 4;
+        burst.ministack_lengths = vec![4];
         let out = finish_displacement(
             &cfg,
             vec![burst],
@@ -5659,6 +5760,7 @@ mod tests {
             });
             burst.days = vec![0.0, 12.0, 24.0, 36.0];
             burst.coverage.acquisition_count = 4;
+            burst.ministack_lengths = vec![4];
             let out = finish_displacement(
                 &cfg,
                 vec![burst],
@@ -5770,6 +5872,55 @@ mod tests {
     }
 
     #[test]
+    fn multiburst_complete_overwrite_restores_known_quality() {
+        let first = seam_burst(0.0, 0.9);
+        let mut partial = seam_burst(0.4, 0.8);
+        partial.pl[(0, 0, 0)] = Cf64::new(f64::NAN, f64::NAN);
+        partial.coverage.burst_index = 1;
+        let mut complete = seam_burst(0.6, 0.7);
+        complete.coverage.burst_index = 2;
+        let output = stitch_bursts(vec![first, partial, complete], true, false).unwrap();
+        assert_eq!(output.temp_coh[(0, 0)], 0.7);
+        assert!(output
+            .ownership
+            .unwrap()
+            .slice(s![.., 0, 0])
+            .iter()
+            .all(|owner| *owner == 2));
+    }
+
+    #[test]
+    fn multiburst_coherence_follows_complementary_ministack_owners() {
+        let mut first = seam_burst(0.0, 0.55);
+        first.ministack_lengths = vec![1, 1];
+        first.ministack_temporal_coherence = vec![
+            Array2::from_elem((3, 3), 0.9),
+            Array2::from_elem((3, 3), 0.2),
+        ];
+        let mut second = seam_burst(0.4, 0.8);
+        second.ministack_lengths = vec![1, 1];
+        second.ministack_temporal_coherence = vec![
+            Array2::from_elem((3, 3), 0.8),
+            Array2::from_elem((3, 3), f64::NAN),
+        ];
+        // Keep enough shared pixels to establish the unchanged scalar seam gauge.
+        second.pl[(1, 0, 0)] = Cf64::new(f64::NAN, f64::NAN);
+        second.ministack_temporal_coherence[1].fill(0.8);
+        second.ministack_temporal_coherence[1][(0, 0)] = f64::NAN;
+        second.coverage.burst_index = 1;
+        let stitched = stitch_bursts(vec![first, second], true, false).unwrap();
+        assert_eq!(stitched.temp_coh[(0, 0)], 0.5);
+        assert!(stitched
+            .pl
+            .slice(s![.., 0, 0])
+            .iter()
+            .all(|z| z.is_finite()));
+        let owners = stitched.ownership.unwrap();
+        assert_eq!(owners[(0, 0, 0)], 1);
+        assert_eq!(owners[(1, 0, 0)], 0);
+    }
+
+    #[test]
     fn multiburst_stitch_does_not_overwrite_finite_overlap_with_nodata() {
         let first = seam_burst(0.0, 0.9);
         let expected = first.pl[(0, 0, 0)];
@@ -5780,7 +5931,7 @@ mod tests {
         second.coverage.burst_index = 1;
         let stitched = stitch_bursts(vec![first, second], true, false).unwrap();
         assert_eq!(stitched.pl[(0, 0, 0)], expected);
-        assert!(stitched.temp_coh[(0, 0)].is_finite());
+        assert!(stitched.temp_coh[(0, 0)].is_nan());
         assert!(stitched.validity_mask[(0, 0)]);
         let ownership = stitched.ownership.unwrap();
         assert_eq!(ownership[(0, 0, 0)], 0);
@@ -7304,6 +7455,23 @@ mod tests {
         assert!(tiled.validity_mask.iter().all(|valid| *valid));
         let tiled = tiled.output;
         assert_c64_eq(tiled.cpx_phase.view(), whole.cpx_phase.view(), "cpx_phase");
+        assert_eq!(tiled.ministack_lengths, whole.ministack_lengths);
+        assert_eq!(
+            tiled.ministack_temporal_coherence.len(),
+            whole.ministack_temporal_coherence.len()
+        );
+        for (a, b) in tiled
+            .ministack_temporal_coherence
+            .iter()
+            .zip(&whole.ministack_temporal_coherence)
+        {
+            assert_f64_eq(
+                a.view().insert_axis(Axis(0)),
+                b.view().insert_axis(Axis(0)),
+                "ministack_coherence",
+            );
+        }
+
         assert_f64_eq(
             tiled.temporal_coherence.view().insert_axis(Axis(0)),
             whole.temporal_coherence.view().insert_axis(Axis(0)),

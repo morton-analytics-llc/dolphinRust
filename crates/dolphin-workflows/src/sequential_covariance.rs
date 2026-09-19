@@ -43,7 +43,7 @@ use crate::sequential::SequentialConfig;
 /// Stable method name for the replayable global covariance operator.
 pub const SEQUENTIAL_SOURCE_DAG_METHOD: &str = "sequential_source_dag_v1";
 /// Versioned identity of the production derivative and contraction kernels.
-pub const SEQUENTIAL_SOURCE_DAG_KERNEL_ID: &str = "dolphinrust:sequential_source_dag_v1:kernel_v1";
+pub const SEQUENTIAL_SOURCE_DAG_KERNEL_ID: &str = "dolphinrust:sequential_source_dag_v1:kernel_v2";
 
 const NODE_KIND_SHIFT: u32 = 62;
 const NODE_MAJOR_LIMIT: u32 = 1 << 30;

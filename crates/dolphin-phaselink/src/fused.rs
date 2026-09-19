@@ -713,6 +713,9 @@ pub(crate) fn average_coherence_sum_count(
     start_idx: usize,
 ) -> (f64, u32) {
     let n = c.nrows();
+    if !crate::estimator::has_complete_power(c) {
+        return (0.0, 0);
+    }
     debug_assert_eq!(n, c.ncols(), "coherence matrix must be square");
     (start_idx..n)
         .map(|date| c.row(date).iter().map(|z| z.norm()).sum::<f64>() / n as f64)

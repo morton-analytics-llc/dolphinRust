@@ -27,7 +27,8 @@ const FIM_JITTER: f64 = 1e-6;
 /// phase layout); `σ[reference_idx] = 0`, and a pixel with a singular `Γ` is
 /// `NaN` on every non-reference date. `num_looks` is dolphin's conservative
 /// `sqrt(half_y · half_x)`; `beta` / `zero_correlation_threshold` regularize `Γ`
-/// exactly as in EMI.
+/// exactly as in EMI. Missing input power yields `NaN` on every date, including
+/// the reference date.
 #[must_use]
 pub fn estimate_crlb(
     c_arrays: ArrayView4<Cf64>,
@@ -61,6 +62,9 @@ pub(crate) fn crlb_pixel(
     num_looks: f64,
 ) -> Array1<f64> {
     let n = c.nrows();
+    if !crate::estimator::has_complete_power(c) {
+        return Array1::from_elem(n, f64::NAN);
+    }
     let gamma = regularized_abs_gamma(c, beta, zero_correlation_threshold);
     let Some(gamma_inv) = invert_pd(&gamma, GAMMA_JITTER) else {
         return nan_with_zero_ref(n, reference_idx);

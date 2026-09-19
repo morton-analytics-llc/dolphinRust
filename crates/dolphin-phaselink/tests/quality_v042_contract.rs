@@ -136,8 +136,8 @@ fn closure_matches_oracle_v042() {
     );
 }
 
-/// The v0.42 singular-Γ fix: zero / identity blocks give NaN past the reference
-/// date, a rank-1 (all-ones) block gives a finite small σ — exactly dolphin's.
+/// Powered singular blocks retain v0.42 parity. Zero-power blocks have no
+/// measured phase, including at the reference date, so every bound is missing.
 #[test]
 fn crlb_singular_matches_oracle_v042() {
     let Some(oracle) = read_f32_3d("crlb_singular_sigma_v042.npy") else {
@@ -151,9 +151,14 @@ fn crlb_singular_matches_oracle_v042() {
     let (rows, cols, nslc) = oracle.dim();
     for r in 0..rows {
         for col in 0..cols {
+            let missing_power = (0..nslc).any(|t| c[(r, col, t, t)].re == 0.0);
             for t in 0..nslc {
                 let got = sigma[(t, r, col)];
                 let want = oracle[(r, col, t)] as f64;
+                if missing_power {
+                    assert!(got.is_nan(), "zero-power pixel ({r},{col}) date {t}");
+                    continue;
+                }
                 if want.is_nan() {
                     assert!(
                         got.is_nan(),

@@ -122,6 +122,21 @@ fn assert_outputs_match(
     assert!(dcrlb < tol, "crlb max|Δ| {dcrlb}");
     assert!(dclos < tol, "closure max|Δ| {dclos}");
     assert_eq!(inc.validity_mask, full.validity_mask, "validity mask");
+    assert_eq!(inc.ministack_lengths, full.ministack_lengths);
+    assert_eq!(
+        inc.ministack_temporal_coherence.len(),
+        full.ministack_temporal_coherence.len()
+    );
+    for (a, b) in inc
+        .ministack_temporal_coherence
+        .iter()
+        .zip(&full.ministack_temporal_coherence)
+    {
+        assert!(
+            max_r(a.view(), b.view()) < tol,
+            "ministack coherence differs"
+        );
+    }
 }
 
 const TOL: f64 = 1e-9;

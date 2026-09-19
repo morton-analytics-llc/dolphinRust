@@ -92,6 +92,10 @@ pub struct SequentialOutput {
     /// (dolphin's `temporal_coherence_average` = `numpy.nanmean`), `(out_rows,
     /// out_cols)`. 1.0 = perfect phase consistency.
     pub temporal_coherence: Array2<f64>,
+    /// Real-acquisition count in each coherence ministack.
+    pub ministack_lengths: Vec<usize>,
+    /// Temporal coherence before the cross-ministack mean, on the output grid.
+    pub ministack_temporal_coherence: Vec<Array2<f64>>,
     /// Mean coherence-matrix magnitude across real acquisition dates,
     /// `(out_rows, out_cols)`. `None` unless requested.
     pub phase_linking_coherence: Option<Array2<f64>>,
@@ -396,6 +400,8 @@ fn build_output(
         cpx_phase,
         compressed_slcs: compressed,
         temporal_coherence: stitch_temp_coh(temp_coh),
+        ministack_lengths: phases.iter().map(|phase| phase.dim().0).collect(),
+        ministack_temporal_coherence: temp_coh.to_vec(),
         phase_linking_coherence: finish_average_coherence(average_coherence),
         crlb_sigma: concat_bands(crlb)?,
         closure_phase: concat_bands(closure)?,

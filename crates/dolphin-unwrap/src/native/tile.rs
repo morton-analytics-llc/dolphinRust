@@ -348,11 +348,7 @@ fn collect_seams(
         .map(|((lo, hi), tally)| {
             let (diff, _) = tally
                 .iter()
-                .max_by(|a, b| {
-                    a.1.total_cmp(b.1)
-                        .then_with(|| b.0.abs().cmp(&a.0.abs()))
-                        .then_with(|| b.0.cmp(a.0))
-                })
+                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(a.0)))
                 .unwrap();
             Seam {
                 lo,
@@ -546,10 +542,47 @@ mod tests {
     }
 
     #[test]
-    fn equal_weight_seam_votes_prefer_smaller_cycle_offset() {
+    fn tied_seam_reconciliation_is_invariant_to_independent_tile_gauge() {
+        let psi = Array2::<f64>::zeros((2, 2));
+        let corr = Array2::<f32>::from_elem((2, 2), 1.0);
+        let expected = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, TAU]).unwrap();
+        for gauge in [0.0, -1.0, 2.0] {
+            let tiles = vec![
+                Tile {
+                    win_r: (0, 2),
+                    win_c: (0, 2),
+                    core_r: (0, 2),
+                    core_c: (0, 1),
+                    unwrapped: psi.clone(),
+                },
+                Tile {
+                    win_r: (0, 2),
+                    win_c: (0, 2),
+                    core_r: (0, 2),
+                    core_c: (1, 2),
+                    unwrapped: Array2::from_shape_fn((2, 2), |(row, _)| (gauge + row as f64) * TAU),
+                },
+            ];
+            let own = Ownership::build(2, 2, &tiles);
+            let regions = segment_regions(&Array2::from_elem((2, 2), true), &own);
+            let offsets = reconcile(&psi, corr.view(), &own, &regions, &tiles);
+            let output = compose(&own, &regions, &offsets);
+            let origin = output[(0, 0)];
+            assert!(
+                output
+                    .iter()
+                    .zip(&expected)
+                    .all(|(actual, wanted)| { (actual - origin - wanted).abs() < 1e-12 }),
+                "independent tile gauge {gauge} changed the reconciled spatial field: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_weight_seam_votes_prefer_numerically_smaller_cycle_offset() {
         // Two regions split by a vertical seam; row 0 votes diff=0, row 1
         // votes diff=1 (val jump of TAU), equal coherence weight — the tied
-        // vote must resolve to the smaller |diff|, not HashMap order.
+        // vote must resolve to the numerically smaller diff, not HashMap order.
         let psi = Array2::<f64>::zeros((2, 2));
         let corr = Array2::<f32>::from_elem((2, 2), 1.0);
         let own = Ownership {

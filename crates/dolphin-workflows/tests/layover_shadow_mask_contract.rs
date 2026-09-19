@@ -194,16 +194,22 @@ fn adaptive_neighbors_are_selected_from_raw_samples_before_masking_covariance() 
                 .cpx_phase
                 .iter()
                 .zip(post_mask_alternative.cpx_phase.iter())
-                .any(|(raw, masked)| (*raw - *masked).norm() > 1e-12),
+                .any(|(raw, masked)| {
+                    raw.is_finite() != masked.is_finite() || (*raw - *masked).norm() > 1e-12
+                }),
             "fixture does not make {method:?} selection order observable"
         );
 
         let actual = run_sequential_masked(stack.view(), mask.view(), &cfg, &engine).unwrap();
         for ((date, row, col), value) in actual.cpx_phase.indexed_iter() {
             if mask[(row, col)] {
+                let wanted = expected.cpx_phase[(date, row, col)];
+                assert_eq!(value.is_finite(), wanted.is_finite());
+                if !wanted.is_finite() {
+                    continue;
+                }
                 assert_eq!(
-                    *value,
-                    expected.cpx_phase[(date, row, col)],
+                    *value, wanted,
                     "{method:?} selected neighbors after applying the terrain mask"
                 );
             }

@@ -440,3 +440,63 @@ fn gpu_emi_falls_back_to_evd_on_singular_gamma() {
     eprintln!("EMI→EVD fallback: overlap={min_sim:.6} max Δφ={max_dphi:.3e} rad");
     assert!(min_sim > 0.999);
 }
+
+#[test]
+fn gpu_hybrid_preserves_zero_power_nodata_in_both_estimators() {
+    let ctx = gpu();
+    let mut coherence = Array4::from_elem((1, 3, 3, 3), Cf64::new(1.0, 0.0));
+    coherence
+        .slice_mut(ndarray::s![0, 0, .., ..])
+        .fill(Cf64::new(0.0, 0.0));
+    coherence
+        .slice_mut(ndarray::s![0, 1, 0, ..])
+        .fill(Cf64::new(0.0, 0.0));
+    coherence
+        .slice_mut(ndarray::s![0, 1, .., 0])
+        .fill(Cf64::new(0.0, 0.0));
+    for use_evd in [false, true] {
+        let raw = process_coherence_matrices_gpu(
+            &ctx,
+            coherence
+                .mapv(|z| Cf32::new(z.re as f32, z.im as f32))
+                .view(),
+            use_evd,
+            0.0,
+            0.0,
+            0,
+            DEFAULT_LINK_ITERS,
+        )
+        .unwrap();
+        for col in 0..2 {
+            assert!(raw
+                .cpx_phase
+                .slice(ndarray::s![.., 0, col])
+                .iter()
+                .all(|z| !z.is_finite()));
+            assert!(raw.eigenvalues[(0, col)].is_nan());
+        }
+        let output = process_coherence_matrices_gpu_hybrid(
+            &ctx,
+            coherence.view(),
+            use_evd,
+            0.0,
+            0.0,
+            0,
+            DEFAULT_LINK_ITERS,
+        )
+        .unwrap();
+        for col in 0..2 {
+            assert!(output
+                .cpx_phase
+                .slice(ndarray::s![.., 0, col])
+                .iter()
+                .all(|z| !z.is_finite()));
+            assert!(output.eigenvalues[(0, col)].is_nan());
+        }
+        assert!(output
+            .cpx_phase
+            .slice(ndarray::s![.., 0, 2])
+            .iter()
+            .all(|z| z.is_finite()));
+    }
+}
