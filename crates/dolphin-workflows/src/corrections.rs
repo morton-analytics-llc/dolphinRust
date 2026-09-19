@@ -1,6 +1,6 @@
-//! Atmospheric-correction stage: build per-date ionospheric + tropospheric range
-//! delays (meters) on the frame grid and subtract them from the inverted
-//! displacement time series, **before velocity** (per the pipeline contract).
+//! Atmospheric-correction stage: build per-date apparent LOS corrections
+//! (meters, positive toward the sensor) on the frame grid and subtract them
+//! from the inverted displacement time series, **before velocity**.
 //!
 //! Opt-in: with no correction files configured this is a no-op and the output is
 //! bit-identical to the uncorrected run. Enabling it requires
@@ -25,20 +25,22 @@ use dolphin_corrections::troposphere::{
 use dolphin_io::{grid_centroid_lonlat, GeoInfo};
 use ndarray::{Array2, Array3, ArrayView2, Axis};
 
-/// Per-date correction delay layers (meters, `(n_dates, rows, cols)`), returned
+/// Per-date apparent LOS layers (meters toward sensor, `(n_dates, rows, cols)`), returned
 /// for the typed API and per-band COG output.
 #[derive(Debug)]
 pub struct CorrectionLayers {
-    /// Ionospheric range delay, present when `ionosphere_files` were supplied.
+    /// Ionospheric phase advance in apparent LOS meters, present when
+    /// `ionosphere_files` were supplied.
     pub ionosphere: Option<Array3<f64>>,
-    /// Tropospheric range delay, present when `troposphere_files` were supplied.
+    /// Negative tropospheric path excess in apparent LOS meters, present when
+    /// timed or per-date tropospheric inputs were supplied.
     pub troposphere: Option<Array3<f64>>,
     /// Per-pixel LOS geometry, present when `geometry_files` (CSLC-S1-STATIC) were
     /// supplied. Independent of the atmospheric terms — the front door for the GPS
     /// ground-truth harness's ENU→LOS projection. When present it also drives the
     /// per-pixel zenith→slant incidence for the iono/tropo delays.
     pub los_geometry: Option<LosGeometry>,
-    /// Solid-earth-tide equivalent range delay, present when
+    /// Solid-earth-tide displacement projected toward the sensor, present when
     /// `correction_options.solid_earth_tide` is set.
     pub solid_earth_tide: Option<Array3<f64>>,
 }
@@ -308,7 +310,7 @@ fn sum_layers<const N: usize>(
     )
 }
 
-/// Per-date solid-earth-tide equivalent range delay (meters) on the frame grid.
+/// Per-date solid-earth-tide apparent LOS displacement (meters toward sensor).
 ///
 /// Needs no external data file — only the acquisition UTC from each granule name
 /// and the per-pixel LOS geometry. Both are hard requirements rather than
@@ -348,7 +350,7 @@ fn build_solid_earth_tide(
                 )
             })?;
         out.index_axis_mut(Axis(0), t)
-            .assign(&tide_range_delay_grid(utc, &lonlat, los));
+            .assign(&tide_range_delay_grid(utc, &lonlat, los).mapv(|range| -range));
     }
     Ok(Some(out))
 }
@@ -457,8 +459,9 @@ fn troposphere_bracket(
     Ok((lower, upper, seconds / span))
 }
 
-/// Build the per-date tropospheric delay grid by resampling each OPERA L4 netCDF
-/// onto the frame grid. Terrain and LOS projection are judged on `support`
+/// Build negative apparent LOS displacement from positive tropospheric path excess.
+/// Resample each OPERA L4 netCDF onto the frame grid. Terrain and LOS
+/// projection are judged on `support`
 /// narrowed to finite geometry ([`geometry_support`]).
 fn build_troposphere(
     opts: &CorrectionOptions,
@@ -518,7 +521,7 @@ fn build_troposphere(
                 .and(&cached[&upper])
                 .and(&slant)
                 .for_each(|value, &a, &b, &projection| {
-                    *value = (a * (1.0 - weight) + b * weight) * projection
+                    *value = -(a * (1.0 - weight) + b * weight) * projection
                 });
         }
         return Ok(Some(out));
@@ -554,7 +557,7 @@ fn build_troposphere(
                 resample_to_frame(&grid, gt, epsg, (rows, cols))?
             }
         };
-        out.index_axis_mut(Axis(0), t).assign(&(&band * &slant));
+        out.index_axis_mut(Axis(0), t).assign(&(-&band * &slant));
     }
     Ok(Some(out))
 }
@@ -842,10 +845,10 @@ mod tests {
             .unwrap();
             let meters =
                 displacement.mapv(|phase| -wavelength * phase / (4.0 * std::f64::consts::PI));
-            assert!((meters[(0, 0, 0)] + 0.825 / 30_f64.to_radians().cos()).abs() < 1e-7);
-            assert!((meters[(0, 0, 1)] + 0.275 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!((meters[(0, 0, 0)] - 0.825 / 30_f64.to_radians().cos()).abs() < 1e-7);
+            assert!((meters[(0, 0, 1)] - 0.275 / 30_f64.to_radians().cos()).abs() < 1e-7);
             assert!(
-                (output.troposphere.unwrap()[(0, 0, 1)] - 1.925 / 30_f64.to_radians().cos()).abs()
+                (output.troposphere.unwrap()[(0, 0, 1)] + 1.925 / 30_f64.to_radians().cos()).abs()
                     < 1e-7
             );
         }
@@ -901,14 +904,20 @@ mod tests {
         .unwrap()
         .unwrap();
         for (index, expected) in [2.0625, 3.09375, 4.125].into_iter().enumerate() {
-            assert!((layers[(index, 0, 0)] - expected).abs() < 1e-10);
+            assert!((layers[(index, 0, 0)] + expected).abs() < 1e-10);
         }
         for wavelength in [0.05546576, 0.238403545] {
-            let mut displacement = Array3::zeros((2, 1, 1));
-            subtract_delay(&mut displacement, layers.view(), wavelength).unwrap();
             let meters_per_radian = -wavelength / (4.0 * std::f64::consts::PI);
-            assert!((displacement[(0, 0, 0)] * meters_per_radian + 1.03125).abs() < 1e-10);
-            assert!((displacement[(1, 0, 0)] * meters_per_radian + 2.0625).abs() < 1e-10);
+            // Stationary ground: increasing path excess produces apparent motion away.
+            let mut displacement = Array3::from_shape_vec(
+                (2, 1, 1),
+                vec![-1.03125 / meters_per_radian, -2.0625 / meters_per_radian],
+            )
+            .unwrap();
+            subtract_delay(&mut displacement, layers.view(), wavelength).unwrap();
+            assert!(displacement
+                .iter()
+                .all(|phase| (phase * meters_per_radian).abs() < 1e-10));
         }
         std::fs::remove_file(dem).unwrap();
     }
@@ -1107,10 +1116,10 @@ mod tests {
             let y = dst_gt[3] + (r as f64 + 0.5) * dst_gt[5];
             let (mut xs, mut ys, mut zs) = ([x], [y], []);
             ct.transform_coords(&mut xs, &mut ys, &mut zs).unwrap();
-            let expected = 1.0 + g(xs[0], ys[0]);
+            let expected = -(1.0 + g(xs[0], ys[0]));
             assert!(
-                (layers[(0, r, cc)] - 1.0).abs() < 5e-3,
-                "date0 should be 1.0"
+                (layers[(0, r, cc)] + 1.0).abs() < 5e-3,
+                "date0 apparent displacement should be -1.0"
             );
             assert!(
                 (layers[(1, r, cc)] - expected).abs() < 5e-3,
@@ -1553,6 +1562,32 @@ mod tests {
             disp.iter().any(|v| v.abs() > 1e-9),
             "the tide was built but never subtracted"
         );
+        let los = layers.los_geometry.expect("tide geometry");
+        let corners = dolphin_io::grid_corner_lonlat(gt, 3, 3, 32610).unwrap();
+        let lonlat = LonLatGrid::from_corners(corners, 3, 3);
+        let meters_per_radian = -0.055 / (4.0 * std::f64::consts::PI);
+        let mut measured = Array3::from_shape_fn((1, 3, 3), |(_, row, col)| {
+            let (lon, lat) = lonlat.at(row, col);
+            let enu = files
+                .iter()
+                .map(|file| {
+                    dolphin_corrections::solid_earth_tide::tide_displacement_enu(
+                        acq_utc_datetime(file).unwrap(),
+                        lon,
+                        lat,
+                        0.0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let tidal_motion = (enu[1][0] - enu[0][0]) * los.east[(row, col)]
+                + (enu[1][1] - enu[0][1]) * los.north[(row, col)]
+                + (enu[1][2] - enu[0][2]) * los.up[(row, col)];
+            (0.003 + tidal_motion) / meters_per_radian
+        });
+        apply_corrections(&opts, Some(0.055), &mut measured, &files, 32610, gt, None).unwrap();
+        assert!(measured
+            .iter()
+            .all(|phase| (phase * meters_per_radian - 0.003).abs() < 1e-10));
         let _ = std::fs::remove_file(&path);
     }
 }

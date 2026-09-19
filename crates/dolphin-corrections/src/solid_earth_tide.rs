@@ -4,8 +4,8 @@
 //! radially. Unlike ionosphere and troposphere this is not a propagation delay —
 //! it is real ground motion — but for a repeat-pass stack it enters the
 //! measurement the same way, so it is modelled here as an equivalent **range
-//! delay** and subtracted by the same [`apply::subtract_delay`](crate::apply)
-//! stage. It matters for velocity specifically because a sun-synchronous stack
+//! delay**. The workflow negates it to positive-toward LOS displacement before
+//! [`apply::subtract_delay`](crate::apply). It matters for velocity specifically because a sun-synchronous stack
 //! samples the solar tide at nearly the same phase every time while the lunar
 //! tide does not, so the residual does not average out over months to years — it
 //! leaks into the fitted rate.
@@ -144,8 +144,8 @@ fn body_displacement(body: BodyPosition, mass_ratio: f64, station_dir: [f64; 3])
 /// the increase in apparent sensor→ground range, i.e. `−(Δr · l̂)` for the
 /// ground→sensor LOS unit vector `l̂`. Ground moving toward the sensor shortens
 /// the range, so an uplift under a near-vertical look yields a negative delay —
-/// the same sign convention the ionospheric and tropospheric layers use, so the
-/// three sum and go through [`apply::subtract_delay`](crate::apply) unchanged.
+/// the workflow must negate this range effect to apparent positive-toward LOS
+/// displacement before calling [`apply::subtract_delay`](crate::apply).
 ///
 /// `lonlat` supplies each pixel's geodetic (lon, lat) in degrees; `los` supplies
 /// its ground→sensor unit vector. Ellipsoidal height is taken as zero: the tidal
