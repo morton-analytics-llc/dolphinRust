@@ -16,6 +16,7 @@ use dolphin_corrections::geometry::{
     DEFAULT_MAX_OUTSIDE_STATIC_FRACTION,
 };
 use dolphin_corrections::ionosphere::{read_ionex, vtec_to_range_delay, SPEED_OF_LIGHT};
+use dolphin_corrections::plate_motion::{plate_motion_range_delay_rate_grid, resolve_euler_pole};
 use dolphin_corrections::solid_earth_tide::{tide_range_delay_grid, LonLatGrid};
 use dolphin_corrections::subtract_delay;
 use dolphin_corrections::troposphere::{
@@ -43,6 +44,9 @@ pub struct CorrectionLayers {
     /// Solid-earth-tide displacement projected toward the sensor, present when
     /// `correction_options.solid_earth_tide` is set.
     pub solid_earth_tide: Option<Array3<f64>>,
+    /// Rigid-plate-motion equivalent range delay, present when
+    /// `correction_options.plate_motion_model` is set.
+    pub plate_motion: Option<Array3<f64>>,
 }
 
 /// Build and subtract the configured corrections from `disp_rad` in place.
@@ -78,6 +82,7 @@ pub fn apply_corrections(
             ionosphere: None,
             troposphere: None,
             solid_earth_tide: None,
+            plate_motion: None,
             los_geometry,
         });
     }
@@ -98,12 +103,14 @@ pub fn apply_corrections(
     let ionosphere = build_ionosphere(opts, date_files, n_dates, (rows, cols), geo, freq, los)?;
     let troposphere = build_troposphere(opts, n_dates, (rows, cols), gt, epsg, los, support)?;
     let solid_earth_tide = build_solid_earth_tide(opts, date_files, (rows, cols), geo, los)?;
+    let plate_motion = build_plate_motion(opts, date_files, (rows, cols), geo, los)?;
 
     let total = sum_layers(
         [
             ionosphere.as_ref(),
             troposphere.as_ref(),
             solid_earth_tide.as_ref(),
+            plate_motion.as_ref(),
         ],
         n_dates,
         (rows, cols),
@@ -113,6 +120,7 @@ pub fn apply_corrections(
         ionosphere,
         troposphere,
         solid_earth_tide,
+        plate_motion,
         los_geometry,
     })
 }
@@ -142,22 +150,13 @@ pub(crate) fn apply_corrections_with_ownership(
         ionosphere: None,
         troposphere: None,
         solid_earth_tide: None,
+        plate_motion: None,
         los_geometry,
     };
     for (owner, options, files) in groups {
-        let mut bounds = (rows, cols, 0, 0);
-        for ((_, row, col), value) in ownership.indexed_iter() {
-            if value == owner {
-                bounds.0 = bounds.0.min(row);
-                bounds.1 = bounds.1.min(col);
-                bounds.2 = bounds.2.max(row + 1);
-                bounds.3 = bounds.3.max(col + 1);
-            }
-        }
-        let (r0, c0, r1, c1) = bounds;
-        if r0 >= r1 || c0 >= c1 {
+        let Some((r0, c0, r1, c1)) = owner_bounds(ownership, *owner, rows, cols) else {
             continue;
-        }
+        };
         ensure!(
             options.acquisition_utc.len() == bands + 1,
             "spatial group acquisition UTC axis mismatch"
@@ -197,10 +196,13 @@ pub(crate) fn apply_corrections_with_ownership(
             local_support,
         )?;
         let tide = build_solid_earth_tide(options, files, shape, local_geo, local_los.as_ref())?;
+        let plate_motion =
+            build_plate_motion(options, files, shape, local_geo, local_los.as_ref())?;
         for (destination, source) in [
             (&mut combined.ionosphere, ionosphere),
             (&mut combined.troposphere, troposphere),
             (&mut combined.solid_earth_tide, tide),
+            (&mut combined.plate_motion, plate_motion),
         ] {
             if let Some(source) = source {
                 let destination = destination
@@ -218,12 +220,35 @@ pub(crate) fn apply_corrections_with_ownership(
             combined.ionosphere.as_ref(),
             combined.troposphere.as_ref(),
             combined.solid_earth_tide.as_ref(),
+            combined.plate_motion.as_ref(),
         ],
         bands + 1,
         (rows, cols),
     );
     subtract_delay(displacement, total.view(), wavelength)?;
     Ok(combined)
+}
+
+/// The `(row_start, col_start, row_stop, col_stop)` bounding box of the pixels
+/// `owner` occupies in `ownership` (across every date band), or `None` if it
+/// owns nothing in this frame.
+fn owner_bounds(
+    ownership: ndarray::ArrayView3<'_, u32>,
+    owner: u32,
+    rows: usize,
+    cols: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let mut bounds = (rows, cols, 0, 0);
+    for ((_, row, col), &value) in ownership.indexed_iter() {
+        if value == owner {
+            bounds.0 = bounds.0.min(row);
+            bounds.1 = bounds.1.min(col);
+            bounds.2 = bounds.2.max(row + 1);
+            bounds.3 = bounds.3.max(col + 1);
+        }
+    }
+    let (r0, c0, r1, c1) = bounds;
+    (r0 < r1 && c0 < c1).then_some(bounds)
 }
 
 /// Resolve the configured LOS geometry and discard it, purely to fail early.
@@ -353,6 +378,70 @@ fn build_solid_earth_tide(
             .assign(&tide_range_delay_grid(utc, &lonlat, los).mapv(|range| -range));
     }
     Ok(Some(out))
+}
+
+/// Per-date rigid-plate-motion equivalent range delay (meters) on the frame
+/// grid.
+///
+/// Needs no external data file — only each acquisition's UTC (for elapsed
+/// time since acquisition 0) and the per-pixel LOS geometry (for projecting
+/// the plate's rigid velocity into line of sight), matching
+/// `build_solid_earth_tide`'s requirements and for the same reason: a 3-D
+/// rigid-rotation velocity cannot be projected from a scalar incidence.
+/// Unlike the tide, the per-pixel term (`plate_motion_range_delay_rate_grid`)
+/// depends only on position, not time, so it is computed once and scaled by
+/// each date's elapsed time relative to acquisition 0.
+fn build_plate_motion(
+    opts: &CorrectionOptions,
+    date_files: &[PathBuf],
+    (rows, cols): (usize, usize),
+    geo: GeoInfo,
+    los: Option<&LosGeometry>,
+) -> Result<Option<Array3<f64>>> {
+    let Some(model) = &opts.plate_motion_model else {
+        return Ok(None);
+    };
+    let los = los.context(
+        "correction_options.plate_motion_model requires geometry_files: projecting the \
+         plate's rigid surface velocity into line of sight needs the full LOS unit vector, \
+         which the scalar incidence_angle_deg cannot supply",
+    )?;
+    let pole = resolve_euler_pole(model)?;
+    let corners = dolphin_io::grid_corner_lonlat(geo.geotransform, rows, cols, geo.epsg)?;
+    let lonlat = LonLatGrid::from_corners(corners, rows, cols);
+    let rate_m_per_year = plate_motion_range_delay_rate_grid(pole, &lonlat, los);
+
+    let reference_utc = plate_motion_acquisition_utc(opts, date_files, 0)?;
+    let mut out = Array3::<f64>::zeros((date_files.len(), rows, cols));
+    for t in 0..date_files.len() {
+        let utc = plate_motion_acquisition_utc(opts, date_files, t)?;
+        let elapsed_years = (utc - reference_utc).num_seconds() as f64 / (365.25 * 86_400.0);
+        out.index_axis_mut(Axis(0), t)
+            .assign(&(&rate_m_per_year * elapsed_years));
+    }
+    Ok(Some(out))
+}
+
+/// A granule's acquisition UTC for the plate-motion correction: explicit
+/// `acquisition_utc[t]` if supplied, else the filename's `YYYYMMDDThhmmss`
+/// token — only elapsed time since acquisition 0 matters here, since the
+/// plate's rigid velocity is a constant rate, position-only.
+fn plate_motion_acquisition_utc(
+    opts: &CorrectionOptions,
+    date_files: &[PathBuf],
+    t: usize,
+) -> Result<chrono::NaiveDateTime> {
+    opts.acquisition_utc
+        .get(t)
+        .map(chrono::DateTime::naive_utc)
+        .or_else(|| acq_utc_datetime(&date_files[t]))
+        .with_context(|| {
+            format!(
+                "correction_options.plate_motion_model needs each granule's acquisition time; \
+                 {} carries no YYYYMMDDThhmmss token",
+                date_files[t].display()
+            )
+        })
 }
 
 /// Full acquisition UTC from a granule name's `YYYYMMDDThhmmss` token.
@@ -1588,6 +1677,127 @@ mod tests {
         assert!(measured
             .iter()
             .all(|phase| (phase * meters_per_radian - 0.003).abs() < 1e-10));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #103, the default: plate motion is unset, so `apply_corrections`
+    /// is a no-op on displacement and emits no plate-motion layer.
+    #[test]
+    fn plate_motion_is_off_by_default() {
+        let opts = CorrectionOptions::default();
+        assert!(!opts.is_enabled());
+        let mut disp = Array3::from_shape_fn((2, 2, 2), |(t, r, c)| (t + r + c) as f64);
+        let original = disp.clone();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6], None).unwrap();
+        assert!(layers.plate_motion.is_none());
+        assert_eq!(disp, original);
+    }
+
+    /// A named plate not in the built-in table is a contextual error, not a panic.
+    #[test]
+    fn plate_motion_unknown_plate_errors() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_plate_unknown.h5");
+        write_uniform_static(&path, 34.0, gt, (3, 3));
+        let opts = CorrectionOptions {
+            plate_motion_model: Some(dolphin_core::config::PlateMotionModel::Plate(
+                "Atlantis".into(),
+            )),
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
+        let mut disp = Array3::<f64>::zeros((1, 3, 3));
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown plate motion model plate"),
+            "expected the unknown-plate error, got: {err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Enabling plate motion without geometry fails closed and says why: a
+    /// rigid-rotation velocity cannot be projected into line of sight from a
+    /// scalar incidence.
+    #[test]
+    fn plate_motion_without_geometry_fails_closed() {
+        let opts = CorrectionOptions {
+            plate_motion_model: Some(dolphin_core::config::PlateMotionModel::Plate(
+                "Pacific".into(),
+            )),
+            ..Default::default()
+        };
+        let mut disp = Array3::<f64>::zeros((1, 2, 2));
+        let gt = [500_000.0, 60.0, 0.0, 2_150_000.0, 0.0, -60.0];
+        let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("geometry_files"),
+            "expected the geometry requirement, got: {err:#}"
+        );
+    }
+
+    /// End to end: with geometry and timestamps the plate-motion layer is
+    /// built, is exactly zero at acquisition 0 (the elapsed-time reference),
+    /// scales *linearly* with elapsed time (the signature that distinguishes
+    /// a constant-rate correction from the tide's oscillatory one), and is
+    /// actually subtracted from the series.
+    #[test]
+    fn plate_motion_is_built_and_subtracted() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 60.0, 0.0, 4_000_000.0, 0.0, -60.0];
+        let path = std::env::temp_dir().join("dolphin_static_plate_applied.h5");
+        write_uniform_static(&path, 34.0, gt, (3, 3));
+        let opts = CorrectionOptions {
+            plate_motion_model: Some(dolphin_core::config::PlateMotionModel::Plate(
+                "Pacific".into(),
+            )),
+            geometry_files: vec![path.clone()],
+            ..Default::default()
+        };
+        // Acquisitions 1 and 2 years after acquisition 0.
+        let files = vec![
+            PathBuf::from("OPERA_L2_CSLC-S1_T005_20200104T004053Z_x.h5"),
+            PathBuf::from("OPERA_L2_CSLC-S1_T005_20210103T184053Z_x.h5"),
+            PathBuf::from("OPERA_L2_CSLC-S1_T005_20220103T124053Z_x.h5"),
+        ];
+        let mut disp = Array3::<f64>::zeros((2, 3, 3));
+        let layers =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap();
+        let plate_motion = layers.plate_motion.expect("plate motion layer");
+        assert_eq!(plate_motion.dim(), (3, 3, 3));
+
+        assert!(
+            plate_motion
+                .index_axis(Axis(0), 0)
+                .iter()
+                .all(|&v| v == 0.0),
+            "delay at the elapsed-time reference (acquisition 0) must be exactly zero"
+        );
+        // Pacific-plate LOS speed at this incidence/azimuth is on the order of
+        // tens of mm/yr, so two years is a physically plausible envelope.
+        let year1 = plate_motion.index_axis(Axis(0), 1);
+        let year2 = plate_motion.index_axis(Axis(0), 2);
+        for ((_idx, &d1), &d2) in year1.indexed_iter().zip(year2.iter()) {
+            assert!(
+                (0.0..0.20).contains(&d1.abs()),
+                "1-year plate motion delay {d1} m is outside the physical envelope"
+            );
+            // Constant rate: year 2 is (to within the ~day-level rounding of
+            // the test's own hand-picked dates) exactly double year 1.
+            let ratio = d2 / d1;
+            assert!(
+                (1.97..2.03).contains(&ratio),
+                "plate motion should accumulate linearly: year1={d1}, year2={d2}, ratio={ratio}"
+            );
+        }
+        assert!(
+            disp.iter().any(|v| v.abs() > 1e-9),
+            "plate motion was built but never subtracted"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
