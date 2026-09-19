@@ -317,3 +317,77 @@ fn fused_equals_staged_evd() {
 fn fused_equals_staged_emi_masked() {
     assert_bit_identical(false, true);
 }
+
+#[test]
+fn zero_power_window_never_claims_linked_phase_or_coherence() {
+    let healthy = synth_stack(3, 9, 9);
+    for missing in [None, Some(0), Some(1)] {
+        for use_evd in [false, true] {
+            let mut stack = healthy.clone();
+            for t in 0..3 {
+                if missing.is_none_or(|epoch| epoch == t) {
+                    stack.slice_mut(s![t, .., 0..4]).fill(Cf64::new(0.0, 0.0));
+                }
+            }
+            let p = FusedParams {
+                use_evd,
+                beta: 0.0,
+                zero_correlation_threshold: 0.0,
+                reference_idx: 0,
+                compute_crlb: true,
+                crlb_reference_idx: 0,
+                num_looks: 1.0,
+                compute_closure: true,
+                compute_average_coherence: true,
+                average_coherence_start_idx: 0,
+            };
+            let half = HalfWindow { y: 1, x: 1 };
+            let strides = Strides { y: 1, x: 1 };
+            let reference = link_fused(healthy.view(), half, strides, None, p).unwrap();
+            let actual = link_fused(stack.view(), half, strides, None, p).unwrap();
+            assert!(actual
+                .crlb_sigma
+                .as_ref()
+                .unwrap()
+                .slice(s![.., 4, 1])
+                .iter()
+                .all(|v| v.is_nan()));
+            assert!(actual
+                .closure_phase
+                .as_ref()
+                .unwrap()
+                .slice(s![.., 4, 1])
+                .iter()
+                .all(|v| v.is_nan()));
+            assert_eq!(actual.average_coherence.as_ref().unwrap().count[(4, 1)], 0);
+
+            let (staged_phase, staged_coherence, _, _) = staged(&stack, half, strides, None, p);
+            assert!(staged_phase
+                .slice(s![.., 4, 1])
+                .iter()
+                .all(|z| !z.is_finite()));
+            assert!(!staged_coherence[(4, 1)].is_finite());
+
+            assert!(
+                actual
+                    .cpx_phase
+                    .slice(s![.., 4, 1])
+                    .iter()
+                    .all(|z| !z.is_finite()),
+                "zero source power produced phase: missing={missing:?}, evd={use_evd}"
+            );
+            assert!(
+                !actual.temporal_coherence[(4, 1)].is_finite(),
+                "zero source power claimed temporal coherence"
+            );
+            assert_eq!(
+                actual.cpx_phase.slice(s![.., 4, 7]),
+                reference.cpx_phase.slice(s![.., 4, 7])
+            );
+            assert_eq!(
+                actual.temporal_coherence[(4, 7)],
+                reference.temporal_coherence[(4, 7)]
+            );
+        }
+    }
+}

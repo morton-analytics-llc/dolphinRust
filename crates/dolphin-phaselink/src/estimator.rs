@@ -334,6 +334,12 @@ pub fn process_coherence_matrices(
     pack(estimates, (out_rows, out_cols, nslc))
 }
 
+pub(crate) fn has_complete_power(c: ArrayView2<Cf64>) -> bool {
+    c.diag()
+        .iter()
+        .all(|value| value.is_finite() && value.re > 0.0)
+}
+
 /// Estimate the linked phase for one pixel's coherence matrix.
 #[must_use]
 pub fn process_coherence_matrix(
@@ -343,6 +349,14 @@ pub fn process_coherence_matrix(
     zero_correlation_threshold: f64,
     reference_idx: usize,
 ) -> PixelEstimate {
+    if !has_complete_power(c) {
+        return PixelEstimate {
+            phase: Array1::from_elem(c.nrows(), Cf64::new(f64::NAN, f64::NAN)),
+            eigenvalue: f64::NAN,
+            eigengap: f64::NAN,
+            estimator: u8::from(!use_evd),
+        };
+    }
     if use_evd {
         return reference(evd_eigenvector(c), 0, reference_idx);
     }

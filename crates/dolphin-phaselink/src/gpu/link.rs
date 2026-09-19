@@ -92,7 +92,23 @@ pub fn process_coherence_matrices_gpu(
         .collect();
 
     let (phase, eig, est, rel) = run(ctx, &flat, &params, use_evd, (n_pix, nslc))?;
-    Ok(pack(phase, eig, est, rel, (out_rows, out_cols, nslc)))
+    let mut output = pack(phase, eig, est, rel, (out_rows, out_cols, nslc));
+    for row in 0..out_rows {
+        for col in 0..out_cols {
+            if (0..nslc).any(|date| {
+                let value = c_arrays[(row, col, date, date)];
+                !value.is_finite() || value.re <= 0.0
+            }) {
+                output
+                    .cpx_phase
+                    .slice_mut(ndarray::s![.., row, col])
+                    .fill(Cf32::new(f32::NAN, f32::NAN));
+                output.eigenvalues[(row, col)] = f32::NAN;
+                output.reliable[(row, col)] = 0;
+            }
+        }
+    }
+    Ok(output)
 }
 
 /// First-class GPU phase linking with CPU hybrid fallback.
@@ -125,6 +141,21 @@ pub fn process_coherence_matrices_gpu_hybrid(
         iters,
     )?;
     let mut out = upcast(&gpu);
+    for row in 0..c_arrays.dim().0 {
+        for col in 0..c_arrays.dim().1 {
+            let coherence = c_arrays.slice(ndarray::s![row, col, .., ..]);
+            if !crate::estimator::has_complete_power(coherence) {
+                let missing = process_coherence_matrix(
+                    coherence,
+                    use_evd,
+                    beta,
+                    zero_correlation_threshold,
+                    reference_idx,
+                );
+                splice_pixel(&mut out, (row, col), &missing);
+            }
+        }
+    }
     if !use_evd {
         recompute_unreliable(
             &mut out,

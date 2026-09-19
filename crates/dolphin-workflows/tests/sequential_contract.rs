@@ -198,3 +198,47 @@ fn compressed_error(rust: &[Array2<Cf64>], oracle: &Array3<Cf64>) -> f64 {
         })
         .fold(0.0_f64, f64::max)
 }
+
+#[test]
+fn zero_power_phase_does_not_resurrect_across_ministacks() {
+    let stack = Array3::from_shape_fn((6, 9, 9), |(t, r, c)| {
+        if c < 4 && t < 3 {
+            Cf64::new(0.0, 0.0)
+        } else {
+            Cf64::from_polar(1.0, 0.2 * t as f64 + 0.03 * (r + c) as f64)
+        }
+    });
+    let mut cfg = SequentialConfig {
+        ministack_size: 3,
+        max_num_compressed: 10,
+        half_window: HalfWindow { y: 1, x: 1 },
+        strides: Strides { y: 1, x: 1 },
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        output_reference_idx: 0,
+        compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
+        compute_crlb: false,
+        compute_closure_phase: false,
+        compute_average_coherence: false,
+        shp_method: ShpMethod::Rect,
+        shp_alpha: 0.001,
+    };
+    let engine = ComputeEngine::new(ComputeBackend::Cpu);
+    for use_evd in [false, true] {
+        cfg.use_evd = use_evd;
+        let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
+        assert!(out
+            .cpx_phase
+            .slice(ndarray::s![.., 4, 1])
+            .iter()
+            .all(|z| !z.is_finite()));
+        assert!(!out.temporal_coherence[(4, 1)].is_finite());
+        assert!(out
+            .cpx_phase
+            .slice(ndarray::s![.., 4, 7])
+            .iter()
+            .all(|z| z.is_finite()));
+        assert!(out.temporal_coherence[(4, 7)].is_finite());
+    }
+}
