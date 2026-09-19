@@ -5,9 +5,10 @@ use ndarray::{s, Array2};
 
 use crate::{GeoInfo, IoError, Result};
 
-/// Read a bounded mask window. Returns validity and full-pixel source coverage.
-/// OPERA STATIC uses 0=good; NISAR GSLC uses subswath IDs 1..254=good.
+/// Read a bounded mask window. Returns validity and source coverage.
+/// OPERA STATIC uses 0=good, 127=nodata; NISAR GSLC uses subswath IDs 1..254=good.
 /// Every native subpixel must pass; partially covered output pixels fail closed.
+/// All-nodata OPERA pixels do not claim coverage in an overlapping burst mosaic.
 ///
 /// # Errors
 /// Rejects missing masks, incompatible CRS, shape, posting, or registration.
@@ -71,20 +72,18 @@ pub fn read_native_quality_mask(
         ];
         let hi = [lo[0] + step[0], lo[1] + step[1]];
         if lo[0] >= 0 && lo[1] >= 0 && hi[0] <= dims[0] as isize && hi[1] <= dims[1] as isize {
-            covered[(r, c)] = true;
-            *good = values
-                .slice(s![
-                    (lo[0] as usize - start[0])..(hi[0] as usize - start[0]),
-                    (lo[1] as usize - start[1])..(hi[1] as usize - start[1])
-                ])
-                .iter()
-                .all(|&v| {
-                    if nisar {
-                        v > 0.0 && v < 255.0 && v.fract() == 0.0
-                    } else {
-                        v == 0.0
-                    }
-                });
+            let window = values.slice(s![
+                (lo[0] as usize - start[0])..(hi[0] as usize - start[0]),
+                (lo[1] as usize - start[1])..(hi[1] as usize - start[1])
+            ]);
+            covered[(r, c)] = nisar || window.iter().any(|&v| v != 127.0);
+            *good = window.iter().all(|&v| {
+                if nisar {
+                    v > 0.0 && v < 255.0 && v.fract() == 0.0
+                } else {
+                    v == 0.0
+                }
+            });
         }
     }
     Ok((valid, covered))
@@ -93,6 +92,54 @@ pub fn read_native_quality_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opera_nodata_does_not_claim_coverage_but_mixed_pixels_fail_closed() {
+        let _lock = crate::test_hdf5_lock::guard();
+        let path = std::env::temp_dir().join("opera_native_mask_nodata.h5");
+        {
+            let file = hdf5::File::create(&path).unwrap();
+            let g = file.create_group("data").unwrap();
+            let values = ndarray::arr2(&[
+                [127u8, 127, 0, 127, 1, 127, 0, 0, 0, 1],
+                [127, 127, 0, 0, 0, 0, 0, 0, 0, 0],
+            ]);
+            g.new_dataset_builder()
+                .with_data(&values)
+                .create("mask")
+                .unwrap();
+            g.new_dataset_builder()
+                .with_data(&[0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5])
+                .create("x_coordinates")
+                .unwrap();
+            g.new_dataset_builder()
+                .with_data(&[1.5, 0.5])
+                .create("y_coordinates")
+                .unwrap();
+            g.new_dataset::<i64>()
+                .create("projection")
+                .unwrap()
+                .write_scalar(&32611)
+                .unwrap();
+        }
+        let target = GeoInfo {
+            epsg: 32611,
+            geotransform: [0.0, 2.0, 0.0, 2.0, 0.0, -2.0],
+        };
+        let (valid, covered) =
+            read_native_quality_mask(&path, "/data/mask", false, target, (1, 5)).unwrap();
+        assert_eq!(covered, ndarray::arr2(&[[false, true, true, true, true]]));
+        assert_eq!(valid, ndarray::arr2(&[[false, false, false, true, false]]));
+        // An overlapping good burst survives an empty companion, but cannot
+        // override partial support or an observed layover/shadow flag.
+        let combined: Vec<bool> = valid
+            .iter()
+            .zip(covered.iter())
+            .map(|(good, covered)| !covered || *good)
+            .collect();
+        assert_eq!(combined, vec![true, false, false, true, false]);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn native_quality_mask_respects_sensor_codes_and_all_subpixels() {
