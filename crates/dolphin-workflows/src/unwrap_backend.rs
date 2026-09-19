@@ -59,6 +59,97 @@ pub struct TophuBackend(pub TophuConfig);
 /// per-pair `par_iter` parallelizes with neither a fork nor flat-binary I/O.
 pub struct NativeUnwrapBackend(pub NativeConfig);
 
+pub(crate) fn unwrap_phase_correlated_network(
+    backend: &dyn UnwrapBackend,
+    pl: ArrayView3<Cf64>,
+    pairs: &[(usize, usize)],
+    support: ArrayView2<bool>,
+    scratch: &Path,
+) -> Result<UnwrapNetworkOutput> {
+    let mut layers = Vec::with_capacity(pairs.len());
+    let batch_size = rayon::current_num_threads().max(1);
+    for (batch_index, batch) in pairs.chunks(batch_size).enumerate() {
+        let batch_layers = batch
+            .par_iter()
+            .enumerate()
+            .map(|(index, &pair)| {
+                let ifg = form_ifg(pl, pair);
+                let correlation = interferogram_correlation(ifg.view(), support);
+                let index = batch_index * batch_size + index;
+                let pair_scratch = scratch.join(format!("ifg_{index:04}"));
+                std::fs::create_dir_all(&pair_scratch)?;
+                let output =
+                    backend.unwrap_network(pl, &[pair], correlation.view(), &pair_scratch)?;
+                Ok((
+                    output.unwrapped.index_axis_move(Axis(0), 0),
+                    output.connected_components.index_axis_move(Axis(0), 0),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        layers.extend(batch_layers);
+    }
+    stack_layers(layers)
+}
+
+/// Upstream workflow phase correlation: Gaussian sigma 11/3, truncated at four
+/// sigma, with nearest boundary extension. Missing samples have zero weight;
+/// correlation never supplies structural support.
+fn interferogram_correlation(ifg: ArrayView2<Cf32>, support: ArrayView2<bool>) -> Array2<f32> {
+    assert_eq!(ifg.dim(), support.dim());
+    let mut real = Array2::zeros(ifg.dim());
+    let mut imaginary = Array2::zeros(ifg.dim());
+    let mut weights = Array2::zeros(ifg.dim());
+    for (point, &value) in ifg.indexed_iter() {
+        let value = Cf64::new(f64::from(value.re), f64::from(value.im));
+        if support[point] && value.re.is_finite() && value.im.is_finite() && value.norm_sqr() > 0.0
+        {
+            let unit = value / value.norm();
+            real[point] = unit.re;
+            imaginary[point] = unit.im;
+            weights[point] = 1.0;
+        }
+    }
+    let sigma = 11.0 / 3.0;
+    let mut kernel: Vec<f64> = (-15..=15)
+        .map(|offset| (-f64::from(offset * offset) / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let total: f64 = kernel.iter().sum();
+    kernel.iter_mut().for_each(|weight| *weight /= total);
+    let filtered_real = gaussian_nearest(real.view(), &kernel);
+    let filtered_imaginary = gaussian_nearest(imaginary.view(), &kernel);
+    let filtered_weights = gaussian_nearest(weights.view(), &kernel);
+    Array2::from_shape_fn(ifg.dim(), |point| {
+        if weights[point] == 0.0 || filtered_weights[point] == 0.0 {
+            0.0
+        } else {
+            (filtered_real[point].hypot(filtered_imaginary[point]) / filtered_weights[point])
+                .clamp(0.0, 1.0) as f32
+        }
+    })
+}
+
+fn gaussian_nearest(values: ArrayView2<f64>, kernel: &[f64]) -> Array2<f64> {
+    let (rows, cols) = values.dim();
+    let vertical = Array2::from_shape_fn((rows, cols), |(row, col)| {
+        kernel
+            .iter()
+            .zip(-15..=15)
+            .map(|(&weight, delta)| {
+                weight * values[(row.saturating_add_signed(delta).min(rows - 1), col)]
+            })
+            .sum::<f64>()
+    });
+    Array2::from_shape_fn((rows, cols), |(row, col)| {
+        kernel
+            .iter()
+            .zip(-15..=15)
+            .map(|(&weight, delta)| {
+                weight * vertical[(row, col.saturating_add_signed(delta).min(cols - 1))]
+            })
+            .sum()
+    })
+}
+
 impl UnwrapBackend for SnaphuBackend {
     fn unwrap_network(
         &self,
@@ -191,6 +282,152 @@ fn form_ifg(pl: ArrayView3<Cf64>, (i, j): (usize, usize)) -> Array2<Cf32> {
     let (_, rows, cols) = pl.dim();
     Array2::from_shape_fn((rows, cols), |(r, c)| {
         let z = pl[(i, r, c)] * pl[(j, r, c)].conj();
-        Cf32::from_polar(1.0, z.arg() as f32)
+        if z.norm_sqr() == 0.0 {
+            Cf32::new(0.0, 0.0)
+        } else {
+            Cf32::from_polar(1.0, z.arg() as f32)
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_correlation_matches_independent_gaussian_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ifg_correlation.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let shape = (
+                case["shape"][0].as_u64().unwrap() as usize,
+                case["shape"][1].as_u64().unwrap() as usize,
+            );
+            let real = case["ifg_re"].as_array().unwrap();
+            let imaginary = case["ifg_im"].as_array().unwrap();
+            let ifg = Array2::from_shape_vec(
+                shape,
+                real.iter()
+                    .zip(imaginary)
+                    .map(|(r, i)| {
+                        Cf32::new(
+                            r.as_f64().unwrap_or(f64::NAN) as f32,
+                            i.as_f64().unwrap_or(f64::NAN) as f32,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let support = Array2::from_shape_vec(
+                shape,
+                case["support"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_bool().unwrap())
+                    .collect(),
+            )
+            .unwrap();
+            let actual = interferogram_correlation(ifg.view(), support.view());
+            for (index, (value, expected)) in actual
+                .iter()
+                .zip(case["expected"].as_array().unwrap())
+                .enumerate()
+            {
+                assert!(
+                    (f64::from(*value) - expected.as_f64().unwrap()).abs() < 1e-6,
+                    "case {} pixel {index}: {value} != {expected}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_phase_never_contributes_a_unit_phasor() {
+        let mut ifg = Array2::from_elem((9, 11), Cf32::new(0.0, 2.0));
+        let mut support = Array2::from_elem(ifg.dim(), true);
+        ifg[(4, 4)] = Cf32::new(f32::NAN, f32::NAN);
+        ifg[(4, 5)] = Cf32::new(0.0, 0.0);
+        ifg[(4, 6)] = Cf32::new(1.0, 0.0);
+        support[(4, 6)] = false;
+        let actual = interferogram_correlation(ifg.view(), support.view());
+        for (point, &value) in actual.indexed_iter() {
+            if point.0 == 4 && (4..=6).contains(&point.1) {
+                assert_eq!(value, 0.0);
+            } else {
+                assert!((value - 1.0).abs() < 1e-6);
+            }
+        }
+        support.fill(false);
+        assert!(interferogram_correlation(ifg.view(), support.view())
+            .iter()
+            .all(|&value| value == 0.0));
+    }
+
+    struct EchoCorrelation;
+
+    impl UnwrapBackend for EchoCorrelation {
+        fn unwrap_network(
+            &self,
+            _pl: ArrayView3<Cf64>,
+            pairs: &[(usize, usize)],
+            correlation: ArrayView2<f32>,
+            scratch: &Path,
+        ) -> Result<UnwrapNetworkOutput> {
+            assert_eq!(pairs.len(), 1);
+            assert!(scratch.is_dir());
+            Ok(UnwrapNetworkOutput {
+                unwrapped: correlation.mapv(f64::from).insert_axis(Axis(0)),
+                connected_components: Array3::from_elem(
+                    (1, correlation.nrows(), correlation.ncols()),
+                    1,
+                ),
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_dispatches_pair_specific_correlation_in_network_order() {
+        let pl = Array3::from_shape_fn((3, 33, 35), |(date, row, col)| {
+            let phase = if date == 2 {
+                0.7 * row as f64 + 0.8 * col as f64
+            } else {
+                date as f64 * 0.4
+            };
+            Cf64::from_polar(1.0, phase)
+        });
+        let support = Array2::from_elem((33, 35), true);
+        let pairs = [(0, 2), (0, 1), (1, 2)];
+        let scratch =
+            std::env::temp_dir().join(format!("dolphin_pair_correlation_{}", std::process::id()));
+        let output = unwrap_phase_correlated_network(
+            &EchoCorrelation,
+            pl.view(),
+            &pairs,
+            support.view(),
+            &scratch,
+        )
+        .unwrap();
+        assert!(output.unwrapped[(0, 16, 17)] < 0.01);
+        assert!((output.unwrapped[(1, 16, 17)] - 1.0).abs() < 1e-6);
+        assert!(output.unwrapped[(2, 16, 17)] < 0.01);
+        assert!(support.iter().all(|&valid| valid));
+        let mut missing = pl.clone();
+        missing[(0, 5, 5)] = Cf64::new(0.0, 0.0);
+        missing[(2, 7, 7)] = Cf64::new(f64::NAN, f64::NAN);
+        let output = unwrap_phase_correlated_network(
+            &EchoCorrelation,
+            missing.view(),
+            &pairs,
+            support.view(),
+            &scratch,
+        )
+        .unwrap();
+        assert_eq!(output.unwrapped[(0, 5, 5)], 0.0);
+        assert_eq!(output.unwrapped[(1, 5, 5)], 0.0);
+        assert_eq!(output.unwrapped[(0, 7, 7)], 0.0);
+        assert_eq!(output.unwrapped[(2, 7, 7)], 0.0);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
 }
