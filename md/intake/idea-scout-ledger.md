@@ -72,6 +72,16 @@ Entry format:
   alongside `FixedEstimatorBranch::{Evd,Emi}`; analytic fixture first, then the paper's
   own real-data statistics as a secondary check (no dolphin oracle exists for this).
 - **Added**: 2026-09-01 by scheduled scout run
+- **New evidence (2026-10-01 scheduled scout run, not sufficient to change the gate)**:
+  the same author group published a sequential/streaming extension — El Hajjar, Ginolhac,
+  Yan, El Korso, "Sequential Covariance Fitting for InSAR Phase Linking,"
+  arXiv:2502.09248 / IEEE TGRS 2025 — using KL-divergence and Frobenius-norm objectives
+  designed to fold in new acquisitions block-by-block without refitting the whole
+  covariance. This variant is conceptually closer to dolphinRust's own NRT
+  incremental-ministack architecture (`run_sequential_resumable`/`update_sequential`)
+  than the original static COFI-PL paper this entry was opened against. No new issue
+  opened — if D8's gate is ever met, prefer this sequential variant as the reference,
+  not the original.
 
 ### D9 — Incremental PS amplitude-dispersion updates + small-stack quality metrics
 - **Source**: researcher (Staniewicz et al., arXiv:2511.12051 — dolphin's own lead-author team)
@@ -142,6 +152,68 @@ Entry format:
   shipped in #118 — this entry is only the remaining, non-derivable product-metadata
   fields.
 - **Added**: 2026-09-14 by scheduled scout run
+
+### D15 — Estimator-agnostic heuristic quality coefficients
+- **Source**: researcher (Heimpel, Hajnsek, Frey, arXiv:2510.24512)
+- **Issue**: #145 (enhancement-labeled, NOT backlog-ready)
+- **Re-entry gate**: dolphin or a peer tool (MintPy, ISCE3) adopts an equivalent
+  coefficient as a parity target, OR a real dolphinRust-validated scene (MMX1/ICMX or
+  the Houston stack) shows CRLB/temporal-coherence/closure-phase disagreeing with
+  observed reliability in a way one of the paper's three coefficients would plausibly
+  resolve.
+- **Design sketch**: new module in `dolphin-phaselink` alongside `crlb.rs`/`closure.rs`,
+  fed from the per-pixel coherence matrix already computed in `link_fused`; analytic
+  fixture first (the paper's own closed-form bounds).
+- **Added**: 2026-10-01 by scheduled scout run
+
+### D16 — spurt-style joint spatiotemporal (3D) unwrapping
+- **Source**: competitive (isce-framework/spurt) + inbound (issue #138 production evidence)
+- **Issue**: #146 — high bar, needs a design review, do not commit without the gate
+- **Re-entry gate**: a design review weighing (a) whether issue #139's loop-closure
+  integer-correction approach, once built and measured on the Houston stack, closes
+  enough of its 79.3%-rejection gap on its own, against (b) the complexity of a
+  clean-room joint spatiotemporal solver (comparable effort to the native MCF unwrapper
+  build) and how it fits the existing `UnwrapBackend` trait seam.
+- **Design sketch**: none yet — needs the design review; the trait seam
+  ("3D-unwrap-ready dispatch interface," v1.4.0) already exists unused.
+- **Added**: 2026-10-01 by scheduled scout run
+
+### D17 — GPU-accelerated unwrap solve
+- **Source**: competitive (PyGMTSAR) + inbound (issue #104 bottleneck measurement)
+- **Issue**: #147
+- **Re-entry gate**: a feasibility spike reads PyGMTSAR's actual unwrap algorithm (not
+  just its benchmark numbers) and assesses whether dolphinRust's network-simplex MCF, or
+  an alternative GPU-amenable formulation, could realize a comparable win without
+  regressing `native_tiling_contract.rs`/`native_dense_parity.rs`.
+- **Design sketch**: none yet — feasibility unconfirmed; network-simplex/MCF is a
+  graph-structured, largely sequential algorithm family, unlike the embarrassingly
+  parallel per-pixel covariance/EVD/EMI kernels the existing GPU backend already covers.
+- **Added**: 2026-10-01 by scheduled scout run
+
+### D18 — StaMPS-style iterative PS-selection refinement and proximity weeding
+- **Source**: competitive (StaMPS)
+- **Issue**: #148
+- **Re-entry gate**: a production AOI with mixed urban/high-PS-density terrain shows the
+  current single-pass D_A<0.25 threshold producing PS density or spatial-clustering
+  issues this method would plausibly fix.
+- **Design sketch**: optional iterative refinement pass in `dolphin-ps` gated by a new
+  `ps_options` flag — relaxed D_A start, phase-stability tightening, spatial-proximity
+  weeding on the final candidate set.
+- **Added**: 2026-10-01 by scheduled scout run
+
+### D19 — Richer edge-cost model for the native unwrapper (joint phase-gradient + coherence)
+- **Source**: researcher + competitive, independently (Whirlwind / ISCE3, Huang et al.,
+  arXiv:2609.36267)
+- **Issue**: #149
+- **Re-entry gate**: (a) the full paper is read (this run only had abstract/summary —
+  arxiv.org direct fetch was proxy-blocked) to extract the exact cost formula, **and**
+  (b) a real residue-dense scene shows the current CRLB-only cost model
+  (`native/cost.rs`) producing branch cuts that visibly misroute through
+  high-phase-gradient-but-still-coherent regions.
+- **Design sketch**: none yet — gated on reading the paper in full. Note: Whirlwind's
+  *solver* (SSP) is not of interest — dolphinRust's network-simplex already beats SSP
+  in-house; only its edge-cost formulation is.
+- **Added**: 2026-10-01 by scheduled scout run
 
 ## SHIPPED
 
