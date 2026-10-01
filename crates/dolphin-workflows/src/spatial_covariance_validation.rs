@@ -3803,6 +3803,7 @@ fn emit_actual_production_fixture(
                 troposphere: None,
                 los_geometry: None,
                 solid_earth_tide: None,
+                plate_motion: None,
             },
         )?,
         unwrap_branch_digest: unwrap_branch_digest(

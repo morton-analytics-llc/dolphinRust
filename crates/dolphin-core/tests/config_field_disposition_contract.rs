@@ -123,6 +123,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "correction_options.incidence_angle_deg",
     "correction_options.troposphere_variable",
     "correction_options.solid_earth_tide",
+    "correction_options.plate_motion_model",
     "correction_options.max_outside_static_fraction",
     "output_options.strides",
     "output_options.epsg",
@@ -480,6 +481,7 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
             incidence_angle_deg,
             troposphere_variable,
             solid_earth_tide,
+            plate_motion_model,
             max_outside_static_fraction,
         ]
     );
@@ -495,6 +497,7 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
         incidence_angle_deg,
         troposphere_variable,
         solid_earth_tide,
+        plate_motion_model,
         max_outside_static_fraction,
     );
 }
