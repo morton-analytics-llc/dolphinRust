@@ -67,6 +67,13 @@ pub enum CorrectionError {
     /// RAiDER ran but failed.
     #[error("RAiDER subprocess failed: {0}")]
     Raider(String),
+    /// `correction_options.plate_motion_model` named a plate not present in
+    /// the built-in ITRF2014 PMM table.
+    #[error(
+        "unknown plate motion model plate \"{0}\" (see dolphin_corrections::plate_motion::ITRF2014_PMM \
+         for the built-in names, or supply an explicit Euler pole)"
+    )]
+    UnknownPlate(String),
 }
 
 /// Result alias for the corrections crate.
