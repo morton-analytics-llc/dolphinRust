@@ -1943,7 +1943,8 @@ pub(crate) fn unwrap_branch_digest(
     loop_qc_enabled: bool,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"dolphinrust:production-unwrap-branch:v1");
+    digest
+        .update(b"dolphinrust:production-unwrap-branch:v2:ifg-phase-gaussian-11-normalized-valid");
     digest.update([unwrap_method_code(method), u8::from(loop_qc_enabled)]);
     digest.update((backend_config.len() as u64).to_le_bytes());
     digest.update(backend_config);
@@ -2231,6 +2232,11 @@ mod tests {
             validity.view(),
             components.view(),
             true,
+        );
+        assert_ne!(
+            sha256_string(native),
+            "sha256:7d9caa37f9ba99323d05df0e373c5a9934a961ed99776076f135a75faafc6830",
+            "per-interferogram correlation must not reuse the temporal-proxy branch identity"
         );
         let snaphu = unwrap_branch_digest(
             UnwrapMethod::Snaphu,

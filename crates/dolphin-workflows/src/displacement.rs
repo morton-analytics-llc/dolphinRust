@@ -89,7 +89,8 @@ use crate::spatial_reference_covariance_output::{
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
-    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend, UnwrapNetworkOutput,
+    unwrap_phase_correlated_network, NativeUnwrapBackend, SnaphuBackend, TophuBackend,
+    UnwrapBackend, UnwrapNetworkOutput,
 };
 use dolphin_corrections::LosGeometry;
 
@@ -526,7 +527,6 @@ fn finish_displacement(
             cfg,
             pl.view(),
             &pairs,
-            temporal_coherence.view(),
             validity_mask.view(),
             geotransform,
             epsg,
@@ -4850,7 +4850,6 @@ fn unwrap_network(
     cfg: &DisplacementWorkflow,
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
-    temporal_coherence: ArrayView2<f64>,
     validity_mask: ArrayView2<bool>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
@@ -4862,20 +4861,8 @@ fn unwrap_network(
     );
     let scratch = cfg.work_directory.join("scratch");
     std::fs::create_dir_all(&scratch)?;
-    let mut correlation =
-        analysis_correlation(cfg, temporal_coherence, geotransform, epsg, (rows, cols))?;
-    ndarray::Zip::from(&mut correlation)
-        .and(validity_mask)
-        .for_each(|correlation, &valid| {
-            if !valid {
-                *correlation = 0.0;
-            }
-        });
-    let apply_configured_mask = cfg.unwrap_options.zero_where_masked && cfg.mask_file.is_some();
-    let support = unwrap_support(
-        validity_mask,
-        apply_configured_mask.then_some(correlation.view()),
-    );
+    let configured_mask = analysis_mask(cfg, geotransform, epsg, (rows, cols))?;
+    let support = unwrap_support(validity_mask, configured_mask.view());
     let masked_phase = support
         .iter()
         .any(|&kept| !kept)
@@ -4884,11 +4871,12 @@ fn unwrap_network(
     // Bound network unwrap concurrency: N concurrent SNAPHU processes + N scratch
     // sets. Pinning the pool caps peak memory and keeps the block-tiled RSS win.
     let pool = unwrap_pool(cfg.unwrap_options.n_parallel_jobs)?;
-    let mut output = match masked_phase.as_ref() {
-        Some(values) => pool
-            .install(|| backend.unwrap_network(values.view(), pairs, correlation.view(), &scratch)),
-        None => pool.install(|| backend.unwrap_network(pl, pairs, correlation.view(), &scratch)),
-    }?;
+    let phases = masked_phase
+        .as_ref()
+        .map_or_else(|| pl.view(), |values| values.view());
+    let mut output = pool.install(|| {
+        unwrap_phase_correlated_network(backend.as_ref(), phases, pairs, support.view(), &scratch)
+    })?;
     // A zero-filled pixel reaches the unwrapper as flat phase and can come back
     // labelled; the loop-closure roots key on labels and would take its zero
     // residual as evidence, so no pixel off support keeps a component.
@@ -4901,10 +4889,10 @@ fn unwrap_network(
 /// keeps. Every other pixel is zero-filled before unwrapping.
 fn unwrap_support(
     phase_link_validity: ArrayView2<bool>,
-    configured_mask: Option<ArrayView2<f32>>,
+    configured_mask: ArrayView2<bool>,
 ) -> Array2<bool> {
     Array2::from_shape_fn(phase_link_validity.dim(), |point| {
-        phase_link_validity[point] && configured_mask.is_none_or(|mask| mask[point] != 0.0)
+        phase_link_validity[point] && configured_mask[point]
     })
 }
 
@@ -4918,39 +4906,22 @@ fn apply_phase_masks(pl: ArrayView3<Cf64>, support: ArrayView2<bool>) -> Array3<
     values
 }
 
-fn analysis_correlation(
+fn analysis_mask(
     cfg: &DisplacementWorkflow,
-    temporal_coherence: ArrayView2<f64>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
     shape: (usize, usize),
-) -> Result<Array2<f32>> {
-    anyhow::ensure!(
-        temporal_coherence.dim() == shape,
-        "temporal coherence shape differs from unwrap grid"
-    );
-    let mut correlation = temporal_coherence.mapv(|value| {
-        if value.is_finite() {
-            value.clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        }
-    });
+) -> Result<Array2<bool>> {
     if !cfg.unwrap_options.zero_where_masked {
-        return Ok(correlation);
+        return Ok(Array2::from_elem(shape, true));
     }
     let Some(path) = cfg.mask_file.as_ref() else {
-        return Ok(correlation);
+        return Ok(Array2::from_elem(shape, true));
     };
     let epsg = epsg.context("mask_file requires a sourced output EPSG")?;
     let mask = read_aligned_raster_window::<u8>(path, geotransform, epsg, shape)
         .context("reading configured aligned mask")?;
-    for ((row, col), value) in mask.indexed_iter() {
-        if *value == 0 {
-            correlation[(row, col)] = 0.0;
-        }
-    }
-    Ok(correlation)
+    Ok(mask.mapv(|value| value != 0))
 }
 
 /// Rayon pool sizing the ifg-network unwrap fan-out. `n_parallel_jobs` is
@@ -6349,9 +6320,8 @@ mod tests {
             ..Default::default()
         };
         cfg.unwrap_options.zero_where_masked = true;
-        let error = analysis_correlation(
+        let error = analysis_mask(
             &cfg,
-            Array2::ones((8, 8)).view(),
             [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
             Some(32611),
             (8, 8),
@@ -6435,30 +6405,28 @@ mod tests {
             mask_file: Some(std::env::temp_dir().join("does-not-exist.tif")),
             ..Default::default()
         };
-        let correlation = analysis_correlation(
+        let mask = analysis_mask(
             &cfg,
-            Array2::ones((8, 8)).view(),
             [0.0, 30.0, 0.0, 240.0, 0.0, -30.0],
             Some(32611),
             (8, 8),
         )
         .unwrap();
-        assert!(correlation.iter().all(|&value| value == 1.0));
+        assert!(mask.iter().all(|&value| value));
     }
 
     #[test]
-    fn unwrap_correlation_preserves_real_temporal_quality() {
+    fn unwrap_mask_without_configured_raster_preserves_structural_support() {
         let cfg = DisplacementWorkflow::default();
-        let temporal = ndarray::array![[0.1, 0.8], [f64::NAN, 1.2]];
-        let correlation = analysis_correlation(
+        let mask = analysis_mask(
             &cfg,
-            temporal.view(),
             [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
             Some(32611),
             (2, 2),
         )
         .unwrap();
-        assert_eq!(correlation, ndarray::array![[0.1_f32, 0.8], [0.0, 1.0]]);
+        let validity = ndarray::array![[true, false], [true, true]];
+        assert_eq!(unwrap_support(validity.view(), mask.view()), validity);
     }
 
     #[test]
@@ -6966,7 +6934,6 @@ mod tests {
             &cfg,
             pl.view(),
             &pairs,
-            Array2::from_elem((4, 4), 0.95).view(),
             validity.view(),
             [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             Some(32611),
@@ -7352,8 +7319,8 @@ mod tests {
     fn terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms() {
         let phase = Array3::from_elem((2, 2, 2), Cf64::new(1.0, 1.0));
         let validity = ndarray::array![[true, true], [false, true]];
-        let mask = ndarray::array![[1.0_f32, 0.0], [1.0, 1.0]];
-        let support = unwrap_support(validity.view(), Some(mask.view()));
+        let mask = ndarray::array![[true, false], [true, true]];
+        let support = unwrap_support(validity.view(), mask.view());
         assert_eq!(support, ndarray::array![[true, false], [false, true]]);
         let masked = apply_phase_masks(phase.view(), support.view());
         assert_eq!(masked[(0, 0, 1)], Cf64::new(0.0, 0.0));
