@@ -7,6 +7,14 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Corrections and time-function model in geometry provenance** (issue #130).
+  `geometry_provenance.json` gains `corrections_applied` (stable names in a fixed order:
+  `ionosphere`, `troposphere`, `solid_earth_tide`, `layover_shadow_mask`; an empty list
+  when none ran) and `time_function_model`
+  (`linear[+seasonal][+step(N)][+relaxation(N)]`). Schema moves to
+  `dolphinrust-geometry-provenance/6`, method version `6.0.0`, and the fixed-cube semantic
+  gate in `temporal_covariance_product` pins the new pair. Older artifacts still
+  deserialize, with the new fields empty.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median

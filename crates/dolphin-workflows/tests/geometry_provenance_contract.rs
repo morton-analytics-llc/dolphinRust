@@ -124,7 +124,7 @@ fn real_metadata_sample_maps_to_exported_fields() {
     assert_eq!(source_keys, &["/metadata/orbit/orbit_type"]);
     let decoded: GeometryProvenance =
         serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/6");
     assert_eq!(decoded.orbit_ephemeris_class.as_deref(), Some("precise"));
     assert!(matches!(
         decoded.geometry_provenance.fields.get("orbit_ephemeris_class"),
@@ -195,7 +195,7 @@ fn coverage_v3_round_trips_without_identifiers() {
     let json = serde_json::to_string(&provenance).unwrap();
     let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/6");
     assert_eq!(decoded.input_coverage, Some(coverage));
     for forbidden in [
         "source_path",
@@ -722,4 +722,41 @@ fn write_static_identification(path: &Path, orbit_pass: &str, burst_id: &str) {
             .write_scalar(&ascii)
             .unwrap();
     }
+}
+
+/// #130: provenance names the corrections the run applied and the velocity
+/// time-function model, and an all-default run reports none and `linear`; a
+/// `/5` artifact without the fields still deserializes.
+#[test]
+fn provenance_records_corrections_and_time_function_model() {
+    let default = assemble_geometry_provenance(&DisplacementWorkflow::default(), None);
+    assert!(default.corrections_applied.is_empty());
+    assert_eq!(default.time_function_model, "linear");
+    let json = serde_json::to_value(&default).unwrap();
+    assert_eq!(json["corrections_applied"], serde_json::json!([]));
+
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.solid_earth_tide = true;
+    cfg.correction_options.ionosphere_files = vec!["jplg0010.23i".into()];
+    cfg.layover_shadow_mask_files = vec!["static.h5".into()];
+    cfg.timeseries_options.velocity_seasonal = true;
+    cfg.timeseries_options.velocity_step_dates = vec!["2023-03-01".into()];
+    let configured = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(
+        configured.corrections_applied,
+        ["ionosphere", "solid_earth_tide", "layover_shadow_mask"]
+    );
+    assert_eq!(configured.time_function_model, "linear+seasonal+step(1)");
+
+    let mut value = serde_json::to_value(&configured).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert(
+        "schema".into(),
+        serde_json::Value::String("dolphinrust-geometry-provenance/5".into()),
+    );
+    object.remove("corrections_applied");
+    object.remove("time_function_model");
+    let decoded: GeometryProvenance = serde_json::from_value(value).unwrap();
+    assert!(decoded.corrections_applied.is_empty());
+    assert!(decoded.time_function_model.is_empty());
 }

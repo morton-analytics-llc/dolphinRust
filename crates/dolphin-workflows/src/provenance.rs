@@ -27,8 +27,8 @@ use crate::phase_steps::{CycleStepProvenance, JunctionProvenance};
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/5";
-const METHOD_VERSION: &str = "5.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/6";
+const METHOD_VERSION: &str = "6.0.0";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
@@ -52,7 +52,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/5`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/6`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -110,6 +110,16 @@ pub struct GeometryProvenance {
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
     /// AOI target/analysis/read-window contract; absent for full-frame runs.
+    /// Corrections this run's configuration applies, in a fixed order using the
+    /// stable names `ionosphere`, `troposphere`, `solid_earth_tide` and
+    /// `layover_shadow_mask`. Empty when none ran.
+    #[serde(default)]
+    pub corrections_applied: Vec<String>,
+    /// The velocity time-function model: `linear`, then `+seasonal`, then
+    /// `+step(N)` for N step dates, then `+relaxation(N)` for N relaxation terms,
+    /// e.g. `linear+seasonal+step(2)`. Empty when read from a pre-`/6` artifact.
+    #[serde(default)]
+    pub time_function_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing_bounds: Option<ProcessingBoundsProvenance>,
     /// Aggregate, identifier-free receipt for temporal input coverage.
@@ -301,6 +311,8 @@ pub fn assemble_geometry_provenance_with_coverage(
             .phase_linking
             .write_phase_similarity
             .then(|| PHASE_SIMILARITY_KEY.into()),
+        corrections_applied: corrections_applied(cfg),
+        time_function_model: time_function_model(cfg),
         decomposition_geometry_complete: orbit_direction.is_some()
             && heading_deg.is_some()
             && acquisition_time_of_day_utc_s.is_some()
@@ -314,6 +326,50 @@ pub fn assemble_geometry_provenance_with_coverage(
             fields,
         },
     }
+}
+
+/// Stable names of the corrections `cfg` applies, in a fixed order.
+fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
+    let corrections = &cfg.correction_options;
+    [
+        ("ionosphere", !corrections.ionosphere_files.is_empty()),
+        (
+            "troposphere",
+            !corrections.troposphere_files.is_empty() || !corrections.troposphere_epochs.is_empty(),
+        ),
+        ("solid_earth_tide", corrections.solid_earth_tide),
+        (
+            "layover_shadow_mask",
+            // Native OPERA masks read the same STATIC `layover_shadow_mask`; NISAR's
+            // native mask is a different quality layer.
+            !cfg.layover_shadow_mask_files.is_empty()
+                || (cfg.input_options.apply_native_input_masks
+                    && cfg.input_options.input_type != InputType::NisarGslc),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, applied)| applied)
+    .map(|(name, _)| name.to_owned())
+    .collect()
+}
+
+/// The velocity time-function model as `linear[+seasonal][+step(N)][+relaxation(N)]`.
+fn time_function_model(cfg: &DisplacementWorkflow) -> String {
+    let options = &cfg.timeseries_options;
+    let mut model = String::from("linear");
+    if options.velocity_seasonal {
+        model.push_str("+seasonal");
+    }
+    if !options.velocity_step_dates.is_empty() {
+        model.push_str(&format!("+step({})", options.velocity_step_dates.len()));
+    }
+    if !options.velocity_relaxation.is_empty() {
+        model.push_str(&format!(
+            "+relaxation({})",
+            options.velocity_relaxation.len()
+        ));
+    }
+    model
 }
 
 /// Write the artifact into `dir` (unconditionally, overwriting any previous run's
