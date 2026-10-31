@@ -5970,6 +5970,7 @@ mod tests {
             ionosphere: Some(values.clone()),
             troposphere: Some(values),
             solid_earth_tide: None,
+            plate_motion: None,
             los_geometry: Some(geometry),
         };
         let target = BlockIndices {
@@ -6031,6 +6032,7 @@ mod tests {
                 ionosphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
                 troposphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: Some(LosGeometry {
                     east: Array2::from_elem((2, 2), 1.0),
                     north: Array2::from_elem((2, 2), 1.0),
@@ -6174,6 +6176,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
@@ -6240,6 +6243,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
@@ -6462,6 +6466,7 @@ mod tests {
                     ionosphere: None,
                     troposphere: None,
                     solid_earth_tide: None,
+                    plate_motion: None,
                     los_geometry: None,
                 })
             },
@@ -7107,6 +7112,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
@@ -7186,6 +7192,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: Some(LosGeometry {
                     east,
                     north: Array2::zeros((4, 4)),
@@ -7947,11 +7954,13 @@ mod tests {
                     Array2::from_shape_fn((3, 3), |(_, c)| 0.01 * t as f64 * (1.0 + c as f64));
                 write_raster(&raster, delay.view(), gt, Some(32611), None).unwrap();
                 let src = gdal::Dataset::open(&raster).unwrap();
-                src.create_copy(
-                    &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
-                    &path,
-                    &Default::default(),
-                )
+                hdf5::sync::sync(|| {
+                    src.create_copy(
+                        &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
+                        &path,
+                        &Default::default(),
+                    )
+                })
                 .unwrap();
                 cfg.correction_options.troposphere_files.push(path);
             }
@@ -8302,6 +8311,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
@@ -9345,6 +9355,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],

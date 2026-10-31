@@ -7,6 +7,11 @@
 //!
 //! netCDF is read through GDAL's `NETCDF:` driver (same GDAL the rest of the
 //! pipeline links), then resampled onto the displacement frame grid.
+//!
+//! GDAL's netCDF driver reaches the same libhdf5 the `hdf5` crate uses, but
+//! without that crate's library lock, and libhdf5 is not built thread-safe. Every
+//! GDAL access to a netCDF file therefore runs inside [`hdf5::sync::sync`], so it
+//! cannot overlap an HDF5 call on another thread (#133).
 
 use std::path::Path;
 
@@ -50,22 +55,24 @@ fn ensure_single_level(ds: &Dataset) -> Result<()> {
 /// Returns [`CorrectionError::Gdal`] if the variable or grid cannot be read, or
 /// [`CorrectionError::TroposphereHeightLevels`] for a height-resolved variable.
 pub fn read_l4_netcdf(path: &Path, var: &str) -> Result<DelayGrid> {
-    let conn = format!("NETCDF:\"{}\":{var}", path.display());
-    let ds = Dataset::open(Path::new(&conn))?;
-    ensure_single_level(&ds)?;
-    let (cols, rows) = ds.raster_size();
-    let band = ds.rasterband(1)?;
-    let buf: Buffer<f64> = band.read_as((0, 0), (cols, rows), (cols, rows), None)?;
-    let (_, values) = buf.into_shape_and_vec();
-    let data = Array2::from_shape_vec((rows, cols), values)
-        .map_err(|e| CorrectionError::Shape(e.to_string()))?;
-    let geotransform = ds.geo_transform()?;
-    let (epsg, srs_wkt) = source_crs(ds.spatial_ref().ok(), geotransform);
-    Ok(DelayGrid {
-        data,
-        geotransform,
-        epsg,
-        srs_wkt,
+    hdf5::sync::sync(|| {
+        let conn = format!("NETCDF:\"{}\":{var}", path.display());
+        let ds = Dataset::open(Path::new(&conn))?;
+        ensure_single_level(&ds)?;
+        let (cols, rows) = ds.raster_size();
+        let band = ds.rasterband(1)?;
+        let buf: Buffer<f64> = band.read_as((0, 0), (cols, rows), (cols, rows), None)?;
+        let (_, values) = buf.into_shape_and_vec();
+        let data = Array2::from_shape_vec((rows, cols), values)
+            .map_err(|e| CorrectionError::Shape(e.to_string()))?;
+        let geotransform = ds.geo_transform()?;
+        let (epsg, srs_wkt) = source_crs(ds.spatial_ref().ok(), geotransform);
+        Ok(DelayGrid {
+            data,
+            geotransform,
+            epsg,
+            srs_wkt,
+        })
     })
 }
 
@@ -82,10 +89,12 @@ pub fn read_l4_netcdf_for_grid(
     dst_epsg: u32,
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
-    let conn = format!("NETCDF:\"{}\":{var}", path.display());
-    let ds = Dataset::open(Path::new(&conn))?;
-    ensure_single_level(&ds)?;
-    read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
+    hdf5::sync::sync(|| {
+        let conn = format!("NETCDF:\"{}\":{var}", path.display());
+        let ds = Dataset::open(Path::new(&conn))?;
+        ensure_single_level(&ds)?;
+        read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
+    })
 }
 
 /// Height levels (metres) of a height-resolved L4 variable, in band order.
@@ -97,18 +106,20 @@ pub fn read_l4_netcdf_for_grid(
 /// [`CorrectionError::Gdal`] if the variable cannot be opened, or
 /// [`CorrectionError::Shape`] if a band carries no height coordinate.
 pub fn height_levels(path: &Path, var: &str) -> Result<Vec<f64>> {
-    let conn = format!("NETCDF:\"{}\":{var}", path.display());
-    let ds = Dataset::open(Path::new(&conn))?;
-    (1..=ds.raster_count())
-        .map(|index| {
-            ds.rasterband(index)?
-                .metadata_item("NETCDF_DIM_height", "")
-                .and_then(|value: String| value.parse::<f64>().ok())
-                .ok_or_else(|| {
-                    CorrectionError::Shape(format!("band {index} has no NETCDF_DIM_height"))
-                })
-        })
-        .collect()
+    hdf5::sync::sync(|| {
+        let conn = format!("NETCDF:\"{}\":{var}", path.display());
+        let ds = Dataset::open(Path::new(&conn))?;
+        (1..=ds.raster_count())
+            .map(|index| {
+                ds.rasterband(index)?
+                    .metadata_item("NETCDF_DIM_height", "")
+                    .and_then(|value: String| value.parse::<f64>().ok())
+                    .ok_or_else(|| {
+                        CorrectionError::Shape(format!("band {index} has no NETCDF_DIM_height"))
+                    })
+            })
+            .collect()
+    })
 }
 
 /// Read one height level of an L4 variable onto the destination grid window.
@@ -124,15 +135,17 @@ pub fn read_l4_level_for_grid(
     dst_epsg: u32,
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
-    let conn = format!("NETCDF:\"{}\":{var}", path.display());
-    let ds = Dataset::open(Path::new(&conn))?;
-    if level >= ds.raster_count() {
-        return Err(CorrectionError::Shape(format!(
-            "height level {level} out of range ({} levels)",
-            ds.raster_count()
-        )));
-    }
-    read_dataset_for_grid(&ds, level + 1, dst_gt, dst_epsg, dst_shape)
+    hdf5::sync::sync(|| {
+        let conn = format!("NETCDF:\"{}\":{var}", path.display());
+        let ds = Dataset::open(Path::new(&conn))?;
+        if level >= ds.raster_count() {
+            return Err(CorrectionError::Shape(format!(
+                "height level {level} out of range ({} levels)",
+                ds.raster_count()
+            )));
+        }
+        read_dataset_for_grid(&ds, level + 1, dst_gt, dst_epsg, dst_shape)
+    })
 }
 
 /// Read a plain georeferenced raster (e.g. a DEM) onto the destination grid
@@ -146,8 +159,10 @@ pub fn read_raster_for_grid(
     dst_epsg: u32,
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
-    let ds = Dataset::open(path)?;
-    read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
+    hdf5::sync::sync(|| {
+        let ds = Dataset::open(path)?;
+        read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
+    })
 }
 
 fn read_dataset_for_grid(
@@ -482,7 +497,7 @@ fn write_netcdf_fixture(
     }
 
     let nc = DriverManager::get_driver_by_name("netCDF")?;
-    src.create_copy(&nc, path, &Default::default())?;
+    hdf5::sync::sync(|| src.create_copy(&nc, path, &Default::default()))?;
     Ok(())
 }
 
@@ -512,7 +527,7 @@ fn write_netcdf_fixture_with_validity(
         band.write((0, 0), (cols, rows), &mut buffer)?;
     }
     let nc = DriverManager::get_driver_by_name("netCDF")?;
-    src.create_copy(&nc, path, &Default::default())?;
+    hdf5::sync::sync(|| src.create_copy(&nc, path, &Default::default()))?;
     Ok(())
 }
 
