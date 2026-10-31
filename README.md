@@ -5,8 +5,9 @@ the DISP-S1 product — optimized for performance. The Python
 [dolphin](https://github.com/isce-framework/dolphin) library is the algorithm reference
 (the scientific spec), **not** a line-by-line port target.
 
-The pipeline estimates surface displacement from Sentinel-1 CSLC stacks via persistent /
-distributed scatterer phase linking (EVD/EMI), sequential ministack processing, phase
+The pipeline estimates surface displacement from Sentinel-1 CSLC stacks via distributed
+scatterer phase linking (EVD/EMI; persistent-scatterer selection is not wired into the
+workflow), sequential ministack processing, phase
 unwrapping, and SBAS network inversion. The rebuild targets the numerically hot paths —
 covariance estimation, eigensolver-based phase linking, SHP selection — where Rust's
 `rayon` + `faer` stack replaces the Python `jax`/`numba` JIT kernels without dispatch or

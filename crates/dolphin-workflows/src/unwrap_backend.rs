@@ -1,12 +1,12 @@
 //! Pluggable phase-unwrapping backend for the interferogram network.
 //!
 //! The pipeline dispatches unwrapping through the [`UnwrapBackend`] trait. Its
-//! signature is **network-level** — it receives the linked phase history and the
-//! date pairs, not pre-formed independent 2D interferograms — so a future
-//! spurt-style **3D spatiotemporal** solver can implement the same trait and
-//! unwrap the whole stack jointly without any pipeline change. The two shipped
-//! backends ([`SnaphuBackend`], [`TophuBackend`]) are 2D: they form each ifg and
-//! unwrap it independently, exactly as before, so their output is unchanged.
+//! signature takes the linked phase history and a list of date pairs. Production
+//! (`unwrap_phase_correlated_network`) calls it **once per pair**, because each
+//! interferogram gets its own phase correlation, so no backend sees the whole
+//! network at once. A 3D spatiotemporal solver would need a network-level entry
+//! point added back. The shipped backends are all 2D: they form each ifg and
+//! unwrap it independently.
 
 use std::path::Path;
 
@@ -23,9 +23,8 @@ use rayon::prelude::*;
 /// phase `pl` `(n_dates, rows, cols)` and the `(i, j)` date `pairs` to the
 /// unwrapped phase per ifg `(n_pairs, rows, cols)` in radians.
 ///
-/// 2D backends unwrap each ifg independently; a 3D backend may use the full
-/// spatiotemporal structure of `pl` + `pairs`. Implement this trait to add a
-/// backend — no other pipeline code changes.
+/// 2D backends unwrap each ifg independently. The production path passes one
+/// pair per call with that pair's correlation (see the module docs).
 pub trait UnwrapBackend: Send + Sync {
     /// Unwrap the whole network, returning `(n_pairs, rows, cols)` radians.
     ///
