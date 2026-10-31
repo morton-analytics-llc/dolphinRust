@@ -31,22 +31,21 @@
 //!
 //! # Euler pole table
 //!
-//! [`ITRF2014_PMM`] holds the ITRF2014 plate motion model (Altamimi, Métivier,
-//! Rebischung, Collilieux, 2017, *ITRF2014 plate motion model*, Geophys. J.
-//! Int. 209(3)), Cartesian angular-velocity components in milliarcseconds/year
-//! — the same table MintPy hardcodes in `objects/euler_pole.py`
-//! (`insarlab/MintPy`), keyed by the same plate names, which is what this
-//! module's oracle contract test was computed against independently.
+//! [`ITRF2020_PMM`] holds the rotation poles of the ITRF2020 plate motion model
+//! (Altamimi et al., 2023, *ITRF2020 plate motion model*, Geophys. Res. Lett.,
+//! DOI 10.1029/2023GL106373), Cartesian angular-velocity components in
+//! milliarcseconds/year. The values were transcribed from PROJ's `data/ITRF2020`
+//! init file (`OSGeo/PROJ`), which carries the same table in arcseconds/year.
+//! PROJ's `data/ITRF2014` entries in that same form equal MintPy's
+//! `ITRF2014_PMM` (`objects/euler_pole.py`) exactly, which confirms the units and
+//! sign convention of the transcription. The oracle tests below compare against
+//! velocities PROJ itself computes (`cct`, `+init=ITRF2020:<PLATE>`), so the
+//! table and the kinematics are checked by an independent implementation.
 //!
-//! **Not yet ITRF2020.** The issue that scoped this correction named the newer
-//! ITRF2020 PMM (Altamimi et al. 2023, DOI 10.1029/2023GL106373); its exact
-//! per-plate Euler-pole table could not be verified against a reachable oracle
-//! from this environment (network egress to the publisher was blocked, and
-//! MintPy itself has not picked up ITRF2020 either as of this writing). Rather
-//! than transcribe unverified numbers into a scientific constant table,
-//! [`PlateMotionModel::EulerPole`] lets a caller supply any pole — ITRF2020 or
-//! otherwise — directly; [`ITRF2014_PMM`] is offered as the verified built-in
-//! default for the named-plate path.
+//! The model's origin-rate bias (0.37, 0.35, 0.74 mm/yr in X, Y, Z) is
+//! not applied. It is a uniform translation across the frame, so a spatially
+//! referenced InSAR product removes nearly all of it, and the paper advises
+//! discarding the vertical component it induces.
 
 use dolphin_core::config::PlateMotionModel;
 use ndarray::Array2;
@@ -75,107 +74,123 @@ pub struct EulerPoleVector {
     pub omega_z_mas_per_year: f64,
 }
 
-/// ITRF2014 plate motion model (Altamimi et al. 2017), Cartesian
-/// angular-velocity vectors in milliarcseconds/year. See the module docs for
-/// provenance and why this is ITRF2014 rather than ITRF2020.
-pub const ITRF2014_PMM: &[(&str, EulerPoleVector)] = &[
+/// ITRF2020 plate motion model (Altamimi et al. 2023), Cartesian
+/// angular-velocity vectors in milliarcseconds/year, rotation only. See the
+/// module docs for provenance.
+pub const ITRF2020_PMM: &[(&str, EulerPoleVector)] = &[
+    (
+        "Amur",
+        EulerPoleVector {
+            omega_x_mas_per_year: -0.131,
+            omega_y_mas_per_year: -0.551,
+            omega_z_mas_per_year: 0.837,
+        },
+    ),
     (
         "Antarctica",
         EulerPoleVector {
-            omega_x_mas_per_year: -0.248,
-            omega_y_mas_per_year: -0.324,
-            omega_z_mas_per_year: 0.675,
+            omega_x_mas_per_year: -0.269,
+            omega_y_mas_per_year: -0.312,
+            omega_z_mas_per_year: 0.678,
         },
     ),
     (
         "Arabia",
         EulerPoleVector {
-            omega_x_mas_per_year: 1.154,
-            omega_y_mas_per_year: -0.136,
-            omega_z_mas_per_year: 1.444,
+            omega_x_mas_per_year: 1.129,
+            omega_y_mas_per_year: -0.146,
+            omega_z_mas_per_year: 1.438,
         },
     ),
     (
         "Australia",
         EulerPoleVector {
-            omega_x_mas_per_year: 1.510,
-            omega_y_mas_per_year: 1.182,
-            omega_z_mas_per_year: 1.215,
+            omega_x_mas_per_year: 1.487,
+            omega_y_mas_per_year: 1.175,
+            omega_z_mas_per_year: 1.223,
+        },
+    ),
+    (
+        "Caribbean",
+        EulerPoleVector {
+            omega_x_mas_per_year: 0.207,
+            omega_y_mas_per_year: -1.422,
+            omega_z_mas_per_year: 0.726,
         },
     ),
     (
         "Eurasia",
         EulerPoleVector {
             omega_x_mas_per_year: -0.085,
-            omega_y_mas_per_year: -0.531,
-            omega_z_mas_per_year: 0.770,
+            omega_y_mas_per_year: -0.519,
+            omega_z_mas_per_year: 0.753,
         },
     ),
     (
         "India",
         EulerPoleVector {
-            omega_x_mas_per_year: 1.154,
-            omega_y_mas_per_year: -0.005,
-            omega_z_mas_per_year: 1.454,
+            omega_x_mas_per_year: 1.137,
+            omega_y_mas_per_year: 0.013,
+            omega_z_mas_per_year: 1.444,
         },
     ),
     (
         "Nazca",
         EulerPoleVector {
-            omega_x_mas_per_year: -0.333,
-            omega_y_mas_per_year: -1.544,
-            omega_z_mas_per_year: 1.623,
+            omega_x_mas_per_year: -0.327,
+            omega_y_mas_per_year: -1.561,
+            omega_z_mas_per_year: 1.605,
         },
     ),
     (
         "NorthAmerica",
         EulerPoleVector {
-            omega_x_mas_per_year: 0.024,
-            omega_y_mas_per_year: -0.694,
-            omega_z_mas_per_year: -0.063,
+            omega_x_mas_per_year: 0.045,
+            omega_y_mas_per_year: -0.666,
+            omega_z_mas_per_year: -0.098,
         },
     ),
     (
         "Nubia",
         EulerPoleVector {
-            omega_x_mas_per_year: 0.099,
-            omega_y_mas_per_year: -0.614,
-            omega_z_mas_per_year: 0.733,
+            omega_x_mas_per_year: 0.090,
+            omega_y_mas_per_year: -0.585,
+            omega_z_mas_per_year: 0.717,
         },
     ),
     (
         "Pacific",
         EulerPoleVector {
-            omega_x_mas_per_year: -0.409,
-            omega_y_mas_per_year: 1.047,
-            omega_z_mas_per_year: -2.169,
+            omega_x_mas_per_year: -0.404,
+            omega_y_mas_per_year: 1.021,
+            omega_z_mas_per_year: -2.154,
         },
     ),
     (
         "SouthAmerica",
         EulerPoleVector {
-            omega_x_mas_per_year: -0.270,
-            omega_y_mas_per_year: -0.301,
-            omega_z_mas_per_year: -0.140,
+            omega_x_mas_per_year: -0.261,
+            omega_y_mas_per_year: -0.282,
+            omega_z_mas_per_year: -0.157,
         },
     ),
     (
         "Somalia",
         EulerPoleVector {
-            omega_x_mas_per_year: -0.121,
-            omega_y_mas_per_year: -0.794,
-            omega_z_mas_per_year: 0.884,
+            omega_x_mas_per_year: -0.081,
+            omega_y_mas_per_year: -0.719,
+            omega_z_mas_per_year: 0.864,
         },
     ),
 ];
 
-/// Look up a plate's Euler pole in [`ITRF2014_PMM`] by name, ignoring case,
+/// Look up a plate's Euler pole in [`ITRF2020_PMM`] by name, ignoring case,
 /// spaces, underscores and hyphens (`"North America"`, `"north_america"` and
 /// `"NorthAmerica"` all match).
 #[must_use]
 pub fn plate_by_name(name: &str) -> Option<EulerPoleVector> {
     let target = normalize_plate_name(name);
-    ITRF2014_PMM
+    ITRF2020_PMM
         .iter()
         .find(|(plate, _)| normalize_plate_name(plate) == target)
         .map(|(_, pole)| *pole)
@@ -189,7 +204,7 @@ fn normalize_plate_name(name: &str) -> String {
 }
 
 /// Resolve a [`PlateMotionModel`] to its Euler pole: a named plate looked up
-/// in [`ITRF2014_PMM`], or an explicit pole passed straight through.
+/// in [`ITRF2020_PMM`], or an explicit pole passed straight through.
 ///
 /// # Errors
 /// [`CorrectionError::UnknownPlate`] if a named plate is not in the built-in
@@ -343,38 +358,39 @@ mod tests {
         assert!(enu[1].abs() < 1e-9, "north component: {}", enu[1]);
     }
 
-    /// Contract (DoD #2, oracle): North America's ITRF2014 PMM pole at
-    /// (-100°, 40°) against an independently hand-derived value (same
-    /// closed-form model, computed separately in Python — see the module
-    /// docs) — 1e-9 m/yr, tight enough to catch a sign, unit or axis-order
-    /// bug while allowing ordinary floating-point round-off.
+    /// Contract (DoD #2, oracle): North America's ITRF2020 PMM pole at
+    /// (-100°, 40°, h = 0) against PROJ 9.8: `cct +proj=cart +ellps=WGS84` then
+    /// `+init=ITRF2020:NOAM +t_epoch=2020`, differenced over one year and
+    /// rotated to ENU. Tolerance 5e-9 m/yr covers `cct`'s nanometer output
+    /// rounding; a sign, unit or axis-order bug is off by millimeters.
     #[test]
     fn north_america_matches_independent_oracle() {
         let pole = plate_by_name("NorthAmerica").expect("NorthAmerica is in the table");
         let enu = plate_velocity_enu(pole, -100.0, 40.0);
         let expected = [
-            -0.014_924_365_796_432_694,
-            -0.004_451_163_361_049_95,
-            -1.471_323_803_703_015_7e-5,
+            -0.015_137_320_023_892_785,
+            -0.004_939_637_225_003_19,
+            -1.632_764_563_400_807e-5,
         ];
         for (got, want) in enu.iter().zip(expected.iter()) {
-            assert!((got - want).abs() < 1e-9, "got {enu:?}, want {expected:?}");
+            assert!((got - want).abs() < 5e-9, "got {enu:?}, want {expected:?}");
         }
     }
 
     /// Contract (DoD #2, oracle): the Pacific plate near Hawaii (-155°, 20°),
-    /// same independent cross-check.
+    /// same PROJ cross-check
+    /// (`+init=ITRF2020:PCFC`).
     #[test]
     fn pacific_matches_independent_oracle() {
         let pole = plate_by_name("Pacific").expect("Pacific is in the table");
         let enu = plate_velocity_enu(pole, -155.0, 20.0);
         let expected = [
-            -0.062_295_287_354_809_13,
-            0.034_673_418_249_220_69,
-            7.465_944_313_187_964e-5,
+            -0.061_927_111_297_583_576,
+            0.033_879_740_516_426_365,
+            7.295_108_599_559_771e-5,
         ];
         for (got, want) in enu.iter().zip(expected.iter()) {
-            assert!((got - want).abs() < 1e-9, "got {enu:?}, want {expected:?}");
+            assert!((got - want).abs() < 5e-9, "got {enu:?}, want {expected:?}");
         }
     }
 

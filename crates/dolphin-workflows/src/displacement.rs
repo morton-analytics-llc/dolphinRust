@@ -7112,6 +7112,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
@@ -7191,6 +7192,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: Some(LosGeometry {
                     east,
                     north: Array2::zeros((4, 4)),

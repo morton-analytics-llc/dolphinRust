@@ -150,19 +150,19 @@ pub(crate) fn apply_corrections_with_ownership(
         ionosphere: None,
         troposphere: None,
         solid_earth_tide: None,
+        plate_motion: None,
         los_geometry,
     };
     for (owner, options, files) in groups {
-        let mut bounds = (rows, cols, 0, 0);
-        for ((_, row, col), value) in ownership.indexed_iter() {
-            if value == owner {
-                bounds.0 = bounds.0.min(row);
-                bounds.1 = bounds.1.min(col);
-                bounds.2 = bounds.2.max(row + 1);
-                bounds.3 = bounds.3.max(col + 1);
-            }
-        }
-        let (r0, c0, r1, c1) = bounds;
+        let (r0, c0, r1, c1) = ownership
+            .indexed_iter()
+            .filter(|(_, value)| *value == owner)
+            .fold(
+                (rows, cols, 0, 0),
+                |(r0, c0, r1, c1), ((_, row, col), _)| {
+                    (r0.min(row), c0.min(col), r1.max(row + 1), c1.max(col + 1))
+                },
+            );
         if r0 >= r1 || c0 >= c1 {
             continue;
         }
@@ -192,9 +192,6 @@ pub(crate) fn apply_corrections_with_ownership(
             SPEED_OF_LIGHT / wavelength,
             local_los.as_ref(),
         )?;
-        let local_support = support
-            .as_ref()
-            .map(|m| m.slice(ndarray::s![r0..r1, c0..c1]));
         let troposphere = build_troposphere(
             options,
             bands + 1,
@@ -202,13 +199,15 @@ pub(crate) fn apply_corrections_with_ownership(
             gt,
             geo.epsg,
             local_los.as_ref(),
-            local_support,
+            support.map(|m| m.slice_move(ndarray::s![r0..r1, c0..c1])),
         )?;
         let tide = build_solid_earth_tide(options, files, shape, local_geo, local_los.as_ref())?;
+        let plate = build_plate_motion(options, files, shape, local_geo, local_los.as_ref())?;
         for (destination, source) in [
             (&mut combined.ionosphere, ionosphere),
             (&mut combined.troposphere, troposphere),
             (&mut combined.solid_earth_tide, tide),
+            (&mut combined.plate_motion, plate),
         ] {
             if let Some(source) = source {
                 let destination = destination
@@ -226,6 +225,7 @@ pub(crate) fn apply_corrections_with_ownership(
             combined.ionosphere.as_ref(),
             combined.troposphere.as_ref(),
             combined.solid_earth_tide.as_ref(),
+            combined.plate_motion.as_ref(),
         ],
         bands + 1,
         (rows, cols),
@@ -1671,7 +1671,7 @@ mod tests {
         assert!(!opts.is_enabled());
         let mut disp = Array3::from_shape_fn((2, 2, 2), |(t, r, c)| (t + r + c) as f64);
         let original = disp.clone();
-        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6]).unwrap();
+        let layers = apply_corrections(&opts, None, &mut disp, &[], 32614, [0.0; 6], None).unwrap();
         assert!(layers.plate_motion.is_none());
         assert_eq!(disp, original);
     }
@@ -1692,7 +1692,8 @@ mod tests {
         };
         let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
         let mut disp = Array3::<f64>::zeros((1, 3, 3));
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("unknown plate motion model plate"),
             "expected the unknown-plate error, got: {err:#}"
@@ -1714,7 +1715,8 @@ mod tests {
         let mut disp = Array3::<f64>::zeros((1, 2, 2));
         let gt = [500_000.0, 60.0, 0.0, 2_150_000.0, 0.0, -60.0];
         let files = vec![PathBuf::from("OPERA_L2_CSLC-S1_T005_20230104T004053Z_x.h5")];
-        let err = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt).unwrap_err();
+        let err =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32614, gt, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("geometry_files"),
             "expected the geometry requirement, got: {err:#}"
@@ -1746,7 +1748,8 @@ mod tests {
             PathBuf::from("OPERA_L2_CSLC-S1_T005_20220103T124053Z_x.h5"),
         ];
         let mut disp = Array3::<f64>::zeros((2, 3, 3));
-        let layers = apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt).unwrap();
+        let layers =
+            apply_corrections(&opts, Some(0.055), &mut disp, &files, 32610, gt, None).unwrap();
         let plate_motion = layers.plate_motion.expect("plate motion layer");
         assert_eq!(plate_motion.dim(), (3, 3, 3));
 

@@ -1266,7 +1266,7 @@ pub struct CorrectionOptions {
     /// (`validate_supported_options`). dolphinRust-only.
     pub max_outside_static_fraction: Option<f64>,
     /// Subtract rigid tectonic plate motion (issue #103): a plate name
-    /// resolved against dolphinRust's built-in ITRF2014 PMM table, or an
+    /// resolved against dolphinRust's built-in ITRF2020 PMM table, or an
     /// explicit Euler pole. Like `solid_earth_tide` this needs **no external
     /// data file** — only the acquisition time and per-pixel LOS geometry —
     /// and requires `geometry_files` for the same reason (projecting a 3-D
@@ -1309,8 +1309,8 @@ impl CorrectionOptions {
 }
 
 /// `correction_options.plate_motion_model` selector: either a named plate,
-/// resolved against dolphinRust's built-in ITRF2014 PMM table
-/// (`dolphin_corrections::plate_motion::ITRF2014_PMM`), or an explicit Euler
+/// resolved against dolphinRust's built-in ITRF2020 PMM table
+/// (`dolphin_corrections::plate_motion::ITRF2020_PMM`), or an explicit Euler
 /// pole that bypasses the named-plate table entirely (e.g. for a newer ITRF
 /// realization's published values, or a locally fit pole). Untagged: a bare
 /// YAML string is a plate name, a mapping with the three `omega_*` keys is an
