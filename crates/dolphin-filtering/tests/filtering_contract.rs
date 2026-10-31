@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 use dolphin_core::Cf64;
 use dolphin_filtering::{filter_long_wavelength, goldstein};
 use ndarray::{Array2, ArrayView2};
-use num_complex::Complex;
-
-type Cf32 = Complex<f32>;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
@@ -70,22 +67,69 @@ fn long_wavelength_matches_oracle() {
     );
 }
 
+/// dolphin PR #680 Goldstein (reflection padding, full trailing-edge coverage,
+/// weight-normalised blending, zero-magnitude-only empty mask) on a divisible
+/// grid, a grid the patch step does not divide, and a grid with valid
+/// zero-phase pixels plus zero and NaN pixels. Fixture:
+/// `oracle/gen_goldstein_pr680.py`.
 #[test]
-fn goldstein_matches_oracle() {
-    let dir = fixtures();
-    if !dir.join("filt_gold_output.npy").exists() {
-        eprintln!("skipping goldstein oracle: no fixtures");
-        return;
+fn goldstein_matches_upstream_pr680() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goldstein_pr680.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let values = |case: &serde_json::Value, key: &str| -> Vec<f64> {
+        case[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(f64::NAN))
+            .collect()
+    };
+    for case in fixture["cases"].as_array().unwrap() {
+        let shape = (
+            case["shape"][0].as_u64().unwrap() as usize,
+            case["shape"][1].as_u64().unwrap() as usize,
+        );
+        let complex = |re: Vec<f64>, im: Vec<f64>| {
+            Array2::from_shape_vec(
+                shape,
+                re.into_iter()
+                    .zip(im)
+                    .map(|(r, i)| Cf64::new(r, i))
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let input = complex(values(case, "input_re"), values(case, "input_im"));
+        let expected = complex(values(case, "expected_re"), values(case, "expected_im"));
+        let out = goldstein(
+            input.view(),
+            case["alpha"].as_f64().unwrap(),
+            case["psize"].as_u64().unwrap() as usize,
+        );
+        // Upstream lets a NaN input spread NaN through every patch that holds
+        // it; the port must reproduce exactly that pattern, and match elsewhere.
+        for ((point, actual), wanted) in out.indexed_iter().zip(expected.iter()) {
+            match wanted.is_nan() {
+                true => assert!(actual.is_nan(), "{}: {point:?} should be NaN", case["name"]),
+                false => assert!(
+                    (actual - wanted).norm() < 1e-4,
+                    "{}: {point:?} {actual} != {wanted}",
+                    case["name"]
+                ),
+            }
+        }
+        if case["name"] == "small_patch_zero_phase_and_empty" {
+            let zero = Cf64::new(0.0, 0.0);
+            assert!(out
+                .slice(ndarray::s![3..9, 4..12])
+                .iter()
+                .all(|&z| z != zero));
+            assert!(out
+                .slice(ndarray::s![14..17, 20..25])
+                .iter()
+                .all(|&z| z == zero));
+            assert_eq!(out[(0, 0)], zero);
+        }
     }
-    let input: Array2<Cf32> = ndarray_npy::read_npy(dir.join("filt_gold_input.npy")).unwrap();
-    let oracle: Array2<Cf32> = ndarray_npy::read_npy(dir.join("filt_gold_output.npy")).unwrap();
-    let input = input.mapv(|z| Cf64::new(z.re as f64, z.im as f64));
-
-    let out = goldstein(input.view(), 0.5, 16);
-    let err = out
-        .iter()
-        .zip(oracle.iter())
-        .map(|(a, b)| (a - Cf64::new(b.re as f64, b.im as f64)).norm())
-        .fold(0.0_f64, f64::max);
-    assert!(err < 1e-4, "goldstein differs: {err}");
 }

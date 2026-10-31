@@ -124,12 +124,14 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "correction_options.troposphere_variable",
     "correction_options.solid_earth_tide",
     "correction_options.max_outside_static_fraction",
+    "correction_options.plate_motion_model",
     "output_options.strides",
     "output_options.epsg",
     "output_options.bounds",
     "output_options.bounds_epsg",
     "output_options.add_overviews",
     "output_options.overview_levels",
+    "output_options.min_reference_component_fraction",
     "worker_settings.gpu_enabled",
     "worker_settings.compute_backend",
     "worker_settings.threads_per_worker",
@@ -227,6 +229,7 @@ fn audit_output(value: OutputOptions, paths: &mut Vec<&'static str>) {
             bounds_epsg,
             add_overviews,
             overview_levels,
+            min_reference_component_fraction,
         ]
     );
     let _ = (
@@ -236,6 +239,7 @@ fn audit_output(value: OutputOptions, paths: &mut Vec<&'static str>) {
         bounds_epsg,
         add_overviews,
         overview_levels,
+        min_reference_component_fraction,
     );
 }
 
@@ -481,6 +485,7 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
             troposphere_variable,
             solid_earth_tide,
             max_outside_static_fraction,
+            plate_motion_model,
         ]
     );
     let _ = (
@@ -496,6 +501,7 @@ fn audit_corrections(value: CorrectionOptions, paths: &mut Vec<&'static str>) {
         troposphere_variable,
         solid_earth_tide,
         max_outside_static_fraction,
+        plate_motion_model,
     );
 }
 
@@ -929,4 +935,39 @@ fn outside_static_fraction_must_be_a_fraction() {
         config.correction_options.max_outside_static_fraction = valid;
         config.validate_supported_options().unwrap();
     }
+}
+
+/// `output_options.min_reference_component_fraction` (#152) is a fraction in
+/// (0, 1] of a bounded target, so it is a config error outside that range or
+/// without `output_options.bounds`, and it round-trips through YAML.
+#[test]
+fn reference_component_fraction_requires_bounds_and_a_fraction() {
+    let bounded = || {
+        let mut config = DisplacementWorkflow::default();
+        config.output_options.bounds = Some((0.0, 0.0, 30.0, 30.0));
+        config.output_options.bounds_epsg = Some(32611);
+        config
+    };
+    for invalid in [f64::NAN, 0.0, -0.1, 1.5] {
+        let mut config = bounded();
+        config.output_options.min_reference_component_fraction = Some(invalid);
+        let error = config.validate_supported_options().unwrap_err().to_string();
+        assert!(error.contains("(0, 1]"), "{invalid}: {error}");
+    }
+    let mut unbounded = DisplacementWorkflow::default();
+    unbounded.output_options.min_reference_component_fraction = Some(0.9);
+    let error = unbounded
+        .validate_supported_options()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires output_options.bounds"), "{error}");
+    let mut config = bounded();
+    config.output_options.min_reference_component_fraction = Some(0.9);
+    config.validate_supported_options().unwrap();
+    let yaml = serde_yaml::to_string(&config).unwrap();
+    let parsed: DisplacementWorkflow = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        parsed.output_options.min_reference_component_fraction,
+        Some(0.9)
+    );
 }
