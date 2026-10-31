@@ -157,14 +157,19 @@ fn combos() -> Vec<(usize, usize, usize, &'static str, CompressedSlcPlan)> {
             "first_per_ministack",
             CompressedSlcPlan::FirstPerMinistack,
         ),
-        (
-            10,
-            4,
-            10,
-            "last_per_ministack",
-            CompressedSlcPlan::LastPerMinistack,
-        ),
     ]
+}
+
+/// #164: `last_per_ministack` across more than one ministack, or on a resumed
+/// stack, is refused (dolphin ≥ 0.40 raises the same); one ministack still plans.
+#[test]
+fn last_per_ministack_is_refused_across_multiple_ministacks() {
+    let plan = CompressedSlcPlan::LastPerMinistack;
+    assert!(planner(10, 10, plan).plan(4).is_err());
+    assert!(planner(4, 10, plan).plan_with_offset(4, 1).is_err());
+    let single = planner(4, 10, plan).plan(4).unwrap();
+    assert_eq!(single.len(), 1);
+    assert_eq!(single[0].num_compressed, 0);
 }
 
 fn row(m: &MiniStack) -> [i64; 4] {

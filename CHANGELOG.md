@@ -59,6 +59,12 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **`compressed_slc_plan: last_per_ministack` is refused across multiple ministacks** (issue
+  #164). From the third ministack on, the plan referenced each ministack to the previous one's
+  last date, while the sequential stitch assumed a single reference, so displacement silently
+  carried the offset (−2.03 rad from date 31 on a noise-free synthetic stack). The planner now
+  errors when the plan would span more than one ministack, or on a resumed stack, as
+  dolphin ≥ 0.40 does. A single-ministack run still plans.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;
