@@ -111,8 +111,8 @@ pub struct GeometryProvenance {
     pub decomposition_geometry_complete: bool,
     /// AOI target/analysis/read-window contract; absent for full-frame runs.
     /// Corrections this run's configuration applies, in a fixed order using the
-    /// stable names `ionosphere`, `troposphere`, `solid_earth_tide` and
-    /// `layover_shadow_mask`. Empty when none ran.
+    /// stable names `ionosphere`, `troposphere`, `solid_earth_tide`,
+    /// `plate_motion` and `layover_shadow_mask`. Empty when none ran.
     #[serde(default)]
     pub corrections_applied: Vec<String>,
     /// The velocity time-function model: `linear`, then `+seasonal`, then
@@ -338,6 +338,7 @@ fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
             !corrections.troposphere_files.is_empty() || !corrections.troposphere_epochs.is_empty(),
         ),
         ("solid_earth_tide", corrections.solid_earth_tide),
+        ("plate_motion", corrections.plate_motion_model.is_some()),
         (
             "layover_shadow_mask",
             // Native OPERA masks read the same STATIC `layover_shadow_mask`; NISAR's

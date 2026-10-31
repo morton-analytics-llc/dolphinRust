@@ -554,6 +554,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.geometry_files is nonempty"
     ),
+    conditional!(
+        "correction_options.plate_motion_model",
+        "CFG-CORRECTIONS",
+        "correction_options.plate_motion_model is set"
+    ),
     consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
     conditional!(
         "output_options.epsg",
@@ -569,6 +574,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "output_options.bounds_epsg",
         "CFG-BOUNDS-CROP",
         "output_options.bounds is set"
+    ),
+    conditional!(
+        "output_options.min_reference_component_fraction",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds and output_options.min_reference_component_fraction are set"
     ),
     compatibility_only!(
         "output_options.add_overviews",
@@ -1260,6 +1270,14 @@ pub struct CorrectionOptions {
     /// the resolver default (0.10); a value must lie in `[0, 1]`
     /// (`validate_supported_options`). dolphinRust-only.
     pub max_outside_static_fraction: Option<f64>,
+    /// Subtract rigid tectonic plate motion (issue #103): a plate name
+    /// resolved against dolphinRust's built-in ITRF2020 PMM table, or an
+    /// explicit Euler pole. Like `solid_earth_tide` this needs **no external
+    /// data file** — only the acquisition time and per-pixel LOS geometry —
+    /// and requires `geometry_files` for the same reason (projecting a 3-D
+    /// rigid-rotation velocity into line of sight needs the full LOS unit
+    /// vector). dolphinRust-only forward divergence, **unset by default**.
+    pub plate_motion_model: Option<PlateMotionModel>,
 }
 
 impl Default for CorrectionOptions {
@@ -1277,20 +1295,45 @@ impl Default for CorrectionOptions {
             troposphere_variable: "total".into(),
             solid_earth_tide: false,
             max_outside_static_fraction: None,
+            plate_motion_model: None,
         }
     }
 }
 
 impl CorrectionOptions {
-    /// Whether any correction is enabled (any correction file supplied, or the
-    /// file-free solid-earth-tide flag set).
+    /// Whether any correction is enabled (any correction file supplied, or one
+    /// of the file-free flags set).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.ionosphere_files.is_empty()
             || !self.troposphere_files.is_empty()
             || !self.troposphere_epochs.is_empty()
             || self.solid_earth_tide
+            || self.plate_motion_model.is_some()
     }
+}
+
+/// `correction_options.plate_motion_model` selector: either a named plate,
+/// resolved against dolphinRust's built-in ITRF2020 PMM table
+/// (`dolphin_corrections::plate_motion::ITRF2020_PMM`), or an explicit Euler
+/// pole that bypasses the named-plate table entirely (e.g. for a newer ITRF
+/// realization's published values, or a locally fit pole). Untagged: a bare
+/// YAML string is a plate name, a mapping with the three `omega_*` keys is an
+/// explicit pole.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlateMotionModel {
+    /// A plate name, e.g. `"NorthAmerica"` — matched case/space-insensitively.
+    Plate(String),
+    /// An explicit Cartesian Euler pole, milliarcseconds/year.
+    EulerPole {
+        /// X-axis angular-velocity component, mas/yr.
+        omega_x_mas_per_year: f64,
+        /// Y-axis angular-velocity component, mas/yr.
+        omega_y_mas_per_year: f64,
+        /// Z-axis angular-velocity component, mas/yr.
+        omega_z_mas_per_year: f64,
+    },
 }
 
 /// Output grid + raster options. dolphin `OutputOptions`.
@@ -1312,6 +1355,13 @@ pub struct OutputOptions {
     /// Dolphin YAML compatibility only; must remain at its default because the
     /// COG writer owns overview generation.
     pub overview_levels: Vec<u32>,
+    /// Bounded runs only: the smallest fraction of target pixels that must share
+    /// the reference pixel's unwrap component (`unwrap_component.tif`). Below it
+    /// the run fails with `BoundsError::DisconnectedTarget` instead of publishing
+    /// regions whose offset from the reference is an arbitrary multiple of 2π.
+    /// `None` (the default) records the components without enforcing a minimum.
+    /// dolphinRust-only.
+    pub min_reference_component_fraction: Option<f64>,
 }
 
 impl Default for OutputOptions {
@@ -1323,6 +1373,7 @@ impl Default for OutputOptions {
             bounds_epsg: Some(4326),
             add_overviews: true,
             overview_levels: vec![4, 8, 16, 32, 64],
+            min_reference_component_fraction: None,
         }
     }
 }
@@ -1516,6 +1567,18 @@ impl DisplacementWorkflow {
             | UnwrapMethod::Phass
             | UnwrapMethod::Spurt
             | UnwrapMethod::Whirlwind => unreachable!("unsupported methods returned above"),
+        }
+        if let Some(fraction) = self.output_options.min_reference_component_fraction {
+            if self.output_options.bounds.is_none() {
+                return Err(CoreError::InvalidConfig(
+                    "output_options.min_reference_component_fraction requires output_options.bounds".into(),
+                ));
+            }
+            if !(fraction.is_finite() && 0.0 < fraction && fraction <= 1.0) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "output_options.min_reference_component_fraction must be in (0, 1], got {fraction}"
+                )));
+            }
         }
         if self.output_options.epsg.is_some() && self.output_options.bounds.is_none() {
             return Err(CoreError::InvalidConfig(

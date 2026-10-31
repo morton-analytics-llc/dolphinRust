@@ -737,6 +737,9 @@ fn provenance_records_corrections_and_time_function_model() {
 
     let mut cfg = DisplacementWorkflow::default();
     cfg.correction_options.solid_earth_tide = true;
+    cfg.correction_options.plate_motion_model = Some(
+        dolphin_core::config::PlateMotionModel::Plate("NorthAmerica".into()),
+    );
     cfg.correction_options.ionosphere_files = vec!["jplg0010.23i".into()];
     cfg.layover_shadow_mask_files = vec!["static.h5".into()];
     cfg.timeseries_options.velocity_seasonal = true;
@@ -744,7 +747,12 @@ fn provenance_records_corrections_and_time_function_model() {
     let configured = assemble_geometry_provenance(&cfg, None);
     assert_eq!(
         configured.corrections_applied,
-        ["ionosphere", "solid_earth_tide", "layover_shadow_mask"]
+        [
+            "ionosphere",
+            "solid_earth_tide",
+            "plate_motion",
+            "layover_shadow_mask"
+        ]
     );
     assert_eq!(configured.time_function_model, "linear+seasonal+step(1)");
 
