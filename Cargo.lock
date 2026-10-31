@@ -516,6 +516,7 @@ dependencies = [
  "dolphin-core",
  "dolphin-io",
  "gdal",
+ "hdf5-metno",
  "ndarray",
  "rayon",
  "thiserror 2.0.18",
