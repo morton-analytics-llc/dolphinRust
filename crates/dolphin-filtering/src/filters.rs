@@ -61,33 +61,81 @@ fn gaussian_lowpass(filled: ArrayView2<f64>, sigma: f64) -> Array2<f64> {
     spectrum.mapv(|z| z.re / norm)
 }
 
-/// Goldstein adaptive filter (port of `goldstein.py`).
+/// Goldstein adaptive filter (port of `goldstein.py` after dolphin PR #680).
 ///
-/// Overlapping `psize`-square patches are power-spectrum weighted by `|F|^alpha`
-/// in the frequency domain and blended with a tent window. `alpha` in `[0, 1]`.
+/// The input is reflection-padded by `psize/2` on every side (plus enough to
+/// make each padded axis a multiple of the step), overlapping `psize`-square
+/// patches stepping by `psize/2` cover the padded grid, each patch is
+/// power-spectrum weighted by `|F|^alpha` and tent-windowed, and the blend is
+/// normalised by the accumulated window weight. Pixels that are NaN or exactly
+/// zero are empty and stay zero; a valid pixel with zero phase is not empty.
+/// `alpha` in `[0, 1]`.
 #[must_use]
 pub fn goldstein(phase: ArrayView2<C>, alpha: f64, psize: usize) -> Array2<C> {
     let (rows, cols) = phase.dim();
-    let empty = phase.mapv(|z| z.is_nan() || z.arg() == 0.0);
+    let empty = phase.mapv(|z| z.is_nan() || z == C::new(0.0, 0.0));
     if empty.iter().all(|&e| e) {
         return phase.to_owned();
     }
+    let step = psize / 2;
+    let pad = |n: usize| step + (step - n % step) % step;
+    let padded = reflect_pad(phase, step, (pad(rows), pad(cols)));
+    let (padded_rows, padded_cols) = padded.dim();
     let weight = make_weight(psize);
-    let mut out = Array2::<C>::zeros((rows, cols));
-    for (i, j) in patch_starts(rows, cols, psize) {
-        let patch = filter_patch(phase.slice(s![i..i + psize, j..j + psize]), &weight, alpha);
+    let mut out = Array2::<C>::zeros(padded.dim());
+    let mut weight_sum = Array2::<f64>::zeros(padded.dim());
+    for (i, j) in patch_starts(padded_rows, padded_cols, psize) {
+        let patch = filter_patch(padded.slice(s![i..i + psize, j..j + psize]), &weight, alpha);
         accumulate(&mut out, &patch, (i, j));
+        let mut region = weight_sum.slice_mut(s![i..i + psize, j..j + psize]);
+        region += &weight;
     }
+    let mut out = Array2::from_shape_fn((rows, cols), |(r, c)| {
+        let total = weight_sum[(r + step, c + step)];
+        let value = out[(r + step, c + step)];
+        if total > 0.0 {
+            value / total
+        } else {
+            value
+        }
+    });
     zero_empty(&mut out, &empty);
     out
 }
 
-/// Top-left corners of overlapping patches stepping by `psize/2` (dolphin's
-/// `range(0, dim - psize, psize//2)` — the trailing edge is left unprocessed).
+/// Pad with numpy's `mode="reflect"` (mirror without repeating the edge),
+/// `before` on the top and left, `after = (bottom, right)`.
+fn reflect_pad(data: ArrayView2<C>, before: usize, after: (usize, usize)) -> Array2<C> {
+    let (rows, cols) = data.dim();
+    let reflect = |index: usize, n: usize| -> usize {
+        if n == 1 {
+            return 0;
+        }
+        let period = 2 * (n - 1);
+        let k = (index as isize - before as isize).rem_euclid(period as isize) as usize;
+        if k < n {
+            k
+        } else {
+            period - k
+        }
+    };
+    Array2::from_shape_fn(
+        (rows + before + after.0, cols + before + after.1),
+        |(r, c)| data[(reflect(r, rows), reflect(c, cols))],
+    )
+}
+
+/// Top-left corners of overlapping patches stepping by `psize/2` over the
+/// padded grid (`range(0, dim - psize + 1, psize//2)`), so every padded pixel
+/// is covered.
 fn patch_starts(rows: usize, cols: usize, psize: usize) -> Vec<(usize, usize)> {
     let step = psize / 2;
-    let is: Vec<usize> = (0..rows.saturating_sub(psize)).step_by(step).collect();
-    let js: Vec<usize> = (0..cols.saturating_sub(psize)).step_by(step).collect();
+    let is: Vec<usize> = (0..(rows + 1).saturating_sub(psize))
+        .step_by(step)
+        .collect();
+    let js: Vec<usize> = (0..(cols + 1).saturating_sub(psize))
+        .step_by(step)
+        .collect();
     is.iter()
         .flat_map(|&i| js.iter().map(move |&j| (i, j)))
         .collect()
@@ -111,7 +159,7 @@ fn accumulate(out: &mut Array2<C>, patch: &Array2<C>, corner: (usize, usize)) {
     region += patch;
 }
 
-/// Zero out pixels flagged empty (NaN or exactly-zero phase).
+/// Zero out pixels flagged empty (NaN or exactly-zero magnitude).
 fn zero_empty(out: &mut Array2<C>, empty: &Array2<bool>) {
     out.iter_mut()
         .zip(empty.iter())

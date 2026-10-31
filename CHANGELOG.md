@@ -81,6 +81,12 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Goldstein filter edge cases** (issue #139): ported dolphin PR #680. The filter reflection-pads
+  by half a patch, covers the trailing rows and columns the old patch grid skipped, normalises
+  the overlapping-patch blend by the accumulated window weight, and treats only NaN or
+  zero-magnitude pixels as empty, so valid zero-phase pixels are filtered. Contract fixture
+  `crates/dolphin-filtering/tests/fixtures/goldstein_pr680.json` from
+  `oracle/gen_goldstein_pr680.py`, which matches upstream's file bit-for-bit.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;
