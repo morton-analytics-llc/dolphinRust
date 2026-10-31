@@ -7,6 +7,15 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Residual DEM-error term in the velocity fit** (issue #143). With
+  `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
+  `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
+  the along-track-corrected perpendicular baseline from acquisition 0 at the first granule's
+  burst centre, from the CSLC orbits at each granule's mid zero-Doppler time. `R` and `θ` are
+  the reference platform's slant range and incidence there. The fitted coefficient is
+  published as `dem_error.tif` in metres, and the rate no longer absorbs the baseline-correlated
+  height error. Off by default. Requires OPERA CSLC inputs and `input_options.wavelength`, and
+  fails the run if any granule's orbit metadata cannot be read.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median

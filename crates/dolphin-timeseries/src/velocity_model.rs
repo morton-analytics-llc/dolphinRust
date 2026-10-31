@@ -50,6 +50,11 @@ pub struct VelocityModel {
     /// Exponential relaxation terms, one basis column each, in the same units and
     /// origin as `x`. Onset and time constant are inputs, never fitted.
     pub relaxation: Vec<RelaxationTerm>,
+    /// Per-date DEM-error sensitivity, series units per metre of height error
+    /// (`B⊥(t) / (R sin θ)` scaled to the series units), one value per entry of
+    /// `x`. Empty to leave the term out; when set, the fitted coefficient is the
+    /// residual DEM error in metres (Fattahi & Amelung 2013).
+    pub dem_error_sensitivity: Vec<f64>,
 }
 
 /// One exponential relaxation basis function
@@ -77,16 +82,24 @@ impl VelocityModel {
     /// existing degree-1 estimators, which this path does not attempt to replace.
     #[must_use]
     pub fn is_linear(&self) -> bool {
-        !self.seasonal && self.step_days.is_empty() && self.relaxation.is_empty()
+        !self.seasonal
+            && self.step_days.is_empty()
+            && self.relaxation.is_empty()
+            && self.dem_error_sensitivity.is_empty()
     }
 
     /// Number of fitted parameters: intercept + rate + optional terms.
     fn n_terms(&self) -> usize {
+        self.dem_error_offset() + usize::from(!self.dem_error_sensitivity.is_empty())
+    }
+
+    /// Column index of the DEM-error term, when configured.
+    fn dem_error_offset(&self) -> usize {
         self.relaxation_offset() + self.relaxation.len()
     }
 
-    /// One row of the design matrix at time `t`.
-    fn basis_row(&self, t: f64) -> Vec<f64> {
+    /// One row of the design matrix at date `index`, time `t`.
+    fn basis_row(&self, index: usize, t: f64) -> Vec<f64> {
         let mut row = vec![1.0, t];
         if self.seasonal {
             let omega_t = std::f64::consts::TAU * t / DAYS_PER_YEAR;
@@ -95,6 +108,7 @@ impl VelocityModel {
         }
         row.extend(self.step_days.iter().map(|&step| f64::from(t >= step)));
         row.extend(self.relaxation.iter().map(|term| term.basis(t)));
+        row.extend(self.dem_error_sensitivity.get(index).copied());
         row
     }
 
@@ -156,6 +170,9 @@ pub struct VelocityModelOutput {
     /// Fitted asymptotic amplitude of each configured relaxation, series units,
     /// in `relaxation` order. Empty when no relaxation is configured.
     pub relaxation_amplitude: Vec<Array2<f64>>,
+    /// Fitted residual DEM error, metres. `None` unless
+    /// [`VelocityModel::dem_error_sensitivity`] is set.
+    pub dem_error: Option<Array2<f64>>,
 }
 
 /// Fitted parameters and diagnostics for one pixel; the estimates are all
@@ -196,7 +213,15 @@ pub fn estimate_velocity_with_model(
          estimate_velocity_with_uncertainty so the parity-critical fit stays the only one"
     );
     let (_, rows, cols) = series.dim();
-    let design: Vec<Vec<f64>> = x.iter().map(|&t| model.basis_row(t)).collect();
+    assert!(
+        model.dem_error_sensitivity.is_empty() || model.dem_error_sensitivity.len() == x.len(),
+        "dem_error_sensitivity needs one value per date"
+    );
+    let design: Vec<Vec<f64>> = x
+        .iter()
+        .enumerate()
+        .map(|(index, &t)| model.basis_row(index, t))
+        .collect();
     let fits: Vec<PixelModelFit> = (0..rows * cols)
         .into_par_iter()
         .map(|idx| {
@@ -237,6 +262,8 @@ pub fn estimate_velocity_with_model(
         relaxation_amplitude: (0..model.relaxation.len())
             .map(|k| parameter(relaxation_offset + k))
             .collect(),
+        dem_error: (!model.dem_error_sensitivity.is_empty())
+            .then(|| parameter(model.dem_error_offset())),
     }
 }
 
@@ -432,6 +459,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -454,6 +482,57 @@ mod tests {
             out.residual_rms[(0, 0)] < 1e-9,
             "exact fit leaves no residual"
         );
+    }
+
+    /// #143: a residual DEM error enters each date as `Δz · sensitivity(t)`. With
+    /// a perpendicular-baseline history that drifts with time, a linear-only fit
+    /// leaks it into the rate; the joint fit recovers both `Δz` and the rate.
+    #[test]
+    fn dem_error_term_recovers_height_error_and_unbiased_rate() {
+        let (rate_per_year, height_error_m) = (-25.0, 12.0);
+        let days: Vec<f64> = (0..30).map(|k| 12.0 * f64::from(k)).collect();
+        // Sensitivity, mm per metre of height error: ~0.2 mm/m drift over a year
+        // (a 100 m B⊥ change at R sin θ ≈ 530 km) plus per-date scatter.
+        let sensitivity: Vec<f64> = days
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| 0.2 * t / 360.0 + 0.05 * ((k as f64) * 1.7).sin())
+            .collect();
+        let values: Vec<f64> = days
+            .iter()
+            .zip(&sensitivity)
+            .map(|(&t, &s)| rate_per_year * t / DAYS_PER_YEAR + height_error_m * s)
+            .collect();
+        let (series, precisions) = one_pixel(&values);
+        let model = VelocityModel {
+            seasonal: false,
+            step_days: Vec::new(),
+            relaxation: Vec::new(),
+            dem_error_sensitivity: sensitivity,
+        };
+        let out =
+            estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
+        assert!((out.velocity[(0, 0)] - rate_per_year).abs() < 1e-8);
+        let recovered = out.dem_error.as_ref().expect("dem error fitted")[(0, 0)];
+        assert!((recovered - height_error_m).abs() < 1e-8, "{recovered}");
+
+        let seasonal_only = VelocityModel {
+            seasonal: true,
+            dem_error_sensitivity: Vec::new(),
+            ..model
+        };
+        let leaked = estimate_velocity_with_model(
+            &days,
+            series.view(),
+            Some(precisions.view()),
+            &seasonal_only,
+        );
+        assert!(
+            (leaked.velocity[(0, 0)] - rate_per_year).abs() > 1.0,
+            "without the term the drifting baseline biases the rate: {}",
+            leaked.velocity[(0, 0)]
+        );
+        assert!(leaked.dem_error.is_none());
     }
 
     /// The bias this exists to remove. On a noiseless series carrying a true
@@ -483,6 +562,7 @@ mod tests {
                 seasonal: true,
                 step_days: Vec::new(),
                 relaxation: Vec::new(),
+                dem_error_sensitivity: Vec::new(),
             };
             let seasonal =
                 estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -517,6 +597,7 @@ mod tests {
             seasonal: false,
             step_days: vec![step_day],
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -551,6 +632,7 @@ mod tests {
             seasonal: true,
             step_days: vec![step_day],
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -579,6 +661,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -605,6 +688,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -626,6 +710,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -662,6 +747,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let (unit, precisions) = one_pixel(&series_at(1.0));
         let (doubled, _) = one_pixel(&series_at(2.0));
@@ -719,6 +805,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);
@@ -744,6 +831,7 @@ mod tests {
             seasonal: false,
             step_days: vec![-1.0],
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let out =
             estimate_velocity_with_model(&days, series.view(), Some(precisions.view()), &model);

@@ -388,6 +388,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.velocity_relaxation is nonempty"
     ),
     conditional!(
+        "timeseries_options.estimate_dem_error",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.estimate_dem_error is true"
+    ),
+    conditional!(
         "timeseries_options.mask_unwrap_loop_errors",
         "CFG-TIMESERIES",
         "timeseries_options.mask_unwrap_loop_errors is true"
@@ -889,6 +894,13 @@ pub struct TimeseriesOptions {
     /// Onset and time constant are **inputs**, never fitted: jointly estimating
     /// them is a nonlinear problem out of scope here (issue #102). Empty by default.
     pub velocity_relaxation: Vec<VelocityRelaxation>,
+    /// Fit a per-pixel residual DEM error jointly with the velocity (Fattahi &
+    /// Amelung 2013): one basis column `B⊥(t) / (R sin θ)`, the frame-centre
+    /// perpendicular baseline to acquisition 0 over slant range times the sine of
+    /// the look-side incidence, derived from the CSLC orbits. Emits
+    /// `dem_error.tif` (metres). Needs OPERA CSLC orbit metadata and
+    /// `input_options.wavelength`. dolphinRust-only; off by default.
+    pub estimate_dem_error: bool,
     /// Close every triangle in the **unwrapped** interferogram network before the
     /// SBAS solve and blank pixels whose loops miss closure by more than half a
     /// cycle — a 2π unwrap error, which the wrapped closure-phase layer cannot
@@ -927,6 +939,7 @@ impl Default for TimeseriesOptions {
             velocity_seasonal: false,
             velocity_step_dates: Vec::new(),
             velocity_relaxation: Vec::new(),
+            estimate_dem_error: false,
             mask_unwrap_loop_errors: false,
             write_cycle_step_diagnostics: false,
         }
@@ -1526,6 +1539,14 @@ impl DisplacementWorkflow {
             return Err(CoreError::InvalidConfig(
                 "output_options.strides.y and output_options.strides.x must both be positive"
                     .into(),
+            ));
+        }
+        if self.timeseries_options.estimate_dem_error
+            && (self.input_options.wavelength.is_none()
+                || self.input_options.input_type != InputType::OperaCslc)
+        {
+            return Err(CoreError::InvalidConfig(
+                "timeseries_options.estimate_dem_error requires OPERA CSLC inputs (for orbits) and input_options.wavelength".into(),
             ));
         }
         if let Some(fraction) = self.correction_options.max_outside_static_fraction {

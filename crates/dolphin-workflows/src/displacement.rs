@@ -939,6 +939,8 @@ struct VelocityTerms {
     seasonal_phase_days: Option<Array2<f64>>,
     step_magnitude_rad: Vec<Array2<f64>>,
     relaxation_amplitude_rad: Vec<Array2<f64>>,
+    /// Residual DEM error in metres (unit-independent of the phase series).
+    dem_error_m: Option<Array2<f64>>,
 }
 
 /// Rate, one-sigma, and optional time-function terms in one place, so the
@@ -976,10 +978,12 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
         seasonal: options.velocity_seasonal,
         step_days: Vec::new(),
         relaxation: Vec::new(),
+        dem_error_sensitivity: Vec::new(),
     };
     if model.is_linear()
         && options.velocity_step_dates.is_empty()
         && options.velocity_relaxation.is_empty()
+        && !options.estimate_dem_error
     {
         return Ok(model);
     }
@@ -1022,9 +1026,27 @@ fn velocity_model(cfg: &DisplacementWorkflow, date_files: &[PathBuf]) -> Result<
             })
         })
         .collect::<Result<Vec<RelaxationTerm>>>()?;
+    let dem_error_sensitivity = match options.estimate_dem_error {
+        true => {
+            let wavelength = cfg.input_options.wavelength.context(
+                "timeseries_options.estimate_dem_error requires input_options.wavelength",
+            )?;
+            // The fit runs on LOS phase; displacement = phase · (−λ/4π).
+            let phase_per_metre = -4.0 * std::f64::consts::PI / wavelength;
+            crate::baseline::dem_error_sensitivity(date_files)
+                .map_err(|reason| {
+                    anyhow::anyhow!("timeseries_options.estimate_dem_error: {reason}")
+                })?
+                .into_iter()
+                .map(|metres_per_metre| metres_per_metre * phase_per_metre)
+                .collect()
+        }
+        false => Vec::new(),
+    };
     Ok(VelocityModel {
         step_days,
         relaxation,
+        dem_error_sensitivity,
         ..model
     })
 }
@@ -1042,6 +1064,7 @@ struct ScaledOutputs {
     seasonal_amplitude: Option<Array2<f64>>,
     step_magnitude: Vec<Array2<f64>>,
     relaxation_amplitude: Vec<Array2<f64>>,
+    dem_error_m: Option<Array2<f64>>,
 }
 
 fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> ScaledOutputs {
@@ -1076,6 +1099,7 @@ fn scale_outputs(cfg: &DisplacementWorkflow, spatial: &SpatialProducts) -> Scale
         seasonal_amplitude: scaled_terms.seasonal_amplitude_rad,
         step_magnitude: scaled_terms.step_magnitude_rad,
         relaxation_amplitude: scaled_terms.relaxation_amplitude_rad,
+        dem_error_m: scaled_terms.dem_error_m,
     }
 }
 
@@ -1100,6 +1124,7 @@ fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTe
         seasonal_phase_days: terms.seasonal_phase_days.clone(),
         step_magnitude_rad: signed(&terms.step_magnitude_rad),
         relaxation_amplitude_rad: signed(&terms.relaxation_amplitude_rad),
+        dem_error_m: terms.dem_error_m.clone(),
     }
 }
 
@@ -1427,6 +1452,7 @@ fn fit_post_gauge_velocity_with_model(
             seasonal_phase_days: output.seasonal_phase_days,
             step_magnitude_rad: output.step_magnitude,
             relaxation_amplitude_rad: output.relaxation_amplitude,
+            dem_error_m: output.dem_error,
         },
     }
 }
@@ -1456,6 +1482,7 @@ fn fit_velocity_with_model(
             seasonal_phase_days: output.seasonal_phase_days,
             step_magnitude_rad: output.step_magnitude,
             relaxation_amplitude_rad: output.relaxation_amplitude,
+            dem_error_m: output.dem_error,
         },
     }
 }
@@ -1822,6 +1849,7 @@ fn emit_displacement(
             seasonal_phase_days: spatial.velocity_terms.seasonal_phase_days.as_ref(),
             step_magnitude: &scaled.step_magnitude,
             relaxation_amplitude: &scaled.relaxation_amplitude,
+            dem_error_m: scaled.dem_error_m.as_ref(),
         },
         loop_closure: spatial.loop_closure.as_ref(),
         junction_steps: cfg
@@ -2139,16 +2167,15 @@ impl SpatialProducts {
             mask2_f64(&mut diagnostics.diagnostic_inflation_factor, mask);
             mask2_f64(&mut diagnostics.diagnostic_effective_sample_size, mask);
         }
-        if let Some(layer) = self.velocity_terms.seasonal_amplitude_rad.as_mut() {
-            mask2_f64(layer, mask);
-        }
-        if let Some(layer) = self.velocity_terms.seasonal_phase_days.as_mut() {
-            mask2_f64(layer, mask);
-        }
-        for layer in &mut self.velocity_terms.step_magnitude_rad {
-            mask2_f64(layer, mask);
-        }
-        for layer in &mut self.velocity_terms.relaxation_amplitude_rad {
+        let terms = &mut self.velocity_terms;
+        for layer in terms
+            .seasonal_amplitude_rad
+            .iter_mut()
+            .chain(terms.seasonal_phase_days.iter_mut())
+            .chain(terms.step_magnitude_rad.iter_mut())
+            .chain(terms.relaxation_amplitude_rad.iter_mut())
+            .chain(terms.dem_error_m.iter_mut())
+        {
             mask2_f64(layer, mask);
         }
         if let Some(qc) = self.loop_closure.as_mut() {
@@ -2237,6 +2264,11 @@ impl SpatialProducts {
                 .iter()
                 .map(|layer| trim2(layer, target))
                 .collect();
+        self.velocity_terms.dem_error_m = self
+            .velocity_terms
+            .dem_error_m
+            .take()
+            .map(|layer| trim2(&layer, target));
         self.temporal_coherence = trim2(&self.temporal_coherence, target);
         self.validity_mask = trim2(&self.validity_mask, target);
         self.phase_linking_coherence = self
@@ -5363,6 +5395,16 @@ fn write_outputs(
             relaxation.view(),
         )?;
     }
+    if let Some(dem_error) = quality.velocity_terms.dem_error_m {
+        write_raster_with_metadata(
+            &dir.join("dem_error.tif"),
+            dem_error.mapv(|v| v as f32).view(),
+            gt,
+            epsg,
+            None,
+            &[("UNITTYPE", "m")],
+        )?;
+    }
     if let Some(qc) = quality.loop_closure {
         write_f32("loop_closure_bad_count.tif", qc.bad_loop_count.view())?;
         write_f32(
@@ -5524,6 +5566,7 @@ struct VelocityTermLayers<'a> {
     seasonal_phase_days: Option<&'a Array2<f64>>,
     step_magnitude: &'a [Array2<f64>],
     relaxation_amplitude: &'a [Array2<f64>],
+    dem_error_m: Option<&'a Array2<f64>>,
 }
 
 /// Write each band of a `(bands, rows, cols)` layer as `{prefix}_NN.tif`.
@@ -6010,6 +6053,7 @@ mod tests {
                     Array2::from_elem((2, 2), 4.0),
                 ],
                 relaxation_amplitude_rad: vec![Array2::from_elem((2, 2), 5.0)],
+                dem_error_m: Some(Array2::from_elem((2, 2), 6.0)),
             },
             loop_closure: Some(LoopClosureQc {
                 bad_loop_count: Array2::from_elem((2, 2), 1.0),
@@ -6104,6 +6148,7 @@ mod tests {
                 .relaxation_amplitude_rad
                 .iter()
                 .all(|layer| layer[(row, col)].is_nan()));
+            assert!(products.velocity_terms.dem_error_m.as_ref().unwrap()[(row, col)].is_nan());
             let loop_closure = products.loop_closure.as_ref().unwrap();
             assert!(loop_closure.bad_loop_count[(row, col)].is_nan());
             assert!(loop_closure.evaluable_loop_count[(row, col)].is_nan());
@@ -6645,6 +6690,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         };
         let fit = fit_velocity(
             &cfg,
@@ -6703,6 +6749,7 @@ mod tests {
             seasonal: true,
             step_days: Vec::new(),
             relaxation: Vec::new(),
+            dem_error_sensitivity: Vec::new(),
         }
     }
 
@@ -9057,6 +9104,29 @@ mod tests {
         std::fs::remove_file(mask_path).unwrap();
     }
 
+    /// #143: the DEM-error term is built from the CSLC orbits, so a granule
+    /// without readable orbit metadata fails the run instead of dropping the
+    /// term, and the default model carries no DEM-error column.
+    #[test]
+    fn dem_error_term_fails_closed_without_orbit_metadata() {
+        let files = vec![
+            PathBuf::from("missing_cslc_20230101.h5"),
+            PathBuf::from("missing_cslc_20230113.h5"),
+        ];
+        let mut cfg = DisplacementWorkflow::default();
+        assert!(velocity_model(&cfg, &files)
+            .unwrap()
+            .dem_error_sensitivity
+            .is_empty());
+        cfg.input_options.wavelength = Some(0.055);
+        cfg.timeseries_options.estimate_dem_error = true;
+        let error = velocity_model(&cfg, &files).unwrap_err().to_string();
+        assert!(
+            error.contains("estimate_dem_error") && error.contains("missing_cslc_20230101.h5"),
+            "{error}"
+        );
+    }
+
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the
     /// solve untouched.
     #[test]
@@ -9329,6 +9399,7 @@ mod tests {
                 seasonal: false,
                 step_days: vec![step_day],
                 relaxation: Vec::new(),
+                dem_error_sensitivity: Vec::new(),
             },
             loop_closure: None,
             junctions: Vec::new(),
