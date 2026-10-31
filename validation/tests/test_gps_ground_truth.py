@@ -305,6 +305,78 @@ class GroundTruthContract(unittest.TestCase):
                     0.055,
                 )
 
+    def test_scorer_declares_the_headline_and_emits_the_estimator_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            cache = root / "cache"
+            work.mkdir()
+            cache.mkdir()
+            # Series rate is -1 mm/day = -365.25 mm/yr; velocity.tif says -250 mm/yr.
+            write_synthetic_work_directory(work, (-0.300, -0.050))
+            stations = {
+                "AAAA": {"longitude": -0.5, "latitude": 0.5},
+                "BBBB": {"longitude": 1.5, "latitude": 0.5},
+            }
+            for station, values in stations.items():
+                values["tenv3_url"] = f"https://example.test/{station}.tenv3"
+                values["metadata_url"] = f"https://example.test/{station}.sta.html"
+                up = [0.0, -0.001, -0.002] if station == "AAAA" else [0.0, 0.0, 0.0]
+                (cache / f"{station}.tenv3").write_text(
+                    tenv3_series(station, values["longitude"], values["latitude"], up)
+                )
+                (cache / f"{station}.sta.html").write_text("synthetic station metadata")
+            recipe = {
+                "stations": stations,
+                "comparison": {
+                    "id": "AAAA_minus_BBBB",
+                    "fixture": "shared",
+                    "primary_station": "AAAA",
+                    "control_station": "BBBB",
+                },
+                "expected_dates": ["2023-01-04", "2023-01-05", "2023-01-06"],
+                "minimum_gnss_fraction": 1.0,
+                "max_interpolation_gap_days": 2,
+                "sample_windows": [1],
+                "primary_window": 1,
+                "minimum_finite_fraction": 1.0,
+                "thresholds": {
+                    "endpoint_error_mm": 1.0,
+                    "tls_slope_min": 0.99,
+                    "tls_slope_max": 1.01,
+                    "correlation_min": 0.99,
+                },
+            }
+            with mock.patch.object(
+                gps, "los_at_output_pixel", return_value=np.array([0.0, 0.0, 1.0])
+            ):
+                payload = gps.score_common_frame(
+                    recipe,
+                    {"fixture": "shared"},
+                    {"native": work},
+                    root / "unused-static.h5",
+                    cache,
+                    root / "output",
+                    0.055,
+                )
+
+            velocity = payload["engines"]["native"]["velocity_comparison"]
+            self.assertEqual(velocity["estimators"]["headline"], "difference_mm_yr")
+            self.assertAlmostEqual(velocity["difference_mm_yr"], 0.0, places=3)
+            self.assertAlmostEqual(velocity["estimator_gap_mm_yr"], 115.25, places=3)
+            self.assertAlmostEqual(
+                velocity["estimator_gap_mm_yr"],
+                velocity["difference_raster_mm_yr"] - velocity["difference_mm_yr"],
+            )
+            self.assertEqual(
+                velocity["estimators"]["estimator_gap_mm_yr"],
+                "insar_velocity_raster_mm_yr_minus_insar_velocity_mm_yr",
+            )
+            self.assertAlmostEqual(
+                score_pairs.summarize(payload, "native")["estimator_gap_mm_yr"],
+                velocity["estimator_gap_mm_yr"],
+            )
+
     def test_comparison_contract_is_generic_and_validated(self) -> None:
         recipe = {
             "stations": {"AAAA": {}, "BBBB": {}},

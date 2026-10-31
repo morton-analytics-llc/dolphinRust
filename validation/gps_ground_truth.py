@@ -829,6 +829,28 @@ def score_common_frame(
     output_directory: Path,
     wavelength_m: float,
 ) -> dict[str, Any]:
+    """Score one station pair on a shared frame against projected GNSS.
+
+    **The headline rate residual is `difference_mm_yr`** (issue #129). It is the only
+    one of the two whose InSAR and GNSS rates come from the same fit: an
+    intercept-plus-rate OLS over the same epochs (common GNSS, gauge zero included),
+    with the InSAR sampled at `primary_window`. Whatever it reports is a difference
+    between the two measurements, not between two estimators.
+
+    `difference_raster_mm_yr` subtracts that GNSS rate from `velocity.tif`, which the
+    pipeline fitted differently: one station pixel, post-gauge epochs only, every
+    date the run produced, and the run's time-function model (annual terms under
+    `--velocity-seasonal`). It stays as a check on the engine's own rate product.
+    The two disagree, so `estimator_gap_mm_yr` (raster minus series InSAR rate,
+    identically `difference_raster_mm_yr - difference_mm_yr`) is emitted beside them
+    and no reader can quote one without the other. On the 2018 Mexico City cohort
+    the gap is 3.4-7.1 mm/yr and the temporal model is its largest component
+    (`md/research/gnss-estimator-gap-2026-10.md`).
+
+    The linear headline assumes the InSAR-minus-GNSS residual series carries no
+    annual term. Where it does, the rate aliases it over a one-year window, and
+    the headline is biased by the same mechanism as the raster gap.
+    """
     comparison = comparison_contract(recipe)
     if fixture_manifest.get("fixture") != comparison["fixture"]:
         raise NotEvaluable("magnitude scoring requires the declared shared station frame")
@@ -980,6 +1002,8 @@ def score_common_frame(
                 "difference_mm_yr": "insar_velocity_mm_yr_minus_gnss_velocity_mm_yr",
                 "insar_velocity_raster_mm_yr": "primary_minus_control_velocity_tif_station_pixels",
                 "difference_raster_mm_yr": "insar_velocity_raster_mm_yr_minus_gnss_velocity_mm_yr",
+                "estimator_gap_mm_yr": "insar_velocity_raster_mm_yr_minus_insar_velocity_mm_yr",
+                "headline": "difference_mm_yr",
                 "station_raster_samples.velocity_raster_mm_yr": "velocity_tif_station_pixel",
             }
             if "velocity_seasonal_amplitude_mm" in station_raster_samples[primary_station]:
@@ -1015,6 +1039,7 @@ def score_common_frame(
                     "difference_mm_yr": insar_velocity - gnss_velocity,
                     "insar_velocity_raster_mm_yr": insar_velocity_raster,
                     "difference_raster_mm_yr": insar_velocity_raster - gnss_velocity,
+                    "estimator_gap_mm_yr": insar_velocity_raster - insar_velocity,
                     "station_raster_samples": station_raster_samples,
                     "estimators": velocity_estimators,
                 },

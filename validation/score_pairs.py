@@ -71,6 +71,7 @@ def summarize(payload: dict[str, Any], engine: str) -> dict[str, Any]:
                 "difference_mm_yr",
                 "insar_velocity_raster_mm_yr",
                 "difference_raster_mm_yr",
+                "estimator_gap_mm_yr",
             )
             if key in velocity
         }
