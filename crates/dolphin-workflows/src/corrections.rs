@@ -1068,7 +1068,7 @@ mod tests {
             band.write((0, 0), (cols, rows), &mut buf).unwrap();
         }
         let nc = DriverManager::get_driver_by_name("netCDF").unwrap();
-        src.create_copy(&nc, path, &Default::default()).unwrap();
+        hdf5::sync::sync(|| src.create_copy(&nc, path, &Default::default())).unwrap();
     }
 
     /// End-to-end (Phase 1): two synthesized **4326** OPERA-L4 netCDFs resampled

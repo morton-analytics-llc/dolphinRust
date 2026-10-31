@@ -7947,11 +7947,13 @@ mod tests {
                     Array2::from_shape_fn((3, 3), |(_, c)| 0.01 * t as f64 * (1.0 + c as f64));
                 write_raster(&raster, delay.view(), gt, Some(32611), None).unwrap();
                 let src = gdal::Dataset::open(&raster).unwrap();
-                src.create_copy(
-                    &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
-                    &path,
-                    &Default::default(),
-                )
+                hdf5::sync::sync(|| {
+                    src.create_copy(
+                        &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
+                        &path,
+                        &Default::default(),
+                    )
+                })
                 .unwrap();
                 cfg.correction_options.troposphere_files.push(path);
             }
