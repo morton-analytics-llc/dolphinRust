@@ -26,6 +26,7 @@ mod spatial_reference_covariance_output;
 pub mod temporal_covariance_product;
 pub mod tiling;
 pub mod unwrap_backend;
+pub mod window_datum;
 
 pub use baseline::{orbit_pair_baseline, pair_baseline, PairBaseline};
 pub use covariance_artifact::{
@@ -37,7 +38,7 @@ pub use covariance_artifact::{
     CovarianceArtifactManifest, CovarianceArtifactTransaction, COVARIANCE_OPERATOR_FILENAME,
     COVARIANCE_OPERATOR_MANIFEST_FILENAME,
 };
-pub use crop::{BoundsError, ProcessingBoundsProvenance};
+pub use crop::{BoundsError, ProcessingBoundsProvenance, UnwrapComponentProvenance};
 pub use cslc_covariance_source::{
     empirical_factor_config, CslcCovarianceGenerationResolverBundle, CslcCovarianceManifest,
     CslcCovarianceResolverMetrics, CslcCovarianceSourceResolver, CslcCovarianceValidityReader,
@@ -113,3 +114,7 @@ pub use temporal_covariance_product::{
     TEMPORAL_RESOURCE_WALL_MULTIPLIER, TEMPORAL_SYNTHETIC_RESULT_FILENAME,
 };
 pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
+pub use window_datum::{
+    estimate_window_datum, DatumAnchor, DatumError, DatumOptions, DatumWindow, OverlapResidual,
+    WindowDatum,
+};

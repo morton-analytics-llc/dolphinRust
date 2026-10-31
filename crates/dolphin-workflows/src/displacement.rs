@@ -228,6 +228,11 @@ pub struct DisplacementOutput {
     pub interferogram_pairs: Vec<(usize, usize)>,
     /// Per-interferogram connected-component labels.
     pub unwrap_connected_components: Array3<u32>,
+    /// Bounded runs only: joint unwrap component per target pixel (0 = none).
+    /// Pixels share a component when they carry the same nonzero label in every
+    /// interferogram, so their relative displacement has no 2π ambiguity; the
+    /// offset between components is arbitrary. Written as `unwrap_component.tif`.
+    pub unwrap_component: Option<Array2<u32>>,
     /// Temporal coherence per pixel in `[0, 1]`, stitched across ministacks by
     /// NaN-aware mean (dolphin's `temporal_coherence_average` = `numpy.nanmean`);
     /// a phase-quality mask, `(rows, cols)`.
@@ -1651,6 +1656,12 @@ fn emit_displacement(
         spatial.interferogram_pairs.len(),
         None,
     )?;
+    let unwrap_component = crop.map(|_| {
+        crate::crop::label_unwrap_components(
+            spatial.unwrap_connected_components.view(),
+            spatial.validity_mask.view(),
+        )
+    });
     // The datum must survive the publication quality masks: every published velocity is
     // relative to the reference pixel, so a reference sitting in layover/shadow — or
     // outside the native STATIC coverage — makes the whole field untrustworthy. The
@@ -1713,6 +1724,24 @@ fn emit_displacement(
         .zip(referenced_rejections)
     {
         *total += rejected;
+    }
+    let unwrap_component_census = unwrap_component.as_ref().map(|labels| {
+        crate::crop::unwrap_component_provenance(labels.view(), spatial.reference_point)
+    });
+    if let (Some(census), Some(minimum)) = (
+        unwrap_component_census.as_ref(),
+        cfg.output_options.min_reference_component_fraction,
+    ) {
+        // Without a reference the product is already published as Unavailable.
+        if census.reference_component.is_some()
+            && census.reference_component_target_fraction < minimum
+        {
+            return Err(crate::crop::BoundsError::DisconnectedTarget {
+                fraction: census.reference_component_target_fraction,
+                minimum,
+            }
+            .into());
+        }
     }
     let component_worst_band = component_rejected_per_band
         .iter()
@@ -1839,7 +1868,10 @@ fn emit_displacement(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
         outside_static,
-        crop.map(|plan| plan.provenance.clone()),
+        crop.map(|plan| crate::crop::ProcessingBoundsProvenance {
+            unwrap_components: unwrap_component_census.clone(),
+            ..plan.provenance.clone()
+        }),
         Some(input_coverage),
     );
     geometry_provenance.ministack_junctions = Some(JunctionProvenance {
@@ -1871,6 +1903,15 @@ fn emit_displacement(
                     spatial.geotransform,
                 )?;
                 write_correction_outputs(cfg, &spatial.corrections, epsg, spatial.geotransform)?;
+                if let Some(labels) = unwrap_component.as_ref() {
+                    write_raster(
+                        &cfg.work_directory.join("unwrap_component.tif"),
+                        labels.view(),
+                        spatial.geotransform,
+                        epsg,
+                        Some(0.0),
+                    )?;
+                }
                 crate::provenance::write_geometry_provenance(
                     &cfg.work_directory,
                     &geometry_provenance,
@@ -1923,6 +1964,7 @@ fn emit_displacement(
         timeseries_residual_rms: scaled.timeseries_residual_rms,
         interferogram_pairs: spatial.interferogram_pairs,
         unwrap_connected_components: spatial.unwrap_connected_components,
+        unwrap_component,
         temporal_coherence: spatial.temporal_coherence,
         phase_linking_coherence: spatial.phase_linking_coherence,
         phase_similarity: spatial.phase_similarity,
@@ -6298,6 +6340,7 @@ mod tests {
                 analysis_halo_pixels: [2, 3],
                 halo_policy_version: crate::crop::HALO_POLICY_VERSION.into(),
                 native_reads: Vec::new(),
+                unwrap_components: None,
             },
         };
         assert_eq!(
@@ -7312,6 +7355,160 @@ mod tests {
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
+    /// A bounded plan whose target is the whole 4×4 analysis grid, so `trim`
+    /// leaves the arrays unchanged.
+    fn whole_grid_plan() -> BoundedPlan {
+        BoundedPlan {
+            windows: Vec::new(),
+            target_in_analysis: BlockIndices {
+                row_start: 0,
+                row_stop: 4,
+                col_start: 0,
+                col_stop: 4,
+            },
+            provenance: crate::crop::ProcessingBoundsProvenance {
+                processing_method: crate::crop::AOI_PROCESSING_METHOD.into(),
+                processing_method_version: crate::crop::AOI_PROCESSING_VERSION.into(),
+                requested_target_bounds: [0.0, 0.0, 120.0, 120.0],
+                requested_bounds_epsg: 32611,
+                actual_output_bounds: [0.0, 0.0, 120.0, 120.0],
+                actual_analysis_bounds: [0.0, 0.0, 120.0, 120.0],
+                actual_read_bounds: [0.0, 0.0, 120.0, 120.0],
+                output_epsg: 32611,
+                target_pixel_offset: [0, 0],
+                analysis_pixel_offset: [0, 0],
+                analysis_halo_pixels: [0, 0],
+                halo_policy_version: crate::crop::HALO_POLICY_VERSION.into(),
+                native_reads: Vec::new(),
+                unwrap_components: None,
+            },
+        }
+    }
+
+    /// Two coherent blobs (columns 0-1 and column 3) split by a decorrelated
+    /// column every unwrapper labelled 0.
+    fn split_products() -> SpatialProducts {
+        let mut products = geometry_masked_products(&[], &[]);
+        products.reference_point = Some((0, 0));
+        products.unwrap_connected_components =
+            Array3::from_shape_fn((3, 4, 4), |(_, _, col)| match col {
+                0 | 1 => 1,
+                2 => 0,
+                _ => 2,
+            });
+        products
+    }
+
+    /// #152: the split target yields two unwrap components, the reference sits in
+    /// the larger one, and the census lands in the bounds provenance.
+    #[test]
+    fn bounded_run_labels_split_target_into_two_unwrap_components() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.work_directory = std::env::temp_dir().join(format!(
+            "dolphin_unwrap_component_split_{}",
+            std::process::id()
+        ));
+        let plan = whole_grid_plan();
+        let out = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            Some(&plan),
+            split_products(),
+            DisplacementOutputPolicy::Full,
+        )
+        .unwrap();
+        let labels = out.unwrap_component.as_ref().expect("bounded run labels");
+        for ((_, col), &label) in labels.indexed_iter() {
+            assert_eq!(label, [1, 1, 0, 2][col], "column {col}");
+        }
+        let census = out
+            .geometry_provenance
+            .processing_bounds
+            .as_ref()
+            .and_then(|bounds| bounds.unwrap_components.clone())
+            .expect("component census");
+        assert_eq!(census.component_count, 2);
+        assert_eq!(census.labelled_pixels, 12);
+        assert_eq!(census.reference_component, Some(1));
+        assert_eq!(census.reference_component_target_fraction, 0.5);
+        assert_eq!(census.largest_component_target_fraction, 0.5);
+        assert!(cfg.work_directory.join("unwrap_component.tif").is_file());
+        std::fs::remove_dir_all(&cfg.work_directory).unwrap();
+    }
+
+    /// #152: with a minimum above the reference component's share, the bounded
+    /// run fails closed with the typed error.
+    #[test]
+    fn bounded_run_below_reference_component_minimum_fails_closed() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.output_options.min_reference_component_fraction = Some(0.6);
+        let plan = whole_grid_plan();
+        let error = emit_displacement(
+            &cfg,
+            vec![0.0, 12.0, 24.0],
+            Some(32611),
+            Some(&plan),
+            split_products(),
+            DisplacementOutputPolicy::GroundPulse,
+        )
+        .err()
+        .expect("half the target is outside the reference component");
+        match error.downcast_ref::<crate::crop::BoundsError>() {
+            Some(crate::crop::BoundsError::DisconnectedTarget { fraction, minimum }) => {
+                assert_eq!((*fraction, *minimum), (0.5, 0.6));
+            }
+            other => panic!("expected DisconnectedTarget, got {other:?}: {error:#}"),
+        }
+    }
+
+    /// #152: a fully coherent target is one component covering all of it, and
+    /// every other output matches the same products published without bounds;
+    /// the full-frame path carries no component layer.
+    #[test]
+    fn coherent_bounded_target_is_one_component_and_otherwise_unchanged() {
+        let mut cfg = unweighted_cfg(0.5);
+        cfg.output_options.min_reference_component_fraction = Some(1.0);
+        let publish = |plan: Option<&BoundedPlan>| {
+            let mut products = geometry_masked_products(&[], &[]);
+            products.reference_point = Some((0, 0));
+            emit_displacement(
+                &cfg,
+                vec![0.0, 12.0, 24.0],
+                Some(32611),
+                plan,
+                products,
+                DisplacementOutputPolicy::GroundPulse,
+            )
+            .unwrap()
+        };
+        let plan = whole_grid_plan();
+        let bounded = publish(Some(&plan));
+        let full = publish(None);
+        assert_eq!(
+            bounded.unwrap_component.as_ref(),
+            Some(&Array2::from_elem((4, 4), 1))
+        );
+        let census = bounded
+            .geometry_provenance
+            .processing_bounds
+            .as_ref()
+            .and_then(|bounds| bounds.unwrap_components.clone())
+            .unwrap();
+        assert_eq!(census.component_count, 1);
+        assert_eq!(census.reference_component_target_fraction, 1.0);
+        assert!(full.unwrap_component.is_none());
+        assert!(full.geometry_provenance.processing_bounds.is_none());
+        let bits = |values: &Array3<f64>| values.mapv(f64::to_bits);
+        assert_eq!(bits(&bounded.displacement), bits(&full.displacement));
+        assert_eq!(
+            bounded.velocity.mapv(f64::to_bits),
+            full.velocity.mapv(f64::to_bits)
+        );
+        assert_eq!(bounded.validity_mask, full.validity_mask);
+        assert_eq!(bounded.reference_point, full.reference_point);
+    }
+
     #[test]
     fn spatial_reference_variance_includes_reference_pixel() {
         let mut variance = Array3::from_shape_vec((1, 1, 3), vec![1.0, 4.0, 9.0]).unwrap();
@@ -7954,11 +8151,13 @@ mod tests {
                     Array2::from_shape_fn((3, 3), |(_, c)| 0.01 * t as f64 * (1.0 + c as f64));
                 write_raster(&raster, delay.view(), gt, Some(32611), None).unwrap();
                 let src = gdal::Dataset::open(&raster).unwrap();
-                src.create_copy(
-                    &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
-                    &path,
-                    &Default::default(),
-                )
+                hdf5::sync::sync(|| {
+                    src.create_copy(
+                        &gdal::DriverManager::get_driver_by_name("netCDF").unwrap(),
+                        &path,
+                        &Default::default(),
+                    )
+                })
                 .unwrap();
                 cfg.correction_options.troposphere_files.push(path);
             }

@@ -3,7 +3,9 @@
 use dolphin_core::config::{DisplacementWorkflow, UnwrapMethod};
 use dolphin_core::BlockIndices;
 use dolphin_io::transform_bounds;
+use ndarray::{s, Array2, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::burst::{burst_offset, frame_grid, BurstGeo, FrameGrid};
 
@@ -14,7 +16,7 @@ pub const HALO_POLICY_VERSION: &str = "dolphinrust-aoi-halo/1";
 /// evaluated only on a bounded dependency domain.
 pub const AOI_PROCESSING_METHOD: &str = "bounded_aoi_local";
 /// Version of the bounded processing/provenance contract.
-pub const AOI_PROCESSING_VERSION: &str = "1.0.0";
+pub const AOI_PROCESSING_VERSION: &str = "1.1.0";
 
 const MIN_TARGET_AXIS_PIXELS: usize = 2;
 const MIN_MULTIBURST_OVERLAP_PIXELS: usize = 4;
@@ -54,6 +56,16 @@ pub enum BoundsError {
         /// Pixels covered by at least two included bursts.
         overlap_pixels: usize,
     },
+    /// Too little of the target shares the reference pixel's unwrap component.
+    #[error(
+        "only {fraction:.4} of the bounded target shares the reference's unwrap component; output_options.min_reference_component_fraction requires {minimum}"
+    )]
+    DisconnectedTarget {
+        /// Target pixel fraction in the reference's component.
+        fraction: f64,
+        /// Configured minimum.
+        minimum: f64,
+    },
 }
 
 /// Requested and actual geometry written into `geometry_provenance.json`.
@@ -86,6 +98,89 @@ pub struct ProcessingBoundsProvenance {
     pub halo_policy_version: String,
     /// Actual native-resolution source windows read for each included burst.
     pub native_reads: Vec<NativeReadProvenance>,
+    /// Unwrap-component census of the published target; filled at publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwrap_components: Option<UnwrapComponentProvenance>,
+}
+
+/// How the published target splits into unwrap components (`unwrap_component.tif`).
+///
+/// Two pixels share a component when they carry the same nonzero
+/// connected-component label in every interferogram, so the unwrapper's own
+/// partition (its connectivity rule and correlation threshold) defines it. Within
+/// one component every interferogram has a single 2π ambiguity; between
+/// components the relative offset is arbitrary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnwrapComponentProvenance {
+    /// Components with at least one target pixel.
+    pub component_count: usize,
+    /// Target pixels that carry a component (nonzero label).
+    pub labelled_pixels: usize,
+    /// Fraction of all target pixels in the largest component.
+    pub largest_component_target_fraction: f64,
+    /// Component of the final reference pixel; `None` without a reference.
+    pub reference_component: Option<u32>,
+    /// Fraction of all target pixels in the reference's component.
+    pub reference_component_target_fraction: f64,
+}
+
+/// Label the joint unwrap components of `valid` pixels: pixels with identical
+/// per-interferogram labels in every band share a label, numbered `1..` by
+/// descending size (ties by first occurrence); invalid pixels and pixels with a
+/// zero label in any band get 0.
+pub(crate) fn label_unwrap_components(
+    components: ArrayView3<'_, u32>,
+    valid: ArrayView2<'_, bool>,
+) -> Array2<u32> {
+    let (_, rows, cols) = components.dim();
+    let mut provisional = Array2::<u32>::zeros((rows, cols));
+    let mut ids: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut sizes = vec![0usize];
+    for ((row, col), &is_valid) in valid.indexed_iter() {
+        let key: Vec<u32> = components.slice(s![.., row, col]).to_vec();
+        if !is_valid || key.contains(&0) {
+            continue;
+        }
+        let next = u32::try_from(sizes.len()).expect("component count fits u32");
+        let id = *ids.entry(key).or_insert(next);
+        if id == next {
+            sizes.push(0);
+        }
+        sizes[id as usize] += 1;
+        provisional[(row, col)] = id;
+    }
+    let mut order: Vec<usize> = (1..sizes.len()).collect();
+    order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]).then(a.cmp(&b)));
+    let mut remap = vec![0u32; sizes.len()];
+    for (rank, &id) in order.iter().enumerate() {
+        remap[id] = u32::try_from(rank + 1).expect("component count fits u32");
+    }
+    provisional.mapv(|id| remap[id as usize])
+}
+
+/// Census of `labels` (from [`label_unwrap_components`]) over the target.
+pub(crate) fn unwrap_component_provenance(
+    labels: ArrayView2<'_, u32>,
+    reference: Option<(usize, usize)>,
+) -> UnwrapComponentProvenance {
+    let mut sizes = BTreeMap::<u32, usize>::new();
+    for &label in labels.iter().filter(|&&label| label != 0) {
+        *sizes.entry(label).or_default() += 1;
+    }
+    let total = labels.len().max(1) as f64;
+    let reference_component = reference
+        .and_then(|point| labels.get(point).copied())
+        .filter(|&label| label != 0);
+    UnwrapComponentProvenance {
+        component_count: sizes.len(),
+        labelled_pixels: sizes.values().sum(),
+        largest_component_target_fraction: sizes.values().copied().max().unwrap_or(0) as f64
+            / total,
+        reference_component,
+        reference_component_target_fraction: reference_component.map_or(0, |label| sizes[&label])
+            as f64
+            / total,
+    }
 }
 
 /// One included burst's actual native-resolution read receipt.
@@ -195,6 +290,7 @@ pub(crate) fn plan_bounds(
             analysis_halo_pixels: [halo.0, halo.1],
             halo_policy_version: HALO_POLICY_VERSION.into(),
             native_reads,
+            unwrap_components: None,
         },
     }))
 }

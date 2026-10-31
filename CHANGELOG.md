@@ -7,6 +7,28 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Datum adjustment across overlapping bounded windows** (issue #153).
+  `dolphin_workflows::estimate_window_datum` takes N bounded windows from one burst stack
+  (`DatumWindow`, built from a `DisplacementOutput`) and returns a constant offset per window
+  for each displacement date plus a velocity offset, which put every window on one anchor's
+  datum. It is a coherence-weighted least-squares adjustment over all overlaps, with weight
+  `γ_a·γ_b` per shared pixel, and is anchored either to one window or to externally supplied
+  anchor values. Per-overlap residual median and MAD are returned so callers can reject a bad
+  seam. Pixels outside a window's reference unwrap component (#152) are excluded. Typed
+  `DatumError`s cover a disconnected overlap graph, an overlap below
+  `min_overlap_pixels`, and incompatible windows (date list, CRS, spacing, lattice).
+- **Unwrap components for bounded runs** (issue #152). A bounded (`output_options.bounds`)
+  run labels each target pixel with its joint unwrap component: pixels share a component
+  when they carry the same nonzero connected-component label in every interferogram, so the
+  unwrapper's own connectivity rule and correlation threshold define it, and relative
+  displacement inside a component has no 2π ambiguity. `DisplacementOutput::unwrap_component`
+  carries the labels (0 = none) and `unwrap_component.tif` holds them. The bounds provenance
+  in `geometry_provenance.json` gains `unwrap_components` (component count, labelled pixels,
+  largest-component and reference-component target fractions, reference component), and
+  `AOI_PROCESSING_VERSION` moves to `1.1.0`. A new opt-in
+  `output_options.min_reference_component_fraction` fails the run with
+  `BoundsError::DisconnectedTarget` when less of the target shares the reference's component.
+  Full-frame runs are unchanged.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median
@@ -63,6 +85,12 @@ All notable changes to dolphinRust are documented here. The format follows
   has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
   and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
   SNAPHU and tophu still take both.
+- **Goldstein filter edge cases** (issue #139): ported dolphin PR #680. The filter reflection-pads
+  by half a patch, covers the trailing rows and columns the old patch grid skipped, normalises
+  the overlapping-patch blend by the accumulated window weight, and treats only NaN or
+  zero-magnitude pixels as empty, so valid zero-phase pixels are filtered. Contract fixture
+  `crates/dolphin-filtering/tests/fixtures/goldstein_pr680.json` from
+  `oracle/gen_goldstein_pr680.py`, which matches upstream's file bit-for-bit.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;
