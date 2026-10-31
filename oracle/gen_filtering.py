@@ -2,8 +2,8 @@
 """Generate Phase-7 (filtering) oracle fixtures from dolphin v0.35.0.
 
 Emits the long-wavelength FFT Gaussian high-pass filter output (no bad pixels,
-so GDAL fill is identity) and the Goldstein adaptive filter output for synthetic
-inputs.
+so GDAL fill is identity). Goldstein contracts follow dolphin PR #680 and come
+from `gen_goldstein_pr680.py`.
 
 Run inside the pinned env:  oracle/.venv/bin/python oracle/gen_filtering.py
 """
@@ -15,14 +15,12 @@ from pathlib import Path
 import numpy as np
 
 from dolphin.filtering import filter_long_wavelength
-from dolphin.goldstein import goldstein
 
 OUT = Path(__file__).resolve().parent / "fixtures"
 
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(5)
 
     # --- long-wavelength high-pass: smooth ramp + short-scale signal, no nodata ---
     rows, cols = 64, 64
@@ -36,18 +34,8 @@ def main() -> None:
     np.save(OUT / "filt_lw_input.npy", unw)
     np.save(OUT / "filt_lw_output.npy", np.asarray(lw).astype(np.float64))
 
-    # --- Goldstein adaptive filter on a complex phase field ---
-    g_rows, g_cols = 48, 48
-    phase = np.exp(1j * (0.2 * xx[:g_rows, :g_cols] + rng.standard_normal((g_rows, g_cols))))
-    phase = phase.astype(np.complex64)
-    gout = goldstein(phase, alpha=0.5, psize=16)
-
-    np.save(OUT / "filt_gold_input.npy", phase)
-    np.save(OUT / "filt_gold_output.npy", np.asarray(gout).astype(np.complex64))
-
     print(f"wrote filtering fixtures to {OUT}")
     print(f"  long-wavelength {unw.shape}  out range=[{lw.min():.3f},{lw.max():.3f}]")
-    print(f"  goldstein {phase.shape}  out |.| max={np.abs(gout).max():.3f}")
 
 
 if __name__ == "__main__":
