@@ -59,6 +59,10 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Native unwrapper no longer accepts a cost mode it ignores** (issue #160). The native solver
+  has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
+  and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
+  SNAPHU and tophu still take both.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;

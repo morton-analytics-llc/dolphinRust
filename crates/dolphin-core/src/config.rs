@@ -420,7 +420,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     conditional!(
         "unwrap_options.snaphu_options.cost",
         "CFG-UNWRAP-BACKEND",
-        "unwrap_method is native or snaphu"
+        "unwrap_method is snaphu; native accepts only smooth"
     ),
     compatibility_only!(
         "unwrap_options.snaphu_options.single_tile_reoptimize",
@@ -1520,10 +1520,12 @@ impl DisplacementWorkflow {
                     &self.unwrap_options.snaphu_options.init_method,
                     &defaults.unwrap_options.snaphu_options.init_method,
                 )?;
+                // The native solver implements one coherence-precision cost; a
+                // `defo` request would silently run it (#160).
                 ensure_supported_choice(
                     "unwrap_options.snaphu_options.cost",
                     &self.unwrap_options.snaphu_options.cost,
-                    &["smooth", "defo"],
+                    &["smooth"],
                 )?;
             }
             UnwrapMethod::Snaphu => {
