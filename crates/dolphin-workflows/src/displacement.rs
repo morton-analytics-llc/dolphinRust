@@ -5970,6 +5970,7 @@ mod tests {
             ionosphere: Some(values.clone()),
             troposphere: Some(values),
             solid_earth_tide: None,
+            plate_motion: None,
             los_geometry: Some(geometry),
         };
         let target = BlockIndices {
@@ -6031,6 +6032,7 @@ mod tests {
                 ionosphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
                 troposphere: Some(Array3::from_elem((2, 2, 2), 1.0)),
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: Some(LosGeometry {
                     east: Array2::from_elem((2, 2), 1.0),
                     north: Array2::from_elem((2, 2), 1.0),
@@ -6174,6 +6176,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
@@ -6240,6 +6243,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
@@ -6462,6 +6466,7 @@ mod tests {
                     ionosphere: None,
                     troposphere: None,
                     solid_earth_tide: None,
+                    plate_motion: None,
                     los_geometry: None,
                 })
             },
@@ -7107,6 +7112,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
@@ -7186,6 +7192,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: Some(LosGeometry {
                     east,
                     north: Array2::zeros((4, 4)),
@@ -8302,6 +8309,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
@@ -9345,6 +9353,7 @@ mod tests {
                 ionosphere: None,
                 troposphere: None,
                 solid_earth_tide: None,
+                plate_motion: None,
                 los_geometry: None,
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
