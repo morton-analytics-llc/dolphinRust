@@ -1365,6 +1365,63 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #151: a STATIC grid is axis-aligned around a rotated burst, so a listed-first
+    /// granule's grid can contain frame pixels where it carries only fill. Each such
+    /// pixel must resolve from the granule that has geometry there, for both fill
+    /// encodings (`0` and NaN), and the frame must count as fully covered.
+    #[test]
+    fn pixel_inside_two_static_grids_resolves_from_the_one_with_geometry() {
+        let _hdf5 = hdf5_guard();
+        let gt = [500_000.0, 30.0, 0.0, 4_000_000.0, 0.0, -30.0];
+        for fill in [0.0_f32, f32::NAN] {
+            let dir = std::env::temp_dir().join(format!(
+                "dolphin_static_bbox_fallback_{}_{}",
+                std::process::id(),
+                fill.is_nan()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Neighbour (listed first): grid starts at frame column 2, fill in its
+            // first two columns (frame columns 2-3), geometry from frame column 4.
+            let neighbour = dir.join("neighbour.h5");
+            let neighbour_gt = [gt[0] + 2.0 * gt[1], gt[1], 0.0, gt[3], 0.0, gt[5]];
+            write_uniform_static(&neighbour, 40.0, neighbour_gt, (4, 6));
+            {
+                let file = hdf5::File::open_rw(&neighbour).unwrap();
+                for name in ["data/los_east", "data/los_north"] {
+                    let dataset = file.dataset(name).unwrap();
+                    let mut values = dataset.read_2d::<f32>().unwrap();
+                    values.slice_mut(ndarray::s![.., 0..2]).fill(fill);
+                    dataset.write(&values).unwrap();
+                }
+            }
+            // Own burst: geometry over frame columns 0-3 only.
+            let own = dir.join("own.h5");
+            write_uniform_static(&own, 34.0, gt, (4, 4));
+            let opts = CorrectionOptions {
+                geometry_files: vec![neighbour, own],
+                ..Default::default()
+            };
+            let los = resolve_geometry(&opts, 32610, gt, (4, 8))
+                .expect("every frame pixel has geometry in some granule")
+                .expect("geometry configured");
+            assert_eq!(los.outside_static().pixel_count, 0, "fill {fill}");
+            let incidence = los.incidence_deg();
+            for row in 0..4 {
+                for col in 0..4 {
+                    assert!(
+                        (incidence[(row, col)] - 34.0).abs() < 1e-4,
+                        "fill {fill}: ({row}, {col}) took {} not the own burst's 34",
+                        incidence[(row, col)]
+                    );
+                }
+                for col in 4..8 {
+                    assert!((incidence[(row, col)] - 40.0).abs() < 1e-4, "fill {fill}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// Bar #5: a geometry-only config (no iono/tropo, no wavelength) still resolves
     /// and returns `LosGeometry`, leaving displacement untouched — proves the gate
     /// decoupling from `is_enabled()`/wavelength.
