@@ -109,7 +109,6 @@ pub struct GeometryProvenance {
     /// Fail-safe decomposition gate: `orbit_direction`, `incidence_angle_deg`, and
     /// `heading_deg` all sourced AND incidence spread within the gate.
     pub decomposition_geometry_complete: bool,
-    /// AOI target/analysis/read-window contract; absent for full-frame runs.
     /// Corrections this run's configuration applies, in a fixed order using the
     /// stable names `ionosphere`, `troposphere`, `solid_earth_tide`,
     /// `plate_motion` and `layover_shadow_mask`. Empty when none ran.
@@ -120,6 +119,7 @@ pub struct GeometryProvenance {
     /// e.g. `linear+seasonal+step(2)`. Empty when read from a pre-`/6` artifact.
     #[serde(default)]
     pub time_function_model: String,
+    /// AOI target/analysis/read-window contract; absent for full-frame runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing_bounds: Option<ProcessingBoundsProvenance>,
     /// Aggregate, identifier-free receipt for temporal input coverage.
