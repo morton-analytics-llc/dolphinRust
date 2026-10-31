@@ -575,6 +575,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-BOUNDS-CROP",
         "output_options.bounds is set"
     ),
+    conditional!(
+        "output_options.min_reference_component_fraction",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds and output_options.min_reference_component_fraction are set"
+    ),
     compatibility_only!(
         "output_options.add_overviews",
         "the COG writer controls overview generation"
@@ -1350,6 +1355,13 @@ pub struct OutputOptions {
     /// Dolphin YAML compatibility only; must remain at its default because the
     /// COG writer owns overview generation.
     pub overview_levels: Vec<u32>,
+    /// Bounded runs only: the smallest fraction of target pixels that must share
+    /// the reference pixel's unwrap component (`unwrap_component.tif`). Below it
+    /// the run fails with `BoundsError::DisconnectedTarget` instead of publishing
+    /// regions whose offset from the reference is an arbitrary multiple of 2π.
+    /// `None` (the default) records the components without enforcing a minimum.
+    /// dolphinRust-only.
+    pub min_reference_component_fraction: Option<f64>,
 }
 
 impl Default for OutputOptions {
@@ -1361,6 +1373,7 @@ impl Default for OutputOptions {
             bounds_epsg: Some(4326),
             add_overviews: true,
             overview_levels: vec![4, 8, 16, 32, 64],
+            min_reference_component_fraction: None,
         }
     }
 }
@@ -1554,6 +1567,18 @@ impl DisplacementWorkflow {
             | UnwrapMethod::Phass
             | UnwrapMethod::Spurt
             | UnwrapMethod::Whirlwind => unreachable!("unsupported methods returned above"),
+        }
+        if let Some(fraction) = self.output_options.min_reference_component_fraction {
+            if self.output_options.bounds.is_none() {
+                return Err(CoreError::InvalidConfig(
+                    "output_options.min_reference_component_fraction requires output_options.bounds".into(),
+                ));
+            }
+            if !(fraction.is_finite() && 0.0 < fraction && fraction <= 1.0) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "output_options.min_reference_component_fraction must be in (0, 1], got {fraction}"
+                )));
+            }
         }
         if self.output_options.epsg.is_some() && self.output_options.bounds.is_none() {
             return Err(CoreError::InvalidConfig(

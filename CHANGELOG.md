@@ -7,6 +7,28 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Datum adjustment across overlapping bounded windows** (issue #153).
+  `dolphin_workflows::estimate_window_datum` takes N bounded windows from one burst stack
+  (`DatumWindow`, built from a `DisplacementOutput`) and returns a constant offset per window
+  for each displacement date plus a velocity offset, which put every window on one anchor's
+  datum. It is a coherence-weighted least-squares adjustment over all overlaps, with weight
+  `γ_a·γ_b` per shared pixel, and is anchored either to one window or to externally supplied
+  anchor values. Per-overlap residual median and MAD are returned so callers can reject a bad
+  seam. Pixels outside a window's reference unwrap component (#152) are excluded. Typed
+  `DatumError`s cover a disconnected overlap graph, an overlap below
+  `min_overlap_pixels`, and incompatible windows (date list, CRS, spacing, lattice).
+- **Unwrap components for bounded runs** (issue #152). A bounded (`output_options.bounds`)
+  run labels each target pixel with its joint unwrap component: pixels share a component
+  when they carry the same nonzero connected-component label in every interferogram, so the
+  unwrapper's own connectivity rule and correlation threshold define it, and relative
+  displacement inside a component has no 2π ambiguity. `DisplacementOutput::unwrap_component`
+  carries the labels (0 = none) and `unwrap_component.tif` holds them. The bounds provenance
+  in `geometry_provenance.json` gains `unwrap_components` (component count, labelled pixels,
+  largest-component and reference-component target fractions, reference component), and
+  `AOI_PROCESSING_VERSION` moves to `1.1.0`. A new opt-in
+  `output_options.min_reference_component_fraction` fails the run with
+  `BoundsError::DisconnectedTarget` when less of the target shares the reference's component.
+  Full-frame runs are unchanged.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median
