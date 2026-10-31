@@ -31,7 +31,7 @@ pub use loop_closure::{
     loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, LoopClosureShapeError,
     Triplet, DEFAULT_CLOSURE_TOLERANCE_CYCLES, MIN_ROOT_PIXELS,
 };
-pub use network::{build_network, NetworkConfig};
+pub use network::{build_network, network_components, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};
 pub use spatial_covariance::{
     convert_covariance_units, date_contrast, fixed_l2_difference_workspace_composition,

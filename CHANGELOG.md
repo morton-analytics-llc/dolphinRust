@@ -50,6 +50,13 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Disconnected interferogram networks fail at the network stage** (issue #159). A pair graph
+  that splits the dates into groups with no interferogram between them, such as an acquisition
+  gap wider than `max_temporal_baseline`, used to panic in the L1 inversion, return arbitrary
+  post-gap offsets from the coherence-weighted L2 path, or fail after unwrap on a date no pair
+  covered. The run now stops before unwrapping and names the date groups.
+  `fixed_l2_pixel_map` reports `RankDeficient` for a singular normal matrix instead of returning
+  an infinite condition number. New `dolphin_timeseries::network_components`.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;

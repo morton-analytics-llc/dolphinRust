@@ -515,6 +515,7 @@ fn finish_displacement(
     })?;
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
+    ensure_connected_network(&pairs, &days)?;
     let configured_reference = checked_configured_analysis_reference(
         cfg.timeseries_options.reference_point,
         crop,
@@ -4818,6 +4819,31 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
 }
 
 /// Build the interferogram index pairs from the config and real baselines.
+/// Refuse, before unwrapping, a pair graph the SBAS inversion cannot solve:
+/// every date must be reachable from every other through interferograms.
+fn ensure_connected_network(pairs: &[(usize, usize)], days: &[f64]) -> Result<()> {
+    let components = dolphin_timeseries::network_components(days.len(), pairs);
+    if components.len() <= 1 {
+        return Ok(());
+    }
+    let groups: Vec<String> = components
+        .iter()
+        .map(|dates| {
+            let span = |date: usize| format!("{date} (day {})", days[date]);
+            match dates.as_slice() {
+                [only] => span(*only),
+                [first, .., last] => format!("{}..{}", span(*first), span(*last)),
+                [] => String::new(),
+            }
+        })
+        .collect();
+    anyhow::bail!(
+        "interferogram_network is disconnected into {} groups of dates with no pair between them: {}; widen max_bandwidth or max_temporal_baseline to bridge the gap",
+        components.len(),
+        groups.join(" | ")
+    )
+}
+
 fn network(cfg: &DisplacementWorkflow, days: &[f64]) -> Vec<(usize, usize)> {
     let configured = &cfg.interferogram_network;
     // An entirely unconfigured network means single-reference on date 0, not "no
@@ -9055,6 +9081,21 @@ mod tests {
         assert!(!new_cslc.exists(), "fixture must fail before new-CSLC I/O");
         std::fs::remove_file(sidecar_path).unwrap();
         std::fs::remove_file(mask_path).unwrap();
+    }
+
+    /// #159: a network split by an acquisition gap fails at the network stage,
+    /// naming both sides, instead of panicking or publishing arbitrary offsets
+    /// after unwrapping.
+    #[test]
+    fn disconnected_network_fails_before_unwrapping() {
+        let days = [0.0, 12.0, 24.0, 108.0, 120.0];
+        let error = ensure_connected_network(&[(0, 1), (1, 2), (0, 2), (3, 4)], &days)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disconnected into 2 groups"), "{error}");
+        assert!(error.contains("0 (day 0)..2 (day 24)"), "{error}");
+        assert!(error.contains("3 (day 108)..4 (day 120)"), "{error}");
+        ensure_connected_network(&[(0, 1), (1, 2), (2, 3), (3, 4)], &days).unwrap();
     }
 
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the

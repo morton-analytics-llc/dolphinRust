@@ -588,12 +588,19 @@ pub fn fixed_l2_pixel_map(
             }
         },
     );
+    let condition_number = normal_condition_number(&normal);
+    if !condition_number.is_finite() {
+        return Err(pixel_map_error(
+            PixelL2MapStatus::RankDeficient,
+            "fixed L2 weighted normal matrix is singular",
+        ));
+    }
     Ok(PixelL2ObservationMap {
         valid_observation_indices,
         precisions,
         observation_phase_map,
         h_map,
-        condition_number: normal_condition_number(&normal),
+        condition_number,
     })
 }
 

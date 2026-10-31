@@ -56,3 +56,68 @@ fn single_reference(n_dates: usize, reference_idx: usize) -> impl Iterator<Item 
         .filter(move |&d| d != reference_idx)
         .map(move |d| (reference_idx.min(d), reference_idx.max(d)))
 }
+
+/// Group the `n_dates` dates into the connected components of the pair graph,
+/// each component's dates ascending and components ordered by first date. A
+/// network an SBAS inversion can solve has exactly one component.
+#[must_use]
+pub fn network_components(n_dates: usize, pairs: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..n_dates).collect();
+    for &(i, j) in pairs.iter().filter(|&&(i, j)| i < n_dates && j < n_dates) {
+        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+        parent[a.max(b)] = a.min(b);
+    }
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut slot = vec![usize::MAX; n_dates];
+    for date in 0..n_dates {
+        let base = root(&mut parent, date);
+        if slot[base] == usize::MAX {
+            slot[base] = components.len();
+            components.push(Vec::new());
+        }
+        components[slot[base]].push(date);
+    }
+    components
+}
+
+/// Union-find root of `node`, halving the path on the way.
+fn root(parent: &mut [usize], mut node: usize) -> usize {
+    while parent[node] != node {
+        parent[node] = parent[parent[node]];
+        node = parent[node];
+    }
+    node
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    #[test]
+    fn a_gap_wider_than_the_temporal_baseline_splits_the_network() {
+        let days = [0.0, 12.0, 24.0, 108.0, 120.0];
+        let cfg = NetworkConfig {
+            max_temporal_baseline: Some(48.0),
+            ..NetworkConfig::default()
+        };
+        let pairs = build_network(5, &days, &cfg);
+        assert_eq!(
+            network_components(5, &pairs),
+            vec![vec![0, 1, 2], vec![3, 4]]
+        );
+        let bridged = NetworkConfig {
+            max_bandwidth: Some(2),
+            ..NetworkConfig::default()
+        };
+        let pairs = build_network(5, &days, &bridged);
+        assert_eq!(network_components(5, &pairs), vec![vec![0, 1, 2, 3, 4]]);
+    }
+
+    #[test]
+    fn a_date_no_pair_touches_is_its_own_component() {
+        assert_eq!(
+            network_components(4, &[(0, 1), (1, 3)]),
+            vec![vec![0, 1, 3], vec![2]]
+        );
+    }
+}
