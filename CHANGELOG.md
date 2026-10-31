@@ -7,6 +7,18 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Unwrap components for bounded runs** (issue #152). A bounded (`output_options.bounds`)
+  run labels each target pixel with its joint unwrap component: pixels share a component
+  when they carry the same nonzero connected-component label in every interferogram, so the
+  unwrapper's own connectivity rule and correlation threshold define it, and relative
+  displacement inside a component has no 2π ambiguity. `DisplacementOutput::unwrap_component`
+  carries the labels (0 = none) and `unwrap_component.tif` holds them. The bounds provenance
+  in `geometry_provenance.json` gains `unwrap_components` (component count, labelled pixels,
+  largest-component and reference-component target fractions, reference component), and
+  `AOI_PROCESSING_VERSION` moves to `1.1.0`. A new opt-in
+  `output_options.min_reference_component_fraction` fails the run with
+  `BoundsError::DisconnectedTarget` when less of the target shares the reference's component.
+  Full-frame runs are unchanged.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median
@@ -40,6 +52,15 @@ All notable changes to dolphinRust are documented here. The format follows
   absent reason rather than asserting ellipsoidal heights, and no DEM at all marks all four
   fields absent. Schema bumped to `dolphinrust-geometry-provenance/5`, method version
   `5.0.0`; the fixed-cube semantic gate in `temporal_covariance_product` pins the new pair.
+- **Rigid tectonic plate-motion LOS correction** (issue #103). New
+  `correction_options.plate_motion_model` — a plate name (e.g. `"NorthAmerica"`, matched
+  case/space-insensitively against the built-in ITRF2020 PMM Euler-pole table) or an explicit
+  `{omega_x_mas_per_year, omega_y_mas_per_year, omega_z_mas_per_year}` pole — subtracts the
+  plate's rigid rotational velocity (`v = ω × r`, projected into line of sight, accumulated
+  linearly over the stack) from displacement, the same way `solid_earth_tide` does for lunisolar
+  tides: no external data file, needs `geometry_files` for the full LOS unit vector, opt-in
+  and unset by default. The table is ITRF2020 PMM (Altamimi et al. 2023, 13 plates),
+  checked against velocities PROJ computes from its own ITRF2020 plate-motion entries.
 - **Exponential relaxation term in the velocity time-function model** (issue #102).
   `timeseries_options.velocity_relaxation: [{onset_date, tau_days}]` adds one
   `H(t − t₀)·(1 − exp(−(t − t₀)/τ))` column per entry to the joint WLS fit alongside the

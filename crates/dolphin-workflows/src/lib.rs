@@ -37,7 +37,7 @@ pub use covariance_artifact::{
     CovarianceArtifactManifest, CovarianceArtifactTransaction, COVARIANCE_OPERATOR_FILENAME,
     COVARIANCE_OPERATOR_MANIFEST_FILENAME,
 };
-pub use crop::{BoundsError, ProcessingBoundsProvenance};
+pub use crop::{BoundsError, ProcessingBoundsProvenance, UnwrapComponentProvenance};
 pub use cslc_covariance_source::{
     empirical_factor_config, CslcCovarianceGenerationResolverBundle, CslcCovarianceManifest,
     CslcCovarianceResolverMetrics, CslcCovarianceSourceResolver, CslcCovarianceValidityReader,
