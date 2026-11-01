@@ -9264,6 +9264,44 @@ mod tests {
         std::fs::remove_file(mask_path).unwrap();
     }
 
+    /// #140 (dolphin PR #674/#700): upstream rejects a real SLC dated on the most
+    /// recent compressed SLC's reference date. Here compressed SLCs are only
+    /// carried state whose reference is one of the prior real acquisitions, so
+    /// that case is an update that repeats a prior date, and it fails before any
+    /// CSLC I/O.
+    #[test]
+    fn update_repeating_a_prior_acquisition_date_fails_before_cslc_io() {
+        let prior = vec![
+            PathBuf::from("t001_000001_iw1_20230101.h5"),
+            PathBuf::from("t001_000001_iw1_20230113.h5"),
+        ];
+        let initial = DisplacementWorkflow {
+            cslc_file_list: prior.clone(),
+            ..Default::default()
+        };
+        let groups = workflow_groups(&initial).unwrap();
+        let masks = resolve_layover_shadow_masks(
+            initial.input_options.input_type,
+            &groups,
+            &initial.layover_shadow_mask_files,
+        )
+        .unwrap();
+        let state = DisplacementState {
+            input_groups: capture_input_groups(&initial, &groups, &masks).unwrap(),
+            bursts: Vec::new(),
+        };
+        let mut updated = initial;
+        updated
+            .cslc_file_list
+            .push(PathBuf::from("t001_000001_iw1_20230113_reprocessed.h5"));
+        let error = match update_displacement(&state, &updated) {
+            Ok(_) => panic!("a repeated acquisition date must fail"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("unique and strictly increasing"), "{error}");
+        assert!(updated.cslc_file_list.iter().all(|path| !path.exists()));
+    }
+
     /// Issue #24: the gate is off by default, so the unwrapped stack reaches the
     /// solve untouched.
     #[test]
