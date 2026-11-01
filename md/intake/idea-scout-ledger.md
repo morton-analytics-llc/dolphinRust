@@ -215,6 +215,38 @@ Entry format:
   in-house; only its edge-cost formulation is.
 - **Added**: 2026-10-01 by scheduled scout run
 
+### D20 — Gaussian-weighted multilook SHP method with ENL quality metric
+- **Source**: researcher (isce-framework/dolphin v0.42.8, PR #734 "Add Gaussian multilooking
+  option for phase linking" + follow-up "Fix ENL weighting for GAUSSIAN SHP" — verified by
+  cloning dolphin and reading the actual commits, `2d0aa18`/`dc5e928`)
+- **Issue**: #177 (enhancement-labeled, NOT backlog-ready)
+- **Re-entry gate**: a production AOI shows GLRT/KS SHP selection producing PS/DS density or
+  spatial-clustering issues a fixed-weight Gaussian method would plausibly fix (same shape as
+  D11/D18's gates), OR a targeted forward-oracle run against dolphin v0.42.8 validates the new
+  method's actual output before adopting it.
+- **Design sketch**: third `ShpMethod` variant in `dolphin-shp`/`dolphin-core::config` alongside
+  Glrt/Ks/Rect; fixed 2D Gaussian neighbor weights feeding a float-weight generalization of the
+  covariance kernel's existing boolean SHP-mask path; new effective-number-of-looks (Kish's
+  formula) quality output for weighted methods, replacing a raw neighbor count.
+- **Added**: 2026-11-01 by scheduled scout run
+
+### D21 — Opt-in integer LAD inversion refinement with shared-threshold rounding
+- **Source**: researcher (isce-framework/dolphin v0.42.8, PR #743 "Add opt-in integer LAD
+  inversion with shared-threshold rounding", `docs/integer-ambiguities.md` — verified by cloning
+  dolphin and reading the actual commit, `d1b28a4`)
+- **Issue**: #178 (enhancement-labeled, NOT backlog-ready)
+- **Re-entry gate**: a production AOI or the existing GNSS/Houston validation stacks show
+  dolphinRust's continuous LAD (`TimeseriesMethod::L1`, already dolphin's own default) leaving
+  residual non-integer-cycle noise at unwrap-ambiguity-prone pixels/edges this rounding
+  refinement would plausibly resolve, OR a targeted forward-oracle run against dolphin v0.42.8's
+  `invert_stack_l1_integer` validates the algorithm before adopting it.
+- **Design sketch**: post-solve refinement appended to the existing ADMM/LAD path in
+  `dolphin-timeseries/src/inversion.rs` — after convergence, derive one shared rounding
+  threshold per dolphin's non-increasing-objective proof on integer-structured inputs; reject
+  disconnected/non-integer network inputs the same way dolphin does; off by default, bit-identical
+  output when disabled.
+- **Added**: 2026-11-01 by scheduled scout run
+
 ## SHIPPED
 
 ### D6 — Expose orbit ephemeris class (POE/RESORB) for processing provenance
