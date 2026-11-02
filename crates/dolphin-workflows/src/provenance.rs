@@ -27,8 +27,15 @@ use crate::phase_steps::{CycleStepProvenance, JunctionProvenance};
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/5";
-const METHOD_VERSION: &str = "5.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/6";
+const METHOD_VERSION: &str = "6.0.0";
+
+/// Stable `corrections_applied` names, in disclosure order (issue #130 / eo#483).
+const CORRECTION_SOLID_EARTH_TIDE: &str = "solid_earth_tide";
+const CORRECTION_PLATE_MOTION: &str = "plate_motion";
+const CORRECTION_IONOSPHERE: &str = "ionosphere";
+const CORRECTION_TROPOSPHERE: &str = "troposphere";
+const CORRECTION_LAYOVER_SHADOW_MASK: &str = "layover_shadow_mask";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
@@ -52,7 +59,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/5`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/6`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -124,6 +131,21 @@ pub struct GeometryProvenance {
     /// same raw series, summarized over the analysis frame (E4, 2026-09-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycle_steps: Option<CycleStepProvenance>,
+    /// Correction categories enabled on this run, in a fixed disclosure order;
+    /// empty (never null) when none ran (issue #130 / eo#483 Table 5). Computed
+    /// directly from `CorrectionOptions` and `layover_shadow_mask_files` — every
+    /// current run can state this with certainty, so unlike the geometry fields
+    /// above there is no absent case. An artifact written before this field
+    /// existed deserializes it as an empty, historical vec, not a reconstruction.
+    #[serde(default)]
+    pub corrections_applied: Vec<String>,
+    /// The velocity time-function model composed from `TimeseriesOptions`, e.g.
+    /// `"linear"`, `"linear+seasonal"`, `"linear+seasonal+step(2)"`,
+    /// `"linear+relaxation(1)"` (issue #130 / eo#483 Table 5). Customer-facing
+    /// string; the composition order is fixed by [`time_function_model`]. An
+    /// artifact written before this field existed deserializes it as `""`.
+    #[serde(default)]
+    pub time_function_model: String,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
 }
@@ -309,6 +331,8 @@ pub fn assemble_geometry_provenance_with_coverage(
         input_coverage,
         ministack_junctions: None,
         cycle_steps: None,
+        corrections_applied: corrections_applied(cfg),
+        time_function_model: time_function_model(cfg),
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,
@@ -326,6 +350,51 @@ pub fn write_geometry_provenance(dir: &Path, prov: &GeometryProvenance) -> anyho
     let json = serde_json::to_string_pretty(prov)?;
     std::fs::write(dir.join(GEOMETRY_PROVENANCE_FILENAME), json + "\n")?;
     Ok(())
+}
+
+/// Correction categories this run's `CorrectionOptions` and
+/// `layover_shadow_mask_files` actually enable, in a fixed disclosure order.
+/// Deterministic from config alone: every current run can state this with
+/// certainty, so (unlike the geometry fields above) there is no absent case.
+fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
+    let corrections = &cfg.correction_options;
+    let mut applied = Vec::new();
+    if corrections.solid_earth_tide {
+        applied.push(CORRECTION_SOLID_EARTH_TIDE.into());
+    }
+    if corrections.plate_motion_model.is_some() {
+        applied.push(CORRECTION_PLATE_MOTION.into());
+    }
+    if !corrections.ionosphere_files.is_empty() {
+        applied.push(CORRECTION_IONOSPHERE.into());
+    }
+    if !corrections.troposphere_files.is_empty() || !corrections.troposphere_epochs.is_empty() {
+        applied.push(CORRECTION_TROPOSPHERE.into());
+    }
+    if !cfg.layover_shadow_mask_files.is_empty() {
+        applied.push(CORRECTION_LAYOVER_SHADOW_MASK.into());
+    }
+    applied
+}
+
+/// The velocity time-function model composed from `TimeseriesOptions`, in the
+/// fixed order `linear` + `seasonal` + `step(n)` + `relaxation(n)`.
+fn time_function_model(cfg: &DisplacementWorkflow) -> String {
+    let timeseries = &cfg.timeseries_options;
+    let mut model = String::from("linear");
+    if timeseries.velocity_seasonal {
+        model.push_str("+seasonal");
+    }
+    if !timeseries.velocity_step_dates.is_empty() {
+        model.push_str(&format!("+step({})", timeseries.velocity_step_dates.len()));
+    }
+    if !timeseries.velocity_relaxation.is_empty() {
+        model.push_str(&format!(
+            "+relaxation({})",
+            timeseries.velocity_relaxation.len()
+        ));
+    }
+    model
 }
 
 /// Fields whose provenance comes from the CSLC acquisition granules.

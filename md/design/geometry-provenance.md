@@ -19,8 +19,8 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/5",
-  "method_version": "5.0.0",
+  "schema": "dolphinrust-geometry-provenance/6",
+  "method_version": "6.0.0",
   "orbit_direction": "descending",
   "orbit_ephemeris_class": "precise",
   "incidence_angle_deg": 39.27,
@@ -37,6 +37,8 @@ Two surfaces, one type:
   "dem_vertical_datum": "EGM96 height",
   "phase_linking_coherence": "phase_linking_coherence.tif",
   "decomposition_geometry_complete": true,
+  "corrections_applied": ["solid_earth_tide"],
+  "time_function_model": "linear+seasonal",
   "input_coverage": {
     "policy_version": "complete-temporal-tile/1",
     "total_tiles": 12,
@@ -71,11 +73,18 @@ Two surfaces, one type:
 }
 ```
 
-Version 4 adds `orbit_ephemeris_class`; version 3 adds `input_coverage`. Version 2 and 3 records
-remain valid and deserialize with newly added optional fields absent. Coverage contains only
-aggregate counts and stable zero-based burst
-ordinals. It must never contain source paths, object keys, AOI geometry, or acquisition
-identifiers.
+Version 4 adds `orbit_ephemeris_class`; version 3 adds `input_coverage`. Version 5 adds the DEM
+identity fields (`dem_grid_spacing_x`/`_y`/`_units`, `dem_vertical_datum`). Version 6 adds
+`corrections_applied` and `time_function_model` (issue #130 / eo#483 Table 5 processing
+disclosure): both are computed directly from `CorrectionOptions`, `layover_shadow_mask_files`,
+and `TimeseriesOptions`, so unlike the fields above they have no absent case — every run can
+state them with certainty. `corrections_applied` is `[]`, never `null`, when nothing ran;
+`time_function_model` is always at least `"linear"`. Records older than version 6 deserialize
+these two fields as `[]` and `""` respectively — a historical placeholder, not a reconstruction
+of what that old run actually did. Version 2 and 3 records remain valid and deserialize with
+newly added optional fields absent. Coverage contains only aggregate counts and stable
+zero-based burst ordinals. It must never contain source paths, object keys, AOI geometry, or
+acquisition identifiers.
 
 A tiled burst is processed only where every selected acquisition has finite complex support
 somewhere in that tile's dependency window. A locally incomplete tile is emitted as nodata in
