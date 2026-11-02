@@ -13,6 +13,13 @@
   `max_bandwidth`/`max_temporal_baseline`. The independent-IFG covariance approximation also
   uses that network shape, but shared acquisition errors mean it has no independent empirical
   scale. Off by default. Never masks a pixel with no evaluable loop: positive evidence only.
+- **Integer-cycle correction before the gate (`loop_correction.rs`, issue #142)** —
+  `U = argmin ‖U‖₁ s.t. C U = −k` (Yunjun et al. 2019 / MintPy), solved exactly: every
+  closing correction is `a + B m` (a fan-triangle particular solution plus an integer date
+  potential), and `min ‖a + B m‖₁` is a min-cost tension problem solved through its
+  unit-capacity circulation dual. Corrects a pixel only when the optimum is unique; ties are
+  left for the gate. Junction offsets in the linked phase cancel in every loop, so closure
+  only ever sees per-interferogram unwrap errors. Off by default, requires the gate.
 
 - **Velocity time-function terms (`velocity_model.rs`, issues #22, #102)** — an annual
   sinusoid, configured Heaviside steps, and/or exponential relaxations

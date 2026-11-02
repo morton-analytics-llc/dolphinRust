@@ -9,6 +9,7 @@
 pub mod cycle_steps;
 pub mod inversion;
 pub mod loop_closure;
+pub mod loop_correction;
 pub mod network;
 pub mod reference;
 pub mod spatial_covariance;
@@ -30,6 +31,10 @@ pub use inversion::{
 pub use loop_closure::{
     loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, LoopClosureShapeError,
     Triplet, DEFAULT_CLOSURE_TOLERANCE_CYCLES, MIN_ROOT_PIXELS,
+};
+pub use loop_correction::{
+    check_correction_network, correct_loop_closure_errors, LoopClosureCorrection,
+    LoopCorrectionError, PixelCorrection, MAX_CORRECTION_FRACTION_CYCLES,
 };
 pub use network::{build_network, NetworkConfig};
 pub use reference::{reference_to_point, select_reference_point};

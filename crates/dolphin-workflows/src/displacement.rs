@@ -31,12 +31,13 @@ use dolphin_phaselink::{
 };
 use dolphin_stack::MiniStackPlanner;
 use dolphin_timeseries::{
-    build_network, estimate_velocity_with_diagnostics, estimate_velocity_with_model,
+    build_network, check_correction_network, correct_loop_closure_errors,
+    estimate_velocity_with_diagnostics, estimate_velocity_with_model,
     estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
     invert_stack_with_uncertainty, loop_closure_qc, mask_failed_loops, network_triplets,
     reference_to_point, select_reference_point, L1Config, LoopClosureQc, NetworkConfig,
-    RelaxationTerm, VelocityCadenceStatus, VelocityModel, VelocityUncertaintyStatus,
-    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    PixelCorrection, RelaxationTerm, VelocityCadenceStatus, VelocityModel,
+    VelocityUncertaintyStatus, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_timeseries::{
     detect_cycle_steps, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
@@ -162,6 +163,16 @@ pub struct PublicationQuality {
     /// Component triples, over every loop, too small to contribute a root;
     /// `None` unless the closure QC ran.
     pub closure_small_root_triples: Option<usize>,
+    /// Analysed pixels the integer-cycle correction repaired before the
+    /// closure QC; `None` unless the correction ran.
+    pub closure_corrected_pixels: Option<usize>,
+    /// Analysed pixels with a whole-cycle loop misclosure the correction left
+    /// alone because it was ambiguous, non-integer or inconsistent; `None`
+    /// unless the correction ran.
+    pub closure_uncorrected_pixels: Option<usize>,
+    /// Pixels corrected in each interferogram, indexed like
+    /// `interferogram_pairs`; `None` unless the correction ran.
+    pub closure_corrected_per_band: Option<Vec<usize>>,
     /// Published pixels carrying at least one detected whole-cycle step
     /// against their neighbours (E4); the per-pixel counts are
     /// [`DisplacementOutput::cycle_step_flag`].
@@ -520,6 +531,9 @@ fn finish_displacement(
     })?;
     let pairs = timed("network", || network(cfg, &days));
     anyhow::ensure!(!pairs.is_empty(), "interferogram_network produced no pairs");
+    if cfg.timeseries_options.correct_unwrap_loop_errors {
+        check_correction_network(&pairs)?;
+    }
     let configured_reference = checked_configured_analysis_reference(
         cfg.timeseries_options.reference_point,
         crop,
@@ -618,6 +632,7 @@ fn finish_displacement(
                 validity_mask.view(),
                 unwrap.connected_components.view(),
                 cfg.timeseries_options.mask_unwrap_loop_errors,
+                cfg.timeseries_options.correct_unwrap_loop_errors,
             ),
         })
     } else {
@@ -1220,7 +1235,8 @@ fn solve_time_series(
     Ok((inversion, loop_closure))
 }
 
-/// Run the opt-in post-unwrap loop-closure QC and blank the failing pixels.
+/// Run the opt-in post-unwrap loop-closure QC and blank the failing pixels,
+/// after the opt-in integer-cycle correction (issue #142) when that is on.
 /// Returns the QC layers for output, or `None` when the gate is off or the
 /// network has no loops to close. The QC needs no spatial reference: each
 /// loop's shared integer-cycle root is removed per unwrap component inside
@@ -1247,12 +1263,30 @@ fn apply_loop_closure_qc(
         );
         return Ok(None);
     }
-    let qc = loop_closure_qc(
+    let correction = cfg
+        .timeseries_options
+        .correct_unwrap_loop_errors
+        .then(|| correct_loop_closure_errors(dphi_rad, connected_components, pairs))
+        .transpose()?;
+    if let Some(correction) = correction.as_ref() {
+        tracing::info!(
+            stage = "loop_closure",
+            corrected_pixels = correction.count(PixelCorrection::Corrected),
+            ambiguous_pixels = correction.count(PixelCorrection::Ambiguous),
+            unevaluable_pixels = correction.count(PixelCorrection::Unevaluable),
+            non_integer_pixels = correction.count(PixelCorrection::NonInteger),
+            inconsistent_pixels = correction.count(PixelCorrection::Inconsistent),
+            "integer-cycle loop-closure correction, pixels corrected per band: {:?}",
+            correction.corrected_per_band
+        );
+    }
+    let mut qc = loop_closure_qc(
         dphi_rad.view(),
         connected_components,
         pairs,
         DEFAULT_CLOSURE_TOLERANCE_CYCLES,
     )?;
+    qc.correction = correction;
     let masked = qc.bad_loop_count.iter().filter(|&&n| n > 0.0).count();
     tracing::info!(
         stage = "loop_closure",
@@ -1631,6 +1665,24 @@ fn emit_displacement(
         .loop_closure
         .as_ref()
         .map(|qc| qc.failed_mask().iter().filter(|&&bad| bad).count());
+    let closure_correction = spatial
+        .loop_closure
+        .as_ref()
+        .and_then(|qc| qc.correction.as_ref());
+    let closure_corrected_pixels =
+        closure_correction.map(|correction| correction.count(PixelCorrection::Corrected));
+    let closure_uncorrected_pixels = closure_correction.map(|correction| {
+        [
+            PixelCorrection::Ambiguous,
+            PixelCorrection::NonInteger,
+            PixelCorrection::Inconsistent,
+        ]
+        .into_iter()
+        .map(|status| correction.count(status))
+        .sum()
+    });
+    let closure_corrected_per_band =
+        closure_correction.map(|correction| correction.corrected_per_band.clone());
     // Likewise the geometry: after the mask, NaN `up` marks every masked pixel,
     // not only those outside the STATIC granule. With output bounds set,
     // `spatial.trim` has already cropped the geometry, so the count and
@@ -1779,6 +1831,9 @@ fn emit_displacement(
             .loop_closure
             .as_ref()
             .map(|qc| qc.small_root_triples),
+        closure_corrected_pixels,
+        closure_uncorrected_pixels,
+        closure_corrected_per_band,
         cycle_step_flagged_pixels: spatial
             .cycle_steps
             .step_count
@@ -1801,6 +1856,7 @@ fn emit_displacement(
             spatial.validity_mask.view(),
             spatial.unwrap_connected_components.view(),
             cfg.timeseries_options.mask_unwrap_loop_errors,
+            cfg.timeseries_options.correct_unwrap_loop_errors,
         );
     }
     if let (Some(variance), Some(point)) = (
@@ -2111,6 +2167,7 @@ impl SpatialProducts {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_validity_mask(&mut self) {
         ndarray::Zip::from(&mut self.validity_mask)
             .and(&self.vel_rad)
@@ -2197,6 +2254,10 @@ impl SpatialProducts {
             mask2_f64(&mut qc.bad_loop_count, mask);
             mask2_f64(&mut qc.evaluable_loop_count, mask);
             mask2_f64(&mut qc.worst_residual_cycles, mask);
+            if let Some(correction) = qc.correction.as_mut() {
+                mask2_f64(&mut correction.status, mask);
+                mask2_f64(&mut correction.corrected_interferogram_count, mask);
+            }
         }
         if let Some(layer) = self.corrections.ionosphere.as_mut() {
             mask3_f64(layer, mask);
@@ -2325,6 +2386,11 @@ impl SpatialProducts {
             qc.bad_loop_count = trim2(&qc.bad_loop_count, target);
             qc.evaluable_loop_count = trim2(&qc.evaluable_loop_count, target);
             qc.worst_residual_cycles = trim2(&qc.worst_residual_cycles, target);
+            if let Some(correction) = qc.correction.as_mut() {
+                correction.status = trim2(&correction.status, target);
+                correction.corrected_interferogram_count =
+                    trim2(&correction.corrected_interferogram_count, target);
+            }
         }
         for junction in &mut self.junctions {
             junction.step_cycles = trim2(&junction.step_cycles, target);
@@ -4385,6 +4451,12 @@ fn update_one_burst(
 
 fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
     cfg.validate_supported_options()?;
+    anyhow::ensure!(
+        !cfg.timeseries_options.correct_unwrap_loop_errors
+            || cfg.timeseries_options.mask_unwrap_loop_errors,
+        "timeseries_options.correct_unwrap_loop_errors requires mask_unwrap_loop_errors: \
+         the gate is the QC on the corrected stack"
+    );
     if cfg.phase_linking.write_covariance_operator {
         anyhow::ensure!(
             cfg.phase_linking.max_num_compressed > 0,
@@ -5411,6 +5483,16 @@ fn write_outputs(
             "loop_closure_worst_cycles.tif",
             qc.worst_residual_cycles.view(),
         )?;
+        if let Some(correction) = qc.correction.as_ref() {
+            write_f32(
+                "loop_closure_correction_status.tif",
+                correction.status.view(),
+            )?;
+            write_f32(
+                "loop_closure_corrected_count.tif",
+                correction.corrected_interferogram_count.view(),
+            )?;
+        }
     }
     for junction in quality.junction_steps.unwrap_or_default() {
         write_f32_with_metadata(
@@ -6060,6 +6142,7 @@ mod tests {
                 worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
                 unjudged_small_triple_pixels: 0,
                 small_root_triples: 0,
+                correction: None,
             }),
             junctions: Vec::new(),
             cycle_steps: CycleStepDetection::unjudged(2, 2),
@@ -6204,6 +6287,7 @@ mod tests {
                 worst_residual_cycles: Array2::from_elem((6, 8), 0.25),
                 unjudged_small_triple_pixels: 0,
                 small_root_triples: 0,
+                correction: None,
             }),
             junctions: Vec::new(),
             cycle_steps: CycleStepDetection::unjudged(6, 8),
@@ -7141,6 +7225,7 @@ mod tests {
                 worst_residual_cycles: Array2::from_elem((2, 2), 1.0),
                 unjudged_small_triple_pixels: 0,
                 small_root_triples: 0,
+                correction: None,
             }),
             junctions: Vec::new(),
             cycle_steps: CycleStepDetection::unjudged(2, 2),
@@ -9359,6 +9444,56 @@ mod tests {
         assert!(qc.bad_loop_count[(1, 1)] > 0.0);
         assert!(dphi.slice(s![.., 1, 1]).iter().all(|v| v.is_nan()));
         assert!(dphi.slice(s![.., 0, 0]).iter().all(|v| v.is_finite()));
+    }
+
+    /// Issue #142: with the correction on, the same kind of error on a
+    /// redundant network is repaired before the gate, so the gate passes the
+    /// pixel with its true values and the QC carries the correction's record.
+    #[test]
+    fn loop_closure_correction_repairs_before_the_gate() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        cfg.timeseries_options.correct_unwrap_loop_errors = true;
+        let pairs = build_network(
+            6,
+            &[0.0, 12.0, 24.0, 36.0, 48.0, 60.0],
+            &NetworkConfig {
+                max_bandwidth: Some(2),
+                ..Default::default()
+            },
+        );
+        let phase = [0.0, 1.3, 2.9, 3.4, 5.0, 6.1];
+        let clean = Array3::from_shape_fn((pairs.len(), 5, 5), |(k, _, _)| {
+            let (i, j) = pairs[k];
+            phase[j] - phase[i]
+        });
+        let mut dphi = clean.clone();
+        let erred = pairs.iter().position(|&pair| pair == (2, 3)).unwrap();
+        dphi[(erred, 1, 1)] -= std::f64::consts::TAU;
+        let components = one_component(&dphi);
+
+        let qc = apply_loop_closure_qc(&cfg, &mut dphi, components.view(), &pairs)
+            .unwrap()
+            .expect("qc ran");
+        assert!(!qc.failed_mask().iter().any(|&bad| bad));
+        assert!((&dphi - &clean).iter().all(|v| v.abs() < 1e-12));
+        let correction = qc.correction.expect("correction ran");
+        assert_eq!(correction.corrected_interferogram_count[(1, 1)], 1.0);
+        assert_eq!(correction.corrected_per_band[erred], 1);
+    }
+
+    /// The correction has no QC of its own: it is refused without the gate.
+    #[test]
+    fn loop_closure_correction_requires_the_gate() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.timeseries_options.correct_unwrap_loop_errors = true;
+        let error = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            error.contains("requires mask_unwrap_loop_errors"),
+            "{error}"
+        );
+        cfg.timeseries_options.mask_unwrap_loop_errors = true;
+        validate_config(&cfg).unwrap();
     }
 
     /// No pixel is exempt from unwrap errors. Referencing every interferogram to
