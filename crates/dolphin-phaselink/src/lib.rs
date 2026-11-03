@@ -18,6 +18,7 @@ pub mod estimator;
 pub mod fused;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod interpolation;
 pub mod phasebias;
 pub mod quality;
 pub mod similarity;
@@ -43,6 +44,7 @@ pub use fused::{
     AverageCoherenceAggregate, FixedBranchStatus, FusedEstimate, FusedParams, PhaseReplayGrid,
     SourceReplayEstimate,
 };
+pub use interpolation::{interpolate, INTERPOLATION_ALPHA, INTERPOLATION_NUM_NEIGHBORS};
 pub use phasebias::{
     correct_phase_bias, estimate_bias_velocity, mean_abs_closure, residual_closure,
 };

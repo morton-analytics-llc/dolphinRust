@@ -103,6 +103,11 @@ pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
         evidence: "dolphin-workflows::displacement workflow-to-backend mapping contracts plus unwrap_backend_contract and unwrap_parallel_contract",
     },
     ConfigBehaviorContract {
+        id: "CFG-UNWRAP-INTERPOLATION",
+        reader: "dolphin-workflows::{displacement::{unwrap_network, interpolation_plan}, unwrap_backend::unwrap_phase_correlated_network}",
+        evidence: "dolphin-phaselink::interpolation_contract plus dolphin-workflows::unwrap_backend::tests::{interpolation_off_leaves_network_output_unchanged, interpolation_feeds_unwrapper_and_transfers_ambiguities_to_original_phase}",
+    },
+    ConfigBehaviorContract {
         id: "CFG-UNWRAP-MASK",
         reader: "dolphin-workflows::displacement::{unwrap_network, analysis_correlation, apply_phase_masks}",
         evidence: "dolphin-workflows::displacement::tests::{aligned_mask_crs_mismatch_fails_explicitly, mask_is_not_read_when_zero_where_masked_is_false, terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms}",
@@ -455,21 +460,24 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "unwrap_options.preprocess_options.alpha",
         "pre-unwrap Goldstein filtering is not implemented"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.max_radius",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.interpolation_cor_threshold",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.interpolation_similarity_threshold",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     compatibility_only!(
         "unwrap_options.preprocess_options.zero_correlation_where_interpolating",
-        "pre-unwrap interpolation is not implemented"
+        "dolphin v0.42-only option; the pinned v0.35.0 interpolation keeps the unwrapper's correlation"
     ),
     compatibility_only!(
         "unwrap_options.run_unwrap",
@@ -479,9 +487,10 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "unwrap_options.run_goldstein",
         "pre-unwrap Goldstein filtering is not implemented"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.run_interpolation",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     consumed!("unwrap_options.unwrap_method", "CFG-UNWRAP-BACKEND"),
     consumed!("unwrap_options.n_parallel_jobs", "CFG-UNWRAP-BACKEND"),
@@ -490,9 +499,10 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-UNWRAP-MASK",
         "unwrap_options.zero_where_masked is true and mask_file is set"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options",
-        "pre-unwrap filtering and interpolation are not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     conditional!(
         "unwrap_options.snaphu_options",
@@ -1072,17 +1082,17 @@ pub struct PreprocessOptions {
     /// Dolphin YAML compatibility only; non-default values are rejected because
     /// pre-unwrap Goldstein filtering is not implemented.
     pub alpha: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: maximum search radius (pixels) for neighbours.
     pub max_radius: usize,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: per-interferogram correlation below this is
+    /// interpolated. Used only when no phase similarity applies (dolphin v0.35.0:
+    /// a nonzero `interpolation_similarity_threshold` *replaces* this test).
     pub interpolation_cor_threshold: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: phase similarity below this is interpolated.
+    /// `0` falls back to `interpolation_cor_threshold`.
     pub interpolation_similarity_threshold: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Dolphin v0.42-only; non-default values are rejected because the pinned
+    /// v0.35.0 interpolation leaves the unwrapper's correlation unchanged.
     pub zero_correlation_where_interpolating: bool,
 }
 
@@ -1109,8 +1119,10 @@ pub struct UnwrapOptions {
     /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
     /// Goldstein filtering is not implemented.
     pub run_goldstein: bool,
-    /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
-    /// interpolation is not implemented.
+    /// Interpolate low-quality wrapped phase from coherent neighbours before
+    /// unwrapping (dolphin `interpolate`). The interpolated phase feeds the
+    /// unwrapper only: its integer-cycle ambiguities are transferred back onto
+    /// each pixel's own wrapped phase.
     pub run_interpolation: bool,
     /// Phase-unwrapping backend to dispatch to.
     pub unwrap_method: UnwrapMethod,
@@ -1118,8 +1130,7 @@ pub struct UnwrapOptions {
     pub n_parallel_jobs: i64,
     /// Set wrapped phase/correlation to 0 where the mask is 0 before unwrapping.
     pub zero_where_masked: bool,
-    /// Dolphin YAML compatibility container for unsupported pre-unwrap
-    /// filtering/interpolation options.
+    /// Pre-unwrap interpolation options (Goldstein filtering stays unsupported).
     pub preprocess_options: PreprocessOptions,
     /// SNAPHU subprocess options.
     pub snaphu_options: SnaphuOptions,
@@ -1696,27 +1707,24 @@ impl DisplacementWorkflow {
         require_compatibility_default!(self, defaults, phase_linking.baseline_lag);
         require_compatibility_default!(self, defaults, unwrap_options.run_unwrap);
         require_compatibility_default!(self, defaults, unwrap_options.run_goldstein);
-        require_compatibility_default!(self, defaults, unwrap_options.run_interpolation);
         require_compatibility_default!(self, defaults, unwrap_options.preprocess_options.alpha);
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options.preprocess_options.max_radius
-        );
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options
-                .preprocess_options
-                .interpolation_cor_threshold
-        );
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options
-                .preprocess_options
-                .interpolation_similarity_threshold
-        );
+        let preprocess = &self.unwrap_options.preprocess_options;
+        for (path, threshold) in [
+            (
+                "unwrap_options.preprocess_options.interpolation_cor_threshold",
+                preprocess.interpolation_cor_threshold,
+            ),
+            (
+                "unwrap_options.preprocess_options.interpolation_similarity_threshold",
+                preprocess.interpolation_similarity_threshold,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "{path} must be in [0, 1], got {threshold}"
+                )));
+            }
+        }
         require_compatibility_default!(
             self,
             defaults,
