@@ -137,7 +137,11 @@ fn first_layer(output: UnwrapNetworkOutput) -> UnwrapLayer {
 /// The interpolated phase reaches only the unwrapper, with the ifg's original
 /// correlation (dolphin v0.35.0 passes the original `corr_filename`); every
 /// pixel's output is its own wrapped phase plus the solved whole-cycle ambiguity.
-/// Also returns which pixels were replaced.
+/// Replaced pixels lose their connected-component label: their ambiguity came
+/// from neighbours, so the interpolation never adds unwrap support (and a
+/// phase-driven solver such as SNAPHU would otherwise label the smoothed gap).
+/// This stands in for dolphin's post-transfer SNAPHU component regrow, which is
+/// not ported. Also returns which pixels were replaced.
 fn unwrap_interpolated(
     backend: &dyn UnwrapBackend,
     ifg: ArrayView2<Cf32>,
@@ -169,7 +173,14 @@ fn unwrap_interpolated(
         correlation,
         scratch,
     )?;
-    let (estimate, components) = first_layer(output);
+    let (estimate, mut components) = first_layer(output);
+    ndarray::Zip::from(&mut components)
+        .and(&replaced)
+        .for_each(|label, &replaced| {
+            if replaced {
+                *label = 0;
+            }
+        });
     Ok((
         (transfer_ambiguities(ifg, estimate.view()), components),
         Some(replaced),
@@ -542,8 +553,9 @@ mod tests {
     }
 
     /// The unwrapper sees the neighbour phase at a decorrelated pixel; the output
-    /// there is the pixel's own wrapped phase plus the transferred cycle, and the
-    /// provenance count marks it (and not the nodata pixel).
+    /// there is the pixel's own wrapped phase plus the transferred cycle, it
+    /// carries no component label, and the provenance count marks it (and not
+    /// the nodata pixel).
     #[test]
     fn interpolation_feeds_unwrapper_and_transfers_ambiguities_to_original_phase() {
         let (pl, similarity) = probe_scene();
@@ -560,6 +572,8 @@ mod tests {
             (probe - (own + std::f64::consts::TAU)).abs() < 1e-6,
             "{probe}"
         );
+        assert_eq!(output.output.connected_components[(0, PROBE.0, PROBE.1)], 0);
+        assert_eq!(output.output.connected_components[(0, 2, 2)], 1);
         let count = output.interpolated_count.unwrap();
         assert_eq!(count[PROBE], 1);
         assert_eq!(count.sum(), 1, "only the valid low-similarity pixel counts");

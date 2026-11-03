@@ -921,8 +921,9 @@ Strategic decisions surfaced by the `../eo` review — answer before the affecte
    `interpolation_similarity_threshold` is nonzero and on per-ifg correlation otherwise, then
    transfers the solved ambiguities back onto the original wrapped phase. v0.42's AND-mask and
    `zero_correlation_where_interpolating` stay out (the latter is still rejected). Not ported:
-   dolphin's post-transfer SNAPHU connected-component regrow; components come from the solve
-   on the interpolated ifg (the native backend's are correlation-based, so unchanged).
+   dolphin's post-transfer SNAPHU connected-component regrow. In its place, interpolated pixels
+   get component label 0 in that ifg, because SNAPHU labels the smoothed gap and otherwise
+   published it (Fresno T137: valid fraction 0.33 to 0.46).
 
    **Decision (2026-08-09): stay on the pinned `v0.35.0` with targeted forward oracles. No
    full re-pin.** Both untested items are closed and neither is material: the default-value

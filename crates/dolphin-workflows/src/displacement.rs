@@ -5608,8 +5608,9 @@ const UNWRAP_INTERPOLATED_COUNT_NOTE: &str =
     "Interferograms whose wrapped phase at this pixel was replaced by neighbour \
      interpolation before unwrapping (unwrap_options.run_interpolation). The \
      interpolated phase fed the unwrapper only: published displacement is the \
-     pixel's own wrapped phase plus the solved whole-cycle ambiguity, and keeps \
-     every quality mask.";
+     pixel's own wrapped phase plus the solved whole-cycle ambiguity, keeps \
+     every quality mask, and carries no connected-component label in those \
+     interferograms.";
 
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
