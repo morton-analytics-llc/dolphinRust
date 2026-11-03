@@ -567,31 +567,9 @@ fn compatibility_only_cases() -> Vec<(&'static str, MutateConfig)> {
         ("unwrap_options.run_goldstein", |c| {
             c.unwrap_options.run_goldstein = true
         }),
-        ("unwrap_options.run_interpolation", |c| {
-            c.unwrap_options.run_interpolation = true
-        }),
         ("unwrap_options.preprocess_options.alpha", |c| {
             c.unwrap_options.preprocess_options.alpha = 0.75
         }),
-        ("unwrap_options.preprocess_options.max_radius", |c| {
-            c.unwrap_options.preprocess_options.max_radius = 25
-        }),
-        (
-            "unwrap_options.preprocess_options.interpolation_cor_threshold",
-            |c| {
-                c.unwrap_options
-                    .preprocess_options
-                    .interpolation_cor_threshold = 0.4
-            },
-        ),
-        (
-            "unwrap_options.preprocess_options.interpolation_similarity_threshold",
-            |c| {
-                c.unwrap_options
-                    .preprocess_options
-                    .interpolation_similarity_threshold = 0.4
-            },
-        ),
         (
             "unwrap_options.preprocess_options.zero_correlation_where_interpolating",
             |c| {
