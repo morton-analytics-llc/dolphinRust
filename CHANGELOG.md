@@ -97,6 +97,24 @@ All notable changes to dolphinRust are documented here. The format follows
   `velocity_sigma.tif`, now scores.
 
 ### Breaking changes
+- **The automatic spatial reference now sits on coherent support by default** (eo #758).
+  New `timeseries_options.reference_selection` (`coherent_support` | `largest_component_centroid`)
+  and `timeseries_options.reference_coherence_floor` (default 0.85). `coherent_support` follows
+  dolphin v0.42's `select_reference_point`: candidates are pixels valid on every date with
+  temporal coherence above the floor (strict `>`), inside the largest joint unwrap component
+  (dolphin: the largest region of its connected-component intersection); the largest
+  8-connected region of candidates wins. Deliberate differences from dolphin: the floor is
+  configurable with default 0.85 rather than a hard-coded 0.95, and within the region the pixel
+  with the highest 3×3 in-region coherence sum wins, with dolphin's nearest-to-centre-of-mass
+  and then `(row, col)` as tie-breaks. An empty pool falls back to the previous rule, which
+  `largest_component_centroid` keeps exactly: largest 4-connected region above
+  `correlation_threshold`, pixel nearest its coherence-weighted centroid. Previously that rule
+  was the only one, so on a frame of middling coherence the datum could land on decorrelated
+  ground (Fresno T137: OPERA temporal coherence 0.595 at the chosen pixel).
+  `geometry_provenance.json` gains `reference_selection`: method and version, requested
+  method, whether it fell back, the pixel, its temporal coherence, the floor, and the
+  candidate pool and region sizes. **Automatically referenced products change value unless
+  the config sets `reference_selection: largest_component_centroid`.**
 - **The velocity point estimator is now post-gauge unit-precision on every path** (issue
   #123). `timeseries_options.write_velocity_uncertainty` used to *select* the estimator as a
   side effect of asking for a sigma layer: with it off the pipeline emitted a full-series fit
