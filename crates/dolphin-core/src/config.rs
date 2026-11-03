@@ -114,7 +114,7 @@ pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
     },
     ConfigBehaviorContract {
         id: "CFG-TIMESERIES",
-        reader: "dolphin-workflows::displacement::{finish_displacement, sequential_config, invert_time_series, fit_velocity, apply_loop_closure_qc}",
+        reader: "dolphin-workflows::displacement::{finish_displacement, sequential_config, invert_time_series, fit_velocity, apply_loop_closure_qc, validate_config}",
         evidence: "dolphin-workflows::{displacement_contract::l2_uncertainty_products_are_opt_in_and_unit_aligned, multiburst_contract} and displacement reference/correlation/loop-closure unit contracts",
     },
     ConfigBehaviorContract {
@@ -406,6 +406,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.mask_unwrap_loop_errors",
         "CFG-TIMESERIES",
         "timeseries_options.mask_unwrap_loop_errors is true"
+    ),
+    conditional!(
+        "timeseries_options.correct_unwrap_loop_errors",
+        "CFG-TIMESERIES",
+        "timeseries_options.correct_unwrap_loop_errors is true"
     ),
     conditional!(
         "timeseries_options.write_cycle_step_diagnostics",
@@ -954,6 +959,18 @@ pub struct TimeseriesOptions {
     /// `max_temporal_baseline`. Emits `loop_closure_bad_count.tif` and
     /// `loop_closure_worst_cycles.tif`. See issue #24.
     pub mask_unwrap_loop_errors: bool,
+    /// Before the loop-closure gate, solve each pixel for the integer `2π`
+    /// cycles that close every loop with the smallest total change (Yunjun et
+    /// al. 2019, MintPy's `unwrap_error_phase_closure`) and add them back, so a
+    /// pixel with a repairable unwrap error is corrected instead of masked. A
+    /// pixel is corrected only when that minimal correction is unique; ties,
+    /// unevaluable loops and non-integer misclosures are left alone, and the
+    /// gate then runs on the corrected stack as QC exactly as before. Requires
+    /// `mask_unwrap_loop_errors` and a bandwidth or temporal-baseline network.
+    /// Forward divergence from dolphin, **off by default**. Emits
+    /// `loop_closure_correction_status.tif` and
+    /// `loop_closure_corrected_count.tif`. See issue #142.
+    pub correct_unwrap_loop_errors: bool,
     /// Write the per-date phase-step diagnostic rasters computed on the inverted
     /// series before corrections and the spatial reference: one
     /// `junction_step_cycles_NN.tif` per ministack boundary (each pixel's step
@@ -986,6 +1003,7 @@ impl Default for TimeseriesOptions {
             velocity_step_dates: Vec::new(),
             velocity_relaxation: Vec::new(),
             mask_unwrap_loop_errors: false,
+            correct_unwrap_loop_errors: false,
             write_cycle_step_diagnostics: false,
         }
     }

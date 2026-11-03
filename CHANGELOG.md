@@ -7,6 +7,21 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Integer-cycle correction of unwrap errors from loop closure** (issue #142). The new
+  `timeseries_options.correct_unwrap_loop_errors` (off by default; requires
+  `mask_unwrap_loop_errors`) solves each pixel, before the loop-closure gate, for the integer
+  `2π` cycles that close every triangle with the smallest total change (Yunjun et al. 2019,
+  MintPy's `unwrap_error_phase_closure`) and adds them back; the gate then runs on the
+  corrected stack as QC. The L1 solve is exact (min-cost circulation over the date graph) and
+  a pixel is corrected only when its minimal correction is unique; ties, unevaluable loops,
+  misclosures more than a quarter cycle from an integer, and inconsistent misclosures are left
+  alone for the gate. Needs every sequential pair and the fan triangles a bandwidth or
+  temporal-baseline network has; other networks fail before unwrapping. Writes
+  `loop_closure_correction_status.tif` and `loop_closure_corrected_count.tif`;
+  `loop_closure_worst_cycles.tif` is then the residual closure after correction.
+  `PublicationQuality` gains `closure_corrected_pixels`, `closure_uncorrected_pixels` and
+  `closure_corrected_per_band`, and the covariance unwrap-branch digest distinguishes a
+  corrected branch.
 - **Pre-unwrap interpolation** (`unwrap_options.run_interpolation`, dolphin's option and
   defaults: `max_radius: 51`, similarity/correlation cutoff `0.3`, 20 neighbours, alpha
   0.75). Each network interferogram's wrapped phase is interpolated from coherent neighbours
