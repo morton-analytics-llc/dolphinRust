@@ -12,7 +12,9 @@ All notable changes to dolphinRust are documented here. The format follows
   0.75). Each network interferogram's wrapped phase is interpolated from coherent neighbours
   before the unwrapper (dolphin v0.35.0 `interpolate`, matched to its oracle), and the solved
   whole-cycle ambiguities are transferred back onto every pixel's own wrapped phase, so the
-  interpolated values feed the unwrapper only and publication masks are unchanged. A nonzero
+  interpolated values feed the unwrapper only. Interpolated pixels carry no connected-component
+  label in that interferogram, so interpolation never adds unwrap support (in place of dolphin's
+  unported SNAPHU component regrow). A nonzero
   `interpolation_similarity_threshold` masks on phase similarity (computed for this purpose
   when `write_phase_similarity` is off), otherwise on per-ifg correlation.
   `unwrap_interpolated_count.tif` records, per pixel, how many interferograms were
