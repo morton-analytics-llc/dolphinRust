@@ -37,7 +37,10 @@ pub use loop_correction::{
     LoopCorrectionError, PixelCorrection, MAX_CORRECTION_FRACTION_CYCLES,
 };
 pub use network::{build_network, NetworkConfig};
-pub use reference::{reference_to_point, select_reference_point};
+pub use reference::{
+    reference_to_point, select_coherent_reference_point, select_reference_point, CoherentReference,
+    COHERENT_SUPPORT_METHOD_VERSION,
+};
 pub use spatial_covariance::{
     convert_covariance_units, date_contrast, fixed_l2_difference_workspace_composition,
     solve_fixed_l2_spatial_covariance, solve_fixed_l2_spatial_covariance_from_factor,

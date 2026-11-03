@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dolphin_core::config::{
-    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, TimeseriesMethod,
-    UnwrapMethod,
+    CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, ReferenceSelectionMethod,
+    TimeseriesMethod, TimeseriesOptions, UnwrapMethod,
 };
 use dolphin_core::{BlockIndices, Cf32, Cf64};
 use dolphin_io::{
@@ -35,9 +35,10 @@ use dolphin_timeseries::{
     estimate_velocity_with_diagnostics, estimate_velocity_with_model,
     estimate_velocity_with_uncertainty, get_incidence_matrix, invert_stack, invert_stack_l1,
     invert_stack_with_uncertainty, loop_closure_qc, mask_failed_loops, network_triplets,
-    reference_to_point, select_reference_point, L1Config, LoopClosureQc, NetworkConfig,
-    PixelCorrection, RelaxationTerm, VelocityCadenceStatus, VelocityModel,
-    VelocityUncertaintyStatus, DEFAULT_CLOSURE_TOLERANCE_CYCLES,
+    reference_to_point, select_coherent_reference_point, select_reference_point, L1Config,
+    LoopClosureQc, NetworkConfig, PixelCorrection, RelaxationTerm, VelocityCadenceStatus,
+    VelocityModel, VelocityUncertaintyStatus, COHERENT_SUPPORT_METHOD_VERSION,
+    DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_timeseries::{
     detect_cycle_steps, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
@@ -70,7 +71,7 @@ use crate::phase_steps::{
 };
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
-    INPUT_COVERAGE_POLICY_VERSION,
+    ReferenceSelectionProvenance, INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
     run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
@@ -575,7 +576,7 @@ fn finish_displacement(
     // on the corrected series so it cannot choose a high-coherence pixel whose
     // displacement became non-finite.
     let date_files = first_burst_files(cfg, &groups);
-    let (corrections, analysis_reference_point) = timed("corrections", || {
+    let (corrections, analysis_reference) = timed("corrections", || {
         correct_then_reference(
             &mut inversion.displacement,
             |displacement| {
@@ -599,10 +600,12 @@ fn finish_displacement(
                     temporal_coherence.view(),
                     validity_mask.view(),
                     displacement,
+                    unwrap.connected_components.view(),
                 )
             },
         )
     })?;
+    let analysis_reference_point = analysis_reference.map(|(point, _)| point);
     let production_covariance = if cfg.phase_linking.write_covariance_operator {
         let backend_config = serde_json::to_vec(&cfg.unwrap_options)
             .context("serializing production unwrap configuration")?;
@@ -672,6 +675,7 @@ fn finish_displacement(
         unwrap_connected_components: unwrap.connected_components,
         geotransform,
         reference_point: analysis_reference_point,
+        reference_selection: analysis_reference.map(|(_, selection)| selection),
         production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
@@ -689,19 +693,21 @@ fn final_spatial_reference(
     temporal_coherence: ArrayView2<f64>,
     validity_mask: ArrayView2<bool>,
     displacement: ArrayView3<f64>,
-) -> Result<Option<(usize, usize)>> {
+    connected_components: ArrayView3<u32>,
+) -> Result<Option<SelectedReference>> {
     if let Some(point) = configured_reference {
         anyhow::ensure!(
             reference_pixel_is_valid(validity_mask, displacement, point),
             "timeseries_options.reference_point has non-finite corrected displacement"
         );
-        return Ok(Some(point));
+        return Ok(Some((point, ReferenceSelection::CONFIGURED)));
     }
     let selected = select_valid_reference_point(
+        &cfg.timeseries_options,
         temporal_coherence,
         validity_mask,
         displacement,
-        cfg.timeseries_options.correlation_threshold,
+        connected_components,
     );
     if selected.is_none() && cfg.timeseries_options.write_velocity_uncertainty {
         let referenceable = referenceable_pixel_count(Some(validity_mask), displacement);
@@ -744,14 +750,14 @@ fn referenceable_pixel_count(
 fn correct_then_reference(
     displacement: &mut Array3<f64>,
     correct: impl FnOnce(&mut Array3<f64>) -> Result<CorrectionLayers>,
-    select_reference: impl FnOnce(ArrayView3<f64>) -> Result<Option<(usize, usize)>>,
-) -> Result<(CorrectionLayers, Option<(usize, usize)>)> {
+    select_reference: impl FnOnce(ArrayView3<f64>) -> Result<Option<SelectedReference>>,
+) -> Result<(CorrectionLayers, Option<SelectedReference>)> {
     let corrections = correct(displacement)?;
-    let reference_point = select_reference(displacement.view())?;
-    if let Some(point) = reference_point {
+    let reference = select_reference(displacement.view())?;
+    if let Some((point, _)) = reference {
         reference_to_point(displacement, point);
     }
-    Ok((corrections, reference_point))
+    Ok((corrections, reference))
 }
 
 fn reference_pixel_is_valid(
@@ -765,25 +771,142 @@ fn reference_pixel_is_valid(
             .all(|band| band[point].is_finite())
 }
 
+/// How the current spatial reference was chosen. Its final coordinates and
+/// coherence are filled in at publication, after any bounded trim or
+/// publication-mask re-selection has moved it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReferenceSelection {
+    method: &'static str,
+    method_version: &'static str,
+    fell_back: bool,
+    coherence_floor: Option<f64>,
+    candidate_pool_pixels: Option<usize>,
+    candidate_region_pixels: Option<usize>,
+}
+
+/// A reference pixel with the rule that chose it.
+type SelectedReference = ((usize, usize), ReferenceSelection);
+
+impl ReferenceSelection {
+    const CONFIGURED: Self = Self {
+        method: "configured",
+        method_version: "configured/1",
+        fell_back: false,
+        coherence_floor: None,
+        candidate_pool_pixels: None,
+        candidate_region_pixels: None,
+    };
+    const LARGEST_COMPONENT_CENTROID: Self = Self {
+        method: "largest_component_centroid",
+        method_version: "largest-component-centroid/1",
+        fell_back: false,
+        coherence_floor: None,
+        candidate_pool_pixels: None,
+        candidate_region_pixels: None,
+    };
+
+    fn provenance(
+        self,
+        cfg: &DisplacementWorkflow,
+        (row, col): (usize, usize),
+        temporal_coherence: f64,
+    ) -> ReferenceSelectionProvenance {
+        let requested_method = match (
+            cfg.timeseries_options.reference_point,
+            cfg.timeseries_options.reference_selection,
+        ) {
+            (Some(_), _) => "configured",
+            (None, ReferenceSelectionMethod::LargestComponentCentroid) => {
+                "largest_component_centroid"
+            }
+            (None, ReferenceSelectionMethod::CoherentSupport) => "coherent_support",
+        };
+        ReferenceSelectionProvenance {
+            method: self.method.into(),
+            method_version: self.method_version.into(),
+            requested_method: requested_method.into(),
+            fell_back: self.fell_back,
+            row,
+            col,
+            temporal_coherence,
+            coherence_floor: self.coherence_floor,
+            candidate_pool_pixels: self.candidate_pool_pixels,
+            candidate_region_pixels: self.candidate_region_pixels,
+        }
+    }
+}
+
+/// Automatic reference among pixels valid on every date, by the configured
+/// rule. `coherent_support` also confines candidates to the largest joint unwrap
+/// component, the region publication keeps when it masks pixels outside the
+/// reference's component (dolphin restricts to the largest region of its
+/// connected-component intersection for the same reason); with no labelled
+/// pixel it proceeds without that restriction, as dolphin does. An empty
+/// candidate pool falls back to `largest_component_centroid`, recorded as such.
 fn select_valid_reference_point(
+    options: &TimeseriesOptions,
     quality: ArrayView2<f64>,
     validity_mask: ArrayView2<bool>,
     displacement: ArrayView3<f64>,
-    threshold: f64,
-) -> Option<(usize, usize)> {
-    if quality.dim() != validity_mask.dim()
-        || quality.dim() != (displacement.dim().1, displacement.dim().2)
+    connected_components: ArrayView3<u32>,
+) -> Option<SelectedReference> {
+    let grid = quality.dim();
+    let (_, component_rows, component_cols) = connected_components.dim();
+    if grid != validity_mask.dim()
+        || grid != (displacement.dim().1, displacement.dim().2)
+        || grid != (component_rows, component_cols)
     {
         return None;
     }
-    let eligible_quality = Array2::from_shape_fn(quality.dim(), |point| {
+    let eligible_quality = Array2::from_shape_fn(grid, |point| {
         if reference_pixel_is_valid(validity_mask, displacement, point) {
             quality[point]
         } else {
             f64::NAN
         }
     });
-    select_reference_point(eligible_quality.view(), threshold)
+    let legacy = |selection: ReferenceSelection| {
+        select_reference_point(eligible_quality.view(), options.correlation_threshold)
+            .map(|point| (point, selection))
+    };
+    if options.reference_selection == ReferenceSelectionMethod::LargestComponentCentroid {
+        return legacy(ReferenceSelection::LARGEST_COMPONENT_CENTROID);
+    }
+    let floor = options.reference_coherence_floor;
+    let labels = crate::crop::label_unwrap_components(connected_components, validity_mask);
+    let has_labels = labels.iter().any(|&label| label != 0);
+    let support_quality = Array2::from_shape_fn(grid, |point| {
+        if has_labels && labels[point] != 1 {
+            f64::NAN
+        } else {
+            eligible_quality[point]
+        }
+    });
+    if let Some(chosen) = select_coherent_reference_point(support_quality.view(), floor) {
+        return Some((
+            chosen.point,
+            ReferenceSelection {
+                method: "coherent_support",
+                method_version: COHERENT_SUPPORT_METHOD_VERSION,
+                fell_back: false,
+                coherence_floor: Some(floor),
+                candidate_pool_pixels: Some(chosen.pool_pixels),
+                candidate_region_pixels: Some(chosen.region_pixels),
+            },
+        ));
+    }
+    tracing::warn!(
+        stage = "reference",
+        coherence_floor = floor,
+        "no displacement-valid pixel in the largest unwrap component exceeds the reference \
+         coherence floor; falling back to largest_component_centroid"
+    );
+    legacy(ReferenceSelection {
+        fell_back: true,
+        coherence_floor: Some(floor),
+        candidate_pool_pixels: Some(0),
+        ..ReferenceSelection::LARGEST_COMPONENT_CENTROID
+    })
 }
 
 struct InversionProducts {
@@ -1521,6 +1644,8 @@ struct SpatialProducts {
     corrections: CorrectionLayers,
     geotransform: [f64; 6],
     reference_point: Option<(usize, usize)>,
+    /// How `reference_point` was chosen; `None` exactly when it is `None`.
+    reference_selection: Option<ReferenceSelection>,
     posterior_variance_rad: Option<Array3<f64>>,
     /// SBAS network-inversion misclosure RMS (see
     /// `InversionProducts::network_misclosure_rms`) — how well the
@@ -1725,14 +1850,16 @@ fn emit_displacement(
         .is_none_or(|point| !spatial.validity_mask.get(point).copied().unwrap_or(false))
     {
         let selected = select_valid_reference_point(
+            &cfg.timeseries_options,
             spatial.temporal_coherence.view(),
             spatial.validity_mask.view(),
             spatial.disp_rad.view(),
-            cfg.timeseries_options.correlation_threshold,
+            spatial.unwrap_connected_components.view(),
         );
         match selected {
-            Some(point) => {
+            Some((point, selection)) => {
                 spatial.rereference_to(point, &days, cfg)?;
+                spatial.reference_selection = Some(selection);
                 SpatialReferenceStatus::Selected
             }
             None => {
@@ -1938,6 +2065,12 @@ fn emit_displacement(
             .map(|junction| junction.summary.clone())
             .collect(),
     });
+    geometry_provenance.reference_selection = spatial
+        .reference_point
+        .zip(spatial.reference_selection)
+        .map(|(point, selection)| {
+            selection.provenance(cfg, point, spatial.temporal_coherence[point])
+        });
     geometry_provenance.cycle_steps = Some(CycleStepProvenance {
         half_window: DEFAULT_CYCLE_STEP_HALF_WINDOW,
         tolerance_cycles: DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
@@ -2305,11 +2438,17 @@ impl SpatialProducts {
                 target.row_start..target.row_stop,
                 target.col_start..target.col_stop
             ]);
-            let local = select_valid_reference_point(
+            let target_components = self.unwrap_connected_components.slice(s![
+                ..,
+                target.row_start..target.row_stop,
+                target.col_start..target.col_stop
+            ]);
+            let (local, selection) = select_valid_reference_point(
+                &cfg.timeseries_options,
                 target_coherence,
                 target_validity,
                 target_displacement,
-                cfg.timeseries_options.correlation_threshold,
+                target_components,
             )
             .context(
                 "bounded target has no displacement-valid pixel meeting the configured reference coherence threshold",
@@ -2317,6 +2456,7 @@ impl SpatialProducts {
             let global = (target.row_start + local.0, target.col_start + local.1);
             self.rereference_to(global, days, cfg)
                 .context("bounded velocity re-fit after re-referencing")?;
+            self.reference_selection = Some(selection);
         }
         self.disp_rad = trim3(&self.disp_rad, target);
         self.vel_rad = trim2(&self.vel_rad, target);
@@ -5867,6 +6007,18 @@ mod tests {
             (cfg, out)
         };
         let (cfg, out) = run(false);
+        // The fixture pins `timeseries_options.reference_point`.
+        let reference = out.geometry_provenance.reference_selection.clone().unwrap();
+        let point = (reference.row, reference.col);
+        assert_eq!(Some(point), out.reference_point);
+        assert_eq!(reference.method, "configured");
+        assert_eq!(reference.temporal_coherence, out.temporal_coherence[point]);
+        let written_path = cfg
+            .work_directory
+            .join(crate::provenance::GEOMETRY_PROVENANCE_FILENAME);
+        assert!(std::fs::read_to_string(written_path)
+            .unwrap()
+            .contains("\"reference_selection\""));
         let junctions = out
             .geometry_provenance
             .ministack_junctions
@@ -6166,6 +6318,7 @@ mod tests {
             },
             geotransform: [0.0; 6],
             reference_point: None,
+            reference_selection: None,
             posterior_variance_rad: Some(Array3::from_elem((2, 2, 2), 1.0)),
             network_misclosure_rad: Some(Array2::from_elem((2, 2), 1.0)),
             timeseries_residual_rad: Some(Array2::from_elem((2, 2), 1.0)),
@@ -6307,6 +6460,7 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 180.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
+            reference_selection: Some(ReferenceSelection::CONFIGURED),
             posterior_variance_rad: None,
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
@@ -6374,6 +6528,7 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
+            reference_selection: Some(ReferenceSelection::CONFIGURED),
             posterior_variance_rad: None,
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
@@ -6597,7 +6752,7 @@ mod tests {
                     los_geometry: None,
                 })
             },
-            |_| Ok(Some((0, 1))),
+            |_| Ok(Some(((0, 1), ReferenceSelection::CONFIGURED))),
         )
         .unwrap();
 
@@ -6607,35 +6762,180 @@ mod tests {
         );
     }
 
+    fn reference_options(method: ReferenceSelectionMethod) -> TimeseriesOptions {
+        TimeseriesOptions {
+            correlation_threshold: 0.5,
+            reference_selection: method,
+            ..TimeseriesOptions::default()
+        }
+    }
+
+    const BOTH_REFERENCE_METHODS: [ReferenceSelectionMethod; 2] = [
+        ReferenceSelectionMethod::LargestComponentCentroid,
+        ReferenceSelectionMethod::CoherentSupport,
+    ];
+
     #[test]
     fn automatic_reference_skips_a_nonfinite_displacement_candidate() {
         let quality = Array2::from_elem((5, 5), 0.9);
         let validity = Array2::from_elem((5, 5), true);
+        let components = Array3::<u32>::ones((2, 5, 5));
         let mut displacement = Array3::from_elem((3, 5, 5), 1.0);
         displacement[(1, 2, 2)] = f64::NAN;
 
-        let reference =
-            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5)
-                .expect("another coherent finite reference remains");
+        for method in BOTH_REFERENCE_METHODS {
+            let (reference, _) = select_valid_reference_point(
+                &reference_options(method),
+                quality.view(),
+                validity.view(),
+                displacement.view(),
+                components.view(),
+            )
+            .expect("another coherent finite reference remains");
 
-        assert_ne!(reference, (2, 2));
-        assert!(reference_pixel_is_valid(
-            validity.view(),
-            displacement.view(),
-            reference
-        ));
+            assert_ne!(reference, (2, 2), "{method:?}");
+            assert!(reference_pixel_is_valid(
+                validity.view(),
+                displacement.view(),
+                reference
+            ));
+        }
     }
 
     #[test]
     fn automatic_reference_abstains_when_every_displacement_candidate_is_invalid() {
         let quality = Array2::from_elem((3, 3), 0.9);
         let validity = Array2::from_elem((3, 3), true);
+        let components = Array3::<u32>::ones((2, 3, 3));
         let displacement = Array3::from_elem((2, 3, 3), f64::NAN);
 
-        assert_eq!(
-            select_valid_reference_point(quality.view(), validity.view(), displacement.view(), 0.5,),
-            None
+        for method in BOTH_REFERENCE_METHODS {
+            assert_eq!(
+                select_valid_reference_point(
+                    &reference_options(method),
+                    quality.view(),
+                    validity.view(),
+                    displacement.view(),
+                    components.view(),
+                ),
+                None,
+                "{method:?}"
+            );
+        }
+    }
+
+    /// Regression: with `largest_component_centroid` the workflow picks exactly
+    /// what it picked before `coherent_support` existed (pins recorded from the
+    /// pre-change code on this fixture), whatever the coherence floor says.
+    #[test]
+    fn legacy_reference_option_reproduces_the_original_choice() {
+        let mut quality =
+            Array2::from_shape_fn((12, 15), |(r, c)| ((r * 7 + c * 13) % 17) as f64 / 17.0);
+        quality[(5, 6)] = f64::NAN;
+        quality[(0, 0)] = f64::NAN;
+        let validity = Array2::from_elem((12, 15), true);
+        let components = Array3::<u32>::ones((3, 12, 15));
+        let displacement = Array3::<f64>::zeros((2, 12, 15));
+        for (threshold, expected) in [(0.2, (6, 7)), (0.5, (1, 2)), (0.8, (0, 5))] {
+            let options = TimeseriesOptions {
+                correlation_threshold: threshold,
+                reference_selection: ReferenceSelectionMethod::LargestComponentCentroid,
+                reference_coherence_floor: 0.1,
+                ..TimeseriesOptions::default()
+            };
+            let (point, selection) = select_valid_reference_point(
+                &options,
+                quality.view(),
+                validity.view(),
+                displacement.view(),
+                components.view(),
+            )
+            .unwrap();
+            assert_eq!(point, expected, "threshold {threshold}");
+            assert_eq!(selection, ReferenceSelection::LARGEST_COMPONENT_CENTROID);
+        }
+    }
+
+    /// With no pixel above the floor, `coherent_support` returns the legacy
+    /// choice and records that it fell back.
+    #[test]
+    fn coherent_support_falls_back_to_the_legacy_rule_and_records_it() {
+        let mut quality = Array2::from_elem((5, 7), 0.6);
+        quality[(0, 0)] = 0.84;
+        let validity = Array2::from_elem((5, 7), true);
+        let components = Array3::<u32>::ones((2, 5, 7));
+        let displacement = Array3::<f64>::zeros((2, 5, 7));
+        let options = reference_options(ReferenceSelectionMethod::CoherentSupport);
+        let (point, selection) = select_valid_reference_point(
+            &options,
+            quality.view(),
+            validity.view(),
+            displacement.view(),
+            components.view(),
+        )
+        .unwrap();
+        let legacy = select_reference_point(quality.view(), options.correlation_threshold);
+        assert_eq!(Some(point), legacy);
+        assert!(selection.fell_back);
+        assert_eq!(selection.method, "largest_component_centroid");
+        assert_eq!(selection.coherence_floor, Some(0.85));
+        assert_eq!(selection.candidate_pool_pixels, Some(0));
+        assert_eq!(selection.candidate_region_pixels, None);
+    }
+
+    /// `coherent_support` draws from the largest joint unwrap component (the
+    /// region publication keeps), even when a bigger coherent patch sits in a
+    /// smaller component, and records its pool and region sizes.
+    #[test]
+    fn coherent_support_stays_in_the_largest_unwrap_component() {
+        let (rows, cols) = (6, 10);
+        let mut quality = Array2::from_elem((rows, cols), 0.5);
+        // Columns 0..=6 are unwrap component 1 in every interferogram; columns
+        // 7..=9 are component 2 in the second one, so they form a smaller joint
+        // component. The coherent patch there is larger than the one in the
+        // main component.
+        for r in 0..rows {
+            for c in 7..cols {
+                quality[(r, c)] = 0.95;
+            }
+        }
+        for r in 1..=2 {
+            for c in 1..=2 {
+                quality[(r, c)] = 0.9;
+            }
+        }
+        let mut components = Array3::<u32>::ones((2, rows, cols));
+        components.slice_mut(s![1, .., 7..]).fill(2);
+        let validity = Array2::from_elem((rows, cols), true);
+        let displacement = Array3::<f64>::zeros((2, rows, cols));
+        let options = reference_options(ReferenceSelectionMethod::CoherentSupport);
+        let (point, selection) = select_valid_reference_point(
+            &options,
+            quality.view(),
+            validity.view(),
+            displacement.view(),
+            components.view(),
+        )
+        .unwrap();
+        assert!(
+            (1..=2).contains(&point.0) && (1..=2).contains(&point.1),
+            "{point:?}"
         );
+        assert_eq!(selection.method, "coherent_support");
+        assert_eq!(selection.method_version, COHERENT_SUPPORT_METHOD_VERSION);
+        assert!(!selection.fell_back);
+        assert_eq!(selection.candidate_pool_pixels, Some(4));
+        assert_eq!(selection.candidate_region_pixels, Some(4));
+        // The legacy rule ignores both coherence and unwrap components.
+        let (legacy, _) = select_valid_reference_point(
+            &reference_options(ReferenceSelectionMethod::LargestComponentCentroid),
+            quality.view(),
+            validity.view(),
+            displacement.view(),
+            components.view(),
+        )
+        .unwrap();
+        assert_ne!(legacy, point);
     }
 
     /// Issue #40: the SBAS network-inversion misclosure and the temporal
@@ -7159,6 +7459,7 @@ mod tests {
                 coherence.view(),
                 validity.view(),
                 displacement.view(),
+                Array3::<u32>::ones((2, 2, 2)).view(),
             )
             .expect("no referenceable pixel is unavailable, not an error");
             assert_eq!(selected, None);
@@ -7166,7 +7467,7 @@ mod tests {
                 &cfg,
                 displacement.view(),
                 &days,
-                selected,
+                None,
                 Some(validity.view()),
                 &VelocityModel::default(),
             )
@@ -7186,17 +7487,30 @@ mod tests {
         let coherence = Array2::from_elem((2, 2), 0.3);
         let validity = Array2::from_elem((2, 2), true);
         let finite = Array3::zeros((2, 2, 2));
-        let error =
-            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), finite.view())
-                .unwrap_err();
+        let components = Array3::<u32>::ones((2, 2, 2));
+        let error = final_spatial_reference(
+            &cfg,
+            None,
+            coherence.view(),
+            validity.view(),
+            finite.view(),
+            components.view(),
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("requires a displacement-valid final spatial reference"));
 
         let empty = Array3::from_elem((2, 2, 2), f64::NAN);
-        let selected =
-            final_spatial_reference(&cfg, None, coherence.view(), validity.view(), empty.view())
-                .unwrap();
+        let selected = final_spatial_reference(
+            &cfg,
+            None,
+            coherence.view(),
+            validity.view(),
+            empty.view(),
+            components.view(),
+        )
+        .unwrap();
         assert_eq!(selected, None);
     }
 
@@ -7245,6 +7559,7 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
             reference_point: None,
+            reference_selection: None,
             posterior_variance_rad: None,
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
@@ -7329,6 +7644,7 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             reference_point: None,
+            reference_selection: None,
             posterior_variance_rad: None,
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
@@ -8598,6 +8914,7 @@ mod tests {
             },
             geotransform: [0.0, 30.0, 0.0, 60.0, 0.0, -30.0],
             reference_point: Some((0, 0)),
+            reference_selection: Some(ReferenceSelection::CONFIGURED),
             posterior_variance_rad: Some(Array3::from_elem((1, 2, 2), 4.0)),
             network_misclosure_rad: None,
             timeseries_residual_rad: None,
@@ -9731,6 +10048,7 @@ mod tests {
             geotransform: [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             // In the halo, so trim re-selects a reference and re-fits.
             reference_point: Some((0, 0)),
+            reference_selection: Some(ReferenceSelection::CONFIGURED),
             posterior_variance_rad: None,
             network_misclosure_rad: None,
             timeseries_residual_rad: None,

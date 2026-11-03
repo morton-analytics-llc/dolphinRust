@@ -26,7 +26,7 @@ Gates green throughout: fmt, clippy -D warnings, test (37 groups), cargo doc --n
 |---|---|
 | Baseline speed benchmark (`bench/`) | ✅ done — PL 3.6× / e2e 2.0× on a real frame; per-stage `tracing` timing; honest unwrap caveat (Rosetta snaphu) |
 | Close velocity-scale residual (B4) | ✅ done — Mexico City T005, TLS slope ≈1.03, magnitudes match; VALIDATION.md updated |
-| Auto reference-point selection (center-of-mass) | ✅ done — `select_reference_point`/`reference_to_point`, wired via `timeseries_options.reference_point`, 5 analytic contracts + e2e green |
+| Auto reference-point selection | ✅ done — `coherent_support` (default; high-coherence floor, dolphin v0.42 candidate rule) and legacy `largest_component_centroid`, chosen by `timeseries_options.reference_selection`; recorded in `geometry_provenance.json` `reference_selection` |
 | eo integration | ✅ done (signed off) — `gp-dolphin` crate+worker in `../eo` (branch `feature/gp-dolphin-rust`, unpushed): in-process `run_displacement` via `spawn_blocking`, COG → gp-storage + summary rows → PostGIS. One real frame ran end-to-end (T144, COG in MinIO + `displacement_aoi_summary`/`aoi_raster_products` ready). Isolated as its own workspace to avoid the hdf5-metno vs hdf5-sys link clash |
 
 Gates green (fmt, clippy -D warnings, test, doc). **Nothing pushed** — branch `v1.1`.

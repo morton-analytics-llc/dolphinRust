@@ -340,6 +340,16 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "the Rust workflow always propagates its validity mask"
     ),
     consumed!("timeseries_options.correlation_threshold", "CFG-TIMESERIES"),
+    conditional!(
+        "timeseries_options.reference_selection",
+        "CFG-TIMESERIES",
+        "timeseries_options.reference_point is unset"
+    ),
+    conditional!(
+        "timeseries_options.reference_coherence_floor",
+        "CFG-TIMESERIES",
+        "timeseries_options.reference_selection is coherent_support and reference_point is unset"
+    ),
     compatibility_only!(
         "timeseries_options.block_shape",
         "timeseries inversion is not configured through block scheduling"
@@ -700,6 +710,25 @@ pub enum TimeseriesMethod {
     L2,
 }
 
+/// Rule for the automatic spatial reference pixel, used when
+/// `timeseries_options.reference_point` is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSelectionMethod {
+    /// The original dolphinRust rule: largest 4-connected region with temporal
+    /// coherence above `correlation_threshold`, pixel nearest its
+    /// coherence-weighted centroid. No high-coherence floor, so on a frame of
+    /// middling coherence it can land on decorrelated ground.
+    LargestComponentCentroid,
+    /// dolphin v0.42's candidate rule: temporal coherence above
+    /// `reference_coherence_floor`, valid on every date, inside the largest joint
+    /// unwrap component; the largest 8-connected region of those, ranked by
+    /// neighbourhood coherence. Falls back to `largest_component_centroid` when
+    /// no pixel qualifies, and records that it did.
+    #[default]
+    CoherentSupport,
+}
+
 /// Persistent-scatterer selection. dolphin `PsOptions`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -855,6 +884,13 @@ pub struct TimeseriesOptions {
     pub apply_mask_to_timeseries: bool,
     /// Pixels with correlation below this value are masked out.
     pub correlation_threshold: f64,
+    /// Automatic reference-pixel rule when `reference_point` is unset.
+    pub reference_selection: ReferenceSelectionMethod,
+    /// Temporal-coherence floor (strict `>`) for `coherent_support` reference
+    /// candidates. dolphin hard-codes 0.95; 0.85 is the point where engine/OPERA
+    /// agreement saturates on Fresno T137 (r 0.90 at 0.85-0.95 vs 0.94 at >=0.95,
+    /// 0.76 at 0.70-0.85) while keeping a candidate pool about five times larger.
+    pub reference_coherence_floor: f64,
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub block_shape: (usize, usize),
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
@@ -944,6 +980,8 @@ impl Default for TimeseriesOptions {
             run_velocity: true,
             apply_mask_to_timeseries: true,
             correlation_threshold: 0.2,
+            reference_selection: ReferenceSelectionMethod::default(),
+            reference_coherence_floor: 0.85,
             block_shape: (256, 256),
             num_parallel_blocks: 4,
             use_coherence_weights: true,
@@ -1651,6 +1689,12 @@ impl DisplacementWorkflow {
                     "phase_linking.empirical_source_factor.relative_diagonal_floor must be finite and in (0, 1]".into(),
                 ));
             }
+        }
+        let floor = self.timeseries_options.reference_coherence_floor;
+        if !(floor.is_finite() && (0.0..1.0).contains(&floor)) {
+            return Err(CoreError::InvalidConfig(format!(
+                "timeseries_options.reference_coherence_floor must be in [0, 1), got {floor}"
+            )));
         }
         if self.timeseries_options.write_posterior_uncertainty
             && self.timeseries_options.method != TimeseriesMethod::L2

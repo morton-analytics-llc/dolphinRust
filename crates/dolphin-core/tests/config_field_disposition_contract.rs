@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use dolphin_core::config::{
     ConfigFieldDisposition, CorrectionOptions, DisplacementWorkflow, EmpiricalSourceFactorOptions,
     InputOptions, InterferogramNetwork, OutputOptions, PhaseLinkingOptions, PreprocessOptions,
-    PsOptions, SnaphuOptions, TimeseriesOptions, TophuOptions, UnwrapMethod, UnwrapOptions,
-    WorkerSettings, CONFIG_BEHAVIOR_CONTRACTS, CONFIG_FIELD_DISPOSITIONS,
+    PsOptions, ReferenceSelectionMethod, SnaphuOptions, TimeseriesOptions, TophuOptions,
+    UnwrapMethod, UnwrapOptions, WorkerSettings, CONFIG_BEHAVIOR_CONTRACTS,
+    CONFIG_FIELD_DISPOSITIONS,
 };
 use dolphin_core::CoreError;
 
@@ -69,6 +70,8 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "timeseries_options.run_velocity",
     "timeseries_options.apply_mask_to_timeseries",
     "timeseries_options.correlation_threshold",
+    "timeseries_options.reference_selection",
+    "timeseries_options.reference_coherence_floor",
     "timeseries_options.block_shape",
     "timeseries_options.num_parallel_blocks",
     "timeseries_options.use_coherence_weights",
@@ -339,6 +342,8 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
             run_velocity,
             apply_mask_to_timeseries,
             correlation_threshold,
+            reference_selection,
+            reference_coherence_floor,
             block_shape,
             num_parallel_blocks,
             use_coherence_weights,
@@ -361,6 +366,8 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
         run_velocity,
         apply_mask_to_timeseries,
         correlation_threshold,
+        reference_selection,
+        reference_coherence_floor,
         block_shape,
         num_parallel_blocks,
         use_coherence_weights,
@@ -973,4 +980,29 @@ fn reference_component_fraction_requires_bounds_and_a_fraction() {
         parsed.output_options.min_reference_component_fraction,
         Some(0.9)
     );
+}
+
+/// `timeseries_options.reference_coherence_floor` is a temporal-coherence floor
+/// in [0, 1); the reference rule is snake_case in YAML and both round-trip.
+#[test]
+fn reference_selection_floor_is_a_coherence_and_round_trips() {
+    for invalid in [f64::NAN, -0.1, 1.0, 1.5] {
+        let mut config = DisplacementWorkflow::default();
+        config.timeseries_options.reference_coherence_floor = invalid;
+        let error = config.validate_supported_options().unwrap_err().to_string();
+        assert!(error.contains("[0, 1)"), "{invalid}: {error}");
+    }
+    let mut config = DisplacementWorkflow::default();
+    assert_eq!(
+        config.timeseries_options.reference_selection,
+        ReferenceSelectionMethod::CoherentSupport
+    );
+    config.timeseries_options.reference_selection =
+        ReferenceSelectionMethod::LargestComponentCentroid;
+    config.timeseries_options.reference_coherence_floor = 0.9;
+    config.validate_supported_options().unwrap();
+    let yaml = serde_yaml::to_string(&config).unwrap();
+    assert!(yaml.contains("reference_selection: largest_component_centroid"));
+    let parsed: DisplacementWorkflow = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(parsed.timeseries_options, config.timeseries_options);
 }
