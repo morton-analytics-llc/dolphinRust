@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Geometry provenance discloses which corrections ran and the velocity time-function
+  model** (issue #130). `GeometryProvenance` gains `corrections_applied` (stable names —
+  `solid_earth_tide`, `plate_motion`, `ionosphere`, `troposphere`, `layover_shadow_mask` — in
+  that order, empty when none ran) and `time_function_model` (composed as `linear`,
+  `linear+seasonal`, `linear+seasonal+step(N)`, `linear+relaxation(N)`), both derived
+  deterministically from `CorrectionOptions`, `layover_shadow_mask_files`, and
+  `TimeseriesOptions`. Unlike the sourced-from-metadata fields above, there is no absent case —
+  every run can state these with certainty. Schema bumped to
+  `dolphinrust-geometry-provenance/6`, method version `6.0.0`; the fixed-cube semantic gate in
+  `temporal_covariance_product` pins the new pair. Records older than `/6` deserialize the two
+  new fields as `[]`/`""` (historical placeholders, not a reconstruction of that run).
 - **Integer-cycle correction of unwrap errors from loop closure** (issue #142). The new
   `timeseries_options.correct_unwrap_loop_errors` (off by default; requires
   `mask_unwrap_loop_errors`) solves each pixel, before the loop-closure gate, for the integer

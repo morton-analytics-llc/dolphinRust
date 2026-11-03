@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use dolphin_core::config::{DisplacementWorkflow, InputType};
+use dolphin_core::config::{
+    DisplacementWorkflow, InputType, PlateMotionModel, TroposphereEpoch, VelocityRelaxation,
+};
 use dolphin_corrections::geometry::resolve_los_geometry;
 use dolphin_corrections::LosGeometry;
 use dolphin_workflows::provenance::{
@@ -124,7 +126,7 @@ fn real_metadata_sample_maps_to_exported_fields() {
     assert_eq!(source_keys, &["/metadata/orbit/orbit_type"]);
     let decoded: GeometryProvenance =
         serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/6");
     assert_eq!(decoded.orbit_ephemeris_class.as_deref(), Some("precise"));
     assert!(matches!(
         decoded.geometry_provenance.fields.get("orbit_ephemeris_class"),
@@ -195,7 +197,7 @@ fn coverage_v3_round_trips_without_identifiers() {
     let json = serde_json::to_string(&provenance).unwrap();
     let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/6");
     assert_eq!(decoded.input_coverage, Some(coverage));
     for forbidden in [
         "source_path",
@@ -226,6 +228,105 @@ fn provenance_v2_without_coverage_still_deserializes() {
     assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/2");
     assert_eq!(decoded.input_coverage, None);
     assert_eq!(decoded.orbit_ephemeris_class, None);
+}
+
+/// Issue #130 / eo#483: disclose which corrections ran and the velocity
+/// time-function model. Every variant below is an analytic fixture — the
+/// expected string is composed by hand from the config, not read back from
+/// the implementation.
+#[test]
+fn no_corrections_and_linear_model_by_default() {
+    let prov = assemble_geometry_provenance(&DisplacementWorkflow::default(), None);
+    assert_eq!(prov.corrections_applied, Vec::<String>::new());
+    assert_eq!(prov.time_function_model, "linear");
+}
+
+#[test]
+fn each_correction_source_adds_its_own_stable_name() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.solid_earth_tide = true;
+    cfg.correction_options.plate_motion_model =
+        Some(PlateMotionModel::Plate("NorthAmerica".into()));
+    cfg.correction_options.ionosphere_files = vec![PathBuf::from("ionex_2024001.tif")];
+    cfg.correction_options.troposphere_files = vec![PathBuf::from("tropo_2024001.nc")];
+    cfg.layover_shadow_mask_files = vec![PathBuf::from("layover_shadow.tif")];
+
+    let prov = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(
+        prov.corrections_applied,
+        vec![
+            "solid_earth_tide",
+            "plate_motion",
+            "ionosphere",
+            "troposphere",
+            "layover_shadow_mask",
+        ]
+    );
+}
+
+#[test]
+fn troposphere_epochs_also_count_as_the_troposphere_correction() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.troposphere_epochs = vec![TroposphereEpoch {
+        path: PathBuf::from("tropo_2024001.nc"),
+        epoch: chrono::DateTime::UNIX_EPOCH,
+    }];
+
+    let prov = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(prov.corrections_applied, vec!["troposphere"]);
+}
+
+#[test]
+fn time_function_model_composes_seasonal_step_and_relaxation_in_fixed_order() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.timeseries_options.velocity_seasonal = true;
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal"
+    );
+
+    cfg.timeseries_options.velocity_step_dates = vec!["2024-01-01".into(), "2024-06-01".into()];
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal+step(2)"
+    );
+
+    cfg.timeseries_options.velocity_relaxation = vec![VelocityRelaxation {
+        onset_date: "2024-01-01".into(),
+        tau_days: 30.0,
+    }];
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal+step(2)+relaxation(1)"
+    );
+}
+
+#[test]
+fn provenance_v5_without_corrections_fields_still_deserializes() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.solid_earth_tide = true;
+    cfg.timeseries_options.velocity_seasonal = true;
+    let current = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(current.corrections_applied, vec!["solid_earth_tide"]);
+    assert_eq!(current.time_function_model, "linear+seasonal");
+
+    let mut value = serde_json::to_value(current).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert(
+        "schema".into(),
+        serde_json::Value::String("dolphinrust-geometry-provenance/5".into()),
+    );
+    object.insert(
+        "method_version".into(),
+        serde_json::Value::String("5.0.0".into()),
+    );
+    object.remove("corrections_applied");
+    object.remove("time_function_model");
+
+    let decoded: GeometryProvenance = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.corrections_applied, Vec::<String>::new());
+    assert_eq!(decoded.time_function_model, "");
 }
 
 #[test]
