@@ -48,7 +48,7 @@ pub fn select_reference_point(quality: ArrayView2<f64>, threshold: f64) -> Optio
 
 /// Provenance tag of [`select_coherent_reference_point`]; bump it whenever the
 /// candidate pool, region rule, ranking, or tie-breaks change.
-pub const COHERENT_SUPPORT_METHOD_VERSION: &str = "coherent-support/1";
+pub const COHERENT_SUPPORT_METHOD_VERSION: &str = "coherent-support/2";
 
 /// A reference chosen by [`select_coherent_reference_point`], with the counts
 /// behind the choice.

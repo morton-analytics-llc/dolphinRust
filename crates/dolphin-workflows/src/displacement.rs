@@ -713,6 +713,7 @@ fn final_spatial_reference(
     }
     let selected = select_valid_reference_point(
         &cfg.timeseries_options,
+        EdgeHalo::of(cfg, (0, 0), temporal_coherence.dim()),
         temporal_coherence,
         validity_mask,
         displacement,
@@ -845,6 +846,58 @@ impl ReferenceSelection {
     }
 }
 
+/// Output pixels near the processing-grid edge that `coherent_support` may not
+/// choose as the reference.
+///
+/// The grid edge is where the processing window was cut, not where the data end.
+/// Within `half_window / stride` output pixels of it the phase-linking window is
+/// clamped inward (`window_origin_row` / `window_origin_col` in
+/// dolphin-phaselink), so the pixel's coherence describes an off-centre
+/// neighbourhood, and the 3x3 support score that ranks candidates runs off the
+/// grid. OPERA DISP-S1 chooses its reference so that it is not "an outlier PS
+/// pixel at the frame boundary" (ATBD JPL D-108765 Rev A, section 2.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeHalo {
+    rows: usize,
+    cols: usize,
+    /// Position of the searched grid's (0, 0) in the processing grid.
+    origin: (usize, usize),
+    /// Processing-grid shape.
+    grid: (usize, usize),
+}
+
+impl EdgeHalo {
+    /// No exclusion.
+    #[cfg(test)]
+    const NONE: Self = Self {
+        rows: 0,
+        cols: 0,
+        origin: (0, 0),
+        grid: (usize::MAX, usize::MAX),
+    };
+
+    /// Halo of `cfg`'s phase-linking window on a search grid whose (0, 0) sits at
+    /// `origin` of the `grid`-shaped processing grid.
+    fn of(cfg: &DisplacementWorkflow, origin: (usize, usize), grid: (usize, usize)) -> Self {
+        let half = cfg.phase_linking.half_window;
+        let strides = cfg.output_options.strides;
+        Self {
+            rows: half.y.div_ceil(strides.y.max(1)),
+            cols: half.x.div_ceil(strides.x.max(1)),
+            origin,
+            grid,
+        }
+    }
+
+    fn excludes(&self, (r, c): (usize, usize)) -> bool {
+        let (r, c) = (r + self.origin.0, c + self.origin.1);
+        r < self.rows
+            || r + self.rows >= self.grid.0
+            || c < self.cols
+            || c + self.cols >= self.grid.1
+    }
+}
+
 /// Automatic reference among pixels valid on every date, by the configured
 /// rule. `coherent_support` also confines candidates to the largest joint unwrap
 /// component, the region publication keeps when it masks pixels outside the
@@ -854,6 +907,7 @@ impl ReferenceSelection {
 /// candidate pool falls back to `largest_component_centroid`, recorded as such.
 fn select_valid_reference_point(
     options: &TimeseriesOptions,
+    edge_halo: EdgeHalo,
     quality: ArrayView2<f64>,
     validity_mask: ArrayView2<bool>,
     displacement: ArrayView3<f64>,
@@ -885,7 +939,7 @@ fn select_valid_reference_point(
     let labels = crate::crop::label_unwrap_components(connected_components, validity_mask);
     let has_labels = labels.iter().any(|&label| label != 0);
     let support_quality = Array2::from_shape_fn(grid, |point| {
-        if has_labels && labels[point] != 1 {
+        if (has_labels && labels[point] != 1) || edge_halo.excludes(point) {
             f64::NAN
         } else {
             eligible_quality[point]
@@ -1863,6 +1917,7 @@ fn emit_displacement(
     {
         let selected = select_valid_reference_point(
             &cfg.timeseries_options,
+            EdgeHalo::of(cfg, (0, 0), spatial.temporal_coherence.dim()),
             spatial.temporal_coherence.view(),
             spatial.validity_mask.view(),
             spatial.disp_rad.view(),
@@ -2458,6 +2513,11 @@ impl SpatialProducts {
             ]);
             let (local, selection) = select_valid_reference_point(
                 &cfg.timeseries_options,
+                EdgeHalo::of(
+                    cfg,
+                    (target.row_start, target.col_start),
+                    self.temporal_coherence.dim(),
+                ),
                 target_coherence,
                 target_validity,
                 target_displacement,
@@ -6873,6 +6933,7 @@ mod tests {
         for method in BOTH_REFERENCE_METHODS {
             let (reference, _) = select_valid_reference_point(
                 &reference_options(method),
+                EdgeHalo::NONE,
                 quality.view(),
                 validity.view(),
                 displacement.view(),
@@ -6900,6 +6961,7 @@ mod tests {
             assert_eq!(
                 select_valid_reference_point(
                     &reference_options(method),
+                    EdgeHalo::NONE,
                     quality.view(),
                     validity.view(),
                     displacement.view(),
@@ -6932,6 +6994,7 @@ mod tests {
             };
             let (point, selection) = select_valid_reference_point(
                 &options,
+                EdgeHalo::NONE,
                 quality.view(),
                 validity.view(),
                 displacement.view(),
@@ -6955,6 +7018,7 @@ mod tests {
         let options = reference_options(ReferenceSelectionMethod::CoherentSupport);
         let (point, selection) = select_valid_reference_point(
             &options,
+            EdgeHalo::NONE,
             quality.view(),
             validity.view(),
             displacement.view(),
@@ -6998,6 +7062,7 @@ mod tests {
         let options = reference_options(ReferenceSelectionMethod::CoherentSupport);
         let (point, selection) = select_valid_reference_point(
             &options,
+            EdgeHalo::NONE,
             quality.view(),
             validity.view(),
             displacement.view(),
@@ -7016,6 +7081,7 @@ mod tests {
         // The legacy rule ignores both coherence and unwrap components.
         let (legacy, _) = select_valid_reference_point(
             &reference_options(ReferenceSelectionMethod::LargestComponentCentroid),
+            EdgeHalo::NONE,
             quality.view(),
             validity.view(),
             displacement.view(),
@@ -7023,6 +7089,77 @@ mod tests {
         )
         .unwrap();
         assert_ne!(legacy, point);
+    }
+
+    /// The halo is the phase-linking half-window in output pixels, rounded up:
+    /// OPERA-like half-window (7, 14) at strides (3, 6) gives three rows and
+    /// three columns, measured in the processing grid.
+    #[test]
+    fn edge_halo_is_the_phase_linking_half_window_in_output_pixels() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.half_window = dolphin_core::HalfWindow { y: 7, x: 14 };
+        cfg.output_options.strides = dolphin_core::Strides { y: 3, x: 6 };
+        let halo = EdgeHalo::of(&cfg, (0, 0), (20, 30));
+        assert_eq!((halo.rows, halo.cols), (3, 3));
+        for point in [(0, 10), (2, 10), (17, 10), (10, 0), (10, 2), (10, 27)] {
+            assert!(halo.excludes(point), "{point:?}");
+        }
+        for point in [(3, 3), (16, 26), (10, 15)] {
+            assert!(!halo.excludes(point), "{point:?}");
+        }
+        // A bounded target is judged by its place in the processing grid.
+        let target = EdgeHalo::of(&cfg, (5, 5), (20, 30));
+        assert!(!target.excludes((0, 0)));
+        assert!(target.excludes((12, 0)));
+    }
+
+    /// eo #758, Fresno T144: `coherent_support` chose row 3 of the grid, on a
+    /// coherent strip that the processing-window cut runs through. A coherent
+    /// region touching the edge must yield an interior pixel; without the halo
+    /// the top-ranked pixel sits on the edge.
+    #[test]
+    fn coherent_support_keeps_the_reference_off_the_grid_edge() {
+        let (rows, cols) = (12, 12);
+        let mut quality = Array2::from_elem((rows, cols), 0.5);
+        // A coherent strip down the full height of columns 4..=7, strongest
+        // in the top rows where the processing window was cut.
+        for r in 0..rows {
+            for c in 4..=7 {
+                quality[(r, c)] = if r < 2 { 0.99 } else { 0.9 };
+            }
+        }
+        let validity = Array2::from_elem((rows, cols), true);
+        let components = Array3::<u32>::ones((2, rows, cols));
+        let displacement = Array3::<f64>::zeros((2, rows, cols));
+        let options = reference_options(ReferenceSelectionMethod::CoherentSupport);
+        let select = |halo| {
+            select_valid_reference_point(
+                &options,
+                halo,
+                quality.view(),
+                validity.view(),
+                displacement.view(),
+                components.view(),
+            )
+            .unwrap()
+        };
+        let (unguarded, _) = select(EdgeHalo::NONE);
+        assert!(
+            unguarded.0 < 2,
+            "fixture must put the unguarded pick on the edge: {unguarded:?}"
+        );
+        let halo = EdgeHalo {
+            rows: 3,
+            cols: 3,
+            origin: (0, 0),
+            grid: (rows, cols),
+        };
+        let (point, selection) = select(halo);
+        assert!(!halo.excludes(point), "{point:?}");
+        assert!((4..=7).contains(&point.1), "{point:?}");
+        assert_eq!(selection.method, "coherent_support");
+        assert!(!selection.fell_back);
+        assert_eq!(selection.method_version, COHERENT_SUPPORT_METHOD_VERSION);
     }
 
     /// Issue #40: the SBAS network-inversion misclosure and the temporal

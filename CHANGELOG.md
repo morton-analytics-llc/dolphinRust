@@ -108,6 +108,13 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **`coherent_support` no longer picks a reference on the processing-grid edge** (eo #758).
+  Candidates within `ceil(half_window / stride)` output pixels of the processing-grid edge
+  (where the phase-linking window is clamped inward and the 3x3 support score runs off the
+  grid) are excluded; a bounded target is judged by its position in the processing grid.
+  Follows the intent of OPERA DISP-S1 ATBD §2.13 (no reference "at the frame boundary").
+  `COHERENT_SUPPORT_METHOD_VERSION` is now `coherent-support/2`. `largest_component_centroid`
+  is unchanged.
 - **Goldstein filter edge cases** (issue #139): ported dolphin PR #680. The filter reflection-pads
   by half a patch, covers the trailing rows and columns the old patch grid skipped, normalises
   the overlapping-patch blend by the accumulated window weight, and treats only NaN or
