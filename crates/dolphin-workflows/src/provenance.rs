@@ -146,8 +146,46 @@ pub struct GeometryProvenance {
     /// artifact written before this field existed deserializes it as `""`.
     #[serde(default)]
     pub time_function_model: String,
+    /// How the final spatial reference pixel was chosen. Absent only for
+    /// products published without a spatial reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_selection: Option<ReferenceSelectionProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
+}
+
+/// The final spatial reference and the rule that chose it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceSelectionProvenance {
+    /// Rule that produced the pixel: `configured` (`timeseries_options.reference_point`),
+    /// `largest_component_centroid`, or `coherent_support`. A `coherent_support`
+    /// run that fell back reports `largest_component_centroid` here.
+    pub method: String,
+    /// Versioned identity of `method`.
+    pub method_version: String,
+    /// The rule the config asked for (`timeseries_options.reference_selection`);
+    /// `configured` when a fixed `reference_point` was set.
+    pub requested_method: String,
+    /// True when `coherent_support` found no candidate and the legacy rule chose.
+    pub fell_back: bool,
+    /// Reference row on the output grid.
+    pub row: usize,
+    /// Reference column on the output grid.
+    pub col: usize,
+    /// Temporal coherence at the reference pixel.
+    pub temporal_coherence: f64,
+    /// Coherence floor of the `coherent_support` candidate pool; absent for
+    /// the other rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence_floor: Option<f64>,
+    /// Pixels in the `coherent_support` candidate pool (0 when it fell back);
+    /// absent for the other rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_pool_pixels: Option<usize>,
+    /// Pixels in the 8-connected candidate region the reference was drawn from;
+    /// absent unless `coherent_support` chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_region_pixels: Option<usize>,
 }
 
 /// Identifier-free coverage receipt for one displacement output.
@@ -333,6 +371,7 @@ pub fn assemble_geometry_provenance_with_coverage(
         cycle_steps: None,
         corrections_applied: corrections_applied(cfg),
         time_function_model: time_function_model(cfg),
+        reference_selection: None,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,
