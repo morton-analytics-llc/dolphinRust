@@ -91,8 +91,8 @@ use crate::spatial_reference_covariance_output::{
 };
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
-    unwrap_phase_correlated_network, NativeUnwrapBackend, SnaphuBackend, TophuBackend,
-    UnwrapBackend, UnwrapNetworkOutput,
+    unwrap_phase_correlated_network, CorrelatedNetworkUnwrap, InterpolationPlan,
+    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend,
 };
 use dolphin_corrections::LosGeometry;
 
@@ -499,7 +499,11 @@ fn finish_displacement(
     // Spatial neighbour-phase agreement, computed on the stitched linked phase
     // (single-reference ifgs) the way dolphin runs `create_similarities` on its
     // stitched rasters, not per-burst.
-    let phase_similarity = cfg.phase_linking.write_phase_similarity.then(|| {
+    // Pre-unwrap interpolation reads the same layer, as dolphin's workflow passes
+    // its stitched similarity raster to the unwrap stage.
+    let needs_similarity =
+        cfg.phase_linking.write_phase_similarity || interpolation_uses_similarity(cfg);
+    let phase_similarity = needs_similarity.then(|| {
         timed("phase_similarity", || {
             dolphin_phaselink::estimate_phase_similarity(
                 pl.view(),
@@ -542,12 +546,16 @@ fn finish_displacement(
         validity_mask.view(),
     )?;
 
-    let unwrap = timed("unwrap", || {
+    let CorrelatedNetworkUnwrap {
+        output: unwrap,
+        interpolated_count: unwrap_interpolated_count,
+    } = timed("unwrap", || {
         unwrap_network(
             cfg,
             pl.view(),
             &pairs,
             validity_mask.view(),
+            phase_similarity.as_ref().map(Array2::view),
             geotransform,
             epsg,
         )
@@ -662,7 +670,8 @@ fn finish_displacement(
         validity_mask,
         burst_coverage,
         phase_linking_coherence: stitched.phase_linking_coherence,
-        phase_similarity,
+        phase_similarity: phase_similarity.filter(|_| cfg.phase_linking.write_phase_similarity),
+        unwrap_interpolated_count,
         crlb_sigma: stitched.crlb_sigma,
         closure_phase: stitched.closure_phase,
         corrections,
@@ -1639,6 +1648,9 @@ struct SpatialProducts {
     phase_linking_coherence: Option<Array2<f64>>,
     /// Spatial phase-similarity quality raster, if enabled.
     phase_similarity: Option<Array2<f64>>,
+    /// Per-pixel count of interferograms whose wrapped phase was interpolated
+    /// before unwrapping; `None` unless `run_interpolation`.
+    unwrap_interpolated_count: Option<Array2<u32>>,
     crlb_sigma: Option<Array3<f64>>,
     closure_phase: Option<Array3<f64>>,
     corrections: CorrectionLayers,
@@ -2017,6 +2029,7 @@ fn emit_displacement(
             .saturating_sub(spatial.disp_rad.dim().0),
         phase_linking_coherence: spatial.phase_linking_coherence.as_ref(),
         phase_similarity: spatial.phase_similarity.as_ref(),
+        unwrap_interpolated_count: spatial.unwrap_interpolated_count.as_ref(),
         crlb_sigma: cfg
             .phase_linking
             .write_crlb
@@ -2488,6 +2501,10 @@ impl SpatialProducts {
             .map(|layer| trim2(&layer, target));
         self.phase_similarity = self
             .phase_similarity
+            .take()
+            .map(|layer| trim2(&layer, target));
+        self.unwrap_interpolated_count = self
+            .unwrap_interpolated_count
             .take()
             .map(|layer| trim2(&layer, target));
         self.crlb_sigma = self.crlb_sigma.take().map(|layer| trim3(&layer, target));
@@ -5105,9 +5122,10 @@ fn unwrap_network(
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
     validity_mask: ArrayView2<bool>,
+    phase_similarity: Option<ArrayView2<f64>>,
     geotransform: [f64; 6],
     epsg: Option<u32>,
-) -> Result<UnwrapNetworkOutput> {
+) -> Result<CorrelatedNetworkUnwrap> {
     let (_, rows, cols) = pl.dim();
     anyhow::ensure!(
         validity_mask.dim() == (rows, cols),
@@ -5128,14 +5146,58 @@ fn unwrap_network(
     let phases = masked_phase
         .as_ref()
         .map_or_else(|| pl.view(), |values| values.view());
-    let mut output = pool.install(|| {
-        unwrap_phase_correlated_network(backend.as_ref(), phases, pairs, support.view(), &scratch)
+    let interpolation = interpolation_plan(cfg, phase_similarity)?;
+    let mut unwrapped = pool.install(|| {
+        unwrap_phase_correlated_network(
+            backend.as_ref(),
+            phases,
+            pairs,
+            support.view(),
+            interpolation.as_ref(),
+            &scratch,
+        )
     })?;
     // A zero-filled pixel reaches the unwrapper as flat phase and can come back
     // labelled; the loop-closure roots key on labels and would take its zero
     // residual as evidence, so no pixel off support keeps a component.
-    mask3_value(&mut output.connected_components, &support, 0);
-    Ok(output)
+    mask3_value(&mut unwrapped.output.connected_components, &support, 0);
+    Ok(unwrapped)
+}
+
+/// Whether pre-unwrap interpolation tests phase similarity (dolphin v0.35.0: a
+/// nonzero similarity threshold replaces the correlation test).
+fn interpolation_uses_similarity(cfg: &DisplacementWorkflow) -> bool {
+    cfg.unwrap_options.run_interpolation
+        && cfg
+            .unwrap_options
+            .preprocess_options
+            .interpolation_similarity_threshold
+            != 0.0
+}
+
+/// The pre-unwrap interpolation the config asks for, if any.
+fn interpolation_plan<'a>(
+    cfg: &DisplacementWorkflow,
+    phase_similarity: Option<ArrayView2<'a, f64>>,
+) -> Result<Option<InterpolationPlan<'a>>> {
+    if !cfg.unwrap_options.run_interpolation {
+        return Ok(None);
+    }
+    let options = &cfg.unwrap_options.preprocess_options;
+    if !interpolation_uses_similarity(cfg) {
+        return Ok(Some(InterpolationPlan {
+            similarity: None,
+            cutoff: options.interpolation_cor_threshold,
+            max_radius: options.max_radius,
+        }));
+    }
+    let similarity =
+        phase_similarity.context("pre-unwrap interpolation requires the phase-similarity layer")?;
+    Ok(Some(InterpolationPlan {
+        similarity: Some(similarity),
+        cutoff: options.interpolation_similarity_threshold,
+        max_radius: options.max_radius,
+    }))
 }
 
 /// Pixels that reach the unwrapper with their phase-linked value: those the
@@ -5641,6 +5703,19 @@ fn write_outputs(
             &[("UNITTYPE", "cycles"), ("DESCRIPTION", JUNCTION_STEP_NOTE)],
         )?;
     }
+    if let Some(count) = quality.unwrap_interpolated_count {
+        write_raster_with_metadata(
+            &dir.join("unwrap_interpolated_count.tif"),
+            count.view(),
+            gt,
+            epsg,
+            None,
+            &[
+                ("UNITTYPE", "count"),
+                ("DESCRIPTION", UNWRAP_INTERPOLATED_COUNT_NOTE),
+            ],
+        )?;
+    }
     if let Some(flag) = quality.cycle_step_flag {
         write_raster_with_metadata(
             &dir.join("cycle_step_flag.tif"),
@@ -5751,6 +5826,14 @@ const VELOCITY_CONDITIONAL_SE_NOTE: &str =
      spatially referenced displacement series, excluding the structural acquisition-0 gauge. \
      Temporal covariance and total field calibration are not included.";
 
+const UNWRAP_INTERPOLATED_COUNT_NOTE: &str =
+    "Interferograms whose wrapped phase at this pixel was replaced by neighbour \
+     interpolation before unwrapping (unwrap_options.run_interpolation). The \
+     interpolated phase fed the unwrapper only: published displacement is the \
+     pixel's own wrapped phase plus the solved whole-cycle ambiguity, keeps \
+     every quality mask, and carries no connected-component label in those \
+     interferograms.";
+
 /// The optional per-pixel quality layers written alongside displacement.
 struct QualityLayers<'a> {
     /// Algebraic residual degrees of freedom of the SBAS network solve,
@@ -5758,6 +5841,7 @@ struct QualityLayers<'a> {
     network_residual_dof: usize,
     phase_linking_coherence: Option<&'a Array2<f64>>,
     phase_similarity: Option<&'a Array2<f64>>,
+    unwrap_interpolated_count: Option<&'a Array2<u32>>,
     crlb_sigma: Option<&'a Array3<f64>>,
     closure_phase: Option<&'a Array3<f64>>,
     displacement_variance: Option<&'a Array3<f64>>,
@@ -6303,6 +6387,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: Some(Array2::from_elem((2, 2), 1.0)),
             phase_similarity: Some(Array2::from_elem((2, 2), 1.0)),
+            unwrap_interpolated_count: None,
             crlb_sigma: Some(Array3::from_elem((2, 2, 2), 1.0)),
             closure_phase: Some(Array3::from_elem((1, 2, 2), 1.0)),
             corrections: CorrectionLayers {
@@ -6449,6 +6534,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: Some(Array2::from_elem((6, 8), 0.75)),
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -6517,6 +6603,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: None,
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -7294,6 +7381,7 @@ mod tests {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
                 phase_similarity: None,
+                unwrap_interpolated_count: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: None,
@@ -7367,10 +7455,12 @@ mod tests {
             pl.view(),
             &pairs,
             validity.view(),
+            None,
             [0.0, 30.0, 0.0, 120.0, 0.0, -30.0],
             Some(32611),
         )
-        .unwrap();
+        .unwrap()
+        .output;
         for ((_, row, col), &label) in output.connected_components.indexed_iter() {
             assert!(
                 validity[(row, col)] || label == 0,
@@ -7548,6 +7638,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: None,
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -7629,6 +7720,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: None,
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -8724,6 +8816,7 @@ mod tests {
                     network_residual_dof: dof,
                     phase_linking_coherence: None,
                     phase_similarity: None,
+                    unwrap_interpolated_count: None,
                     crlb_sigma: Some(&crlb),
                     closure_phase: None,
                     displacement_variance: Some(&variance),
@@ -8903,6 +8996,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: None,
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {
@@ -8935,6 +9029,7 @@ mod tests {
                 network_residual_dof: 0,
                 phase_linking_coherence: None,
                 phase_similarity: None,
+                unwrap_interpolated_count: None,
                 crlb_sigma: None,
                 closure_phase: None,
                 displacement_variance: scaled.displacement_variance.as_ref(),
@@ -9047,19 +9142,35 @@ mod tests {
         assert_eq!(acquisition_days(&cfg, &files).unwrap(), vec![0.0, 15.0]);
     }
 
-    /// Issue #25: `run_interpolation` round-trips from a dolphin YAML and already
-    /// widens the AOI halo, but no interpolation stage exists — so it must be
-    /// rejected, not silently ignored.
+    /// `run_interpolation` is accepted and takes pinned dolphin v0.35.0's mask
+    /// choice: a nonzero similarity threshold replaces the correlation test, and
+    /// zero falls back to per-interferogram correlation.
     #[test]
-    fn run_interpolation_is_rejected_as_unimplemented() {
+    fn run_interpolation_maps_to_pinned_mask_choice() {
         let mut cfg = DisplacementWorkflow::default();
-        assert!(
-            validate_config(&cfg).is_ok(),
-            "dolphin's own default (false) must pass"
-        );
+        assert!(interpolation_plan(&cfg, None).unwrap().is_none());
+        assert!(!interpolation_uses_similarity(&cfg));
         cfg.unwrap_options.run_interpolation = true;
-        let error = validate_config(&cfg).unwrap_err();
-        assert!(error.to_string().contains("run_interpolation"), "{error}");
+        validate_config(&cfg).unwrap();
+        assert!(interpolation_uses_similarity(&cfg));
+        let similarity = Array2::from_elem((2, 2), 0.5);
+        let plan = interpolation_plan(&cfg, Some(similarity.view()))
+            .unwrap()
+            .unwrap();
+        assert!(plan.similarity.is_some());
+        assert_eq!((plan.cutoff, plan.max_radius), (0.3, 51));
+        assert!(interpolation_plan(&cfg, None).is_err());
+        let options = &mut cfg.unwrap_options.preprocess_options;
+        options.interpolation_similarity_threshold = 0.0;
+        options.interpolation_cor_threshold = 0.25;
+        let plan = interpolation_plan(&cfg, None).unwrap().unwrap();
+        assert!(plan.similarity.is_none());
+        assert_eq!(plan.cutoff, 0.25);
+        cfg.unwrap_options
+            .preprocess_options
+            .interpolation_cor_threshold = 1.5;
+        let error = validate_config(&cfg).unwrap_err().to_string();
+        assert!(error.contains("interpolation_cor_threshold"), "{error}");
     }
 
     #[test]
@@ -10036,6 +10147,7 @@ mod tests {
             burst_coverage: Vec::new(),
             phase_linking_coherence: None,
             phase_similarity: None,
+            unwrap_interpolated_count: None,
             crlb_sigma: None,
             closure_phase: None,
             corrections: CorrectionLayers {

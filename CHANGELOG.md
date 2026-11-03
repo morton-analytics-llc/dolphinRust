@@ -22,6 +22,18 @@ All notable changes to dolphinRust are documented here. The format follows
   `PublicationQuality` gains `closure_corrected_pixels`, `closure_uncorrected_pixels` and
   `closure_corrected_per_band`, and the covariance unwrap-branch digest distinguishes a
   corrected branch.
+- **Pre-unwrap interpolation** (`unwrap_options.run_interpolation`, dolphin's option and
+  defaults: `max_radius: 51`, similarity/correlation cutoff `0.3`, 20 neighbours, alpha
+  0.75). Each network interferogram's wrapped phase is interpolated from coherent neighbours
+  before the unwrapper (dolphin v0.35.0 `interpolate`, matched to its oracle), and the solved
+  whole-cycle ambiguities are transferred back onto every pixel's own wrapped phase, so the
+  interpolated values feed the unwrapper only. Interpolated pixels carry no connected-component
+  label in that interferogram, so interpolation never adds unwrap support (in place of dolphin's
+  unported SNAPHU component regrow). A nonzero
+  `interpolation_similarity_threshold` masks on phase similarity (computed for this purpose
+  when `write_phase_similarity` is off), otherwise on per-ifg correlation.
+  `unwrap_interpolated_count.tif` records, per pixel, how many interferograms were
+  interpolated there. Off by default; off is the unchanged code path.
 - **Datum adjustment across overlapping bounded windows** (issue #153).
   `dolphin_workflows::estimate_window_datum` takes N bounded windows from one burst stack
   (`DatumWindow`, built from a `DisplacementOutput`) and returns a constant offset per window
