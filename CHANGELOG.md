@@ -119,6 +119,22 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **The cycle-step check now flags integer-cycle discontinuities at ministack junctions**
+  (issue #184). At the first date of each ministack after the first, the compressed-SLC datum
+  error arrives as a patch about one phase-linking look window wide; on Fresno T137 the
+  patches sit 0.5–0.84 cycle from their surroundings. The 5x5 median moved with such a patch
+  and a 0.6-cycle residual missed the quarter-cycle tolerance, so `cycle_step_flag` caught 0 of
+  the 37 fast cells eo #758 found stepping at junctions. At junction epochs the residual is now
+  taken against a neighbourhood three look radii wide (`3 · max(ceil(half_window / stride))`
+  output pixels, at least 2) and any step beyond half a cycle is flagged as `round(residual)`
+  cycles; other epochs keep the 5x5 quarter-cycle rule. On the same T137 inputs the flag now
+  marks 31 of those 37 cells. Diagnostic only: displacement and velocity are bit-identical.
+  `detect_cycle_steps_with_junctions` is the new entry point (`detect_cycle_steps` is it with
+  no junctions); `CycleStepDetection` and the `cycle_steps` provenance record gain
+  `junction_epochs` and `junction_half_window` (absent in older records, read as empty/0).
+  The junction steps themselves are the sequential estimator's: dolphin v0.35.0
+  (`run_wrapped_phase_single` + `compress`) produces the same junction statistics on the same
+  real crop.
 - **`coherent_support` no longer picks a reference on the processing-grid edge** (eo #758).
   Candidates within `ceil(half_window / stride)` output pixels of the processing-grid edge
   (where the phase-linking window is clamped inward and the 3x3 support score runs off the

@@ -18,8 +18,9 @@ mod temporal_covariance_batch;
 pub mod velocity_model;
 
 pub use cycle_steps::{
-    detect_cycle_steps, CycleStepDateSummary, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
-    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, MIN_CYCLE_STEP_NEIGHBOURS,
+    detect_cycle_steps, detect_cycle_steps_with_junctions, CycleStepDateSummary,
+    CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW, DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+    JUNCTION_SUPPORT_LOOK_RADII, MIN_CYCLE_STEP_NEIGHBOURS,
 };
 pub use inversion::{
     estimate_velocity, estimate_velocity_with_diagnostics, estimate_velocity_with_precisions,
