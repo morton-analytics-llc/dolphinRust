@@ -41,8 +41,8 @@ use dolphin_timeseries::{
     DEFAULT_CLOSURE_TOLERANCE_CYCLES,
 };
 use dolphin_timeseries::{
-    detect_cycle_steps, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
-    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, MIN_CYCLE_STEP_NEIGHBOURS,
+    detect_cycle_steps_with_junctions, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
+    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, JUNCTION_SUPPORT_LOOK_RADII, MIN_CYCLE_STEP_NEIGHBOURS,
 };
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
@@ -1319,13 +1319,16 @@ linked-phase step; a whole number of cycles is the unwrapper's integer. Diagnost
 
 const CYCLE_STEP_FLAG_NOTE: &str = "Number of dates at which the pixel's phase step into the date \
 differed from the median step of its unwrap connected component within a 5x5 neighbourhood by a \
-whole number of cycles (within 0.25 cycle), on the inverted series before corrections and the \
-spatial reference. 0 = none detected or unpublished. Never corrected; a mask or annotation input.";
+whole number of cycles (within 0.25 cycle), or, at the first date of each ministack after the \
+first, by more than half a cycle from the median of a neighbourhood three look windows wide, on \
+the inverted series before corrections and the spatial reference. 0 = none detected or \
+unpublished. Never corrected; a mask or annotation input.";
 
 const CYCLE_STEP_NOTE: &str =
     "Detected whole-cycle step of the pixel into this acquisition against \
-the median step of its unwrap connected component within a 5x5 neighbourhood, in cycles; 0 = none \
-detected or not judged. File index NN is the acquisition index the step lands on.";
+the median step of its unwrap connected component within a 5x5 neighbourhood (at a ministack \
+junction: beyond half a cycle from the median of a neighbourhood three look windows wide), in \
+cycles; 0 = none detected or not judged. File index NN is the acquisition index the step lands on.";
 
 /// Per-date step diagnostics on the raw inverted series (E4, 2026-09-15).
 struct PhaseStepProducts {
@@ -1368,11 +1371,13 @@ fn phase_step_diagnostics(
             "ministack junction step"
         );
     }
-    let cycle_steps = detect_cycle_steps(
+    let cycle_steps = detect_cycle_steps_with_junctions(
         series,
         components.view(),
         DEFAULT_CYCLE_STEP_HALF_WINDOW,
         DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+        &epochs,
+        junction_cycle_step_half_window(cfg),
     );
     let flagged_pixels = cycle_steps
         .step_count
@@ -1394,6 +1399,20 @@ fn phase_step_diagnostics(
         junctions,
         cycle_steps,
     })
+}
+
+/// Junction-rule neighbourhood half-width in output pixels: three phase-linking
+/// look radii (half-window over stride, rounded up, on the wider axis), and no
+/// narrower than the plain rule. The compressed-SLC datum error at a junction is
+/// correlated over one look window, so the support must reach well past it.
+fn junction_cycle_step_half_window(cfg: &DisplacementWorkflow) -> usize {
+    let half = cfg.phase_linking.half_window;
+    let strides = cfg.output_options.strides;
+    let radius = half
+        .y
+        .div_ceil(strides.y.max(1))
+        .max(half.x.div_ceil(strides.x.max(1)));
+    (JUNCTION_SUPPORT_LOOK_RADII * radius).max(DEFAULT_CYCLE_STEP_HALF_WINDOW)
 }
 
 fn solve_time_series(
@@ -2143,6 +2162,8 @@ fn emit_displacement(
         half_window: DEFAULT_CYCLE_STEP_HALF_WINDOW,
         tolerance_cycles: DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
         min_neighbours: MIN_CYCLE_STEP_NEIGHBOURS,
+        junction_epochs: spatial.cycle_steps.junction_epochs.clone(),
+        junction_half_window: spatial.cycle_steps.junction_half_window,
         flagged_pixels: cycle_step_flagged_analysis_pixels,
         per_date: spatial.cycle_steps.per_date.clone(),
     });
@@ -6113,6 +6134,28 @@ mod tests {
         std::fs::remove_dir_all(&cfg.work_directory).unwrap();
     }
 
+    /// The junction support is three look radii on the wider axis (the eo
+    /// Fresno geometry: half-window 6x12 over strides 3x6 is a radius of two
+    /// output pixels, so a 13x13 support) and never narrower than the plain
+    /// 5x5 rule.
+    #[test]
+    fn junction_cycle_step_support_spans_three_look_radii() {
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.half_window = HalfWindow { y: 6, x: 12 };
+        cfg.output_options.strides = Strides { y: 3, x: 6 };
+        assert_eq!(junction_cycle_step_half_window(&cfg), 6);
+        cfg.phase_linking.half_window = HalfWindow { y: 5, x: 11 };
+        assert_eq!(junction_cycle_step_half_window(&cfg), 6);
+        cfg.phase_linking.half_window = HalfWindow { y: 1, x: 1 };
+        cfg.output_options.strides = Strides { y: 1, x: 1 };
+        assert_eq!(junction_cycle_step_half_window(&cfg), 3);
+        cfg.phase_linking.half_window = HalfWindow { y: 0, x: 0 };
+        assert_eq!(
+            junction_cycle_step_half_window(&cfg),
+            DEFAULT_CYCLE_STEP_HALF_WINDOW
+        );
+    }
+
     /// The ministack boundaries the planner crossed are diagnosed on the raw
     /// inverted series and always recorded in the provenance; the per-junction
     /// rasters are opt-in.
@@ -6187,6 +6230,11 @@ mod tests {
             .expect("cycle-step statistics are always recorded");
         assert_eq!(cycle_steps.flagged_pixels, 0);
         assert_eq!(cycle_steps.half_window, DEFAULT_CYCLE_STEP_HALF_WINDOW);
+        assert_eq!(cycle_steps.junction_epochs, vec![2]);
+        assert_eq!(
+            cycle_steps.junction_half_window,
+            junction_cycle_step_half_window(&cfg)
+        );
         let epochs: Vec<usize> = cycle_steps.per_date.iter().map(|d| d.epoch).collect();
         assert_eq!(epochs, vec![1, 2, 3]);
         // A 3x3 frame leaves every pixel at least four same-component
