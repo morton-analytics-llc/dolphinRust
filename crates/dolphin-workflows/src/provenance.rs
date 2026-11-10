@@ -16,8 +16,8 @@ use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_corrections::geometry::OutsideStatic;
 use dolphin_corrections::LosGeometry;
 use dolphin_io::{
-    read_cslc_burst_metadata, read_cslc_identification, read_cslc_orbit, read_cslc_orbit_type,
-    CslcBurstMetadata, CslcIdentification, CslcOrbit,
+    read_cslc_burst_metadata, read_cslc_dem_source, read_cslc_identification, read_cslc_orbit,
+    read_cslc_orbit_type, CslcBurstMetadata, CslcIdentification, CslcOrbit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +27,15 @@ use crate::phase_steps::{CycleStepProvenance, JunctionProvenance};
 /// Artifact filename inside `work_directory`.
 pub const GEOMETRY_PROVENANCE_FILENAME: &str = "geometry_provenance.json";
 
-const SCHEMA: &str = "dolphinrust-geometry-provenance/5";
-const METHOD_VERSION: &str = "5.0.0";
+const SCHEMA: &str = "dolphinrust-geometry-provenance/7";
+const METHOD_VERSION: &str = "7.0.0";
+
+/// Stable `corrections_applied` names, in disclosure order (issue #130 / eo#483).
+const CORRECTION_SOLID_EARTH_TIDE: &str = "solid_earth_tide";
+const CORRECTION_PLATE_MOTION: &str = "plate_motion";
+const CORRECTION_IONOSPHERE: &str = "ionosphere";
+const CORRECTION_TROPOSPHERE: &str = "troposphere";
+const CORRECTION_LAYOVER_SHADOW_MASK: &str = "layover_shadow_mask";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
@@ -52,7 +59,7 @@ const WGS84_B_M: f64 = 6_356_752.314_245;
 /// always pairs with an `Absent` entry in `geometry_provenance.fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeometryProvenance {
-    /// Schema identifier (`dolphinrust-geometry-provenance/5`).
+    /// Schema identifier (`dolphinrust-geometry-provenance/7`).
     pub schema: String,
     /// Derivation method version.
     pub method_version: String,
@@ -86,20 +93,34 @@ pub struct GeometryProvenance {
     pub native_azimuth_spacing_m: Option<f64>,
     /// Zero-doppler mid-time seconds-of-day (UTC), mean across granules.
     pub acquisition_time_of_day_utc_s: Option<f64>,
-    /// DEM pixel width, in the units of the DEM's own horizontal CRS.
+    /// DEM pixel width, in the units of the DEM's own horizontal CRS. Describes
+    /// the **correction** DEM (`correction_options.dem_file` /
+    /// `nisar_ellipsoidal_dem_file`) used for atmospheric/geometric correction —
+    /// not the DEM that shaped the CSLC phase itself; see
+    /// [`Self::cslc_dem_source`] for that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dem_grid_spacing_x: Option<f64>,
     /// DEM pixel height (magnitude), same units as [`Self::dem_grid_spacing_x`].
+    /// Describes the correction DEM; see [`Self::dem_grid_spacing_x`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dem_grid_spacing_y: Option<f64>,
     /// CRS unit the DEM grid spacings are expressed in (e.g. `degree`, `metre`).
+    /// Describes the correction DEM; see [`Self::dem_grid_spacing_x`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dem_grid_spacing_units: Option<String>,
     /// Vertical CRS name carried by the DEM (e.g. `EGM96 height`), when it has
     /// one. Never inferred: a DEM with no vertical CRS leaves this absent rather
-    /// than asserting ellipsoidal heights.
+    /// than asserting ellipsoidal heights. Describes the correction DEM; see
+    /// [`Self::dem_grid_spacing_x`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dem_vertical_datum: Option<String>,
+    /// CSLC-shaping DEM dataset identity (e.g. `"Copernicus DEM 30 m (WGS84
+    /// ellipsoid)"`), read from `/metadata/processing_information/inputs/dem_source`
+    /// on every CSLC and CSLC-S1-STATIC granule — the DEM that actually shaped the
+    /// CSLC phase, distinct from the correction-DEM fields above (issue #167,
+    /// eo#483 Table 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cslc_dem_source: Option<String>,
     /// Artifact key of the phase-linking coherence raster, relative to
     /// `work_directory`; absent when `calc_average_coh` is disabled.
     pub phase_linking_coherence: Option<String>,
@@ -124,8 +145,61 @@ pub struct GeometryProvenance {
     /// same raw series, summarized over the analysis frame (E4, 2026-09-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycle_steps: Option<CycleStepProvenance>,
+    /// Correction categories enabled on this run, in a fixed disclosure order;
+    /// empty (never null) when none ran (issue #130 / eo#483 Table 5). Computed
+    /// directly from `CorrectionOptions` and `layover_shadow_mask_files` — every
+    /// current run can state this with certainty, so unlike the geometry fields
+    /// above there is no absent case. An artifact written before this field
+    /// existed deserializes it as an empty, historical vec, not a reconstruction.
+    #[serde(default)]
+    pub corrections_applied: Vec<String>,
+    /// The velocity time-function model composed from `TimeseriesOptions`, e.g.
+    /// `"linear"`, `"linear+seasonal"`, `"linear+seasonal+step(2)"`,
+    /// `"linear+relaxation(1)"` (issue #130 / eo#483 Table 5). Customer-facing
+    /// string; the composition order is fixed by [`time_function_model`]. An
+    /// artifact written before this field existed deserializes it as `""`.
+    #[serde(default)]
+    pub time_function_model: String,
+    /// How the final spatial reference pixel was chosen. Absent only for
+    /// products published without a spatial reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_selection: Option<ReferenceSelectionProvenance>,
     /// Per-field source files/keys/method — the block eo persists as JSONB.
     pub geometry_provenance: ProvenanceBlock,
+}
+
+/// The final spatial reference and the rule that chose it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceSelectionProvenance {
+    /// Rule that produced the pixel: `configured` (`timeseries_options.reference_point`),
+    /// `largest_component_centroid`, or `coherent_support`. A `coherent_support`
+    /// run that fell back reports `largest_component_centroid` here.
+    pub method: String,
+    /// Versioned identity of `method`.
+    pub method_version: String,
+    /// The rule the config asked for (`timeseries_options.reference_selection`);
+    /// `configured` when a fixed `reference_point` was set.
+    pub requested_method: String,
+    /// True when `coherent_support` found no candidate and the legacy rule chose.
+    pub fell_back: bool,
+    /// Reference row on the output grid.
+    pub row: usize,
+    /// Reference column on the output grid.
+    pub col: usize,
+    /// Temporal coherence at the reference pixel.
+    pub temporal_coherence: f64,
+    /// Coherence floor of the `coherent_support` candidate pool; absent for
+    /// the other rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence_floor: Option<f64>,
+    /// Pixels in the `coherent_support` candidate pool (0 when it fell back);
+    /// absent for the other rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_pool_pixels: Option<usize>,
+    /// Pixels in the 8-connected candidate region the reference was drawn from;
+    /// absent unless `coherent_support` chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_region_pixels: Option<usize>,
 }
 
 /// Identifier-free coverage receipt for one displacement output.
@@ -258,6 +332,7 @@ pub fn assemble_geometry_provenance_with_coverage(
     let cslc = read_granules(cfg, &mut fields);
     let orbit_direction = orbit_direction(&cslc, &mut fields);
     let orbit_ephemeris_class = orbit_ephemeris_class(cfg, &mut fields);
+    let cslc_dem_source = cslc_dem_source(cfg, &mut fields);
     let heading_deg = heading(&cslc, &mut fields);
     let native_range_spacing_m = range_spacing(&cslc, &mut fields);
     let native_azimuth_spacing_m = azimuth_spacing(&cslc, &mut fields);
@@ -279,6 +354,7 @@ pub fn assemble_geometry_provenance_with_coverage(
         method_version: METHOD_VERSION.into(),
         orbit_direction: orbit_direction.clone(),
         orbit_ephemeris_class,
+        cslc_dem_source,
         incidence_angle_deg: incidence.map(|s| s.mean_deg),
         incidence_angle_spread_deg: incidence.map(|s| s.std_deg),
         incidence_angle_min_deg: incidence.map(|s| s.min_deg),
@@ -309,6 +385,9 @@ pub fn assemble_geometry_provenance_with_coverage(
         input_coverage,
         ministack_junctions: None,
         cycle_steps: None,
+        corrections_applied: corrections_applied(cfg),
+        time_function_model: time_function_model(cfg),
+        reference_selection: None,
         geometry_provenance: ProvenanceBlock {
             method_version: METHOD_VERSION.into(),
             fields,
@@ -328,6 +407,51 @@ pub fn write_geometry_provenance(dir: &Path, prov: &GeometryProvenance) -> anyho
     Ok(())
 }
 
+/// Correction categories this run's `CorrectionOptions` and
+/// `layover_shadow_mask_files` actually enable, in a fixed disclosure order.
+/// Deterministic from config alone: every current run can state this with
+/// certainty, so (unlike the geometry fields above) there is no absent case.
+fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
+    let corrections = &cfg.correction_options;
+    let mut applied = Vec::new();
+    if corrections.solid_earth_tide {
+        applied.push(CORRECTION_SOLID_EARTH_TIDE.into());
+    }
+    if corrections.plate_motion_model.is_some() {
+        applied.push(CORRECTION_PLATE_MOTION.into());
+    }
+    if !corrections.ionosphere_files.is_empty() {
+        applied.push(CORRECTION_IONOSPHERE.into());
+    }
+    if !corrections.troposphere_files.is_empty() || !corrections.troposphere_epochs.is_empty() {
+        applied.push(CORRECTION_TROPOSPHERE.into());
+    }
+    if !cfg.layover_shadow_mask_files.is_empty() {
+        applied.push(CORRECTION_LAYOVER_SHADOW_MASK.into());
+    }
+    applied
+}
+
+/// The velocity time-function model composed from `TimeseriesOptions`, in the
+/// fixed order `linear` + `seasonal` + `step(n)` + `relaxation(n)`.
+fn time_function_model(cfg: &DisplacementWorkflow) -> String {
+    let timeseries = &cfg.timeseries_options;
+    let mut model = String::from("linear");
+    if timeseries.velocity_seasonal {
+        model.push_str("+seasonal");
+    }
+    if !timeseries.velocity_step_dates.is_empty() {
+        model.push_str(&format!("+step({})", timeseries.velocity_step_dates.len()));
+    }
+    if !timeseries.velocity_relaxation.is_empty() {
+        model.push_str(&format!(
+            "+relaxation({})",
+            timeseries.velocity_relaxation.len()
+        ));
+    }
+    model
+}
+
 /// Fields whose provenance comes from the CSLC acquisition granules.
 const CSLC_FIELDS: [&str; 5] = [
     "orbit_direction",
@@ -338,6 +462,9 @@ const CSLC_FIELDS: [&str; 5] = [
 ];
 
 const ORBIT_EPHEMERIS_FIELD: &[&str] = &["orbit_ephemeris_class"];
+
+const CSLC_DEM_SOURCE_FIELD: &[&str] = &["cslc_dem_source"];
+const CSLC_DEM_SOURCE_KEY: &str = "/metadata/processing_information/inputs/dem_source";
 
 /// Fields read from the run's DEM raster.
 const DEM_FIELDS: [&str; 4] = [
@@ -496,6 +623,88 @@ fn orbit_ephemeris_class(
         },
     );
     Some(class.into())
+}
+
+/// Read and classify `/metadata/processing_information/inputs/dem_source` across
+/// every CSLC and CSLC-S1-STATIC granule — the DEM that shaped the CSLC phase,
+/// read independently from the identification/orbit/burst metadata bundle so one
+/// missing or unreadable key never erases other readable geometry provenance.
+fn cslc_dem_source(
+    cfg: &DisplacementWorkflow,
+    fields: &mut BTreeMap<String, FieldProvenance>,
+) -> Option<String> {
+    if cfg.input_options.input_type == InputType::NisarGslc {
+        return mark_absent(
+            fields,
+            CSLC_DEM_SOURCE_FIELD,
+            "NISAR GSLC dem_source mapping not implemented",
+        );
+    }
+    let granules: Vec<&PathBuf> = cfg
+        .cslc_file_list
+        .iter()
+        .chain(cfg.correction_options.geometry_files.iter())
+        .collect();
+    if granules.is_empty() {
+        return mark_absent(
+            fields,
+            CSLC_DEM_SOURCE_FIELD,
+            "cslc_file_list and geometry_files are both empty",
+        );
+    }
+    let mut names = Vec::with_capacity(granules.len());
+    let mut raw_values = Vec::with_capacity(granules.len());
+    for path in granules {
+        let name = granule_name(path);
+        match read_cslc_dem_source(path) {
+            Ok(value) => {
+                names.push(name);
+                raw_values.push(value);
+            }
+            Err(error) => {
+                return mark_absent(
+                    fields,
+                    CSLC_DEM_SOURCE_FIELD,
+                    &format!("granule {name}: dem_source unreadable ({error})"),
+                );
+            }
+        }
+    }
+    let trimmed: Vec<&str> = raw_values
+        .iter()
+        .map(|value| {
+            value.trim_matches(|character: char| {
+                character == '\0' || character.is_ascii_whitespace()
+            })
+        })
+        .collect();
+    let Some(&first) = trimmed.first() else {
+        return mark_absent(fields, CSLC_DEM_SOURCE_FIELD, "dem_source values are empty");
+    };
+    if trimmed.iter().any(|&value| value != first) {
+        let distinct = trimmed
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        return mark_absent(
+            fields,
+            CSLC_DEM_SOURCE_FIELD,
+            &format!("mixed dem_source across granules ({distinct} distinct values)"),
+        );
+    }
+    fields.insert(
+        "cslc_dem_source".into(),
+        FieldProvenance::Sourced {
+            source_files: names,
+            source_keys: vec![CSLC_DEM_SOURCE_KEY.into()],
+            method:
+                "read scalar per CSLC/STATIC granule, trim NUL/whitespace, require byte-identical"
+                    .into(),
+            raw_value: Some(raw_values[0].clone()),
+            note: None,
+        },
+    );
+    Some(first.to_string())
 }
 
 /// DEM identity read from the configured elevation raster itself.

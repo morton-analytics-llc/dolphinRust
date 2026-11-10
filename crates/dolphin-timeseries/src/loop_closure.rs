@@ -49,6 +49,7 @@
 //! Triples below the floor contribute no root; their pixels are unjudged, not
 //! graded, and counted in [`LoopClosureQc::unjudged_small_triple_pixels`].
 
+use crate::loop_correction::LoopClosureCorrection;
 use ndarray::{Array2, Array3, ArrayView3};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -118,6 +119,11 @@ pub struct LoopClosureQc {
     /// Component triples, over every loop, that had fewer than
     /// [`MIN_ROOT_PIXELS`] finite residuals and so contributed no root.
     pub small_root_triples: usize,
+    /// Integer-cycle correction applied to the stack before this QC ran
+    /// (issue #142), when enabled. With it, every layer above describes the
+    /// **corrected** stack: `worst_residual_cycles` is the residual closure
+    /// after correction.
+    pub correction: Option<LoopClosureCorrection>,
 }
 
 impl LoopClosureQc {
@@ -226,15 +232,16 @@ pub fn loop_closure_qc(
             .filter(|stats| stats.evaluable == 0.0 && stats.withheld_small_triple)
             .count(),
         small_root_triples,
+        correction: None,
     })
 }
 
 /// The component labels of a loop's three members at one pixel.
-type ComponentKey = [u32; 3];
+pub(crate) type ComponentKey = [u32; 3];
 
 /// One loop's integer-cycle root per component triple, in radians; `None` for
 /// a triple with fewer than [`MIN_ROOT_PIXELS`] finite residuals.
-type ComponentRoots = HashMap<ComponentKey, Option<f64>>;
+pub(crate) type ComponentRoots = HashMap<ComponentKey, Option<f64>>;
 
 /// One pixel's loop verdicts.
 struct PixelLoopStats {
@@ -246,7 +253,7 @@ struct PixelLoopStats {
     withheld_small_triple: bool,
 }
 
-fn triangle_residual(
+pub(crate) fn triangle_residual(
     unwrapped: ArrayView3<f64>,
     triplet: &Triplet,
     (row, col): (usize, usize),
@@ -257,7 +264,7 @@ fn triangle_residual(
 
 /// The labels a loop's members carry at a pixel, or `None` when any member has
 /// no component there: such a pixel belongs to no root and cannot be judged.
-fn component_key(
+pub(crate) fn component_key(
     connected_components: ArrayView3<u32>,
     triplet: &Triplet,
     (row, col): (usize, usize),
@@ -281,7 +288,7 @@ fn component_key(
 /// unwrap error can never be charged to the rest of the frame. Triples with
 /// fewer than [`MIN_ROOT_PIXELS`] finite residuals, and any pixel with a
 /// label-0 member, contribute no root.
-fn triangle_roots(
+pub(crate) fn triangle_roots(
     unwrapped: ArrayView3<f64>,
     connected_components: ArrayView3<u32>,
     triplet: &Triplet,

@@ -114,16 +114,13 @@ fn default_config_round_trips() {
 fn compatibility_only_values_still_round_trip_before_runtime_validation() {
     let mut original = DisplacementWorkflow::default();
     original.worker_settings.threads_per_worker = 6;
-    original
-        .unwrap_options
-        .preprocess_options
-        .interpolation_cor_threshold = 0.4;
+    original.unwrap_options.preprocess_options.alpha = 0.75;
 
     let yaml = original.to_yaml().unwrap();
     let parsed = DisplacementWorkflow::from_yaml(&yaml).unwrap();
     assert_eq!(parsed, original);
     let error = parsed.validate_supported_options().unwrap_err().to_string();
-    assert!(error.contains("unwrap_options.preprocess_options.interpolation_cor_threshold"));
+    assert!(error.contains("unwrap_options.preprocess_options.alpha"));
 }
 
 /// Forward divergence: `input_options.input_type` is dolphinRust-only. A legacy

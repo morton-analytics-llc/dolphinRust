@@ -1931,6 +1931,7 @@ pub(crate) fn correction_order_digest(
     hash_optional_array(&mut digest, layers.ionosphere.as_ref());
     hash_optional_array(&mut digest, layers.troposphere.as_ref());
     hash_optional_array(&mut digest, layers.solid_earth_tide.as_ref());
+    hash_optional_array(&mut digest, layers.plate_motion.as_ref());
     Ok(digest.finalize().into())
 }
 
@@ -1941,11 +1942,17 @@ pub(crate) fn unwrap_branch_digest(
     validity: ArrayView2<'_, bool>,
     connected_components: ArrayView3<'_, u32>,
     loop_qc_enabled: bool,
+    loop_correction_enabled: bool,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest
         .update(b"dolphinrust:production-unwrap-branch:v2:ifg-phase-gaussian-11-normalized-valid");
-    digest.update([unwrap_method_code(method), u8::from(loop_qc_enabled)]);
+    // The correction changes the unwrapped values the solve sees, so it is part of
+    // the branch; bit 1 is zero without it, leaving every earlier digest as it was.
+    digest.update([
+        unwrap_method_code(method),
+        u8::from(loop_qc_enabled) | (u8::from(loop_correction_enabled) << 1),
+    ]);
     digest.update((backend_config.len() as u64).to_le_bytes());
     digest.update(backend_config);
     for &(reference, secondary) in pairs {
@@ -2206,6 +2213,7 @@ mod tests {
             troposphere: None,
             los_geometry: None,
             solid_earth_tide: None,
+            plate_motion: None,
         };
         let base = correction_order_digest(&options, Some(0.056), &layers).unwrap();
         let changed_wavelength = correction_order_digest(&options, Some(0.055), &layers).unwrap();
@@ -2232,6 +2240,7 @@ mod tests {
             validity.view(),
             components.view(),
             true,
+            false,
         );
         assert_ne!(
             sha256_string(native),
@@ -2245,6 +2254,7 @@ mod tests {
             validity.view(),
             components.view(),
             true,
+            false,
         );
         let changed_validity = unwrap_branch_digest(
             UnwrapMethod::Native,
@@ -2253,9 +2263,23 @@ mod tests {
             Array2::from_elem((2, 2), true).view(),
             components.view(),
             true,
+            false,
+        );
+        let corrected = unwrap_branch_digest(
+            UnwrapMethod::Native,
+            b"native-config",
+            &pairs,
+            validity.view(),
+            components.view(),
+            true,
+            true,
         );
         assert_ne!(native, snaphu);
         assert_ne!(native, changed_validity);
+        assert_ne!(
+            native, corrected,
+            "the loop-closure correction is its own branch"
+        );
     }
 
     #[test]

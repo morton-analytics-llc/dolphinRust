@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dolphin_core::{Cf32, Cf64};
+use dolphin_phaselink::{interpolate, INTERPOLATION_ALPHA, INTERPOLATION_NUM_NEIGHBORS};
 use dolphin_unwrap::native::{unwrap_native, NativeConfig};
 use dolphin_unwrap::{
     unwrap_multiscale, unwrap_with_corr, write_correlation, TophuConfig, UnwrapConfig,
@@ -59,14 +60,36 @@ pub struct TophuBackend(pub TophuConfig);
 /// per-pair `par_iter` parallelizes with neither a fork nor flat-binary I/O.
 pub struct NativeUnwrapBackend(pub NativeConfig);
 
+/// Pre-unwrap interpolation of low-quality wrapped phase, as dolphin v0.35.0's
+/// `unwrap/_unwrap.py` runs it when `unwrap_options.run_interpolation` is set.
+pub(crate) struct InterpolationPlan<'a> {
+    /// Phase similarity deciding the coherent-pixel mask. `None` falls back to
+    /// each interferogram's own correlation — dolphin's similarity test
+    /// *replaces* the correlation test rather than combining with it.
+    pub similarity: Option<ArrayView2<'a, f64>>,
+    /// Pixels below this (similarity, else correlation) are interpolated.
+    pub cutoff: f64,
+    /// Neighbour search radius in pixels.
+    pub max_radius: usize,
+}
+
+/// Network unwrap products plus, when interpolation ran, the per-pixel number of
+/// interferograms whose wrapped phase was replaced before unwrapping.
+pub(crate) struct CorrelatedNetworkUnwrap {
+    pub output: UnwrapNetworkOutput,
+    pub interpolated_count: Option<Array2<u32>>,
+}
+
 pub(crate) fn unwrap_phase_correlated_network(
     backend: &dyn UnwrapBackend,
     pl: ArrayView3<Cf64>,
     pairs: &[(usize, usize)],
     support: ArrayView2<bool>,
+    interpolation: Option<&InterpolationPlan>,
     scratch: &Path,
-) -> Result<UnwrapNetworkOutput> {
+) -> Result<CorrelatedNetworkUnwrap> {
     let mut layers = Vec::with_capacity(pairs.len());
+    let mut interpolated_count = interpolation.map(|_| Array2::<u32>::zeros(support.dim()));
     let batch_size = rayon::current_num_threads().max(1);
     for (batch_index, batch) in pairs.chunks(batch_size).enumerate() {
         let batch_layers = batch
@@ -78,17 +101,119 @@ pub(crate) fn unwrap_phase_correlated_network(
                 let index = batch_index * batch_size + index;
                 let pair_scratch = scratch.join(format!("ifg_{index:04}"));
                 std::fs::create_dir_all(&pair_scratch)?;
-                let output =
-                    backend.unwrap_network(pl, &[pair], correlation.view(), &pair_scratch)?;
-                Ok((
-                    output.unwrapped.index_axis_move(Axis(0), 0),
-                    output.connected_components.index_axis_move(Axis(0), 0),
-                ))
+                let Some(plan) = interpolation else {
+                    let output =
+                        backend.unwrap_network(pl, &[pair], correlation.view(), &pair_scratch)?;
+                    return Ok((first_layer(output), None));
+                };
+                unwrap_interpolated(backend, ifg.view(), correlation.view(), plan, &pair_scratch)
             })
             .collect::<Result<Vec<_>>>()?;
-        layers.extend(batch_layers);
+        for (layer, replaced) in batch_layers {
+            if let (Some(count), Some(replaced)) = (interpolated_count.as_mut(), replaced) {
+                ndarray::Zip::from(count)
+                    .and(&replaced)
+                    .for_each(|count, &replaced| *count += u32::from(replaced));
+            }
+            layers.push(layer);
+        }
     }
-    stack_layers(layers)
+    Ok(CorrelatedNetworkUnwrap {
+        output: stack_layers(layers)?,
+        interpolated_count,
+    })
+}
+
+type UnwrapLayer = (Array2<f64>, Array2<u32>);
+
+fn first_layer(output: UnwrapNetworkOutput) -> UnwrapLayer {
+    (
+        output.unwrapped.index_axis_move(Axis(0), 0),
+        output.connected_components.index_axis_move(Axis(0), 0),
+    )
+}
+
+/// dolphin's interpolate → unwrap → `transfer_ambiguities` sequence for one ifg.
+/// The interpolated phase reaches only the unwrapper, with the ifg's original
+/// correlation (dolphin v0.35.0 passes the original `corr_filename`); every
+/// pixel's output is its own wrapped phase plus the solved whole-cycle ambiguity.
+/// Replaced pixels lose their connected-component label: their ambiguity came
+/// from neighbours, so the interpolation never adds unwrap support (and a
+/// phase-driven solver such as SNAPHU would otherwise label the smoothed gap).
+/// This stands in for dolphin's post-transfer SNAPHU component regrow, which is
+/// not ported. Also returns which pixels were replaced.
+fn unwrap_interpolated(
+    backend: &dyn UnwrapBackend,
+    ifg: ArrayView2<Cf32>,
+    correlation: ArrayView2<f32>,
+    plan: &InterpolationPlan,
+    scratch: &Path,
+) -> Result<(UnwrapLayer, Option<Array2<bool>>)> {
+    // dolphin compares the float32 rasters against the cutoff in float32.
+    let cutoff = plan.cutoff as f32;
+    let weights = match plan.similarity {
+        Some(similarity) => similarity.mapv(|value| value as f32 >= cutoff),
+        None => correlation.mapv(|value| value >= cutoff),
+    }
+    .mapv(|coherent| f32::from(u8::from(coherent)));
+    let interpolated = interpolate(
+        ifg,
+        weights.view(),
+        cutoff,
+        INTERPOLATION_NUM_NEIGHBORS,
+        plan.max_radius,
+        INTERPOLATION_ALPHA,
+    );
+    let replaced = ndarray::Zip::from(&ifg)
+        .and(&weights)
+        .map_collect(|&value, &weight| value != Cf32::new(0.0, 0.0) && weight < cutoff);
+    let output = backend.unwrap_network(
+        single_pair_stack(interpolated.view()).view(),
+        &[(0, 1)],
+        correlation,
+        scratch,
+    )?;
+    let (estimate, mut components) = first_layer(output);
+    ndarray::Zip::from(&mut components)
+        .and(&replaced)
+        .for_each(|label, &replaced| {
+            if replaced {
+                *label = 0;
+            }
+        });
+    Ok((
+        (transfer_ambiguities(ifg, estimate.view()), components),
+        Some(replaced),
+    ))
+}
+
+/// A two-date linked-phase stack whose single pair `(0, 1)` forms exactly `ifg`,
+/// so a prepared interferogram can go through the network-level backend trait.
+fn single_pair_stack(ifg: ArrayView2<Cf32>) -> Array3<Cf64> {
+    let (rows, cols) = ifg.dim();
+    Array3::from_shape_fn((2, rows, cols), |(date, row, col)| match date {
+        0 => {
+            let value = ifg[(row, col)];
+            Cf64::new(f64::from(value.re), f64::from(value.im))
+        }
+        _ => Cf64::new(1.0, 0.0),
+    })
+}
+
+/// dolphin `transfer_ambiguities`: round the unwrapped estimate's offset from the
+/// original wrapped phase to whole cycles (numpy rounds half to even) and add
+/// them to the wrapped phase. Nodata pixels keep the solver's value.
+fn transfer_ambiguities(ifg: ArrayView2<Cf32>, estimate: ArrayView2<f64>) -> Array2<f64> {
+    ndarray::Zip::from(&ifg)
+        .and(&estimate)
+        .map_collect(|&value, &unwrapped| {
+            if value == Cf32::new(0.0, 0.0) {
+                return unwrapped;
+            }
+            let wrapped = f64::from(value.im.atan2(value.re));
+            let cycles = ((unwrapped - wrapped) / std::f64::consts::TAU).round_ties_even();
+            wrapped + std::f64::consts::TAU * cycles
+        })
 }
 
 /// Upstream workflow phase correlation: Gaussian sigma 11/3, truncated at four
@@ -365,6 +490,117 @@ mod tests {
             .all(|&value| value == 0.0));
     }
 
+    /// Returns each received ifg's wrapped phase plus one cycle, and records the
+    /// phase it was handed at `PROBE`.
+    struct PhasePlusCycle(std::sync::Mutex<Vec<f64>>);
+
+    const PROBE: (usize, usize) = (4, 4);
+
+    impl UnwrapBackend for PhasePlusCycle {
+        fn unwrap_network(
+            &self,
+            pl: ArrayView3<Cf64>,
+            pairs: &[(usize, usize)],
+            _correlation: ArrayView2<f32>,
+            _scratch: &Path,
+        ) -> Result<UnwrapNetworkOutput> {
+            let ifg = form_ifg(pl, pairs[0]);
+            self.0.lock().unwrap().push(f64::from(ifg[PROBE].arg()));
+            let unwrapped = ifg.mapv(|z| f64::from(z.arg()) + std::f64::consts::TAU);
+            Ok(UnwrapNetworkOutput {
+                unwrapped: unwrapped.insert_axis(Axis(0)),
+                connected_components: Array3::from_elem((1, ifg.nrows(), ifg.ncols()), 1),
+            })
+        }
+    }
+
+    /// A smooth 0.9 rad field with a decorrelated probe pixel at +2.0 rad and a
+    /// nodata pixel, both below the similarity cutoff.
+    fn probe_scene() -> (Array3<Cf64>, Array2<f64>) {
+        let mut pl = Array3::from_elem((2, 9, 9), Cf64::new(1.0, 0.0));
+        pl.index_axis_mut(Axis(0), 0)
+            .fill(Cf64::from_polar(1.0, 0.9));
+        pl[(0, PROBE.0, PROBE.1)] = Cf64::from_polar(1.0, 0.9 + 2.0);
+        pl[(0, 0, 0)] = Cf64::new(0.0, 0.0);
+        let mut similarity = Array2::from_elem((9, 9), 0.8);
+        similarity[PROBE] = 0.1;
+        similarity[(0, 0)] = 0.1;
+        (pl, similarity)
+    }
+
+    fn run_probe(
+        pl: &Array3<Cf64>,
+        interpolation: Option<&InterpolationPlan>,
+    ) -> (CorrelatedNetworkUnwrap, Vec<f64>) {
+        let backend = PhasePlusCycle(std::sync::Mutex::new(Vec::new()));
+        let scratch = std::env::temp_dir().join(format!(
+            "dolphin_interpolation_probe_{}_{}",
+            std::process::id(),
+            interpolation.map_or(0.0, |plan| plan.cutoff)
+        ));
+        let support = Array2::from_elem((9, 9), true);
+        let output = unwrap_phase_correlated_network(
+            &backend,
+            pl.view(),
+            &[(0, 1)],
+            support.view(),
+            interpolation,
+            &scratch,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(scratch).unwrap();
+        (output, backend.0.into_inner().unwrap())
+    }
+
+    /// The unwrapper sees the neighbour phase at a decorrelated pixel; the output
+    /// there is the pixel's own wrapped phase plus the transferred cycle, it
+    /// carries no component label, and the provenance count marks it (and not
+    /// the nodata pixel).
+    #[test]
+    fn interpolation_feeds_unwrapper_and_transfers_ambiguities_to_original_phase() {
+        let (pl, similarity) = probe_scene();
+        let plan = InterpolationPlan {
+            similarity: Some(similarity.view()),
+            cutoff: 0.3,
+            max_radius: 51,
+        };
+        let (output, seen) = run_probe(&pl, Some(&plan));
+        assert!((seen[0] - 0.9).abs() < 1e-6, "unwrapper saw {}", seen[0]);
+        let own = f64::from(Cf32::from_polar(1.0, (0.9 + 2.0_f64) as f32).arg());
+        let probe = output.output.unwrapped[(0, PROBE.0, PROBE.1)];
+        assert!(
+            (probe - (own + std::f64::consts::TAU)).abs() < 1e-6,
+            "{probe}"
+        );
+        assert_eq!(output.output.connected_components[(0, PROBE.0, PROBE.1)], 0);
+        assert_eq!(output.output.connected_components[(0, 2, 2)], 1);
+        let count = output.interpolated_count.unwrap();
+        assert_eq!(count[PROBE], 1);
+        assert_eq!(count.sum(), 1, "only the valid low-similarity pixel counts");
+    }
+
+    /// Interpolation that replaces nothing (cutoff 0) reproduces the
+    /// interpolation-off output bit for bit, and off records no provenance.
+    #[test]
+    fn interpolation_off_leaves_network_output_unchanged() {
+        let (pl, similarity) = probe_scene();
+        let (off, seen_off) = run_probe(&pl, None);
+        assert!(off.interpolated_count.is_none());
+        assert!((seen_off[0] - (0.9 + 2.0)).abs() < 1e-6);
+        let plan = InterpolationPlan {
+            similarity: Some(similarity.view()),
+            cutoff: 0.0,
+            max_radius: 51,
+        };
+        let (noop, _) = run_probe(&pl, Some(&plan));
+        assert_eq!(noop.output.unwrapped, off.output.unwrapped);
+        assert_eq!(
+            noop.output.connected_components,
+            off.output.connected_components
+        );
+        assert_eq!(noop.interpolated_count.unwrap().sum(), 0);
+    }
+
     struct EchoCorrelation;
 
     impl UnwrapBackend for EchoCorrelation {
@@ -406,9 +642,11 @@ mod tests {
             pl.view(),
             &pairs,
             support.view(),
+            None,
             &scratch,
         )
-        .unwrap();
+        .unwrap()
+        .output;
         assert!(output.unwrapped[(0, 16, 17)] < 0.01);
         assert!((output.unwrapped[(1, 16, 17)] - 1.0).abs() < 1e-6);
         assert!(output.unwrapped[(2, 16, 17)] < 0.01);
@@ -421,9 +659,11 @@ mod tests {
             missing.view(),
             &pairs,
             support.view(),
+            None,
             &scratch,
         )
-        .unwrap();
+        .unwrap()
+        .output;
         assert_eq!(output.unwrapped[(0, 5, 5)], 0.0);
         assert_eq!(output.unwrapped[(1, 5, 5)], 0.0);
         assert_eq!(output.unwrapped[(0, 7, 7)], 0.0);
