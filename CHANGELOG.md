@@ -164,8 +164,10 @@ All notable changes to dolphinRust are documented here. The format follows
   the replay-config digest gives the new rule its own code while `always_first_legacy` keeps
   the value every earlier artifact carries. `JunctionStepSummary` gains `reference`, the
   resolved reference of the later ministack. Oracles: planner and four-ministack sequential
-  fixtures from dolphin v0.42.9 and v0.35.0 are committed under `oracle/fixtures/`. Evidence
-  and real-data validation: `md/research/issue-192-validation-protocol-2026-11.md`.
+  fixtures from dolphin v0.42.9 and v0.35.0 are committed under `oracle/fixtures/`. Simulation
+  parity with dolphin v0.42.9: `md/research/issue-192-simulation-parity-2026-11.md`. The
+  real-data protocol (`md/research/issue-192-validation-protocol-2026-11.md`) is frozen and has
+  not been run.
 
 ### Fixed
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
