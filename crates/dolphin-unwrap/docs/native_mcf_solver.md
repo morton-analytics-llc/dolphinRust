@@ -42,13 +42,22 @@ Primal NS on a spanning-tree basis with an artificial **root**:
   cost `c_ij − π_i + π_j`, refresh the block when exhausted) — O(√m) amortized/pivot.
 - **Pivot:** the entering arc closes a cycle with the tree; augment the cycle by its
   bottleneck; the saturated tree arc leaves. Update potentials on the moved subtree
-  and the thread/parent/depth arrays.
+  and the parent/thread/subtree-size arrays.
 - **Anti-cycling (load-bearing):** **strongly-feasible basis** (Cunningham 1973) — on
   ties for the leaving arc pick the one nearest the root along the cycle. Without it
   degenerate pivots can loop forever. Termination at *an* optimum, not a unique one.
 
-Tree as parallel arrays: `parent`, `parent_arc` (signed), `thread` (preorder),
-`depth`, `pi` (potential). Reused across tiles. Real-arc caps set to a big-M ≥ F so
+Tree as parallel arrays (`simplex.rs`): `parent`, `pred_arc`, `thread` (preorder
+successor, circular through the root) with its inverse `rev_thread`, `subtree_size`,
+`last_descendant`, and `pi` (potential). A node's subtree is the `subtree_size` nodes
+starting at it on the thread, so the potential update walks that segment with no
+allocation, and the cycle apex is found by climbing from whichever endpoint has the
+smaller subtree (this takes the place of a `depth` array). A pivot cuts the leaving
+arc's subtree out of the thread, re-roots it at the entering arc's endpoint by
+reversing the parent chain and reordering the segment, and splices it back in after
+its new parent. The pivot rule never reads the thread, so the flows are the same as
+with any other tree storage (issue #161: 36–71% less unwrap CPU than the earlier
+child-list tree on the dense bench, output bit-identical). Real-arc caps set to a big-M ≥ F so
 the upper bound never binds → nonbasic arcs are only ever at the lower bound (no
 upper-bound state flips → smaller leaving-arc logic, less risk).
 
