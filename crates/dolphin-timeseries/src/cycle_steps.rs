@@ -23,6 +23,29 @@
 //! label, a non-finite step, or fewer than [`MIN_CYCLE_STEP_NEIGHBOURS`]
 //! qualifying neighbours are not judged (never flagged). Nothing is corrected
 //! here: the output is counts, flags, and per-date fractions.
+//!
+//! # Ministack junctions (issue #184)
+//!
+//! At the first date of every ministack after the first, the linked phase
+//! changes datum to the carried compressed SLCs. That datum error is spatially
+//! correlated over the phase-linking look window, so it arrives as a *patch*
+//! several output pixels wide; on Fresno T137 the patches sit 0.5–0.84 cycle
+//! from their surroundings (eo #758, fast-pixel attribution 2026-11-03). The
+//! same estimator in dolphin v0.35.0 (`workflows/single.py`
+//! `run_wrapped_phase_single` + `phase_link/_compress.py` `compress`) produces
+//! the same junction steps on the same input, so they are a property of the
+//! sequential estimator, not of this port. The plain rule misses them twice: a
+//! 5x5 median moves with a patch that fills most of the window, and a 0.6-cycle
+//! residual is not within a quarter cycle of a whole one.
+//!
+//! At a junction epoch the residual is therefore taken against the median of a
+//! wider same-component neighbourhood (`junction_half_window`, sized by the
+//! caller from the look window), and any residual beyond half a cycle is
+//! flagged as `round(residual)` cycles. Beyond half a cycle from its
+//! surroundings, a step sits on an integer branch away from the nearest one —
+//! whether the unwrapper added that integer or the datum error itself exceeds
+//! half a cycle, the series carries an integer-cycle ambiguity there. Other
+//! epochs keep the plain rule.
 
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
@@ -39,6 +62,11 @@ pub const DEFAULT_CYCLE_STEP_HALF_WINDOW: usize = 2;
 /// Fewest same-component finite neighbours a pixel needs before its residual
 /// is judged; a median of fewer is one or two pixels' opinion.
 pub const MIN_CYCLE_STEP_NEIGHBOURS: usize = 4;
+/// Junction neighbourhood half-width in units of the phase-linking look-window
+/// half-width (in output pixels). A datum patch spans about one look window,
+/// `(2r + 1)²` pixels; three look radii keep it under a fifth of the
+/// `(6r + 1)²` support, so the median stays on the surroundings.
+pub const JUNCTION_SUPPORT_LOOK_RADII: usize = 3;
 
 /// Per-date integer-cycle steps detected inside connected components.
 #[derive(Debug, Clone)]
@@ -51,6 +79,11 @@ pub struct CycleStepDetection {
     pub step_count: Array2<u32>,
     /// Per step index, in order; `epoch` is the later acquisition.
     pub per_date: Vec<CycleStepDateSummary>,
+    /// Acquisition indices judged by the junction rule (first date of each
+    /// ministack after the first); empty when no junction was supplied.
+    pub junction_epochs: Vec<usize>,
+    /// Neighbourhood half-width the junction rule used; `0` when none ran.
+    pub junction_half_window: usize,
 }
 
 /// Identifier-free frame statistics for one date's step.
@@ -84,6 +117,8 @@ impl CycleStepDetection {
             steps: Array3::zeros((0, rows, cols)),
             step_count: Array2::zeros((rows, cols)),
             per_date: Vec::new(),
+            junction_epochs: Vec::new(),
+            junction_half_window: 0,
         }
     }
 }
@@ -101,6 +136,25 @@ pub fn detect_cycle_steps(
     half_window: usize,
     tolerance_cycles: f64,
 ) -> CycleStepDetection {
+    detect_cycle_steps_with_junctions(series, components, half_window, tolerance_cycles, &[], 0)
+}
+
+/// [`detect_cycle_steps`] with the ministack-junction rule: at each acquisition
+/// index in `junction_epochs` the residual is taken against the
+/// `junction_half_window` neighbourhood and flagged as `round(residual)` once
+/// it exceeds half a cycle (see the module docs).
+///
+/// # Panics
+/// If `components` and `series` differ in shape.
+#[must_use]
+pub fn detect_cycle_steps_with_junctions(
+    series: ArrayView3<f64>,
+    components: ArrayView3<u32>,
+    half_window: usize,
+    tolerance_cycles: f64,
+    junction_epochs: &[usize],
+    junction_half_window: usize,
+) -> CycleStepDetection {
     assert_eq!(
         components.dim(),
         series.dim(),
@@ -113,7 +167,12 @@ pub fn detect_cycle_steps(
     for k in 0..n_steps {
         let step = date_step_cycles(series, k);
         let labels = components.index_axis(Axis(0), k);
-        let residuals = neighbourhood_residuals(step.view(), labels, half_window);
+        let at_junction = junction_epochs.contains(&(k + 1));
+        let (window, tolerance) = match at_junction {
+            true => (junction_half_window, 0.5),
+            false => (half_window, tolerance_cycles),
+        };
+        let residuals = neighbourhood_residuals(step.view(), labels, window);
         let mut judged = 0;
         let mut flagged = 0;
         let mut over_half = 0;
@@ -127,7 +186,7 @@ pub fn detect_cycle_steps(
                 judged += 1;
                 over_half += usize::from(residual.abs() > 0.5);
                 let whole = residual.round();
-                if whole != 0.0 && (residual - whole).abs() <= tolerance_cycles {
+                if whole != 0.0 && (residual - whole).abs() <= tolerance {
                     flagged += 1;
                     *detected = whole.clamp(f64::from(i8::MIN), f64::from(i8::MAX)) as i8;
                     *offset += i32::from(*detected);
@@ -152,10 +211,20 @@ pub fn detect_cycle_steps(
         });
     }
     let step_count = steps.fold_axis(Axis(0), 0_u32, |&count, &step| count + u32::from(step != 0));
+    let junction_epochs: Vec<usize> = junction_epochs
+        .iter()
+        .copied()
+        .filter(|&epoch| (1..=n_steps).contains(&epoch))
+        .collect();
     CycleStepDetection {
         steps,
         step_count,
         per_date,
+        junction_half_window: match junction_epochs.is_empty() {
+            true => 0,
+            false => junction_half_window,
+        },
+        junction_epochs,
     }
 }
 
@@ -330,6 +399,104 @@ mod tests {
         assert_eq!(detection.per_date[5].offset_pixels, 1);
         assert_eq!(detection.per_date[7].offset_pixels, 1);
         assert_eq!(detection.per_date[8].offset_pixels, 0);
+    }
+
+    /// Known-answer junction case (issue #184, synthetic): thirty dates in
+    /// ministacks of fifteen, so acquisition 15 opens the second ministack.
+    /// From there on a 5x5 patch sits 0.6 cycle above its surroundings and a
+    /// 4x4 patch a whole cycle below, the window-scale datum patches Fresno
+    /// T137 showed. The same 0.6-cycle patch also appears at a non-junction
+    /// epoch (22). The 5x5 rule misses the 0.6-cycle patch (not near a whole
+    /// cycle) and the interior of the whole-cycle one (its 5x5 median moves
+    /// with the patch); only the patch rim is flagged. The junction rule flags
+    /// every patch pixel at epoch 15 (+1 and -1) and nothing else.
+    #[test]
+    fn junction_rule_flags_window_scale_patches_the_plain_rule_misses() {
+        let (rows, cols) = (40, 40);
+        let junction = 15;
+        let mut series = smooth_series(30, rows, cols);
+        let raised: Vec<(usize, usize)> = (8..13)
+            .flat_map(|row| (8..13).map(move |col| (row, col)))
+            .collect();
+        let lowered: Vec<(usize, usize)> = (25..29)
+            .flat_map(|row| (24..28).map(move |col| (row, col)))
+            .collect();
+        let later: Vec<(usize, usize)> = (26..31)
+            .flat_map(|row| (8..13).map(move |col| (row, col)))
+            .collect();
+        for k in junction - 1..29 {
+            for &(row, col) in &raised {
+                series[(k, row, col)] += 0.6 * TAU;
+            }
+            for &(row, col) in &lowered {
+                series[(k, row, col)] -= TAU;
+            }
+        }
+        for k in 21..29 {
+            for &(row, col) in &later {
+                series[(k, row, col)] += 0.6 * TAU;
+            }
+        }
+        let components = one_component(&series);
+
+        let plain = detect(&series, &components);
+        let plain_flagged = |patch: &[(usize, usize)]| {
+            patch
+                .iter()
+                .filter(|&&(row, col)| plain.steps[(junction - 1, row, col)] != 0)
+                .count()
+        };
+        assert_eq!(
+            plain_flagged(&raised),
+            0,
+            "0.6 cycle is not near a whole one"
+        );
+        assert!(
+            plain_flagged(&lowered) < lowered.len(),
+            "inside a whole-cycle patch the 5x5 median moves with the patch"
+        );
+        assert!(plain.junction_epochs.is_empty());
+
+        let detection = detect_cycle_steps_with_junctions(
+            series.view(),
+            components.view(),
+            DEFAULT_CYCLE_STEP_HALF_WINDOW,
+            DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+            &[junction],
+            JUNCTION_SUPPORT_LOOK_RADII * 2,
+        );
+        for ((k, row, col), &step) in detection.steps.indexed_iter() {
+            let expected = match (k + 1 == junction, raised.contains(&(row, col))) {
+                (true, true) => 1,
+                (true, false) if lowered.contains(&(row, col)) => -1,
+                _ => 0,
+            };
+            assert_eq!(step, expected, "step index {k} pixel ({row},{col})");
+        }
+        let summary = &detection.per_date[junction - 1];
+        assert_eq!(summary.flagged_pixels, raised.len() + lowered.len());
+        assert_eq!(summary.offset_pixels, raised.len() + lowered.len());
+        assert_eq!(detection.junction_epochs, vec![junction]);
+        assert_eq!(detection.junction_half_window, 6);
+    }
+
+    /// Junction epochs outside the series are dropped, and with none left the
+    /// detection records no junction rule.
+    #[test]
+    fn junction_epochs_outside_the_series_are_not_recorded() {
+        let series = smooth_series(5, 6, 6);
+        let components = one_component(&series);
+        let detection = detect_cycle_steps_with_junctions(
+            series.view(),
+            components.view(),
+            DEFAULT_CYCLE_STEP_HALF_WINDOW,
+            DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+            &[0, 9],
+            6,
+        );
+        assert!(detection.junction_epochs.is_empty());
+        assert_eq!(detection.junction_half_window, 0);
+        assert!(detection.steps.iter().all(|&step| step == 0));
     }
 
     /// Neighbours in another component do not vote, an unlabelled pixel is

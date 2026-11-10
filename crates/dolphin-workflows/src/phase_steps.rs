@@ -77,6 +77,16 @@ pub struct CycleStepProvenance {
     pub tolerance_cycles: f64,
     /// Fewest same-component finite neighbours before a pixel is judged.
     pub min_neighbours: usize,
+    /// Acquisition indices judged by the junction rule (issue #184): the first
+    /// date of each ministack after the first. Empty in records written before
+    /// the rule existed.
+    #[serde(default)]
+    pub junction_epochs: Vec<usize>,
+    /// Junction-rule neighbourhood half-width in pixels; at a junction a step
+    /// more than half a cycle from that neighbourhood's median is flagged.
+    /// `0` when no junction was judged.
+    #[serde(default)]
+    pub junction_half_window: usize,
     /// Analysis-frame pixels with at least one detected step.
     pub flagged_pixels: usize,
     /// One entry per step index, in acquisition order.

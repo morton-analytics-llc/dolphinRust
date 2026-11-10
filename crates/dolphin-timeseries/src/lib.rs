@@ -9,6 +9,7 @@
 pub mod cycle_steps;
 pub mod inversion;
 pub mod loop_closure;
+pub mod loop_correction;
 pub mod network;
 pub mod reference;
 pub mod spatial_covariance;
@@ -17,8 +18,9 @@ mod temporal_covariance_batch;
 pub mod velocity_model;
 
 pub use cycle_steps::{
-    detect_cycle_steps, CycleStepDateSummary, CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW,
-    DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, MIN_CYCLE_STEP_NEIGHBOURS,
+    detect_cycle_steps, detect_cycle_steps_with_junctions, CycleStepDateSummary,
+    CycleStepDetection, DEFAULT_CYCLE_STEP_HALF_WINDOW, DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES,
+    JUNCTION_SUPPORT_LOOK_RADII, MIN_CYCLE_STEP_NEIGHBOURS,
 };
 pub use inversion::{
     estimate_velocity, estimate_velocity_with_diagnostics, estimate_velocity_with_precisions,
@@ -31,8 +33,15 @@ pub use loop_closure::{
     loop_closure_qc, mask_failed_loops, network_triplets, LoopClosureQc, LoopClosureShapeError,
     Triplet, DEFAULT_CLOSURE_TOLERANCE_CYCLES, MIN_ROOT_PIXELS,
 };
+pub use loop_correction::{
+    check_correction_network, correct_loop_closure_errors, LoopClosureCorrection,
+    LoopCorrectionError, PixelCorrection, MAX_CORRECTION_FRACTION_CYCLES,
+};
 pub use network::{build_network, network_components, NetworkConfig};
-pub use reference::{reference_to_point, select_reference_point};
+pub use reference::{
+    reference_to_point, select_coherent_reference_point, select_reference_point, CoherentReference,
+    COHERENT_SUPPORT_METHOD_VERSION,
+};
 pub use spatial_covariance::{
     convert_covariance_units, date_contrast, fixed_l2_difference_workspace_composition,
     solve_fixed_l2_spatial_covariance, solve_fixed_l2_spatial_covariance_from_factor,

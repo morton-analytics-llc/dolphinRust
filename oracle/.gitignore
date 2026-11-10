@@ -20,4 +20,6 @@ fixtures/*
 # total) — committed so the metric and its neighbour-set are gated in CI rather
 # than skipped for want of a local fixture.
 !fixtures/similarity_*.npy
+# Pre-unwrap interpolation: compact pinned dolphin v0.35.0 oracle (~45 KB).
+!fixtures/interpolation_*.npy
 __pycache__/

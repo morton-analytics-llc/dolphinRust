@@ -1031,4 +1031,26 @@ mod production_l2_map_contract {
         assert!(map.condition_number() > 1.0e12);
         PIXEL_L2_MAP_CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 1));
     }
+
+    /// #159: a disconnected network (pairs 0-1 and 2-3 only) has an exactly
+    /// singular weighted normal matrix. Whatever rounding does to its Cholesky
+    /// factor, the map must report rank deficiency, never an `Ok` solve.
+    #[test]
+    fn fixed_l2_pixel_map_rejects_a_disconnected_network_at_every_weight() {
+        let design = array![[1.0, 0.0, 0.0], [0.0, -1.0, 1.0], [0.0, -1.0, 1.0]];
+        let observations = Array3::from_shape_vec((3, 1, 1), vec![0.5, 0.25, 0.25]).unwrap();
+        for step in 1..=400_u32 {
+            let weight = f64::from(step) / 7.0;
+            let weights = Array3::from_shape_vec((3, 1, 1), vec![1.0, weight, 0.3]).unwrap();
+            let error = fixed_l2_pixel_map(
+                design.view(),
+                observations.view(),
+                Some(weights.view()),
+                (0, 0),
+                3,
+            )
+            .unwrap_err();
+            assert_eq!(error.status, PixelL2MapStatus::RankDeficient, "{weight}");
+        }
+    }
 }
