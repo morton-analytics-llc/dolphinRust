@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use dolphin_ingest::stage_from_store;
 use object_store::memory::InMemory;
-use object_store::{path::Path as ObjPath, ObjectStore, PutPayload};
+use object_store::{path::Path as ObjPath, ObjectStoreExt, PutPayload};
 
 #[test]
 fn stages_objects_in_order_byte_exact() {

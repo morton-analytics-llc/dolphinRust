@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
-use object_store::{path::Path as ObjPath, ObjectStore};
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use tokio::runtime::Builder;
 
 /// Max concurrent downloads / runtime worker threads.
@@ -13,10 +13,13 @@ const MAX_CONCURRENT: usize = 8;
 /// Errors raised while staging granules.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
+    /// The object store refused or failed a request.
     #[error("object_store: {0}")]
     Store(#[from] object_store::Error),
+    /// A granule URL did not parse.
     #[error("url parse: {0}")]
     Url(String),
+    /// Writing a staged granule to local scratch failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
