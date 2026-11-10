@@ -242,6 +242,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     consumed!("phase_linking.zero_correlation_threshold", "CFG-PHASE-LINK"),
     consumed!("phase_linking.shp_method", "CFG-SHP-WIRING"),
     consumed!("phase_linking.shp_alpha", "CFG-SHP-WIRING"),
+    consumed!("phase_linking.shp_amplitude_statistics", "CFG-SHP-WIRING"),
     compatibility_only!(
         "phase_linking.mask_input_ps",
         "the workflow has no persistent-scatterer label input"
@@ -401,6 +402,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.velocity_relaxation",
         "CFG-VELOCITY-MODEL",
         "timeseries_options.velocity_relaxation is nonempty"
+    ),
+    conditional!(
+        "timeseries_options.estimate_dem_error",
+        "CFG-VELOCITY-MODEL",
+        "timeseries_options.estimate_dem_error is true"
     ),
     conditional!(
         "timeseries_options.mask_unwrap_loop_errors",
@@ -663,6 +669,26 @@ pub enum ShpMethod {
     Rect,
 }
 
+/// Which acquisitions supply the amplitude mean and variance the GLRT SHP test
+/// compares (`shp_method: glrt`; the KS and rect methods do not use them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShpAmplitudeStatistics {
+    /// Every real acquisition of the run, with `nslc` the run's date count, the
+    /// same for every ministack. This is what dolphin does: it computes one
+    /// amplitude mean/dispersion pair over the whole input stack before the
+    /// sequential pass. An incremental update uses every date the series has
+    /// seen so far for the ministacks it links, and leaves sealed ministacks
+    /// as they were, so under this setting an update is not bit-identical to a
+    /// full rerun (which would reselect the sealed ministacks' neighbours).
+    #[default]
+    FullStack,
+    /// Each ministack's own real acquisitions (dolphinRust before issue #165).
+    /// Fewer samples per test, so more neighbours are accepted. An incremental
+    /// update stays bit-identical to a full rerun.
+    Ministack,
+}
+
 /// Compressed-SLC carry-forward plan. dolphin `CompressedSlcPlan`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -778,6 +804,9 @@ pub struct PhaseLinkingOptions {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
+    /// Which acquisitions the GLRT's amplitude mean and variance come from.
+    /// dolphinRust-only switch; the default matches dolphin.
+    pub shp_amplitude_statistics: ShpAmplitudeStatistics,
     /// Dolphin YAML compatibility only; non-default values are rejected because
     /// the workflow has no persistent-scatterer label input.
     pub mask_input_ps: bool,
@@ -824,6 +853,7 @@ impl Default for PhaseLinkingOptions {
             zero_correlation_threshold: 0.0,
             shp_method: ShpMethod::default(),
             shp_alpha: 0.001,
+            shp_amplitude_statistics: ShpAmplitudeStatistics::default(),
             mask_input_ps: false,
             baseline_lag: None,
             compressed_slc_plan: CompressedSlcPlan::default(),
@@ -950,6 +980,16 @@ pub struct TimeseriesOptions {
     /// Onset and time constant are **inputs**, never fitted: jointly estimating
     /// them is a nonlinear problem out of scope here (issue #102). Empty by default.
     pub velocity_relaxation: Vec<VelocityRelaxation>,
+    /// Fit a per-pixel residual DEM error jointly with the velocity (Fattahi &
+    /// Amelung 2013): one basis column `B⊥(t) / (R sin θ)`, the frame-centre
+    /// perpendicular baseline to acquisition 0 over slant range times the sine of
+    /// the look-side incidence, derived from the CSLC orbits. Emits
+    /// `dem_error.tif` (metres, relative to the reference point's own height
+    /// error, like the displacement it is fitted from; `B⊥` and `R sin θ` are
+    /// burst-centre values, so the height scale is up to about ±10% off at the
+    /// burst's range edges). Needs OPERA CSLC orbit metadata and
+    /// `input_options.wavelength`. dolphinRust-only; off by default.
+    pub estimate_dem_error: bool,
     /// Close every triangle in the **unwrapped** interferogram network before the
     /// SBAS solve and blank pixels whose loops miss closure by more than half a
     /// cycle — a 2π unwrap error, which the wrapped closure-phase layer cannot
@@ -1002,6 +1042,7 @@ impl Default for TimeseriesOptions {
             velocity_seasonal: false,
             velocity_step_dates: Vec::new(),
             velocity_relaxation: Vec::new(),
+            estimate_dem_error: false,
             mask_unwrap_loop_errors: false,
             correct_unwrap_loop_errors: false,
             write_cycle_step_diagnostics: false,
@@ -1658,6 +1699,14 @@ impl DisplacementWorkflow {
             return Err(CoreError::InvalidConfig(
                 "output_options.strides.y and output_options.strides.x must both be positive"
                     .into(),
+            ));
+        }
+        if self.timeseries_options.estimate_dem_error
+            && (self.input_options.wavelength.is_none()
+                || self.input_options.input_type != InputType::OperaCslc)
+        {
+            return Err(CoreError::InvalidConfig(
+                "timeseries_options.estimate_dem_error requires OPERA CSLC inputs (for orbits) and input_options.wavelength".into(),
             ));
         }
         if let Some(fraction) = self.correction_options.max_outside_static_fraction {

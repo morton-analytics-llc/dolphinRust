@@ -46,6 +46,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "phase_linking.zero_correlation_threshold",
     "phase_linking.shp_method",
     "phase_linking.shp_alpha",
+    "phase_linking.shp_amplitude_statistics",
     "phase_linking.mask_input_ps",
     "phase_linking.baseline_lag",
     "phase_linking.compressed_slc_plan",
@@ -82,6 +83,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "timeseries_options.velocity_seasonal",
     "timeseries_options.velocity_step_dates",
     "timeseries_options.velocity_relaxation",
+    "timeseries_options.estimate_dem_error",
     "timeseries_options.mask_unwrap_loop_errors",
     "timeseries_options.correct_unwrap_loop_errors",
     "timeseries_options.write_cycle_step_diagnostics",
@@ -274,6 +276,7 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
             zero_correlation_threshold,
             shp_method,
             shp_alpha,
+            shp_amplitude_statistics,
             mask_input_ps,
             baseline_lag,
             compressed_slc_plan,
@@ -297,6 +300,7 @@ fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>
         zero_correlation_threshold,
         shp_method,
         shp_alpha,
+        shp_amplitude_statistics,
         mask_input_ps,
         baseline_lag,
         compressed_slc_plan,
@@ -354,6 +358,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
             velocity_seasonal,
             velocity_step_dates,
             velocity_relaxation,
+            estimate_dem_error,
             mask_unwrap_loop_errors,
             correct_unwrap_loop_errors,
             write_cycle_step_diagnostics,
@@ -378,6 +383,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
         velocity_seasonal,
         velocity_step_dates,
         velocity_relaxation,
+        estimate_dem_error,
         mask_unwrap_loop_errors,
         correct_unwrap_loop_errors,
         write_cycle_step_diagnostics,
@@ -923,6 +929,18 @@ fn outside_static_fraction_must_be_a_fraction() {
         config.correction_options.max_outside_static_fraction = valid;
         config.validate_supported_options().unwrap();
     }
+}
+
+/// `timeseries_options.estimate_dem_error` (#143) needs OPERA orbits and a
+/// wavelength to scale the baseline sensitivity into phase.
+#[test]
+fn dem_error_requires_wavelength_and_opera_inputs() {
+    let mut config = DisplacementWorkflow::default();
+    config.timeseries_options.estimate_dem_error = true;
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(error.contains("estimate_dem_error"), "{error}");
+    config.input_options.wavelength = Some(0.055);
+    config.validate_supported_options().unwrap();
 }
 
 /// #160: the native unwrapper has one cost model, so `cost: defo` on native is a

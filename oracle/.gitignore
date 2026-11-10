@@ -22,4 +22,7 @@ fixtures/*
 !fixtures/similarity_*.npy
 # Pre-unwrap interpolation: compact pinned dolphin v0.35.0 oracle (~45 KB).
 !fixtures/interpolation_*.npy
+# Issue #165: dolphin v0.42.0 workflow SHP counts under full-stack GLRT
+# statistics, and the stack they came from (~63 KB).
+!fixtures/shp_fullstack_*.npy
 __pycache__/

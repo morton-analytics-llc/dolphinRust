@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
+use dolphin_core::config::{CompressedSlcPlan, ShpAmplitudeStatistics, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_io::covariance::{
     covariance_operator_block_sha256, CovarianceGenerationBlockIdentity,
@@ -80,6 +80,8 @@ pub struct SequentialConfig {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
+    /// Which acquisitions the GLRT's amplitude statistics come from.
+    pub shp_amplitude_statistics: ShpAmplitudeStatistics,
 }
 
 /// Output of a sequential run.
@@ -142,6 +144,85 @@ pub struct SequentialState {
     /// Raw real SLCs of the open trailing ministack, `(n_open, rows, cols)`;
     /// `n_open = 0` when the prior run ended exactly on a ministack boundary.
     open_real_slcs: Array3<Cf64>,
+    /// Amplitude sums over every real date of the series so far, sealed and
+    /// open; `Some` only when the GLRT uses full-stack statistics.
+    amplitude_sums: Option<AmplitudeSums>,
+}
+
+/// Running per-pixel amplitude sums over the real acquisitions of a series.
+/// Dates are added one at a time in acquisition order, so a full run and an
+/// incremental update that have seen the same dates hold identical sums.
+#[derive(Clone)]
+struct AmplitudeSums {
+    count: usize,
+    sum: Array2<f64>,
+    sum_of_squares: Array2<f64>,
+}
+
+impl AmplitudeSums {
+    /// `prior` (or nothing) with every date of `slcs` added.
+    fn extended(prior: Option<&Self>, slcs: ArrayView3<Cf64>) -> Self {
+        let (_, rows, cols) = slcs.dim();
+        let mut sums = prior.cloned().unwrap_or_else(|| Self {
+            count: 0,
+            sum: Array2::zeros((rows, cols)),
+            sum_of_squares: Array2::zeros((rows, cols)),
+        });
+        for date in slcs.outer_iter() {
+            ndarray::Zip::from(&mut sums.sum)
+                .and(&mut sums.sum_of_squares)
+                .and(&date)
+                .for_each(|sum, squares, value| {
+                    *sum += value.norm();
+                    *squares += value.norm_sqr();
+                });
+        }
+        sums.count += slcs.dim().0;
+        sums
+    }
+
+    /// The GLRT's inputs: amplitude mean, population variance and date count.
+    fn statistics(&self) -> ShpStatistics {
+        let count = self.count as f64;
+        let mean = &self.sum / count;
+        let variance = ndarray::Zip::from(&self.sum_of_squares)
+            .and(&mean)
+            .map_collect(|&squares, &mean| (squares / count - mean * mean).max(0.0));
+        ShpStatistics {
+            mean,
+            variance,
+            nslc: self.count,
+        }
+    }
+}
+
+/// Amplitude mean, variance and sample count for the GLRT SHP test.
+struct ShpStatistics {
+    mean: Array2<f64>,
+    variance: Array2<f64>,
+    nslc: usize,
+}
+
+/// Amplitude sums over `prior`'s dates plus `slcs`, when the configured SHP
+/// test takes its statistics from the whole stack (GLRT, `full_stack`);
+/// `None` for every other configuration, which reads the ministack alone.
+fn full_stack_amplitude_sums(
+    cfg: &SequentialConfig,
+    prior: Option<&AmplitudeSums>,
+    slcs: ArrayView3<Cf64>,
+) -> Option<AmplitudeSums> {
+    (cfg.shp_method == ShpMethod::Glrt
+        && cfg.shp_amplitude_statistics == ShpAmplitudeStatistics::FullStack)
+        .then(|| AmplitudeSums::extended(prior, slcs))
+}
+
+/// An update needs the prior dates' amplitude sums whenever the SHP test uses
+/// full-stack statistics and the series already holds dates.
+fn prior_amplitude_sums_are_missing(state: &SequentialState, cfg: &SequentialConfig) -> bool {
+    cfg.shp_method == ShpMethod::Glrt
+        && cfg.shp_amplitude_statistics == ShpAmplitudeStatistics::FullStack
+        && state.amplitude_sums.is_none()
+        && (!state.sealed_compressed.is_empty() || state.open_real_slcs.dim().0 > 0)
 }
 
 /// Immutable source revision supplied to one resumable covariance capture.
@@ -263,6 +344,7 @@ fn drive(
     valid_mask: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
+    shp_statistics: Option<&ShpStatistics>,
 ) -> Result<Drive, &'static str> {
     let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
     let mut out = Drive {
@@ -275,7 +357,7 @@ fn drive(
     };
     for &ms in plans {
         let combined = assemble(&carry, real_stack, ms);
-        let r = link_and_compress(combined.view(), ms, valid_mask, cfg, engine)?;
+        let r = link_and_compress(combined.view(), ms, valid_mask, cfg, engine, shp_statistics)?;
         out.phases
             .push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
         carry.push(r.compressed.clone());
@@ -308,6 +390,7 @@ fn drive_with_covariance_capture<F>(
     source_resolver: Option<
         &mut dyn crate::sequential_covariance::SequentialPrimitiveSourceResolver,
     >,
+    shp_statistics: Option<&ShpStatistics>,
     emit: &mut F,
 ) -> Result<Drive, SequentialReplayError>
 where
@@ -333,6 +416,7 @@ where
             cfg,
             engine,
             request.branch_tolerance,
+            shp_statistics,
         )?;
         let block = match source_resolver.as_mut() {
             Some(resolver) => build_covariance_operator_block(
@@ -535,6 +619,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_sequential_with_covariance_capture_impl<F>(
     slc_stack: ArrayView3<Cf64>,
     native_validity: Option<ArrayView2<bool>>,
@@ -625,6 +710,8 @@ where
         .map_err(SequentialReplayError::Execution)?
         .flatten();
     let mut adapted_emit = |block| emit(block).map_err(SequentialReplayError::Execution);
+    let shp_statistics =
+        full_stack_amplitude_sums(cfg, None, slc_stack).map(|sums| sums.statistics());
     let d = drive_with_covariance_capture(
         &plans,
         slc_stack,
@@ -636,6 +723,7 @@ where
         &topology,
         request,
         source_resolver,
+        shp_statistics.as_ref(),
         &mut adapted_emit,
     )?;
     build_output(
@@ -1049,6 +1137,8 @@ where
         block_digests.insert(block.block_id, covariance_operator_block_sha256(&block));
         emit(block)
     };
+    let amplitude_sums = full_stack_amplitude_sums(cfg, None, slc_stack);
+    let shp_statistics = amplitude_sums.as_ref().map(AmplitudeSums::statistics);
     let drive = drive_with_covariance_capture(
         &plans,
         slc_stack,
@@ -1060,6 +1150,7 @@ where
         &topology,
         request,
         source_resolver,
+        shp_statistics.as_ref(),
         &mut capture,
     )?;
     let output = build_output(
@@ -1088,6 +1179,7 @@ where
         cfg.ministack_size,
         native_validity,
         drive,
+        amplitude_sums,
     );
     Ok((
         output,
@@ -1415,6 +1507,14 @@ fn update_sequential_with_covariance_capture_impl(
             .write_block(&block)
             .map_err(SequentialReplayError::Io)
     };
+    if prior_amplitude_sums_are_missing(&state.sequential, cfg) {
+        return Err(SequentialReplayError::Invalid(
+            "covariance update state holds no full-stack amplitude statistics",
+        ));
+    }
+    let amplitude_sums =
+        full_stack_amplitude_sums(cfg, state.sequential.amplitude_sums.as_ref(), new_slcs);
+    let shp_statistics = amplitude_sums.as_ref().map(AmplitudeSums::statistics);
     let drive = drive_with_covariance_capture(
         &tail_plans,
         tail.view(),
@@ -1426,6 +1526,7 @@ fn update_sequential_with_covariance_capture_impl(
         &topology,
         request,
         source_resolver,
+        shp_statistics.as_ref(),
         &mut capture,
     )?;
     let phases = chain(&state.sequential.sealed_phases, &drive.phases);
@@ -1462,6 +1563,7 @@ fn update_sequential_with_covariance_capture_impl(
         cfg.ministack_size,
         native_validity,
         drive,
+        amplitude_sums,
     )
     .with_sealed_prefix(&state.sequential);
     let state = SequentialCovarianceState {
@@ -1657,7 +1759,17 @@ fn run_sequential_resumable_impl(
     };
     let planner = planner_for(slc_stack.dim().0, cfg)?;
     let plans = planner.plan(cfg.ministack_size)?;
-    let d = drive(&plans, slc_stack, &[], valid_mask, cfg, engine)?;
+    let amplitude_sums = full_stack_amplitude_sums(cfg, None, slc_stack);
+    let shp_statistics = amplitude_sums.as_ref().map(AmplitudeSums::statistics);
+    let d = drive(
+        &plans,
+        slc_stack,
+        &[],
+        valid_mask,
+        cfg,
+        engine,
+        shp_statistics.as_ref(),
+    )?;
     let output = build_output(
         &d.phases,
         d.compressed.clone(),
@@ -1671,7 +1783,14 @@ fn run_sequential_resumable_impl(
             cfg.strides,
         ),
     )?;
-    let state = seal_state(&plans, slc_stack, cfg.ministack_size, native_validity, d);
+    let state = seal_state(
+        &plans,
+        slc_stack,
+        cfg.ministack_size,
+        native_validity,
+        d,
+        amplitude_sums,
+    );
     Ok((output, state))
 }
 
@@ -1746,6 +1865,11 @@ fn update_sequential_impl(
     let num_sealed = state.sealed_compressed.len();
     let tail_plans =
         planner_for(tail.dim().0, cfg)?.plan_with_offset(cfg.ministack_size, num_sealed)?;
+    if prior_amplitude_sums_are_missing(state, cfg) {
+        return Err("update_sequential: the series state holds no full-stack amplitude statistics");
+    }
+    let amplitude_sums = full_stack_amplitude_sums(cfg, state.amplitude_sums.as_ref(), new_slcs);
+    let shp_statistics = amplitude_sums.as_ref().map(AmplitudeSums::statistics);
     let d = drive(
         &tail_plans,
         tail.view(),
@@ -1753,6 +1877,7 @@ fn update_sequential_impl(
         valid_mask,
         cfg,
         engine,
+        shp_statistics.as_ref(),
     )?;
 
     let phases = chain(&state.sealed_phases, &d.phases);
@@ -1776,6 +1901,7 @@ fn update_sequential_impl(
         cfg.ministack_size,
         native_validity,
         d,
+        amplitude_sums,
     )
     .with_sealed_prefix(state);
     Ok((output, next))
@@ -1828,6 +1954,7 @@ fn seal_state(
     ministack_size: usize,
     native_validity: Option<ArrayView2<bool>>,
     d: Drive,
+    amplitude_sums: Option<AmplitudeSums>,
 ) -> SequentialState {
     let (_, rows, cols) = real_stack.dim();
     let last = plans.last();
@@ -1848,6 +1975,7 @@ fn seal_state(
         sealed_crlb: take_prefix(&d.crlb, sealed),
         sealed_closure: take_prefix(&d.closure, sealed),
         open_real_slcs,
+        amplitude_sums,
     }
 }
 
@@ -1983,6 +2111,7 @@ fn link_and_compress_with_covariance_capture(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
     branch_tolerance: f64,
+    shp_statistics: Option<&ShpStatistics>,
 ) -> Result<CapturedMinistackResult, SequentialReplayError> {
     let output_reference_idx = ms
         .resolved_output_reference_idx()
@@ -1990,7 +2119,11 @@ fn link_and_compress_with_covariance_capture(
     let compressed_reference_idx = ms
         .resolved_compressed_reference_idx()
         .map_err(SequentialReplayError::Execution)?;
-    let neighbors = shp_neighbors(combined.slice(s![ms.num_compressed.., .., ..]), cfg);
+    let neighbors = shp_neighbors(
+        combined.slice(s![ms.num_compressed.., .., ..]),
+        cfg,
+        shp_statistics,
+    );
     let compute = |input: ArrayView3<Cf64>| {
         let mut replay = engine
             .link_with_source_replay(
@@ -2056,13 +2189,18 @@ fn link_and_compress(
     valid_mask: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
+    shp_statistics: Option<&ShpStatistics>,
 ) -> Result<MinistackResult, &'static str> {
     let output_reference_idx = ms.resolved_output_reference_idx()?;
     let compressed_reference_idx = ms.resolved_compressed_reference_idx()?;
     // SHP neighbors are selected from the real acquisitions only; the carried
     // compressed SLCs are projections, not observations, so their amplitude
     // statistics would not describe the scatterer.
-    let neighbors = shp_neighbors(combined.slice(s![ms.num_compressed.., .., ..]), cfg);
+    let neighbors = shp_neighbors(
+        combined.slice(s![ms.num_compressed.., .., ..]),
+        cfg,
+        shp_statistics,
+    );
     let compute = |input: ArrayView3<Cf64>| {
         let fused = engine.link(
             input,
@@ -2146,19 +2284,36 @@ fn mask_native_complex(values: &mut Array2<Cf64>, valid_mask: ArrayView2<bool>) 
 /// SHP neighbor mask for one ministack's real acquisitions, or `None` for the
 /// full rectangular window ([`ShpMethod::Rect`], which keeps the unmasked
 /// covariance kernel and so stays bit-identical to the pre-SHP output).
-fn shp_neighbors(real: ArrayView3<Cf64>, cfg: &SequentialConfig) -> Option<Array4<bool>> {
+///
+/// The GLRT compares `full_stack` statistics when given (the same for every
+/// ministack, as in dolphin) and otherwise this ministack's own.
+fn shp_neighbors(
+    real: ArrayView3<Cf64>,
+    cfg: &SequentialConfig,
+    full_stack: Option<&ShpStatistics>,
+) -> Option<Array4<bool>> {
     let nslc = real.dim().0;
     let amplitude = real.mapv(|z| z.norm());
     match cfg.shp_method {
         ShpMethod::Rect => None,
         ShpMethod::Glrt => {
-            let mean = amplitude.mean_axis(Axis(0))?;
-            let var = amplitude.var_axis(Axis(0), 0.0);
+            let ministack;
+            let statistics = match full_stack {
+                Some(statistics) => statistics,
+                None => {
+                    ministack = ShpStatistics {
+                        mean: amplitude.mean_axis(Axis(0))?,
+                        variance: amplitude.var_axis(Axis(0), 0.0),
+                        nslc,
+                    };
+                    &ministack
+                }
+            };
             Some(estimate_neighbors_glrt(
-                mean.view(),
-                var.view(),
+                statistics.mean.view(),
+                statistics.variance.view(),
                 cfg.half_window,
-                nslc,
+                statistics.nslc,
                 cfg.strides,
                 cfg.shp_alpha,
             ))
@@ -2176,7 +2331,8 @@ fn shp_neighbors(real: ArrayView3<Cf64>, cfg: &SequentialConfig) -> Option<Array
 /// Build the fused-pass parameters. `num_looks` is dolphin's conservative
 /// `sqrt(half_y · half_x)`; the CRLB reference is the last compressed date
 /// (dolphin's `max(first_real_slc_idx − 1, 0)`), which may differ from the
-/// output reference.
+/// output reference. The count is that date's position because [`assemble`]
+/// always puts the carried compressed SLCs first (#176).
 fn fused_params(ms: MiniStack, cfg: &SequentialConfig, output_reference_idx: usize) -> FusedParams {
     FusedParams {
         use_evd: cfg.use_evd,
@@ -2194,7 +2350,7 @@ fn fused_params(ms: MiniStack, cfg: &SequentialConfig, output_reference_idx: usi
 
 #[cfg(test)]
 mod tests {
-    use super::{stitch_temp_coh, Array2};
+    use super::*;
 
     /// On all-finite layers the stitch is a plain mean (prior parity preserved).
     #[test]
@@ -2221,5 +2377,193 @@ mod tests {
         a[(0, 0)] = f64::NAN;
         let allnan = stitch_temp_coh(&[a.clone(), a]);
         assert!(allnan[(0, 0)].is_nan(), "all-NaN pixel stays NaN");
+    }
+
+    // ---- Issue #165: full-stack GLRT amplitude statistics ----------------------
+
+    const DATES: usize = 12;
+
+    fn glrt_config(statistics: ShpAmplitudeStatistics) -> SequentialConfig {
+        SequentialConfig {
+            ministack_size: 4,
+            max_num_compressed: 10,
+            half_window: HalfWindow { y: 1, x: 1 },
+            strides: Strides { y: 1, x: 1 },
+            use_evd: true,
+            beta: 0.0,
+            zero_correlation_threshold: 0.0,
+            output_reference_idx: 0,
+            compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
+            compute_crlb: false,
+            compute_closure_phase: false,
+            compute_average_coherence: false,
+            shp_method: ShpMethod::Glrt,
+            shp_alpha: 0.001,
+            shp_amplitude_statistics: statistics,
+        }
+    }
+
+    /// Dim left half (amplitude 1), bright right half (6), and the dim column
+    /// next to the boundary bright during the first four dates only. Over all
+    /// 12 dates that column tests as bright (GLRT statistic 15.7 against dim,
+    /// 3.1 against bright; threshold 10.8); over dates 4.. it is dim. Phases
+    /// are a fixed pseudo-random hash.
+    fn two_population_stack() -> Array3<Cf64> {
+        Array3::from_shape_fn((DATES, 6, 6), |(date, row, col)| {
+            let bright = col >= 3 || (col == 2 && date < 4);
+            let amplitude =
+                if bright { 6.0 } else { 1.0 } * (1.0 + 0.05 * f64::from(date as u32 % 2));
+            let hash = (date * 7919 + row * 104_729 + col * 1_299_709) % 6283;
+            Cf64::from_polar(amplitude, hash as f64 / 1000.0)
+        })
+    }
+
+    fn cpu() -> ComputeEngine {
+        ComputeEngine::new(dolphin_core::config::ComputeBackend::Cpu)
+    }
+
+    /// An update continues the date-by-date sums a full run makes, so both hold
+    /// the same sums bit for bit, and the statistics are the stack's mean and
+    /// population variance.
+    #[test]
+    fn amplitude_sums_of_an_update_equal_those_of_a_full_run() {
+        let stack = two_population_stack();
+        let cfg = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let (_, state) =
+            run_sequential_resumable(stack.slice(s![..6, .., ..]), &cfg, &cpu()).unwrap();
+        let (_, next) =
+            update_sequential(&state, stack.slice(s![6.., .., ..]), &cfg, &cpu()).unwrap();
+        let carried = next.amplitude_sums.expect("full-stack GLRT keeps sums");
+        let full = AmplitudeSums::extended(None, stack.view());
+        assert_eq!(carried.count, DATES);
+        assert_eq!(carried.sum, full.sum);
+        assert_eq!(carried.sum_of_squares, full.sum_of_squares);
+
+        let amplitude = stack.mapv(|z| z.norm());
+        let statistics = full.statistics();
+        let mean = amplitude.mean_axis(Axis(0)).unwrap();
+        let variance = amplitude.var_axis(Axis(0), 0.0);
+        assert_eq!(statistics.nslc, DATES);
+        assert!((&statistics.mean - &mean).iter().all(|d| d.abs() < 1e-12));
+        assert!((&statistics.variance - &variance)
+            .iter()
+            .all(|d| d.abs() < 1e-12));
+
+        let ministack = glrt_config(ShpAmplitudeStatistics::Ministack);
+        let (_, state) = run_sequential_resumable(stack.view(), &ministack, &cpu()).unwrap();
+        assert!(state.amplitude_sums.is_none());
+    }
+
+    /// The ministacks an update links (the reopened one and the new one) get
+    /// statistics over every date so far, not over the tail or the ministack.
+    #[test]
+    fn an_update_links_its_tail_with_statistics_over_every_date_so_far() {
+        let stack = two_population_stack();
+        let cfg = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let (_, state) =
+            run_sequential_resumable(stack.slice(s![..6, .., ..]), &cfg, &cpu()).unwrap();
+        let (output, _) =
+            update_sequential(&state, stack.slice(s![6.., .., ..]), &cfg, &cpu()).unwrap();
+
+        let tail = stack.slice(s![4.., .., ..]);
+        let plans = planner_for(tail.dim().0, &cfg)
+            .unwrap()
+            .plan_with_offset(cfg.ministack_size, 1)
+            .unwrap();
+        let linked_with = |statistics: Option<&ShpStatistics>| {
+            let d = drive(
+                &plans,
+                tail,
+                &state.sealed_compressed,
+                None,
+                &cfg,
+                &cpu(),
+                statistics,
+            )
+            .unwrap();
+            concatenate(Axis(0), &[d.phases[0].view(), d.phases[1].view()]).unwrap()
+        };
+        let every_date = AmplitudeSums::extended(None, stack.view()).statistics();
+        let tail_only = AmplitudeSums::extended(None, tail).statistics();
+        let updated = output.cpx_phase.slice(s![4.., .., ..]);
+        assert_eq!(updated, linked_with(Some(&every_date)));
+        assert_ne!(updated, linked_with(Some(&tail_only)));
+        assert_ne!(updated, linked_with(None));
+    }
+
+    /// A state made without full-stack sums cannot be continued with them.
+    #[test]
+    fn update_refuses_a_state_without_the_prior_amplitude_sums() {
+        let stack = two_population_stack();
+        let ministack = glrt_config(ShpAmplitudeStatistics::Ministack);
+        let (_, state) =
+            run_sequential_resumable(stack.slice(s![..6, .., ..]), &ministack, &cpu()).unwrap();
+        let full_stack = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let error = update_sequential(&state, stack.slice(s![6.., .., ..]), &full_stack, &cpu())
+            .err()
+            .expect("update must fail");
+        assert!(error.contains("full-stack amplitude statistics"), "{error}");
+    }
+
+    /// #176 (dolphin PR #750, v0.42.9). dolphin took the last compressed SLC's
+    /// position to be `count − 1` in a date-sorted file list where a compressed
+    /// SLC could sort between real ones. Here `assemble` is the only builder of
+    /// a combined ministack and it puts the carried compressed SLCs first, so
+    /// the position found by scanning (dolphin's fix) equals the count-derived
+    /// index the driver uses: for both plans that carry compressed SLCs, with
+    /// and without `max_num_compressed` truncation, and on a resumed plan.
+    #[test]
+    fn compressed_slcs_always_lead_the_combined_ministack() {
+        // Real layer `d` holds `d`; the `k`-th compressed SLC holds `-(k + 1)`.
+        let layer = |value: f64| Array2::from_elem((1, 1), Cf64::new(value, 0.0));
+        let real = Array3::from_shape_fn((11, 1, 1), |(date, _, _)| Cf64::new(date as f64, 0.0));
+        let cases = [
+            CompressedSlcPlan::AlwaysFirst,
+            CompressedSlcPlan::FirstPerMinistack,
+        ]
+        .into_iter()
+        .flat_map(|plan| [2, 10].map(|max| (plan, max)))
+        .flat_map(|(plan, max)| [0, 3].map(|sealed| (plan, max, sealed)));
+        for (plan, max_num_compressed, sealed) in cases {
+            let cfg = SequentialConfig {
+                ministack_size: 3,
+                max_num_compressed,
+                compressed_slc_plan: plan,
+                ..glrt_config(ShpAmplitudeStatistics::FullStack)
+            };
+            let plans = planner_for(real.dim().0, &cfg)
+                .unwrap()
+                .plan_with_offset(cfg.ministack_size, sealed)
+                .unwrap();
+            let mut carry: Vec<_> = (0..sealed).map(|k| layer(-(k as f64 + 1.0))).collect();
+            for ms in plans {
+                let combined = assemble(&carry, real.view(), ms);
+                let values: Vec<f64> = combined.iter().map(|z| z.re).collect();
+                let last_compressed = values.iter().rposition(|&value| value < 0.0);
+                let first_real = values.iter().position(|&value| value >= 0.0).unwrap();
+                let context = format!("{plan:?}, max {max_num_compressed}, block {}", ms.block_id);
+                assert_eq!(
+                    last_compressed,
+                    ms.num_compressed.checked_sub(1),
+                    "{context}"
+                );
+                assert_eq!(first_real, ms.num_compressed, "{context}");
+
+                let newest = carry.len() as f64;
+                let expected_compressed =
+                    (0..ms.num_compressed).map(|k| -(newest - (ms.num_compressed - 1 - k) as f64));
+                let expected_real = (0..ms.num_real).map(|j| (ms.real_start + j) as f64);
+                assert_eq!(
+                    values,
+                    expected_compressed.chain(expected_real).collect::<Vec<_>>(),
+                    "{context}"
+                );
+
+                let params = fused_params(ms, &cfg, ms.resolved_output_reference_idx().unwrap());
+                assert_eq!(params.crlb_reference_idx, last_compressed.unwrap_or(0));
+                assert_eq!(params.average_coherence_start_idx, first_real);
+                carry.push(layer(-(newest + 1.0)));
+            }
+        }
     }
 }

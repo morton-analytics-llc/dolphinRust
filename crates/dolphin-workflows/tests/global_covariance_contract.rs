@@ -114,6 +114,7 @@ fn config() -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     }
 }
 
@@ -1491,12 +1492,14 @@ fn adaptive_capture_matches_glrt_and_ks_production_and_persists_realized_support
                 .collect::<Vec<_>>();
             let real = stack.select(Axis(0), &dates);
             let amplitude = real.mapv(|value| value.norm());
+            // GLRT statistics come from the whole stack (#165); KS from the block.
+            let stack_amplitude = stack.mapv(|value| value.norm());
             let expected = match method {
                 ShpMethod::Glrt => estimate_neighbors_glrt(
-                    amplitude.mean_axis(Axis(0)).unwrap().view(),
-                    amplitude.var_axis(Axis(0), 0.0).view(),
+                    stack_amplitude.mean_axis(Axis(0)).unwrap().view(),
+                    stack_amplitude.var_axis(Axis(0), 0.0).view(),
                     cfg.half_window,
-                    real.dim().0,
+                    stack.dim().0,
                     cfg.strides,
                     cfg.shp_alpha,
                 ),
@@ -2731,6 +2734,7 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     };
     let amplitudes = [1.0, 1.2, 0.9, 1.1];
     let phases = [0.4, 0.9, 1.25, 1.8];

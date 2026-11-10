@@ -386,6 +386,7 @@ fn resumable_capture_persists_empirical_receipts_and_leaves_only_tail_open() {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     };
     let request = SequentialCovarianceCaptureRequest {
         burst_id: "burst".to_owned(),

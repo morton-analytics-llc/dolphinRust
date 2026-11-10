@@ -18,7 +18,7 @@ optimize. All math in `Cf64`.
   own samples. Do **not** materialize an `nslc²·area` cube — per-row buffers only.
 - **EVD:** largest eigenvector of `C ⊙ |C|` (power iteration).
 - **EMI (default):** smallest eigenvector of `Γ⁻¹ ⊙ C`, where `Γ = |C|`. Regularize
-  `Γ ← (1−β)Γ + βI`, threshold near-zero entries, Cholesky-invert with 1e-6 jitter,
+  `Γ ← (1−β)Γ + βI`, threshold near-zero entries, Cholesky-invert (no jitter; only the CRLB path adds one),
   inverse iteration (shift μ=0.99). **On singular `Γ⁻¹` (NaN), fall back to EVD** — this
   fallback is part of the algorithm, keep it.
 - Eigensolvers: power / inverse iteration are dolphin's approach; we are free to use faer's

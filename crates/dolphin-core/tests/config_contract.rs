@@ -5,7 +5,8 @@
 //! groups we don't model) must deserialize, and our own emit must round-trip.
 
 use dolphin_core::config::{
-    CompressedSlcPlan, DisplacementWorkflow, InputType, ShpMethod, TimeseriesMethod, UnwrapMethod,
+    CompressedSlcPlan, DisplacementWorkflow, InputType, ShpAmplitudeStatistics, ShpMethod,
+    TimeseriesMethod, UnwrapMethod,
 };
 
 #[test]
@@ -263,4 +264,26 @@ correction_options:
     // Round-trips through serialize → parse.
     let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();
     assert_eq!(reparsed, c, "correction_options round-trips");
+}
+
+/// #165: the GLRT takes its amplitude statistics from the whole stack by
+/// default, as dolphin does; `ministack` restores the earlier behaviour.
+#[test]
+fn shp_amplitude_statistics_default_to_the_full_stack() {
+    let default = DisplacementWorkflow::default();
+    assert_eq!(
+        default.phase_linking.shp_amplitude_statistics,
+        ShpAmplitudeStatistics::FullStack
+    );
+    assert!(default
+        .to_yaml()
+        .unwrap()
+        .contains("shp_amplitude_statistics: full_stack"));
+    let parsed =
+        DisplacementWorkflow::from_yaml("phase_linking:\n  shp_amplitude_statistics: ministack\n")
+            .unwrap();
+    assert_eq!(
+        parsed.phase_linking.shp_amplitude_statistics,
+        ShpAmplitudeStatistics::Ministack
+    );
 }

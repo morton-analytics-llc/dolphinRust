@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Residual DEM-error term in the velocity fit** (issue #143). With
+  `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
+  `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
+  the along-track-corrected perpendicular baseline from acquisition 0 at the first granule's
+  burst centre, from the CSLC orbits at each granule's mid zero-Doppler time. `R` and `θ` are
+  the reference platform's slant range and incidence there. The fitted coefficient is
+  published as `dem_error.tif` in metres relative to the reference point, and the rate no longer
+  absorbs the baseline-correlated height error. The geometry is evaluated at the burst centre, so
+  the height scale is up to about ±10% off at the burst's range edges; the sign and size are
+  tested against directly computed ranges for a raised scatterer. Off by default. Requires OPERA CSLC inputs and `input_options.wavelength`, and
+  fails the run if any granule's orbit metadata cannot be read.
 - **Geometry provenance records the CSLC-shaping DEM dataset identity** (issue #167, eo#483
   Table 5). `GeometryProvenance` gains `cslc_dem_source`, read from
   `/metadata/processing_information/inputs/dem_source` on every `cslc_file_list` and
@@ -145,6 +156,11 @@ All notable changes to dolphinRust are documented here. The format follows
   so the output is bit-identical. Single-thread CPU on the dense `unwrap_bench`: 128² 0.42 →
   0.26 s, 256² 3.88 → 1.52 s, 384² 17.3 → 5.3 s, 512² (2 ifgs) 34.0 → 9.7 s, and 1024² in
   16×16 tiles 7.40 → 4.70 s (−36% to −71%).
+- **`object_store` 0.11 → 0.14 in `dolphin-ingest`** (issue #188). Moves `quick-xml` 0.37.5 →
+  0.41.0, which clears RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both High) for builds with the
+  `s3` feature; `cargo audit` reports no vulnerabilities. `get`/`put` now come from
+  `ObjectStoreExt`. With `s3` (and in the crate's tests) the build now compiles `aws-lc-sys`,
+  so it needs a C toolchain.
 - **Native unwrapper no longer accepts a cost mode it ignores** (issue #160). The native solver
   has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
   and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
@@ -201,6 +217,22 @@ All notable changes to dolphinRust are documented here. The format follows
   `velocity_sigma.tif`, now scores.
 
 ### Breaking changes
+- **GLRT SHP selection now uses whole-stack amplitude statistics, as dolphin does** (issue
+  #165). The sequential pass used to compare each ministack's own amplitude mean and variance
+  (about 15 dates). dolphin computes one mean/dispersion pair over the whole input stack before
+  the sequential pass and passes the stack's length as `nslc`, so every ministack gets the same
+  neighbourhoods and the test has more samples behind it. New
+  `phase_linking.shp_amplitude_statistics`: `full_stack` (default, dolphin's behaviour) or
+  `ministack` (the earlier behaviour). Parity: on a 30-date, three-ministack scene dolphin
+  v0.42.0's `run_wrapped_phase_sequential` wrote identical `shp_counts` for all three
+  ministacks, and `full_stack` reproduces them exactly on every compared pixel; per-ministack
+  statistics differ on 48 of the 144 in each ministack (`oracle/gen_shp_fullstack_v042.py`). Every
+  default (`shp_method: glrt`) run changes: fewer neighbours are accepted where populations
+  differ. `rect` and `ks` runs are unchanged. Under `full_stack` an incremental update uses
+  every date the series has seen for the ministacks it links and leaves sealed ministacks
+  alone, so it is no longer bit-identical to a full rerun; `ministack` keeps that identity.
+  Covariance-operator artifacts written with GLRT before this change carry the old config
+  digest and match `ministack`, not the new default.
 - **The automatic spatial reference now sits on coherent support by default** (eo #758).
   New `timeseries_options.reference_selection` (`coherent_support` | `largest_component_centroid`)
   and `timeseries_options.reference_coherence_floor` (default 0.85). `coherent_support` follows
