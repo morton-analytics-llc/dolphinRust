@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
-use object_store::{path::Path as ObjPath, ObjectStore};
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use tokio::runtime::Builder;
 
 /// Max concurrent downloads / runtime worker threads.
