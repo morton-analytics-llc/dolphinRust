@@ -5891,20 +5891,16 @@ pub fn sequential_replay_config_digest(cfg: &SequentialConfig) -> [u8; 32] {
             CompressedSlcPlan::FirstPerMinistack => 1,
             CompressedSlcPlan::LastPerMinistack => 2,
         },
+        // Per-ministack GLRT keeps 0, the value every GLRT artifact written
+        // before #165 carries; whole-stack GLRT selects different neighbours
+        // and gets its own.
         match cfg.shp_method {
-            ShpMethod::Glrt => 0,
+            ShpMethod::GlrtMinistack => 0,
             ShpMethod::Ks => 1,
             ShpMethod::Rect => 2,
+            ShpMethod::Glrt => 3,
         },
     ]);
-    // Full-stack GLRT statistics select different neighbours than the
-    // per-ministack statistics every earlier artifact was written with, so
-    // only that combination gets a new digest (#165); the rest are unchanged.
-    if cfg.shp_method == ShpMethod::Glrt
-        && cfg.shp_amplitude_statistics == dolphin_core::config::ShpAmplitudeStatistics::FullStack
-    {
-        digest.update(b"shp_amplitude_statistics:full_stack");
-    }
     digest.finalize().into()
 }
 
