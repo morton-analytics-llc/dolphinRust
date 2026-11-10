@@ -1747,7 +1747,9 @@ pub fn run_frozen_attempt(
     config.use_evd = request.estimator == "evd";
     config.shp_method = match request.support.as_str() {
         "rect" => ShpMethod::Rect,
-        "glrt_frozen" => ShpMethod::Glrt,
+        // The preregistered cells were generated with per-ministack GLRT
+        // statistics (see the mask this file recomputes), before #165.
+        "glrt_frozen" => ShpMethod::GlrtMinistack,
         "ks_frozen" => ShpMethod::Ks,
         _ => anyhow::bail!("unsupported frozen SHP method"),
     };

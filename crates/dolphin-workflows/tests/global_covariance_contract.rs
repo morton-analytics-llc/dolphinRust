@@ -1491,12 +1491,14 @@ fn adaptive_capture_matches_glrt_and_ks_production_and_persists_realized_support
                 .collect::<Vec<_>>();
             let real = stack.select(Axis(0), &dates);
             let amplitude = real.mapv(|value| value.norm());
+            // GLRT statistics come from the whole stack (#165); KS from the block.
+            let stack_amplitude = stack.mapv(|value| value.norm());
             let expected = match method {
                 ShpMethod::Glrt => estimate_neighbors_glrt(
-                    amplitude.mean_axis(Axis(0)).unwrap().view(),
-                    amplitude.var_axis(Axis(0), 0.0).view(),
+                    stack_amplitude.mean_axis(Axis(0)).unwrap().view(),
+                    stack_amplitude.var_axis(Axis(0), 0.0).view(),
                     cfg.half_window,
-                    real.dim().0,
+                    stack.dim().0,
                     cfg.strides,
                     cfg.shp_alpha,
                 ),
@@ -1507,7 +1509,7 @@ fn adaptive_capture_matches_glrt_and_ks_production_and_persists_realized_support
                     cfg.shp_alpha,
                     false,
                 ),
-                ShpMethod::Rect => unreachable!(),
+                ShpMethod::Rect | ShpMethod::GlrtMinistack => unreachable!(),
             };
             assert_eq!(block.support_bits_per_output, 9);
             for output in 0..4 {

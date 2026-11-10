@@ -112,7 +112,7 @@ fn phase_difference_at(
 fn selected_neighbors(stack: &Array3<Cf64>, cfg: &SequentialConfig) -> Array4<bool> {
     let amplitude = stack.mapv(|value| value.norm());
     match cfg.shp_method {
-        ShpMethod::Glrt => estimate_neighbors_glrt(
+        ShpMethod::Glrt | ShpMethod::GlrtMinistack => estimate_neighbors_glrt(
             amplitude.mean_axis(Axis(0)).unwrap().view(),
             amplitude.var_axis(Axis(0), 0.0).view(),
             cfg.half_window,

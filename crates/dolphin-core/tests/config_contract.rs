@@ -264,3 +264,22 @@ correction_options:
     let reparsed = DisplacementWorkflow::from_yaml(&c.to_yaml().unwrap()).unwrap();
     assert_eq!(reparsed, c, "correction_options round-trips");
 }
+
+/// #165: `glrt` is dolphin's whole-stack test and stays the default;
+/// `glrt_ministack` names the earlier per-ministack behaviour.
+#[test]
+fn glrt_ministack_is_a_separate_shp_method() {
+    assert_eq!(
+        serde_yaml::to_string(&ShpMethod::GlrtMinistack)
+            .unwrap()
+            .trim(),
+        "glrt_ministack"
+    );
+    let parsed =
+        DisplacementWorkflow::from_yaml("phase_linking:\n  shp_method: glrt_ministack\n").unwrap();
+    assert_eq!(parsed.phase_linking.shp_method, ShpMethod::GlrtMinistack);
+    assert_eq!(
+        DisplacementWorkflow::default().phase_linking.shp_method,
+        ShpMethod::Glrt
+    );
+}

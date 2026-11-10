@@ -6,6 +6,9 @@ neighbor mask consumed by dolphin-phaselink covariance estimation.
 ## Domain
 - **GLRT (default):** Rayleigh amplitude model; `σ² = (var + mean²)/2`;
   `T = N(2 log σ_pooled − log σ_1 − log σ_2)`; threshold `χ²(1, 1−α)`, α=0.001 (statrs).
+  The caller chooses the samples: for `shp_method: glrt` the sequential workflow passes the
+  mean and variance of every real date in the run with `N` that date count, the same for all
+  ministacks, as dolphin does (issue #165); `glrt_ministack` passes each ministack's own.
 - **KS test:** non-parametric, sorted-amplitude ECDF max distance vs. critical value. In
   dolphin this is the numba `njit(parallel=True)` hot loop; here it is rayon over center
   pixels — a prime optimization target.

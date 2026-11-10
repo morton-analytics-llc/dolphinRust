@@ -659,9 +659,21 @@ fn ensure_supported_choice(path: &str, actual: &str, allowed: &[&str]) -> Result
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShpMethod {
-    /// Generalized likelihood ratio test.
+    /// Generalized likelihood ratio test on amplitude statistics of the whole
+    /// stack: the mean and variance of every real acquisition in the run, with
+    /// `nslc` the run's date count, the same for every ministack. This is what
+    /// dolphin does (one mean/dispersion pair computed before the sequential
+    /// pass). An incremental update uses every date the series has seen for the
+    /// ministacks it links and leaves sealed ministacks as they were, so an
+    /// update is not bit-identical to a full rerun (which would reselect the
+    /// sealed ministacks' neighbours).
     #[default]
     Glrt,
+    /// The same test on each ministack's own real acquisitions: dolphinRust's
+    /// GLRT before issue #165, and not a dolphin value. Fewer samples per test,
+    /// so more neighbours are accepted; an incremental update stays
+    /// bit-identical to a full rerun.
+    GlrtMinistack,
     /// Kolmogorov-Smirnov two-sample test.
     Ks,
     /// No SHP search; use the full rectangular window.
