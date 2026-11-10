@@ -42,8 +42,10 @@ enum Command {
         #[arg(short, long, default_value_t = 2)]
         initial: usize,
     },
-    /// Write dated pairwise products (e.g. pair coherence) for a planned set of
-    /// acquisition pairs, plus a `pairs.json` run index.
+    /// Write dated pairwise products for a planned set of acquisition pairs: pair
+    /// coherence (`mode: coherence`), or the NISAR split-spectrum ionosphere-corrected
+    /// unwrapped interferogram plus `los_enu.tif` (`mode: interferogram`), and a
+    /// `pairs.json` run index.
     Pairs {
         /// Path to the pairs config (YAML).
         #[arg(short, long)]

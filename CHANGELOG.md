@@ -32,6 +32,23 @@ All notable changes to dolphinRust are documented here. The format follows
   pair's IDs, dates, files and sha256. Optional EPSG:4326 `bounds` go through the same
   bounded-read planning as displacement runs. All acquisitions must share one grid. OPERA
   CSLC only: `input_type: nisar_gslc` fails with an explicit error.
+- **`dolphin pairs` interferogram mode: NISAR split-spectrum ionosphere correction.**
+  `mode: interferogram` with `input_type: nisar_gslc` forms the `frequencyA` and
+  `frequencyB` interferograms `ref · conj(sec)` (the `tests/sign_convention.rs` order),
+  multilooks A onto the B grid by complex averaging, unwraps both with SNAPHU, estimates the
+  ionosphere in the A interferogram with the main/side-band split-spectrum kernel, low-pass
+  filters it at `ionosphere_lowpass_wavelength_m`, and subtracts it. Per pair it writes
+  `unwrapped`, `ionosphere`, `corrected`, `coherence` and `connected_components`; once per
+  run it writes a three-band (east, north, up) ground→sensor `los_enu.tif` from the radarGrid
+  LOS cube (`nisar_geometry_group`, `nisar_ellipsoidal_dem_file`). Layers add the
+  `REFERENCE_CRID`, `SECONDARY_CRID`, `CENTER_FREQUENCY_A_HZ`, `CENTER_FREQUENCY_B_HZ`,
+  `WAVELENGTH_M`, `IONOSPHERE_METHOD=split_spectrum_main_side_band` and `PHASE_SIGN` tags, and
+  `pairs.json` gains a per-pair coherence ≥ 0.2 fraction, median coherence and ionosphere
+  std, plus the `los_enu` file. `corrected` is computed in f32 from the written `unwrapped`
+  and `ionosphere`, so `corrected − (unwrapped − ionosphere)` is exactly 0. `frequencyB`
+  must be an integer multilook of `frequencyA`, and `strides` must equal those looks. A
+  product without `frequencyB` is refused with `PairsError::MissingFrequencyB`. On a 256²
+  synthetic two-band pair a planted ionosphere screen is removed to 1.4e-3 rad RMS.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
@@ -209,6 +226,9 @@ All notable changes to dolphinRust are documented here. The format follows
   the disclosure order. It was previously not listed. The field's shape and the schema
   (`dolphinrust-geometry-provenance/7`) are unchanged: this adds one stable name to the list's
   vocabulary.
+- **`dolphin pairs` nodata.** A NaN input pixel used to come out of coherence mode as
+  coherence 0 with no nodata set. In both modes an output pixel is now NaN when any input
+  sample it is formed from is NaN, and every pair COG carries GDAL nodata NaN.
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
   #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and
   edited child lists with `retain`. The tree is now `parent`/`thread`/`rev_thread`/
