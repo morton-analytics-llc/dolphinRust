@@ -136,6 +136,10 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Native unwrapper no longer accepts a cost mode it ignores** (issue #160). The native solver
+  has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
+  and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
+  SNAPHU and tophu still take both.
 - **`compressed_slc_plan: last_per_ministack` is refused across multiple ministacks** (issue
   #164). From the third ministack on, the plan referenced each ministack to the previous one's
   last date, while the sequential stitch assumed a single reference, so displacement silently
