@@ -111,9 +111,15 @@ has decorrelated against the new dates and the newest has not. With a coherence 
 ### What is and is not established
 
 - **Measured:** the tables, in dolphin's kernels.
-- **By the parity contract, not re-measured in Rust:** dolphinRust behaves as the "oldest"
-  rows. `sequential_contract` pins the Rust driver to `oracle/gen_sequential.py`, which runs
-  `ALWAYS_FIRST` with `output_reference_idx=0` at v0.35.0.
+- **Measured in Rust, one stack:** dolphinRust's `run_sequential` (`rect`, EMI, the same
+  ministack and window settings) on the seed-0 stack of the τ = 90 d, γ∞ = 0 case gives
+  0.1032, 0.2178, 0.4994 and 0.8990 rad by ministack. dolphin's kernels on that stack give
+  0.1032, 0.2178, 0.4995, 0.8990 under the oldest rule and 0.1032, 0.2178, 0.2590, 0.3302
+  under the newest. So the Rust driver is the "oldest" row, 1.9× and 2.7× worse than the
+  newest rule in ministacks 3 and 4 there. The other rows of the tables are dolphin's
+  kernels only; that the Rust driver follows them rests on that one check and on
+  `sequential_contract`, which pins it to `oracle/gen_sequential.py` (`ALWAYS_FIRST`,
+  `output_reference_idx=0`, v0.35.0).
 - **Not established:** that this causes the junction steps of #184 and eo #758. #184 found
   that dolphin v0.35.0 "produces the same junction statistics on the same real crop". That
   comparison has the old rule on both sides, so it neither supports nor rules this out.
