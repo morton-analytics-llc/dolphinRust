@@ -65,13 +65,18 @@ All notable changes to dolphinRust are documented here. The format follows
   `ionosphere` and `corrected` (`unwrapped` and `coherence` are unchanged) and get no `k`;
   `pairs.json` reports `in_component_fraction`, the share of valid pixels inside a component.
   The low-pass is a normalized convolution, `G∗(x·m) / G∗m` with `m` the component's finite
-  pixels, run separately per component on a field zero-padded by 3σ, so offsets do not
+  pixels, run separately per component on a field zero-padded by 3σ per axis, so offsets do not
   bleed across component edges or wrap across the image, and a valid `0.0` is data rather
   than nodata (the previous filter zero-filled and treated exact zeros as gaps). A pixel
   whose normalized weight `G∗m` is below 0.25 is NaN: a straight component edge sits at ½
   and a convex corner at ¼, so slivers narrower than about 0.6σ and islands much smaller
   than the filter scale are dropped. A smooth screen next to a 16×16 hole is recovered to
   5.6e-3 rad, and two abutting components with constant offsets keep them to 1e-9 rad.
+  `σ_y` and `σ_x` are derived separately from the cutoff and the output grid's own y and x
+  spacings (from the geotransform), so the cutoff holds in metres on anisotropic NISAR grids
+  (e.g. 5 m × 40 m); the previous single σ from the geometric-mean spacing made the filter
+  about 2.8× too narrow along y and 2.8× too wide along x there. On a 5 m × 40 m grid a
+  sinusoid at the cutoff wavelength comes out at the half-power gain 1/√2 along both axes.
   Known limit: B is aligned and filtered on A's component labels only; a B unwrapping
   error that does not follow an A component boundary is not corrected (intersecting the A
   and B label maps is not implemented).

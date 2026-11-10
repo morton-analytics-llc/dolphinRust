@@ -252,7 +252,8 @@ pub const LOWPASS_MIN_WEIGHT: f64 = 0.25;
 
 /// Gaussian low-pass of an ionosphere estimate within each connected component, by
 /// normalized convolution ([`dolphin_filtering::masked_gaussian_lowpass`], the
-/// `wavelength_cutoff_m` half-power point of `filter_long_wavelength`).
+/// `wavelength_cutoff_m` half-power point of `filter_long_wavelength`), with
+/// `pixel_spacing_m = [y, x]` so `σ_y` and `σ_x` follow the grid's own spacings.
 ///
 /// Each label is filtered over its own finite pixels only, so per-component offsets
 /// never bleed across component edges, and non-finite pixels carry no weight (a valid
@@ -266,7 +267,7 @@ pub fn lowpass_ionosphere(
     ionosphere: ArrayView2<f64>,
     components: ArrayView2<u32>,
     wavelength_cutoff_m: f64,
-    pixel_spacing_m: f64,
+    pixel_spacing_m: [f64; 2],
 ) -> Result<Array2<f64>, SplitSpectrumError> {
     if components.dim() != ionosphere.dim() {
         return Err(SplitSpectrumError::LabelShapeMismatch {

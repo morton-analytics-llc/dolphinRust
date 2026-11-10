@@ -124,7 +124,8 @@ fn lowpass_removes_short_wavelengths_and_keeps_the_mean() {
         0.7 + 0.3 * if (r + c) % 2 == 0 { 1.0 } else { -1.0 }
     });
     let one_component = Array2::from_elem((ROWS, COLS), 1_u32);
-    let smoothed = lowpass_ionosphere(field.view(), one_component.view(), 2_000.0, 100.0).unwrap();
+    let smoothed =
+        lowpass_ionosphere(field.view(), one_component.view(), 2_000.0, [100.0, 100.0]).unwrap();
     // The field is not periodic-extended past the image edge, so the checkerboard only
     // cancels exactly away from it: check pixels at least 5σ (σ ≈ 2.65 px) inside.
     let margin = 14;
@@ -151,7 +152,8 @@ fn masked_lowpass_recovers_a_smooth_screen_next_to_a_hole() {
         false => screen[(r, c)],
     });
     let labels = Array2::from_elem((rows, cols), 1_u32);
-    let smoothed = lowpass_ionosphere(with_hole.view(), labels.view(), 2_000.0, 100.0).unwrap();
+    let smoothed =
+        lowpass_ionosphere(with_hole.view(), labels.view(), 2_000.0, [100.0, 100.0]).unwrap();
 
     let near_hole = |r: usize, c: usize| (37..59).contains(&r) && (37..59).contains(&c);
     let mut worst_near_hole = 0.0_f64;
@@ -175,7 +177,8 @@ fn per_component_lowpass_does_not_bleed_offsets_across_components() {
     let labels = Array2::from_shape_fn((ROWS, COLS), |(_, c)| 1 + u32::from(c >= 24));
     let offset = |label: u32| if label == 1 { 5.0 } else { -20.0 };
     let field = labels.mapv(offset);
-    let smoothed = lowpass_ionosphere(field.view(), labels.view(), 2_000.0, 100.0).unwrap();
+    let smoothed =
+        lowpass_ionosphere(field.view(), labels.view(), 2_000.0, [100.0, 100.0]).unwrap();
     ndarray::Zip::from(&smoothed)
         .and(&labels)
         .for_each(|&value, &label| {
@@ -184,4 +187,33 @@ fn per_component_lowpass_does_not_bleed_offsets_across_components() {
                 "{value} in component {label}"
             )
         });
+}
+
+#[test]
+fn anisotropic_grid_gets_the_same_physical_response_along_both_axes() {
+    // 5 m rows × 40 m columns over 8 km × 8 km; a 2 km cutoff gives σ_y ≈ 53 px and
+    // σ_x ≈ 6.6 px. A sinusoid at the cutoff wavelength must come out at the half-power
+    // gain 1/√2 whichever axis it runs along.
+    let (spacing_y, spacing_x, cutoff) = (5.0, 40.0, 2_000.0);
+    let (rows, cols) = (1_600, 200);
+    let labels = Array2::from_elem((rows, cols), 1_u32);
+    let along = |metres: fn(usize, usize) -> f64| {
+        Array2::from_shape_fn((rows, cols), |(r, c)| (TAU * metres(r, c) / 2_000.0).sin())
+    };
+    let along_y = along(|r, _| r as f64 * 5.0);
+    let along_x = along(|_, c| c as f64 * 40.0);
+    let gain = std::f64::consts::FRAC_1_SQRT_2;
+    // Stay 4σ clear of the zero-padded image edges, where the response is one-sided.
+    let interior = ndarray::s![212..rows - 212, 27..cols - 27];
+    for field in [along_y, along_x] {
+        let smoothed =
+            lowpass_ionosphere(field.view(), labels.view(), cutoff, [spacing_y, spacing_x])
+                .unwrap();
+        let max_error = ndarray::Zip::from(smoothed.slice(interior))
+            .and(field.slice(interior))
+            .fold(0.0_f64, |acc, &out, &input| {
+                acc.max((out - gain * input).abs())
+            });
+        assert!(max_error < 2e-3, "max |out − gain·in| = {max_error:e}");
+    }
 }

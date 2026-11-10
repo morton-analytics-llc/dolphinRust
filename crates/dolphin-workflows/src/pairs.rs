@@ -1117,7 +1117,7 @@ fn split_spectrum_ionosphere(
     };
     let raw = estimate_ionosphere(&main, Some(&side)).context("split-spectrum ionosphere")?;
     let gt = grid.geo.geotransform;
-    let pixel_spacing_m = (gt[1] * gt[5]).abs().sqrt();
+    let pixel_spacing_m = [gt[5].abs(), gt[1].abs()];
     let lowpassed = lowpass_ionosphere(
         raw.view(),
         labels.view(),
