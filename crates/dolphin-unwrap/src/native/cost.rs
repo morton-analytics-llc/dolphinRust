@@ -22,6 +22,8 @@ const GAMMA_MAX: f64 = 0.99;
 const SCALE: f64 = 1.0e4;
 
 /// Per-edge integer costs `(wx, wy)` aligned with the `ax`/`ay` gradient grids.
+/// Every `CostMode` gets the same coherence-precision cost; config validation
+/// accepts only `smooth` for the native backend (#160).
 /// `wx[i,j]` weights the horizontal edge between pixels `(i,j)`-`(i,j+1)`;
 /// `wy[i,j]` the vertical edge between `(i,j)`-`(i+1,j)`.
 pub fn edge_costs(corr: ArrayView2<f32>, _mode: CostMode) -> (Array2<i64>, Array2<i64>) {
