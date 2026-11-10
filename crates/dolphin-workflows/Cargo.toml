@@ -16,7 +16,6 @@ dolphin-core.workspace = true
 dolphin-io.workspace = true
 dolphin-phaselink.workspace = true
 dolphin-shp.workspace = true
-dolphin-ps.workspace = true
 dolphin-stack.workspace = true
 dolphin-timeseries.workspace = true
 dolphin-filtering.workspace = true
