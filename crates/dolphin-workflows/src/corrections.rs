@@ -1313,11 +1313,11 @@ mod tests {
             ct.transform_coords(&mut xs, &mut ys, &mut zs).unwrap();
             let expected = -(1.0 + g(xs[0], ys[0]));
             assert!(
-                (layers[(0, r, cc)] + 1.0).abs() < 5e-3,
+                (layers[(0, r, cc)] + 1.0).abs() < 1e-6,
                 "date0 apparent displacement should be -1.0"
             );
             assert!(
-                (layers[(1, r, cc)] - expected).abs() < 5e-3,
+                (layers[(1, r, cc)] - expected).abs() < 1e-6,
                 "date1 ({r},{cc}): {} vs {expected}",
                 layers[(1, r, cc)]
             );

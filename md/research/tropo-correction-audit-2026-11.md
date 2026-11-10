@@ -19,7 +19,8 @@ RMS uncorrected to 20.0 mm corrected)
    spatially uniform, and the only spatially varying test (the legacy per-date path) allowed
    5 mm, which is what a half-pixel shift of its 0.1° grid produces. A row flip or a
    half-pixel registration error in the timed path would have passed. The existing timed test
-   also cannot see a reversed time weight (see below).
+   also cannot see a reversed time weight (see below). The legacy test's tolerance is now
+   1×10⁻⁶ m, which it meets.
 
 The three kinds of evidence are kept apart below.
 
