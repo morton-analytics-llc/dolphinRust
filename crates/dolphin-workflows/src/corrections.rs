@@ -994,6 +994,129 @@ mod tests {
         std::fs::remove_file(dem).unwrap();
     }
 
+    /// #186 (eo #757, "a test pins the correction against a hand-computed
+    /// case"). Two stations 15 km apart on a UTM frame; a delay that is a
+    /// different plane in longitude, latitude and height at each of two
+    /// six-hourly epochs (`tests/fixtures/tropo_plane_{lower,upper}.cdl`, one
+    /// stored south-up and one north-up); a sloping DEM; a different LOS at
+    /// each station; three acquisitions inside the bracket. Every step the
+    /// correction takes is exact on planes, so the layer at each station, and
+    /// the station-minus-station correction relative to the first date, must
+    /// equal the closed form: a half-pixel shift, a flipped row order, a wrong
+    /// height or a reversed time weight each move it by millimetres.
+    #[test]
+    fn timed_troposphere_reproduces_a_hand_computed_station_differential() {
+        use dolphin_core::config::TroposphereEpoch;
+        use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+
+        let _hdf5 = hdf5_guard();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // Hydrostatic plus wet delay of each fixture, metres.
+        let lower = |lon: f64, lat: f64, h: f64| {
+            2.50 - 3.6e-4 * h + 0.040 * (lon - 10.0) + 0.014 * (lat - 40.0)
+        };
+        let upper = |lon: f64, lat: f64, h: f64| {
+            2.57 - 3.8e-4 * h + 0.262 * (lon - 10.0) + 0.006 * (lat - 40.0)
+        };
+        let terrain = |lon: f64, lat: f64| 300.0 + 2500.0 * (lon - 10.3) + 800.0 * (lat - 40.7);
+
+        let dem = std::env::temp_dir().join(format!(
+            "dolphin-tropo-differential-dem-{}.nc",
+            std::process::id()
+        ));
+        let dem_gt = [10.0, 0.05, 0.0, 41.0, 0.0, -0.05];
+        write_4326_netcdf(
+            &dem,
+            &Array2::from_shape_fn((12, 20), |(row, col)| {
+                terrain(
+                    dem_gt[0] + (col as f64 + 0.5) * dem_gt[1],
+                    dem_gt[3] + (row as f64 + 0.5) * dem_gt[5],
+                )
+            }),
+            dem_gt,
+        );
+
+        // One row of 30 m pixels, 15 km long, in UTM 32N; the stations are its ends.
+        let (cols, stations) = (501_usize, [0_usize, 500]);
+        let frame_gt = [618_000.0, 30.0, 0.0, 4_517_015.0, 0.0, -30.0];
+        let up = |col: usize| 0.80 - 0.06 * col as f64 / 500.0;
+        let los = LosGeometry {
+            east: Array2::from_elem((1, cols), 0.6),
+            north: Array2::zeros((1, cols)),
+            up: Array2::from_shape_fn((1, cols), |(_, col)| up(col)),
+        };
+        let epoch = chrono::DateTime::parse_from_rfc3339("2026-03-01T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let minutes_after = [60_i64, 150, 300];
+        let opts = CorrectionOptions {
+            acquisition_utc: minutes_after
+                .map(|minutes| epoch + chrono::Duration::minutes(minutes))
+                .to_vec(),
+            troposphere_epochs: vec![
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_plane_lower.nc"),
+                    epoch,
+                },
+                TroposphereEpoch {
+                    path: fixtures.join("tropo_plane_upper.nc"),
+                    epoch: epoch + chrono::Duration::hours(6),
+                },
+            ],
+            dem_file: Some(dem.clone()),
+            ..Default::default()
+        };
+        let layers = build_troposphere(&opts, 3, (1, cols), frame_gt, 32632, Some(&los), None)
+            .unwrap()
+            .expect("troposphere layers present");
+        std::fs::remove_file(dem).unwrap();
+
+        let mut utm = SpatialRef::from_epsg(32632).unwrap();
+        let mut wgs = SpatialRef::from_epsg(4326).unwrap();
+        utm.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        wgs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+        let to_lonlat = CoordTransform::new(&utm, &wgs).unwrap();
+        // Closed-form layer: minus the time-interpolated delay at the station's
+        // position and terrain height, over the up component of its LOS.
+        let expected = |date: usize, col: usize| {
+            let (mut x, mut y) = (
+                [frame_gt[0] + (col as f64 + 0.5) * frame_gt[1]],
+                [frame_gt[3] + 0.5 * frame_gt[5]],
+            );
+            to_lonlat.transform_coords(&mut x, &mut y, &mut []).unwrap();
+            let height = terrain(x[0], y[0]);
+            let weight = minutes_after[date] as f64 / 360.0;
+            let delay =
+                (1.0 - weight) * lower(x[0], y[0], height) + weight * upper(x[0], y[0], height);
+            -delay / up(col)
+        };
+        for (date, col) in (0..3).flat_map(|date| stations.map(|col| (date, col))) {
+            let error = layers[(date, 0, col)] - expected(date, col);
+            assert!(error.abs() < 1e-6, "date {date}, column {col}: {error} m");
+        }
+
+        // What the InSAR-minus-GNSS comparison sees: primary minus control,
+        // relative to the reference date, after the correction is subtracted
+        // from a series that measured no motion.
+        let wavelength = 0.055_465_76;
+        let mut displacement = Array3::zeros((2, 1, cols));
+        subtract_delay(&mut displacement, layers.view(), wavelength).unwrap();
+        let metres = displacement.mapv(|phase| -wavelength * phase / (4.0 * std::f64::consts::PI));
+        for band in 0..2 {
+            let relative = |col| expected(band + 1, col) - expected(0, col);
+            let differential = metres[(band, 0, stations[0])] - metres[(band, 0, stations[1])];
+            let hand_computed = -(relative(stations[0]) - relative(stations[1]));
+            assert!(
+                hand_computed.abs() > 1e-3,
+                "the fixture must carry a differential signal: {hand_computed}"
+            );
+            assert!(
+                (differential - hand_computed).abs() < 1e-6,
+                "band {band}: {differential} vs {hand_computed}"
+            );
+        }
+    }
+
     /// A DEM nodata pixel is judged on the validity support: off it, the delay
     /// there is NaN and the run goes on; on it, the run still fails closed.
     #[test]
@@ -1190,11 +1313,11 @@ mod tests {
             ct.transform_coords(&mut xs, &mut ys, &mut zs).unwrap();
             let expected = -(1.0 + g(xs[0], ys[0]));
             assert!(
-                (layers[(0, r, cc)] + 1.0).abs() < 5e-3,
+                (layers[(0, r, cc)] + 1.0).abs() < 1e-6,
                 "date0 apparent displacement should be -1.0"
             );
             assert!(
-                (layers[(1, r, cc)] - expected).abs() < 5e-3,
+                (layers[(1, r, cc)] - expected).abs() < 1e-6,
                 "date1 ({r},{cc}): {} vs {expected}",
                 layers[(1, r, cc)]
             );
