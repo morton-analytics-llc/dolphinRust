@@ -136,6 +136,13 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Disconnected interferogram networks fail at the network stage** (issue #159). A pair graph
+  that splits the dates into groups with no interferogram between them, such as an acquisition
+  gap wider than `max_temporal_baseline`, used to panic in the L1 inversion, return arbitrary
+  post-gap offsets from the coherence-weighted L2 path, or fail after unwrap on a date no pair
+  covered. The run now stops before unwrapping and names the date groups.
+  `fixed_l2_pixel_map` reports `RankDeficient` for a singular normal matrix instead of returning
+  an infinite condition number. New `dolphin_timeseries::network_components`.
 - **The cycle-step check now flags integer-cycle discontinuities at ministack junctions**
   (issue #184). At the first date of each ministack after the first, the compressed-SLC datum
   error arrives as a patch about one phase-linking look window wide; on Fresno T137 the
