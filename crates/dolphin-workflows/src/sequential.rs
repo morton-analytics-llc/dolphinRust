@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use dolphin_core::config::{CompressedSlcPlan, ShpAmplitudeStatistics, ShpMethod};
+use dolphin_core::config::{CompressedSlcPlan, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_io::covariance::{
     covariance_operator_block_sha256, CovarianceGenerationBlockIdentity,
@@ -80,8 +80,6 @@ pub struct SequentialConfig {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
-    /// Which acquisitions the GLRT's amplitude statistics come from.
-    pub shp_amplitude_statistics: ShpAmplitudeStatistics,
 }
 
 /// Output of a sequential run.
@@ -145,7 +143,8 @@ pub struct SequentialState {
     /// `n_open = 0` when the prior run ended exactly on a ministack boundary.
     open_real_slcs: Array3<Cf64>,
     /// Amplitude sums over every real date of the series so far, sealed and
-    /// open; `Some` only when the GLRT uses full-stack statistics.
+    /// open; `Some` only for [`ShpMethod::Glrt`], which tests whole-stack
+    /// statistics.
     amplitude_sums: Option<AmplitudeSums>,
 }
 
@@ -204,23 +203,20 @@ struct ShpStatistics {
 }
 
 /// Amplitude sums over `prior`'s dates plus `slcs`, when the configured SHP
-/// test takes its statistics from the whole stack (GLRT, `full_stack`);
-/// `None` for every other configuration, which reads the ministack alone.
+/// test takes its statistics from the whole stack ([`ShpMethod::Glrt`]);
+/// `None` for every other method, which reads the ministack alone.
 fn full_stack_amplitude_sums(
     cfg: &SequentialConfig,
     prior: Option<&AmplitudeSums>,
     slcs: ArrayView3<Cf64>,
 ) -> Option<AmplitudeSums> {
-    (cfg.shp_method == ShpMethod::Glrt
-        && cfg.shp_amplitude_statistics == ShpAmplitudeStatistics::FullStack)
-        .then(|| AmplitudeSums::extended(prior, slcs))
+    (cfg.shp_method == ShpMethod::Glrt).then(|| AmplitudeSums::extended(prior, slcs))
 }
 
 /// An update needs the prior dates' amplitude sums whenever the SHP test uses
-/// full-stack statistics and the series already holds dates.
+/// whole-stack statistics and the series already holds dates.
 fn prior_amplitude_sums_are_missing(state: &SequentialState, cfg: &SequentialConfig) -> bool {
     cfg.shp_method == ShpMethod::Glrt
-        && cfg.shp_amplitude_statistics == ShpAmplitudeStatistics::FullStack
         && state.amplitude_sums.is_none()
         && (!state.sealed_compressed.is_empty() || state.open_real_slcs.dim().0 > 0)
 }
@@ -2285,8 +2281,9 @@ fn mask_native_complex(values: &mut Array2<Cf64>, valid_mask: ArrayView2<bool>) 
 /// full rectangular window ([`ShpMethod::Rect`], which keeps the unmasked
 /// covariance kernel and so stays bit-identical to the pre-SHP output).
 ///
-/// The GLRT compares `full_stack` statistics when given (the same for every
-/// ministack, as in dolphin) and otherwise this ministack's own.
+/// [`ShpMethod::Glrt`] compares the `full_stack` statistics (the same for
+/// every ministack, as in dolphin); [`ShpMethod::GlrtMinistack`], or a missing
+/// `full_stack`, compares this ministack's own.
 fn shp_neighbors(
     real: ArrayView3<Cf64>,
     cfg: &SequentialConfig,
@@ -2296,7 +2293,7 @@ fn shp_neighbors(
     let amplitude = real.mapv(|z| z.norm());
     match cfg.shp_method {
         ShpMethod::Rect => None,
-        ShpMethod::Glrt => {
+        ShpMethod::Glrt | ShpMethod::GlrtMinistack => {
             let ministack;
             let statistics = match full_stack {
                 Some(statistics) => statistics,
@@ -2383,7 +2380,7 @@ mod tests {
 
     const DATES: usize = 12;
 
-    fn glrt_config(statistics: ShpAmplitudeStatistics) -> SequentialConfig {
+    fn glrt_config(shp_method: ShpMethod) -> SequentialConfig {
         SequentialConfig {
             ministack_size: 4,
             max_num_compressed: 10,
@@ -2397,9 +2394,8 @@ mod tests {
             compute_crlb: false,
             compute_closure_phase: false,
             compute_average_coherence: false,
-            shp_method: ShpMethod::Glrt,
+            shp_method,
             shp_alpha: 0.001,
-            shp_amplitude_statistics: statistics,
         }
     }
 
@@ -2428,7 +2424,7 @@ mod tests {
     #[test]
     fn amplitude_sums_of_an_update_equal_those_of_a_full_run() {
         let stack = two_population_stack();
-        let cfg = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let cfg = glrt_config(ShpMethod::Glrt);
         let (_, state) =
             run_sequential_resumable(stack.slice(s![..6, .., ..]), &cfg, &cpu()).unwrap();
         let (_, next) =
@@ -2449,7 +2445,7 @@ mod tests {
             .iter()
             .all(|d| d.abs() < 1e-12));
 
-        let ministack = glrt_config(ShpAmplitudeStatistics::Ministack);
+        let ministack = glrt_config(ShpMethod::GlrtMinistack);
         let (_, state) = run_sequential_resumable(stack.view(), &ministack, &cpu()).unwrap();
         assert!(state.amplitude_sums.is_none());
     }
@@ -2459,7 +2455,7 @@ mod tests {
     #[test]
     fn an_update_links_its_tail_with_statistics_over_every_date_so_far() {
         let stack = two_population_stack();
-        let cfg = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let cfg = glrt_config(ShpMethod::Glrt);
         let (_, state) =
             run_sequential_resumable(stack.slice(s![..6, .., ..]), &cfg, &cpu()).unwrap();
         let (output, _) =
@@ -2495,10 +2491,10 @@ mod tests {
     #[test]
     fn update_refuses_a_state_without_the_prior_amplitude_sums() {
         let stack = two_population_stack();
-        let ministack = glrt_config(ShpAmplitudeStatistics::Ministack);
+        let ministack = glrt_config(ShpMethod::GlrtMinistack);
         let (_, state) =
             run_sequential_resumable(stack.slice(s![..6, .., ..]), &ministack, &cpu()).unwrap();
-        let full_stack = glrt_config(ShpAmplitudeStatistics::FullStack);
+        let full_stack = glrt_config(ShpMethod::Glrt);
         let error = update_sequential(&state, stack.slice(s![6.., .., ..]), &full_stack, &cpu())
             .err()
             .expect("update must fail");
@@ -2529,7 +2525,7 @@ mod tests {
                 ministack_size: 3,
                 max_num_compressed,
                 compressed_slc_plan: plan,
-                ..glrt_config(ShpAmplitudeStatistics::FullStack)
+                ..glrt_config(ShpMethod::Glrt)
             };
             let plans = planner_for(real.dim().0, &cfg)
                 .unwrap()

@@ -717,16 +717,18 @@ workflow (issue #33).
 Issue #165. The 2026-08-08 wiring took the GLRT's amplitude mean and variance from each
 ministack. dolphin takes them from the whole input stack (`ps.create_ps` before the sequential
 pass; `shp_nslc = slc_vrt_stack.shape[0]`), the same for every ministack.
-`phase_linking.shp_amplitude_statistics` now defaults to `full_stack`; `ministack` restores the
-earlier behaviour.
+`shp_method: glrt` now does the same; the earlier behaviour is the dolphinRust-only
+`shp_method: glrt_ministack`.
 
 Oracle: `oracle/gen_shp_fullstack_v042.py` runs dolphin v0.42.0's `create_ps` and
 `run_wrapped_phase_sequential` on a 30-date, three-ministack scene whose GLRT decisions sit
 well clear of the threshold. dolphin wrote identical `shp_counts` for the three ministacks.
-`full_stack` reproduces them on all 144 compared pixels of each ministack (dolphin blanks a
+`glrt` reproduces them on all 144 compared pixels of each ministack (dolphin blanks a
 half-window border); per-ministack statistics differ on 48 of the 144.
 `tests/shp_wiring_contract.rs` holds the parity test and the driver-wiring tests. The numbers in
 the section above were measured with per-ministack statistics and have not been re-measured.
+The preregistered `glrt_frozen` spatial-covariance cells were generated with per-ministack
+statistics too, so `spatial_covariance_validation.rs` runs them as `glrt_ministack`.
 
 ### Reading the coverage table correctly, and the N_eff correction (2026-08-08, issue #33)
 
