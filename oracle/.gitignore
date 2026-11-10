@@ -25,4 +25,10 @@ fixtures/*
 # Issue #165: dolphin v0.42.0 workflow SHP counts under full-stack GLRT
 # statistics, and the stack they came from (~63 KB).
 !fixtures/shp_fullstack_*.npy
+# Issue #192: planner and four-ministack sequential oracles, one set per
+# dolphin release (v0.42.9 = `always_first`, v0.35.0 = `always_first_legacy`),
+# ~40 KB total, committed so the reference rule is gated in CI.
+!fixtures/plan_v*.npy
+!fixtures/sequential_multi_slc_stack.npy
+!fixtures/sequential_v*.npy
 __pycache__/

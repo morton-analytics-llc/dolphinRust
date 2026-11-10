@@ -115,7 +115,8 @@ non-closure diagnostic. Both are validated against a forward dolphin v0.42.0 ora
 `phase_linking.write_covariance_operator: true` separately captures the implicit
 `sequential_source_dag_v1` replay operator as `phase_covariance_operator.h5`, with
 `phase_covariance_provenance.json` written last as its commit marker. The supported capture path
-is full-batch CPU/f64, Rect support, `AlwaysFirst`, output reference 0, and no phase-bias
+is full-batch CPU/f64, Rect support, `AlwaysFirst` or `AlwaysFirstLegacy`, an unset output
+reference, and no phase-bias
 correction. It stores source-keyed replay state, not a dense date-by-date covariance cube. The
 CLI artifact has no proper-complex source model and is therefore marked
 `source_model_unavailable`; low-level replay requires a verified caller-supplied source resolver

@@ -684,9 +684,20 @@ pub enum ShpMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressedSlcPlan {
-    /// Always reference the first date of the first ministack.
+    /// Every compressed SLC carries the phase of the first date of the first
+    /// ministack. Each ministack is phase-linked and compressed against the
+    /// newest carried compressed SLC, `max(0, num_compressed - 1)` (dolphin
+    /// >= v0.39, PR #588; issue #192).
     #[default]
     AlwaysFirst,
+    /// [`Self::AlwaysFirst`] as dolphin < v0.39 ran it, and dolphinRust before
+    /// issue #192: every ministack is phase-linked and compressed against the
+    /// configured output index, the oldest carried compressed SLC by default.
+    /// Not a dolphin plan name. Kept so a series or covariance artifact produced
+    /// under the old rule can be reproduced and continued; from the third
+    /// ministack on it is the noisier of the two wherever coherence decays
+    /// without a floor.
+    AlwaysFirstLegacy,
     /// Reference the first date of each ministack.
     FirstPerMinistack,
     /// Reference the last date of each ministack.
@@ -782,6 +793,9 @@ pub struct PhaseLinkingOptions {
     /// Maximum number of compressed images to use in the sequential estimator.
     pub max_num_compressed: usize,
     /// Index of the input SLC to reference for phase-linked interferograms after EVD/EMI.
+    /// Unset or `0` selects the plan's default, as dolphin's workflow reads the
+    /// option (`output_reference_idx or <default>`): the newest carried
+    /// compressed SLC under `always_first`, index 0 under the other plans.
     pub output_reference_idx: Option<usize>,
     /// Half-window size for multilooking during phase linking.
     pub half_window: HalfWindow,

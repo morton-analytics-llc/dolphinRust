@@ -30,7 +30,7 @@ use dolphin_phaselink::{
     NodeId, PhaseAngleLinearization, PhaseReplayGrid, ProperComplexFactor, RectPixelReplay,
     RectReplayDescriptor, SourceId, TemporalCoordinate,
 };
-use dolphin_stack::{MiniStack, MiniStackPlanner};
+use dolphin_stack::MiniStack;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use sha2::{Digest, Sha256};
 
@@ -1130,7 +1130,8 @@ pub enum ReplayStatus {
     Disabled,
     /// The compressed-reference plan is not `AlwaysFirst`.
     UnsupportedReferencePlan,
-    /// The public output reference is not acquisition zero.
+    /// A configured output reference moves the phase-linking output off the
+    /// plan's own reference component.
     UnsupportedOutputReference,
     /// The selected execution backend is not CPU/f64.
     UnsupportedBackend,
@@ -1899,6 +1900,12 @@ impl From<dolphin_io::IoError> for SequentialReplayError {
 #[derive(Debug, Clone)]
 pub struct SequentialReplayTopology {
     blocks: Vec<SequentialReplayBlock>,
+    /// Each block's reference component in its combined (carried compressed,
+    /// then real) phase vector, by generation: the one coordinate removed from
+    /// the block's reduced phase vector. Always a carried compressed SLC, or
+    /// acquisition zero in the first block, so no retained date is ever the
+    /// reference (issue #192).
+    reference_components: Vec<usize>,
     num_real_dates: usize,
     native_area: usize,
     output_area: usize,
@@ -2132,17 +2139,13 @@ impl SequentialReplayTopology {
                 ));
             }
         }
-        let planner = MiniStackPlanner {
-            num_slc: num_real_dates,
-            max_num_compressed: cfg.max_num_compressed,
-            output_reference_idx: isize::try_from(cfg.output_reference_idx).map_err(|_| {
-                SequentialReplayError::Invalid("output reference index exceeds isize")
-            })?,
-            compressed_slc_plan: cfg.compressed_slc_plan,
-        };
-        let planned = planner
-            .plan(cfg.ministack_size)
+        let planned = crate::sequential::planner_for(num_real_dates, cfg)
+            .and_then(|planner| planner.plan(cfg.ministack_size))
             .map_err(SequentialReplayError::Invalid)?;
+        let reference_components = planned
+            .iter()
+            .map(replay_reference_component)
+            .collect::<Result<Vec<_>, _>>()?;
         if planned.len() >= NODE_MAJOR_LIMIT as usize {
             return Err(SequentialReplayError::Invalid(
                 "replay block identifier exceeds its supported range",
@@ -2204,6 +2207,7 @@ impl SequentialReplayTopology {
         }
         Ok(Self {
             blocks,
+            reference_components,
             num_real_dates,
             native_area,
             output_area,
@@ -3169,11 +3173,9 @@ impl SequentialReplayTopology {
             let full_component = block.carried_parent_ids.len()
                 + (date.get() - block.real_date_start.get()) as usize;
             let reduced_component =
-                full_component
-                    .checked_sub(1)
-                    .ok_or(SequentialReplayError::Invalid(
-                        "non-gauge date selected the gauge component",
-                    ))?;
+                reduced_phase_component(full_component, self.reference_component(block)).ok_or(
+                    SequentialReplayError::Invalid("non-gauge date selected the gauge component"),
+                )?;
             let phase = adjoints.phase[block_index]
                 .entry(output)
                 .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
@@ -3373,11 +3375,9 @@ impl SequentialReplayTopology {
             let full_component = block.carried_parent_ids.len()
                 + (date.get() - block.real_date_start.get()) as usize;
             let reduced_component =
-                full_component
-                    .checked_sub(1)
-                    .ok_or(SequentialReplayError::Invalid(
-                        "non-gauge date selected the gauge component",
-                    ))?;
+                reduced_phase_component(full_component, self.reference_component(block)).ok_or(
+                    SequentialReplayError::Invalid("non-gauge date selected the gauge component"),
+                )?;
             let phase = adjoints.phase[block_index]
                 .entry(output)
                 .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
@@ -4042,6 +4042,7 @@ impl SequentialReplayTopology {
 
     fn same_replay_graph(&self, other: &Self) -> bool {
         self.blocks == other.blocks
+            && self.reference_components == other.reference_components
             && self.num_real_dates == other.num_real_dates
             && self.native_shape == other.native_shape
             && self.output_shape == other.output_shape
@@ -4149,6 +4150,7 @@ impl SequentialReplayTopology {
                 .map(|parent| other.block(*parent).map(|block| block.generation))
                 .collect::<Result<Vec<_>, _>>()?;
             if left_block.generation != right_block.generation
+                || self.reference_component(left_block) != other.reference_component(right_block)
                 || left_block.real_date_start != right_block.real_date_start
                 || left_block.num_real_dates != right_block.num_real_dates
                 || left_block.phase_dimension != right_block.phase_dimension
@@ -4242,11 +4244,9 @@ impl SequentialReplayTopology {
             let full_component = block.carried_parent_ids.len()
                 + (date.get() - block.real_date_start.get()) as usize;
             let reduced_component =
-                full_component
-                    .checked_sub(1)
-                    .ok_or(SequentialReplayError::Invalid(
-                        "non-gauge date selected the gauge component",
-                    ))?;
+                reduced_phase_component(full_component, self.reference_component(block)).ok_or(
+                    SequentialReplayError::Invalid("non-gauge date selected the gauge component"),
+                )?;
             let phase = adjoints.phase[block_index]
                 .entry(output)
                 .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
@@ -4525,9 +4525,17 @@ impl SequentialReplayTopology {
             }
         }
         let support_bytes = self.support_slots_per_output().div_ceil(8);
+        let phase_width = stored.phase_components.len();
+        let reference_component = self.reference_component(block);
         for output_index in 0..self.output_area {
+            // A block captured under the other `always_first` rule has its
+            // zero phase on a different component (issue #192).
+            let reference_phase =
+                stored.phase_angles[output_index * phase_width + reference_component];
             if stored.phase_node_ids[output_index]
                 != self.phase_node_id(block.id, output_index)?.get()
+                || (stored.status[output_index] == CovarianceOperatorStatus::Valid
+                    && reference_phase != 0.0)
             {
                 return Err(mismatch());
             }
@@ -4616,8 +4624,9 @@ impl SequentialReplayTopology {
         let phase_root = phase_adjoints
             .entry(output_index)
             .or_insert_with(|| Array2::zeros((block.phase_dimension, selected)));
+        let reference_component = self.reference_component(block);
         for reduced_component in 0..block.phase_dimension {
-            let full_component = reduced_component + 1;
+            let full_component = full_phase_component(reduced_component, reference_component);
             if full_component < first_real {
                 continue;
             }
@@ -4663,10 +4672,11 @@ impl SequentialReplayTopology {
         let linearization = PhaseAngleLinearization::prepare(
             window.replay.coherence.view(),
             self.estimator_branch,
-            0,
+            self.reference_component(block),
             branch_tolerance,
         )
         .map_err(estimator_jvp_error)?;
+        let reference_component = self.reference_component(block);
         let selected = child_adjoint.ncols();
         let first_real = block.carried_parent_ids.len();
         for (support_index, &source_pixel) in window.replay.source_pixels.iter().enumerate() {
@@ -4694,7 +4704,7 @@ impl SequentialReplayTopology {
                 let phase_direction = linearization
                     .apply(coherence_direction.view())
                     .map_err(estimator_jvp_error)?;
-                let reduced = Array1::from_iter(phase_direction.iter().skip(1).copied());
+                let reduced = reduced_phase_vector(phase_direction.view(), reference_component);
                 accumulate_basis(root, basis, reduced.view(), child_adjoint);
             }
 
@@ -4721,7 +4731,7 @@ impl SequentialReplayTopology {
                     let phase_direction = linearization
                         .apply(coherence_direction.view())
                         .map_err(estimator_jvp_error)?;
-                    let reduced = Array1::from_iter(phase_direction.iter().skip(1).copied());
+                    let reduced = reduced_phase_vector(phase_direction.view(), reference_component);
                     accumulate_basis(parent_root, basis, reduced.view(), child_adjoint);
                 }
             }
@@ -4775,7 +4785,12 @@ impl SequentialReplayTopology {
         let replay =
             replay_rect_source_values(descriptor, output, &source_pixels, source_values.view())
                 .map_err(covariance_replay_error)?;
-        self.validate_phase_baseline(&phase, &replay, branch_tolerance)?;
+        self.validate_phase_baseline(
+            &phase,
+            &replay,
+            self.reference_component(block),
+            branch_tolerance,
+        )?;
         Ok(PhaseWindowReplay {
             source_values,
             replay,
@@ -4786,6 +4801,7 @@ impl SequentialReplayTopology {
         &self,
         phase: &ResolvedPhaseReplay,
         replay: &RectPixelReplay,
+        reference_component: usize,
         branch_tolerance: f64,
     ) -> Result<(), SequentialReplayError> {
         let (use_evd, beta, zero_correlation_threshold, estimator) = match self.estimator_branch {
@@ -4800,7 +4816,7 @@ impl SequentialReplayTopology {
             use_evd,
             beta,
             zero_correlation_threshold,
-            0,
+            reference_component,
         );
         let phase_matches = baseline.phase.len() == phase.linked_phase.len()
             && baseline
@@ -4986,6 +5002,11 @@ impl SequentialReplayTopology {
             (namespace.owned_output_origin.1 - namespace.output_origin.1) as usize;
         (owned_row_start..owned_row_start + namespace.owned_output_shape.0).contains(&row)
             && (owned_col_start..owned_col_start + namespace.owned_output_shape.1).contains(&column)
+    }
+
+    /// The block's reference component in its combined phase vector.
+    fn reference_component(&self, block: &SequentialReplayBlock) -> usize {
+        self.reference_components[block.generation as usize]
     }
 
     fn block(&self, id: GlobalBlockId) -> Result<&SequentialReplayBlock, SequentialReplayError> {
@@ -5650,12 +5671,16 @@ pub(crate) fn build_covariance_operator_block(
     }
     let native_validity_bits = pack_bits(&topology.native_validity);
 
+    let reference_component = topology.reference_component(block);
     let phase_angles = (0..topology.output_area)
         .flat_map(|output| {
             let row = output / topology.output_shape.1;
             let column = output % topology.output_shape.1;
             (0..ministack.size()).map(move |component| {
-                persisted_phase_angle(component, linked_phase[(component, row, column)])
+                persisted_phase_angle(
+                    component == reference_component,
+                    linked_phase[(component, row, column)],
+                )
             })
         })
         .collect();
@@ -5886,10 +5911,14 @@ pub fn sequential_replay_config_digest(cfg: &SequentialConfig) -> [u8; 32] {
         u8::from(cfg.compute_crlb),
         u8::from(cfg.compute_closure_phase),
         u8::from(cfg.compute_average_coherence),
+        // The oldest-compressed rule keeps 0, the value every artifact
+        // written before #192 carries under the name `always_first`; the
+        // newest-compressed rule links different coherence and gets its own.
         match cfg.compressed_slc_plan {
-            CompressedSlcPlan::AlwaysFirst => 0,
+            CompressedSlcPlan::AlwaysFirstLegacy => 0,
             CompressedSlcPlan::FirstPerMinistack => 1,
             CompressedSlcPlan::LastPerMinistack => 2,
+            CompressedSlcPlan::AlwaysFirst => 3,
         },
         // Per-ministack GLRT keeps 0, the value every GLRT artifact written
         // before #165 carries; whole-stack GLRT selects different neighbours
@@ -5958,7 +5987,10 @@ fn assess_support(
 ) -> Result<(), SequentialReplayError> {
     let status = if !scope.enabled {
         ReplayStatus::Disabled
-    } else if cfg.compressed_slc_plan != CompressedSlcPlan::AlwaysFirst {
+    } else if !matches!(
+        cfg.compressed_slc_plan,
+        CompressedSlcPlan::AlwaysFirst | CompressedSlcPlan::AlwaysFirstLegacy
+    ) {
         ReplayStatus::UnsupportedReferencePlan
     } else if cfg.output_reference_idx != 0 {
         ReplayStatus::UnsupportedOutputReference
@@ -6072,11 +6104,55 @@ fn checked_mul(left: u64, right: u64) -> Result<u64, SequentialReplayError> {
         ))
 }
 
-fn persisted_phase_angle(component: usize, phase: Cf64) -> f64 {
-    match component {
-        0 => 0.0,
-        _ => phase.arg(),
+fn persisted_phase_angle(is_reference: bool, phase: Cf64) -> f64 {
+    match is_reference {
+        true => 0.0,
+        false => phase.arg(),
     }
+}
+
+/// The reference component of one planned block for replay: the phase-linking
+/// output reference, which must also be the compression reference so that
+/// compression's re-referencing is the identity the derivative assumes.
+fn replay_reference_component(
+    block: &dolphin_stack::MiniStack,
+) -> Result<usize, SequentialReplayError> {
+    let output = block
+        .resolved_output_reference_idx()
+        .map_err(SequentialReplayError::Invalid)?;
+    let compressed = block
+        .resolved_compressed_reference_idx()
+        .map_err(SequentialReplayError::Invalid)?;
+    if output != compressed || output >= block.num_compressed.max(1) {
+        return Err(SequentialReplayError::Unsupported(
+            ReplayStatus::UnsupportedOutputReference,
+        ));
+    }
+    Ok(output)
+}
+
+/// Position of `full_component` in the phase vector with the reference
+/// coordinate removed; `None` for the reference itself.
+fn reduced_phase_component(full_component: usize, reference_component: usize) -> Option<usize> {
+    match full_component.cmp(&reference_component) {
+        std::cmp::Ordering::Less => Some(full_component),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(full_component - 1),
+    }
+}
+
+/// Inverse of [`reduced_phase_component`].
+fn full_phase_component(reduced_component: usize, reference_component: usize) -> usize {
+    reduced_component + usize::from(reduced_component >= reference_component)
+}
+
+/// A full phase direction with its reference coordinate removed.
+fn reduced_phase_vector(full: ArrayView1<f64>, reference_component: usize) -> Array1<f64> {
+    full.iter()
+        .enumerate()
+        .filter(|(component, _)| *component != reference_component)
+        .map(|(_, value)| *value)
+        .collect()
 }
 
 #[cfg(test)]
@@ -6093,7 +6169,35 @@ mod tests {
             })
             .expect("fixture scan must find a nonzero floating phase residue");
         assert_ne!(shifted.arg(), 0.0);
-        assert_eq!(persisted_phase_angle(0, shifted), 0.0);
-        assert_eq!(persisted_phase_angle(1, shifted), shifted.arg());
+        assert_eq!(persisted_phase_angle(true, shifted), 0.0);
+        assert_eq!(persisted_phase_angle(false, shifted), shifted.arg());
+    }
+
+    #[test]
+    fn reduced_phase_indexing_removes_only_the_reference_component() {
+        for reference in 0..4 {
+            let reduced = (0..5)
+                .filter_map(|full| reduced_phase_component(full, reference))
+                .collect::<Vec<_>>();
+            assert_eq!(reduced, vec![0, 1, 2, 3]);
+            assert_eq!(reduced_phase_component(reference, reference), None);
+            let full = (0..4)
+                .map(|component| full_phase_component(component, reference))
+                .collect::<Vec<_>>();
+            assert!(!full.contains(&reference));
+            assert_eq!(
+                full.iter()
+                    .map(|&component| reduced_phase_component(component, reference))
+                    .collect::<Vec<_>>(),
+                (0..4).map(Some).collect::<Vec<_>>()
+            );
+            let direction = Array1::from_iter((0..5).map(f64::from));
+            assert_eq!(
+                reduced_phase_vector(direction.view(), reference).to_vec(),
+                full.iter()
+                    .map(|&component| component as f64)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

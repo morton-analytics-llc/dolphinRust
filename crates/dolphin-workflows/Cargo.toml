@@ -66,5 +66,9 @@ path = "examples/profile_e2e.rs"
 name = "unwrap_bench"
 path = "examples/unwrap_bench.rs"
 
+[[example]]
+name = "ref_idx_parity"
+path = "examples/ref_idx_parity.rs"
+
 [lints]
 workspace = true

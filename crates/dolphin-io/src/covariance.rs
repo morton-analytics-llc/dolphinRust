@@ -1735,7 +1735,15 @@ impl CovarianceOperatorBlock {
                 phases.iter().all(|phase| phase.is_finite()),
                 "valid output has nonfinite phase state",
             )?;
-            ensure_valid(phases[0] == 0.0, "valid output reference phase is not zero")?;
+            // The block's reference is the oldest or the newest carried
+            // compressed SLC (acquisition zero in the first block), depending
+            // on the plan the artifact was captured under; the replay topology
+            // checks the exact one against its own plan.
+            let newest_carried = self.carry_parent_ids.len().saturating_sub(1);
+            ensure_valid(
+                phases[0] == 0.0 || phases[newest_carried] == 0.0,
+                "valid output reference phase is not zero",
+            )?;
             ensure_valid(
                 self.selected_eigenvalue[output_index].is_finite()
                     && self.selected_eigenvalue[output_index] > 0.0,

@@ -29,7 +29,7 @@ use dolphin_io::{
 use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
-use dolphin_stack::MiniStackPlanner;
+
 use dolphin_timeseries::{
     build_network, check_correction_network, correct_loop_closure_errors,
     estimate_velocity_with_diagnostics, estimate_velocity_with_model,
@@ -67,7 +67,7 @@ use crate::cslc_covariance_source::{
 use crate::dates::parse_date;
 use crate::phase_steps::{
     junction_epochs, junction_steps, step_components, CycleStepProvenance, JunctionProvenance,
-    JunctionStep,
+    JunctionStep, MinistackReference,
 };
 use crate::provenance::{
     BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
@@ -1374,18 +1374,16 @@ fn phase_step_diagnostics(
     pairs: &[(usize, usize)],
 ) -> Result<PhaseStepProducts> {
     let n_dates = series.dim().0 + 1;
-    let plan = MiniStackPlanner {
-        num_slc: n_dates,
-        max_num_compressed: cfg.phase_linking.max_num_compressed,
-        output_reference_idx: isize::try_from(cfg.phase_linking.output_reference_idx.unwrap_or(0))
-            .context("phase_linking.output_reference_idx exceeds isize")?,
-        compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
-    }
-    .plan(cfg.phase_linking.ministack_size)
-    .map_err(anyhow::Error::msg)?;
+    let plan = crate::sequential::planner_for(n_dates, &sequential_config(cfg))
+        .and_then(|planner| planner.plan(cfg.phase_linking.ministack_size))
+        .map_err(anyhow::Error::msg)?;
     let epochs = junction_epochs(&plan);
     let components = step_components(pairs, connected_components, series);
-    let junctions = junction_steps(series, components.view(), &epochs);
+    let mut junctions = junction_steps(series, components.view(), &epochs);
+    for (junction, block) in junctions.iter_mut().zip(plan.iter().skip(1)) {
+        junction.summary.reference =
+            Some(MinistackReference::of(block).map_err(anyhow::Error::msg)?);
+    }
     for junction in &junctions {
         tracing::info!(
             stage = "phase_steps",
@@ -3052,17 +3050,10 @@ fn projected_covariance_artifact(
             window_rows <= shape.0 && window_cols <= shape.1,
             "covariance Rect support exceeds the bounded source grid"
         );
-        let sequential_plan = MiniStackPlanner {
-            num_slc: indices.len(),
-            max_num_compressed: cfg.phase_linking.max_num_compressed,
-            output_reference_idx: isize::try_from(
-                cfg.phase_linking.output_reference_idx.unwrap_or(0),
-            )
-            .context("covariance output reference exceeds isize")?,
-            compressed_slc_plan: cfg.phase_linking.compressed_slc_plan,
-        }
-        .plan(cfg.phase_linking.ministack_size)
-        .map_err(anyhow::Error::msg)?;
+        let sequential_plan =
+            crate::sequential::planner_for(indices.len(), &sequential_config(cfg))
+                .and_then(|planner| planner.plan(cfg.phase_linking.ministack_size))
+                .map_err(anyhow::Error::msg)?;
         let depth = sequential_plan.len();
         let source_dates_by_generation = sequential_plan
             .iter()
@@ -4742,8 +4733,11 @@ fn validate_config(cfg: &DisplacementWorkflow) -> Result<()> {
             "phase_linking.write_covariance_operator requires output_reference_idx = 0"
         );
         anyhow::ensure!(
-            cfg.phase_linking.compressed_slc_plan == CompressedSlcPlan::AlwaysFirst,
-            "phase_linking.write_covariance_operator requires compressed_slc_plan = always_first"
+            matches!(
+                cfg.phase_linking.compressed_slc_plan,
+                CompressedSlcPlan::AlwaysFirst | CompressedSlcPlan::AlwaysFirstLegacy
+            ),
+            "phase_linking.write_covariance_operator requires compressed_slc_plan = always_first or always_first_legacy"
         );
         anyhow::ensure!(
             !cfg.phase_linking.correct_phase_bias,
@@ -9469,6 +9463,8 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("compressed_slc_plan = always_first"));
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::AlwaysFirstLegacy;
+        validate_config(&cfg).expect("the replay follows either always_first reference rule");
         cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::AlwaysFirst;
 
         cfg.phase_linking.correct_phase_bias = true;
@@ -9571,6 +9567,46 @@ mod tests {
             .expect("resumable covariance capture must fail")
             .to_string();
         assert!(error.contains("full batch"), "{error}");
+    }
+
+    /// Issue #192: an unset (or zero) output reference plans dolphin v0.42.9's
+    /// `always_first` rule, the newest carried compressed SLC, and the junction
+    /// provenance records the reference each later ministack actually used.
+    #[test]
+    fn default_workflow_references_the_newest_compressed_slc_and_records_it() {
+        let references = |cfg: &DisplacementWorkflow| {
+            let series = Array3::<f64>::zeros((59, 2, 2));
+            let components = Array3::<u32>::ones((59, 2, 2));
+            let pairs: Vec<(usize, usize)> = (0..59).map(|k| (k, k + 1)).collect();
+            phase_step_diagnostics(cfg, series.view(), components.view(), &pairs)
+                .unwrap()
+                .junctions
+                .iter()
+                .map(|junction| {
+                    let reference = junction.summary.reference.unwrap();
+                    (
+                        reference.num_compressed,
+                        reference.output_reference_idx,
+                        reference.compressed_reference_idx,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut cfg = DisplacementWorkflow::default();
+        cfg.phase_linking.ministack_size = 15;
+        cfg.phase_linking.max_num_compressed = 5;
+        assert_eq!(cfg.phase_linking.output_reference_idx, None);
+        assert_eq!(
+            cfg.phase_linking.compressed_slc_plan,
+            CompressedSlcPlan::AlwaysFirst
+        );
+        let newest = vec![(1, 0, 0), (2, 1, 1), (3, 2, 2)];
+        assert_eq!(references(&cfg), newest);
+        cfg.phase_linking.output_reference_idx = Some(0);
+        assert_eq!(references(&cfg), newest, "0 reads as unset, as in dolphin");
+
+        cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::AlwaysFirstLegacy;
+        assert_eq!(references(&cfg), vec![(1, 0, 0), (2, 0, 0), (3, 0, 0)]);
     }
 
     #[test]

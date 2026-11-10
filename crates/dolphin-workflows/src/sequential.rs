@@ -64,7 +64,11 @@ pub struct SequentialConfig {
     pub beta: f64,
     /// Coherence values at or below this are treated as zero.
     pub zero_correlation_threshold: f64,
-    /// Index of the reference date for the output phase history.
+    /// Configured phase-linking output reference, an index into each combined
+    /// (carried compressed, then real) ministack. `0` selects the plan's
+    /// default, as dolphin's workflow reads the option: the newest carried
+    /// compressed SLC under [`CompressedSlcPlan::AlwaysFirst`], index 0 under
+    /// the other plans.
     pub output_reference_idx: usize,
     /// Strategy for choosing each ministack's compressed-SLC reference.
     pub compressed_slc_plan: CompressedSlcPlan,
@@ -1930,12 +1934,19 @@ fn looked_validity(
 }
 
 /// The [`MiniStackPlanner`] for a stack of `num_slc` real SLCs under `cfg`.
-fn planner_for(num_slc: usize, cfg: &SequentialConfig) -> Result<MiniStackPlanner, &'static str> {
+/// The one place a [`SequentialConfig`] becomes a plan, so the driver, the
+/// covariance replay topology and the junction diagnostics cannot disagree
+/// about a ministack's reference.
+pub(crate) fn planner_for(
+    num_slc: usize,
+    cfg: &SequentialConfig,
+) -> Result<MiniStackPlanner, &'static str> {
+    let configured = isize::try_from(cfg.output_reference_idx)
+        .map_err(|_| "output reference index exceeds isize")?;
     Ok(MiniStackPlanner {
         num_slc,
         max_num_compressed: cfg.max_num_compressed,
-        output_reference_idx: isize::try_from(cfg.output_reference_idx)
-            .map_err(|_| "output reference index exceeds isize")?,
+        output_reference_idx: (configured != 0).then_some(configured),
         compressed_slc_plan: cfg.compressed_slc_plan,
     })
 }
@@ -2515,6 +2526,7 @@ mod tests {
         let real = Array3::from_shape_fn((11, 1, 1), |(date, _, _)| Cf64::new(date as f64, 0.0));
         let cases = [
             CompressedSlcPlan::AlwaysFirst,
+            CompressedSlcPlan::AlwaysFirstLegacy,
             CompressedSlcPlan::FirstPerMinistack,
         ]
         .into_iter()

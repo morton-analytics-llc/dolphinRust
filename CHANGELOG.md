@@ -146,6 +146,27 @@ All notable changes to dolphinRust are documented here. The format follows
   non-positive `tau_days` fails validation. Default empty; the linear/seasonal/step paths
   are unchanged with the term unset.
 
+### Changed
+- **`always_first` references each ministack to the newest carried compressed SLC** (issue
+  #192). `MiniStackPlanner` gave `CompressedSlcPlan::AlwaysFirst` dolphin v0.35.0's rule: phase
+  linking and compression were both referenced to index 0 of the combined ministack, the
+  *oldest* carried compressed SLC. dolphin moved both to `max(0, num_compressed − 1)`, the
+  *newest*, in v0.39.0 (PR #588), and the planner now matches dolphin v0.42.9: the compressed
+  reference is always the newest carried compressed SLC and so is the output reference unless
+  `phase_linking.output_reference_idx` is set. **Every product with three or more ministacks
+  changes from the third ministack on**; one- and two-ministack products are bit-identical.
+  `phase_linking.output_reference_idx: 0` now reads as unset, as dolphin's workflow reads it.
+  `MiniStackPlanner::output_reference_idx` is `Option<isize>`. The old rule stays selectable
+  as `compressed_slc_plan: always_first_legacy` (not a dolphin plan name) so a series or
+  covariance artifact produced under it can be reproduced or continued; a resumed update must
+  keep the plan that sealed its state. The covariance replay follows either rule: each block's
+  reduced phase vector drops that block's own reference component instead of component 0, and
+  the replay-config digest gives the new rule its own code while `always_first_legacy` keeps
+  the value every earlier artifact carries. `JunctionStepSummary` gains `reference`, the
+  resolved reference of the later ministack. Oracles: planner and four-ministack sequential
+  fixtures from dolphin v0.42.9 and v0.35.0 are committed under `oracle/fixtures/`. Evidence
+  and real-data validation: `md/research/issue-192-validation-protocol-2026-11.md`.
+
 ### Fixed
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
   #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and

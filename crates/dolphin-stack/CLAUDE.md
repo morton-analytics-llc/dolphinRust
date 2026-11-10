@@ -3,8 +3,10 @@
 ## Domain
 Ansari et al. (2017) sequential estimator — pure planning logic, no numerics.
 - `MiniStackPlanner` partitions N dates into `ministack_size` (default 15) batches.
-- Each ministack compresses to one SLC (dolphin-phaselink), carried forward as the first
-  element of the next ministack (`CompressedSlcPlan::AlwaysFirst`).
+- Each ministack compresses to one SLC (dolphin-phaselink), carried forward ahead of the
+  next ministack's real SLCs. `CompressedSlcPlan::AlwaysFirst` references each ministack to
+  the newest carried compressed SLC (dolphin v0.42.9; issue #192);
+  `AlwaysFirstLegacy` keeps the pre-v0.39 rule (the oldest).
 - `max_num_compressed` (default 10) caps accumulated compressed SLCs.
 
 ## Contracts

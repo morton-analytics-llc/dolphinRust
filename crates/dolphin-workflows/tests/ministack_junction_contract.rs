@@ -2,8 +2,8 @@
 //! ministack junction.
 //!
 //! Ministack `k+1` is phase-linked against the compressed SLC of ministack
-//! `k` and referenced to it (`output_reference_idx = 0` under
-//! `CompressedSlcPlan::AlwaysFirst`), so its linked phases are relative to
+//! `k` and referenced to it (the only carried compressed SLC here, so the
+//! reference under either `always_first` rule), so its linked phases are relative to
 //! the compressed SLC's phase, which is the projection of ministack `k` onto
 //! its own linked phase, i.e. relative to ministack `k`'s reference date. A
 //! per-date phase common to every pixel of the later ministack (an

@@ -143,7 +143,8 @@ finite nonzero pixels are valid. Resumable updates bind the mask and every effec
 file reported by GDAL and reject any identity or validity change before new CSLC I/O.
 
 `write_covariance_operator: true` is restricted to the CPU/f64 Rect path with
-`max_num_compressed > 0`, `compressed_slc_plan: always_first`, output reference 0, and
+`max_num_compressed > 0`, `compressed_slc_plan: always_first` or `always_first_legacy`, an
+unset output reference, and
 `correct_phase_bias: false`. It is available only for a full batch under the full output policy;
 GroundPulse serialization and resumable entry points reject it before source reads. Capture
 writes an implicit source-keyed replay operator rather than a dense temporal covariance cube.
