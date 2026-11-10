@@ -7,6 +7,23 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Geometry provenance records the CSLC-shaping DEM dataset identity** (issue #167, eo#483
+  Table 5). `GeometryProvenance` gains `cslc_dem_source`, read from
+  `/metadata/processing_information/inputs/dem_source` on every `cslc_file_list` and
+  `correction_options.geometry_files` (CSLC-S1-STATIC) granule — the DEM that shaped the CSLC
+  phase itself, distinct from the existing `dem_grid_spacing_x`/`_y`/`_units`/`dem_vertical_datum`
+  fields, which describe the *correction* DEM (`correction_options.dem_file` /
+  `nisar_ellipsoidal_dem_file`; their doc comments now say so explicitly). Values are trimmed of
+  NUL padding and incidental whitespace and required byte-identical across every granule; a
+  missing or unreadable key names the offending granule, a disagreement reports the distinct
+  value count, and NISAR GSLC input is explicit "not implemented" — none of this is ever
+  defaulted. Schema bumped to `dolphinrust-geometry-provenance/7`, method version `7.0.0`; the
+  fixed-cube semantic gate in `temporal_covariance_product` pins the new pair. New
+  `dolphin-io::read_cslc_dem_source`. **Caveat:** the committed real T144 CI fixture
+  (`geomprov_ci_cslc.h5`) carries no `inputs` group at all, so the exact key path is unverified
+  against this repository's one real sample; the contract tests cover the absence path
+  explicitly, and a `#[ignore]`-gated real-data test is ready for when real T035 granules are
+  staged.
 - **Geometry provenance discloses which corrections ran and the velocity time-function
   model** (issue #130). `GeometryProvenance` gains `corrections_applied` (stable names —
   `solid_earth_tide`, `plate_motion`, `ionosphere`, `troposphere`, `layover_shadow_mask` — in
