@@ -1,0 +1,157 @@
+//! Split-spectrum ionosphere estimation from two NISAR range bands.
+//!
+//! Main/side-band method (Gomba et al. 2016; Fattahi et al. 2017; Liang et al.
+//! 2019): NISAR acquires a wide main band (`frequencyA`, e.g. 40 MHz) and a
+//! narrow side band (`frequencyB`, 5 MHz) at a different carrier. Each band's
+//! unwrapped interferometric phase is modelled as a non-dispersive term
+//! (troposphere + deformation + geometry, `∝ f`) plus a dispersive ionospheric
+//! term (`∝ 1/f`):
+//!
+//! ```text
+//! φ(f) = a·f + b/f
+//! ```
+//!
+//! Solving the two-band system for the dispersive term at the reference
+//! frequency `f₀` gives
+//!
+//! ```text
+//! φ_iono(f₀) = b/f₀ = f_A·f_B / (f₀·(f_A² − f_B²)) · (φ_B·f_A − φ_A·f_B)
+//! ```
+//!
+//! **Reference frequency.** Here `f₀ = f_A`, the main-band carrier: the
+//! estimate is the ionospheric phase *in the frequencyA interferogram*, so
+//! `φ_A − φ_iono` is the non-dispersive frequencyA phase. With `r = f_B/f_A`
+//! the formula reduces to `φ_iono = r·(φ_B − r·φ_A)/(1 − r²)`, which is what is
+//! evaluated (it avoids forming `f²` products of ~1e18).
+//!
+//! **Sign convention.** Linear in the inputs, so `φ_iono` carries the sign of
+//! the input phases. Both bands must be formed `ref · conj(sec)` — the pipeline
+//! convention pinned by `dolphin-workflows/tests/sign_convention.rs` — and the
+//! result is in that same convention, in radians.
+//!
+//! **Unwrapping errors.** A `k·2π` slip in `φ_B` adds the constant
+//! `k · 2π·r/(1 − r²)` ([`side_band_cycle_offset`]) to `φ_iono` over the
+//! affected connected component. For NISAR-like carriers (`r ≈ 1.03`) that is
+//! ≈ −111 rad per cycle, so the two bands must be unwrapped consistently and the
+//! estimate low-pass filtered ([`lowpass_ionosphere`]) before use.
+
+use dolphin_filtering::filter_long_wavelength;
+use ndarray::{Array2, ArrayView2, Zip};
+use thiserror::Error;
+
+/// Split-spectrum failures.
+#[derive(Debug, Error)]
+pub enum SplitSpectrumError {
+    /// The side-band (`frequencyB`) phase was not supplied. A main-band-only
+    /// estimate is not possible, so the output is refused rather than faked.
+    #[error(
+        "split-spectrum ionosphere needs the frequencyB (side-band) unwrapped phase; \
+         the product has no side band, so the estimate is refused"
+    )]
+    MissingSideBand,
+    /// The two bands are on different grids.
+    #[error(
+        "main-band phase shape {main:?} != side-band shape {side:?}; resample \
+         frequencyA onto the frequencyB grid first"
+    )]
+    ShapeMismatch {
+        /// Main-band `(rows, cols)`.
+        main: (usize, usize),
+        /// Side-band `(rows, cols)`.
+        side: (usize, usize),
+    },
+    /// A center frequency is non-finite, non-positive, or the two are equal
+    /// (the two-band system is singular).
+    #[error(
+        "center frequencies must be finite, positive and distinct: \
+         main {main_hz} Hz, side {side_hz} Hz"
+    )]
+    InvalidFrequencies {
+        /// Main-band center frequency (Hz).
+        main_hz: f64,
+        /// Side-band center frequency (Hz).
+        side_hz: f64,
+    },
+    /// The `dolphin-filtering` low-pass rejected its parameters.
+    #[error("low-pass filter: {0}")]
+    Filter(&'static str),
+}
+
+/// One band's unwrapped interferometric phase (radians, `ref · conj(sec)`) and
+/// its center frequency.
+#[derive(Debug, Clone, Copy)]
+pub struct BandPhase<'a> {
+    /// Unwrapped phase in radians. NaN marks nodata and propagates.
+    pub unwrapped_phase: ArrayView2<'a, f64>,
+    /// Band center frequency in Hz (NISAR `centerFrequency`).
+    pub center_frequency_hz: f64,
+}
+
+/// Ionospheric phase in the main-band interferogram (`f₀ = f_A`), radians,
+/// from main (`frequencyA`) and side (`frequencyB`) unwrapped phase.
+///
+/// # Errors
+/// [`SplitSpectrumError::MissingSideBand`] when `side` is `None`;
+/// [`SplitSpectrumError::ShapeMismatch`] when the grids differ;
+/// [`SplitSpectrumError::InvalidFrequencies`] for unusable center frequencies.
+pub fn estimate_ionosphere(
+    main: &BandPhase,
+    side: Option<&BandPhase>,
+) -> Result<Array2<f64>, SplitSpectrumError> {
+    let side = side.ok_or(SplitSpectrumError::MissingSideBand)?;
+    let (main_dim, side_dim) = (main.unwrapped_phase.dim(), side.unwrapped_phase.dim());
+    if main_dim != side_dim {
+        return Err(SplitSpectrumError::ShapeMismatch {
+            main: main_dim,
+            side: side_dim,
+        });
+    }
+    let r = frequency_ratio(main.center_frequency_hz, side.center_frequency_hz)?;
+    let scale = r / (1.0 - r * r);
+    Ok(Zip::from(&main.unwrapped_phase)
+        .and(&side.unwrapped_phase)
+        .map_collect(|&phi_a, &phi_b| scale * (phi_b - r * phi_a)))
+}
+
+/// Constant added to [`estimate_ionosphere`] by one `+2π` unwrapping slip in
+/// the side-band phase: `2π·r/(1 − r²)`, `r = f_B/f_A` (radians per cycle).
+///
+/// # Errors
+/// [`SplitSpectrumError::InvalidFrequencies`] for unusable center frequencies.
+pub fn side_band_cycle_offset(main_hz: f64, side_hz: f64) -> Result<f64, SplitSpectrumError> {
+    let r = frequency_ratio(main_hz, side_hz)?;
+    Ok(std::f64::consts::TAU * r / (1.0 - r * r))
+}
+
+/// Gaussian low-pass of an ionosphere estimate, the complement of
+/// `dolphin_filtering::filter_long_wavelength` (`lowpass = x − highpass(x)`), so
+/// wavelengths shorter than `wavelength_cutoff_m` are removed.
+///
+/// Inherits that filter's nodata rule: non-finite and exactly-zero pixels are
+/// nodata, zero-filled before the FFT, and returned as NaN.
+///
+/// # Errors
+/// [`SplitSpectrumError::Filter`] if the cutoff is too large for the image.
+pub fn lowpass_ionosphere(
+    ionosphere: ArrayView2<f64>,
+    wavelength_cutoff_m: f64,
+    pixel_spacing_m: f64,
+) -> Result<Array2<f64>, SplitSpectrumError> {
+    let highpass = filter_long_wavelength(ionosphere, wavelength_cutoff_m, pixel_spacing_m)
+        .map_err(SplitSpectrumError::Filter)?;
+    Ok(Zip::from(&ionosphere)
+        .and(&highpass)
+        .map_collect(|&value, &high| match value.is_finite() && value != 0.0 {
+            true => value - high,
+            false => f64::NAN,
+        }))
+}
+
+/// `f_B/f_A`, rejecting non-finite, non-positive or equal frequencies.
+fn frequency_ratio(main_hz: f64, side_hz: f64) -> Result<f64, SplitSpectrumError> {
+    let usable = |f: f64| f.is_finite() && f > 0.0;
+    if !usable(main_hz) || !usable(side_hz) || main_hz == side_hz {
+        return Err(SplitSpectrumError::InvalidFrequencies { main_hz, side_hz });
+    }
+    Ok(side_hz / main_hz)
+}

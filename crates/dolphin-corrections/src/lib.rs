@@ -21,6 +21,9 @@
 //!   equivalent range-rate delay that accumulates linearly over the stack.
 //!   Needs no external data file, only the acquisition time and per-pixel LOS
 //!   geometry, like [`solid_earth_tide`].
+//! - [`split_spectrum`] — NISAR main/side-band (`frequencyA`/`frequencyB`)
+//!   split-spectrum ionosphere from the two bands' unwrapped phase, with a
+//!   `dolphin-filtering` Gaussian low-pass.
 //!
 //! See `CLAUDE.md` in this crate for the delay math.
 #![warn(missing_docs)]
@@ -32,6 +35,7 @@ pub mod ionosphere;
 pub mod plate_motion;
 pub mod raider;
 pub mod solid_earth_tide;
+pub mod split_spectrum;
 pub mod troposphere;
 
 pub use apply::subtract_delay;
@@ -43,4 +47,7 @@ pub use plate_motion::{
     ITRF2020_PMM,
 };
 pub use solid_earth_tide::{tide_displacement_enu, tide_range_delay_grid, LonLatGrid};
+pub use split_spectrum::{
+    estimate_ionosphere, lowpass_ionosphere, side_band_cycle_offset, BandPhase, SplitSpectrumError,
+};
 pub use troposphere::{read_l4_netcdf, resample_bilinear, DelayGrid};

@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 chrono.workspace = true
 dolphin-core.workspace = true
+dolphin-filtering.workspace = true
 dolphin-io.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
