@@ -5,13 +5,34 @@ burst `T005_008704_IW1`, 52 epochs, fixture `mmx1_2018_los_common`, seasonal mod
 backend, no troposphere · **Continues:**
 [`gps-mmx1-2018-troposphere-result.md`](gps-mmx1-2018-troposphere-result.md)
 
-> **Result (2026-09-10, same day):** the sweep was run. The residual is a **station-local
-> additive term of order 10 mm/yr**. It is not point-vs-pixel sampling (0.08–0.70 mm/yr), not
-> a smooth ramp (a 2.9 km pair disagrees *more* than an 11 km pair), and not a scale error
-> (the residual is flat at 9–19 mm/yr against signals from 15 to 255 mm/yr). Whether the
+> **Result (2026-09-10, same day):** the sweep was run. The raster residual is a
+> **station-local additive term of order 10 mm/yr**. It is not point-vs-pixel sampling
+> (0.08–0.70 mm/yr), not a smooth ramp (a 2.9 km pair disagrees *more* than an 11 km pair,
+> raster), and not a scale error (the raster residual is flat at 9–19 mm/yr against signals
+> from 15 to 255 mm/yr). Whether the
 > station-local term sits on the InSAR side or the GNSS side is still open and needs the 80 m
 > control pair. Full numbers in [Results](#results) below; the sections before it are the
 > design and still describe what was run.
+
+> **Estimator naming and correction (2026-10-31, #129, #126).** Unless marked otherwise, every
+> residual in this note is *raster*: `difference_raster_mm_yr`, which is `velocity.tif` at the
+> two station pixels minus the linear common-epoch GNSS rate. "17–19 mm/yr" means the raster
+> residual of MMX1−ICMX (18.94 base, 17.02 with troposphere). *Series* is `difference_mm_yr`,
+> InSAR and GNSS fitted with the same linear OLS on the same epochs. It is now the declared
+> headline: +22.36 ± 5.21 mm/yr for ICMX−MMX1. Two readings below change under it, per
+> [`gnss-estimator-gap-2026-10.md`](gnss-estimator-gap-2026-10.md):
+>
+> - **Baseline.** Series residuals are +7.33 (2.92 km), +22.36 and −16.56 (11 km). The shortest
+>   pair has the smallest residual, not one as large as the 11 km pairs. With 0 independent
+>   dof at the recipe gate, neither ordering is evidence.
+> - **Plane test.** Under the series estimator a plane explains 90% of the four-station field
+>   (F(2,1) = 4.62, p = 0.31). Under matched seasonal, which is the right estimator here
+>   because MXTM's residual carries a 25–28 mm annual term, it explains 39% (p = 0.78). That
+>   compares with 9% (p = 0.95) raster. None is significant, but dof = 1 cannot rule out a ramp
+>   "large enough to matter": a one-SE tilt across 11 km is 9.7–53 mm/yr.
+>
+> The "station-local" verdict below is therefore not established. The (a)/(b)/(c) question
+> stays open; the missing measurements are listed in the new note.
 
 ## The question
 
@@ -188,7 +209,8 @@ baseline test. The nine-station frame is not a nice-to-have.
 | MXMX | 178.19 | 178.13 | 178.12 | 178.11 | **0.08** | 0.20 mm |
 
 (mm/yr unless noted.) The InSAR field is flat to well under 1 mm/yr across a 7×7 patch at
-every station. Representativeness error is **2–4% of the residual**, not an explanation for
+every station. Representativeness error is **2–4% of the raster residual** (2.9–3.4% of the
+series residual per pair), not an explanation for
 it. This was the hypothesis the Mexico City gradient literature made most plausible, and the
 data rejects it.
 
@@ -197,7 +219,7 @@ data rejects it.
 Solving the pair table for per-station residuals (zero-mean gauge, since only differences are
 observable):
 
-| station | residual | east | north |
+| station | residual (raster) | east | north |
 |---|---:|---:|---:|
 | ICMX | **+10.06** | −3.43 km | −1.93 km |
 | MMX1 | **−9.48** | +7.32 km | +0.97 km |
@@ -244,7 +266,7 @@ substantially on the same run:
 | ICMX–MXMX | +11.23 | +7.33 | 3.90 |
 | MMX1–MXMX | −9.51 | −16.56 | **7.05** |
 
-Up to 7 mm/yr of the 17–19 mm/yr is internal to how the rate is fitted from the *same*
+Up to 7 mm/yr of the 17–19 mm/yr raster residual is internal to how the rate is fitted from the *same*
 displacement product — a third of the number under investigation, before any physics. Any
 future statement of the residual has to name which estimator it means. This is the same class
 of problem #123 just fixed one level down.
@@ -258,7 +280,7 @@ any degrees of freedom at all, so this is the first time the test could actually
 Per-station residuals (zero-mean gauge), pair table explained to R² = 0.9938, misfit RMS
 0.978 mm/yr:
 
-| station | residual mm/yr | east | north |
+| station | residual (raster) mm/yr | east | north |
 |---|---:|---:|---:|
 | ICMX | +7.71 | −7.62 km | −3.64 km |
 | MMX1 | −11.51 | +3.13 km | −0.73 km |
@@ -275,7 +297,8 @@ north gradient +1.501 mm/yr per km      F(2,1) = 0.05, p = 0.9548
                                         →  no gradient — station-local
 ```
 
-**No gradient.** A plane explains 9% of the station field. With dof = 1 the test is weak
+**No gradient (raster estimator; see the correction at the top).** A plane explains 9% of
+the raster station field. With dof = 1 the test is weak
 against a *small* tilt, so this rules out a ramp large enough to matter, not every conceivable
 one. Combined with the baseline evidence above — the 2.92 km pair carrying as much residual
 as the 11 km pairs — the station-local reading stands.
@@ -316,8 +339,8 @@ window on this one — a multi-burst cohort, not a crop.
 
 ## Verdict
 
-The residual is a **station-local additive term of order 10 mm/yr**, plus up to 7 mm/yr of
-estimator choice. Ruled out: point-vs-pixel sampling, a smooth spatial ramp (now tested, not
+*Superseded in part 2026-10-31, see the correction at the top.* The raster residual is a
+**station-local additive term of order 10 mm/yr**, plus up to 7 mm/yr of estimator choice. Ruled out: point-vs-pixel sampling, a smooth spatial ramp (now tested, not
 assumed), and a multiplicative scale error. Troposphere and plate motion were already out.
 
 What remains, and unchanged by this run:
