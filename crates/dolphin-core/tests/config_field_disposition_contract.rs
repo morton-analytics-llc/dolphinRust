@@ -82,6 +82,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "timeseries_options.velocity_seasonal",
     "timeseries_options.velocity_step_dates",
     "timeseries_options.velocity_relaxation",
+    "timeseries_options.estimate_dem_error",
     "timeseries_options.mask_unwrap_loop_errors",
     "timeseries_options.correct_unwrap_loop_errors",
     "timeseries_options.write_cycle_step_diagnostics",
@@ -354,6 +355,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
             velocity_seasonal,
             velocity_step_dates,
             velocity_relaxation,
+            estimate_dem_error,
             mask_unwrap_loop_errors,
             correct_unwrap_loop_errors,
             write_cycle_step_diagnostics,
@@ -378,6 +380,7 @@ fn audit_timeseries(value: TimeseriesOptions, paths: &mut Vec<&'static str>) {
         velocity_seasonal,
         velocity_step_dates,
         velocity_relaxation,
+        estimate_dem_error,
         mask_unwrap_loop_errors,
         correct_unwrap_loop_errors,
         write_cycle_step_diagnostics,
@@ -923,6 +926,33 @@ fn outside_static_fraction_must_be_a_fraction() {
         config.correction_options.max_outside_static_fraction = valid;
         config.validate_supported_options().unwrap();
     }
+}
+
+/// `timeseries_options.estimate_dem_error` (#143) needs OPERA orbits and a
+/// wavelength to scale the baseline sensitivity into phase.
+#[test]
+fn dem_error_requires_wavelength_and_opera_inputs() {
+    let mut config = DisplacementWorkflow::default();
+    config.timeseries_options.estimate_dem_error = true;
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(error.contains("estimate_dem_error"), "{error}");
+    config.input_options.wavelength = Some(0.055);
+    config.validate_supported_options().unwrap();
+}
+
+/// #160: the native unwrapper has one cost model, so `cost: defo` on native is a
+/// config error instead of silently running the smooth cost; SNAPHU keeps both.
+#[test]
+fn native_unwrap_rejects_a_cost_mode_it_does_not_implement() {
+    let mut config = DisplacementWorkflow::default();
+    config.unwrap_options.snaphu_options.cost = "defo".into();
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(
+        error.contains("unwrap_options.snaphu_options.cost"),
+        "{error}"
+    );
+    config.unwrap_options.unwrap_method = UnwrapMethod::Snaphu;
+    config.validate_supported_options().unwrap();
 }
 
 /// `output_options.min_reference_component_fraction` (#152) is a fraction in
