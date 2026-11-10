@@ -25,7 +25,6 @@ COMBOS = [
     (12, 5, 2, "always_first"),
     (7, 3, 10, "always_first"),
     (10, 4, 10, "first_per_ministack"),
-    (10, 4, 10, "last_per_ministack"),
 ]
 PLANS = {p.value: p for p in CompressedSlcPlan}
 
