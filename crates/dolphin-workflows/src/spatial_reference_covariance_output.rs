@@ -1740,7 +1740,7 @@ pub(crate) fn production_resource_admission(
 fn support_method(method: ShpMethod) -> &'static str {
     match method {
         ShpMethod::Rect => "rect",
-        ShpMethod::Glrt => "glrt_frozen",
+        ShpMethod::Glrt | ShpMethod::GlrtMinistack => "glrt_frozen",
         ShpMethod::Ks => "ks_frozen",
     }
 }
