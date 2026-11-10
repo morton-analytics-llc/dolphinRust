@@ -5,10 +5,17 @@
 **Run date:** 2026-09-03 · **Commit:** `c12bc07` · **Cohort:** `gps_mmx1_2018`,
 fixture `mmx1_2018_los_common`, burst `T005_008704_IW1`, 52 epochs
 
+> **Estimator naming (2026-10-31, #129).** The harness reports two residuals. *Series* is
+> `difference_mm_yr`: InSAR and GNSS fitted with the same linear OLS over common GNSS
+> epochs. It is the declared headline. *Raster* is `difference_raster_mm_yr`: `velocity.tif`
+> at the station pixels minus that GNSS rate. Every residual below is labelled with one or the
+> other. Why they differ by 3.4–7.1 mm/yr, and why the series one is the headline:
+> [`gnss-estimator-gap-2026-10.md`](gnss-estimator-gap-2026-10.md).
+
 ## Result
 
 **Troposphere does not explain the InSAR-minus-GNSS velocity residual.** It can move the
-comparison by at most **0.83 mm/yr** against a **22.36 mm/yr** discrepancy — under 4 % — and
+comparison by at most **0.83 mm/yr** against a **22.36 mm/yr** discrepancy (series) — under 4 % — and
 applying it makes epoch-wise agreement *worse*, not better.
 
 The lead is closed. This was the only remaining hypothesis on the residual after the
@@ -20,8 +27,8 @@ Identical configs but for `correction_options.troposphere_files` + `dem_file`.
 
 | metric | baseline | + troposphere | change |
 |---|---:|---:|---|
-| velocity difference (polyfit) | −22.3625 mm/yr | −22.3820 mm/yr | −0.020 |
-| velocity difference (raster) | −20.2730 mm/yr | −19.3974 mm/yr | **+0.876** |
+| velocity difference, series (`difference_mm_yr`) | −22.3625 mm/yr | −22.3820 mm/yr | −0.020 |
+| velocity difference, raster (`difference_raster_mm_yr`, linear `velocity.tif`) | −20.2730 mm/yr | −19.3974 mm/yr | **+0.876** |
 | MAE | 9.034 mm | 10.182 mm | **+1.148 worse** |
 | RMSE | 11.244 mm | 13.335 mm | **+2.091 worse** |
 | correlation | 0.9908 | 0.9858 | −0.0050 worse |
@@ -32,7 +39,7 @@ about that verdict.
 
 ## Why it cannot help, quantitatively
 
-The delay itself is large, but almost all of it is common mode between two stations 13 km
+The delay itself is large, but almost all of it is common mode between two stations 11.13 km
 apart at nearly equal elevation, and the harness scores `MMX1_minus_ICMX`, so the common
 part cancels before anything is compared.
 
@@ -54,7 +61,7 @@ inject is the 6 mm epoch-to-epoch scatter of the HRES model differential, which 
 and RMSE degrade: model noise added, no comparable real signal removed.
 
 This is the same cancellation that ruled out rigid plate motion for this comparison on the
-same day. A 13 km differential pair is insensitive to any smooth, regional field — which is
+same day. An 11.13 km differential pair is insensitive to any smooth, regional field — which is
 a property of the truth set, not a defect in either correction.
 
 ## Seasonal-model A/B (2026-09-08)
@@ -67,8 +74,8 @@ N19W100 + N19W099 via `gdalwarp`. Results committed under
 
 | metric | baseline | + troposphere | change |
 |---|---:|---:|---|
-| velocity difference (polyfit) | −22.3625 mm/yr | −22.3721 mm/yr | −0.010 |
-| velocity difference (raster, seasonal) | −18.9444 mm/yr | −17.0195 mm/yr | **+1.925** |
+| velocity difference, series (`difference_mm_yr`) | −22.3625 mm/yr | −22.3721 mm/yr | −0.010 |
+| velocity difference, raster (`difference_raster_mm_yr`, seasonal `velocity.tif`) | −18.9444 mm/yr | −17.0195 mm/yr | **+1.925** |
 | RSS velocity sigma (new) | 20.78 mm/yr | 21.78 mm/yr | +1.00 |
 | MAE | 9.034 mm | 10.180 mm | **+1.146 worse** |
 | RMSE | 11.244 mm | 13.332 mm | **+2.088 worse** |
@@ -85,13 +92,14 @@ peaking ~3 days apart), so most of it cancels in the differential and the season
 
 ### The −5.74 mm/yr figure does not reproduce, and the reason is the estimator
 
-The August number (−11.51 linear → −5.74 seasonal) was produced before v1.6.0 changed what
+The August number (raster: −11.51 linear → −5.74 seasonal) was produced before v1.6.0 changed what
 `write_velocity_uncertainty: true` selects. The harness sets that flag, so today's
 `velocity.tif` is the **post-gauge, unit-precision** fit
 (`time_function_post_gauge_unit_precision`); the August raster was the **full-series,
 stitched-CRLB-weighted** fit. Re-fitting the two station pixels offline from today's
 `displacement_NN.tif` + `crlb_sigma_NN.tif` under each estimator reproduces the harness
-numbers exactly and gives, MMX1−ICMX residual vs GNSS (mm/yr):
+numbers exactly and gives, MMX1−ICMX residual vs GNSS (mm/yr; raster-type: the InSAR rate refitted
+at the two station pixels under the named estimator, minus the series GNSS rate):
 
 | estimator | linear, base | seasonal, base | linear, +tropo | seasonal, +tropo |
 |---|---:|---:|---:|---:|
@@ -110,11 +118,13 @@ Three things follow:
    The remaining gap to the August figure is engine change between v1.5.0 and `f3e6a36`
    (#117 acquisition/UTC contracts, v1.6.0 velocity gauge), not a scoring difference.
 3. **Troposphere's contribution is estimator-independent in sign and small in size**:
-   +0.9 to +3.4 mm/yr across every row, against residuals of 8.5–20.3. It does not close the
+   +0.9 to +3.4 mm/yr across every row, against raster-type residuals of 8.5–20.3. It does not close the
    gap under any framing and always degrades the epoch-wise fit.
 
-The residual to explain is therefore **17–19 mm/yr** in the seasonal model under the
-production estimator, not 5.74.
+The residual to explain is therefore **17–19 mm/yr** (raster, seasonal model, production
+`velocity.tif` estimator), not 5.74. The matched headline for the same run is −22.36 mm/yr
+(series); [`gnss-estimator-gap-2026-10.md`](gnss-estimator-gap-2026-10.md) explains why the
+two differ.
 
 ## Transfer
 
@@ -135,7 +145,7 @@ The projection was conservative by 6 %. Staged via
   `--velocity-seasonal` could not score (issue #115). With #115 fixed (`f3e6a36`) the A/B was
   rerun in the seasonal model; see [Seasonal-model A/B](#seasonal-model-ab-2026-09-08). The
   conclusion holds: troposphere moves the seasonal raster residual by 1.9 mm/yr against
-  18.9, and the epoch-wise degradation is identical.
+  18.9 (raster), and the epoch-wise degradation is identical.
 - One cohort, one station pair, one burst. The cancellation argument generalizes to any
   short-baseline differential pair, not to absolute single-station comparison.
 - Delays come from HRES via OPERA L4 `TROPO-ZENITH`; no other weather model was tried.
@@ -160,8 +170,8 @@ Each pipeline run is ~26 minutes at full resolution over 52 epochs (~30–34 wit
 ## What this leaves
 
 The residual is unexplained. Troposphere and plate motion are both ruled out for this
-comparison, and both for the same structural reason: the truth set is a 13 km differential
-pair. The next hypotheses worth separating are ones that do *not* cancel over 13 km —
+comparison, and both for the same structural reason: the truth set is an 11.13 km differential
+pair. The next hypotheses worth separating are ones that do *not* cancel over 11.13 km —
 per-station local motion, reference-pixel selection, or a systematic in the phase-linking
 or inversion chain itself. Testing absolute (single-station) agreement would need a
 different truth construction than this cohort provides.
