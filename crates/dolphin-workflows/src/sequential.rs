@@ -2331,7 +2331,8 @@ fn shp_neighbors(
 /// Build the fused-pass parameters. `num_looks` is dolphin's conservative
 /// `sqrt(half_y · half_x)`; the CRLB reference is the last compressed date
 /// (dolphin's `max(first_real_slc_idx − 1, 0)`), which may differ from the
-/// output reference.
+/// output reference. The count is that date's position because [`assemble`]
+/// always puts the carried compressed SLCs first (#176).
 fn fused_params(ms: MiniStack, cfg: &SequentialConfig, output_reference_idx: usize) -> FusedParams {
     FusedParams {
         use_evd: cfg.use_evd,
@@ -2502,5 +2503,67 @@ mod tests {
             .err()
             .expect("update must fail");
         assert!(error.contains("full-stack amplitude statistics"), "{error}");
+    }
+
+    /// #176 (dolphin PR #750, v0.42.9). dolphin took the last compressed SLC's
+    /// position to be `count − 1` in a date-sorted file list where a compressed
+    /// SLC could sort between real ones. Here `assemble` is the only builder of
+    /// a combined ministack and it puts the carried compressed SLCs first, so
+    /// the position found by scanning (dolphin's fix) equals the count-derived
+    /// index the driver uses: for both plans that carry compressed SLCs, with
+    /// and without `max_num_compressed` truncation, and on a resumed plan.
+    #[test]
+    fn compressed_slcs_always_lead_the_combined_ministack() {
+        // Real layer `d` holds `d`; the `k`-th compressed SLC holds `-(k + 1)`.
+        let layer = |value: f64| Array2::from_elem((1, 1), Cf64::new(value, 0.0));
+        let real = Array3::from_shape_fn((11, 1, 1), |(date, _, _)| Cf64::new(date as f64, 0.0));
+        let cases = [
+            CompressedSlcPlan::AlwaysFirst,
+            CompressedSlcPlan::FirstPerMinistack,
+        ]
+        .into_iter()
+        .flat_map(|plan| [2, 10].map(|max| (plan, max)))
+        .flat_map(|(plan, max)| [0, 3].map(|sealed| (plan, max, sealed)));
+        for (plan, max_num_compressed, sealed) in cases {
+            let cfg = SequentialConfig {
+                ministack_size: 3,
+                max_num_compressed,
+                compressed_slc_plan: plan,
+                ..glrt_config(ShpAmplitudeStatistics::FullStack)
+            };
+            let plans = planner_for(real.dim().0, &cfg)
+                .unwrap()
+                .plan_with_offset(cfg.ministack_size, sealed)
+                .unwrap();
+            let mut carry: Vec<_> = (0..sealed).map(|k| layer(-(k as f64 + 1.0))).collect();
+            for ms in plans {
+                let combined = assemble(&carry, real.view(), ms);
+                let values: Vec<f64> = combined.iter().map(|z| z.re).collect();
+                let last_compressed = values.iter().rposition(|&value| value < 0.0);
+                let first_real = values.iter().position(|&value| value >= 0.0).unwrap();
+                let context = format!("{plan:?}, max {max_num_compressed}, block {}", ms.block_id);
+                assert_eq!(
+                    last_compressed,
+                    ms.num_compressed.checked_sub(1),
+                    "{context}"
+                );
+                assert_eq!(first_real, ms.num_compressed, "{context}");
+
+                let newest = carry.len() as f64;
+                let expected_compressed =
+                    (0..ms.num_compressed).map(|k| -(newest - (ms.num_compressed - 1 - k) as f64));
+                let expected_real = (0..ms.num_real).map(|j| (ms.real_start + j) as f64);
+                assert_eq!(
+                    values,
+                    expected_compressed.chain(expected_real).collect::<Vec<_>>(),
+                    "{context}"
+                );
+
+                let params = fused_params(ms, &cfg, ms.resolved_output_reference_idx().unwrap());
+                assert_eq!(params.crlb_reference_idx, last_compressed.unwrap_or(0));
+                assert_eq!(params.average_coherence_start_idx, first_real);
+                carry.push(layer(-(newest + 1.0)));
+            }
+        }
     }
 }
