@@ -114,7 +114,6 @@ fn config() -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
-        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     }
 }
 
@@ -1510,7 +1509,7 @@ fn adaptive_capture_matches_glrt_and_ks_production_and_persists_realized_support
                     cfg.shp_alpha,
                     false,
                 ),
-                ShpMethod::Rect => unreachable!(),
+                ShpMethod::Rect | ShpMethod::GlrtMinistack => unreachable!(),
             };
             assert_eq!(block.support_bits_per_output, 9);
             for output in 0..4 {
@@ -2734,7 +2733,6 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
-        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     };
     let amplitudes = [1.0, 1.2, 0.9, 1.1];
     let phases = [0.4, 0.9, 1.25, 1.8];

@@ -16,7 +16,7 @@
 //! decorrelated. Unmasked, `Γ`'s smallest eigenvalue is about -0.30; under the
 //! GLRT mask it is about +0.35.
 
-use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpAmplitudeStatistics, ShpMethod};
+use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
 use dolphin_phaselink::{ComputeEngine, FusedParams};
 use dolphin_shp::estimate_neighbors_glrt;
@@ -101,7 +101,6 @@ fn config(shp_method: ShpMethod) -> SequentialConfig {
         compute_average_coherence: false,
         shp_method,
         shp_alpha: 0.001,
-        shp_amplitude_statistics: ShpAmplitudeStatistics::FullStack,
     }
 }
 
@@ -160,13 +159,12 @@ fn oracle_stack() -> Array3<Cf64> {
     stack.mapv(|z| Cf64::new(f64::from(z.re), f64::from(z.im)))
 }
 
-fn oracle_config(statistics: ShpAmplitudeStatistics) -> SequentialConfig {
+fn oracle_config(shp_method: ShpMethod) -> SequentialConfig {
     SequentialConfig {
         ministack_size: ORACLE_MINISTACK,
         half_window: ORACLE_HALF,
         compute_crlb: false,
-        shp_amplitude_statistics: statistics,
-        ..config(ShpMethod::Glrt)
+        ..config(shp_method)
     }
 }
 
@@ -238,10 +236,10 @@ fn full_stack_glrt_statistics_reproduce_dolphins_shp_counts_for_every_ministack(
     }
 }
 
-/// First-ministack phases of a sequential run under `statistics`.
-fn first_ministack_phase(stack: &Array3<Cf64>, statistics: ShpAmplitudeStatistics) -> Array3<Cf64> {
+/// First-ministack phases of a sequential run under `shp_method`.
+fn first_ministack_phase(stack: &Array3<Cf64>, shp_method: ShpMethod) -> Array3<Cf64> {
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
-    run_sequential(stack.view(), &oracle_config(statistics), &engine)
+    run_sequential(stack.view(), &oracle_config(shp_method), &engine)
         .unwrap()
         .cpx_phase
         .slice(s![..ORACLE_MINISTACK, .., ..])
@@ -251,7 +249,7 @@ fn first_ministack_phase(stack: &Array3<Cf64>, statistics: ShpAmplitudeStatistic
 /// The first ministack carries no compressed SLC, so phase-linking it directly
 /// with a given neighbour mask is the whole computation.
 fn linked_with(stack: &Array3<Cf64>, neighbors: &Array4<bool>) -> Array3<Cf64> {
-    let cfg = oracle_config(ShpAmplitudeStatistics::FullStack);
+    let cfg = oracle_config(ShpMethod::Glrt);
     let params = FusedParams {
         use_evd: cfg.use_evd,
         beta: cfg.beta,
@@ -282,9 +280,9 @@ fn bit_identical(left: &Array3<Cf64>, right: &Array3<Cf64>) -> bool {
         .all(|(a, b)| a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits())
 }
 
-/// The driver applies what the setting says: under `full_stack` the first
+/// The driver applies what the method says: under `glrt` the first
 /// ministack is linked with neighbours chosen from all 30 dates, under
-/// `ministack` from its own 10, and on this scene the two differ.
+/// `glrt_ministack` from its own 10, and on this scene the two differ.
 #[test]
 fn the_sequential_driver_links_each_ministack_with_the_configured_statistics() {
     let stack = oracle_stack();
@@ -292,8 +290,8 @@ fn the_sequential_driver_links_each_ministack_with_the_configured_statistics() {
     let from_first_ministack = glrt_neighbors(stack.slice(s![..ORACLE_MINISTACK, .., ..]));
     assert_ne!(from_all_dates, from_first_ministack);
 
-    let full_stack = first_ministack_phase(&stack, ShpAmplitudeStatistics::FullStack);
-    let ministack = first_ministack_phase(&stack, ShpAmplitudeStatistics::Ministack);
+    let full_stack = first_ministack_phase(&stack, ShpMethod::Glrt);
+    let ministack = first_ministack_phase(&stack, ShpMethod::GlrtMinistack);
     assert!(bit_identical(
         &full_stack,
         &linked_with(&stack, &from_all_dates)
@@ -305,8 +303,8 @@ fn the_sequential_driver_links_each_ministack_with_the_configured_statistics() {
     assert!(!bit_identical(&full_stack, &ministack));
 }
 
-/// `ministack` statistics keep the incremental guarantee: an update is
-/// bit-identical to a full rerun. Under `full_stack` it is not, because a
+/// `glrt_ministack` keeps the incremental guarantee: an update is
+/// bit-identical to a full rerun. Under `glrt` it is not, because a
 /// rerun reselects the sealed ministacks' neighbours with the later dates;
 /// the update's own statistics still cover every date (see the unit tests in
 /// `sequential.rs`).
@@ -315,8 +313,8 @@ fn an_update_matches_a_rerun_under_ministack_statistics_only() {
     let stack = oracle_stack();
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let split = 2 * ORACLE_MINISTACK;
-    let updated = |statistics| {
-        let cfg = oracle_config(statistics);
+    let updated = |shp_method| {
+        let cfg = oracle_config(shp_method);
         let (_, state) =
             run_sequential_resumable(stack.slice(s![..split, .., ..]), &cfg, &engine).unwrap();
         let (output, _) =
@@ -324,8 +322,8 @@ fn an_update_matches_a_rerun_under_ministack_statistics_only() {
         let rerun = run_sequential(stack.view(), &cfg, &engine).unwrap();
         (output.cpx_phase, rerun.cpx_phase)
     };
-    let (update, rerun) = updated(ShpAmplitudeStatistics::Ministack);
+    let (update, rerun) = updated(ShpMethod::GlrtMinistack);
     assert!(bit_identical(&update, &rerun));
-    let (update, rerun) = updated(ShpAmplitudeStatistics::FullStack);
+    let (update, rerun) = updated(ShpMethod::Glrt);
     assert!(!bit_identical(&update, &rerun));
 }

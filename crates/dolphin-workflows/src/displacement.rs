@@ -5199,7 +5199,6 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         compute_average_coherence: cfg.phase_linking.calc_average_coh,
         shp_method: cfg.phase_linking.shp_method,
         shp_alpha: cfg.phase_linking.shp_alpha,
-        shp_amplitude_statistics: cfg.phase_linking.shp_amplitude_statistics,
     }
 }
 
@@ -9586,8 +9585,6 @@ mod tests {
         cfg.phase_linking.zero_correlation_threshold = 0.23;
         cfg.phase_linking.shp_method = ShpMethod::Ks;
         cfg.phase_linking.shp_alpha = 0.007;
-        cfg.phase_linking.shp_amplitude_statistics =
-            dolphin_core::config::ShpAmplitudeStatistics::Ministack;
         cfg.phase_linking.compressed_slc_plan = CompressedSlcPlan::LastPerMinistack;
         cfg.phase_linking.write_crlb = false;
         cfg.phase_linking.write_closure_phase = false;
@@ -9608,10 +9605,6 @@ mod tests {
         assert_eq!(mapped.zero_correlation_threshold, 0.23);
         assert_eq!(mapped.shp_method, ShpMethod::Ks);
         assert_eq!(mapped.shp_alpha, 0.007);
-        assert_eq!(
-            mapped.shp_amplitude_statistics,
-            dolphin_core::config::ShpAmplitudeStatistics::Ministack
-        );
         assert_eq!(
             mapped.compressed_slc_plan,
             CompressedSlcPlan::LastPerMinistack

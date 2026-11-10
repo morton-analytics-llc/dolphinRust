@@ -5,8 +5,7 @@
 //! groups we don't model) must deserialize, and our own emit must round-trip.
 
 use dolphin_core::config::{
-    CompressedSlcPlan, DisplacementWorkflow, InputType, ShpAmplitudeStatistics, ShpMethod,
-    TimeseriesMethod, UnwrapMethod,
+    CompressedSlcPlan, DisplacementWorkflow, InputType, ShpMethod, TimeseriesMethod, UnwrapMethod,
 };
 
 #[test]
@@ -266,24 +265,21 @@ correction_options:
     assert_eq!(reparsed, c, "correction_options round-trips");
 }
 
-/// #165: the GLRT takes its amplitude statistics from the whole stack by
-/// default, as dolphin does; `ministack` restores the earlier behaviour.
+/// #165: `glrt` is dolphin's whole-stack test and stays the default;
+/// `glrt_ministack` names the earlier per-ministack behaviour.
 #[test]
-fn shp_amplitude_statistics_default_to_the_full_stack() {
-    let default = DisplacementWorkflow::default();
+fn glrt_ministack_is_a_separate_shp_method() {
     assert_eq!(
-        default.phase_linking.shp_amplitude_statistics,
-        ShpAmplitudeStatistics::FullStack
+        serde_yaml::to_string(&ShpMethod::GlrtMinistack)
+            .unwrap()
+            .trim(),
+        "glrt_ministack"
     );
-    assert!(default
-        .to_yaml()
-        .unwrap()
-        .contains("shp_amplitude_statistics: full_stack"));
     let parsed =
-        DisplacementWorkflow::from_yaml("phase_linking:\n  shp_amplitude_statistics: ministack\n")
-            .unwrap();
+        DisplacementWorkflow::from_yaml("phase_linking:\n  shp_method: glrt_ministack\n").unwrap();
+    assert_eq!(parsed.phase_linking.shp_method, ShpMethod::GlrtMinistack);
     assert_eq!(
-        parsed.phase_linking.shp_amplitude_statistics,
-        ShpAmplitudeStatistics::Ministack
+        DisplacementWorkflow::default().phase_linking.shp_method,
+        ShpMethod::Glrt
     );
 }
