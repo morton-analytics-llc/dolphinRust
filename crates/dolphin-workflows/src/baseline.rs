@@ -124,8 +124,15 @@ pub fn orbit_pair_baseline(
 /// granule `t`, each platform at its own mid zero-Doppler time; `R` is the
 /// slant range from granule 0's platform to the centre; `θ` is the incidence
 /// there, the angle between the target-to-satellite vector and the ellipsoid
-/// normal. Frame-centre values: `B⊥` and `R sin θ` vary by a few percent across a
-/// burst, which scales the fitted height error, not the rate it is removed from.
+/// normal. Positive `B⊥` with a scatterer above the DEM shortens the secondary's
+/// range, so the product of this value and the height error is an apparent
+/// displacement toward the satellite.
+///
+/// These are burst-centre values. Across one IW burst's range extent the
+/// incidence changes by about 5°, so `R sin θ` is up to about ±10% off at the
+/// near and far edges. That error scales the fitted height error by the same
+/// fraction; the rate is unaffected, because the column's shape in time is the
+/// same up to that scale.
 ///
 /// # Errors
 /// `Err` naming the granule when its orbit, identification or burst metadata
@@ -254,40 +261,92 @@ fn normalize(a: [f64; 3]) -> [f64; 3] {
 mod tests {
     use super::*;
 
-    /// #143: a satellite at 700 km altitude looking 30° off nadir at an
-    /// equatorial target, and a secondary displaced 100 m along the
-    /// perpendicular-baseline direction, give `B⊥ / (R sin θ)` with the
-    /// closed-form `R` and `θ`; acquisition 0 is zero.
-    #[test]
-    fn dem_error_sensitivity_matches_closed_form_geometry() {
+    /// The reference and target of the #143 fixtures: a satellite at 700 km
+    /// altitude in the equatorial plane looking 30° off nadir at the target on
+    /// the equator at longitude 0, flying along `+Z`.
+    fn equatorial_reference() -> ([f64; 3], [f64; 3], f64) {
         let target = geodetic_to_ecef(0.0, 0.0, 0.0);
-        let up = [1.0, 0.0, 0.0];
-        let east = [0.0, 1.0, 0.0];
-        let (height, look) = (700_000.0, 30.0_f64.to_radians());
-        let slant = height / look.cos();
-        let to_satellite = [look.cos(), look.sin(), 0.0];
+        let look = 30.0_f64.to_radians();
+        let slant = 700_000.0 / look.cos();
         let reference = [
-            target[0] + slant * to_satellite[0],
-            target[1] + slant * to_satellite[1],
+            target[0] + slant * look.cos(),
+            target[1] + slant * look.sin(),
             0.0,
         ];
-        // Perpendicular to the look in the look/vertical plane, away from Earth.
-        let perpendicular = normalize(subtract(up, scale(to_satellite, dot(up, to_satellite))));
-        let secondary = std::array::from_fn(|i| reference[i] + 100.0 * perpendicular[i]);
-        let state = |position| GranuleState {
+        (target, reference, slant)
+    }
+
+    fn state(position: [f64; 3]) -> GranuleState {
+        GranuleState {
             position,
             velocity: [0.0, 0.0, 7_500.0],
             center_lonlat_deg: [0.0, 0.0],
-        };
+        }
+    }
+
+    /// The secondary of the #143 fixtures: the reference moved `metres` along
+    /// the perpendicular-baseline direction, away from Earth.
+    fn raised_secondary(target: [f64; 3], reference: [f64; 3], metres: f64) -> [f64; 3] {
+        let up = [1.0, 0.0, 0.0];
+        let to_satellite = normalize(subtract(reference, target));
+        let perpendicular = normalize(subtract(up, scale(to_satellite, dot(up, to_satellite))));
+        std::array::from_fn(|i| reference[i] + metres * perpendicular[i])
+    }
+
+    /// #143: a secondary displaced 100 m along the perpendicular-baseline
+    /// direction gives `+B⊥ / (R sin θ)` with the closed-form `R` and `θ`;
+    /// acquisition 0 is zero.
+    #[test]
+    fn dem_error_sensitivity_matches_closed_form_geometry() {
+        let (target, reference, slant) = equatorial_reference();
+        let secondary = raised_secondary(target, reference, 100.0);
         let values = sensitivity_from_states(&[state(reference), state(secondary)]).unwrap();
         assert_eq!(values[0], 0.0);
-        let expected = 100.0 / (slant * look.sin());
+        let expected = 100.0 / (slant * 30.0_f64.to_radians().sin());
         assert!(
-            (values[1].abs() - expected).abs() < 1e-9 * expected,
+            (values[1] - expected).abs() < 1e-9 * expected,
             "{} vs {expected}",
             values[1]
         );
-        let _ = east;
+    }
+
+    /// #143, sign and size against ranges computed directly: raise the
+    /// scatterer 20 m above the ellipsoid at the same range from the reference
+    /// (the pixel it is imaged in) and measure how much nearer the secondary
+    /// sees it than the flattening to the ellipsoid assumed. That apparent
+    /// motion toward the satellite must equal `sensitivity · height`.
+    #[test]
+    fn dem_error_sensitivity_predicts_the_range_change_of_a_raised_scatterer() {
+        let (target, reference, _) = equatorial_reference();
+        let secondary = raised_secondary(target, reference, 100.0);
+        let range = |from: [f64; 3], to: [f64; 3]| {
+            let d = subtract(to, from);
+            dot(d, d).sqrt()
+        };
+        let height = 20.0;
+        let reference_range = range(reference, target);
+        // Bisect the longitude at which the raised scatterer keeps the
+        // reference's range; the satellite is east of the target.
+        let (mut west, mut east) = (-1.0e-3_f64, 1.0e-3_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (west + east);
+            let raised = geodetic_to_ecef(mid, 0.0, height);
+            match range(reference, raised) > reference_range {
+                true => west = mid,
+                false => east = mid,
+            }
+        }
+        let raised = geodetic_to_ecef(0.5 * (west + east), 0.0, height);
+        let range_difference = |point| range(secondary, point) - range(reference, point);
+        let toward_satellite = -(range_difference(raised) - range_difference(target));
+        let sensitivity =
+            sensitivity_from_states(&[state(reference), state(secondary)]).unwrap()[1];
+        let predicted = sensitivity * height;
+        assert!(predicted > 0.0, "{predicted}");
+        assert!(
+            (toward_satellite - predicted).abs() < 1e-3 * predicted,
+            "measured {toward_satellite} m, predicted {predicted} m"
+        );
     }
 
     /// A synthetic side-looking geometry: target on the `+X` axis (its own ECEF

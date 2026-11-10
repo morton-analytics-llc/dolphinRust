@@ -103,13 +103,18 @@ pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
         evidence: "dolphin-workflows::displacement workflow-to-backend mapping contracts plus unwrap_backend_contract and unwrap_parallel_contract",
     },
     ConfigBehaviorContract {
+        id: "CFG-UNWRAP-INTERPOLATION",
+        reader: "dolphin-workflows::{displacement::{unwrap_network, interpolation_plan}, unwrap_backend::unwrap_phase_correlated_network}",
+        evidence: "dolphin-phaselink::interpolation_contract plus dolphin-workflows::unwrap_backend::tests::{interpolation_off_leaves_network_output_unchanged, interpolation_feeds_unwrapper_and_transfers_ambiguities_to_original_phase}",
+    },
+    ConfigBehaviorContract {
         id: "CFG-UNWRAP-MASK",
         reader: "dolphin-workflows::displacement::{unwrap_network, analysis_correlation, apply_phase_masks}",
         evidence: "dolphin-workflows::displacement::tests::{aligned_mask_crs_mismatch_fails_explicitly, mask_is_not_read_when_zero_where_masked_is_false, terrain_and_enabled_unwrap_masks_zero_linked_phase_before_interferograms}",
     },
     ConfigBehaviorContract {
         id: "CFG-TIMESERIES",
-        reader: "dolphin-workflows::displacement::{finish_displacement, sequential_config, invert_time_series, fit_velocity, apply_loop_closure_qc}",
+        reader: "dolphin-workflows::displacement::{finish_displacement, sequential_config, invert_time_series, fit_velocity, apply_loop_closure_qc, validate_config}",
         evidence: "dolphin-workflows::{displacement_contract::l2_uncertainty_products_are_opt_in_and_unit_aligned, multiburst_contract} and displacement reference/correlation/loop-closure unit contracts",
     },
     ConfigBehaviorContract {
@@ -340,6 +345,16 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "the Rust workflow always propagates its validity mask"
     ),
     consumed!("timeseries_options.correlation_threshold", "CFG-TIMESERIES"),
+    conditional!(
+        "timeseries_options.reference_selection",
+        "CFG-TIMESERIES",
+        "timeseries_options.reference_point is unset"
+    ),
+    conditional!(
+        "timeseries_options.reference_coherence_floor",
+        "CFG-TIMESERIES",
+        "timeseries_options.reference_selection is coherent_support and reference_point is unset"
+    ),
     compatibility_only!(
         "timeseries_options.block_shape",
         "timeseries inversion is not configured through block scheduling"
@@ -396,6 +411,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "timeseries_options.mask_unwrap_loop_errors",
         "CFG-TIMESERIES",
         "timeseries_options.mask_unwrap_loop_errors is true"
+    ),
+    conditional!(
+        "timeseries_options.correct_unwrap_loop_errors",
+        "CFG-TIMESERIES",
+        "timeseries_options.correct_unwrap_loop_errors is true"
     ),
     conditional!(
         "timeseries_options.write_cycle_step_diagnostics",
@@ -460,21 +480,24 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "unwrap_options.preprocess_options.alpha",
         "pre-unwrap Goldstein filtering is not implemented"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.max_radius",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.interpolation_cor_threshold",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options.interpolation_similarity_threshold",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     compatibility_only!(
         "unwrap_options.preprocess_options.zero_correlation_where_interpolating",
-        "pre-unwrap interpolation is not implemented"
+        "dolphin v0.42-only option; the pinned v0.35.0 interpolation keeps the unwrapper's correlation"
     ),
     compatibility_only!(
         "unwrap_options.run_unwrap",
@@ -484,9 +507,10 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "unwrap_options.run_goldstein",
         "pre-unwrap Goldstein filtering is not implemented"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.run_interpolation",
-        "pre-unwrap interpolation is not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     consumed!("unwrap_options.unwrap_method", "CFG-UNWRAP-BACKEND"),
     consumed!("unwrap_options.n_parallel_jobs", "CFG-UNWRAP-BACKEND"),
@@ -495,9 +519,10 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-UNWRAP-MASK",
         "unwrap_options.zero_where_masked is true and mask_file is set"
     ),
-    compatibility_only!(
+    conditional!(
         "unwrap_options.preprocess_options",
-        "pre-unwrap filtering and interpolation are not implemented"
+        "CFG-UNWRAP-INTERPOLATION",
+        "unwrap_options.run_interpolation is true"
     ),
     conditional!(
         "unwrap_options.snaphu_options",
@@ -559,6 +584,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "CFG-CORRECTIONS",
         "correction_options.geometry_files is nonempty"
     ),
+    conditional!(
+        "correction_options.plate_motion_model",
+        "CFG-CORRECTIONS",
+        "correction_options.plate_motion_model is set"
+    ),
     consumed!("output_options.strides", "CFG-BOUNDS-CROP"),
     conditional!(
         "output_options.epsg",
@@ -574,6 +604,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
         "output_options.bounds_epsg",
         "CFG-BOUNDS-CROP",
         "output_options.bounds is set"
+    ),
+    conditional!(
+        "output_options.min_reference_component_fraction",
+        "CFG-BOUNDS-CROP",
+        "output_options.bounds and output_options.min_reference_component_fraction are set"
     ),
     compatibility_only!(
         "output_options.add_overviews",
@@ -688,6 +723,25 @@ pub enum TimeseriesMethod {
     L1,
     /// L2 (least-squares) norm.
     L2,
+}
+
+/// Rule for the automatic spatial reference pixel, used when
+/// `timeseries_options.reference_point` is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSelectionMethod {
+    /// The original dolphinRust rule: largest 4-connected region with temporal
+    /// coherence above `correlation_threshold`, pixel nearest its
+    /// coherence-weighted centroid. No high-coherence floor, so on a frame of
+    /// middling coherence it can land on decorrelated ground.
+    LargestComponentCentroid,
+    /// dolphin v0.42's candidate rule: temporal coherence above
+    /// `reference_coherence_floor`, valid on every date, inside the largest joint
+    /// unwrap component; the largest 8-connected region of those, ranked by
+    /// neighbourhood coherence. Falls back to `largest_component_centroid` when
+    /// no pixel qualifies, and records that it did.
+    #[default]
+    CoherentSupport,
 }
 
 /// Persistent-scatterer selection. dolphin `PsOptions`.
@@ -845,6 +899,13 @@ pub struct TimeseriesOptions {
     pub apply_mask_to_timeseries: bool,
     /// Pixels with correlation below this value are masked out.
     pub correlation_threshold: f64,
+    /// Automatic reference-pixel rule when `reference_point` is unset.
+    pub reference_selection: ReferenceSelectionMethod,
+    /// Temporal-coherence floor (strict `>`) for `coherent_support` reference
+    /// candidates. dolphin hard-codes 0.95; 0.85 is the point where engine/OPERA
+    /// agreement saturates on Fresno T137 (r 0.90 at 0.85-0.95 vs 0.94 at >=0.95,
+    /// 0.76 at 0.70-0.85) while keeping a candidate pool about five times larger.
+    pub reference_coherence_floor: f64,
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
     pub block_shape: (usize, usize),
     /// Dolphin YAML compatibility only; non-default block scheduling is rejected.
@@ -910,6 +971,18 @@ pub struct TimeseriesOptions {
     /// `max_temporal_baseline`. Emits `loop_closure_bad_count.tif` and
     /// `loop_closure_worst_cycles.tif`. See issue #24.
     pub mask_unwrap_loop_errors: bool,
+    /// Before the loop-closure gate, solve each pixel for the integer `2π`
+    /// cycles that close every loop with the smallest total change (Yunjun et
+    /// al. 2019, MintPy's `unwrap_error_phase_closure`) and add them back, so a
+    /// pixel with a repairable unwrap error is corrected instead of masked. A
+    /// pixel is corrected only when that minimal correction is unique; ties,
+    /// unevaluable loops and non-integer misclosures are left alone, and the
+    /// gate then runs on the corrected stack as QC exactly as before. Requires
+    /// `mask_unwrap_loop_errors` and a bandwidth or temporal-baseline network.
+    /// Forward divergence from dolphin, **off by default**. Emits
+    /// `loop_closure_correction_status.tif` and
+    /// `loop_closure_corrected_count.tif`. See issue #142.
+    pub correct_unwrap_loop_errors: bool,
     /// Write the per-date phase-step diagnostic rasters computed on the inverted
     /// series before corrections and the spatial reference: one
     /// `junction_step_cycles_NN.tif` per ministack boundary (each pixel's step
@@ -929,6 +1002,8 @@ impl Default for TimeseriesOptions {
             run_velocity: true,
             apply_mask_to_timeseries: true,
             correlation_threshold: 0.2,
+            reference_selection: ReferenceSelectionMethod::default(),
+            reference_coherence_floor: 0.85,
             block_shape: (256, 256),
             num_parallel_blocks: 4,
             use_coherence_weights: true,
@@ -941,6 +1016,7 @@ impl Default for TimeseriesOptions {
             velocity_relaxation: Vec::new(),
             estimate_dem_error: false,
             mask_unwrap_loop_errors: false,
+            correct_unwrap_loop_errors: false,
             write_cycle_step_diagnostics: false,
         }
     }
@@ -1075,17 +1151,17 @@ pub struct PreprocessOptions {
     /// Dolphin YAML compatibility only; non-default values are rejected because
     /// pre-unwrap Goldstein filtering is not implemented.
     pub alpha: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: maximum search radius (pixels) for neighbours.
     pub max_radius: usize,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: per-interferogram correlation below this is
+    /// interpolated. Used only when no phase similarity applies (dolphin v0.35.0:
+    /// a nonzero `interpolation_similarity_threshold` *replaces* this test).
     pub interpolation_cor_threshold: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Pre-unwrap interpolation: phase similarity below this is interpolated.
+    /// `0` falls back to `interpolation_cor_threshold`.
     pub interpolation_similarity_threshold: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// pre-unwrap interpolation is not implemented.
+    /// Dolphin v0.42-only; non-default values are rejected because the pinned
+    /// v0.35.0 interpolation leaves the unwrapper's correlation unchanged.
     pub zero_correlation_where_interpolating: bool,
 }
 
@@ -1112,8 +1188,10 @@ pub struct UnwrapOptions {
     /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
     /// Goldstein filtering is not implemented.
     pub run_goldstein: bool,
-    /// Dolphin YAML compatibility only; must remain `false` because pre-unwrap
-    /// interpolation is not implemented.
+    /// Interpolate low-quality wrapped phase from coherent neighbours before
+    /// unwrapping (dolphin `interpolate`). The interpolated phase feeds the
+    /// unwrapper only: its integer-cycle ambiguities are transferred back onto
+    /// each pixel's own wrapped phase.
     pub run_interpolation: bool,
     /// Phase-unwrapping backend to dispatch to.
     pub unwrap_method: UnwrapMethod,
@@ -1121,8 +1199,7 @@ pub struct UnwrapOptions {
     pub n_parallel_jobs: i64,
     /// Set wrapped phase/correlation to 0 where the mask is 0 before unwrapping.
     pub zero_where_masked: bool,
-    /// Dolphin YAML compatibility container for unsupported pre-unwrap
-    /// filtering/interpolation options.
+    /// Pre-unwrap interpolation options (Goldstein filtering stays unsupported).
     pub preprocess_options: PreprocessOptions,
     /// SNAPHU subprocess options.
     pub snaphu_options: SnaphuOptions,
@@ -1273,6 +1350,14 @@ pub struct CorrectionOptions {
     /// the resolver default (0.10); a value must lie in `[0, 1]`
     /// (`validate_supported_options`). dolphinRust-only.
     pub max_outside_static_fraction: Option<f64>,
+    /// Subtract rigid tectonic plate motion (issue #103): a plate name
+    /// resolved against dolphinRust's built-in ITRF2020 PMM table, or an
+    /// explicit Euler pole. Like `solid_earth_tide` this needs **no external
+    /// data file** — only the acquisition time and per-pixel LOS geometry —
+    /// and requires `geometry_files` for the same reason (projecting a 3-D
+    /// rigid-rotation velocity into line of sight needs the full LOS unit
+    /// vector). dolphinRust-only forward divergence, **unset by default**.
+    pub plate_motion_model: Option<PlateMotionModel>,
 }
 
 impl Default for CorrectionOptions {
@@ -1290,20 +1375,45 @@ impl Default for CorrectionOptions {
             troposphere_variable: "total".into(),
             solid_earth_tide: false,
             max_outside_static_fraction: None,
+            plate_motion_model: None,
         }
     }
 }
 
 impl CorrectionOptions {
-    /// Whether any correction is enabled (any correction file supplied, or the
-    /// file-free solid-earth-tide flag set).
+    /// Whether any correction is enabled (any correction file supplied, or one
+    /// of the file-free flags set).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.ionosphere_files.is_empty()
             || !self.troposphere_files.is_empty()
             || !self.troposphere_epochs.is_empty()
             || self.solid_earth_tide
+            || self.plate_motion_model.is_some()
     }
+}
+
+/// `correction_options.plate_motion_model` selector: either a named plate,
+/// resolved against dolphinRust's built-in ITRF2020 PMM table
+/// (`dolphin_corrections::plate_motion::ITRF2020_PMM`), or an explicit Euler
+/// pole that bypasses the named-plate table entirely (e.g. for a newer ITRF
+/// realization's published values, or a locally fit pole). Untagged: a bare
+/// YAML string is a plate name, a mapping with the three `omega_*` keys is an
+/// explicit pole.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlateMotionModel {
+    /// A plate name, e.g. `"NorthAmerica"` — matched case/space-insensitively.
+    Plate(String),
+    /// An explicit Cartesian Euler pole, milliarcseconds/year.
+    EulerPole {
+        /// X-axis angular-velocity component, mas/yr.
+        omega_x_mas_per_year: f64,
+        /// Y-axis angular-velocity component, mas/yr.
+        omega_y_mas_per_year: f64,
+        /// Z-axis angular-velocity component, mas/yr.
+        omega_z_mas_per_year: f64,
+    },
 }
 
 /// Output grid + raster options. dolphin `OutputOptions`.
@@ -1325,6 +1435,13 @@ pub struct OutputOptions {
     /// Dolphin YAML compatibility only; must remain at its default because the
     /// COG writer owns overview generation.
     pub overview_levels: Vec<u32>,
+    /// Bounded runs only: the smallest fraction of target pixels that must share
+    /// the reference pixel's unwrap component (`unwrap_component.tif`). Below it
+    /// the run fails with `BoundsError::DisconnectedTarget` instead of publishing
+    /// regions whose offset from the reference is an arbitrary multiple of 2π.
+    /// `None` (the default) records the components without enforcing a minimum.
+    /// dolphinRust-only.
+    pub min_reference_component_fraction: Option<f64>,
 }
 
 impl Default for OutputOptions {
@@ -1336,6 +1453,7 @@ impl Default for OutputOptions {
             bounds_epsg: Some(4326),
             add_overviews: true,
             overview_levels: vec![4, 8, 16, 32, 64],
+            min_reference_component_fraction: None,
         }
     }
 }
@@ -1530,6 +1648,18 @@ impl DisplacementWorkflow {
             | UnwrapMethod::Spurt
             | UnwrapMethod::Whirlwind => unreachable!("unsupported methods returned above"),
         }
+        if let Some(fraction) = self.output_options.min_reference_component_fraction {
+            if self.output_options.bounds.is_none() {
+                return Err(CoreError::InvalidConfig(
+                    "output_options.min_reference_component_fraction requires output_options.bounds".into(),
+                ));
+            }
+            if !(fraction.is_finite() && 0.0 < fraction && fraction <= 1.0) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "output_options.min_reference_component_fraction must be in (0, 1], got {fraction}"
+                )));
+            }
+        }
         if self.output_options.epsg.is_some() && self.output_options.bounds.is_none() {
             return Err(CoreError::InvalidConfig(
                 "output_options.epsg is supported only as a source-CRS consistency check when output_options.bounds is set; unbounded runs require sourced CSLC georeferencing".into(),
@@ -1591,6 +1721,12 @@ impl DisplacementWorkflow {
                     "phase_linking.empirical_source_factor.relative_diagonal_floor must be finite and in (0, 1]".into(),
                 ));
             }
+        }
+        let floor = self.timeseries_options.reference_coherence_floor;
+        if !(floor.is_finite() && (0.0..1.0).contains(&floor)) {
+            return Err(CoreError::InvalidConfig(format!(
+                "timeseries_options.reference_coherence_floor must be in [0, 1), got {floor}"
+            )));
         }
         if self.timeseries_options.write_posterior_uncertainty
             && self.timeseries_options.method != TimeseriesMethod::L2
@@ -1654,27 +1790,24 @@ impl DisplacementWorkflow {
         require_compatibility_default!(self, defaults, phase_linking.baseline_lag);
         require_compatibility_default!(self, defaults, unwrap_options.run_unwrap);
         require_compatibility_default!(self, defaults, unwrap_options.run_goldstein);
-        require_compatibility_default!(self, defaults, unwrap_options.run_interpolation);
         require_compatibility_default!(self, defaults, unwrap_options.preprocess_options.alpha);
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options.preprocess_options.max_radius
-        );
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options
-                .preprocess_options
-                .interpolation_cor_threshold
-        );
-        require_compatibility_default!(
-            self,
-            defaults,
-            unwrap_options
-                .preprocess_options
-                .interpolation_similarity_threshold
-        );
+        let preprocess = &self.unwrap_options.preprocess_options;
+        for (path, threshold) in [
+            (
+                "unwrap_options.preprocess_options.interpolation_cor_threshold",
+                preprocess.interpolation_cor_threshold,
+            ),
+            (
+                "unwrap_options.preprocess_options.interpolation_similarity_threshold",
+                preprocess.interpolation_similarity_threshold,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "{path} must be in [0, 1], got {threshold}"
+                )));
+            }
+        }
         require_compatibility_default!(
             self,
             defaults,

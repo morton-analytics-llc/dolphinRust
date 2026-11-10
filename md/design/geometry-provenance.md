@@ -19,8 +19,8 @@ Two surfaces, one type:
 
 ```json
 {
-  "schema": "dolphinrust-geometry-provenance/5",
-  "method_version": "5.0.0",
+  "schema": "dolphinrust-geometry-provenance/7",
+  "method_version": "7.0.0",
   "orbit_direction": "descending",
   "orbit_ephemeris_class": "precise",
   "incidence_angle_deg": 39.27,
@@ -35,8 +35,11 @@ Two surfaces, one type:
   "dem_grid_spacing_y": 0.0002777777777777778,
   "dem_grid_spacing_units": "degree",
   "dem_vertical_datum": "EGM96 height",
+  "cslc_dem_source": "Copernicus DEM 30 m (WGS84 ellipsoid)",
   "phase_linking_coherence": "phase_linking_coherence.tif",
   "decomposition_geometry_complete": true,
+  "corrections_applied": ["solid_earth_tide"],
+  "time_function_model": "linear+seasonal",
   "input_coverage": {
     "policy_version": "complete-temporal-tile/1",
     "total_tiles": 12,
@@ -71,11 +74,25 @@ Two surfaces, one type:
 }
 ```
 
-Version 4 adds `orbit_ephemeris_class`; version 3 adds `input_coverage`. Version 2 and 3 records
+Version 4 adds `orbit_ephemeris_class`; version 3 adds `input_coverage`. Version 5 adds the DEM
+identity fields (`dem_grid_spacing_x`/`_y`/`_units`, `dem_vertical_datum`). Version 6 adds
+`corrections_applied` and `time_function_model` (issue #130 / eo#483 Table 5 processing
+disclosure): both are computed directly from `CorrectionOptions`, `layover_shadow_mask_files`,
+and `TimeseriesOptions`, so unlike the fields above they have no absent case — every run can
+state them with certainty. `corrections_applied` is `[]`, never `null`, when nothing ran;
+`time_function_model` is always at least `"linear"`. Version 7 adds `cslc_dem_source` (issue
+#167, eo#483 Table 5): `/metadata/processing_information/inputs/dem_source`, read from every
+`cslc_file_list` and `correction_options.geometry_files` (CSLC-S1-STATIC) granule and required
+byte-identical after trimming NUL/whitespace. It is the DEM that shaped the CSLC phase itself —
+distinct from `dem_grid_spacing_x`/`_y`/`_units`/`dem_vertical_datum` above, which describe the
+*correction* DEM (`correction_options.dem_file` / `nisar_ellipsoidal_dem_file`). Not derivable
+for NISAR GSLC input, and absent on the committed real T144 CI fixture, which carries no
+`inputs` group at all — see the contract test file for the exact absence reasons. Records older
+than version 6 deserialize these two fields as `[]` and `""` respectively — a historical
+placeholder, not a reconstruction of what that old run actually did. Version 2 and 3 records
 remain valid and deserialize with newly added optional fields absent. Coverage contains only
-aggregate counts and stable zero-based burst
-ordinals. It must never contain source paths, object keys, AOI geometry, or acquisition
-identifiers.
+aggregate counts and stable zero-based burst ordinals. It must never contain source paths,
+object keys, AOI geometry, or acquisition identifiers.
 
 A tiled burst is processed only where every selected acquisition has finite complex support
 somewhere in that tile's dependency window. A locally incomplete tile is emitted as nodata in

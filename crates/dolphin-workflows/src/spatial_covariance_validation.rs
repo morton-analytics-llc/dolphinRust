@@ -3803,6 +3803,7 @@ fn emit_actual_production_fixture(
                 troposphere: None,
                 los_geometry: None,
                 solid_earth_tide: None,
+                plate_motion: None,
             },
         )?,
         unwrap_branch_digest: unwrap_branch_digest(
@@ -3811,6 +3812,7 @@ fn emit_actual_production_fixture(
             &[(0, 1)],
             validity.view(),
             Array3::from_elem((1, shape.0, shape.1), 1).view(),
+            false,
             false,
         ),
     };
