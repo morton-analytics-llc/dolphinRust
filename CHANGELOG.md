@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Residual DEM-error term in the velocity fit** (issue #143). With
+  `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
+  `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
+  the along-track-corrected perpendicular baseline from acquisition 0 at the first granule's
+  burst centre, from the CSLC orbits at each granule's mid zero-Doppler time. `R` and `θ` are
+  the reference platform's slant range and incidence there. The fitted coefficient is
+  published as `dem_error.tif` in metres relative to the reference point, and the rate no longer
+  absorbs the baseline-correlated height error. The geometry is evaluated at the burst centre, so
+  the height scale is up to about ±10% off at the burst's range edges; the sign and size are
+  tested against directly computed ranges for a raised scatterer. Off by default. Requires OPERA CSLC inputs and `input_options.wavelength`, and
+  fails the run if any granule's orbit metadata cannot be read.
 - **Geometry provenance records the CSLC-shaping DEM dataset identity** (issue #167, eo#483
   Table 5). `GeometryProvenance` gains `cslc_dem_source`, read from
   `/metadata/processing_information/inputs/dem_source` on every `cslc_file_list` and
