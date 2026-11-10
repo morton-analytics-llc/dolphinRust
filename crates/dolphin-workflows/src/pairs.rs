@@ -12,14 +12,15 @@
 //! unwraps both with SNAPHU, aligns B's integer cycles to A within each A connected
 //! component ([`align_side_band_cycles`]), estimates the ionosphere in the A
 //! interferogram by split-spectrum ([`dolphin_corrections::split_spectrum`]), low-pass
-//! filters it and
-//! subtracts it from A. Per pair it writes `unwrapped` (A), `ionosphere`, `corrected`
+//! filters it within each component and subtracts it from A. Per pair it writes `unwrapped` (A), `ionosphere`, `corrected`
 //! (`unwrapped − ionosphere`), `coherence` (A, `half_window` with strides equal to the
 //! A→B looks) and `connected_components` (A); once per run it writes `los_enu.tif`. A
 //! product without `frequencyB` is refused with [`PairsError::MissingFrequencyB`].
 //!
 //! Nodata: an output pixel is NaN when any input sample it is formed from (in either
 //! acquisition, and in either band) is NaN, and every COG carries GDAL nodata NaN.
+//! `ionosphere` and `corrected` are also NaN outside every A connected component
+//! (label 0) and where the per-component low-pass has too little support.
 //!
 //! Outputs, under `work_directory`:
 //! - `<layer>_<refYYYYMMDD>_<secYYYYMMDD>.tif` per pair: a COG carrying the
@@ -244,6 +245,9 @@ pub struct InterferogramSummary {
     /// Population standard deviation of the finite low-passed ionosphere pixels
     /// (radians); `None` if none are finite.
     pub ionosphere_std_rad: Option<f64>,
+    /// Fraction of valid pixels inside a frequencyA connected component (label ≠ 0);
+    /// only those carry `ionosphere` and `corrected`. `None` if no pixel is valid.
+    pub in_component_fraction: Option<f64>,
     /// Integer cycles removed from the frequencyB unwrapped phase per frequencyA
     /// connected component before the ionosphere estimate, ascending by component.
     pub side_band_cycle_alignment: Vec<SideBandCycleAlignment>,
@@ -1005,7 +1009,7 @@ fn write_interferogram_pair(
         coherence,
         connected_components: components,
     };
-    record.interferogram = Some(summarize(&layers.coherence, &layers.ionosphere, &alignment));
+    record.interferogram = Some(summarize(&layers, &alignment));
     record.files = write_interferogram_layers(cfg, grid, pair, &record, &layers)?;
     Ok(record)
 }
@@ -1079,7 +1083,9 @@ fn unwrap_band(
 }
 
 /// Low-passed split-spectrum ionosphere in the main-band interferogram (radians), with
-/// the side band first aligned to the main band's cycles per main-band component.
+/// the side band first aligned to the main band's cycles per main-band component and
+/// the low-pass applied within each component. Pixels outside every component (SNAPHU
+/// label 0) are NaN: their unwrapping is unreliable and no single offset holds there.
 /// Components come from the main band: it is the written `connected_components` layer
 /// and, multilooked from the wider band, the better-unwrapped of the two.
 fn split_spectrum_ionosphere(
@@ -1089,17 +1095,20 @@ fn split_spectrum_ionosphere(
     side_unwrapped: &Array2<f64>,
     components: &Array2<f32>,
 ) -> Result<(Array2<f64>, Vec<ComponentCycles>)> {
+    // Nodata labels are NaN and cast to 0; both are outside every component.
+    let labels = components.mapv(|label| label as u32);
+    let (main_in_component, side_in_component) = (
+        in_component(main_unwrapped, &labels),
+        in_component(side_unwrapped, &labels),
+    );
     let main = BandPhase {
-        unwrapped_phase: main_unwrapped.view(),
+        unwrapped_phase: main_in_component.view(),
         center_frequency_hz: grid.main_band.center_frequency_hz,
     };
     let side = BandPhase {
-        unwrapped_phase: side_unwrapped.view(),
+        unwrapped_phase: side_in_component.view(),
         center_frequency_hz: grid.side_band.center_frequency_hz,
     };
-    // Nodata labels are NaN and cast to 0, but their phase is NaN in both bands, so
-    // they never enter a component's median.
-    let labels = components.mapv(|label| label as u32);
     let aligned = align_side_band_cycles(&main, &side, labels.view())
         .context("aligning frequencyB cycles to frequencyA")?;
     let side = BandPhase {
@@ -1109,17 +1118,39 @@ fn split_spectrum_ionosphere(
     let raw = estimate_ionosphere(&main, Some(&side)).context("split-spectrum ionosphere")?;
     let gt = grid.geo.geotransform;
     let pixel_spacing_m = (gt[1] * gt[5]).abs().sqrt();
-    let lowpassed = lowpass_ionosphere(raw.view(), settings.lowpass_wavelength_m, pixel_spacing_m)
-        .context("low-pass filtering the ionosphere")?;
+    let lowpassed = lowpass_ionosphere(
+        raw.view(),
+        labels.view(),
+        settings.lowpass_wavelength_m,
+        pixel_spacing_m,
+    )
+    .context("low-pass filtering the ionosphere")?;
     Ok((lowpassed, aligned.components))
 }
 
+/// `phase` with every pixel outside a SNAPHU connected component (label 0) set to NaN.
+fn in_component(phase: &Array2<f64>, labels: &Array2<u32>) -> Array2<f64> {
+    Zip::from(phase)
+        .and(labels)
+        .map_collect(|&value, &label| match label {
+            0 => f64::NAN,
+            _ => value,
+        })
+}
+
+/// Fraction of labelled (valid) pixels inside a connected component (label ≠ 0).
+fn in_component_fraction(components: &Array2<f32>) -> Option<f64> {
+    let labelled: Vec<f32> = components
+        .iter()
+        .copied()
+        .filter(|l| l.is_finite())
+        .collect();
+    let inside = labelled.iter().filter(|&&label| label != 0.0).count();
+    (!labelled.is_empty()).then(|| inside as f64 / labelled.len() as f64)
+}
+
 /// Pair summary over finite pixels.
-fn summarize(
-    coherence: &Array2<f32>,
-    ionosphere: &Array2<f32>,
-    alignment: &[ComponentCycles],
-) -> InterferogramSummary {
+fn summarize(layers: &PairLayers, alignment: &[ComponentCycles]) -> InterferogramSummary {
     let finite = |values: &Array2<f32>| -> Vec<f64> {
         values
             .iter()
@@ -1127,9 +1158,9 @@ fn summarize(
             .map(|&value| f64::from(value))
             .collect()
     };
-    let mut coherence = finite(coherence);
+    let mut coherence = finite(&layers.coherence);
     coherence.sort_by(f64::total_cmp);
-    let ionosphere = finite(ionosphere);
+    let ionosphere = finite(&layers.ionosphere);
     let count = |values: &[f64]| values.len() as f64;
     let above = coherence
         .iter()
@@ -1152,6 +1183,7 @@ fn summarize(
             .then(|| above as f64 / count(&coherence)),
         median_coherence: median,
         ionosphere_std_rad: (!ionosphere.is_empty()).then(|| variance.sqrt()),
+        in_component_fraction: in_component_fraction(&layers.connected_components),
         side_band_cycle_alignment: alignment.iter().copied().map(Into::into).collect(),
     }
 }

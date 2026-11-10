@@ -37,6 +37,57 @@ pub fn filter_long_wavelength(
     }))
 }
 
+/// Masked Gaussian low-pass by normalized convolution: `G∗(x·m) / G∗m`, with the same
+/// `wavelength_cutoff` half-power point as [`filter_long_wavelength`].
+///
+/// `valid` is the mask `m`; invalid pixels contribute nothing (no zero-fill bias),
+/// whatever their value. The field is zero-padded by `3σ` on every side before the
+/// FFT, so the result does not wrap across image edges. A pixel is NaN when it is
+/// invalid or its normalized weight `G∗m` (the fraction of the Gaussian mass on valid
+/// pixels: 1 in the interior, ½ on a straight mask edge) is below `min_weight`.
+///
+/// # Errors
+/// Returns `Err` if `valid` differs in shape from `values`, or the cutoff, spacing or
+/// `min_weight` is non-finite or non-positive.
+pub fn masked_gaussian_lowpass(
+    values: ArrayView2<f64>,
+    valid: ArrayView2<bool>,
+    wavelength_cutoff: f64,
+    pixel_spacing: f64,
+    min_weight: f64,
+) -> Result<Array2<f64>, &'static str> {
+    if values.dim() != valid.dim() {
+        return Err("mask shape differs from values");
+    }
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    if !positive(wavelength_cutoff) || !positive(pixel_spacing) || !positive(min_weight) {
+        return Err("wavelength_cutoff, pixel_spacing and min_weight must be finite and positive");
+    }
+    let (rows, cols) = values.dim();
+    let sigma = filter_sigma(wavelength_cutoff, pixel_spacing);
+    let pad = (3.0 * sigma).ceil() as usize;
+    let padded = (rows + 2 * pad, cols + 2 * pad);
+    let mut weighted = Array2::<f64>::zeros(padded);
+    let mut mask = Array2::<f64>::zeros(padded);
+    ndarray::Zip::indexed(&values)
+        .and(&valid)
+        .for_each(|(row, col), &value, &ok| {
+            if ok {
+                weighted[(row + pad, col + pad)] = value;
+                mask[(row + pad, col + pad)] = 1.0;
+            }
+        });
+    let numerator = gaussian_lowpass(weighted.view(), sigma);
+    let weight = gaussian_lowpass(mask.view(), sigma);
+    Ok(Array2::from_shape_fn((rows, cols), |(row, col)| {
+        let (pr, pc) = (row + pad, col + pad);
+        match valid[(row, col)] && weight[(pr, pc)] >= min_weight {
+            true => numerator[(pr, pc)] / weight[(pr, pc)],
+            false => f64::NAN,
+        }
+    }))
+}
+
 /// Filter `sigma` (in pixels) giving a `wavelength_cutoff` half-power point.
 fn filter_sigma(wavelength_cutoff: f64, pixel_spacing: f64) -> f64 {
     let sigma_f = 1.0 / wavelength_cutoff / (1.0 / 0.5f64).ln().sqrt();

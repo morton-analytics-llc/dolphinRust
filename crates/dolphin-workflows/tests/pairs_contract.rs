@@ -725,3 +725,66 @@ fn pairs_json_reports_side_band_cycle_alignment_per_connected_component() {
         "stripe did not split components: {expected:?}"
     );
 }
+
+/// Overwrite `[start, stop)²` of the secondary's `group` grid with decorrelated phase.
+fn decorrelate_block(path: &Path, group: &str, start: usize, stop: usize) {
+    let file = hdf5::File::open_rw(path).unwrap();
+    let dataset = file.dataset(&format!("{group}/HH")).unwrap();
+    let mut grid: Array2<Cf32> = dataset.read_2d().unwrap();
+    for row in start..stop {
+        for col in start..stop {
+            let hash = ((row as f64 * 12.9898 + col as f64 * 78.233).sin() * 43_758.545).fract();
+            grid[(row, col)] = Cf32::from_polar(1.0, (std::f64::consts::TAU * hash) as f32);
+        }
+    }
+    dataset.write(&grid).unwrap();
+}
+
+#[test]
+fn pixels_outside_every_connected_component_are_nan_in_ionosphere_and_corrected() {
+    let _hdf5 = hdf5_guard();
+    if !snaphu_available() {
+        eprintln!("snaphu absent; skipping label-0 exclusion check");
+        return;
+    }
+    let side_n = 64;
+    let dir = std::env::temp_dir().join("dolphin_pairs_label_zero");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = nisar_pair(&dir, side_n, (&[], &[]));
+    let secondary = &cfg.acquisitions[1].path;
+    decorrelate_block(secondary, FREQUENCY_A_GROUP, 16, 48);
+    decorrelate_block(secondary, "/science/LSAR/GSLC/grids/frequencyB", 8, 24);
+    let index = run_pairs(&cfg).unwrap();
+
+    let out = &cfg.work_directory;
+    let components = layer(out, "connected_components");
+    let [unwrapped, ionosphere, corrected, coherence] =
+        ["unwrapped", "ionosphere", "corrected", "coherence"].map(|name| layer(out, name));
+    let outside: Vec<(usize, usize)> = components
+        .indexed_iter()
+        .filter(|(_, &label)| label == 0.0)
+        .map(|(pixel, _)| pixel)
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "decorrelated block produced no label-0 pixels"
+    );
+    for &pixel in &outside {
+        assert!(
+            ionosphere[pixel].is_nan() && corrected[pixel].is_nan(),
+            "{pixel:?}"
+        );
+        assert!(
+            unwrapped[pixel].is_finite() && coherence[pixel].is_finite(),
+            "{pixel:?}"
+        );
+    }
+    let summary = index.pairs[0].interferogram.as_ref().unwrap();
+    let inside = components.len() - outside.len();
+    let fraction = summary.in_component_fraction.unwrap();
+    assert!((fraction - inside as f64 / components.len() as f64).abs() < 1e-12);
+    assert!(summary
+        .side_band_cycle_alignment
+        .iter()
+        .all(|e| e.component != 0));
+}

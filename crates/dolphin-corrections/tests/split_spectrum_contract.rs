@@ -123,8 +123,65 @@ fn lowpass_removes_short_wavelengths_and_keeps_the_mean() {
     let field = Array2::from_shape_fn((ROWS, COLS), |(r, c)| {
         0.7 + 0.3 * if (r + c) % 2 == 0 { 1.0 } else { -1.0 }
     });
-    let smoothed = lowpass_ionosphere(field.view(), 2_000.0, 100.0).unwrap();
+    let one_component = Array2::from_elem((ROWS, COLS), 1_u32);
+    let smoothed = lowpass_ionosphere(field.view(), one_component.view(), 2_000.0, 100.0).unwrap();
+    // The field is not periodic-extended past the image edge, so the checkerboard only
+    // cancels exactly away from it: check pixels at least 5σ (σ ≈ 2.65 px) inside.
+    let margin = 14;
     smoothed
+        .slice(ndarray::s![margin..ROWS - margin, margin..COLS - margin])
         .iter()
-        .for_each(|v| assert!((v - 0.7).abs() < 1e-9, "{v}"));
+        .for_each(|v| assert!((v - 0.7).abs() < 1e-6, "{v}"));
+}
+
+/// Smooth screen at 100 m posting, offset from zero so a zero-fill bias would show.
+fn smooth_screen(rows: usize, cols: usize) -> Array2<f64> {
+    Array2::from_shape_fn((rows, cols), |(r, c)| {
+        3.0 + (TAU * (r as f64 + 0.5 * c as f64) / 2_000.0).sin()
+    })
+}
+
+#[test]
+fn masked_lowpass_recovers_a_smooth_screen_next_to_a_hole() {
+    let (rows, cols) = (96, 96);
+    let screen = smooth_screen(rows, cols);
+    let hole = |r: usize, c: usize| (40..56).contains(&r) && (40..56).contains(&c);
+    let with_hole = Array2::from_shape_fn((rows, cols), |(r, c)| match hole(r, c) {
+        true => f64::NAN,
+        false => screen[(r, c)],
+    });
+    let labels = Array2::from_elem((rows, cols), 1_u32);
+    let smoothed = lowpass_ionosphere(with_hole.view(), labels.view(), 2_000.0, 100.0).unwrap();
+
+    let near_hole = |r: usize, c: usize| (37..59).contains(&r) && (37..59).contains(&c);
+    let mut worst_near_hole = 0.0_f64;
+    for ((r, c), value) in smoothed.indexed_iter() {
+        if hole(r, c) {
+            assert!(value.is_nan(), "hole pixel ({r}, {c}) = {value}");
+            continue;
+        }
+        let error = (value - screen[(r, c)]).abs();
+        assert!(error < 0.01, "({r}, {c}): |error| {error} rad");
+        if near_hole(r, c) {
+            worst_near_hole = worst_near_hole.max(error);
+        }
+    }
+    eprintln!("max |error| within 3 px of the hole: {worst_near_hole:.2e} rad");
+}
+
+#[test]
+fn per_component_lowpass_does_not_bleed_offsets_across_components() {
+    // Two components abutting at column 24, with constant offsets 25 rad apart.
+    let labels = Array2::from_shape_fn((ROWS, COLS), |(_, c)| 1 + u32::from(c >= 24));
+    let offset = |label: u32| if label == 1 { 5.0 } else { -20.0 };
+    let field = labels.mapv(offset);
+    let smoothed = lowpass_ionosphere(field.view(), labels.view(), 2_000.0, 100.0).unwrap();
+    ndarray::Zip::from(&smoothed)
+        .and(&labels)
+        .for_each(|&value, &label| {
+            assert!(
+                (value - offset(label)).abs() < 1e-9,
+                "{value} in component {label}"
+            )
+        });
 }

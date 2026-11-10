@@ -37,8 +37,8 @@ All notable changes to dolphinRust are documented here. The format follows
   `frequencyB` interferograms `ref · conj(sec)` (the `tests/sign_convention.rs` order),
   multilooks A onto the B grid by complex averaging, unwraps both with SNAPHU, aligns B's
   integer cycles to A, estimates the ionosphere in the A interferogram with the
-  main/side-band split-spectrum kernel, low-pass
-  filters it at `ionosphere_lowpass_wavelength_m`, and subtracts it. Per pair it writes
+  main/side-band split-spectrum kernel, low-pass filters it within each connected component
+  at `ionosphere_lowpass_wavelength_m`, and subtracts it. Per pair it writes
   `unwrapped`, `ionosphere`, `corrected`, `coherence` and `connected_components`; once per
   run it writes a three-band (east, north, up) ground→sensor `los_enu.tif` from the radarGrid
   LOS cube (`nisar_geometry_group`, `nisar_ellipsoidal_dem_file`). Layers add the
@@ -49,7 +49,7 @@ All notable changes to dolphinRust are documented here. The format follows
   and `ionosphere`, so `corrected − (unwrapped − ionosphere)` is exactly 0. `frequencyB`
   must be an integer multilook of `frequencyA`, and `strides` must equal those looks. A
   product without `frequencyB` is refused with `PairsError::MissingFrequencyB`. On a 256²
-  synthetic two-band pair a planted ionosphere screen is removed to 1.4e-3 rad RMS.
+  synthetic two-band pair a planted ionosphere screen is removed to 2.4e-3 rad RMS.
   SNAPHU unwraps the two bands independently, so each connected component can carry its own
   integer-cycle offset between them, and one cycle in B moves the estimate by about 73 rad at
   NISAR L-band carriers. Before estimating, `align_side_band_cycles` computes, per
@@ -61,7 +61,20 @@ All notable changes to dolphinRust are documented here. The format follows
   inter-band ambiguity only; each component's absolute offset against ground truth remains
   and is left to downstream anchoring. With +1 and −2 cycles planted on B in two components
   of a synthetic pair, the kernel returns `k = 1` and `k = −2` and the ionosphere residual is
-  under 0.01 rad RMS.
+  under 0.01 rad RMS. Pixels outside every A connected component (SNAPHU label 0) are NaN in
+  `ionosphere` and `corrected` (`unwrapped` and `coherence` are unchanged) and get no `k`;
+  `pairs.json` reports `in_component_fraction`, the share of valid pixels inside a component.
+  The low-pass is a normalized convolution, `G∗(x·m) / G∗m` with `m` the component's finite
+  pixels, run separately per component on a field zero-padded by 3σ, so offsets do not
+  bleed across component edges or wrap across the image, and a valid `0.0` is data rather
+  than nodata (the previous filter zero-filled and treated exact zeros as gaps). A pixel
+  whose normalized weight `G∗m` is below 0.25 is NaN: a straight component edge sits at ½
+  and a convex corner at ¼, so slivers narrower than about 0.6σ and islands much smaller
+  than the filter scale are dropped. A smooth screen next to a 16×16 hole is recovered to
+  5.6e-3 rad, and two abutting components with constant offsets keep them to 1e-9 rad.
+  Known limit: B is aligned and filtered on A's component labels only; a B unwrapping
+  error that does not follow an A component boundary is not corrected (intersecting the A
+  and B label maps is not implemented).
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is

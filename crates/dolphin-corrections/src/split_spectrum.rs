@@ -33,7 +33,8 @@
 //! `k · 2π·r/(1 − r²)` ([`side_band_cycle_offset`]) to `φ_iono` over the
 //! affected connected component. For NISAR-like carriers (`r ≈ 1.03`) that is
 //! ≈ −111 rad per cycle, so the two bands must be unwrapped consistently and the
-//! estimate low-pass filtered ([`lowpass_ionosphere`]) before use.
+//! estimate low-pass filtered within each connected component
+//! ([`lowpass_ionosphere`]) before use.
 //!
 //! **Inter-band cycle alignment.** Unwrapping the two bands independently leaves
 //! each connected component with its own integer offset between them.
@@ -46,8 +47,8 @@
 use std::collections::BTreeMap;
 use std::f64::consts::TAU;
 
-use dolphin_filtering::filter_long_wavelength;
-use ndarray::{Array2, ArrayView2, Zip};
+use dolphin_filtering::masked_gaussian_lowpass;
+use ndarray::{s, Array2, ArrayView2, Zip};
 use thiserror::Error;
 
 /// Split-spectrum failures.
@@ -242,28 +243,86 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
-/// Gaussian low-pass of an ionosphere estimate, the complement of
-/// `dolphin_filtering::filter_long_wavelength` (`lowpass = x − highpass(x)`), so
-/// wavelengths shorter than `wavelength_cutoff_m` are removed.
+/// Minimum normalized weight of [`lowpass_ionosphere`]: a pixel whose Gaussian
+/// neighbourhood holds less than a quarter of the kernel mass on finite pixels of its
+/// own component is NaN. A straight component edge sits at ½ and a convex corner at ¼,
+/// so both are kept; slivers narrower than about `0.6σ` and islands much smaller than
+/// the filter scale are dropped, since their estimate rests on a handful of pixels.
+pub const LOWPASS_MIN_WEIGHT: f64 = 0.25;
+
+/// Gaussian low-pass of an ionosphere estimate within each connected component, by
+/// normalized convolution ([`dolphin_filtering::masked_gaussian_lowpass`], the
+/// `wavelength_cutoff_m` half-power point of `filter_long_wavelength`).
 ///
-/// Inherits that filter's nodata rule: non-finite and exactly-zero pixels are
-/// nodata, zero-filled before the FFT, and returned as NaN.
+/// Each label is filtered over its own finite pixels only, so per-component offsets
+/// never bleed across component edges, and non-finite pixels carry no weight (a valid
+/// `0.0` is data, not nodata). Pixels below [`LOWPASS_MIN_WEIGHT`], and non-finite
+/// pixels, are NaN.
 ///
 /// # Errors
-/// [`SplitSpectrumError::Filter`] if the cutoff is too large for the image.
+/// [`SplitSpectrumError::LabelShapeMismatch`] when `components` differs in shape;
+/// [`SplitSpectrumError::Filter`] for an unusable cutoff or spacing.
 pub fn lowpass_ionosphere(
     ionosphere: ArrayView2<f64>,
+    components: ArrayView2<u32>,
     wavelength_cutoff_m: f64,
     pixel_spacing_m: f64,
 ) -> Result<Array2<f64>, SplitSpectrumError> {
-    let highpass = filter_long_wavelength(ionosphere, wavelength_cutoff_m, pixel_spacing_m)
+    if components.dim() != ionosphere.dim() {
+        return Err(SplitSpectrumError::LabelShapeMismatch {
+            labels: components.dim(),
+            phase: ionosphere.dim(),
+        });
+    }
+    let mut lowpassed = Array2::from_elem(ionosphere.dim(), f64::NAN);
+    for (label, bounds) in component_bounds(ionosphere, components) {
+        let window = s![bounds[0]..bounds[1], bounds[2]..bounds[3]];
+        let values = ionosphere.slice(window);
+        let labels = components.slice(window);
+        let valid = Zip::from(&values)
+            .and(&labels)
+            .map_collect(|value, &other| value.is_finite() && other == label);
+        let filtered = masked_gaussian_lowpass(
+            values,
+            valid.view(),
+            wavelength_cutoff_m,
+            pixel_spacing_m,
+            LOWPASS_MIN_WEIGHT,
+        )
         .map_err(SplitSpectrumError::Filter)?;
-    Ok(Zip::from(&ionosphere)
-        .and(&highpass)
-        .map_collect(|&value, &high| match value.is_finite() && value != 0.0 {
-            true => value - high,
-            false => f64::NAN,
-        }))
+        Zip::from(lowpassed.slice_mut(window))
+            .and(&filtered)
+            .and(&valid)
+            .for_each(|out, &value, &ok| {
+                if ok {
+                    *out = value;
+                }
+            });
+    }
+    Ok(lowpassed)
+}
+
+/// `[row_start, row_stop, col_start, col_stop]` of each label's finite pixels.
+fn component_bounds(
+    values: ArrayView2<f64>,
+    components: ArrayView2<u32>,
+) -> BTreeMap<u32, [usize; 4]> {
+    let mut bounds: BTreeMap<u32, [usize; 4]> = BTreeMap::new();
+    Zip::indexed(&values)
+        .and(&components)
+        .for_each(|(row, col), value, &label| {
+            if !value.is_finite() {
+                return;
+            }
+            let entry = bounds.entry(label).or_insert([row, row + 1, col, col + 1]);
+            *entry = [
+                entry[0].min(row),
+                entry[1].max(row + 1),
+                entry[2].min(col),
+                entry[3].max(col + 1),
+            ];
+        });
+    bounds
 }
 
 /// `f_B/f_A`, rejecting non-finite, non-positive or equal frequencies.
