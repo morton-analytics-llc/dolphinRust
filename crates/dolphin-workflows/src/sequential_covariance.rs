@@ -5897,6 +5897,14 @@ pub fn sequential_replay_config_digest(cfg: &SequentialConfig) -> [u8; 32] {
             ShpMethod::Rect => 2,
         },
     ]);
+    // Full-stack GLRT statistics select different neighbours than the
+    // per-ministack statistics every earlier artifact was written with, so
+    // only that combination gets a new digest (#165); the rest are unchanged.
+    if cfg.shp_method == ShpMethod::Glrt
+        && cfg.shp_amplitude_statistics == dolphin_core::config::ShpAmplitudeStatistics::FullStack
+    {
+        digest.update(b"shp_amplitude_statistics:full_stack");
+    }
     digest.finalize().into()
 }
 

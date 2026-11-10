@@ -47,6 +47,7 @@ fn cfg() -> SequentialConfig {
         // rather than inheriting dolphin's GLRT config default.
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        shp_amplitude_statistics: dolphin_core::config::ShpAmplitudeStatistics::FullStack,
     }
 }
 

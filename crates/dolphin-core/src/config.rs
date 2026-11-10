@@ -242,6 +242,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     consumed!("phase_linking.zero_correlation_threshold", "CFG-PHASE-LINK"),
     consumed!("phase_linking.shp_method", "CFG-SHP-WIRING"),
     consumed!("phase_linking.shp_alpha", "CFG-SHP-WIRING"),
+    consumed!("phase_linking.shp_amplitude_statistics", "CFG-SHP-WIRING"),
     compatibility_only!(
         "phase_linking.mask_input_ps",
         "the workflow has no persistent-scatterer label input"
@@ -668,6 +669,26 @@ pub enum ShpMethod {
     Rect,
 }
 
+/// Which acquisitions supply the amplitude mean and variance the GLRT SHP test
+/// compares (`shp_method: glrt`; the KS and rect methods do not use them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShpAmplitudeStatistics {
+    /// Every real acquisition of the run, with `nslc` the run's date count, the
+    /// same for every ministack. This is what dolphin does: it computes one
+    /// amplitude mean/dispersion pair over the whole input stack before the
+    /// sequential pass. An incremental update uses every date the series has
+    /// seen so far for the ministacks it links, and leaves sealed ministacks
+    /// as they were, so under this setting an update is not bit-identical to a
+    /// full rerun (which would reselect the sealed ministacks' neighbours).
+    #[default]
+    FullStack,
+    /// Each ministack's own real acquisitions (dolphinRust before issue #165).
+    /// Fewer samples per test, so more neighbours are accepted. An incremental
+    /// update stays bit-identical to a full rerun.
+    Ministack,
+}
+
 /// Compressed-SLC carry-forward plan. dolphin `CompressedSlcPlan`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -783,6 +804,9 @@ pub struct PhaseLinkingOptions {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
+    /// Which acquisitions the GLRT's amplitude mean and variance come from.
+    /// dolphinRust-only switch; the default matches dolphin.
+    pub shp_amplitude_statistics: ShpAmplitudeStatistics,
     /// Dolphin YAML compatibility only; non-default values are rejected because
     /// the workflow has no persistent-scatterer label input.
     pub mask_input_ps: bool,
@@ -829,6 +853,7 @@ impl Default for PhaseLinkingOptions {
             zero_correlation_threshold: 0.0,
             shp_method: ShpMethod::default(),
             shp_alpha: 0.001,
+            shp_amplitude_statistics: ShpAmplitudeStatistics::default(),
             mask_input_ps: false,
             baseline_lag: None,
             compressed_slc_plan: CompressedSlcPlan::default(),

@@ -203,6 +203,22 @@ All notable changes to dolphinRust are documented here. The format follows
   `velocity_sigma.tif`, now scores.
 
 ### Breaking changes
+- **GLRT SHP selection now uses whole-stack amplitude statistics, as dolphin does** (issue
+  #165). The sequential pass used to compare each ministack's own amplitude mean and variance
+  (about 15 dates). dolphin computes one mean/dispersion pair over the whole input stack before
+  the sequential pass and passes the stack's length as `nslc`, so every ministack gets the same
+  neighbourhoods and the test has more samples behind it. New
+  `phase_linking.shp_amplitude_statistics`: `full_stack` (default, dolphin's behaviour) or
+  `ministack` (the earlier behaviour). Parity: on a 30-date, three-ministack scene dolphin
+  v0.42.0's `run_wrapped_phase_sequential` wrote identical `shp_counts` for all three
+  ministacks, and `full_stack` reproduces them exactly on every compared pixel; per-ministack
+  statistics differ on 48 of the 144 in each ministack (`oracle/gen_shp_fullstack_v042.py`). Every
+  default (`shp_method: glrt`) run changes: fewer neighbours are accepted where populations
+  differ. `rect` and `ks` runs are unchanged. Under `full_stack` an incremental update uses
+  every date the series has seen for the ministacks it links and leaves sealed ministacks
+  alone, so it is no longer bit-identical to a full rerun; `ministack` keeps that identity.
+  Covariance-operator artifacts written with GLRT before this change carry the old config
+  digest and match `ministack`, not the new default.
 - **The automatic spatial reference now sits on coherent support by default** (eo #758).
   New `timeseries_options.reference_selection` (`coherent_support` | `largest_component_centroid`)
   and `timeseries_options.reference_coherence_floor` (default 0.85). `coherent_support` follows
