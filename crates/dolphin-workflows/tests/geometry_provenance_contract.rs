@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use dolphin_core::config::{DisplacementWorkflow, InputType};
+use dolphin_core::config::{
+    DisplacementWorkflow, InputType, PlateMotionModel, TroposphereEpoch, VelocityRelaxation,
+};
 use dolphin_corrections::geometry::resolve_los_geometry;
 use dolphin_corrections::LosGeometry;
 use dolphin_workflows::provenance::{
@@ -57,6 +59,39 @@ fn orbit_type_fixture(value: Option<&str>, suffix: &str) -> PathBuf {
             .unwrap(),
         None => orbit.unlink("orbit_type").unwrap(),
     }
+    target
+}
+
+/// Copy `source` to a fresh temp file and set (or, for `None`, leave absent)
+/// `/metadata/processing_information/inputs/dem_source`, creating the group
+/// chain when the base granule (e.g. the real STATIC fixture) doesn't already
+/// carry it.
+fn dem_source_fixture(source: &Path, value: Option<&str>, suffix: &str) -> PathBuf {
+    let target = std::env::temp_dir().join(format!("dolphin_geomprov_dem_source_{suffix}.h5"));
+    let _ = std::fs::remove_file(&target);
+    std::fs::copy(source, &target).unwrap();
+    let Some(value) = value else {
+        return target;
+    };
+    let file = hdf5::File::open_rw(&target).unwrap();
+    let metadata = file
+        .group("metadata")
+        .or_else(|_| file.create_group("metadata"))
+        .unwrap();
+    let processing = metadata
+        .group("processing_information")
+        .or_else(|_| metadata.create_group("processing_information"))
+        .unwrap();
+    let inputs = processing
+        .group("inputs")
+        .or_else(|_| processing.create_group("inputs"))
+        .unwrap();
+    inputs
+        .new_dataset::<hdf5::types::FixedAscii<64>>()
+        .create("dem_source")
+        .unwrap()
+        .write_scalar(&hdf5::types::FixedAscii::<64>::from_ascii(value).unwrap())
+        .unwrap();
     target
 }
 
@@ -122,9 +157,13 @@ fn real_metadata_sample_maps_to_exported_fields() {
     };
     assert_eq!(raw_value.as_deref(), Some("POEORB"));
     assert_eq!(source_keys, &["/metadata/orbit/orbit_type"]);
+    // The committed real T144 sample has no `inputs/dem_source` group at all —
+    // an honest absent, not a guess (issue #167).
+    assert_eq!(prov.cslc_dem_source, None);
+    assert!(!absent_reason(&prov, "cslc_dem_source").is_empty());
     let decoded: GeometryProvenance =
         serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/7");
     assert_eq!(decoded.orbit_ephemeris_class.as_deref(), Some("precise"));
     assert!(matches!(
         decoded.geometry_provenance.fields.get("orbit_ephemeris_class"),
@@ -195,7 +234,7 @@ fn coverage_v3_round_trips_without_identifiers() {
     let json = serde_json::to_string(&provenance).unwrap();
     let decoded: GeometryProvenance = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/7");
     assert_eq!(decoded.input_coverage, Some(coverage));
     for forbidden in [
         "source_path",
@@ -226,6 +265,106 @@ fn provenance_v2_without_coverage_still_deserializes() {
     assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/2");
     assert_eq!(decoded.input_coverage, None);
     assert_eq!(decoded.orbit_ephemeris_class, None);
+    assert_eq!(decoded.cslc_dem_source, None);
+}
+
+/// Issue #130 / eo#483: disclose which corrections ran and the velocity
+/// time-function model. Every variant below is an analytic fixture — the
+/// expected string is composed by hand from the config, not read back from
+/// the implementation.
+#[test]
+fn no_corrections_and_linear_model_by_default() {
+    let prov = assemble_geometry_provenance(&DisplacementWorkflow::default(), None);
+    assert_eq!(prov.corrections_applied, Vec::<String>::new());
+    assert_eq!(prov.time_function_model, "linear");
+}
+
+#[test]
+fn each_correction_source_adds_its_own_stable_name() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.solid_earth_tide = true;
+    cfg.correction_options.plate_motion_model =
+        Some(PlateMotionModel::Plate("NorthAmerica".into()));
+    cfg.correction_options.ionosphere_files = vec![PathBuf::from("ionex_2024001.tif")];
+    cfg.correction_options.troposphere_files = vec![PathBuf::from("tropo_2024001.nc")];
+    cfg.layover_shadow_mask_files = vec![PathBuf::from("layover_shadow.tif")];
+
+    let prov = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(
+        prov.corrections_applied,
+        vec![
+            "solid_earth_tide",
+            "plate_motion",
+            "ionosphere",
+            "troposphere",
+            "layover_shadow_mask",
+        ]
+    );
+}
+
+#[test]
+fn troposphere_epochs_also_count_as_the_troposphere_correction() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.troposphere_epochs = vec![TroposphereEpoch {
+        path: PathBuf::from("tropo_2024001.nc"),
+        epoch: chrono::DateTime::UNIX_EPOCH,
+    }];
+
+    let prov = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(prov.corrections_applied, vec!["troposphere"]);
+}
+
+#[test]
+fn time_function_model_composes_seasonal_step_and_relaxation_in_fixed_order() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.timeseries_options.velocity_seasonal = true;
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal"
+    );
+
+    cfg.timeseries_options.velocity_step_dates = vec!["2024-01-01".into(), "2024-06-01".into()];
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal+step(2)"
+    );
+
+    cfg.timeseries_options.velocity_relaxation = vec![VelocityRelaxation {
+        onset_date: "2024-01-01".into(),
+        tau_days: 30.0,
+    }];
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).time_function_model,
+        "linear+seasonal+step(2)+relaxation(1)"
+    );
+}
+
+#[test]
+fn provenance_v5_without_corrections_fields_still_deserializes() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.correction_options.solid_earth_tide = true;
+    cfg.timeseries_options.velocity_seasonal = true;
+    let current = assemble_geometry_provenance(&cfg, None);
+    assert_eq!(current.corrections_applied, vec!["solid_earth_tide"]);
+    assert_eq!(current.time_function_model, "linear+seasonal");
+
+    let mut value = serde_json::to_value(current).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert(
+        "schema".into(),
+        serde_json::Value::String("dolphinrust-geometry-provenance/5".into()),
+    );
+    object.insert(
+        "method_version".into(),
+        serde_json::Value::String("5.0.0".into()),
+    );
+    object.remove("corrections_applied");
+    object.remove("time_function_model");
+
+    let decoded: GeometryProvenance = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.schema, "dolphinrust-geometry-provenance/5");
+    assert_eq!(decoded.corrections_applied, Vec::<String>::new());
+    assert_eq!(decoded.time_function_model, "");
 }
 
 #[test]
@@ -284,6 +423,152 @@ fn nisar_orbit_type_is_explicitly_absent() {
 
     assert_eq!(prov.orbit_ephemeris_class, None);
     assert!(absent_reason(&prov, "orbit_ephemeris_class").contains("NISAR"));
+}
+
+/// Issue #167 / eo#483 Table 5: `cslc_dem_source` agrees across a CSLC and a
+/// CSLC-S1-STATIC granule and trims incidental whitespace without altering the
+/// reported value, while the untrimmed original survives in `raw_value`.
+#[test]
+fn dem_source_agrees_across_cslc_and_static_and_trims_whitespace() {
+    let _hdf5 = hdf5_guard();
+    let cslc = dem_source_fixture(
+        &fixtures().join("geomprov_ci_cslc.h5"),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid) "),
+        "agree_cslc",
+    );
+    let static_file = dem_source_fixture(
+        &fixtures().join("geomprov_ci_static.h5"),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid)"),
+        "agree_static",
+    );
+    let mut cfg = cfg_with_inputs(std::slice::from_ref(&cslc));
+    cfg.correction_options.geometry_files = vec![static_file.clone()];
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(
+        prov.cslc_dem_source.as_deref(),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid)")
+    );
+    let Some(FieldProvenance::Sourced {
+        source_files,
+        source_keys,
+        raw_value,
+        ..
+    }) = prov.geometry_provenance.fields.get("cslc_dem_source")
+    else {
+        panic!("cslc_dem_source not sourced");
+    };
+    assert_eq!(
+        source_keys,
+        &["/metadata/processing_information/inputs/dem_source".to_string()]
+    );
+    assert_eq!(
+        source_files.len(),
+        2,
+        "expected both granules named, got {source_files:?}"
+    );
+    assert_eq!(
+        raw_value.as_deref(),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid) ")
+    );
+    let _ = std::fs::remove_file(cslc);
+    let _ = std::fs::remove_file(static_file);
+}
+
+#[test]
+fn dem_source_mismatch_across_granules_is_absent_with_distinct_count() {
+    let _hdf5 = hdf5_guard();
+    let cslc = dem_source_fixture(
+        &fixtures().join("geomprov_ci_cslc.h5"),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid)"),
+        "mismatch_cslc",
+    );
+    let static_file = dem_source_fixture(
+        &fixtures().join("geomprov_ci_static.h5"),
+        Some("Copernicus DEM 90 m (WGS84 ellipsoid)"),
+        "mismatch_static",
+    );
+    let mut cfg = cfg_with_inputs(std::slice::from_ref(&cslc));
+    cfg.correction_options.geometry_files = vec![static_file.clone()];
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.cslc_dem_source, None);
+    let reason = absent_reason(&prov, "cslc_dem_source");
+    assert!(reason.contains("mixed"), "{reason}");
+    assert!(reason.contains('2'), "{reason}");
+    let _ = std::fs::remove_file(cslc);
+    let _ = std::fs::remove_file(static_file);
+}
+
+#[test]
+fn dem_source_missing_on_one_granule_names_it() {
+    let _hdf5 = hdf5_guard();
+    let cslc = dem_source_fixture(
+        &fixtures().join("geomprov_ci_cslc.h5"),
+        Some("Copernicus DEM 30 m (WGS84 ellipsoid)"),
+        "missing_cslc",
+    );
+    let mut cfg = cfg_with_inputs(std::slice::from_ref(&cslc));
+    // The real STATIC fixture has no `/metadata` group at all, so dem_source is
+    // genuinely unreadable there.
+    cfg.correction_options.geometry_files = vec![fixtures().join("geomprov_ci_static.h5")];
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.cslc_dem_source, None);
+    let reason = absent_reason(&prov, "cslc_dem_source");
+    assert!(
+        reason.contains("geomprov_ci_static.h5"),
+        "expected the STATIC granule named: {reason}"
+    );
+    let _ = std::fs::remove_file(cslc);
+}
+
+#[test]
+fn nisar_dem_source_is_explicitly_absent() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.input_options.input_type = InputType::NisarGslc;
+    let prov = assemble_geometry_provenance(&cfg, None);
+
+    assert_eq!(prov.cslc_dem_source, None);
+    assert!(absent_reason(&prov, "cslc_dem_source").contains("NISAR"));
+}
+
+#[test]
+fn cslc_dem_source_omitted_from_json_when_absent() {
+    let prov = assemble_geometry_provenance(&DisplacementWorkflow::default(), None);
+    assert_eq!(prov.cslc_dem_source, None);
+    let value = serde_json::to_value(&prov).unwrap();
+    assert!(
+        !value.as_object().unwrap().contains_key("cslc_dem_source"),
+        "top-level scalar should be skipped when absent: {value}"
+    );
+    // The absence reason still lives in the per-field provenance block, same as
+    // every other geometry-provenance field.
+    assert!(prov
+        .geometry_provenance
+        .fields
+        .contains_key("cslc_dem_source"));
+}
+
+/// Real-source gate: an opt-in exact match against real T035 CSLC and
+/// CSLC-S1-STATIC granules. Ignored unless both are staged — see issue #167.
+#[test]
+#[ignore = "requires staged real-source input; run explicitly with --ignored"]
+fn real_t035_dem_source_matches_copernicus_identity() {
+    let cslc = std::env::var("T035_CSLC_REAL")
+        .expect("T035_CSLC_REAL must name a staged real CSLC granule");
+    let static_file = std::env::var("T035_STATIC_REAL")
+        .expect("T035_STATIC_REAL must name a staged real CSLC-S1-STATIC granule");
+    let mut cfg = cfg_with_inputs(&[PathBuf::from(cslc)]);
+    cfg.correction_options.geometry_files = vec![PathBuf::from(static_file)];
+    let prov = assemble_geometry_provenance(&cfg, None);
+    let value = prov
+        .cslc_dem_source
+        .expect("dem_source sourced on real T035 CSLC and STATIC granules");
+    assert!(
+        value.to_lowercase().contains("copernicus"),
+        "unexpected dem_source {value}"
+    );
 }
 
 /// Contract 2a: a /data-only granule (cropped, no metadata groups) yields explicit

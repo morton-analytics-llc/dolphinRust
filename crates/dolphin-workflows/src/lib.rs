@@ -55,8 +55,8 @@ pub use fixed_cube::{write_fixed_cube_bundle, FixedCubeReceipt};
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
     assemble_geometry_provenance_with_coverage, write_geometry_provenance, BurstCoverageProvenance,
-    FieldProvenance, GeometryProvenance, InputCoverageProvenance, GEOMETRY_PROVENANCE_FILENAME,
-    INPUT_COVERAGE_POLICY_VERSION,
+    FieldProvenance, GeometryProvenance, InputCoverageProvenance, ReferenceSelectionProvenance,
+    GEOMETRY_PROVENANCE_FILENAME, INPUT_COVERAGE_POLICY_VERSION,
 };
 pub use sequential::{
     plan_sequential_covariance_capture, plan_sequential_covariance_update,

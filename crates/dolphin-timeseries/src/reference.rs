@@ -1,12 +1,21 @@
-//! Automatic spatial reference-point selection (dolphin v0.36 center-of-mass).
+//! Automatic spatial reference-point selection.
 //!
 //! dolphin references the displacement time series to a single high-quality pixel
-//! so every date is relative to stable ground. v0.35.0 picks the single
-//! best-condition pixel (`argmin`); v0.36 added a **center-of-mass** method that
-//! is spatially robust: take the largest connected region of high-quality pixels
-//! and pick the one nearest its quality-weighted centroid — avoiding an isolated
-//! outlier pixel as the reference. The pinned v0.35.0 oracle has no center-of-mass
-//! method, so this is contract-tested against analytic fixtures.
+//! so every date is relative to stable ground. Two rules live here:
+//!
+//! - [`select_reference_point`] — the original dolphinRust rule: the largest
+//!   4-connected region of pixels above a (low) threshold and the pixel nearest its
+//!   quality-weighted centroid. Kept bit-for-bit as the
+//!   `largest_component_centroid` method and as the fallback of the next rule.
+//! - [`select_coherent_reference_point`] — the `coherent_support` method. Follows
+//!   dolphin v0.42 `timeseries.select_reference_point`: candidates are pixels whose
+//!   quality (temporal coherence) exceeds a *high* floor, grouped into 8-connected
+//!   regions, and the largest region wins. Deliberate difference: dolphin then takes
+//!   the pixel nearest the region's centre of mass; here the region's pixels are
+//!   ranked by a stability score (the summed coherence of the pixel's 3×3
+//!   neighbourhood inside the region, so a coherent interior pixel beats a coherent
+//!   edge pixel), with dolphin's centre-of-mass distance and then `(row, col)` as
+//!   deterministic tie-breaks.
 
 use ndarray::{Array2, Array3, ArrayView2, Axis};
 
@@ -19,7 +28,7 @@ use ndarray::{Array2, Array3, ArrayView2, Axis};
 /// `None` if no pixel exceeds `threshold`.
 #[must_use]
 pub fn select_reference_point(quality: ArrayView2<f64>, threshold: f64) -> Option<(usize, usize)> {
-    let component = largest_component(quality, threshold)?;
+    let component = largest_component(quality, threshold, neighbors4)?;
     let (mut sum_w, mut sum_r, mut sum_c) = (0.0, 0.0, 0.0);
     for &(r, c) in &component {
         let w = quality[(r, c)];
@@ -34,6 +43,71 @@ pub fn select_reference_point(quality: ArrayView2<f64>, threshold: f64) -> Optio
         da.partial_cmp(&db)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
+    })
+}
+
+/// Provenance tag of [`select_coherent_reference_point`]; bump it whenever the
+/// candidate pool, region rule, ranking, or tie-breaks change.
+pub const COHERENT_SUPPORT_METHOD_VERSION: &str = "coherent-support/2";
+
+/// A reference chosen by [`select_coherent_reference_point`], with the counts
+/// behind the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoherentReference {
+    /// The reference pixel `(row, col)`.
+    pub point: (usize, usize),
+    /// Candidate pool: finite pixels with quality above the floor.
+    pub pool_pixels: usize,
+    /// Pixels in the largest 8-connected region of the pool, which holds `point`.
+    pub region_pixels: usize,
+}
+
+/// Select a spatial reference on coherent support.
+///
+/// Candidates are finite pixels with `quality > floor` (dolphin's strict
+/// `> candidate_threshold`); callers mark ineligible pixels non-finite. The
+/// largest 8-connected region of candidates is kept (equal sizes: the region
+/// reached first in row-major order, as `scipy.ndimage.label` numbers them).
+/// Within it the pixel with the highest summed quality over its 3×3
+/// neighbourhood, counting only pixels of that region, wins; ties go to the
+/// pixel nearest the region's unweighted centre of mass, then to the smallest
+/// `(row, col)`. Returns `None` when no pixel exceeds `floor`.
+#[must_use]
+pub fn select_coherent_reference_point(
+    quality: ArrayView2<f64>,
+    floor: f64,
+) -> Option<CoherentReference> {
+    let region = largest_component(quality, floor, neighbors8)?;
+    let pool_pixels = quality
+        .iter()
+        .filter(|value| value.is_finite() && **value > floor)
+        .count();
+    let (rows, cols) = quality.dim();
+    let mut in_region = Array2::from_elem((rows, cols), false);
+    for &point in &region {
+        in_region[point] = true;
+    }
+    let neighbourhood_quality = |(r, c): (usize, usize)| -> f64 {
+        let window_rows = r.saturating_sub(1)..(r + 2).min(rows);
+        window_rows
+            .flat_map(|nr| (c.saturating_sub(1)..(c + 2).min(cols)).map(move |nc| (nr, nc)))
+            .filter(|&neighbour| in_region[neighbour])
+            .map(|neighbour| quality[neighbour])
+            .sum()
+    };
+    let n = region.len() as f64;
+    let centroid_r = region.iter().map(|&(r, _)| r as f64).sum::<f64>() / n;
+    let centroid_c = region.iter().map(|&(_, c)| c as f64).sum::<f64>() / n;
+    let point = region.iter().copied().min_by(|&a, &b| {
+        neighbourhood_quality(b)
+            .total_cmp(&neighbourhood_quality(a))
+            .then(dist2(a, centroid_r, centroid_c).total_cmp(&dist2(b, centroid_r, centroid_c)))
+            .then(a.cmp(&b))
+    })?;
+    Some(CoherentReference {
+        point,
+        pool_pixels,
+        region_pixels: region.len(),
     })
 }
 
@@ -55,13 +129,11 @@ fn dist2((r, c): (usize, usize), centroid_r: f64, centroid_c: f64) -> f64 {
     (r as f64 - centroid_r).powi(2) + (c as f64 - centroid_c).powi(2)
 }
 
+/// In-bounds neighbours of `(r, c)` on a `rows × cols` grid.
+type Neighbours = fn(usize, usize, usize, usize) -> Vec<(usize, usize)>;
+
 /// In-bounds 4-connected neighbours of `(r, c)`.
-fn neighbors4(
-    r: usize,
-    c: usize,
-    rows: usize,
-    cols: usize,
-) -> impl Iterator<Item = (usize, usize)> {
+fn neighbors4(r: usize, c: usize, rows: usize, cols: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::with_capacity(4);
     if r > 0 {
         v.push((r - 1, c));
@@ -75,7 +147,16 @@ fn neighbors4(
     if c + 1 < cols {
         v.push((r, c + 1));
     }
-    v.into_iter()
+    v
+}
+
+/// In-bounds 8-connected neighbours of `(r, c)` (dolphin labels candidate
+/// regions with `structure=np.ones((3, 3))`).
+fn neighbors8(r: usize, c: usize, rows: usize, cols: usize) -> Vec<(usize, usize)> {
+    (r.saturating_sub(1)..(r + 2).min(rows))
+        .flat_map(|nr| (c.saturating_sub(1)..(c + 2).min(cols)).map(move |nc| (nr, nc)))
+        .filter(|&neighbour| neighbour != (r, c))
+        .collect()
 }
 
 /// Flood-fill the candidate component containing `start`, marking `seen`.
@@ -83,6 +164,7 @@ fn flood(
     start: (usize, usize),
     quality: ArrayView2<f64>,
     threshold: f64,
+    neighbours: Neighbours,
     seen: &mut Array2<bool>,
 ) -> Vec<(usize, usize)> {
     let (rows, cols) = quality.dim();
@@ -92,7 +174,8 @@ fn flood(
     let mut component = Vec::new();
     while let Some((r, c)) = stack.pop() {
         component.push((r, c));
-        let next: Vec<(usize, usize)> = neighbors4(r, c, rows, cols)
+        let next: Vec<(usize, usize)> = neighbours(r, c, rows, cols)
+            .into_iter()
             .filter(|&(nr, nc)| !seen[(nr, nc)] && ok(nr, nc))
             .collect();
         for p in next {
@@ -103,8 +186,13 @@ fn flood(
     component
 }
 
-/// Largest 4-connected component of pixels with `quality > threshold`.
-fn largest_component(quality: ArrayView2<f64>, threshold: f64) -> Option<Vec<(usize, usize)>> {
+/// Largest component (under `neighbours`) of pixels with `quality > threshold`;
+/// on equal sizes the component reached first in row-major order.
+fn largest_component(
+    quality: ArrayView2<f64>,
+    threshold: f64,
+    neighbours: Neighbours,
+) -> Option<Vec<(usize, usize)>> {
     let (rows, cols) = quality.dim();
     let ok = |r: usize, c: usize| quality[(r, c)].is_finite() && quality[(r, c)] > threshold;
     let mut seen = Array2::from_elem((rows, cols), false);
@@ -116,7 +204,7 @@ fn largest_component(quality: ArrayView2<f64>, threshold: f64) -> Option<Vec<(us
         if seen[(r, c)] || !ok(r, c) {
             continue;
         }
-        let component = flood((r, c), quality, threshold, &mut seen);
+        let component = flood((r, c), quality, threshold, neighbours, &mut seen);
         if component.len() > best.len() {
             best = component;
         }
@@ -178,6 +266,99 @@ mod tests {
     fn none_when_all_below_threshold() {
         let q = Array2::<f64>::from_elem((4, 4), 0.1);
         assert_eq!(select_reference_point(q.view(), 0.5), None);
+    }
+
+    /// Regression pin: the legacy rule's choices on a fragmented fixture, recorded
+    /// from the code before `coherent_support` existed. The connectivity refactor
+    /// must not move them.
+    #[test]
+    fn legacy_choice_is_unchanged() {
+        let mut q = Array2::from_shape_fn((12, 15), |(r, c)| ((r * 7 + c * 13) % 17) as f64 / 17.0);
+        q[(5, 6)] = f64::NAN;
+        q[(0, 0)] = f64::NAN;
+        assert_eq!(select_reference_point(q.view(), 0.2), Some((6, 7)));
+        assert_eq!(select_reference_point(q.view(), 0.5), Some((1, 2)));
+        assert_eq!(select_reference_point(q.view(), 0.8), Some((0, 5)));
+    }
+
+    /// Fresno's failure mode: a wide field of middling coherence holds a small
+    /// coherent patch off-centre. The legacy rule lands mid-field; coherent
+    /// support lands in the patch.
+    #[test]
+    fn coherent_support_leaves_the_middling_field() {
+        let mut q = Array2::<f64>::from_elem((9, 9), 0.6);
+        for r in 0..3 {
+            for c in 6..9 {
+                q[(r, c)] = 0.95;
+            }
+        }
+        assert_eq!(select_reference_point(q.view(), 0.2), Some((4, 4)));
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!(chosen.point, (1, 7));
+        assert_eq!((chosen.pool_pixels, chosen.region_pixels), (9, 9));
+    }
+
+    /// Regions are 8-connected (dolphin's `np.ones((3, 3))` structure): a
+    /// diagonal chain is one region and outweighs a larger-valued 2-pixel blob.
+    #[test]
+    fn coherent_regions_are_eight_connected_and_largest_wins() {
+        let mut q = Array2::<f64>::zeros((6, 6));
+        for i in 0..4 {
+            q[(i, i)] = 0.9;
+        }
+        q[(5, 4)] = 0.99;
+        q[(5, 5)] = 0.99;
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!((chosen.pool_pixels, chosen.region_pixels), (6, 4));
+        assert!(chosen.point.0 == chosen.point.1 && chosen.point.0 < 4);
+    }
+
+    /// A coherent interior pixel beats a slightly more coherent pixel on the
+    /// region's edge, because the score sums the neighbourhood inside the region.
+    #[test]
+    fn coherent_support_prefers_interior_over_a_lone_edge_peak() {
+        let mut q = Array2::<f64>::zeros((5, 5));
+        for r in 1..=3 {
+            for c in 1..=3 {
+                q[(r, c)] = 0.9;
+            }
+        }
+        q[(1, 3)] = 0.99;
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!(chosen.point, (2, 2));
+    }
+
+    /// Score ties go to the pixel nearest the unweighted centre of mass, and a
+    /// remaining tie to the smaller `(row, col)`; equal-size regions resolve to
+    /// the one reached first in row-major order.
+    #[test]
+    fn coherent_support_tie_breaks_are_deterministic() {
+        // One row of four equal pixels (cols 1..=4): cols 2 and 3 tie on score
+        // (three region pixels in the window) and on distance to the centre
+        // (col 2.5), so the smaller (row, col) wins.
+        let q = array![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.9, 0.9, 0.9, 0.0]
+        ];
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!(chosen.point, (1, 2));
+        // Two equal single-pixel regions: the first in row-major order wins.
+        let mut q = Array2::<f64>::zeros((4, 4));
+        q[(3, 0)] = 0.9;
+        q[(0, 3)] = 0.9;
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!(chosen.point, (0, 3));
+    }
+
+    /// The floor is strict, as dolphin's `quality > candidate_threshold`, and
+    /// non-finite pixels are never candidates.
+    #[test]
+    fn coherent_support_floor_is_strict_and_skips_nonfinite() {
+        let q = array![[0.85, f64::NAN], [0.5, 0.85]];
+        assert_eq!(select_coherent_reference_point(q.view(), 0.85), None);
+        let q = array![[0.85, f64::NAN], [0.5, 0.86]];
+        let chosen = select_coherent_reference_point(q.view(), 0.85).unwrap();
+        assert_eq!(chosen.point, (1, 1));
     }
 
     /// Referencing zeroes the reference pixel at every date and shifts each band

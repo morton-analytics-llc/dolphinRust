@@ -62,6 +62,22 @@ pub fn read_cslc_orbit_type(path: &Path) -> Result<String> {
     read_string(&file, "/metadata/orbit/orbit_type")
 }
 
+/// Read the raw CSLC-shaping DEM dataset identity from
+/// `/metadata/processing_information/inputs/dem_source` (e.g. `"Copernicus DEM
+/// 30 m (WGS84 ellipsoid)"`). This is the DEM that shaped the CSLC phase, not
+/// the DEM a run configures for atmospheric correction
+/// (`correction_options.dem_file`). CSLC-S1-STATIC companion granules carry the
+/// same key.
+///
+/// # Errors
+/// `Err` when the field is missing or unreadable. Workflow provenance treats
+/// this field independently from the identification/orbit/burst metadata
+/// bundle.
+pub fn read_cslc_dem_source(path: &Path) -> Result<String> {
+    let file = hdf5::File::open(path)?;
+    read_string(&file, "/metadata/processing_information/inputs/dem_source")
+}
+
 /// Read the `/identification` provenance scalars.
 ///
 /// # Errors
@@ -200,6 +216,17 @@ mod tests {
             .unwrap()
             .write_scalar(&epoch)
             .unwrap();
+        let inputs = f
+            .create_group("metadata/processing_information/inputs")
+            .unwrap();
+        inputs
+            .new_dataset::<FixedAscii<64>>()
+            .create("dem_source")
+            .unwrap()
+            .write_scalar(
+                &FixedAscii::<64>::from_ascii("Copernicus DEM 30 m (WGS84 ellipsoid)").unwrap(),
+            )
+            .unwrap();
         let burst = f
             .create_group("metadata/processing_information/input_burst_metadata")
             .unwrap();
@@ -245,6 +272,10 @@ mod tests {
         assert_eq!(orbit.velocity_mps[0], [7.5e3, 7.5e3 + 1.0, 7.5e3 + 2.0]);
         assert_eq!(orbit.reference_epoch, "2022-10-31 14:00:26.983904");
         assert_eq!(read_cslc_orbit_type(&path).unwrap(), "POEORB");
+        assert_eq!(
+            read_cslc_dem_source(&path).unwrap(),
+            "Copernicus DEM 30 m (WGS84 ellipsoid)"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -258,6 +289,7 @@ mod tests {
         assert!(read_cslc_burst_metadata(&path).is_err());
         assert!(read_cslc_orbit(&path).is_err());
         assert!(read_cslc_orbit_type(&path).is_err());
+        assert!(read_cslc_dem_source(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }
