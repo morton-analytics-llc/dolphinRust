@@ -2525,7 +2525,7 @@ mod tests {
                 ministack_size: 3,
                 max_num_compressed,
                 compressed_slc_plan: plan,
-                ..glrt_config(ShpAmplitudeStatistics::FullStack)
+                ..glrt_config(ShpMethod::Glrt)
             };
             let plans = planner_for(real.dim().0, &cfg)
                 .unwrap()
