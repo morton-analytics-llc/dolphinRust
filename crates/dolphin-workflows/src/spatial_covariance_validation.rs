@@ -3813,6 +3813,7 @@ fn emit_actual_production_fixture(
             validity.view(),
             Array3::from_elem((1, shape.0, shape.1), 1).view(),
             false,
+            false,
         ),
     };
     let mut emitted_validity = validity;

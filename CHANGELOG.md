@@ -7,6 +7,83 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Geometry provenance records the CSLC-shaping DEM dataset identity** (issue #167, eo#483
+  Table 5). `GeometryProvenance` gains `cslc_dem_source`, read from
+  `/metadata/processing_information/inputs/dem_source` on every `cslc_file_list` and
+  `correction_options.geometry_files` (CSLC-S1-STATIC) granule — the DEM that shaped the CSLC
+  phase itself, distinct from the existing `dem_grid_spacing_x`/`_y`/`_units`/`dem_vertical_datum`
+  fields, which describe the *correction* DEM (`correction_options.dem_file` /
+  `nisar_ellipsoidal_dem_file`; their doc comments now say so explicitly). Values are trimmed of
+  NUL padding and incidental whitespace and required byte-identical across every granule; a
+  missing or unreadable key names the offending granule, a disagreement reports the distinct
+  value count, and NISAR GSLC input is explicit "not implemented" — none of this is ever
+  defaulted. Schema bumped to `dolphinrust-geometry-provenance/7`, method version `7.0.0`; the
+  fixed-cube semantic gate in `temporal_covariance_product` pins the new pair. New
+  `dolphin-io::read_cslc_dem_source`. **Caveat:** the committed real T144 CI fixture
+  (`geomprov_ci_cslc.h5`) carries no `inputs` group at all, so the exact key path is unverified
+  against this repository's one real sample; the contract tests cover the absence path
+  explicitly, and a `#[ignore]`-gated real-data test is ready for when real T035 granules are
+  staged.
+- **Geometry provenance discloses which corrections ran and the velocity time-function
+  model** (issue #130). `GeometryProvenance` gains `corrections_applied` (stable names —
+  `solid_earth_tide`, `plate_motion`, `ionosphere`, `troposphere`, `layover_shadow_mask` — in
+  that order, empty when none ran) and `time_function_model` (composed as `linear`,
+  `linear+seasonal`, `linear+seasonal+step(N)`, `linear+relaxation(N)`), both derived
+  deterministically from `CorrectionOptions`, `layover_shadow_mask_files`, and
+  `TimeseriesOptions`. Unlike the sourced-from-metadata fields above, there is no absent case —
+  every run can state these with certainty. Schema bumped to
+  `dolphinrust-geometry-provenance/6`, method version `6.0.0`; the fixed-cube semantic gate in
+  `temporal_covariance_product` pins the new pair. Records older than `/6` deserialize the two
+  new fields as `[]`/`""` (historical placeholders, not a reconstruction of that run).
+- **Integer-cycle correction of unwrap errors from loop closure** (issue #142). The new
+  `timeseries_options.correct_unwrap_loop_errors` (off by default; requires
+  `mask_unwrap_loop_errors`) solves each pixel, before the loop-closure gate, for the integer
+  `2π` cycles that close every triangle with the smallest total change (Yunjun et al. 2019,
+  MintPy's `unwrap_error_phase_closure`) and adds them back; the gate then runs on the
+  corrected stack as QC. The L1 solve is exact (min-cost circulation over the date graph) and
+  a pixel is corrected only when its minimal correction is unique; ties, unevaluable loops,
+  misclosures more than a quarter cycle from an integer, and inconsistent misclosures are left
+  alone for the gate. Needs every sequential pair and the fan triangles a bandwidth or
+  temporal-baseline network has; other networks fail before unwrapping. Writes
+  `loop_closure_correction_status.tif` and `loop_closure_corrected_count.tif`;
+  `loop_closure_worst_cycles.tif` is then the residual closure after correction.
+  `PublicationQuality` gains `closure_corrected_pixels`, `closure_uncorrected_pixels` and
+  `closure_corrected_per_band`, and the covariance unwrap-branch digest distinguishes a
+  corrected branch.
+- **Pre-unwrap interpolation** (`unwrap_options.run_interpolation`, dolphin's option and
+  defaults: `max_radius: 51`, similarity/correlation cutoff `0.3`, 20 neighbours, alpha
+  0.75). Each network interferogram's wrapped phase is interpolated from coherent neighbours
+  before the unwrapper (dolphin v0.35.0 `interpolate`, matched to its oracle), and the solved
+  whole-cycle ambiguities are transferred back onto every pixel's own wrapped phase, so the
+  interpolated values feed the unwrapper only. Interpolated pixels carry no connected-component
+  label in that interferogram, so interpolation never adds unwrap support (in place of dolphin's
+  unported SNAPHU component regrow). A nonzero
+  `interpolation_similarity_threshold` masks on phase similarity (computed for this purpose
+  when `write_phase_similarity` is off), otherwise on per-ifg correlation.
+  `unwrap_interpolated_count.tif` records, per pixel, how many interferograms were
+  interpolated there. Off by default; off is the unchanged code path.
+- **Datum adjustment across overlapping bounded windows** (issue #153).
+  `dolphin_workflows::estimate_window_datum` takes N bounded windows from one burst stack
+  (`DatumWindow`, built from a `DisplacementOutput`) and returns a constant offset per window
+  for each displacement date plus a velocity offset, which put every window on one anchor's
+  datum. It is a coherence-weighted least-squares adjustment over all overlaps, with weight
+  `γ_a·γ_b` per shared pixel, and is anchored either to one window or to externally supplied
+  anchor values. Per-overlap residual median and MAD are returned so callers can reject a bad
+  seam. Pixels outside a window's reference unwrap component (#152) are excluded. Typed
+  `DatumError`s cover a disconnected overlap graph, an overlap below
+  `min_overlap_pixels`, and incompatible windows (date list, CRS, spacing, lattice).
+- **Unwrap components for bounded runs** (issue #152). A bounded (`output_options.bounds`)
+  run labels each target pixel with its joint unwrap component: pixels share a component
+  when they carry the same nonzero connected-component label in every interferogram, so the
+  unwrapper's own connectivity rule and correlation threshold define it, and relative
+  displacement inside a component has no 2π ambiguity. `DisplacementOutput::unwrap_component`
+  carries the labels (0 = none) and `unwrap_component.tif` holds them. The bounds provenance
+  in `geometry_provenance.json` gains `unwrap_components` (component count, labelled pixels,
+  largest-component and reference-component target fractions, reference component), and
+  `AOI_PROCESSING_VERSION` moves to `1.1.0`. A new opt-in
+  `output_options.min_reference_component_fraction` fails the run with
+  `BoundsError::DisconnectedTarget` when less of the target shares the reference's component.
+  Full-frame runs are unchanged.
 - **Ministack-junction step diagnostic** (E4, 2026-09-15). On the raw inverted series —
   after `solve_time_series`, before corrections and the spatial reference — each pixel's
   phase step from the last date of one ministack to the first of the next, minus the median
@@ -59,6 +136,35 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **The cycle-step check now flags integer-cycle discontinuities at ministack junctions**
+  (issue #184). At the first date of each ministack after the first, the compressed-SLC datum
+  error arrives as a patch about one phase-linking look window wide; on Fresno T137 the
+  patches sit 0.5–0.84 cycle from their surroundings. The 5x5 median moved with such a patch
+  and a 0.6-cycle residual missed the quarter-cycle tolerance, so `cycle_step_flag` caught 0 of
+  the 37 fast cells eo #758 found stepping at junctions. At junction epochs the residual is now
+  taken against a neighbourhood three look radii wide (`3 · max(ceil(half_window / stride))`
+  output pixels, at least 2) and any step beyond half a cycle is flagged as `round(residual)`
+  cycles; other epochs keep the 5x5 quarter-cycle rule. On the same T137 inputs the flag now
+  marks 31 of those 37 cells. Diagnostic only: displacement and velocity are bit-identical.
+  `detect_cycle_steps_with_junctions` is the new entry point (`detect_cycle_steps` is it with
+  no junctions); `CycleStepDetection` and the `cycle_steps` provenance record gain
+  `junction_epochs` and `junction_half_window` (absent in older records, read as empty/0).
+  The junction steps themselves are the sequential estimator's: dolphin v0.35.0
+  (`run_wrapped_phase_single` + `compress`) produces the same junction statistics on the same
+  real crop.
+- **`coherent_support` no longer picks a reference on the processing-grid edge** (eo #758).
+  Candidates within `ceil(half_window / stride)` output pixels of the processing-grid edge
+  (where the phase-linking window is clamped inward and the 3x3 support score runs off the
+  grid) are excluded; a bounded target is judged by its position in the processing grid.
+  Follows the intent of OPERA DISP-S1 ATBD §2.13 (no reference "at the frame boundary").
+  `COHERENT_SUPPORT_METHOD_VERSION` is now `coherent-support/2`. `largest_component_centroid`
+  is unchanged.
+- **Goldstein filter edge cases** (issue #139): ported dolphin PR #680. The filter reflection-pads
+  by half a patch, covers the trailing rows and columns the old patch grid skipped, normalises
+  the overlapping-patch blend by the accumulated window weight, and treats only NaN or
+  zero-magnitude pixels as empty, so valid zero-phase pixels are filtered. Contract fixture
+  `crates/dolphin-filtering/tests/fixtures/goldstein_pr680.json` from
+  `oracle/gen_goldstein_pr680.py`, which matches upstream's file bit-for-bit.
 - **`write_velocity_uncertainty` now works with the seasonal/step time-function model**
   (issue #115). The joint post-gauge unit-precision fit emits the IID-conditional standard
   error of its rate column plus the same temporal-fit diagnostics as the linear path;
@@ -69,6 +175,24 @@ All notable changes to dolphinRust are documented here. The format follows
   `velocity_sigma.tif`, now scores.
 
 ### Breaking changes
+- **The automatic spatial reference now sits on coherent support by default** (eo #758).
+  New `timeseries_options.reference_selection` (`coherent_support` | `largest_component_centroid`)
+  and `timeseries_options.reference_coherence_floor` (default 0.85). `coherent_support` follows
+  dolphin v0.42's `select_reference_point`: candidates are pixels valid on every date with
+  temporal coherence above the floor (strict `>`), inside the largest joint unwrap component
+  (dolphin: the largest region of its connected-component intersection); the largest
+  8-connected region of candidates wins. Deliberate differences from dolphin: the floor is
+  configurable with default 0.85 rather than a hard-coded 0.95, and within the region the pixel
+  with the highest 3×3 in-region coherence sum wins, with dolphin's nearest-to-centre-of-mass
+  and then `(row, col)` as tie-breaks. An empty pool falls back to the previous rule, which
+  `largest_component_centroid` keeps exactly: largest 4-connected region above
+  `correlation_threshold`, pixel nearest its coherence-weighted centroid. Previously that rule
+  was the only one, so on a frame of middling coherence the datum could land on decorrelated
+  ground (Fresno T137: OPERA temporal coherence 0.595 at the chosen pixel).
+  `geometry_provenance.json` gains `reference_selection`: method and version, requested
+  method, whether it fell back, the pixel, its temporal coherence, the floor, and the
+  candidate pool and region sizes. **Automatically referenced products change value unless
+  the config sets `reference_selection: largest_component_centroid`.**
 - **The velocity point estimator is now post-gauge unit-precision on every path** (issue
   #123). `timeseries_options.write_velocity_uncertainty` used to *select* the estimator as a
   side effect of asking for a sigma layer: with it off the pipeline emitted a full-series fit

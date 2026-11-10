@@ -1942,11 +1942,17 @@ pub(crate) fn unwrap_branch_digest(
     validity: ArrayView2<'_, bool>,
     connected_components: ArrayView3<'_, u32>,
     loop_qc_enabled: bool,
+    loop_correction_enabled: bool,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest
         .update(b"dolphinrust:production-unwrap-branch:v2:ifg-phase-gaussian-11-normalized-valid");
-    digest.update([unwrap_method_code(method), u8::from(loop_qc_enabled)]);
+    // The correction changes the unwrapped values the solve sees, so it is part of
+    // the branch; bit 1 is zero without it, leaving every earlier digest as it was.
+    digest.update([
+        unwrap_method_code(method),
+        u8::from(loop_qc_enabled) | (u8::from(loop_correction_enabled) << 1),
+    ]);
     digest.update((backend_config.len() as u64).to_le_bytes());
     digest.update(backend_config);
     for &(reference, secondary) in pairs {
@@ -2234,6 +2240,7 @@ mod tests {
             validity.view(),
             components.view(),
             true,
+            false,
         );
         assert_ne!(
             sha256_string(native),
@@ -2247,6 +2254,7 @@ mod tests {
             validity.view(),
             components.view(),
             true,
+            false,
         );
         let changed_validity = unwrap_branch_digest(
             UnwrapMethod::Native,
@@ -2255,9 +2263,23 @@ mod tests {
             Array2::from_elem((2, 2), true).view(),
             components.view(),
             true,
+            false,
+        );
+        let corrected = unwrap_branch_digest(
+            UnwrapMethod::Native,
+            b"native-config",
+            &pairs,
+            validity.view(),
+            components.view(),
+            true,
+            true,
         );
         assert_ne!(native, snaphu);
         assert_ne!(native, changed_validity);
+        assert_ne!(
+            native, corrected,
+            "the loop-closure correction is its own branch"
+        );
     }
 
     #[test]

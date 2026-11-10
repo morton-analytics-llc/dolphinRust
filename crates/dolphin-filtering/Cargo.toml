@@ -19,6 +19,7 @@ rustfft.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 ndarray-npy = { version = "0.9", default-features = false, features = ["num-complex-0_4"] }
 
 [lints]
