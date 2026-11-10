@@ -136,6 +136,15 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
+  #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and
+  edited child lists with `retain`. The tree is now `parent`/`thread`/`rev_thread`/
+  `subtree_size`/`last_descendant` arrays, as `docs/native_mcf_solver.md` specified: the
+  potential update walks one thread segment, the cycle apex is found from subtree sizes, and a
+  pivot re-roots the cut subtree in one pass with no allocation. The pivot rule is untouched,
+  so the output is bit-identical. Single-thread CPU on the dense `unwrap_bench`: 128² 0.42 →
+  0.26 s, 256² 3.88 → 1.52 s, 384² 17.3 → 5.3 s, 512² (2 ifgs) 34.0 → 9.7 s, and 1024² in
+  16×16 tiles 7.40 → 4.70 s (−36% to −71%).
 - **Native unwrapper no longer accepts a cost mode it ignores** (issue #160). The native solver
   has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
   and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
