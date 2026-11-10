@@ -136,6 +136,11 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **`object_store` 0.11 → 0.14 in `dolphin-ingest`** (issue #188). Moves `quick-xml` 0.37.5 →
+  0.41.0, which clears RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both High) for builds with the
+  `s3` feature; `cargo audit` reports no vulnerabilities. `get`/`put` now come from
+  `ObjectStoreExt`. With `s3` (and in the crate's tests) the build now compiles `aws-lc-sys`,
+  so it needs a C toolchain.
 - **Native unwrapper no longer accepts a cost mode it ignores** (issue #160). The native solver
   has one coherence-precision cost, but `unwrap_options.snaphu_options.cost: defo` was accepted
   and silently ran it. With `unwrap_method: native`, validation now accepts only `smooth`.
