@@ -35,11 +35,13 @@ pub fn calc_ps(stack_mag: ArrayView3<f64>, threshold: f64, min_count: usize) -> 
         })
         .collect();
 
-    let at = |row: usize, col: usize| stats[row * cols + col];
+    let mean = stats.iter().map(|s| s.0).collect();
+    let disp = stats.iter().map(|s| s.1).collect();
+    let ps = stats.iter().map(|s| s.2).collect();
     PsResult {
-        amp_mean: Array2::from_shape_fn((rows, cols), |(r, c)| at(r, c).0),
-        amp_dispersion: Array2::from_shape_fn((rows, cols), |(r, c)| at(r, c).1),
-        ps: Array2::from_shape_fn((rows, cols), |(r, c)| at(r, c).2),
+        amp_mean: Array2::from_shape_vec((rows, cols), mean).expect("mean shape"),
+        amp_dispersion: Array2::from_shape_vec((rows, cols), disp).expect("disp shape"),
+        ps: Array2::from_shape_vec((rows, cols), ps).expect("ps shape"),
     }
 }
 
