@@ -9,8 +9,10 @@
 //!
 //! `mode: interferogram` (NISAR GSLC only) forms the `frequencyA` (main band) and
 //! `frequencyB` (side band) interferograms `ref · conj(sec)`, multilooks A onto the B grid,
-//! unwraps both with SNAPHU, estimates the ionosphere in the A interferogram by
-//! split-spectrum ([`dolphin_corrections::split_spectrum`]), low-pass filters it and
+//! unwraps both with SNAPHU, aligns B's integer cycles to A within each A connected
+//! component ([`align_side_band_cycles`]), estimates the ionosphere in the A
+//! interferogram by split-spectrum ([`dolphin_corrections::split_spectrum`]), low-pass
+//! filters it and
 //! subtracts it from A. Per pair it writes `unwrapped` (A), `ionosphere`, `corrected`
 //! (`unwrapped − ionosphere`), `coherence` (A, `half_window` with strides equal to the
 //! A→B looks) and `connected_components` (A); once per run it writes `los_enu.tif`. A
@@ -27,7 +29,9 @@
 //!   `WAVELENGTH_M`, `IONOSPHERE_METHOD` and `PHASE_SIGN`.
 //! - `los_enu.tif` (interferogram mode): ground→sensor LOS unit vector, bands east,
 //!   north, up, on the output grid.
-//! - `pairs.json`: the run index listing every pair's IDs, dates, files and sha256.
+//! - `pairs.json`: the run index listing every pair's IDs, dates, files and sha256;
+//!   interferogram mode adds each pair's summary, including the per-component side-band
+//!   cycle shift `k` and its pixel count.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,7 +40,9 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_core::{BlockIndices, Cf32, Cf64, HalfWindow, Strides};
-use dolphin_corrections::split_spectrum::{estimate_ionosphere, lowpass_ionosphere, BandPhase};
+use dolphin_corrections::split_spectrum::{
+    align_side_band_cycles, estimate_ionosphere, lowpass_ionosphere, BandPhase, ComponentCycles,
+};
 use dolphin_io::geometry::read_nisar_los_layers_for_grid;
 use dolphin_io::nisar::{read_nisar_band_metadata, NisarBandMetadata};
 use dolphin_io::{
@@ -238,6 +244,30 @@ pub struct InterferogramSummary {
     /// Population standard deviation of the finite low-passed ionosphere pixels
     /// (radians); `None` if none are finite.
     pub ionosphere_std_rad: Option<f64>,
+    /// Integer cycles removed from the frequencyB unwrapped phase per frequencyA
+    /// connected component before the ionosphere estimate, ascending by component.
+    pub side_band_cycle_alignment: Vec<SideBandCycleAlignment>,
+}
+
+/// One connected component's frequencyB→frequencyA cycle alignment in `pairs.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideBandCycleAlignment {
+    /// frequencyA connected-component label (as in the `connected_components` layer).
+    pub component: u32,
+    /// Cycles removed from frequencyB: `φ_B ← φ_B − 2π·k`.
+    pub k: i64,
+    /// Pixels with both bands valid, over which `k` was estimated.
+    pub pixel_count: usize,
+}
+
+impl From<ComponentCycles> for SideBandCycleAlignment {
+    fn from(entry: ComponentCycles) -> Self {
+        Self {
+            component: entry.component,
+            k: entry.k,
+            pixel_count: entry.pixel_count,
+        }
+    }
 }
 
 /// One written pair layer.
@@ -962,14 +992,20 @@ fn write_interferogram_pair(
     let (side_unwrapped, _) =
         unwrap_band(&side_ifg, &coherence, &nodata, &scratch.join("frequencyB"))?;
     std::fs::remove_dir_all(&scratch).with_context(|| format!("removing {}", scratch.display()))?;
-    let ionosphere = split_spectrum_ionosphere(grid, settings, &main_unwrapped, &side_unwrapped)?;
+    let (ionosphere, alignment) = split_spectrum_ionosphere(
+        grid,
+        settings,
+        &main_unwrapped,
+        &side_unwrapped,
+        &components,
+    )?;
     let layers = PairLayers {
         unwrapped: main_unwrapped.mapv(|value| value as f32),
         ionosphere: ionosphere.mapv(|value| value as f32),
         coherence,
         connected_components: components,
     };
-    record.interferogram = Some(summarize(&layers.coherence, &layers.ionosphere));
+    record.interferogram = Some(summarize(&layers.coherence, &layers.ionosphere, &alignment));
     record.files = write_interferogram_layers(cfg, grid, pair, &record, &layers)?;
     Ok(record)
 }
@@ -1042,13 +1078,17 @@ fn unwrap_band(
     Ok((unwrapped, components))
 }
 
-/// Low-passed split-spectrum ionosphere in the main-band interferogram (radians).
+/// Low-passed split-spectrum ionosphere in the main-band interferogram (radians), with
+/// the side band first aligned to the main band's cycles per main-band component.
+/// Components come from the main band: it is the written `connected_components` layer
+/// and, multilooked from the wider band, the better-unwrapped of the two.
 fn split_spectrum_ionosphere(
     grid: &DualBandGrid,
     settings: &InterferogramSettings,
     main_unwrapped: &Array2<f64>,
     side_unwrapped: &Array2<f64>,
-) -> Result<Array2<f64>> {
+    components: &Array2<f32>,
+) -> Result<(Array2<f64>, Vec<ComponentCycles>)> {
     let main = BandPhase {
         unwrapped_phase: main_unwrapped.view(),
         center_frequency_hz: grid.main_band.center_frequency_hz,
@@ -1057,15 +1097,29 @@ fn split_spectrum_ionosphere(
         unwrapped_phase: side_unwrapped.view(),
         center_frequency_hz: grid.side_band.center_frequency_hz,
     };
+    // Nodata labels are NaN and cast to 0, but their phase is NaN in both bands, so
+    // they never enter a component's median.
+    let labels = components.mapv(|label| label as u32);
+    let aligned = align_side_band_cycles(&main, &side, labels.view())
+        .context("aligning frequencyB cycles to frequencyA")?;
+    let side = BandPhase {
+        unwrapped_phase: aligned.unwrapped_phase.view(),
+        ..side
+    };
     let raw = estimate_ionosphere(&main, Some(&side)).context("split-spectrum ionosphere")?;
     let gt = grid.geo.geotransform;
     let pixel_spacing_m = (gt[1] * gt[5]).abs().sqrt();
-    lowpass_ionosphere(raw.view(), settings.lowpass_wavelength_m, pixel_spacing_m)
-        .context("low-pass filtering the ionosphere")
+    let lowpassed = lowpass_ionosphere(raw.view(), settings.lowpass_wavelength_m, pixel_spacing_m)
+        .context("low-pass filtering the ionosphere")?;
+    Ok((lowpassed, aligned.components))
 }
 
 /// Pair summary over finite pixels.
-fn summarize(coherence: &Array2<f32>, ionosphere: &Array2<f32>) -> InterferogramSummary {
+fn summarize(
+    coherence: &Array2<f32>,
+    ionosphere: &Array2<f32>,
+    alignment: &[ComponentCycles],
+) -> InterferogramSummary {
     let finite = |values: &Array2<f32>| -> Vec<f64> {
         values
             .iter()
@@ -1098,6 +1152,7 @@ fn summarize(coherence: &Array2<f32>, ionosphere: &Array2<f32>) -> Interferogram
             .then(|| above as f64 / count(&coherence)),
         median_coherence: median,
         ionosphere_std_rad: (!ionosphere.is_empty()).then(|| variance.sqrt()),
+        side_band_cycle_alignment: alignment.iter().copied().map(Into::into).collect(),
     }
 }
 

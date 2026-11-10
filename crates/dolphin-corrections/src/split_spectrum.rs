@@ -34,6 +34,17 @@
 //! affected connected component. For NISAR-like carriers (`r ≈ 1.03`) that is
 //! ≈ −111 rad per cycle, so the two bands must be unwrapped consistently and the
 //! estimate low-pass filtered ([`lowpass_ionosphere`]) before use.
+//!
+//! **Inter-band cycle alignment.** Unwrapping the two bands independently leaves
+//! each connected component with its own integer offset between them.
+//! [`align_side_band_cycles`] removes it before estimation: per component `c`,
+//! `k_c = round(median((φ_B − r·φ_A) / 2π))` over pixels where both bands are
+//! finite, and `φ_B ← φ_B − 2π·k_c`. This fixes the side band to the main
+//! band's cycles only; the main band's own per-component offset against ground
+//! truth remains and must be anchored downstream.
+
+use std::collections::BTreeMap;
+use std::f64::consts::TAU;
 
 use dolphin_filtering::filter_long_wavelength;
 use ndarray::{Array2, ArrayView2, Zip};
@@ -59,6 +70,14 @@ pub enum SplitSpectrumError {
         main: (usize, usize),
         /// Side-band `(rows, cols)`.
         side: (usize, usize),
+    },
+    /// The connected-component labels are on a different grid from the phase.
+    #[error("component label shape {labels:?} != phase shape {phase:?}")]
+    LabelShapeMismatch {
+        /// Label `(rows, cols)`.
+        labels: (usize, usize),
+        /// Phase `(rows, cols)`.
+        phase: (usize, usize),
     },
     /// A center frequency is non-finite, non-positive, or the two are equal
     /// (the two-band system is singular).
@@ -120,7 +139,107 @@ pub fn estimate_ionosphere(
 /// [`SplitSpectrumError::InvalidFrequencies`] for unusable center frequencies.
 pub fn side_band_cycle_offset(main_hz: f64, side_hz: f64) -> Result<f64, SplitSpectrumError> {
     let r = frequency_ratio(main_hz, side_hz)?;
-    Ok(std::f64::consts::TAU * r / (1.0 - r * r))
+    Ok(TAU * r / (1.0 - r * r))
+}
+
+/// Integer side-band cycles removed from one connected component by
+/// [`align_side_band_cycles`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentCycles {
+    /// Connected-component label.
+    pub component: u32,
+    /// Cycles removed from the side band in this component: `φ_B ← φ_B − 2π·k`.
+    pub k: i64,
+    /// Pixels with both bands finite, over which `k` was estimated.
+    pub pixel_count: usize,
+}
+
+/// Side-band phase on the main band's integer cycles, and the per-component shifts.
+#[derive(Debug, Clone)]
+pub struct AlignedSideBand {
+    /// `φ_B − 2π·k_c` (radians); pixels of a component without any finite
+    /// pixel pair are returned unchanged.
+    pub unwrapped_phase: Array2<f64>,
+    /// One entry per label with at least one finite pixel pair, ascending by label.
+    pub components: Vec<ComponentCycles>,
+}
+
+/// Align the side-band unwrapped phase to the main band's integer cycles within
+/// each connected component: `k_c = round(median((φ_B − r·φ_A) / 2π))`,
+/// `r = f_B/f_A`, over the component's pixels where both bands are finite.
+///
+/// # Errors
+/// [`SplitSpectrumError::ShapeMismatch`] / [`SplitSpectrumError::LabelShapeMismatch`]
+/// when the grids differ; [`SplitSpectrumError::InvalidFrequencies`] for unusable
+/// center frequencies.
+pub fn align_side_band_cycles(
+    main: &BandPhase,
+    side: &BandPhase,
+    labels: ArrayView2<u32>,
+) -> Result<AlignedSideBand, SplitSpectrumError> {
+    let (main_dim, side_dim) = (main.unwrapped_phase.dim(), side.unwrapped_phase.dim());
+    if main_dim != side_dim {
+        return Err(SplitSpectrumError::ShapeMismatch {
+            main: main_dim,
+            side: side_dim,
+        });
+    }
+    let r = frequency_ratio(main.center_frequency_hz, side.center_frequency_hz)?;
+    if labels.dim() != side_dim {
+        return Err(SplitSpectrumError::LabelShapeMismatch {
+            labels: labels.dim(),
+            phase: side_dim,
+        });
+    }
+    let components: Vec<ComponentCycles> = cycle_residuals_by_component(main, side, labels, r)
+        .into_iter()
+        .map(|(component, mut cycles)| ComponentCycles {
+            component,
+            k: median(&mut cycles).round() as i64,
+            pixel_count: cycles.len(),
+        })
+        .collect();
+    let shift: BTreeMap<u32, f64> = components
+        .iter()
+        .map(|entry| (entry.component, TAU * entry.k as f64))
+        .collect();
+    let unwrapped_phase = Zip::from(&side.unwrapped_phase)
+        .and(&labels)
+        .map_collect(|&phase, label| phase - shift.get(label).copied().unwrap_or(0.0));
+    Ok(AlignedSideBand {
+        unwrapped_phase,
+        components,
+    })
+}
+
+/// `(φ_B − r·φ_A) / 2π` at every pixel with both bands finite, grouped by label.
+fn cycle_residuals_by_component(
+    main: &BandPhase,
+    side: &BandPhase,
+    labels: ArrayView2<u32>,
+    r: f64,
+) -> BTreeMap<u32, Vec<f64>> {
+    let mut residuals: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+    Zip::from(&main.unwrapped_phase)
+        .and(&side.unwrapped_phase)
+        .and(&labels)
+        .for_each(|&phi_a, &phi_b, &label| {
+            let cycles = (phi_b - r * phi_a) / TAU;
+            if cycles.is_finite() {
+                residuals.entry(label).or_default().push(cycles);
+            }
+        });
+    residuals
+}
+
+/// Median of a non-empty slice (mean of the two middle values for even length).
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let half = values.len() / 2;
+    match values.len() % 2 {
+        1 => values[half],
+        _ => (values[half - 1] + values[half]) / 2.0,
+    }
 }
 
 /// Gaussian low-pass of an ionosphere estimate, the complement of

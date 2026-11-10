@@ -8,7 +8,8 @@
 //! - Interferogram mode on a synthetic two-band NISAR pair: a planted ionosphere screen
 //!   is removed from the main-band phase to < 0.01 rad RMS; `corrected − (unwrapped −
 //!   ionosphere)` is exactly 0; all five layers, `los_enu.tif` and the T7 tags are written;
-//!   a product without `frequencyB` is refused with a typed error.
+//!   a product without `frequencyB` is refused with a typed error; `pairs.json` records the
+//!   side-band cycle alignment for every connected component in the written layer.
 //! - In both modes a NaN input pixel is NaN in every output layer, and every COG has GDAL
 //!   nodata NaN.
 
@@ -680,4 +681,47 @@ fn input_nan_is_nan_in_every_output_layer_with_nan_nodata() {
     }
     let los = read_raster_header(&cfg.work_directory.join(LOS_ENU_FILENAME)).unwrap();
     assert!(los.nodata.unwrap().is_nan());
+}
+
+#[test]
+fn pairs_json_reports_side_band_cycle_alignment_per_connected_component() {
+    let _hdf5 = hdf5_guard();
+    if !snaphu_available() {
+        eprintln!("snaphu absent; skipping side-band cycle alignment record check");
+        return;
+    }
+    // A full-height nodata column splits the scene into two connected components.
+    let side_n = 64;
+    let side_stripe: Vec<(usize, usize)> = (0..side_n).map(|row| (row, side_n / 2)).collect();
+    let main_stripe: Vec<(usize, usize)> = (0..2 * side_n)
+        .flat_map(|row| [(row, side_n), (row, side_n + 1)])
+        .collect();
+    let dir = std::env::temp_dir().join("dolphin_pairs_cycle_alignment");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = nisar_pair(&dir, side_n, (&main_stripe, &side_stripe));
+    run_pairs(&cfg).unwrap();
+
+    let json = std::fs::read_to_string(cfg.work_directory.join(PAIRS_INDEX_FILENAME)).unwrap();
+    let index: PairsIndex = serde_json::from_str(&json).unwrap();
+    let alignment = &index.pairs[0]
+        .interferogram
+        .as_ref()
+        .unwrap()
+        .side_band_cycle_alignment;
+    eprintln!("side-band cycle alignment: {alignment:?}");
+    let components = layer(&cfg.work_directory, "connected_components");
+    let mut expected = std::collections::BTreeMap::<u32, usize>::new();
+    components
+        .iter()
+        .filter(|label| label.is_finite())
+        .for_each(|&label| *expected.entry(label as u32).or_default() += 1);
+    let reported: std::collections::BTreeMap<u32, usize> = alignment
+        .iter()
+        .map(|entry| (entry.component, entry.pixel_count))
+        .collect();
+    assert_eq!(reported, expected);
+    assert!(
+        expected.len() >= 2,
+        "stripe did not split components: {expected:?}"
+    );
 }

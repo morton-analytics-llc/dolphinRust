@@ -35,8 +35,9 @@ All notable changes to dolphinRust are documented here. The format follows
 - **`dolphin pairs` interferogram mode: NISAR split-spectrum ionosphere correction.**
   `mode: interferogram` with `input_type: nisar_gslc` forms the `frequencyA` and
   `frequencyB` interferograms `ref · conj(sec)` (the `tests/sign_convention.rs` order),
-  multilooks A onto the B grid by complex averaging, unwraps both with SNAPHU, estimates the
-  ionosphere in the A interferogram with the main/side-band split-spectrum kernel, low-pass
+  multilooks A onto the B grid by complex averaging, unwraps both with SNAPHU, aligns B's
+  integer cycles to A, estimates the ionosphere in the A interferogram with the
+  main/side-band split-spectrum kernel, low-pass
   filters it at `ionosphere_lowpass_wavelength_m`, and subtracts it. Per pair it writes
   `unwrapped`, `ionosphere`, `corrected`, `coherence` and `connected_components`; once per
   run it writes a three-band (east, north, up) ground→sensor `los_enu.tif` from the radarGrid
@@ -49,6 +50,18 @@ All notable changes to dolphinRust are documented here. The format follows
   must be an integer multilook of `frequencyA`, and `strides` must equal those looks. A
   product without `frequencyB` is refused with `PairsError::MissingFrequencyB`. On a 256²
   synthetic two-band pair a planted ionosphere screen is removed to 1.4e-3 rad RMS.
+  SNAPHU unwraps the two bands independently, so each connected component can carry its own
+  integer-cycle offset between them, and one cycle in B moves the estimate by about 73 rad at
+  NISAR L-band carriers. Before estimating, `align_side_band_cycles` computes, per
+  connected component `c` of the A `connected_components` layer, `k_c = round(median((φ_B −
+  (f_B/f_A)·φ_A) / 2π))` over the component's pixels where both bands are valid, and sets
+  `φ_B ← φ_B − 2π·k_c`. The A labels are used because they are the written layer and A,
+  multilooked from the wider band, is the better-unwrapped of the two. `pairs.json` records
+  each component's `k` and `pixel_count` under `side_band_cycle_alignment`. This removes the
+  inter-band ambiguity only; each component's absolute offset against ground truth remains
+  and is left to downstream anchoring. With +1 and −2 cycles planted on B in two components
+  of a synthetic pair, the kernel returns `k = 1` and `k = −2` and the ionosphere residual is
+  under 0.01 rad RMS.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is

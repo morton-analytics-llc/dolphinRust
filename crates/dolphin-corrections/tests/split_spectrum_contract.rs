@@ -3,12 +3,15 @@
 //! Synthetic two-band phase `φ(f) = φ_nd·f/f_A + φ_iono·f_A/f` with known
 //! non-dispersive and dispersive fields. The estimator must return the
 //! dispersive term at `f_A`, a `2π` side-band slip must shift it by the
-//! documented constant, and a missing side band must be refused.
+//! documented constant, and a missing side band must be refused. Per-component
+//! side-band cycle offsets (+1 and −2 planted in two components) must be found
+//! and removed before estimation.
 
 use std::f64::consts::TAU;
 
 use dolphin_corrections::split_spectrum::{
-    estimate_ionosphere, lowpass_ionosphere, side_band_cycle_offset, BandPhase, SplitSpectrumError,
+    align_side_band_cycles, estimate_ionosphere, lowpass_ionosphere, side_band_cycle_offset,
+    BandPhase, ComponentCycles, SplitSpectrumError,
 };
 use ndarray::Array2;
 
@@ -76,6 +79,35 @@ fn side_band_cycle_slip_gives_documented_constant_offset() {
     (&slipped - &clean)
         .iter()
         .for_each(|offset| assert!((offset - documented).abs() < 1e-9, "{offset}"));
+}
+
+#[test]
+fn planted_side_band_cycle_offsets_are_removed_per_component() {
+    // Three components: left columns (0), middle (1, +1 cycle), right (2, −2 cycles).
+    let labels = Array2::from_shape_fn((ROWS, COLS), |(_, c)| (c / 16) as u32);
+    let planted = |label: u32| [0.0, 1.0, -2.0][label as usize];
+    let phase_a = band_phase(MAIN_HZ);
+    let phase_b = band_phase(SIDE_HZ);
+    let slipped_b = ndarray::Zip::from(&phase_b)
+        .and(&labels)
+        .map_collect(|&phase, &label| phase + TAU * planted(label));
+    let main = band(&phase_a, MAIN_HZ);
+
+    let aligned = align_side_band_cycles(&main, &band(&slipped_b, SIDE_HZ), labels.view()).unwrap();
+    let expected: Vec<ComponentCycles> = [(0, 0), (1, 1), (2, -2)]
+        .map(|(component, k)| ComponentCycles {
+            component,
+            k,
+            pixel_count: ROWS * 16,
+        })
+        .to_vec();
+    assert_eq!(aligned.components, expected);
+
+    let side = band(&aligned.unwrapped_phase, SIDE_HZ);
+    let estimate = estimate_ionosphere(&main, Some(&side)).unwrap();
+    let squared: f64 = (&estimate - &ionosphere_at_main()).mapv(|e| e * e).sum();
+    let rms = (squared / estimate.len() as f64).sqrt();
+    assert!(rms < 0.01, "ionosphere residual RMS {rms} rad");
 }
 
 #[test]
