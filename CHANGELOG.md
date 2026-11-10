@@ -18,6 +18,20 @@ All notable changes to dolphinRust are documented here. The format follows
   (16x16), or 417 untiled. `snaphu_options` cost, init method and tiling must stay at their
   defaults with this backend. The default stays `native`. `unwrap_bench` accepts
   `BACKEND=whirlwind`.
+- **`dolphin pairs` subcommand, coherence mode.** `dolphin pairs --config <yaml>` with
+  `mode: coherence` writes the pair coherence `|Γ_ij|` for a planned set of acquisition
+  pairs, one COG per pair named `coherence_<refYYYYMMDD>_<secYYYYMMDD>.tif`. `|Γ_ij|` comes
+  from `estimate_stack_covariance` with the phase-linking `half_window` and `strides`
+  semantics, so it is the off-diagonal phase linking computes and then discards; the
+  contract test matches it to the full-stack covariance to max |Δ| < 1e-6 on the real
+  cropped Mexico City stack. Pairs are either listed explicitly or formed from every
+  date-ordered pair whose calendar-day baseline is within `tolerance_days` of a
+  `pair_class_days` entry, so a gap in a 12-day series forms no pair across it. Each COG
+  carries `REFERENCE_ACQUISITION_ID`, `SECONDARY_ACQUISITION_ID`, `REFERENCE_DATE`,
+  `SECONDARY_DATE`, `TEMPORAL_BASELINE_DAYS` and `LAYER`. A `pairs.json` index lists each
+  pair's IDs, dates, files and sha256. Optional EPSG:4326 `bounds` go through the same
+  bounded-read planning as displacement runs. All acquisitions must share one grid. OPERA
+  CSLC only: `input_type: nisar_gslc` fails with an explicit error.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
