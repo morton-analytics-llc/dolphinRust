@@ -940,6 +940,21 @@ fn dem_error_requires_wavelength_and_opera_inputs() {
     config.validate_supported_options().unwrap();
 }
 
+/// #160: the native unwrapper has one cost model, so `cost: defo` on native is a
+/// config error instead of silently running the smooth cost; SNAPHU keeps both.
+#[test]
+fn native_unwrap_rejects_a_cost_mode_it_does_not_implement() {
+    let mut config = DisplacementWorkflow::default();
+    config.unwrap_options.snaphu_options.cost = "defo".into();
+    let error = config.validate_supported_options().unwrap_err().to_string();
+    assert!(
+        error.contains("unwrap_options.snaphu_options.cost"),
+        "{error}"
+    );
+    config.unwrap_options.unwrap_method = UnwrapMethod::Snaphu;
+    config.validate_supported_options().unwrap();
+}
+
 /// `output_options.min_reference_component_fraction` (#152) is a fraction in
 /// (0, 1] of a bounded target, so it is a config error outside that range or
 /// without `output_options.bounds`, and it round-trips through YAML.
