@@ -118,7 +118,11 @@ impl MiniStackPlanner {
     /// SLCs precede the tail.
     ///
     /// # Errors
-    /// Returns `Err` if `ministack_size < 2` (dolphin's minimum).
+    /// Returns `Err` if `ministack_size < 2` (dolphin's minimum), or if
+    /// `LastPerMinistack` would span more than one ministack: from the third
+    /// ministack on it references each to the previous ministack's last date,
+    /// and the series is stitched as single-referenced, so displacement would
+    /// silently carry that offset (#164; dolphin ≥ 0.40 raises here too).
     pub fn plan_with_offset(
         &self,
         ministack_size: usize,
@@ -126,6 +130,11 @@ impl MiniStackPlanner {
     ) -> Result<Vec<MiniStack>, &'static str> {
         if ministack_size < 2 {
             return Err("cannot create ministacks with size < 2");
+        }
+        if self.compressed_slc_plan == CompressedSlcPlan::LastPerMinistack
+            && (batch_offset > 0 || self.num_slc > ministack_size)
+        {
+            return Err("'last_per_ministack' cannot be used for multiple ministacks");
         }
         let ministacks = (0..self.num_slc)
             .step_by(ministack_size)

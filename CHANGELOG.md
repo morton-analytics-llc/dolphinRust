@@ -136,6 +136,12 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Fixed
+- **`compressed_slc_plan: last_per_ministack` is refused across multiple ministacks** (issue
+  #164). From the third ministack on, the plan referenced each ministack to the previous one's
+  last date, while the sequential stitch assumed a single reference, so displacement silently
+  carried the offset (−2.03 rad from date 31 on a noise-free synthetic stack). The planner now
+  errors when the plan would span more than one ministack, or on a resumed stack, as
+  dolphin ≥ 0.40 does. A single-ministack run still plans.
 - **Disconnected interferogram networks fail at the network stage** (issue #159). A pair graph
   that splits the dates into groups with no interferogram between them, such as an acquisition
   gap wider than `max_temporal_baseline`, used to panic in the L1 inversion, return arbitrary
