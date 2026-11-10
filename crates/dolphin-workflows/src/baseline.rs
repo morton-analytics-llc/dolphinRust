@@ -33,6 +33,8 @@
 //! `L̂` is by construction (the zero-Doppler imaging condition) orthogonal to `V̂`,
 //! so `B∥` and `B⊥` carry none of the along-track offset once `B′` has removed it.
 
+use std::path::PathBuf;
+
 use dolphin_io::CslcOrbit;
 
 /// WGS84 semi-major axis, meters.
@@ -114,6 +116,93 @@ pub fn orbit_pair_baseline(
     ))
 }
 
+/// Per-date DEM-error sensitivity `B⊥(t) / (R sin θ)` (metres of LOS
+/// displacement per metre of height error) at the first granule's burst centre,
+/// one value per granule, zero at acquisition 0 (issue #143).
+///
+/// `B⊥(t)` is [`pair_baseline`]'s perpendicular baseline from granule 0 to
+/// granule `t`, each platform at its own mid zero-Doppler time; `R` is the
+/// slant range from granule 0's platform to the centre; `θ` is the incidence
+/// there, the angle between the target-to-satellite vector and the ellipsoid
+/// normal. Positive `B⊥` with a scatterer above the DEM shortens the secondary's
+/// range, so the product of this value and the height error is an apparent
+/// displacement toward the satellite.
+///
+/// These are burst-centre values. Across one IW burst's range extent the
+/// incidence changes by about 5°, so `R sin θ` is up to about ±10% off at the
+/// near and far edges. That error scales the fitted height error by the same
+/// fraction; the rate is unaffected, because the column's shape in time is the
+/// same up to that scale.
+///
+/// # Errors
+/// `Err` naming the granule when its orbit, identification or burst metadata
+/// cannot be read, its times do not parse, or a time falls outside its orbit.
+pub fn dem_error_sensitivity(granules: &[PathBuf]) -> Result<Vec<f64>, String> {
+    let states = granules
+        .iter()
+        .map(|path| granule_state(path).map_err(|e| format!("{}: {e}", path.display())))
+        .collect::<Result<Vec<_>, String>>()?;
+    sensitivity_from_states(&states)
+}
+
+fn sensitivity_from_states(states: &[GranuleState]) -> Result<Vec<f64>, String> {
+    let Some(reference) = states.first() else {
+        return Err("DEM-error sensitivity needs at least one granule".into());
+    };
+    let [lon_deg, lat_deg] = reference.center_lonlat_deg;
+    let target = geodetic_to_ecef(lon_deg, lat_deg, 0.0);
+    let to_satellite = subtract(reference.position, target);
+    let (lon, lat) = (lon_deg.to_radians(), lat_deg.to_radians());
+    let normal = [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()];
+    let slant_range = dot(to_satellite, to_satellite).sqrt();
+    let cos_incidence = dot(normalize(to_satellite), normal);
+    let denominator = slant_range * (1.0 - cos_incidence * cos_incidence).sqrt();
+    Ok(states
+        .iter()
+        .map(|state| {
+            pair_baseline(
+                target,
+                reference.position,
+                reference.velocity,
+                state.position,
+            )
+            .perpendicular_m
+                / denominator
+        })
+        .collect())
+}
+
+/// One granule's platform state at its mid zero-Doppler time.
+struct GranuleState {
+    position: [f64; 3],
+    velocity: [f64; 3],
+    center_lonlat_deg: [f64; 2],
+}
+
+fn granule_state(path: &std::path::Path) -> Result<GranuleState, String> {
+    const FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
+    let orbit = dolphin_io::read_cslc_orbit(path).map_err(|e| e.to_string())?;
+    let ident = dolphin_io::read_cslc_identification(path).map_err(|e| e.to_string())?;
+    let burst = dolphin_io::read_cslc_burst_metadata(path).map_err(|e| e.to_string())?;
+    let parse = |raw: &str, what: &str| {
+        chrono::NaiveDateTime::parse_from_str(raw.trim(), FORMAT)
+            .map_err(|e| format!("unparseable {what} {raw:?}: {e}"))
+    };
+    let epoch = parse(&orbit.reference_epoch, "orbit reference_epoch")?;
+    let start = parse(&ident.zero_doppler_start_time, "zero_doppler_start_time")?;
+    let end = parse(&ident.zero_doppler_end_time, "zero_doppler_end_time")?;
+    let mid = start + (end - start) / 2;
+    let seconds = (mid - epoch)
+        .num_microseconds()
+        .ok_or("mid zero-Doppler time overflows")? as f64
+        / 1e6;
+    Ok(GranuleState {
+        position: interpolate_span(&orbit, seconds, "granule")?,
+        velocity: interp3_clamped(&orbit.time_s, &orbit.velocity_mps, seconds),
+        center_lonlat_deg: burst.center_lonlat_deg,
+    })
+}
+
 fn interpolate_span(orbit: &CslcOrbit, time_s: f64, which: &str) -> Result<[f64; 3], String> {
     if orbit.time_s.len() < 2 {
         return Err(format!("{which} orbit has fewer than 2 state vectors"));
@@ -171,6 +260,94 @@ fn normalize(a: [f64; 3]) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference and target of the #143 fixtures: a satellite at 700 km
+    /// altitude in the equatorial plane looking 30° off nadir at the target on
+    /// the equator at longitude 0, flying along `+Z`.
+    fn equatorial_reference() -> ([f64; 3], [f64; 3], f64) {
+        let target = geodetic_to_ecef(0.0, 0.0, 0.0);
+        let look = 30.0_f64.to_radians();
+        let slant = 700_000.0 / look.cos();
+        let reference = [
+            target[0] + slant * look.cos(),
+            target[1] + slant * look.sin(),
+            0.0,
+        ];
+        (target, reference, slant)
+    }
+
+    fn state(position: [f64; 3]) -> GranuleState {
+        GranuleState {
+            position,
+            velocity: [0.0, 0.0, 7_500.0],
+            center_lonlat_deg: [0.0, 0.0],
+        }
+    }
+
+    /// The secondary of the #143 fixtures: the reference moved `metres` along
+    /// the perpendicular-baseline direction, away from Earth.
+    fn raised_secondary(target: [f64; 3], reference: [f64; 3], metres: f64) -> [f64; 3] {
+        let up = [1.0, 0.0, 0.0];
+        let to_satellite = normalize(subtract(reference, target));
+        let perpendicular = normalize(subtract(up, scale(to_satellite, dot(up, to_satellite))));
+        std::array::from_fn(|i| reference[i] + metres * perpendicular[i])
+    }
+
+    /// #143: a secondary displaced 100 m along the perpendicular-baseline
+    /// direction gives `+B⊥ / (R sin θ)` with the closed-form `R` and `θ`;
+    /// acquisition 0 is zero.
+    #[test]
+    fn dem_error_sensitivity_matches_closed_form_geometry() {
+        let (target, reference, slant) = equatorial_reference();
+        let secondary = raised_secondary(target, reference, 100.0);
+        let values = sensitivity_from_states(&[state(reference), state(secondary)]).unwrap();
+        assert_eq!(values[0], 0.0);
+        let expected = 100.0 / (slant * 30.0_f64.to_radians().sin());
+        assert!(
+            (values[1] - expected).abs() < 1e-9 * expected,
+            "{} vs {expected}",
+            values[1]
+        );
+    }
+
+    /// #143, sign and size against ranges computed directly: raise the
+    /// scatterer 20 m above the ellipsoid at the same range from the reference
+    /// (the pixel it is imaged in) and measure how much nearer the secondary
+    /// sees it than the flattening to the ellipsoid assumed. That apparent
+    /// motion toward the satellite must equal `sensitivity · height`.
+    #[test]
+    fn dem_error_sensitivity_predicts_the_range_change_of_a_raised_scatterer() {
+        let (target, reference, _) = equatorial_reference();
+        let secondary = raised_secondary(target, reference, 100.0);
+        let range = |from: [f64; 3], to: [f64; 3]| {
+            let d = subtract(to, from);
+            dot(d, d).sqrt()
+        };
+        let height = 20.0;
+        let reference_range = range(reference, target);
+        // Bisect the longitude at which the raised scatterer keeps the
+        // reference's range; the satellite is east of the target.
+        let (mut west, mut east) = (-1.0e-3_f64, 1.0e-3_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (west + east);
+            let raised = geodetic_to_ecef(mid, 0.0, height);
+            match range(reference, raised) > reference_range {
+                true => west = mid,
+                false => east = mid,
+            }
+        }
+        let raised = geodetic_to_ecef(0.5 * (west + east), 0.0, height);
+        let range_difference = |point| range(secondary, point) - range(reference, point);
+        let toward_satellite = -(range_difference(raised) - range_difference(target));
+        let sensitivity =
+            sensitivity_from_states(&[state(reference), state(secondary)]).unwrap()[1];
+        let predicted = sensitivity * height;
+        assert!(predicted > 0.0, "{predicted}");
+        assert!(
+            (toward_satellite - predicted).abs() < 1e-3 * predicted,
+            "measured {toward_satellite} m, predicted {predicted} m"
+        );
+    }
 
     /// A synthetic side-looking geometry: target on the `+X` axis (its own ECEF
     /// direction is `up = [1,0,0]`), 30° incidence look vector in the X/Y plane,
