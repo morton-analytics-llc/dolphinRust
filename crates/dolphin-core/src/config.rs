@@ -959,7 +959,10 @@ pub struct TimeseriesOptions {
     /// Amelung 2013): one basis column `B⊥(t) / (R sin θ)`, the frame-centre
     /// perpendicular baseline to acquisition 0 over slant range times the sine of
     /// the look-side incidence, derived from the CSLC orbits. Emits
-    /// `dem_error.tif` (metres). Needs OPERA CSLC orbit metadata and
+    /// `dem_error.tif` (metres, relative to the reference point's own height
+    /// error, like the displacement it is fitted from; `B⊥` and `R sin θ` are
+    /// burst-centre values, so the height scale is up to about ±10% off at the
+    /// burst's range edges). Needs OPERA CSLC orbit metadata and
     /// `input_options.wavelength`. dolphinRust-only; off by default.
     pub estimate_dem_error: bool,
     /// Close every triangle in the **unwrapped** interferogram network before the
