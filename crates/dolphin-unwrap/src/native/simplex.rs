@@ -38,13 +38,19 @@ pub struct MinCostFlow {
     parent: Vec<u32>,
     /// Basic arc linking each node to its parent (`SENTINEL` for the root).
     pred_arc: Vec<u32>,
-    /// Tree children adjacency.
-    children: Vec<Vec<u32>>,
+    /// Preorder successor of each node, circular through the root: a node's
+    /// subtree is the `subtree_size` nodes starting at it.
+    thread: Vec<u32>,
+    /// Preorder predecessor (the inverse of `thread`).
+    rev_thread: Vec<u32>,
+    /// Node count of each node's subtree, itself included.
+    subtree_size: Vec<u32>,
+    /// Last node of each node's subtree in preorder.
+    last_descendant: Vec<u32>,
     /// Node potentials (`pi`); reduced cost of a tree arc is zero.
     pi: Vec<i64>,
-    /// Per-pivot apex-finding stamps and the working stamp value.
-    stamp: Vec<u32>,
-    cur_stamp: u32,
+    /// The current pivot's cycle, kept to reuse its allocation.
+    cycle: Vec<CycleArc>,
     root: u32,
 }
 
@@ -57,10 +63,12 @@ impl MinCostFlow {
             supply: vec![0; n_nodes],
             parent: Vec::new(),
             pred_arc: Vec::new(),
-            children: Vec::new(),
+            thread: Vec::new(),
+            rev_thread: Vec::new(),
+            subtree_size: Vec::new(),
+            last_descendant: Vec::new(),
             pi: Vec::new(),
-            stamp: Vec::new(),
-            cur_stamp: 0,
+            cycle: Vec::new(),
             root: n_nodes as u32,
         }
     }
@@ -104,9 +112,14 @@ impl MinCostFlow {
         let big = self.big_cost();
         self.parent = vec![SENTINEL; n + 1];
         self.pred_arc = vec![SENTINEL; n + 1];
-        self.children = vec![Vec::new(); n + 1];
+        // Preorder of the star: root, 0, 1, …, n-1, and back to the root.
+        self.thread = (0..=n).map(|i| ((i + 1) % (n + 1)) as u32).collect();
+        self.rev_thread = (0..=n).map(|i| ((i + n) % (n + 1)) as u32).collect();
+        self.subtree_size = vec![1; n + 1];
+        self.subtree_size[r] = (n + 1) as u32;
+        self.last_descendant = (0..=n as u32).collect();
+        self.last_descendant[r] = self.rev_thread[r];
         self.pi = vec![0; n + 1];
-        self.stamp = vec![0; n + 1];
         for i in 0..n {
             let b = self.supply[i];
             let arc = if b > 0 {
@@ -118,7 +131,6 @@ impl MinCostFlow {
             };
             self.parent[i] = self.root;
             self.pred_arc[i] = arc as u32;
-            self.children[r].push(i as u32);
         }
     }
 
@@ -193,46 +205,51 @@ impl MinCostFlow {
     fn pivot(&mut self, e: usize) {
         let (k, l) = (self.arcs[e].from, self.arcs[e].to);
         let apex = self.apex(k, l);
-        let cyc = self.cycle_arcs(e, k, l, apex);
+        let mut cyc = std::mem::take(&mut self.cycle);
+        let entering_pos = self.fill_cycle(&mut cyc, e, k, l, apex);
         let (delta, leave_pos) = self.bottleneck(&cyc);
         self.augment(&cyc, delta);
-        self.restructure(e, &cyc, leave_pos);
+        // The leaving arc cuts off the subtree holding the endpoint on its own
+        // side of the cycle; if the entering arc itself leaves (it saturated
+        // immediately), the basis is unchanged.
+        match leave_pos.cmp(&entering_pos) {
+            std::cmp::Ordering::Less => self.restructure(e, cyc[leave_pos].arc, k, l, apex),
+            std::cmp::Ordering::Greater => self.restructure(e, cyc[leave_pos].arc, l, k, apex),
+            std::cmp::Ordering::Equal => {}
+        }
+        self.cycle = cyc;
     }
 
-    /// Least-common-ancestor of `k` and `l` in the tree, via ancestor stamping.
-    fn apex(&mut self, k: u32, l: u32) -> u32 {
-        self.cur_stamp += 1;
-        let s = self.cur_stamp;
-        let mut a = k;
-        while a != SENTINEL {
-            self.stamp[a as usize] = s;
-            a = self.parent[a as usize];
+    /// Least-common-ancestor of `k` and `l` in the tree. The endpoint with the
+    /// smaller subtree cannot be an ancestor of the other, so it climbs.
+    fn apex(&self, mut k: u32, mut l: u32) -> u32 {
+        while k != l {
+            if self.subtree_size[k as usize] < self.subtree_size[l as usize] {
+                k = self.parent[k as usize];
+            } else {
+                l = self.parent[l as usize];
+            }
         }
-        let mut b = l;
-        while self.stamp[b as usize] != s {
-            b = self.parent[b as usize];
-        }
-        b
+        k
     }
 
-    /// The cycle arcs in cycle-orientation order: the `k`-side (root-ward,
-    /// reversed to run apex->k), then entering arc, then the `l`-side (l->apex).
-    /// Each entry is `(node, parent, increasing)` where `increasing` marks an
-    /// arc whose flow rises with the augmentation.
-    fn cycle_arcs(&self, e: usize, k: u32, l: u32, apex: u32) -> Vec<CycleArc> {
-        let mut k_side = Vec::new();
+    /// Fill `cyc` with the cycle arcs in cycle-orientation order: the `k`-side
+    /// (root-ward, reversed to run apex->k), then the entering arc, then the
+    /// `l`-side (l->apex). Returns the entering arc's position.
+    fn fill_cycle(&self, cyc: &mut Vec<CycleArc>, e: usize, k: u32, l: u32, apex: u32) -> usize {
+        cyc.clear();
         let mut n = k;
         while n != apex {
             // cycle runs apex->k here, i.e. parent->child: arc increases iff
             // it is oriented parent->child (from == parent).
             let arc = self.pred_arc[n as usize];
             let inc = self.arcs[arc as usize].from == self.parent[n as usize];
-            k_side.push(CycleArc { arc, inc });
+            cyc.push(CycleArc { arc, inc });
             n = self.parent[n as usize];
         }
-        k_side.reverse();
-        let mut out = k_side;
-        out.push(CycleArc {
+        cyc.reverse();
+        let entering_pos = cyc.len();
+        cyc.push(CycleArc {
             arc: e as u32,
             inc: true,
         });
@@ -242,10 +259,10 @@ impl MinCostFlow {
             // it is oriented child->parent (from == n).
             let arc = self.pred_arc[n as usize];
             let inc = self.arcs[arc as usize].from == n;
-            out.push(CycleArc { arc, inc });
+            cyc.push(CycleArc { arc, inc });
             n = self.parent[n as usize];
         }
-        out
+        entering_pos
     }
 
     /// Bottleneck `delta` and the position of the leaving arc — the LAST
@@ -279,22 +296,16 @@ impl MinCostFlow {
         }
     }
 
-    /// Swap the leaving tree arc for the entering arc `e` and re-root the
-    /// detached subtree, shifting its potentials by the entering reduced cost.
-    fn restructure(&mut self, e: usize, cyc: &[CycleArc], leave_pos: usize) {
-        let leave = cyc[leave_pos].arc as usize;
-        if leave == e {
-            return; // entering arc immediately saturated: basis unchanged
-        }
-        let child = self.tree_child(leave);
-        let subtree = self.collect_subtree(child);
-        self.detach(child);
-        let (k, l) = (self.arcs[e].from, self.arcs[e].to);
-        let in_s = if self.in_set(&subtree, l) { l } else { k };
-        let out = if in_s == l { k } else { l };
-        self.reroot(in_s, child);
-        self.attach(in_s, out, e);
-        self.shift_potentials(&subtree, in_s, out, e);
+    /// Swap the leaving tree arc for the entering arc `e`: cut the subtree
+    /// below the leaving arc, re-root it at `inside` (the entering arc's
+    /// endpoint in it), hang it under `outside`, and shift its potentials by
+    /// the entering reduced cost.
+    fn restructure(&mut self, e: usize, leave: u32, inside: u32, outside: u32, apex: u32) {
+        let child = self.tree_child(leave as usize);
+        self.cut(child, apex);
+        self.reroot(inside, child);
+        self.graft(inside, outside, e, apex);
+        self.shift_potentials(inside, outside, e);
     }
 
     /// The child-side endpoint of a tree arc (deeper node).
@@ -307,73 +318,132 @@ impl MinCostFlow {
         }
     }
 
-    /// Depth-first node list of the subtree rooted at `root` (current tree).
-    fn collect_subtree(&self, root: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(v) = stack.pop() {
-            out.push(v);
-            stack.extend_from_slice(&self.children[v as usize]);
+    /// Make `b` the preorder successor of `a`.
+    fn link(&mut self, a: u32, b: u32) {
+        self.thread[a as usize] = b;
+        self.rev_thread[b as usize] = a;
+    }
+
+    /// Cut `child`'s subtree out of the tree (the leaving arc): close the
+    /// thread over its segment and take its nodes off its ancestors. `apex`
+    /// and the nodes above it keep their size, because the subtree is grafted
+    /// back below `apex`.
+    fn cut(&mut self, child: u32, apex: u32) {
+        let size = self.subtree_size[child as usize];
+        let last = self.last_descendant[child as usize];
+        let before = self.rev_thread[child as usize];
+        self.link(before, self.thread[last as usize]);
+        let mut a = self.parent[child as usize];
+        while a != apex {
+            self.subtree_size[a as usize] -= size;
+            a = self.parent[a as usize];
         }
-        out
-    }
-
-    fn in_set(&self, nodes: &[u32], v: u32) -> bool {
-        nodes.contains(&v)
-    }
-
-    /// Cut `child` from its parent (the leaving arc).
-    fn detach(&mut self, child: u32) {
-        let p = self.parent[child as usize];
-        self.children[p as usize].retain(|&c| c != child);
+        // An ancestor that ended on the cut segment now ends just before it.
+        let mut a = self.parent[child as usize];
+        while a != SENTINEL && self.last_descendant[a as usize] == last {
+            self.last_descendant[a as usize] = before;
+            a = self.parent[a as usize];
+        }
         self.parent[child as usize] = SENTINEL;
         self.pred_arc[child as usize] = SENTINEL;
     }
 
-    /// Reverse the parent chain from `x` up to `stop` so `x` becomes the
-    /// subtree root (its old ancestors become its descendants).
+    /// Re-root the cut subtree at `x`: reverse the parent chain from `x` up to
+    /// its old root `stop`, and rewrite the thread to the new preorder.
+    ///
+    /// With the chain `x = u0, u1, …, um = stop`, the old preorder nests as
+    /// `um A_m … u1 A_1 [u0's subtree] B_1 … B_m`, where `A_i` and `B_i` are the
+    /// parts of `u_i`'s subtree before and after `u_{i-1}`'s. The new preorder is
+    /// `[u0's subtree] u1 A_1 B_1 … um A_m B_m`: every `u_i` now hangs under
+    /// `u_{i-1}` and keeps its other descendants.
     fn reroot(&mut self, x: u32, stop: u32) {
         if x == stop {
             return;
         }
+        let total = self.subtree_size[stop as usize];
+        let mut tail = self.last_descendant[x as usize];
+        // Old end of the inner subtree and its old successor (the next `B`).
+        let mut inner_last = tail;
+        let mut after_inner = self.thread[tail as usize];
         let mut prev = x;
+        let mut prev_old_rev = self.rev_thread[x as usize];
+        let mut prev_old_size = self.subtree_size[x as usize];
+        let mut carried_arc = self.pred_arc[x as usize];
         let mut cur = self.parent[x as usize];
-        let mut prev_arc = self.pred_arc[x as usize];
         loop {
-            let next = self.parent[cur as usize];
-            let next_arc = self.pred_arc[cur as usize];
-            self.children[cur as usize].retain(|&c| c != prev);
+            let (next, next_arc) = (self.parent[cur as usize], self.pred_arc[cur as usize]);
+            let cur_old_rev = self.rev_thread[cur as usize];
+            let cur_old_size = self.subtree_size[cur as usize];
+            let cur_old_last = self.last_descendant[cur as usize];
+            let a_is_empty = self.thread[cur as usize] == prev;
+            self.link(tail, cur);
+            tail = if a_is_empty { cur } else { prev_old_rev };
+            if cur_old_last != inner_last {
+                let b_first = after_inner;
+                after_inner = self.thread[cur_old_last as usize];
+                inner_last = cur_old_last;
+                self.link(tail, b_first);
+                tail = cur_old_last;
+            }
             self.parent[cur as usize] = prev;
-            self.pred_arc[cur as usize] = prev_arc;
-            self.children[prev as usize].push(cur);
+            self.pred_arc[cur as usize] = carried_arc;
+            self.subtree_size[cur as usize] = total - prev_old_size;
             if cur == stop {
                 break;
             }
             prev = cur;
+            prev_old_rev = cur_old_rev;
+            prev_old_size = cur_old_size;
+            carried_arc = next_arc;
             cur = next;
-            prev_arc = next_arc;
         }
+        self.subtree_size[x as usize] = total;
+        // Every node on the reversed chain now ends on the segment's last node.
+        let mut v = stop;
+        while v != x {
+            self.last_descendant[v as usize] = tail;
+            v = self.parent[v as usize];
+        }
+        self.last_descendant[x as usize] = tail;
     }
 
-    /// Hang re-rooted subtree (now rooted at `in_s`) under `out` via arc `e`.
-    fn attach(&mut self, in_s: u32, out: u32, e: usize) {
-        self.parent[in_s as usize] = out;
-        self.pred_arc[in_s as usize] = e as u32;
-        self.children[out as usize].push(in_s);
+    /// Hang the re-rooted subtree (rooted at `inside`) under `outside` via arc
+    /// `e`, as the first subtree after `outside` in preorder.
+    fn graft(&mut self, inside: u32, outside: u32, e: usize, apex: u32) {
+        let size = self.subtree_size[inside as usize];
+        let last = self.last_descendant[inside as usize];
+        self.parent[inside as usize] = outside;
+        self.pred_arc[inside as usize] = e as u32;
+        let after = self.thread[outside as usize];
+        self.link(outside, inside);
+        self.link(last, after);
+        let mut a = outside;
+        while a != apex {
+            self.subtree_size[a as usize] += size;
+            a = self.parent[a as usize];
+        }
+        // An ancestor that ended on `outside` now ends on the grafted segment.
+        let mut a = outside;
+        while a != SENTINEL && self.last_descendant[a as usize] == outside {
+            self.last_descendant[a as usize] = last;
+            a = self.parent[a as usize];
+        }
     }
 
     /// Shift every potential in the moved subtree by the constant that restores
     /// zero reduced cost on the entering arc.
-    fn shift_potentials(&mut self, subtree: &[u32], in_s: u32, out: u32, e: usize) {
+    fn shift_potentials(&mut self, inside: u32, outside: u32, e: usize) {
         let arc = &self.arcs[e];
-        let new_pi = if arc.from == out {
-            self.pi[out as usize] - arc.cost
+        let new_pi = if arc.from == outside {
+            self.pi[outside as usize] - arc.cost
         } else {
-            self.pi[out as usize] + arc.cost
+            self.pi[outside as usize] + arc.cost
         };
-        let delta = new_pi - self.pi[in_s as usize];
-        for &v in subtree {
+        let delta = new_pi - self.pi[inside as usize];
+        let mut v = inside;
+        for _ in 0..self.subtree_size[inside as usize] {
             self.pi[v as usize] += delta;
+            v = self.thread[v as usize];
         }
     }
 
@@ -392,6 +462,12 @@ struct CycleArc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GOLDEN_FLOW_HASHES: [u64; 3] = [
+        0xe1f9_9171_53e6_a431,
+        0xbaa2_f996_6be3_f4f8,
+        0xcca0_da53_e1e7_716c,
+    ];
 
     /// A 4-node transportation problem with a unique optimum: two sources
     /// (supply +2 each at 0,1), two sinks (-2 each at 2,3), arc costs chosen so
@@ -441,5 +517,164 @@ mod tests {
         let flow = mcf.solve().expect("feasible");
         assert_eq!(flow[cheap], 2, "cheap arc saturated at cap");
         assert_eq!(flow[dear], 1, "remainder on the dearer arc");
+    }
+
+    /// SplitMix64, so the instances below need no rng crate.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A `side x side` grid of nodes plus a ground node, a pair of opposed arcs
+    /// between 4-neighbours and from every border node to ground, costs in
+    /// 1..=50, and unit supplies or demands on about a fifth of the nodes with
+    /// the ground balancing them: the shape of the unwrapper's dual graph.
+    fn grid_instance(side: usize, seed: u64) -> MinCostFlow {
+        let mut state = seed;
+        let ground = side * side;
+        let mut mcf = MinCostFlow::new(ground + 1);
+        let mut connect = |mcf: &mut MinCostFlow, a: usize, b: usize| {
+            for (from, to) in [(a, b), (b, a)] {
+                mcf.add_arc(from, to, 1 + (next(&mut state) % 50) as i64, 1_000_000);
+            }
+        };
+        for node in 0..ground {
+            let (row, col) = (node / side, node % side);
+            if col + 1 < side {
+                connect(&mut mcf, node, node + 1);
+            }
+            if row + 1 < side {
+                connect(&mut mcf, node, node + side);
+            }
+            if row == 0 || col == 0 || row + 1 == side || col + 1 == side {
+                connect(&mut mcf, node, ground);
+            }
+        }
+        let mut total = 0;
+        for node in 0..ground {
+            let supply = match next(&mut state) % 10 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            };
+            mcf.set_supply(node, supply);
+            total += supply;
+        }
+        mcf.set_supply(ground, -total);
+        mcf
+    }
+
+    fn flow_hash(flow: &[i64]) -> u64 {
+        flow.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &f| {
+            (h.rotate_left(5) ^ f as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        })
+    }
+
+    /// The pivot rule does not depend on how the spanning tree is stored, so
+    /// the flows on these instances are pinned to the values the child-list
+    /// tree produced before the thread representation replaced it (#161).
+    #[test]
+    fn flows_are_unchanged_by_the_tree_representation() {
+        let hashes: Vec<u64> = [(12, 1), (24, 2), (40, 3)]
+            .into_iter()
+            .map(|(side, seed)| flow_hash(&grid_instance(side, seed).solve().unwrap()))
+            .collect();
+        assert_eq!(hashes, GOLDEN_FLOW_HASHES, "{hashes:#x?}");
+    }
+
+    /// Check the thread arrays against the tree the parent pointers define:
+    /// the thread is one cycle through every node, `rev_thread` inverts it,
+    /// each node's true subtree is exactly the `subtree_size` nodes starting
+    /// at it and ending on `last_descendant`, and every tree arc has zero
+    /// reduced cost.
+    fn assert_tree_is_consistent(mcf: &MinCostFlow) {
+        let n = mcf.parent.len();
+        let mut order = Vec::with_capacity(n);
+        let mut v = mcf.root;
+        for _ in 0..n {
+            order.push(v);
+            assert_eq!(mcf.rev_thread[mcf.thread[v as usize] as usize], v);
+            v = mcf.thread[v as usize];
+        }
+        assert_eq!(v, mcf.root, "thread must close after every node");
+        let mut position = vec![usize::MAX; n];
+        for (at, &node) in order.iter().enumerate() {
+            assert_eq!(position[node as usize], usize::MAX, "node visited twice");
+            position[node as usize] = at;
+        }
+        let mut true_size = vec![0u32; n];
+        for node in 0..n as u32 {
+            let mut a = node;
+            while a != SENTINEL {
+                true_size[a as usize] += 1;
+                a = mcf.parent[a as usize];
+            }
+        }
+        for node in 0..n {
+            let size = mcf.subtree_size[node] as usize;
+            assert_eq!(size, true_size[node] as usize, "subtree size of {node}");
+            let end = position[node] + size;
+            assert_eq!(mcf.last_descendant[node], order[end - 1], "last of {node}");
+            let parent = mcf.parent[node];
+            if parent == SENTINEL {
+                continue;
+            }
+            let parent_start = position[parent as usize];
+            let parent_end = parent_start + mcf.subtree_size[parent as usize] as usize;
+            assert!(parent_start < position[node] && end <= parent_end);
+            let arc = &mcf.arcs[mcf.pred_arc[node] as usize];
+            assert_eq!(
+                arc.cost - mcf.pi[arc.from as usize] + mcf.pi[arc.to as usize],
+                0
+            );
+        }
+    }
+
+    /// #161: the thread, sizes and last descendants stay a valid preorder of
+    /// the parent tree after every pivot, and the result is optimal by
+    /// conservation plus complementary slackness.
+    #[test]
+    fn thread_stays_a_preorder_through_every_pivot_and_ends_optimal() {
+        let mut mcf = grid_instance(12, 7);
+        mcf.n_user = mcf.arcs.len();
+        mcf.init_basis();
+        assert_tree_is_consistent(&mcf);
+        // `run`, with the check after each pivot.
+        let m = mcf.n_user;
+        let block = ((m as f64).sqrt() as usize).max(1);
+        let (mut next, mut scanned, mut pivots) = (0, 0, 0);
+        while scanned < m {
+            match mcf.best_in_block(next, block) {
+                Some(enter) => {
+                    mcf.pivot(enter);
+                    assert_tree_is_consistent(&mcf);
+                    scanned = 0;
+                    pivots += 1;
+                }
+                None => scanned += block,
+            }
+            next = (next + block) % m;
+        }
+        assert!(
+            pivots > 100,
+            "{pivots} pivots is too few to exercise re-rooting"
+        );
+        assert!(mcf.feasible());
+
+        let mut net = mcf.supply.clone();
+        for arc in &mcf.arcs[..m] {
+            net[arc.from as usize] -= arc.flow;
+            net[arc.to as usize] += arc.flow;
+            let reduced = arc.cost - mcf.pi[arc.from as usize] + mcf.pi[arc.to as usize];
+            assert!(reduced >= 0, "an arc could still enter");
+            assert!(arc.flow == 0 || reduced == 0, "flow on a non-tight arc");
+        }
+        assert!(
+            net.iter().all(|&balance| balance == 0),
+            "flow not conserved"
+        );
     }
 }

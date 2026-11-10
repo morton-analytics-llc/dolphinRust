@@ -159,8 +159,13 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_dir_all(&scratch);
 
     let checksum = out.unwrapped.iter().copied().fold(0.0_f64, |a, b| a + b);
+    // Order-sensitive hash of every output bit pattern: equal hashes mean
+    // bit-identical output.
+    let bits_hash = out.unwrapped.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+        (h.rotate_left(5) ^ v.to_bits()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
     println!(
-        "backend={name} dense={} tile={tile} epochs={epochs} ifgs={} grid={rows}x{cols} threads={threads} wall_ms={wall_ms:.1} checksum={checksum:.3}",
+        "backend={name} dense={} tile={tile} epochs={epochs} ifgs={} grid={rows}x{cols} threads={threads} wall_ms={wall_ms:.1} checksum={checksum:.3} bits_hash={bits_hash:016x}",
         dense as u8,
         pairs.len()
     );
