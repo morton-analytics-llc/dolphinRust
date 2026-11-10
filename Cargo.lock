@@ -769,7 +769,6 @@ dependencies = [
  "dolphin-filtering",
  "dolphin-io",
  "dolphin-phaselink",
- "dolphin-ps",
  "dolphin-shp",
  "dolphin-stack",
  "dolphin-timeseries",

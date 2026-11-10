@@ -37,7 +37,7 @@ pub use loop_correction::{
     check_correction_network, correct_loop_closure_errors, LoopClosureCorrection,
     LoopCorrectionError, PixelCorrection, MAX_CORRECTION_FRACTION_CYCLES,
 };
-pub use network::{build_network, NetworkConfig};
+pub use network::{build_network, network_components, NetworkConfig};
 pub use reference::{
     reference_to_point, select_coherent_reference_point, select_reference_point, CoherentReference,
     COHERENT_SUPPORT_METHOD_VERSION,
