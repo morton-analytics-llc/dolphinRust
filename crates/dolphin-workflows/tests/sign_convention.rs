@@ -8,10 +8,11 @@
 //! against an analytically-known sign, with **no network and no oracle fixture**.
 //!
 //! Construction: a noise-free single-burst stack carrying a positive, monotonic,
-//! cycle-free LOS phase ramp `+0.3·t·(col/cols)` — range that *increases* in time
-//! away from a zero-phase reference column. Under `ref · conj(sec)` the recovered
-//! displacement at the far column is **positive**; under the reverted order it is
-//! negative. Reverting `unwrap_pair` to `pl[j]·conj(pl[i])` flips this assertion
+//! cycle-free SLC phase ramp `+0.3·t·(col/cols)` away from a zero-phase reference
+//! column. ISCE3-focused SLCs carry `exp(-j·4πR/λ)`, so rising SLC phase is range
+//! that *decreases* in time (motion toward the sensor). Under `ref · conj(sec)` the
+//! recovered displacement at the far column is **positive** (toward the sensor);
+//! under the reverted order it is negative. Reverting `unwrap_pair` to `pl[j]·conj(pl[i])` flips this assertion
 //! red (verified by hand: flip the order locally → test fails → flip back).
 
 use std::path::{Path, PathBuf};
@@ -35,8 +36,9 @@ fn snaphu_available() -> bool {
         .is_ok()
 }
 
-/// Positive, monotonic, cycle-free LOS ramp: range grows with acquisition index
-/// and with column, anchored at zero on column 0 (the reference column).
+/// Positive, monotonic, cycle-free SLC phase ramp (range shrinking under the ISCE3
+/// `exp(-j·4πR/λ)` convention) growing with acquisition index and with column,
+/// anchored at zero on column 0 (the reference column).
 fn sample(t: usize, col: usize) -> Cf32 {
     let phase = 0.3 * t as f64 * (col as f64 / COLS as f64);
     Cf32::from_polar(1.0, phase as f32)
@@ -119,7 +121,7 @@ fn displacement_sign_matches_ref_conj_sec_convention() {
     let near = out.displacement[(last, REF_ROW, 0)];
     eprintln!("sign guard: disp[far]={far:+.6e} m, disp[ref-col]={near:+.6e} m");
 
-    // Injected range *increases* away from the reference column; under the
+    // Injected SLC phase rises (range shrinks) away from the reference column; under the
     // production `ref · conj(sec)` order the recovered displacement is positive
     // there. The reverted `sec · conj(ref)` order makes this negative.
     assert!(

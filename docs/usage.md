@@ -244,8 +244,8 @@ unit vector, bands east/north/up, from the `nisar_geometry_group` radarGrid cube
 at `nisar_ellipsoidal_dem_file` heights). Each COG carries `WAVELENGTH_M`,
 `CENTER_FREQUENCY_A_HZ`, `CENTER_FREQUENCY_B_HZ`, `IONOSPHERE_METHOD` and
 `PHASE_SIGN = reference_times_conj_secondary`: positive phase is the `ref · conj(sec)` order
-of `tests/sign_convention.rs`, so an apparent range increase from reference to secondary
-is `−λ·φ / 4π`.
+of `tests/sign_convention.rs`. ISCE3-focused SLCs carry `exp(−j·4πR/λ)`, so an apparent
+range increase from reference to secondary is `+λ·φ / 4π`.
 
 `pairs.json` indexes every pair's IDs, dates, files and sha256, and adds an `interferogram`
 summary per pair:
