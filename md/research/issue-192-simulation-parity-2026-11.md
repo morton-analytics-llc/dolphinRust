@@ -53,9 +53,32 @@ radians between engines from the first ministack, where the reference rule plays
 estimate there is an eigenvector of a matrix with no signal, and dolphin's single-precision and
 dolphinRust's double-precision solves pick differently. The RMS error still agrees to 0.005 rad.
 
-## Real-data validation: frozen, not run
+## Real-data validation: run 2026-11-11, pass, no reduction measured
 
-The protocol is `issue-192-validation-protocol-2026-11.md`, frozen in commit `3ac9bd7`. It has
-not been run. The Earthdata bearer token available to this session was rejected (HTTP 401 on a
-one-byte authenticated range read of the first granule, 2026-11-10), so no sample of the site
-was fetched and neither arm was run. No metric in the protocol has a value.
+Protocol `issue-192-validation-protocol-2026-11.md`, frozen in commit `3ac9bd7` and run
+unchanged. Receipt:
+`validation/results/issue192_reference_rule/houston_t034_071054_iw3_20261110/receipt.json`.
+Houston burst T034-071054-IW3, 91 dates, 126,950 output cells valid on every date in both arms.
+
+| Frozen metric | old (`always_first_legacy`) | new (`always_first`) | rule | |
+|---|---:|---:|---|---|
+| J, junction-step roughness, mm | 1.919 | 1.926 | ≤ 1.05 × old = 2.015 | pass |
+| F_int, integer-cycle fraction | 0.1849 | 0.1842 | ≤ old + 0.002 | pass |
+| F_link, linked phase over a quarter cycle | 0.2951 | 0.2941 | ≤ old + 0.002 | pass |
+| O_mad vs OPERA DISP-S1, mm/yr | 0.414 | 0.438 | ≤ old + 0.1 | pass |
+| O_frac within 1.5 mm/yr of OPERA | 0.9354 | 0.9298 | ≥ old − 0.01 | pass |
+| G vs GNSS, mean abs error, mm/yr (3 pairs) | 0.825 | 0.720 | ≤ old + 0.25 | pass |
+
+The new rule passes. **Junction steps are not reduced** (J(new) is 0.3% above J(old); the
+protocol's bar for a reduction is 5% below). On this urban burst the two rules are the same to
+within the tolerances on every metric, which is what the simulation gives where coherence has
+a floor.
+
+Not criteria, recorded:
+
+- The control junction (date index 15) is identical in both arms (1.574 mm), and the median
+  roughness of non-junction steps is 1.391 mm in both.
+- Issue #184 flags (`cycle_steps.flagged_pixels`): 428 old, 391 new, of 155,178 cells.
+- The junctions at date indices 45 and 75 carry an integer-cycle disagreement on 51% and 37%
+  of evaluable cells **under both rules** (old 0.5067 / 0.3753, new 0.5070 / 0.3740). The
+  reference rule does not cause it and does not remove it.

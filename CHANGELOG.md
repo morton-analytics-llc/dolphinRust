@@ -165,9 +165,10 @@ All notable changes to dolphinRust are documented here. The format follows
   the value every earlier artifact carries. `JunctionStepSummary` gains `reference`, the
   resolved reference of the later ministack. Oracles: planner and four-ministack sequential
   fixtures from dolphin v0.42.9 and v0.35.0 are committed under `oracle/fixtures/`. Simulation
-  parity with dolphin v0.42.9: `md/research/issue-192-simulation-parity-2026-11.md`. The
-  real-data protocol (`md/research/issue-192-validation-protocol-2026-11.md`) is frozen and has
-  not been run.
+  parity with dolphin v0.42.9: `md/research/issue-192-simulation-parity-2026-11.md`. Real
+  data (Houston T034-071054-IW3, 91 dates, protocol
+  `md/research/issue-192-validation-protocol-2026-11.md` frozen before the run): the new rule is
+  not worse than the old on any frozen metric, and no reduction in junction steps was measured.
 
 ### Fixed
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
