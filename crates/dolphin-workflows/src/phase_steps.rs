@@ -55,6 +55,38 @@ pub struct JunctionStepSummary {
     /// exceeds a quarter cycle in magnitude: the linked phase itself disagrees
     /// with the component across the junction.
     pub fraction_linked_over_quarter_cycle: f64,
+    /// How the later ministack was referenced. `None` in records written
+    /// before issue #192, which all used the oldest carried compressed SLC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<MinistackReference>,
+}
+
+/// The reference of one ministack in its combined stack (carried compressed
+/// SLCs first, then real SLCs), as the planner resolved it. The compressed-SLC
+/// plan alone does not say this: `always_first` meant the oldest carried
+/// compressed SLC before issue #192 and the newest since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinistackReference {
+    /// Compressed SLCs carried into the ministack.
+    pub num_compressed: usize,
+    /// Position the phase-linking output was referenced to.
+    pub output_reference_idx: usize,
+    /// Position the ministack's own compressed SLC was referenced to.
+    pub compressed_reference_idx: usize,
+}
+
+impl MinistackReference {
+    /// The resolved reference of one planned ministack.
+    ///
+    /// # Errors
+    /// Returns `Err` when a planned index is outside the combined ministack.
+    pub fn of(block: &dolphin_stack::MiniStack) -> Result<Self, &'static str> {
+        Ok(Self {
+            num_compressed: block.num_compressed,
+            output_reference_idx: block.resolved_output_reference_idx()?,
+            compressed_reference_idx: block.resolved_compressed_reference_idx()?,
+        })
+    }
 }
 
 /// Ministack-junction provenance: the boundaries and their frame statistics.
@@ -233,6 +265,7 @@ fn summarize_junction(step_cycles: ArrayView2<f64>, epoch: usize) -> JunctionSte
         fraction_over_three_quarter_cycle: fraction(&|value| value.abs() > three_quarter),
         fraction_integer_cycle: fraction(&|value| value.round() != 0.0),
         fraction_linked_over_quarter_cycle: fraction(&|value| wrap_cycles(value).abs() > quarter),
+        reference: None,
     }
 }
 
@@ -259,7 +292,7 @@ mod tests {
         let plan = MiniStackPlanner {
             num_slc: 30,
             max_num_compressed: 5,
-            output_reference_idx: 0,
+            output_reference_idx: None,
             compressed_slc_plan: Default::default(),
         }
         .plan(15)
@@ -268,7 +301,7 @@ mod tests {
         let plan = MiniStackPlanner {
             num_slc: 7,
             max_num_compressed: 5,
-            output_reference_idx: 0,
+            output_reference_idx: None,
             compressed_slc_plan: Default::default(),
         }
         .plan(3)

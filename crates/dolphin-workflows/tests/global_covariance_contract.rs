@@ -2714,68 +2714,79 @@ fn production_replay_preflights_streams_jvps_and_bounds_two_parent_block_reads()
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-#[test]
-#[allow(clippy::too_many_lines)]
-fn production_two_ministack_covariance_matches_central_difference_jjt() {
-    let _hdf5 = HDF5_LOCK.lock().unwrap();
-    let cfg = SequentialConfig {
+fn central_difference_config(
+    max_num_compressed: usize,
+    half_window: usize,
+    compressed_slc_plan: CompressedSlcPlan,
+) -> SequentialConfig {
+    SequentialConfig {
         ministack_size: 2,
-        max_num_compressed: 1,
-        half_window: dolphin_core::HalfWindow { y: 0, x: 0 },
+        max_num_compressed,
+        half_window: dolphin_core::HalfWindow {
+            y: half_window,
+            x: half_window,
+        },
         strides: dolphin_core::Strides { y: 1, x: 1 },
         use_evd: true,
         beta: 0.0,
         zero_correlation_threshold: 0.0,
         output_reference_idx: 0,
-        compressed_slc_plan: CompressedSlcPlan::AlwaysFirst,
+        compressed_slc_plan,
         compute_crlb: false,
         compute_closure_phase: false,
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+    }
+}
+
+/// What [`replay_against_central_difference`] measured.
+struct CentralDifferenceReplay {
+    /// Captured operator blocks, in generation order.
+    blocks: Vec<CovarianceOperatorBlock>,
+    /// Central-difference Jacobian of the production driver's per-date phase at
+    /// the queried output: one column per (date, native pixel, real/imaginary)
+    /// source coordinate, in that order.
+    jacobian: Array2<f64>,
+    /// Replayed covariance in date order.
+    covariance: Array2<f64>,
+}
+
+/// Capture one production run, persist and reopen its operator, replay the
+/// temporal covariance of `output`, and require it to equal `J Jᵀ` of the
+/// production driver's central-difference Jacobian over every source sample.
+#[allow(clippy::too_many_lines)]
+fn replay_against_central_difference(
+    label: &str,
+    cfg: &SequentialConfig,
+    stack: &Array3<Cf64>,
+    output: usize,
+) -> CentralDifferenceReplay {
+    let (dates, rows, cols) = stack.dim();
+    let grid = CovarianceOperatorGrid {
+        row_start: 0,
+        col_start: 0,
+        rows: rows as u32,
+        cols: cols as u32,
+        stride_y: 1,
+        stride_x: 1,
     };
-    let amplitudes = [1.0, 1.2, 0.9, 1.1];
-    let phases = [0.4, 0.9, 1.25, 1.8];
-    let stack = Array3::from_shape_fn((4, 1, 1), |(date, _, _)| {
-        Cf64::from_polar(amplitudes[date], phases[date])
-    });
     let request = SequentialCovarianceCaptureRequest {
         burst_id: "finite-difference-burst".to_owned(),
         source_manifest_digest: [31; 32],
         source_model_version_digest: source_model_identity_digest(),
-        native_grid: CovarianceOperatorGrid {
-            row_start: 0,
-            col_start: 0,
-            rows: 1,
-            cols: 1,
-            stride_y: 1,
-            stride_x: 1,
-        },
-        output_grid: CovarianceOperatorGrid {
-            row_start: 0,
-            col_start: 0,
-            rows: 1,
-            cols: 1,
-            stride_y: 1,
-            stride_x: 1,
-        },
-        owned_output_grid: CovarianceOperatorGrid {
-            row_start: 0,
-            col_start: 0,
-            rows: 1,
-            cols: 1,
-            stride_y: 1,
-            stride_x: 1,
-        },
+        native_grid: grid,
+        output_grid: grid,
+        owned_output_grid: grid,
         branch_tolerance: 1e-10,
     };
     let topology = SequentialReplayTopology::plan_identified(
-        4,
-        (1, 1),
-        (1, 1),
-        1,
-        Array2::from_elem((1, 1), true).view(),
-        &cfg,
+        dates,
+        (rows, cols),
+        (rows, cols),
+        (2 * cfg.half_window.y + 1) * (2 * cfg.half_window.x + 1),
+        Array2::from_elem((rows, cols), true).view(),
+        cfg,
         scope(),
         ReplayIdNamespace {
             burst_id: request.burst_id.clone(),
@@ -2784,20 +2795,19 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
             native_origin: (0, 0),
             output_origin: (0, 0),
             owned_output_origin: (0, 0),
-            owned_output_shape: (1, 1),
+            owned_output_shape: (rows, cols),
         },
     )
     .unwrap();
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let mut blocks = Vec::new();
-    run_sequential_with_covariance_capture(stack.view(), &cfg, &engine, &request, |block| {
+    run_sequential_with_covariance_capture(stack.view(), cfg, &engine, &request, |block| {
         blocks.push(block);
         Ok(())
     })
     .unwrap();
     bind_test_factor_receipts(&mut blocks);
-    assert_eq!(blocks.len(), 2);
-    assert_eq!(blocks[1].carry_parent_ids, vec![blocks[0].block_id]);
+    assert_eq!(blocks.len(), dates.div_ceil(cfg.ministack_size));
     assert!(blocks.iter().all(|block| {
         block
             .status
@@ -2845,7 +2855,7 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         ..CovarianceOperatorMetadata::default()
     };
     let directory = std::env::temp_dir().join(format!(
-        "dolphin-workflow-finite-difference-{}",
+        "dolphin-workflow-finite-difference-{label}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
@@ -2879,7 +2889,8 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         source_model_hash: [9; 32],
     };
     let stored_blocks = blocks
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|block| (GlobalBlockId::new(block.block_id), block))
         .collect();
     let raw = CapturedProvider {
@@ -2898,10 +2909,10 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         raw,
     )
     .unwrap();
-    let selection = (0..4)
-        .map(|date| (GlobalDateId::new(date), 0))
+    let selection = (0..dates as u32)
+        .map(|date| (GlobalDateId::new(date), output))
         .collect::<Vec<_>>();
-    let source_rank = 4;
+    let source_rank = 2 * cfg.ministack_size;
     let estimate = topology
         .estimate_dependency_cone(&selection, source_rank, 1)
         .unwrap();
@@ -2920,44 +2931,36 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
 
     let epsilon = 1e-4;
     let sigma = 0.02 * std::f64::consts::FRAC_1_SQRT_2;
-    let mut jacobian = Array2::<f64>::zeros((4, 8));
-    for block in 0..2 {
-        for basis in 0..4 {
-            let date = block * 2 + basis % 2;
-            let perturbation = match basis < 2 {
-                true => Cf64::new(epsilon * sigma, 0.0),
-                false => Cf64::new(0.0, epsilon * sigma),
+    let output_pixel = (output / cols, output % cols);
+    let mut jacobian = Array2::<f64>::zeros((dates, dates * rows * cols * 2));
+    for (sample, _) in stack.indexed_iter() {
+        let (date, row, col) = sample;
+        for part in 0..2 {
+            let perturbation = match part {
+                0 => Cf64::new(epsilon * sigma, 0.0),
+                _ => Cf64::new(0.0, epsilon * sigma),
             };
             let mut plus_stack = stack.clone();
             let mut minus_stack = stack.clone();
-            plus_stack[(date, 0, 0)] += perturbation;
-            minus_stack[(date, 0, 0)] -= perturbation;
-            let plus = run_sequential(plus_stack.view(), &cfg, &engine).unwrap();
-            let minus = run_sequential(minus_stack.view(), &cfg, &engine).unwrap();
-            for output_date in 0..4 {
-                jacobian[(output_date, block * 4 + basis)] = (plus.cpx_phase[(output_date, 0, 0)]
-                    * minus.cpx_phase[(output_date, 0, 0)].conj())
-                .arg()
-                    / (2.0 * epsilon);
+            plus_stack[sample] += perturbation;
+            minus_stack[sample] -= perturbation;
+            let plus = run_sequential(plus_stack.view(), cfg, &engine).unwrap();
+            let minus = run_sequential(minus_stack.view(), cfg, &engine).unwrap();
+            let column = ((date * rows + row) * cols + col) * 2 + part;
+            for output_date in 0..dates {
+                let at = (output_date, output_pixel.0, output_pixel.1);
+                jacobian[(output_date, column)] =
+                    (plus.cpx_phase[at] * minus.cpx_phase[at].conj()).arg() / (2.0 * epsilon);
             }
         }
     }
     let oracle = jacobian.dot(&jacobian.t());
-    assert!(jacobian
-        .slice(ndarray::s![2, ..4])
-        .iter()
-        .any(|v| v.abs() > 1e-8));
-    assert!(jacobian
-        .slice(ndarray::s![2, 4..])
-        .iter()
-        .any(|v| v.abs() > 1e-8));
-    assert!(oracle[(1, 2)].abs() > 1e-10);
     for ((row, col), expected) in oracle.indexed_iter() {
         let actual = replay.covariance[(row, col)];
         let tolerance = 5e-9 + 5e-5 * expected.abs();
         assert!(
             (actual - expected).abs() <= tolerance,
-            "covariance[{row},{col}] {actual} != central-difference {expected}"
+            "{label}: covariance[{row},{col}] {actual} != central-difference {expected}"
         );
     }
     assert!(replay.covariance.row(0).iter().all(|value| *value == 0.0));
@@ -2967,6 +2970,93 @@ fn production_two_ministack_covariance_matches_central_difference_jjt() {
         .iter()
         .all(|value| *value == 0.0));
     std::fs::remove_dir_all(directory).unwrap();
+    CentralDifferenceReplay {
+        blocks,
+        jacobian,
+        covariance: replay.covariance,
+    }
+}
+
+#[test]
+fn production_two_ministack_covariance_matches_central_difference_jjt() {
+    let _hdf5 = HDF5_LOCK.lock().unwrap();
+    let cfg = central_difference_config(1, 0, CompressedSlcPlan::AlwaysFirst);
+    let amplitudes = [1.0, 1.2, 0.9, 1.1];
+    let phases = [0.4, 0.9, 1.25, 1.8];
+    let stack = Array3::from_shape_fn((4, 1, 1), |(date, _, _)| {
+        Cf64::from_polar(amplitudes[date], phases[date])
+    });
+    let measured = replay_against_central_difference("two-ministack", &cfg, &stack, 0);
+    assert_eq!(
+        measured.blocks[1].carry_parent_ids,
+        vec![measured.blocks[0].block_id]
+    );
+    let jacobian = &measured.jacobian;
+    assert!(jacobian
+        .slice(ndarray::s![2, ..4])
+        .iter()
+        .any(|v| v.abs() > 1e-8));
+    assert!(jacobian
+        .slice(ndarray::s![2, 4..])
+        .iter()
+        .any(|v| v.abs() > 1e-8));
+    assert!(measured.covariance[(1, 2)].abs() > 1e-10);
+}
+
+/// Decorrelating multi-look stack for the reference-rule tests: a common phase
+/// history plus per-pixel, per-date phase noise that grows with the date, so
+/// the oldest and the newest carried compressed SLC are differently coherent
+/// with a later ministack.
+fn decorrelating_stack(dates: usize) -> Array3<Cf64> {
+    Array3::from_shape_fn((dates, 3, 3), |(date, row, col)| {
+        let pixel = (row * 3 + col) as f64;
+        let wobble = (1.7 * pixel + 0.9 * date as f64).sin() * (0.08 + 0.05 * date as f64);
+        Cf64::from_polar(
+            1.0 + 0.07 * pixel + 0.03 * date as f64,
+            0.35 * date as f64 + 0.4 * pixel + wobble,
+        )
+    })
+}
+
+/// Issue #192. With three carried compressed SLCs the two `always_first` rules
+/// reference different components from the third ministack on (the newest
+/// carried compressed SLC against the oldest). The replay must follow the plan:
+/// under both rules the persisted operator's covariance equals the production
+/// driver's central-difference `J Jᵀ`, on a multi-look window where the
+/// reference choice changes the estimate.
+#[test]
+fn covariance_replay_follows_the_always_first_reference_rule() {
+    let _hdf5 = HDF5_LOCK.lock().unwrap();
+    let stack = decorrelating_stack(8);
+    let measure = |label: &str, plan: CompressedSlcPlan| {
+        let cfg = central_difference_config(3, 1, plan);
+        replay_against_central_difference(label, &cfg, &stack, 4)
+    };
+    let newest = measure("newest-compressed", CompressedSlcPlan::AlwaysFirst);
+    let oldest = measure("oldest-compressed", CompressedSlcPlan::AlwaysFirstLegacy);
+
+    // The persisted zero phase sits on each rule's own reference component.
+    let reference_components = |blocks: &[CovarianceOperatorBlock]| {
+        blocks
+            .iter()
+            .map(|block| {
+                let width = block.phase_components.len();
+                let output = &block.phase_angles[4 * width..5 * width];
+                output.iter().position(|angle| *angle == 0.0).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reference_components(&newest.blocks), vec![0, 0, 1, 2]);
+    assert_eq!(reference_components(&oldest.blocks), vec![0, 0, 0, 0]);
+
+    // Identical through the second ministack, different from the third on.
+    let largest_difference = |dates: std::ops::Range<usize>| {
+        dates
+            .map(|date| (newest.covariance[(date, date)] - oldest.covariance[(date, date)]).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    assert_eq!(largest_difference(0..4), 0.0);
+    assert!(largest_difference(4..8) > 1e-9);
 }
 
 #[test]

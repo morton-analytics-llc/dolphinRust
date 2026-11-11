@@ -1,0 +1,317 @@
+{
+  "schema": "dolphinrust.issue192-reference-rule-receipt/1",
+  "recipe_sha256": "32bcbfe62834023e6025f8ce84e9597e46847c58d5dc50b9aaa99cc9cb230e2a",
+  "scorer_sha256": "24e24c314dc24610d5d41fd42afe9041c46e5c6b91d094d0f7ebff00b5f8f09d",
+  "protocol": "md/research/issue-192-validation-protocol-2026-11.md",
+  "run_identity": {
+    "binary": "target/release/dolphin",
+    "binary_sha256": "8be3b893e611c8c65935465e1eb56034d863466eeb2d780a7c7dd36647c74f4c",
+    "config_overrides": {},
+    "old": {
+      "compressed_slc_plan": "always_first_legacy",
+      "config_sha256": "72e309d6ef7ca0ba9e89fcacadc7c0e8a1cc7e359f994d517a1f7ea6db643be0",
+      "elapsed_seconds": 95.466167
+    },
+    "new": {
+      "compressed_slc_plan": "always_first",
+      "config_sha256": "5ed3e02875dae6c0e40dee92799c530ae450266389b3719cb94076aeceae9173",
+      "elapsed_seconds": 84.76722
+    }
+  },
+  "plan": {
+    "recipe_sha256": "32bcbfe62834023e6025f8ce84e9597e46847c58d5dc50b9aaa99cc9cb230e2a",
+    "catalog_sha256": "9226039c94c2cf37b287c8a513cfc211ac43c8ac3e1b78c949e22c9162894045",
+    "window": {
+      "row0": 2704,
+      "col0": 1266,
+      "height": 699,
+      "width": 3996
+    }
+  },
+  "dates": 91,
+  "output_grid": {
+    "shape": [
+      233,
+      666
+    ],
+    "transform": [
+      30.0,
+      0.0,
+      255000.0,
+      0.0,
+      -30.0,
+      3303500.0
+    ],
+    "crs": "EPSG:32615"
+  },
+  "pixels": {
+    "grid": 155178,
+    "common_valid": 126950,
+    "with_opera": 125862
+  },
+  "arms": {
+    "old": {
+      "junction_roughness_mm": 1.9193881473203915,
+      "junction_roughness_by_epoch_mm": {
+        "15": 1.5744036565037278,
+        "30": 1.1870269229464818,
+        "45": 2.9665012036696186,
+        "60": 1.617290660636103,
+        "75": 2.5975447167626147,
+        "90": 1.2285772325871405
+      },
+      "non_junction_roughness_median_mm": 1.390567220598172,
+      "fraction_integer_cycle": 0.1848748198973354,
+      "fraction_linked_over_quarter_cycle": 0.29508794397499033,
+      "per_junction": [
+        {
+          "epoch": 15,
+          "evaluable_pixels": 130898,
+          "fraction_over_quarter_cycle": 0.25838439089978454,
+          "fraction_over_half_cycle": 0.03377438921908662,
+          "fraction_over_three_quarter_cycle": 0.0005958838179345751,
+          "fraction_integer_cycle": 0.03377438921908662,
+          "fraction_linked_over_quarter_cycle": 0.25778850708184997,
+          "reference": {
+            "num_compressed": 1,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 30,
+          "evaluable_pixels": 130902,
+          "fraction_over_quarter_cycle": 0.013895891583016302,
+          "fraction_over_half_cycle": 0.0004583581610670578,
+          "fraction_over_three_quarter_cycle": 7.639302684450964e-06,
+          "fraction_integer_cycle": 0.0004583581610670578,
+          "fraction_linked_over_quarter_cycle": 0.013888252280331852,
+          "reference": {
+            "num_compressed": 2,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 45,
+          "evaluable_pixels": 130203,
+          "fraction_over_quarter_cycle": 0.7429552314462801,
+          "fraction_over_half_cycle": 0.5066780335322535,
+          "fraction_over_three_quarter_cycle": 0.39087425020928857,
+          "fraction_integer_cycle": 0.5066780335322535,
+          "fraction_linked_over_quarter_cycle": 0.5226991697579932,
+          "reference": {
+            "num_compressed": 3,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 60,
+          "evaluable_pixels": 130897,
+          "fraction_over_quarter_cycle": 0.1357785128765365,
+          "fraction_over_half_cycle": 0.003980228729459041,
+          "fraction_over_three_quarter_cycle": 0.00019862945674843578,
+          "fraction_integer_cycle": 0.003980228729459041,
+          "fraction_linked_over_quarter_cycle": 0.13557988341978808,
+          "reference": {
+            "num_compressed": 4,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 75,
+          "evaluable_pixels": 130086,
+          "fraction_over_quarter_cycle": 0.6248943006933875,
+          "fraction_over_half_cycle": 0.3752825054194917,
+          "fraction_over_three_quarter_cycle": 0.2731270082868256,
+          "fraction_integer_cycle": 0.3752825054194917,
+          "fraction_linked_over_quarter_cycle": 0.49260489214827113,
+          "reference": {
+            "num_compressed": 5,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 90,
+          "evaluable_pixels": 130902,
+          "fraction_over_quarter_cycle": 0.3120273181463996,
+          "fraction_over_half_cycle": 0.03797497364440574,
+          "fraction_over_three_quarter_cycle": 0.0013750744832011733,
+          "fraction_integer_cycle": 0.03797497364440574,
+          "fraction_linked_over_quarter_cycle": 0.3106675222685673,
+          "reference": {
+            "num_compressed": 6,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        }
+      ],
+      "cycle_step_flagged_pixels": 428,
+      "opera_median_abs_mm_yr": 0.41419300207655496,
+      "opera_fraction_within": 0.9354292796872765,
+      "station_pixels": {
+        "HSMN": 25,
+        "RDCT": 25,
+        "SPBH": 25
+      },
+      "gnss_pairs": {
+        "HSMN-RDCT": {
+          "insar_mm_yr": 1.6800040796015274,
+          "gnss_mm_yr": 0.4418000000000002,
+          "error_mm_yr": 1.2382040796015272
+        },
+        "HSMN-SPBH": {
+          "insar_mm_yr": 1.9223079134508672,
+          "gnss_mm_yr": 1.3287000000000004,
+          "error_mm_yr": 0.5936079134508667
+        },
+        "RDCT-SPBH": {
+          "insar_mm_yr": 0.24230383384933932,
+          "gnss_mm_yr": 0.8869000000000002,
+          "error_mm_yr": -0.644596166150661
+        }
+      },
+      "gnss_mean_abs_mm_yr": 0.8254693864010183
+    },
+    "new": {
+      "junction_roughness_mm": 1.925744101539624,
+      "junction_roughness_by_epoch_mm": {
+        "15": 1.5744036565037278,
+        "30": 1.2299884169186504,
+        "45": 2.9498610553944125,
+        "60": 1.625946876352223,
+        "75": 2.594167671756138,
+        "90": 1.2287564872766965
+      },
+      "non_junction_roughness_median_mm": 1.390567220598172,
+      "fraction_integer_cycle": 0.18421835288204474,
+      "fraction_linked_over_quarter_cycle": 0.29405212618583715,
+      "per_junction": [
+        {
+          "epoch": 15,
+          "evaluable_pixels": 130952,
+          "fraction_over_quarter_cycle": 0.25833893334962427,
+          "fraction_over_half_cycle": 0.03394373510904759,
+          "fraction_over_three_quarter_cycle": 0.0005421833954426049,
+          "fraction_integer_cycle": 0.03394373510904759,
+          "fraction_linked_over_quarter_cycle": 0.25779674995418167,
+          "reference": {
+            "num_compressed": 1,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 30,
+          "evaluable_pixels": 130953,
+          "fraction_over_quarter_cycle": 0.014142478599192076,
+          "fraction_over_half_cycle": 0.0003283620841065115,
+          "fraction_over_three_quarter_cycle": 7.636327537360733e-06,
+          "fraction_integer_cycle": 0.0003283620841065115,
+          "fraction_linked_over_quarter_cycle": 0.014134842271654716,
+          "reference": {
+            "num_compressed": 2,
+            "output_reference_idx": 1,
+            "compressed_reference_idx": 1
+          }
+        },
+        {
+          "epoch": 45,
+          "evaluable_pixels": 130278,
+          "fraction_over_quarter_cycle": 0.7432413761341132,
+          "fraction_over_half_cycle": 0.5069850627120466,
+          "fraction_over_three_quarter_cycle": 0.3911865395538771,
+          "fraction_integer_cycle": 0.5069850627120466,
+          "fraction_linked_over_quarter_cycle": 0.522068192634213,
+          "reference": {
+            "num_compressed": 3,
+            "output_reference_idx": 2,
+            "compressed_reference_idx": 2
+          }
+        },
+        {
+          "epoch": 60,
+          "evaluable_pixels": 130953,
+          "fraction_over_quarter_cycle": 0.13459790917352027,
+          "fraction_over_half_cycle": 0.003375256771513444,
+          "fraction_over_three_quarter_cycle": 0.0001679992058219361,
+          "fraction_integer_cycle": 0.003375256771513444,
+          "fraction_linked_over_quarter_cycle": 0.13442990996769832,
+          "reference": {
+            "num_compressed": 4,
+            "output_reference_idx": 3,
+            "compressed_reference_idx": 3
+          }
+        },
+        {
+          "epoch": 75,
+          "evaluable_pixels": 130136,
+          "fraction_over_quarter_cycle": 0.6234170406344133,
+          "fraction_over_half_cycle": 0.37394725517919714,
+          "fraction_over_three_quarter_cycle": 0.27241501198745927,
+          "fraction_integer_cycle": 0.37394725517919714,
+          "fraction_linked_over_quarter_cycle": 0.4916087785086371,
+          "reference": {
+            "num_compressed": 5,
+            "output_reference_idx": 4,
+            "compressed_reference_idx": 4
+          }
+        },
+        {
+          "epoch": 90,
+          "evaluable_pixels": 130953,
+          "fraction_over_quarter_cycle": 0.3091261750398998,
+          "fraction_over_half_cycle": 0.036455827663360134,
+          "fraction_over_three_quarter_cycle": 0.0011072674929173063,
+          "fraction_integer_cycle": 0.036455827663360134,
+          "fraction_linked_over_quarter_cycle": 0.3080189075469825,
+          "reference": {
+            "num_compressed": 6,
+            "output_reference_idx": 5,
+            "compressed_reference_idx": 5
+          }
+        }
+      ],
+      "cycle_step_flagged_pixels": 391,
+      "opera_median_abs_mm_yr": 0.43836567263989545,
+      "opera_fraction_within": 0.9298279067550174,
+      "station_pixels": {
+        "HSMN": 25,
+        "RDCT": 25,
+        "SPBH": 25
+      },
+      "gnss_pairs": {
+        "HSMN-RDCT": {
+          "insar_mm_yr": 1.5214578431066865,
+          "gnss_mm_yr": 0.4418000000000002,
+          "error_mm_yr": 1.0796578431066863
+        },
+        "HSMN-SPBH": {
+          "insar_mm_yr": 1.9556391159733664,
+          "gnss_mm_yr": 1.3287000000000004,
+          "error_mm_yr": 0.6269391159733659
+        },
+        "RDCT-SPBH": {
+          "insar_mm_yr": 0.43418127286667996,
+          "gnss_mm_yr": 0.8869000000000002,
+          "error_mm_yr": -0.4527187271333203
+        }
+      },
+      "gnss_mean_abs_mm_yr": 0.7197718954044575
+    }
+  },
+  "not_worse": {
+    "junction_roughness_mm": true,
+    "fraction_integer_cycle": true,
+    "fraction_linked_over_quarter_cycle": true,
+    "opera_median_abs_mm_yr": true,
+    "opera_fraction_within": true,
+    "gnss_mean_abs_mm_yr": true
+  },
+  "gnss": "scored",
+  "junction_steps_reduced": false,
+  "verdict": "pass"
+}

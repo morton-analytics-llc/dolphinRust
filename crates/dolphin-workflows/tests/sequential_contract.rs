@@ -90,6 +90,99 @@ fn sequential_phase_history_matches_oracle() {
     assert!(max_err < 1e-3, "compressed-SLC error {max_err}");
 }
 
+/// The multi-ministack oracle run (`oracle/gen_sequential_multi.py`): four
+/// ministacks of a decorrelating stack, so up to three compressed SLCs are
+/// carried and the reference rule matters.
+fn multi_ministack_run(plan: CompressedSlcPlan) -> dolphin_workflows::SequentialOutput {
+    let stack = to_c64(
+        ndarray_npy::read_npy::<_, Array3<Cf32>>(fixtures().join("sequential_multi_slc_stack.npy"))
+            .expect("committed multi-ministack oracle stack"),
+    );
+    let cfg = SequentialConfig {
+        ministack_size: 5,
+        max_num_compressed: 10,
+        half_window: HalfWindow { y: 2, x: 2 },
+        strides: Strides { y: 1, x: 1 },
+        use_evd: false,
+        beta: 0.0,
+        zero_correlation_threshold: 0.0,
+        output_reference_idx: 0,
+        compressed_slc_plan: plan,
+        compute_crlb: false,
+        compute_closure_phase: false,
+        compute_average_coherence: false,
+        shp_method: ShpMethod::Rect,
+        shp_alpha: 0.001,
+    };
+    run_sequential(stack.view(), &cfg, &ComputeEngine::new(ComputeBackend::Cpu)).unwrap()
+}
+
+/// Worst per-pixel phase-history similarity and worst compressed-SLC error of
+/// a run against one dolphin release's fixture (`tag` is `v0429` or `v0350`).
+fn multi_ministack_agreement(out: &dolphin_workflows::SequentialOutput, tag: &str) -> (f64, f64) {
+    let load = |layer: &str| {
+        let file = fixtures().join(format!("sequential_{tag}_{layer}.npy"));
+        to_c64(
+            ndarray_npy::read_npy::<_, Array3<Cf32>>(&file)
+                .unwrap_or_else(|error| panic!("committed oracle fixture {file:?}: {error}")),
+        )
+    };
+    let phase_o = load("phase");
+    let (nslc, rows, cols) = out.cpx_phase.dim();
+    assert_eq!((nslc, rows, cols), phase_o.dim(), "phase-history shape");
+    let mut min_sim = 1.0_f64;
+    for r in 0..rows {
+        for c in 0..cols {
+            let rust: Vec<Cf64> = (0..nslc).map(|t| out.cpx_phase[(t, r, c)]).collect();
+            let orc: Vec<Cf64> = (0..nslc).map(|t| phase_o[(t, r, c)]).collect();
+            min_sim = min_sim.min(cos_sim(&rust, &orc));
+        }
+    }
+    (
+        min_sim,
+        compressed_error(&out.compressed_slcs, &load("compressed")),
+    )
+}
+
+/// Issue #192. The default `always_first` plan reproduces dolphin v0.42.9's
+/// sequential run, which references each ministack to the newest carried
+/// compressed SLC; `always_first_legacy` reproduces dolphin v0.35.0's, which
+/// references the oldest. The two releases' histories differ on this stack, and
+/// each plan matches only its own.
+#[test]
+fn always_first_plans_match_their_dolphin_release_across_four_ministacks() {
+    let newest = multi_ministack_run(CompressedSlcPlan::AlwaysFirst);
+    let oldest = multi_ministack_run(CompressedSlcPlan::AlwaysFirstLegacy);
+    assert_eq!(newest.compressed_slcs.len(), 4, "four ministacks");
+
+    for (out, tag) in [(&newest, "v0429"), (&oldest, "v0350")] {
+        let (min_sim, compressed_err) = multi_ministack_agreement(out, tag);
+        assert!(
+            min_sim > 1.0 - 1e-3,
+            "{tag}: phase-history cos-sim {min_sim}"
+        );
+        assert!(
+            compressed_err < 1e-3,
+            "{tag}: compressed-SLC error {compressed_err}"
+        );
+    }
+    for (out, tag) in [(&newest, "v0350"), (&oldest, "v0429")] {
+        let (min_sim, compressed_err) = multi_ministack_agreement(out, tag);
+        assert!(
+            min_sim < 1.0 - 1e-2 && compressed_err > 1e-2,
+            "{tag} is the other rule's oracle: cos-sim {min_sim}, compressed error {compressed_err}"
+        );
+    }
+
+    // The rules are the same function until two compressed SLCs are carried.
+    let first_two = ndarray::s![..10, .., ..];
+    assert_eq!(
+        newest.cpx_phase.slice(first_two),
+        oldest.cpx_phase.slice(first_two)
+    );
+    assert_eq!(newest.compressed_slcs[..2], oldest.compressed_slcs[..2]);
+}
+
 /// Stitched temporal coherence + concatenated CRLB/closure on a >=2-ministack
 /// stack must match dolphin v0.42 composed per `sequential.rs` (gen_stitch_v042).
 /// Closes the CRLB/closure many-ministack concatenation caveat: the same stack

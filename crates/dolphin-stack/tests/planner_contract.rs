@@ -1,10 +1,12 @@
 //! Phase-5 planner contract tests.
 //!
 //! Primary (analytic): compressed-SLC carry-forward grows by one per ministack,
-//! capped at `max_num_compressed`; the trailing batch is partial. Secondary
+//! capped at `max_num_compressed`; the trailing batch is partial; `always_first`
+//! references the newest carried compressed SLC (issue #192). Secondary
 //! (oracle): the full plan (num_compressed, num_real, output/compressed
-//! reference indices per ministack) matches dolphin v0.35.0 for several
-//! (N, size, max_compressed, plan) combos. Oracle tests skip without fixtures.
+//! reference indices per ministack) matches dolphin v0.42.9 for `always_first`
+//! and dolphin v0.35.0 for `always_first_legacy` and `first_per_ministack`, on
+//! the committed `oracle/fixtures/plan_v*.npy` (`oracle/gen_stack.py`).
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +18,7 @@ fn planner(num_slc: usize, max_num_compressed: usize, plan: CompressedSlcPlan) -
     MiniStackPlanner {
         num_slc,
         max_num_compressed,
-        output_reference_idx: 0,
+        output_reference_idx: None,
         compressed_slc_plan: plan,
     }
 }
@@ -81,16 +83,22 @@ fn reference_indices_are_checked_before_consumers_index() {
     assert!(resolve_reference_index(4, 4).is_err());
     assert!(resolve_reference_index(-1, 0).is_err());
 
-    let mut p = planner(4, 2, CompressedSlcPlan::AlwaysFirst);
-    p.output_reference_idx = -1;
+    let mut p = planner(4, 2, CompressedSlcPlan::AlwaysFirstLegacy);
+    p.output_reference_idx = Some(-1);
     let stack = p.plan(4).unwrap().remove(0);
     assert_eq!(stack.resolved_output_reference_idx().unwrap(), 3);
     assert_eq!(stack.resolved_compressed_reference_idx().unwrap(), 3);
 
-    p.output_reference_idx = -2;
-    assert!(p.plan(4).is_err());
-    p.output_reference_idx = 4;
-    assert!(p.plan(4).is_err());
+    for plan in [
+        CompressedSlcPlan::AlwaysFirst,
+        CompressedSlcPlan::AlwaysFirstLegacy,
+    ] {
+        let mut p = planner(4, 2, plan);
+        p.output_reference_idx = Some(-2);
+        assert!(p.plan(4).is_err());
+        p.output_reference_idx = Some(4);
+        assert!(p.plan(4).is_err());
+    }
 }
 
 #[test]
@@ -138,23 +146,118 @@ fn zero_carry_remains_available_to_legacy_independent_ministacks() {
     assert_eq!(resumed[0].num_compressed, 0);
 }
 
+fn reference_pairs(stacks: &[MiniStack]) -> Vec<(isize, isize)> {
+    stacks
+        .iter()
+        .map(|m| (m.output_reference_idx, m.compressed_reference_idx))
+        .collect()
+}
+
+/// Issue #192, dolphin >= v0.39 (PR #588): under `always_first` both reference
+/// indices sit on the newest carried compressed SLC, `max(0, num_compressed - 1)`,
+/// so they advance by one per ministack until `max_num_compressed` caps them.
+#[test]
+fn always_first_references_the_newest_carried_compressed_slc() {
+    let stacks = planner(25, 3, CompressedSlcPlan::AlwaysFirst)
+        .plan(5)
+        .unwrap();
+    assert_eq!(
+        stacks.iter().map(|m| m.num_compressed).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 3]
+    );
+    assert_eq!(
+        reference_pairs(&stacks),
+        vec![(0, 0), (0, 0), (1, 1), (2, 2), (2, 2)]
+    );
+
+    // A resumed tail continues the same sequence.
+    let tail = planner(10, 3, CompressedSlcPlan::AlwaysFirst)
+        .plan_with_offset(5, 3)
+        .unwrap();
+    assert_eq!(reference_pairs(&tail), vec![(2, 2), (2, 2)]);
+}
+
+/// A configured output reference moves only the phase-linking output; the
+/// compressed SLC is still formed against the newest carried one (dolphin
+/// v0.42.9 `stack.py`).
+#[test]
+fn always_first_configured_output_reference_leaves_the_compressed_reference() {
+    let mut p = planner(20, 10, CompressedSlcPlan::AlwaysFirst);
+    p.output_reference_idx = Some(2);
+    let stacks = p.plan(5).unwrap();
+    assert_eq!(
+        reference_pairs(&stacks),
+        vec![(2, 0), (2, 0), (2, 1), (2, 2)]
+    );
+}
+
+/// `always_first_legacy` keeps dolphin's rule before v0.39: both indices on the
+/// configured output index, the oldest carried compressed SLC by default.
+#[test]
+fn always_first_legacy_references_the_oldest_carried_compressed_slc() {
+    let stacks = planner(25, 3, CompressedSlcPlan::AlwaysFirstLegacy)
+        .plan(5)
+        .unwrap();
+    assert_eq!(reference_pairs(&stacks), vec![(0, 0); 5]);
+
+    let mut p = planner(20, 10, CompressedSlcPlan::AlwaysFirstLegacy);
+    p.output_reference_idx = Some(2);
+    assert_eq!(reference_pairs(&p.plan(5).unwrap()), vec![(2, 2); 4]);
+}
+
+/// The two rules can only differ once two compressed SLCs are carried.
+#[test]
+fn always_first_rules_agree_through_the_second_ministack() {
+    for max_num_compressed in [1, 5] {
+        let new = planner(45, max_num_compressed, CompressedSlcPlan::AlwaysFirst)
+            .plan(15)
+            .unwrap();
+        let legacy = planner(45, max_num_compressed, CompressedSlcPlan::AlwaysFirstLegacy)
+            .plan(15)
+            .unwrap();
+        assert_eq!(new[..2], legacy[..2]);
+        assert_eq!(new[2] == legacy[2], max_num_compressed == 1);
+    }
+}
+
 // ------------------------------- oracle (secondary) ---------------------------
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/fixtures")
 }
 
-/// (N, size, max_compressed, plan) — mirrors `oracle/gen_stack.py` COMBOS.
-fn combos() -> Vec<(usize, usize, usize, &'static str, CompressedSlcPlan)> {
+/// One `oracle/gen_stack.py` combo: the dolphin release tag in the fixture
+/// name, `(N, size, max_compressed)`, dolphin's plan name, the configured
+/// output reference, and the dolphinRust plan that release's rule maps to.
+type Combo = (
+    &'static str,
+    (usize, usize, usize),
+    &'static str,
+    Option<isize>,
+    CompressedSlcPlan,
+);
+
+/// Mirrors `oracle/gen_stack.py` COMBOS.
+fn combos() -> Vec<Combo> {
+    let new = CompressedSlcPlan::AlwaysFirst;
+    let legacy = CompressedSlcPlan::AlwaysFirstLegacy;
     vec![
-        (10, 5, 10, "always_first", CompressedSlcPlan::AlwaysFirst),
-        (12, 5, 2, "always_first", CompressedSlcPlan::AlwaysFirst),
-        (7, 3, 10, "always_first", CompressedSlcPlan::AlwaysFirst),
+        ("v0429", (10, 5, 10), "always_first", None, new),
+        ("v0429", (12, 5, 2), "always_first", None, new),
+        ("v0429", (7, 3, 10), "always_first", None, new),
+        ("v0429", (60, 15, 5), "always_first", None, new),
+        ("v0429", (20, 5, 3), "always_first", None, new),
+        ("v0429", (20, 5, 10), "always_first", Some(2), new),
+        ("v0350", (10, 5, 10), "always_first", Some(0), legacy),
+        ("v0350", (12, 5, 2), "always_first", Some(0), legacy),
+        ("v0350", (7, 3, 10), "always_first", Some(0), legacy),
+        ("v0350", (60, 15, 5), "always_first", Some(0), legacy),
+        ("v0350", (20, 5, 10), "always_first", Some(2), legacy),
         (
-            10,
-            4,
-            10,
+            "v0350",
+            (10, 4, 10),
             "first_per_ministack",
+            Some(0),
             CompressedSlcPlan::FirstPerMinistack,
         ),
     ]
@@ -184,15 +287,16 @@ fn row(m: &MiniStack) -> [i64; 4] {
 #[test]
 fn plans_match_oracle() {
     let dir = fixtures();
-    for (n, size, maxc, name, plan) in combos() {
-        let path = dir.join(format!("plan_{n}_{size}_{maxc}_{name}.npy"));
-        if !path.exists() {
-            eprintln!("skipping plan oracle ({name}): no fixtures");
-            continue;
-        }
-        let oracle: Array2<i64> = ndarray_npy::read_npy(&path).unwrap();
-        let stacks = planner(n, maxc, plan).plan(size).unwrap();
-        assert_eq!(stacks.len(), oracle.nrows(), "ministack count for {name}");
+    for (tag, (n, size, maxc), name, reference, plan) in combos() {
+        let reference_name = reference.map_or("none".to_string(), |index| index.to_string());
+        let file = format!("plan_{tag}_{n}_{size}_{maxc}_{name}_ref{reference_name}.npy");
+        // Committed fixtures: a missing one is a broken checkout, not a skip.
+        let oracle: Array2<i64> = ndarray_npy::read_npy(dir.join(&file))
+            .unwrap_or_else(|error| panic!("planner oracle fixture {file}: {error}"));
+        let mut planner = planner(n, maxc, plan);
+        planner.output_reference_idx = reference;
+        let stacks = planner.plan(size).unwrap();
+        assert_eq!(stacks.len(), oracle.nrows(), "ministack count for {file}");
         for (i, m) in stacks.iter().enumerate() {
             let want = [
                 oracle[(i, 0)],
@@ -200,7 +304,7 @@ fn plans_match_oracle() {
                 oracle[(i, 2)],
                 oracle[(i, 3)],
             ];
-            assert_eq!(row(m), want, "ministack {i} of {name}_{n}_{size}_{maxc}");
+            assert_eq!(row(m), want, "ministack {i} of {file}");
         }
     }
 }

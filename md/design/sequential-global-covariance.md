@@ -292,11 +292,16 @@ invalidates the node.
 
 ### Exact gauge and query
 
-Version 1 supports only `CompressedSlcPlan::AlwaysFirst` with `output_reference_idx=0`. Acquisition
+Version 1 supports `CompressedSlcPlan::AlwaysFirst` and `AlwaysFirstLegacy` with an unset
+`output_reference_idx`, so that a block's phase-linking and compression references are the same
+component. Acquisition
 0 has no stochastic **date/phase coordinate**, but its raw complex samples remain in the first
 block's `Source` roots. The first block removes only its phase coordinate from the estimator
-output. Its compressed SLC carries that reference recursively. Each later block references the
-first carried compressed channel, so its retained real-date phase components are already the
+output. Its compressed SLC carries that reference recursively. Each later block references one
+carried compressed channel (the newest under `AlwaysFirst`, issue #192; the oldest under
+`AlwaysFirstLegacy`), and its reduced phase vector drops that component. Either way the
+reference is a carried compressed SLC, never a retained date, so the block's retained real-date
+phase components are already the
 production recurrence in the same acquisition-0 gauge; `Date` is a deterministic selection from
 that referenced `Phase` node, not an invented physical-date anchor. The compression and phase
 operators carry the reference uncertainty through their actual shared sources. Reconstructing the
@@ -364,8 +369,9 @@ table.
 ### Supported producer scope
 
 Initial support is CPU/f64, Rect support with a fixed native validity mask, a fixed successful EVD
-or EMI branch, `CompressedSlcPlan::AlwaysFirst`, single-burst whole/tiled/bounded batch processing,
-immutable strong source IDs, exact output reference 0, partial final blocks, and a caller-supplied
+or EMI branch, `CompressedSlcPlan::AlwaysFirst` or `AlwaysFirstLegacy`, single-burst
+whole/tiled/bounded batch processing, immutable strong source IDs, an unset output reference,
+partial final blocks, and a caller-supplied
 source-factor model.
 
 GPU, EMI-to-EVD fallback, adaptive GLRT/KS support, phase-bias correction, weak source identity,

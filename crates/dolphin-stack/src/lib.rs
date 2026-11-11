@@ -90,8 +90,9 @@ pub struct MiniStackPlanner {
     pub num_slc: usize,
     /// Cap on the number of compressed SLCs carried into any ministack.
     pub max_num_compressed: usize,
-    /// Default phase-linking output reference index.
-    pub output_reference_idx: isize,
+    /// Configured phase-linking output reference index; `None` takes the
+    /// plan's default (dolphin `MiniStackPlanner.output_reference_idx`).
+    pub output_reference_idx: Option<isize>,
     /// Compressed-SLC carry-forward convention.
     pub compressed_slc_plan: CompressedSlcPlan,
 }
@@ -166,13 +167,22 @@ impl MiniStackPlanner {
 
     /// Resolve `(output_reference_idx, compressed_reference_idx)` for a ministack
     /// carrying `num_compressed` compressed SLCs, per the plan.
+    ///
+    /// `AlwaysFirst` is dolphin v0.42.9 `stack.py`: the compressed SLC is formed
+    /// against the newest carried one, and so is the output unless configured.
+    /// That count is a position because the carried compressed SLCs always lead
+    /// the combined ministack (#176).
     fn references(&self, num_compressed: usize) -> (isize, isize) {
         let ncc = num_compressed as isize;
+        let newest = (ncc - 1).max(0);
+        let configured = self.output_reference_idx;
         match self.compressed_slc_plan {
-            CompressedSlcPlan::AlwaysFirst => {
-                (self.output_reference_idx, self.output_reference_idx)
+            CompressedSlcPlan::AlwaysFirst => (configured.unwrap_or(newest), newest),
+            CompressedSlcPlan::AlwaysFirstLegacy => {
+                let oldest = configured.unwrap_or(0);
+                (oldest, oldest)
             }
-            CompressedSlcPlan::FirstPerMinistack => (self.output_reference_idx, ncc),
+            CompressedSlcPlan::FirstPerMinistack => (configured.unwrap_or(0), ncc),
             CompressedSlcPlan::LastPerMinistack => (ncc - 1, -1),
         }
     }
