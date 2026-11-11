@@ -43,12 +43,22 @@
 //! finite, and `φ_B ← φ_B − 2π·k_c`. This fixes the side band to the main
 //! band's cycles only; the main band's own per-component offset against ground
 //! truth remains and must be anchored downstream.
+//!
+//! **Side-band slips inside a component.** The side band is narrow (5 MHz) and its
+//! unwrapping can slip by whole cycles inside one main-band component, which one
+//! `k_c` per component cannot remove. [`correct_side_band_cycle_slips`] then works per
+//! pixel on `d = (φ_B − r·φ_A) / 2π`: each pixel takes the integer that brings the
+//! median of `d` over its window to the component's circular-mean cycle fraction
+//! `d₀`, and is then re-wrapped against the window median of the corrected field.
+//! It assumes the true dispersive term stays within ±½ cycle of `d₀` across a
+//! component (`±π·r/(1 − r²)` rad of ionosphere, ≈ ±36 rad at NISAR carriers).
 
 use std::collections::BTreeMap;
 use std::f64::consts::TAU;
 
 use dolphin_filtering::masked_gaussian_lowpass;
 use ndarray::{s, Array2, ArrayView2, Zip};
+use rayon::prelude::*;
 use thiserror::Error;
 
 /// Split-spectrum failures.
@@ -211,6 +221,144 @@ pub fn align_side_band_cycles(
         unwrapped_phase,
         components,
     })
+}
+
+/// Side-band phase with in-component cycle slips removed, and the per-label count of
+/// pixels that were shifted.
+#[derive(Debug, Clone)]
+pub struct SlipCorrectedSideBand {
+    /// `φ_B − 2π·k(p)` (radians); NaN where either band is NaN.
+    pub unwrapped_phase: Array2<f64>,
+    /// Label → pixels with `k(p) ≠ 0`, for labels with at least one finite pixel pair.
+    pub corrected_pixels: BTreeMap<u32, usize>,
+}
+
+/// Remove whole-cycle side-band slips per pixel within each connected component.
+///
+/// With `d = (φ_B − r·φ_A) / 2π` and `d₀` the circular mean of `d` over the pixel's
+/// component (the cycle fraction every slip-free pixel shares, whatever the slipped
+/// share), `k₁ = round(median_w(d) − d₀)` and then `k₂ = round(d − k₁ − median_w(d − k₁))`,
+/// `φ_B ← φ_B − 2π·(k₁ + k₂)`. `median_w` is the median over the
+/// `(2·half_window[0] + 1) × (2·half_window[1] + 1)` window `[rows, cols]`, using finite
+/// pixels of the same label only. The first pass assigns regions; the second fixes their
+/// corners, where a region fills less than half the window, and leaves noise under ½ cycle
+/// unchanged.
+///
+/// # Errors
+/// [`SplitSpectrumError::ShapeMismatch`] / [`SplitSpectrumError::LabelShapeMismatch`]
+/// when the grids differ; [`SplitSpectrumError::InvalidFrequencies`] for unusable
+/// center frequencies.
+pub fn correct_side_band_cycle_slips(
+    main: &BandPhase,
+    side: &BandPhase,
+    labels: ArrayView2<u32>,
+    half_window: [usize; 2],
+) -> Result<SlipCorrectedSideBand, SplitSpectrumError> {
+    let (main_dim, side_dim) = (main.unwrapped_phase.dim(), side.unwrapped_phase.dim());
+    if main_dim != side_dim {
+        return Err(SplitSpectrumError::ShapeMismatch {
+            main: main_dim,
+            side: side_dim,
+        });
+    }
+    if labels.dim() != side_dim {
+        return Err(SplitSpectrumError::LabelShapeMismatch {
+            labels: labels.dim(),
+            phase: side_dim,
+        });
+    }
+    let r = frequency_ratio(main.center_frequency_hz, side.center_frequency_hz)?;
+    let cycles = Zip::from(&main.unwrapped_phase)
+        .and(&side.unwrapped_phase)
+        .map_collect(|&phi_a, &phi_b| (phi_b - r * phi_a) / TAU);
+    let fraction = circular_mean_fraction(&cycles, labels);
+    let first = Zip::from(&local_median(&cycles, labels, half_window))
+        .and(&labels)
+        .map_collect(|&median, label| match fraction.get(label) {
+            Some(&d0) if median.is_finite() => (median - d0).round(),
+            _ => 0.0,
+        });
+    let shifted = &cycles - &first;
+    let second = Zip::from(&shifted)
+        .and(&local_median(&shifted, labels, half_window))
+        .map_collect(|&value, &median| match (value - median).round() {
+            k if k.is_finite() => k,
+            _ => 0.0,
+        });
+    let total = first + second;
+    let mut corrected_pixels: BTreeMap<u32, usize> =
+        fraction.keys().map(|&label| (label, 0)).collect();
+    Zip::from(&total)
+        .and(&labels)
+        .and(&cycles)
+        .for_each(|&k, label, value| {
+            if k != 0.0 && value.is_finite() {
+                *corrected_pixels.entry(*label).or_default() += 1;
+            }
+        });
+    let unwrapped_phase = Zip::from(&side.unwrapped_phase)
+        .and(&total)
+        .map_collect(|&phase, &k| phase - TAU * k);
+    Ok(SlipCorrectedSideBand {
+        unwrapped_phase,
+        corrected_pixels,
+    })
+}
+
+/// Per label, the circular mean of `values` (cycles) as a fraction in (−½, ½].
+fn circular_mean_fraction(values: &Array2<f64>, labels: ArrayView2<u32>) -> BTreeMap<u32, f64> {
+    let mut sums: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
+    Zip::from(values).and(&labels).for_each(|&value, &label| {
+        if value.is_finite() {
+            let entry = sums.entry(label).or_default();
+            entry.0 += (TAU * value).sin();
+            entry.1 += (TAU * value).cos();
+        }
+    });
+    sums.into_iter()
+        .map(|(label, (sin, cos))| (label, sin.atan2(cos) / TAU))
+        .collect()
+}
+
+/// Median of the finite same-label pixels in each `half_window = [rows, cols]` window;
+/// NaN where the centre pixel is not finite.
+fn local_median(
+    values: &Array2<f64>,
+    labels: ArrayView2<u32>,
+    half_window: [usize; 2],
+) -> Array2<f64> {
+    let (rows, cols) = values.dim();
+    let median_at = |row: usize, col: usize| -> f64 {
+        let label = labels[(row, col)];
+        let (r0, r1) = (
+            row.saturating_sub(half_window[0]),
+            (row + half_window[0] + 1).min(rows),
+        );
+        let (c0, c1) = (
+            col.saturating_sub(half_window[1]),
+            (col + half_window[1] + 1).min(cols),
+        );
+        let mut window: Vec<f64> = Zip::from(values.slice(s![r0..r1, c0..c1]))
+            .and(labels.slice(s![r0..r1, c0..c1]))
+            .fold(Vec::new(), |mut acc, &value, &other| {
+                if value.is_finite() && other == label {
+                    acc.push(value);
+                }
+                acc
+            });
+        median(&mut window)
+    };
+    let flat: Vec<f64> = (0..rows)
+        .into_par_iter()
+        .flat_map_iter(|row| {
+            (0..cols).map(move |col| match values[(row, col)].is_finite() {
+                true => median_at(row, col),
+                false => f64::NAN,
+            })
+        })
+        .collect();
+    Array2::from_shape_vec((rows, cols), flat)
+        .unwrap_or_else(|_| Array2::from_elem((rows, cols), f64::NAN))
 }
 
 /// `(φ_B − r·φ_A) / 2π` at every pixel with both bands finite, grouped by label.

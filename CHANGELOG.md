@@ -77,9 +77,17 @@ All notable changes to dolphinRust are documented here. The format follows
   (e.g. 5 m × 40 m); the previous single σ from the geometric-mean spacing made the filter
   about 2.8× too narrow along y and 2.8× too wide along x there. On a 5 m × 40 m grid a
   sinusoid at the cutoff wavelength comes out at the half-power gain 1/√2 along both axes.
-  Known limit: B is aligned and filtered on A's component labels only; a B unwrapping
-  error that does not follow an A component boundary is not corrected (intersecting the A
-  and B label maps is not implemented).
+  B unwrapping slips that do not follow an A component boundary are removed per pixel
+  (`correct_side_band_cycle_slips`): with `d = (φ_B − r·φ_A)/2π` and `d₀` the component's
+  circular-mean cycle fraction, `k₁ = round(median_w(d) − d₀)`, then a re-wrap against the
+  window median of the corrected field, over a ±100 m window of same-component pixels.
+  `side_band_cycle_alignment` gains `cycle_slip_pixel_count`. A half-component one-cycle
+  slip plus a two-cycle island under ±0.6 rad noise is restored to 1e-9 rad. On a real
+  dual-band 12-day pair one in-component B slip had left a 72 rad step (low-passed
+  ionosphere std 34 rad, about ten times the expected deformation phase); with the
+  correction the std is 0.45 rad over the same 51% in-component area. Intersecting the A and
+  B label maps instead also removed the step but kept only 5.6% of the scene, because
+  SNAPHU leaves most of B at label 0.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is

@@ -217,16 +217,26 @@ product without `frequencyB` is refused. Per pair:
    `k_c = round(median((φ_B − r·φ_A) / 2π))`, `r = f_B / f_A`, over the pixels where both
    bands are finite: `φ_B ← φ_B − 2π·k_c`. Without it, one slip in B adds a constant
    `2π·r / (1 − r²)` rad to that component's ionosphere estimate.
-5. **Split-spectrum estimate.** Ionospheric phase in the A interferogram:
+5. **Per-pixel side-band slip correction.** The narrow side band can also slip by whole
+   cycles *inside* one A component (SNAPHU unwraps B with A's coherence, so it rarely
+   puts a component boundary there), which one `k_c` cannot remove; on real data a
+   single such slip leaves a ≈ 73 rad step in the estimate. With `d = (φ_B − r·φ_A)/2π`
+   and `d₀` the component's circular-mean cycle fraction, each pixel is shifted by
+   `k₁ = round(median_w(d) − d₀)`, then re-wrapped against the window median of the
+   corrected field, `k₂ = round(d − k₁ − median_w(d − k₁))`. The window is ±100 m in
+   each axis (in that axis's pixels, at least one), same-component finite pixels only.
+   This assumes the true dispersive term stays within ±½ cycle of `d₀` over a
+   component (`±π·r/(1 − r²)` rad, ≈ ±36 rad at NISAR carriers).
+6. **Split-spectrum estimate.** Ionospheric phase in the A interferogram:
    `φ_iono = r / (1 − r²) · (φ_B − r·φ_A)`, from the bands' `centerFrequency`.
-6. **Masked anisotropic low-pass.** `φ_iono` is smoothed by normalized convolution
+7. **Masked anisotropic low-pass.** `φ_iono` is smoothed by normalized convolution
    (`G∗(x·m) / G∗m`) with a Gaussian whose half-power wavelength is
    `ionosphere_lowpass_wavelength_m`, applied to each component separately so offsets never
    bleed across component edges. σ is set per axis from the grid's y and x pixel spacings,
    so the response is isotropic on the ground even when pixels are not square. A pixel whose
    kernel holds less than a quarter of its mass on finite pixels of its own component is
    NaN (straight edges and convex corners are kept; thin slivers and small islands drop).
-7. **Correction.** `corrected = unwrapped − ionosphere` (A, radians).
+8. **Correction.** `corrected = unwrapped − ionosphere` (A, radians).
 
 Outputs per pair (`<layer>_<refYYYYMMDD>_<secYYYYMMDD>.tif`): `unwrapped`, `ionosphere`,
 `corrected`, `coherence`, `connected_components`; once per run `los_enu.tif` (ground→sensor
@@ -246,11 +256,12 @@ summary per pair:
 | `median_coherence` | median finite coherence |
 | `ionosphere_std_rad` | population std of the finite low-passed ionosphere (rad) |
 | `in_component_fraction` | fraction of valid pixels inside an A component (label ≠ 0); only these carry `ionosphere` and `corrected` |
-| `side_band_cycle_alignment` | per A component: `component`, the cycle shift `k` removed from B, and the `pixel_count` it was estimated over |
+| `side_band_cycle_alignment` | per A component: `component`, the cycle shift `k` removed from B, the `pixel_count` it was estimated over, and `cycle_slip_pixel_count`, the pixels shifted further by the per-pixel slip correction |
 
 A low `in_component_fraction` means most of the scene was left unwrapped-but-unlabelled
 (typically decorrelation) and has no corrected phase; a nonzero `k` is expected and records
-an inter-band SNAPHU offset that was removed.
+an inter-band SNAPHU offset that was removed. A large `cycle_slip_pixel_count` records
+B unwrapping slips inside the component that were removed.
 
 ```yaml
 mode: interferogram

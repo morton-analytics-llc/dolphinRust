@@ -110,8 +110,8 @@ cargo build --release
 `dolphin pairs --config pairs.yaml` writes dated pairwise products instead of a time series.
 With `mode: interferogram` on dual-band NISAR GSLCs it forms per-pair unwrapped
 interferograms corrected for the ionosphere by split-spectrum: side-band cycles aligned to
-the main band per connected component, label-0 pixels masked, and a masked anisotropic
-low-pass within each component. `pairs.json` records `in_component_fraction` and
+the main band per connected component and then per pixel (for side-band slips inside a
+component), label-0 pixels masked, and a masked anisotropic low-pass within each component. `pairs.json` records `in_component_fraction` and
 `side_band_cycle_alignment` per pair; rasters carry
 `PHASE_SIGN = reference_times_conj_secondary`. See
 [docs/usage.md](docs/usage.md) §3b.

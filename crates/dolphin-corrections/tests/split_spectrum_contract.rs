@@ -5,13 +5,15 @@
 //! dispersive term at `f_A`, a `2π` side-band slip must shift it by the
 //! documented constant, and a missing side band must be refused. Per-component
 //! side-band cycle offsets (+1 and −2 planted in two components) must be found
-//! and removed before estimation.
+//! and removed before estimation. Side-band slips *inside* one component (half the
+//! component one cycle off, an island two cycles off, plus noise) must be found per
+//! pixel and removed.
 
 use std::f64::consts::TAU;
 
 use dolphin_corrections::split_spectrum::{
-    align_side_band_cycles, estimate_ionosphere, lowpass_ionosphere, side_band_cycle_offset,
-    BandPhase, ComponentCycles, SplitSpectrumError,
+    align_side_band_cycles, correct_side_band_cycle_slips, estimate_ionosphere, lowpass_ionosphere,
+    side_band_cycle_offset, BandPhase, ComponentCycles, SplitSpectrumError,
 };
 use ndarray::Array2;
 
@@ -108,6 +110,41 @@ fn planted_side_band_cycle_offsets_are_removed_per_component() {
     let squared: f64 = (&estimate - &ionosphere_at_main()).mapv(|e| e * e).sum();
     let rms = (squared / estimate.len() as f64).sqrt();
     assert!(rms < 0.01, "ionosphere residual RMS {rms} rad");
+}
+
+#[test]
+fn side_band_cycle_slips_inside_one_component_are_removed_per_pixel() {
+    // One component. The right half of the side band is +1 cycle off (an even split,
+    // so no component-wide median can pick a side), a 6×6 island −2 cycles, and every
+    // side-band pixel carries ±0.6 rad of deterministic noise.
+    let labels = Array2::from_elem((ROWS, COLS), 1_u32);
+    let planted = |r: usize, c: usize| match (r, c) {
+        (8..14, 4..10) => -2.0,
+        (_, c) if c >= COLS / 2 => 1.0,
+        _ => 0.0,
+    };
+    let noise = |r: usize, c: usize| {
+        0.6 * ((r as f64 * 12.9898 + c as f64 * 78.233).sin() * 43_758.545).fract()
+    };
+    let phase_a = band_phase(MAIN_HZ);
+    let phase_b = band_phase(SIDE_HZ);
+    let noisy_b = Array2::from_shape_fn((ROWS, COLS), |(r, c)| phase_b[(r, c)] + noise(r, c));
+    let slipped_b =
+        Array2::from_shape_fn((ROWS, COLS), |(r, c)| noisy_b[(r, c)] + TAU * planted(r, c));
+    let main = band(&phase_a, MAIN_HZ);
+
+    let fixed =
+        correct_side_band_cycle_slips(&main, &band(&slipped_b, SIDE_HZ), labels.view(), [2, 2])
+            .unwrap();
+    let slipped_pixels = ROWS * COLS / 2 + 36;
+    assert_eq!(fixed.corrected_pixels.get(&1), Some(&slipped_pixels));
+    let max_error = (&fixed.unwrapped_phase - &noisy_b)
+        .iter()
+        .fold(0.0_f64, |acc, e| acc.max(e.abs()));
+    assert!(
+        max_error < 1e-9,
+        "side band not restored: max |Δφ_B| {max_error}"
+    );
 }
 
 #[test]

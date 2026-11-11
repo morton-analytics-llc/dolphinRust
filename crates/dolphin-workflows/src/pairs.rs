@@ -10,7 +10,8 @@
 //! `mode: interferogram` (NISAR GSLC only) forms the `frequencyA` (main band) and
 //! `frequencyB` (side band) interferograms `ref · conj(sec)`, multilooks A onto the B grid,
 //! unwraps both with SNAPHU, aligns B's integer cycles to A within each A connected
-//! component ([`align_side_band_cycles`]), estimates the ionosphere in the A
+//! component ([`align_side_band_cycles`]) and then per pixel
+//! ([`correct_side_band_cycle_slips`], for B slips inside a component), estimates the ionosphere in the A
 //! interferogram by split-spectrum ([`dolphin_corrections::split_spectrum`]), low-pass
 //! filters it within each component and subtracts it from A. Per pair it writes `unwrapped` (A), `ionosphere`, `corrected`
 //! (`unwrapped − ionosphere`), `coherence` (A, `half_window` with strides equal to the
@@ -32,7 +33,7 @@
 //!   north, up, on the output grid.
 //! - `pairs.json`: the run index listing every pair's IDs, dates, files and sha256;
 //!   interferogram mode adds each pair's summary, including the per-component side-band
-//!   cycle shift `k` and its pixel count.
+//!   cycle shift `k`, its pixel count and the number of pixels shifted per pixel.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -42,7 +43,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_core::{BlockIndices, Cf32, Cf64, HalfWindow, Strides};
 use dolphin_corrections::split_spectrum::{
-    align_side_band_cycles, estimate_ionosphere, lowpass_ionosphere, BandPhase, ComponentCycles,
+    align_side_band_cycles, correct_side_band_cycle_slips, estimate_ionosphere, lowpass_ionosphere,
+    BandPhase, ComponentCycles,
 };
 use dolphin_io::geometry::read_nisar_los_layers_for_grid;
 use dolphin_io::nisar::{read_nisar_band_metadata, NisarBandMetadata};
@@ -76,6 +78,10 @@ pub const LOS_ENU_FILENAME: &str = "los_enu.tif";
 
 /// `IONOSPHERE_METHOD` tag value.
 const IONOSPHERE_METHOD: &str = "split_spectrum_main_side_band";
+
+/// Half-width (m) of the window whose median assigns per-pixel side-band cycle slips;
+/// converted to pixels per axis from the output grid spacing (at least one pixel).
+const SLIP_MEDIAN_HALF_WIDTH_M: f64 = 100.0;
 
 /// `PHASE_SIGN` tag value: the `tests/sign_convention.rs` interferogram order.
 const PHASE_SIGN: &str = "reference_times_conj_secondary";
@@ -262,16 +268,9 @@ pub struct SideBandCycleAlignment {
     pub k: i64,
     /// Pixels with both bands valid, over which `k` was estimated.
     pub pixel_count: usize,
-}
-
-impl From<ComponentCycles> for SideBandCycleAlignment {
-    fn from(entry: ComponentCycles) -> Self {
-        Self {
-            component: entry.component,
-            k: entry.k,
-            pixel_count: entry.pixel_count,
-        }
-    }
+    /// Pixels then shifted by a further whole number of cycles for a side-band slip
+    /// inside the component ([`correct_side_band_cycle_slips`]).
+    pub cycle_slip_pixel_count: usize,
 }
 
 /// One written pair layer.
@@ -1083,8 +1082,9 @@ fn unwrap_band(
 }
 
 /// Low-passed split-spectrum ionosphere in the main-band interferogram (radians), with
-/// the side band first aligned to the main band's cycles per main-band component and
-/// the low-pass applied within each component. Pixels outside every component (SNAPHU
+/// the side band first aligned to the main band's cycles per main-band component, then
+/// cleared of whole-cycle slips per pixel inside each component, and the low-pass
+/// applied within each component. Pixels outside every component (SNAPHU
 /// label 0) are NaN: their unwrapping is unreliable and no single offset holds there.
 /// Components come from the main band: it is the written `connected_components` layer
 /// and, multilooked from the wider band, the better-unwrapped of the two.
@@ -1094,7 +1094,7 @@ fn split_spectrum_ionosphere(
     main_unwrapped: &Array2<f64>,
     side_unwrapped: &Array2<f64>,
     components: &Array2<f32>,
-) -> Result<(Array2<f64>, Vec<ComponentCycles>)> {
+) -> Result<(Array2<f64>, Vec<SideBandCycleAlignment>)> {
     // Nodata labels are NaN and cast to 0; both are outside every component.
     let labels = components.mapv(|label| label as u32);
     let (main_in_component, side_in_component) = (
@@ -1111,13 +1111,25 @@ fn split_spectrum_ionosphere(
     };
     let aligned = align_side_band_cycles(&main, &side, labels.view())
         .context("aligning frequencyB cycles to frequencyA")?;
+    let gt = grid.geo.geotransform;
+    let pixel_spacing_m = [gt[5].abs(), gt[1].abs()];
+    let half_window = pixel_spacing_m
+        .map(|spacing| ((SLIP_MEDIAN_HALF_WIDTH_M / spacing).round() as usize).max(1));
+    let slip_free = correct_side_band_cycle_slips(
+        &main,
+        &BandPhase {
+            unwrapped_phase: aligned.unwrapped_phase.view(),
+            ..side
+        },
+        labels.view(),
+        half_window,
+    )
+    .context("correcting frequencyB cycle slips")?;
     let side = BandPhase {
-        unwrapped_phase: aligned.unwrapped_phase.view(),
+        unwrapped_phase: slip_free.unwrapped_phase.view(),
         ..side
     };
     let raw = estimate_ionosphere(&main, Some(&side)).context("split-spectrum ionosphere")?;
-    let gt = grid.geo.geotransform;
-    let pixel_spacing_m = [gt[5].abs(), gt[1].abs()];
     let lowpassed = lowpass_ionosphere(
         raw.view(),
         labels.view(),
@@ -1125,7 +1137,21 @@ fn split_spectrum_ionosphere(
         pixel_spacing_m,
     )
     .context("low-pass filtering the ionosphere")?;
-    Ok((lowpassed, aligned.components))
+    let alignment = aligned
+        .components
+        .iter()
+        .map(|entry: &ComponentCycles| SideBandCycleAlignment {
+            component: entry.component,
+            k: entry.k,
+            pixel_count: entry.pixel_count,
+            cycle_slip_pixel_count: slip_free
+                .corrected_pixels
+                .get(&entry.component)
+                .copied()
+                .unwrap_or(0),
+        })
+        .collect();
+    Ok((lowpassed, alignment))
 }
 
 /// `phase` with every pixel outside a SNAPHU connected component (label 0) set to NaN.
@@ -1150,7 +1176,7 @@ fn in_component_fraction(components: &Array2<f32>) -> Option<f64> {
 }
 
 /// Pair summary over finite pixels.
-fn summarize(layers: &PairLayers, alignment: &[ComponentCycles]) -> InterferogramSummary {
+fn summarize(layers: &PairLayers, alignment: &[SideBandCycleAlignment]) -> InterferogramSummary {
     let finite = |values: &Array2<f32>| -> Vec<f64> {
         values
             .iter()
@@ -1184,7 +1210,7 @@ fn summarize(layers: &PairLayers, alignment: &[ComponentCycles]) -> Interferogra
         median_coherence: median,
         ionosphere_std_rad: (!ionosphere.is_empty()).then(|| variance.sqrt()),
         in_component_fraction: in_component_fraction(&layers.connected_components),
-        side_band_cycle_alignment: alignment.iter().copied().map(Into::into).collect(),
+        side_band_cycle_alignment: alignment.to_vec(),
     }
 }
 
