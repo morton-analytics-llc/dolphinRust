@@ -241,6 +241,7 @@ type Combo = (
 fn combos() -> Vec<Combo> {
     let new = CompressedSlcPlan::AlwaysFirst;
     let legacy = CompressedSlcPlan::AlwaysFirstLegacy;
+    let last = CompressedSlcPlan::LastPerMinistack;
     vec![
         ("v0429", (10, 5, 10), "always_first", None, new),
         ("v0429", (12, 5, 2), "always_first", None, new),
@@ -248,6 +249,8 @@ fn combos() -> Vec<Combo> {
         ("v0429", (60, 15, 5), "always_first", None, new),
         ("v0429", (20, 5, 3), "always_first", None, new),
         ("v0429", (20, 5, 10), "always_first", Some(2), new),
+        ("v0429", (4, 4, 10), "last_per_ministack", None, last),
+        ("v0429", (4, 4, 10), "last_per_ministack", Some(2), last),
         ("v0350", (10, 5, 10), "always_first", Some(0), legacy),
         ("v0350", (12, 5, 2), "always_first", Some(0), legacy),
         ("v0350", (7, 3, 10), "always_first", Some(0), legacy),
@@ -273,6 +276,17 @@ fn last_per_ministack_is_refused_across_multiple_ministacks() {
     let single = planner(4, 10, plan).plan(4).unwrap();
     assert_eq!(single.len(), 1);
     assert_eq!(single[0].num_compressed, 0);
+}
+
+/// Issue #206, dolphin v0.42.9 `stack.py`: the one ministack `last_per_ministack`
+/// allows carries no compressed SLC, so its output reference is index 0 (the
+/// configured index when set); only the compressed SLC is formed against the last.
+#[test]
+fn single_last_per_ministack_outputs_against_the_first_slc() {
+    let mut p = planner(4, 10, CompressedSlcPlan::LastPerMinistack);
+    assert_eq!(reference_pairs(&p.plan(4).unwrap()), vec![(0, -1)]);
+    p.output_reference_idx = Some(2);
+    assert_eq!(reference_pairs(&p.plan(4).unwrap()), vec![(2, -1)]);
 }
 
 fn row(m: &MiniStack) -> [i64; 4] {
