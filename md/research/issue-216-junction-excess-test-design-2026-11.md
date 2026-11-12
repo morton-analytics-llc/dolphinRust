@@ -134,3 +134,27 @@ ministack (`dolphin-stack` `plan_with_offset`, #164), as dolphin ≥ v0.40 `stac
 remaining plan that changes the carried reference, `first_per_ministack` (each ministack's
 compressed SLC formed against its first real date; output against the oldest carried
 compressed SLC). The C2 rule is unchanged with this R.
+
+## Addendum 2, 2026-11-12: M6 made concrete, after C4 was scored and before dolphin was run
+
+C4 holds (scored). M6 was written without a statistic; it is fixed here before dolphin is
+run. dolphin v0.42.9 (tag `v0.42.9`, 6edd7e1, source on `PYTHONPATH` over the v0.42.0 oracle
+environment, as `oracle/gen_sequential_multi.py` documents) runs
+`workflows.sequential.run_wrapped_phase_sequential` on the same 91 cropped CSLCs
+(`/data/VV`) with the recipe's phase-linking configuration: ministack 15, max 10
+compressed, half-window (6, 12), strides (3, 6), `shp_method: rect`, EMI, beta 0,
+zero-correlation threshold 0, `always_first`, no PS mask. Its `linked_phase` rasters
+are on the engine's output grid.
+
+The engine writes no linked-phase raster, but its network is closure-exact (nearest-2
+from the linked phase), so the wrapped published step `wrap(step_k)` is the wrapped
+linked-phase step. dolphin's is `wrap(arg(L_k · conj(L_{k−1})))` in cycles. Per step,
+`δ(k) = wrap(w_A0(k) − w_D(k) − c_k)` with `c_k` the circular mean of the difference over
+cells finite in both (the date's constant reference).
+
+- **M6a** — at each junction `k ∈ J0`, over the A0 over-half cells `F_k`, the fraction with
+  `|δ| > 0.25` cycle, pooled over J0. **Estimator property** if ≤ 0.2 (dolphin carries the
+  same junction step at the same cells); **port defect** if ≥ 0.5. Between: reported as
+  measured.
+- **M6b** — context: the fraction of all common cells with `|δ| > 0.25` at junction steps
+  and at ordinary steps (median, p95), the agreement floor between the two processors.
