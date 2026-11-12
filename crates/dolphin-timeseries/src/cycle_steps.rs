@@ -238,9 +238,11 @@ fn date_step_cycles(series: ArrayView3<f64>, k: usize) -> Array2<f64> {
     step / std::f64::consts::TAU
 }
 
-/// Each pixel's step minus the median step of its qualifying neighbours; NaN
-/// where the pixel is not judged.
-fn neighbourhood_residuals(
+/// Each pixel's step minus the median step of its qualifying neighbours: the
+/// finite steps within `half_window` that share its non-zero label, at least
+/// [`MIN_CYCLE_STEP_NEIGHBOURS`] of them. NaN where the pixel is not judged.
+#[must_use]
+pub fn neighbourhood_residuals(
     step: ArrayView2<f64>,
     labels: ArrayView2<u32>,
     half_window: usize,

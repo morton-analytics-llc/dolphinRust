@@ -1340,8 +1340,9 @@ fn scale_velocity_terms(terms: &VelocityTerms, phase_to_disp: f64) -> VelocityTe
 /// it is invisible to the wrapped closure-phase layer (#24).
 const JUNCTION_STEP_NOTE: &str = "Per-pixel phase step from the last date of one ministack to the \
 first of the next, on the inverted series before corrections and the spatial reference, minus \
-the median step of the pixel's unwrap connected component. Its fractional part is the wrapped \
-linked-phase step; a whole number of cycles is the unwrapper's integer. Diagnostic only.";
+the median step of the pixels of its unwrap connected component within a neighbourhood three \
+look windows wide. Its fractional part is the wrapped linked-phase step; a whole number of \
+cycles is an integer-cycle disagreement with its surroundings. Diagnostic only.";
 
 const CYCLE_STEP_FLAG_NOTE: &str = "Number of dates at which the pixel's phase step into the date \
 differed from the median step of its unwrap connected component within a 5x5 neighbourhood by a \
@@ -1379,7 +1380,12 @@ fn phase_step_diagnostics(
         .map_err(anyhow::Error::msg)?;
     let epochs = junction_epochs(&plan);
     let components = step_components(pairs, connected_components, series);
-    let mut junctions = junction_steps(series, components.view(), &epochs);
+    let mut junctions = junction_steps(
+        series,
+        components.view(),
+        &epochs,
+        junction_cycle_step_half_window(cfg),
+    );
     for (junction, block) in junctions.iter_mut().zip(plan.iter().skip(1)) {
         junction.summary.reference =
             Some(MinistackReference::of(block).map_err(anyhow::Error::msg)?);
@@ -2173,6 +2179,7 @@ fn emit_displacement(
     );
     geometry_provenance.ministack_junctions = Some(JunctionProvenance {
         ministack_size: cfg.phase_linking.ministack_size,
+        half_window: spatial.cycle_steps.junction_half_window,
         junctions: spatial
             .junctions
             .iter()
@@ -6355,8 +6362,8 @@ mod tests {
         assert_eq!(cycle_steps.half_window, DEFAULT_CYCLE_STEP_HALF_WINDOW);
         assert_eq!(cycle_steps.junction_epochs, vec![2]);
         assert_eq!(
-            cycle_steps.junction_half_window,
-            junction_cycle_step_half_window(&cfg)
+            [cycle_steps.junction_half_window, junctions.half_window],
+            [junction_cycle_step_half_window(&cfg); 2]
         );
         let epochs: Vec<usize> = cycle_steps.per_date.iter().map(|d| d.epoch).collect();
         assert_eq!(epochs, vec![1, 2, 3]);
