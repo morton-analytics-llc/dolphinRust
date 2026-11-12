@@ -34,7 +34,10 @@
 //! same estimator in dolphin v0.35.0 (`workflows/single.py`
 //! `run_wrapped_phase_single` + `phase_link/_compress.py` `compress`) produces
 //! the same junction steps on the same input, so they are a property of the
-//! sequential estimator, not of this port. The plain rule misses them twice: a
+//! sequential estimator, not of this port. On Houston T034-071054-IW3 (#216)
+//! dolphin v0.42.9 reproduces the linked-phase junction step at 360 of 365
+//! flagged cells, the excess moves with the ministack boundary, and one ministack
+//! removes it. The plain rule misses them twice: a
 //! 5x5 median moves with a patch that fills most of the window, and a 0.6-cycle
 //! residual is not within a quarter cycle of a whole one.
 //!
