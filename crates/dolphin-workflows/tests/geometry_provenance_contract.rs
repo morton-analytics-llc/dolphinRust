@@ -302,6 +302,34 @@ fn each_correction_source_adds_its_own_stable_name() {
     );
 }
 
+/// Issue #195: `apply_native_input_masks` on OPERA inputs applies the STATIC
+/// `/data/layover_shadow_mask` at publication, the same layer
+/// `layover_shadow_mask_files` supplies before phase linking, so it discloses
+/// under the same name, once. NISAR's native mask is a different quality layer.
+#[test]
+fn native_opera_input_mask_counts_as_the_layover_shadow_mask() {
+    let mut cfg = DisplacementWorkflow::default();
+    cfg.input_options.apply_native_input_masks = true;
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).corrections_applied,
+        vec!["layover_shadow_mask"]
+    );
+
+    cfg.layover_shadow_mask_files = vec![PathBuf::from("layover_shadow.tif")];
+    assert_eq!(
+        assemble_geometry_provenance(&cfg, None).corrections_applied,
+        vec!["layover_shadow_mask"]
+    );
+
+    let mut nisar = DisplacementWorkflow::default();
+    nisar.input_options.apply_native_input_masks = true;
+    nisar.input_options.input_type = InputType::NisarGslc;
+    assert_eq!(
+        assemble_geometry_provenance(&nisar, None).corrections_applied,
+        Vec::<String>::new()
+    );
+}
+
 #[test]
 fn troposphere_epochs_also_count_as_the_troposphere_correction() {
     let mut cfg = DisplacementWorkflow::default();
