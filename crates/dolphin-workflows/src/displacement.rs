@@ -6100,6 +6100,7 @@ mod tests {
     /// open files without `O_CLOEXEC`, so a child inherits them and, with them,
     /// the HDF5 file locks (`flock` belongs to the open file description) until
     /// it exits; the parent then cannot reopen a file it has closed (#191).
+    /// Marked, the child drops them when its exec completes.
     fn close_descriptors_on_exec() {
         std::fs::read_dir("/dev/fd")
             .unwrap()
@@ -6127,13 +6128,21 @@ mod tests {
     /// file's lock, or the parent cannot reopen the file while the child runs.
     #[test]
     fn isolated_child_does_not_hold_hdf5_file_locks() {
+        use std::io::Read;
         let _hdf5 = crate::corrections::hdf5_guard();
         let path = std::env::temp_dir().join(format!(
             "dolphin_isolated_child_lock_{}.h5",
             std::process::id()
         ));
         let file = hdf5::File::create(&path).unwrap();
-        let mut child = spawn_isolated(std::process::Command::new("sleep").arg("30"));
+        let mut child = spawn_isolated(
+            std::process::Command::new("sh").args(["-c", "echo ready; exec sleep 30"]),
+        );
+        // The shell prints once its own exec has completed, and `sleep` keeps
+        // whatever the shell still holds.
+        let mut ready = [0_u8; 6];
+        let stdout = child.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut ready).unwrap();
         drop(file);
         let reopened = hdf5::File::open_rw(&path).map(drop);
         child.kill().unwrap();
