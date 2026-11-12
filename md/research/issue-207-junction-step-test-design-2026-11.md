@@ -122,3 +122,22 @@ Taken in this order; the first that holds is the finding.
   cell. Published displacement must be bit-identical, since only the diagnostic changes.
 
 Receipt: `validation/results/issue207_junction_steps/houston_t034_071054_iw3_<date>/receipt.json`.
+
+## Addendum, 2026-11-12, after M0 and M1 were first computed
+
+Recorded here rather than edited above, because it was found by running the scorer. Two
+defects in the **scorer**, not in the engine, and one in how M1 was written:
+
+1. The scorer converted published displacement to cycles at `+λ/2`; the engine publishes
+   `−λ/(4π)` m per radian, so a cycle is `−λ/2`. With the wrong sign every offline step
+   was negated and the per-cell M1 difference read ~2 × |step − median| (0.998 cycle at 45).
+   Fixed in the scorer.
+2. M1 compared the offline fraction, computed on the 127,692 cells the published product
+   keeps, with the provenance fraction, computed by the engine on the ~130,000 cells of the
+   raw series before the publication mask. The difference between the two populations
+   shifts each component median by a constant (0.0088 cycle at 45; the per-cell difference
+   is that constant at the median and at the 99th percentile alike), and moves the fraction
+   at 45 from 0.5004 to 0.5070. M1 now compares the offline fraction with the engine's own
+   `junction_step_cycles_KK.tif` fraction on the same cells; the provenance value is kept in
+   the receipt beside it. The thresholds (0.005 on the fraction, 0.01 cycle per cell) are
+   unchanged.
