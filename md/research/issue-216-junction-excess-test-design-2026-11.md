@@ -125,3 +125,12 @@ is unchanged.
 Receipt: `validation/results/issue216_junction_excess/houston_t034_071054_iw3_<date>/receipt.json`.
 Scorer: `validation/issue216_junction_excess.py`. Eo #758 (Fresno T137 junction patches) is
 the same population on another site; Fresno is closed as a validation site and is not run.
+
+## Addendum, 2026-11-12, before any arm was scored
+
+Arm R as frozen cannot run: the engine refuses `last_per_ministack` across more than one
+ministack (`dolphin-stack` `plan_with_offset`, #164), as dolphin ≥ v0.40 `stack.py` does
+(`'last_per_ministack' cannot be used for multiple ministacks`). R is replaced by the one
+remaining plan that changes the carried reference, `first_per_ministack` (each ministack's
+compressed SLC formed against its first real date; output against the oldest carried
+compressed SLC). The C2 rule is unchanged with this R.
