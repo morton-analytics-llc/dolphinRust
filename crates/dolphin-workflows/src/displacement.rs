@@ -6096,11 +6096,62 @@ mod tests {
         assert!(temporal_product_displacement_rasters(directory, 0).is_err());
     }
 
+    /// Mark every descriptor this process holds close-on-exec. libhdf5 and GDAL
+    /// open files without `O_CLOEXEC`, so a child inherits them and, with them,
+    /// the HDF5 file locks (`flock` belongs to the open file description) until
+    /// it exits; the parent then cannot reopen a file it has closed (#191).
+    fn close_descriptors_on_exec() {
+        std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&descriptor| descriptor > 2)
+            .for_each(|descriptor| {
+                // SAFETY: F_SETFD only sets a descriptor flag; a number that has
+                // been closed since the listing fails with EBADF.
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+            });
+    }
+
+    /// Spawn `command` with captured output and none of this process's files.
+    fn spawn_isolated(command: &mut std::process::Command) -> std::process::Child {
+        close_descriptors_on_exec();
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// #191: a child spawned while an HDF5 file is open must not keep that
+    /// file's lock, or the parent cannot reopen the file while the child runs.
+    #[test]
+    fn isolated_child_does_not_hold_hdf5_file_locks() {
+        let _hdf5 = crate::corrections::hdf5_guard();
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_isolated_child_lock_{}.h5",
+            std::process::id()
+        ));
+        let file = hdf5::File::create(&path).unwrap();
+        let mut child = spawn_isolated(std::process::Command::new("sleep").arg("30"));
+        drop(file);
+        let reopened = hdf5::File::open_rw(&path).map(drop);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        reopened.expect("a live child holds the lock on a file its parent closed");
+    }
+
     fn run_isolated_hdf5_test(name: &str) {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", name, "--test-threads=1"])
-            .output()
-            .unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", name, "--test-threads=1"]);
+        // No `corrections` test holds a file it will reopen while this spawns:
+        // one opened after the descriptors were listed would still be inherited.
+        let child = {
+            let _hdf5 = crate::corrections::hdf5_guard();
+            spawn_isolated(&mut command)
+        };
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "isolated HDF5 contract failed:\n{}\n{}",
