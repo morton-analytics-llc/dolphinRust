@@ -141,3 +141,32 @@ defects in the **scorer**, not in the engine, and one in how M1 was written:
    `junction_step_cycles_KK.tif` fraction on the same cells; the provenance value is kept in
    the receipt beside it. The thresholds (0.005 on the fraction, 0.01 cycle per cell) are
    unchanged.
+
+## Result, 2026-11-12
+
+Receipt `validation/results/issue207_junction_steps/houston_t034_071054_iw3_20261112/receipt.json`.
+Finding by the decision rule: **(a)**.
+
+- M0: the engine reproduces #192 exactly (0.5070 at 45, 0.3739 at 75).
+- M1 (after the addendum): offline and engine agree to ≤ 0.0024 in fraction and ≤ 0.0088
+  cycle per cell. Pass.
+- M2: the large fractions are not junction-specific. Non-junction steps 44, 46, 47, 74, 76
+  read 0.415, 0.638, 0.224, 0.260, 0.378. Step 46 has the widest field (4.25 cycles from
+  the 2nd to the 98th percentile). Itoh(k) stays ≤ 0.0007 at every step, so no boundary of
+  whole-cycle jumps divides the frame.
+- M3: SNAPHU in place of the native unwrapper gives 0.536 and 0.415 (native: 0.507, 0.374).
+  So the native unwrapper is ruled out.
+- M4: OPERA DISP-S1 steps correlate with A0 at r = 0.998 (45) and 0.998 (75), and OPERA's
+  own J_O is 0.497 and 0.362. Only 0.08% and 0.05% of cells differ from A0 by a whole cycle.
+- M5: J = J1 at 45 and 75, so the component labels play no part.
+
+Fix: the junction diagnostic now measures against the same-component neighbourhood median at
+the #184 junction half-window (6 px here). Published displacement is bit-identical, and the
+#192 velocity metrics are unchanged to the last digit. The fraction at 45 is now 0.00059 and
+at 75 0.00044, in line with the other junctions (0.00021–0.00080).
+
+**The acceptance bound fails and stays as written.** 0.00059 and 0.00044 are above the
+non-junction p95 of L (0.000083). That holds like for like too: with the junction window
+applied at every step, the non-junction p95 is 0.000153 and five of six junctions exceed it.
+The cells left over are exactly the #184-flagged cells at every junction (24–101 each). That
+excess is a separate finding, filed as #216.

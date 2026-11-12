@@ -1,0 +1,317 @@
+{
+  "schema": "dolphinrust.issue192-reference-rule-receipt/1",
+  "recipe_sha256": "32bcbfe62834023e6025f8ce84e9597e46847c58d5dc50b9aaa99cc9cb230e2a",
+  "scorer_sha256": "24e24c314dc24610d5d41fd42afe9041c46e5c6b91d094d0f7ebff00b5f8f09d",
+  "protocol": "md/research/issue-192-validation-protocol-2026-11.md",
+  "run_identity": {
+    "binary": "target/release/dolphin",
+    "binary_sha256": "cc5b8e7ff95ae16b58579a78e6a4739c0fb59c9f40fbce5b9cad0f69c129d980",
+    "config_overrides": {},
+    "old": {
+      "compressed_slc_plan": "always_first_legacy",
+      "config_sha256": "a6e1a5188c5f2767f21a46d4b67dbbce9374fa766f3d620af7e1137dbadcdff6",
+      "elapsed_seconds": 55.932892
+    },
+    "new": {
+      "compressed_slc_plan": "always_first",
+      "config_sha256": "364f53e0bd54da93ae399bef10404bd8af5a01df6f6c35390c74be17ec1503ef",
+      "elapsed_seconds": 53.861155
+    }
+  },
+  "plan": {
+    "recipe_sha256": "32bcbfe62834023e6025f8ce84e9597e46847c58d5dc50b9aaa99cc9cb230e2a",
+    "catalog_sha256": "9226039c94c2cf37b287c8a513cfc211ac43c8ac3e1b78c949e22c9162894045",
+    "window": {
+      "row0": 2704,
+      "col0": 1266,
+      "height": 699,
+      "width": 3996
+    }
+  },
+  "dates": 91,
+  "output_grid": {
+    "shape": [
+      233,
+      666
+    ],
+    "transform": [
+      30.0,
+      0.0,
+      255000.0,
+      0.0,
+      -30.0,
+      3303500.0
+    ],
+    "crs": "EPSG:32615"
+  },
+  "pixels": {
+    "grid": 155178,
+    "common_valid": 126950,
+    "with_opera": 125862
+  },
+  "arms": {
+    "old": {
+      "junction_roughness_mm": 1.9193881473203915,
+      "junction_roughness_by_epoch_mm": {
+        "15": 1.5744036565037278,
+        "30": 1.1870269229464818,
+        "45": 2.9665012036696186,
+        "60": 1.617290660636103,
+        "75": 2.5975447167626147,
+        "90": 1.2285772325871405
+      },
+      "non_junction_roughness_median_mm": 1.390567220598172,
+      "fraction_integer_cycle": 0.0005666929829657011,
+      "fraction_linked_over_quarter_cycle": 0.00854358327424926,
+      "per_junction": [
+        {
+          "epoch": 15,
+          "evaluable_pixels": 130898,
+          "fraction_over_quarter_cycle": 0.007043652309431771,
+          "fraction_over_half_cycle": 0.0005882442818072087,
+          "fraction_over_three_quarter_cycle": 3.8197680636831734e-05,
+          "fraction_integer_cycle": 0.0005882442818072087,
+          "fraction_linked_over_quarter_cycle": 0.007005454628794939,
+          "reference": {
+            "num_compressed": 1,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 30,
+          "evaluable_pixels": 130902,
+          "fraction_over_quarter_cycle": 0.004270370200608088,
+          "fraction_over_half_cycle": 0.00021390047516462696,
+          "fraction_over_three_quarter_cycle": 0.0,
+          "fraction_integer_cycle": 0.00021390047516462696,
+          "fraction_linked_over_quarter_cycle": 0.004270370200608088,
+          "reference": {
+            "num_compressed": 2,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 45,
+          "evaluable_pixels": 130193,
+          "fraction_over_quarter_cycle": 0.010776309018149978,
+          "fraction_over_half_cycle": 0.0007143241188082308,
+          "fraction_over_three_quarter_cycle": 3.840452251657155e-05,
+          "fraction_integer_cycle": 0.0007143241188082308,
+          "fraction_linked_over_quarter_cycle": 0.010737904495633405,
+          "reference": {
+            "num_compressed": 3,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 60,
+          "evaluable_pixels": 130897,
+          "fraction_over_quarter_cycle": 0.013804747244016287,
+          "fraction_over_half_cycle": 0.0009167513388389344,
+          "fraction_over_three_quarter_cycle": 3.8197972451622266e-05,
+          "fraction_integer_cycle": 0.0009167513388389344,
+          "fraction_linked_over_quarter_cycle": 0.013766549271564666,
+          "reference": {
+            "num_compressed": 4,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 75,
+          "evaluable_pixels": 130086,
+          "fraction_over_quarter_cycle": 0.0076103500761035,
+          "fraction_over_half_cycle": 0.00048429500484295,
+          "fraction_over_three_quarter_cycle": 3.843611149547223e-05,
+          "fraction_integer_cycle": 0.00048429500484295,
+          "fraction_linked_over_quarter_cycle": 0.007571913964608028,
+          "reference": {
+            "num_compressed": 5,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 90,
+          "evaluable_pixels": 130902,
+          "fraction_over_quarter_cycle": 0.006394096346885456,
+          "fraction_over_half_cycle": 0.0005041939771737636,
+          "fraction_over_three_quarter_cycle": 2.291790805335289e-05,
+          "fraction_integer_cycle": 0.0005041939771737636,
+          "fraction_linked_over_quarter_cycle": 0.006371178438832103,
+          "reference": {
+            "num_compressed": 6,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        }
+      ],
+      "cycle_step_flagged_pixels": 428,
+      "opera_median_abs_mm_yr": 0.41419300207655496,
+      "opera_fraction_within": 0.9354292796872765,
+      "station_pixels": {
+        "HSMN": 25,
+        "RDCT": 25,
+        "SPBH": 25
+      },
+      "gnss_pairs": {
+        "HSMN-RDCT": {
+          "insar_mm_yr": 1.6800040796015274,
+          "gnss_mm_yr": 0.4418000000000002,
+          "error_mm_yr": 1.2382040796015272
+        },
+        "HSMN-SPBH": {
+          "insar_mm_yr": 1.9223079134508672,
+          "gnss_mm_yr": 1.3287000000000004,
+          "error_mm_yr": 0.5936079134508667
+        },
+        "RDCT-SPBH": {
+          "insar_mm_yr": 0.24230383384933932,
+          "gnss_mm_yr": 0.8869000000000002,
+          "error_mm_yr": -0.644596166150661
+        }
+      },
+      "gnss_mean_abs_mm_yr": 0.8254693864010183
+    },
+    "new": {
+      "junction_roughness_mm": 1.925744101539624,
+      "junction_roughness_by_epoch_mm": {
+        "15": 1.5744036565037278,
+        "30": 1.2299884169186504,
+        "45": 2.9498610553944125,
+        "60": 1.625946876352223,
+        "75": 2.594167671756138,
+        "90": 1.2287564872766965
+      },
+      "non_junction_roughness_median_mm": 1.390567220598172,
+      "fraction_integer_cycle": 0.0004975254745786166,
+      "fraction_linked_over_quarter_cycle": 0.007728363703218488,
+      "per_junction": [
+        {
+          "epoch": 15,
+          "evaluable_pixels": 130951,
+          "fraction_over_quarter_cycle": 0.007208803292834724,
+          "fraction_over_half_cycle": 0.0006032790891249398,
+          "fraction_over_three_quarter_cycle": 3.81822208306924e-05,
+          "fraction_integer_cycle": 0.0006032790891249398,
+          "fraction_linked_over_quarter_cycle": 0.007170621072004032,
+          "reference": {
+            "num_compressed": 1,
+            "output_reference_idx": 0,
+            "compressed_reference_idx": 0
+          }
+        },
+        {
+          "epoch": 30,
+          "evaluable_pixels": 130952,
+          "fraction_over_quarter_cycle": 0.004131284745555623,
+          "fraction_over_half_cycle": 0.00021381880383652025,
+          "fraction_over_three_quarter_cycle": 0.0,
+          "fraction_integer_cycle": 0.00021381880383652025,
+          "fraction_linked_over_quarter_cycle": 0.004131284745555623,
+          "reference": {
+            "num_compressed": 2,
+            "output_reference_idx": 1,
+            "compressed_reference_idx": 1
+          }
+        },
+        {
+          "epoch": 45,
+          "evaluable_pixels": 130272,
+          "fraction_over_quarter_cycle": 0.009510869565217392,
+          "fraction_over_half_cycle": 0.0005910709899287645,
+          "fraction_over_three_quarter_cycle": 3.8381233112257434e-05,
+          "fraction_integer_cycle": 0.0005910709899287645,
+          "fraction_linked_over_quarter_cycle": 0.009472488332105134,
+          "reference": {
+            "num_compressed": 3,
+            "output_reference_idx": 2,
+            "compressed_reference_idx": 2
+          }
+        },
+        {
+          "epoch": 60,
+          "evaluable_pixels": 130952,
+          "fraction_over_quarter_cycle": 0.012691673284867738,
+          "fraction_over_half_cycle": 0.000801820514386951,
+          "fraction_over_three_quarter_cycle": 5.345470095913006e-05,
+          "fraction_integer_cycle": 0.000801820514386951,
+          "fraction_linked_over_quarter_cycle": 0.012638218583908607,
+          "reference": {
+            "num_compressed": 4,
+            "output_reference_idx": 3,
+            "compressed_reference_idx": 3
+          }
+        },
+        {
+          "epoch": 75,
+          "evaluable_pixels": 130135,
+          "fraction_over_quarter_cycle": 0.007084950243977408,
+          "fraction_over_half_cycle": 0.00043800668536519765,
+          "fraction_over_three_quarter_cycle": 7.68432781342452e-06,
+          "fraction_integer_cycle": 0.00043800668536519765,
+          "fraction_linked_over_quarter_cycle": 0.007077265916163983,
+          "reference": {
+            "num_compressed": 5,
+            "output_reference_idx": 4,
+            "compressed_reference_idx": 4
+          }
+        },
+        {
+          "epoch": 90,
+          "evaluable_pixels": 130952,
+          "fraction_over_quarter_cycle": 0.005360742867615615,
+          "fraction_over_half_cycle": 0.0004429103793756491,
+          "fraction_over_three_quarter_cycle": 3.8181929256521476e-05,
+          "fraction_integer_cycle": 0.0004429103793756491,
+          "fraction_linked_over_quarter_cycle": 0.005322560938359093,
+          "reference": {
+            "num_compressed": 6,
+            "output_reference_idx": 5,
+            "compressed_reference_idx": 5
+          }
+        }
+      ],
+      "cycle_step_flagged_pixels": 391,
+      "opera_median_abs_mm_yr": 0.43836567263989545,
+      "opera_fraction_within": 0.9298279067550174,
+      "station_pixels": {
+        "HSMN": 25,
+        "RDCT": 25,
+        "SPBH": 25
+      },
+      "gnss_pairs": {
+        "HSMN-RDCT": {
+          "insar_mm_yr": 1.5214578431066865,
+          "gnss_mm_yr": 0.4418000000000002,
+          "error_mm_yr": 1.0796578431066863
+        },
+        "HSMN-SPBH": {
+          "insar_mm_yr": 1.9556391159733664,
+          "gnss_mm_yr": 1.3287000000000004,
+          "error_mm_yr": 0.6269391159733659
+        },
+        "RDCT-SPBH": {
+          "insar_mm_yr": 0.43418127286667996,
+          "gnss_mm_yr": 0.8869000000000002,
+          "error_mm_yr": -0.4527187271333203
+        }
+      },
+      "gnss_mean_abs_mm_yr": 0.7197718954044575
+    }
+  },
+  "not_worse": {
+    "junction_roughness_mm": true,
+    "fraction_integer_cycle": true,
+    "fraction_linked_over_quarter_cycle": true,
+    "opera_median_abs_mm_yr": true,
+    "opera_fraction_within": true,
+    "gnss_mean_abs_mm_yr": true
+  },
+  "gnss": "scored",
+  "junction_steps_reduced": false,
+  "verdict": "pass"
+}
