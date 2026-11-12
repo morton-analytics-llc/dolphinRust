@@ -853,6 +853,20 @@ fn resample_terrain_to_frame(
     }
 }
 
+/// Serialize HDF5 access across parallel tests in this crate's test binary —
+/// `hdf5-metno` is not thread-safe (mirrors `dolphin_io`'s own test lock, which
+/// is `pub(crate)` and so unreachable from here). The isolated-test wrapper in
+/// `displacement` spawns its child under it too (#191).
+#[cfg(test)]
+static HDF5_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn hdf5_guard() -> std::sync::MutexGuard<'static, ()> {
+    HDF5_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1357,17 +1371,6 @@ mod tests {
         let err =
             apply_corrections(&opts, None, &mut disp, &[], 32610, [0.0; 6], None).unwrap_err();
         assert!(err.to_string().contains("wavelength"));
-    }
-
-    /// Serialize HDF5 access across parallel tests in this crate's test binary —
-    /// `hdf5-metno` is not thread-safe (mirrors `dolphin_io`'s own test lock, which
-    /// is `pub(crate)` and so unreachable from here).
-    static HDF5_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn hdf5_guard() -> std::sync::MutexGuard<'static, ()> {
-        HDF5_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Write a minimal CSLC-S1-STATIC HDF5 with *uniform* LOS (incidence θ, az 30°)
