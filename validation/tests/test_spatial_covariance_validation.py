@@ -658,8 +658,16 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
         ):
             first = _effective_looks_fraction(support)
             second = _effective_looks_fraction(support)
-        self.assertEqual(first, expected)
-        self.assertEqual(second, expected)
+        # The batched path sums the same len(support)**2 kernel terms in numpy's
+        # order, not this reference's, so the two agree to roundoff, not bit for
+        # bit (issue #201: 1 ulp apart on macOS arm64, terms bit-identical).
+        # Budget in units of ulp(1.0) = 2u: two orderings of m positive terms
+        # differ by at most 2(m - 1)u, the two divisions by 2u, and an exp good
+        # to 1 ulp in each path moves the sum by at most 2 ulp.
+        terms = len(support) ** 2
+        tolerance = (terms + 2) * math.ulp(1.0)
+        self.assertLessEqual(abs(first - expected), tolerance * expected)
+        self.assertEqual(second, first)
         self.assertEqual(_cached_effective_looks_fraction.cache_info().hits, 1)
 
     def test_source_correlation_support_count_and_receipt_are_exact(self):
