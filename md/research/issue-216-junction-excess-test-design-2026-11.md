@@ -158,3 +158,44 @@ cells finite in both (the date's constant reference).
   measured.
 - **M6b** — context: the fraction of all common cells with `|δ| > 0.25` at junction steps
   and at ordinary steps (median, p95), the agreement floor between the two processors.
+
+## Result, 2026-11-12
+
+Receipt `validation/results/issue216_junction_excess/houston_t034_071054_iw3_20261112/receipt.json`.
+Finding by the decision rule: **C4, the compressed-SLC handoff**. By M6 it is a property of the
+sequential estimator that dolphin v0.42.9 shares cell for cell. It is not a port defect.
+No engine code changes, and published displacement is unchanged.
+
+- M0: A0 reproduces #207 (cells 76, 24, 63, 101, 50, 57 against 77, 24, 64, 101, 48, 57;
+  ordinary p95 0.000153 exactly). Baseline excess `E_A0` = 253.7 cells. The engine is
+  deterministic run to run (a repeat A0 run is bit-identical), so the ±2 cells come from the
+  binary build, not from the arithmetic.
+- C1, window: the excess is 198.9 / 253.7 / 299.9 / 323.0 cells at h = 3 / 6 / 9 / 12. Wider
+  windows raise it, so the window is not the cause.
+- C2, reference: 310.0 (`always_first_legacy`) and 357.8 (`first_per_ministack`). Moving the
+  carried reference changes the excess by less than half, so the reference is not the cause.
+- C3, unwrapper: 236.8 with SNAPHU, so the native unwrapper is not the cause.
+- C4, handoff: with one ministack (B) the six dates are ordinary (−66.3; fractions
+  0.000023–0.000343 against B's own ordinary p95 0.000269). With ministack 13 (C) the excess
+  moves to C's own boundaries (169.2 cells; 25–67 cells at 13, 26, …, 78), and the J0 dates
+  become ordinary (−52.8). The excess follows the boundary, not the dates.
+- M5, OPERA: of A0's 369 over-half junction cells that OPERA covers, 73.4% differ from OPERA's
+  step at the same date by more than half a cycle (59–82% per junction). With one ministack
+  (B), 10.6% do. The frozen threshold for that half of the rule was ≤ 0.1, so this sits just
+  outside it and is reported as measured. The cells are not deformation that an independent
+  estimate of the same steps sees. OPERA's own ordinary-step p95 of the statistic is
+  0.000248.
+- M6, dolphin v0.42.9 on the same 91 CSLCs and configuration: dolphin's linked-phase step
+  agrees with A0's wrapped step to within a quarter cycle at 360 of 365 flagged cells
+  compared (pooled disagreement 0.014, verdict *estimator property*). Over the whole frame,
+  at most 0.026% of cells disagree by more than a quarter cycle at any junction, and 0.005%
+  (p95) on ordinary steps.
+
+So the junction excess is the datum error the carried compressed SLC puts into the next
+ministack (#184). It is spatially correlated and exceeds half a cycle at about 0.05% of
+cells per junction. dolphin produces it at the same cells. The #207 acceptance bound
+(junction fraction ≤ the ordinary p95) still fails. It is not relaxed: the population is
+real in the series, it is the sequential estimator's, and #184 flags every cell of it.
+Removing it would mean changing the estimator away from dolphin, and this issue does not
+make that call. Eo #758 (Fresno T137 junction patches) is the same population on another
+site.
