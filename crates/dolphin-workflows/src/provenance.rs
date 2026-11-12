@@ -147,7 +147,8 @@ pub struct GeometryProvenance {
     pub cycle_steps: Option<CycleStepProvenance>,
     /// Correction categories enabled on this run, in a fixed disclosure order;
     /// empty (never null) when none ran (issue #130 / eo#483 Table 5). Computed
-    /// directly from `CorrectionOptions` and `layover_shadow_mask_files` — every
+    /// directly from `CorrectionOptions`, `layover_shadow_mask_files` and
+    /// `input_options.apply_native_input_masks` — every
     /// current run can state this with certainty, so unlike the geometry fields
     /// above there is no absent case. An artifact written before this field
     /// existed deserializes it as an empty, historical vec, not a reconstruction.
@@ -407,8 +408,9 @@ pub fn write_geometry_provenance(dir: &Path, prov: &GeometryProvenance) -> anyho
     Ok(())
 }
 
-/// Correction categories this run's `CorrectionOptions` and
-/// `layover_shadow_mask_files` actually enable, in a fixed disclosure order.
+/// Correction categories this run's `CorrectionOptions`,
+/// `layover_shadow_mask_files` and native OPERA input masks actually enable, in
+/// a fixed disclosure order.
 /// Deterministic from config alone: every current run can state this with
 /// certainty, so (unlike the geometry fields above) there is no absent case.
 fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
@@ -426,7 +428,11 @@ fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
     if !corrections.troposphere_files.is_empty() || !corrections.troposphere_epochs.is_empty() {
         applied.push(CORRECTION_TROPOSPHERE.into());
     }
-    if !cfg.layover_shadow_mask_files.is_empty() {
+    // Native OPERA masks read the same STATIC `layover_shadow_mask` at
+    // publication; NISAR's native mask is a different quality layer (#195).
+    let native_layover_shadow = cfg.input_options.apply_native_input_masks
+        && cfg.input_options.input_type != InputType::NisarGslc;
+    if !cfg.layover_shadow_mask_files.is_empty() || native_layover_shadow {
         applied.push(CORRECTION_LAYOVER_SHADOW_MASK.into());
     }
     applied
