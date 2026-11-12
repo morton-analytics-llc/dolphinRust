@@ -12,6 +12,8 @@ be regenerated under the wrong rule:
 
 - v0.42.9 pins `always_first` as dolphinRust implements it (issue #192): both
   indices on the newest carried compressed SLC unless the output is configured.
+  It also pins the single ministack `last_per_ministack` allows (issue #206):
+  output on index 0 unless configured, compressed on -1.
 - v0.35.0 pins `always_first_legacy`, dolphin's rule before PR #588 (v0.39.0):
   both indices on the configured output index, 0 by default.
 
@@ -42,6 +44,8 @@ COMBOS = {
         (60, 15, 5, "always_first", None),
         (20, 5, 3, "always_first", None),
         (20, 5, 10, "always_first", 2),
+        (4, 4, 10, "last_per_ministack", None),
+        (4, 4, 10, "last_per_ministack", 2),
     ],
     "0.35.0": [
         (10, 5, 10, "always_first", 0),

@@ -171,7 +171,8 @@ impl MiniStackPlanner {
     /// `AlwaysFirst` is dolphin v0.42.9 `stack.py`: the compressed SLC is formed
     /// against the newest carried one, and so is the output unless configured.
     /// That count is a position because the carried compressed SLCs always lead
-    /// the combined ministack (#176).
+    /// the combined ministack (#176). `LastPerMinistack` takes the same output
+    /// default and forms the compressed SLC against the last date (#206).
     fn references(&self, num_compressed: usize) -> (isize, isize) {
         let ncc = num_compressed as isize;
         let newest = (ncc - 1).max(0);
@@ -183,7 +184,7 @@ impl MiniStackPlanner {
                 (oldest, oldest)
             }
             CompressedSlcPlan::FirstPerMinistack => (configured.unwrap_or(0), ncc),
-            CompressedSlcPlan::LastPerMinistack => (ncc - 1, -1),
+            CompressedSlcPlan::LastPerMinistack => (configured.unwrap_or(newest), -1),
         }
     }
 }
