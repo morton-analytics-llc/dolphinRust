@@ -9,14 +9,23 @@
 //! `solve_time_series` returns, before corrections and the spatial reference.
 //!
 //! The junction diagnostic reports each pixel's step across a ministack boundary
-//! relative to the median step of its connected component. In a closure-exact
-//! network the inverted step reproduces the unwrapped nearest-neighbour
-//! interferogram, so the wrapped linked-phase step is exactly `wrap(step)`: the
-//! fractional part of the reported step *is* the linked-phase step, and the
-//! integer part is what the unwrapper added. A separate wrapped layer would
-//! carry nothing more, so the summary splits the two instead.
+//! relative to the median step of the same-component pixels around it, within
+//! the #184 junction neighbourhood. In a closure-exact network the inverted
+//! step reproduces the unwrapped nearest-neighbour interferogram, so the wrapped
+//! linked-phase step is exactly `wrap(step)`: the fractional part of the
+//! reported step *is* the linked-phase step, and the integer part is the
+//! pixel's integer-cycle disagreement with its surroundings. A separate wrapped
+//! layer would carry nothing more, so the summary splits the two instead.
+//!
+//! The reference is local, not the component median (issue #207). On Houston
+//! T034-071054-IW3 the 12-day step at dates 45 and 75 spans 3.2-3.6 cycles
+//! across a 20 km frame with no neighbour-to-neighbour jump, and OPERA DISP-S1,
+//! unwrapped independently, carries the same field (r = 0.998, 0.08% of cells
+//! a whole cycle apart). Against the component median that real field read as
+//! half the frame stepping a whole cycle; against the neighbourhood it is the
+//! 0.05% of cells every junction shows.
 
-use dolphin_timeseries::CycleStepDateSummary;
+use dolphin_timeseries::{neighbourhood_residuals, CycleStepDateSummary};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +36,9 @@ pub const JUNCTION_STEP_THRESHOLDS_CYCLES: [f64; 3] = [0.25, 0.5, 0.75];
 #[derive(Debug, Clone)]
 pub struct JunctionStep {
     /// Per-pixel step from the last date of one ministack to the first of the
-    /// next, minus the median step of the pixel's connected component, in
-    /// cycles. NaN where the step is non-finite or the component has no label.
+    /// next, minus the median step of the same-component pixels within the
+    /// junction neighbourhood, in cycles. NaN where the step is non-finite, the
+    /// pixel has no component label, or too few such neighbours.
     pub step_cycles: Array2<f64>,
     /// Frame statistics of [`Self::step_cycles`].
     pub summary: JunctionStepSummary,
@@ -48,12 +58,12 @@ pub struct JunctionStepSummary {
     /// Fraction of evaluable pixels with `|step| > 0.75` cycle.
     pub fraction_over_three_quarter_cycle: f64,
     /// Fraction of evaluable pixels whose step rounds to a non-zero whole
-    /// number of cycles: the unwrapper's integer disagreement with the
-    /// component.
+    /// number of cycles: an integer-cycle disagreement with the surrounding
+    /// same-component pixels.
     pub fraction_integer_cycle: f64,
     /// Fraction of evaluable pixels whose step, wrapped to `(-0.5, 0.5]`,
     /// exceeds a quarter cycle in magnitude: the linked phase itself disagrees
-    /// with the component across the junction.
+    /// with its surroundings across the junction.
     pub fraction_linked_over_quarter_cycle: f64,
     /// How the later ministack was referenced. `None` in records written
     /// before issue #192, which all used the oldest carried compressed SLC.
@@ -94,6 +104,12 @@ impl MinistackReference {
 pub struct JunctionProvenance {
     /// `phase_linking.ministack_size` the boundaries were planned with.
     pub ministack_size: usize,
+    /// Half-width in pixels of the neighbourhood each junction step is measured
+    /// against. `0` in records written before issue #207, which measured
+    /// against the median of the whole connected component, and when there is
+    /// no junction.
+    #[serde(default)]
+    pub half_window: usize,
     /// One entry per boundary, in acquisition order; empty for a single ministack.
     pub junctions: Vec<JunctionStepSummary>,
 }
@@ -183,17 +199,20 @@ pub fn wrap_cycles(cycles: f64) -> f64 {
 
 /// The junction step diagnostic for each boundary epoch. `series` is the
 /// `(n_dates - 1, rows, cols)` per-date series in radians referenced to
-/// acquisition 0; `components` are the per-step labels from [`step_components`].
+/// acquisition 0; `components` are the per-step labels from [`step_components`];
+/// `half_window` is the neighbourhood each step is measured against (the #184
+/// junction half-window).
 #[must_use]
 pub fn junction_steps(
     series: ArrayView3<f64>,
     components: ArrayView3<u32>,
     epochs: &[usize],
+    half_window: usize,
 ) -> Vec<JunctionStep> {
     epochs
         .iter()
         .filter(|&&epoch| epoch >= 1 && epoch <= series.dim().0)
-        .map(|&epoch| junction_step(series, components, epoch))
+        .map(|&epoch| junction_step(series, components, epoch, half_window))
         .collect()
 }
 
@@ -201,49 +220,17 @@ fn junction_step(
     series: ArrayView3<f64>,
     components: ArrayView3<u32>,
     epoch: usize,
+    half_window: usize,
 ) -> JunctionStep {
     let k = epoch - 1;
     let step = date_step(series, k).mapv(|value| value / std::f64::consts::TAU);
-    let labels = components.index_axis(Axis(0), k);
-    let medians = component_medians(step.view(), labels);
-    let step_cycles = Array2::from_shape_fn(step.dim(), |point| {
-        let label = labels[point];
-        match (label, medians.get(&label)) {
-            (0, _) | (_, None) => f64::NAN,
-            (_, Some(median)) => step[point] - median,
-        }
-    });
+    let step_cycles =
+        neighbourhood_residuals(step.view(), components.index_axis(Axis(0), k), half_window);
     let summary = summarize_junction(step_cycles.view(), epoch);
     JunctionStep {
         step_cycles,
         summary,
     }
-}
-
-/// Median of the finite values per non-zero label.
-fn component_medians(
-    values: ArrayView2<f64>,
-    labels: ArrayView2<u32>,
-) -> std::collections::HashMap<u32, f64> {
-    let mut grouped: std::collections::HashMap<u32, Vec<f64>> = std::collections::HashMap::new();
-    ndarray::Zip::from(values)
-        .and(labels)
-        .for_each(|&value, &label| {
-            if label != 0 && value.is_finite() {
-                grouped.entry(label).or_default().push(value);
-            }
-        });
-    grouped
-        .into_iter()
-        .map(|(label, mut values)| (label, median(&mut values)))
-        .collect()
-}
-
-/// Median of a non-empty slice (upper median for even lengths).
-fn median(values: &mut [f64]) -> f64 {
-    let middle = values.len() / 2;
-    let (_, median, _) = values.select_nth_unstable_by(middle, |a, b| a.total_cmp(b));
-    *median
 }
 
 fn summarize_junction(step_cycles: ArrayView2<f64>, epoch: usize) -> JunctionStepSummary {
@@ -322,7 +309,7 @@ mod tests {
             series[(k, 1, 3)] += TAU;
         }
         let components = one_component(&series);
-        let junctions = junction_steps(series.view(), components.view(), &[3]);
+        let junctions = junction_steps(series.view(), components.view(), &[3], 2);
         assert_eq!(junctions.len(), 1);
         let junction = &junctions[0];
         assert_eq!(junction.summary.epoch, 3);
@@ -345,7 +332,7 @@ mod tests {
     fn smooth_series_reports_no_step_at_any_junction() {
         let series = smooth_series(9, 3, 3);
         let components = one_component(&series);
-        for junction in junction_steps(series.view(), components.view(), &[3, 6]) {
+        for junction in junction_steps(series.view(), components.view(), &[3, 6], 2) {
             assert_eq!(junction.summary.fraction_over_quarter_cycle, 0.0);
             assert_eq!(junction.summary.fraction_integer_cycle, 0.0);
             assert_eq!(junction.summary.fraction_linked_over_quarter_cycle, 0.0);
@@ -361,7 +348,7 @@ mod tests {
         series[(2, 0, 1)] = f64::NAN;
         let mut components = one_component(&series);
         components[(2, 1, 3)] = 0;
-        let junction = junction_steps(series.view(), components.view(), &[3]).remove(0);
+        let junction = junction_steps(series.view(), components.view(), &[3], 3).remove(0);
         assert_eq!(junction.summary.evaluable_pixels, 6);
         assert!((junction.step_cycles[(0, 0)] - 0.4).abs() < 0.02);
         assert!(junction.step_cycles[(0, 1)].is_nan());
@@ -372,20 +359,59 @@ mod tests {
         assert!((junction.summary.fraction_linked_over_quarter_cycle - 1.0 / 6.0).abs() < 1e-12);
     }
 
-    /// Each component is judged against its own median: a whole-cycle datum
-    /// difference between two components is not a step in either.
+    /// Each pixel is judged against neighbours of its own component: a
+    /// whole-cycle datum difference between two adjacent components is not a
+    /// step in either.
     #[test]
     fn components_carry_their_own_median() {
-        let mut series = smooth_series(4, 2, 4);
+        let mut series = smooth_series(4, 3, 6);
         let mut components = one_component(&series);
-        for col in 2..4 {
-            for row in 0..2 {
+        for col in 3..6 {
+            for row in 0..3 {
                 components[(2, row, col)] = 2;
                 series[(2, row, col)] += TAU;
             }
         }
-        let junction = junction_steps(series.view(), components.view(), &[3]).remove(0);
+        let junction = junction_steps(series.view(), components.view(), &[3], 3).remove(0);
+        assert_eq!(junction.summary.evaluable_pixels, 18);
         assert_eq!(junction.summary.fraction_over_quarter_cycle, 0.0);
+    }
+
+    /// Issue #207: a spatially smooth step several cycles wide across the frame
+    /// (Houston T034 dates 45 and 75: 3.2-3.6 cycles over 20 km, matched by
+    /// OPERA DISP-S1) is no step at all against the surroundings, though most
+    /// of the frame lies beyond half a cycle from the frame median. A whole
+    /// cycle added at one pixel on top of it is still reported there alone.
+    #[test]
+    fn smooth_field_wider_than_a_cycle_is_not_an_integer_step() {
+        let (rows, cols) = (6, 40);
+        let ramp = |col: usize| 3.0 * col as f64 / (cols - 1) as f64;
+        let mut series = smooth_series(4, rows, cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                series[(2, row, col)] += ramp(col) * TAU;
+            }
+        }
+        let frame: Vec<f64> = (0..cols).map(ramp).collect();
+        let frame_median = frame[cols / 2];
+        let beyond_half_from_frame_median = frame
+            .iter()
+            .filter(|&&v| (v - frame_median).abs() > 0.5)
+            .count() as f64
+            / cols as f64;
+        assert!(beyond_half_from_frame_median > 0.5);
+
+        let components = one_component(&series);
+        let junction = junction_steps(series.view(), components.view(), &[3], 2).remove(0);
+        assert_eq!(junction.summary.evaluable_pixels, rows * cols);
+        assert_eq!(junction.summary.fraction_over_quarter_cycle, 0.0);
+        assert_eq!(junction.summary.fraction_integer_cycle, 0.0);
+
+        series[(2, 3, 20)] += TAU;
+        let junction = junction_steps(series.view(), components.view(), &[3], 2).remove(0);
+        assert!((junction.step_cycles[(3, 20)] - 1.0).abs() < 0.1);
+        let expected = 1.0 / (rows * cols) as f64;
+        assert!((junction.summary.fraction_integer_cycle - expected).abs() < 1e-12);
     }
 
     #[test]
