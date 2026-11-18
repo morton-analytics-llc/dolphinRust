@@ -14,7 +14,9 @@ ships its own unwrapper and only falls back to a subprocess on request.
 - **`tophu`** — multi-scale driver over the SNAPHU per-tile solver (coarse init → overlapping
   tiled SNAPHU → 2π-reconciled merge). dolphin reserves `multiscale_unwrap` for ICU/PHASS;
   we expose tophu as first-class over the solver we ship.
-- `icu` / `phass` / `spurt` / `whirlwind` are documented gaps unless required.
+- **`whirlwind`** — in-process `whirlwind-core` (git dependency pinned to the v0.10.0 tag):
+  `unwrap_linear` phase plus `components_snaphu` labels, no subprocess (#169). Opt-in.
+- `icu` / `phass` / `spurt` are documented gaps unless required.
 
 ## Conventions
 - SNAPHU is **not** a hard dependency — it is required only when `unwrap_method` selects

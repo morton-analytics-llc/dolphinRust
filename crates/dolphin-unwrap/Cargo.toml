@@ -18,6 +18,8 @@ num-complex.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Pinned to the v0.10.0 tag; not published to crates.io.
+whirlwind-core = { git = "https://github.com/scottstanie/whirlwind-insar", rev = "91bd5abf5e5dd9d0da3d32264489f006316709f4" }
 
 [dev-dependencies]
 libc = "0.2"

@@ -9,9 +9,11 @@
 pub mod native;
 pub mod snaphu;
 pub mod tophu;
+pub mod whirlwind;
 
 pub use snaphu::{
     unwrap, unwrap_with_corr, write_correlation, CostMode, InitMethod, UnwrapConfig, UnwrapError,
     UnwrapResult,
 };
 pub use tophu::{unwrap_multiscale, TophuConfig};
+pub use whirlwind::{unwrap_whirlwind, WhirlwindConfig, WhirlwindError};

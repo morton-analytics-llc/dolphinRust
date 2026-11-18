@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Opt-in whirlwind unwrapper** (issue #169). `unwrap_method: whirlwind` now runs
+  `whirlwind-core` (Scott Staniewicz's Rust minimum-cost-flow unwrapper, BSD-3-Clause OR
+  Apache-2.0, git dependency pinned to its v0.10.0 tag) in-process through a new
+  `WhirlwindBackend`. Phase comes from `unwrap_linear`, and component labels from
+  `components_snaphu`. It was previously refused at validation. On the real MMX1 common frame
+  (12 interferograms, 352x2217) it matches SNAPHU to 0.0058–0.0729% per component (gate 0.5%)
+  in 5.8 CPU-s, against 36.3 CPU-s for native with production tiles. On the synthetic dense
+  1024² `unwrap_bench` it uses 8.9–10.1 CPU-s against native's 12.2–13.3 with production tiles
+  (16x16), or 417 untiled. `snaphu_options` cost, init method and tiling must stay at their
+  defaults with this backend. The default stays `native`. `unwrap_bench` accepts
+  `BACKEND=whirlwind`.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is

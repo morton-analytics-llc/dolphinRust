@@ -113,7 +113,9 @@ pub use temporal_covariance_product::{
     TEMPORAL_RESOURCE_RSS_LIMIT_BYTES, TEMPORAL_RESOURCE_TILE_COLUMNS, TEMPORAL_RESOURCE_TILE_ROWS,
     TEMPORAL_RESOURCE_WALL_MULTIPLIER, TEMPORAL_SYNTHETIC_RESULT_FILENAME,
 };
-pub use unwrap_backend::{NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend};
+pub use unwrap_backend::{
+    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend, WhirlwindBackend,
+};
 pub use window_datum::{
     estimate_window_datum, DatumAnchor, DatumError, DatumOptions, DatumWindow, OverlapResidual,
     WindowDatum,

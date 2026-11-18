@@ -725,7 +725,9 @@ pub enum UnwrapMethod {
     Phass,
     /// spurt 3D temporal/spatial unwrapper.
     Spurt,
-    /// Whirlwind unwrapper.
+    /// Whirlwind in-process minimum-cost-flow unwrapper (`whirlwind-core`,
+    /// linear Carballo costs, SNAPHU-style connected components). Opt-in; matched
+    /// SNAPHU to <=0.5% per component on every MMX1 interferogram (#169).
     Whirlwind,
     /// Clean-room in-process native unwrapper (Costantini MCF via network
     /// simplex, no SNAPHU subprocess) — **the default**. Auto-tiling keeps a
@@ -1628,10 +1630,13 @@ impl DisplacementWorkflow {
         let defaults = Self::default();
         if !matches!(
             self.unwrap_options.unwrap_method,
-            UnwrapMethod::Native | UnwrapMethod::Snaphu | UnwrapMethod::Tophu
+            UnwrapMethod::Native
+                | UnwrapMethod::Snaphu
+                | UnwrapMethod::Tophu
+                | UnwrapMethod::Whirlwind
         ) {
             return Err(CoreError::InvalidConfig(format!(
-                "unwrap_options.unwrap_method {:?} is modeled for dolphin YAML compatibility but dolphinRust supports only native, snaphu, and tophu",
+                "unwrap_options.unwrap_method {:?} is modeled for dolphin YAML compatibility but dolphinRust supports only native, snaphu, tophu, and whirlwind",
                 self.unwrap_options.unwrap_method
             )));
         }
@@ -1674,10 +1679,30 @@ impl DisplacementWorkflow {
                     &["smooth", "defo"],
                 )?;
             }
-            UnwrapMethod::Icu
-            | UnwrapMethod::Phass
-            | UnwrapMethod::Spurt
-            | UnwrapMethod::Whirlwind => unreachable!("unsupported methods returned above"),
+            UnwrapMethod::Whirlwind => {
+                // Whirlwind runs its own linear Carballo cost on the whole grid;
+                // SNAPHU's cost, init and tiling would be silently ignored.
+                let snaphu = &self.unwrap_options.snaphu_options;
+                let snaphu_defaults = &defaults.unwrap_options.snaphu_options;
+                ensure_compatibility_default(
+                    "unwrap_options.snaphu_options.init_method",
+                    &snaphu.init_method,
+                    &snaphu_defaults.init_method,
+                )?;
+                ensure_supported_choice(
+                    "unwrap_options.snaphu_options.cost",
+                    &snaphu.cost,
+                    &["smooth"],
+                )?;
+                ensure_compatibility_default(
+                    "unwrap_options.snaphu_options.ntiles",
+                    &snaphu.ntiles,
+                    &snaphu_defaults.ntiles,
+                )?;
+            }
+            UnwrapMethod::Icu | UnwrapMethod::Phass | UnwrapMethod::Spurt => {
+                unreachable!("unsupported methods returned above")
+            }
         }
         if let Some(fraction) = self.output_options.min_reference_component_fraction {
             if self.output_options.bounds.is_none() {

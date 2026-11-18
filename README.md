@@ -56,8 +56,11 @@ tolerances (not bit-exactness):
   TEC map: 56.5 TECU → 14 m**) and tropospheric (OPERA L4 netCDF ingest — **real granule
   validated**, total ZTD ≈ 2.8 m), subtracted per date from the time series before velocity,
   with RAiDER as a gated fallback. Off by default. See [docs/usage.md](docs/usage.md) §3a.
-- `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, and the spurt/whirlwind unwrappers
-  are deferred.
+- **whirlwind unwrapping** is implemented and opt-in (`unwrap_method: whirlwind`, #169): the
+  in-process `whirlwind-core` solver, within 0.08% of SNAPHU per component on the real MMX1
+  frame at about a sixth of native's CPU there.
+- `EagerLoader` prefetch, complex-GeoTIFF (CFloat32) writer, and the spurt unwrapper are
+  deferred.
 
 See [STATUS.md](STATUS.md) and [PLAYBOOK.md](PLAYBOOK.md) for the full roadmap.
 
