@@ -79,7 +79,11 @@ identity fields (`dem_grid_spacing_x`/`_y`/`_units`, `dem_vertical_datum`). Vers
 `corrections_applied` and `time_function_model` (issue #130 / eo#483 Table 5 processing
 disclosure): both are computed directly from `CorrectionOptions`, `layover_shadow_mask_files`,
 and `TimeseriesOptions`, so unlike the fields above they have no absent case — every run can
-state them with certainty. `corrections_applied` is `[]`, never `null`, when nothing ran;
+state them with certainty. Its stable names, in disclosure order, are `solid_earth_tide`,
+`plate_motion`, `ionosphere`, `troposphere`, `layover_shadow_mask` (explicit
+`layover_shadow_mask_files`, or native OPERA input masks, which read the same CSLC-S1-STATIC
+layer) and `native_quality_mask` (native NISAR GSLC input masks, the GSLC's own quality
+layer; #210). `corrections_applied` is `[]`, never `null`, when nothing ran;
 `time_function_model` is always at least `"linear"`. Version 7 adds `cslc_dem_source` (issue
 #167, eo#483 Table 5): `/metadata/processing_information/inputs/dem_source`, read from every
 `cslc_file_list` and `correction_options.geometry_files` (CSLC-S1-STATIC) granule and required

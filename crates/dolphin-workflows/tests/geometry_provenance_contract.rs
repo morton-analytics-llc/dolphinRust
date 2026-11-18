@@ -320,13 +320,30 @@ fn native_opera_input_mask_counts_as_the_layover_shadow_mask() {
         assemble_geometry_provenance(&cfg, None).corrections_applied,
         vec!["layover_shadow_mask"]
     );
+}
 
+/// #210: NISAR's native mask is the GSLC's own quality layer, not the OPERA
+/// STATIC layover/shadow mask, so it is disclosed under its own name, after
+/// `layover_shadow_mask` when explicit layover/shadow files are also given.
+#[test]
+fn native_nisar_input_mask_counts_as_the_native_quality_mask() {
     let mut nisar = DisplacementWorkflow::default();
-    nisar.input_options.apply_native_input_masks = true;
     nisar.input_options.input_type = InputType::NisarGslc;
     assert_eq!(
         assemble_geometry_provenance(&nisar, None).corrections_applied,
         Vec::<String>::new()
+    );
+
+    nisar.input_options.apply_native_input_masks = true;
+    assert_eq!(
+        assemble_geometry_provenance(&nisar, None).corrections_applied,
+        vec!["native_quality_mask"]
+    );
+
+    nisar.layover_shadow_mask_files = vec![PathBuf::from("layover_shadow.tif")];
+    assert_eq!(
+        assemble_geometry_provenance(&nisar, None).corrections_applied,
+        vec!["layover_shadow_mask", "native_quality_mask"]
     );
 }
 

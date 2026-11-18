@@ -36,6 +36,8 @@ const CORRECTION_PLATE_MOTION: &str = "plate_motion";
 const CORRECTION_IONOSPHERE: &str = "ionosphere";
 const CORRECTION_TROPOSPHERE: &str = "troposphere";
 const CORRECTION_LAYOVER_SHADOW_MASK: &str = "layover_shadow_mask";
+/// NISAR GSLC `<frequency group>/mask` applied at publication (#210).
+const CORRECTION_NATIVE_QUALITY_MASK: &str = "native_quality_mask";
 /// Versioned rule used to turn locally incomplete temporal tiles into nodata.
 pub const INPUT_COVERAGE_POLICY_VERSION: &str = "complete-temporal-tile/1";
 /// Genuine coherence-matrix-magnitude raster, distinct from estimator-fit
@@ -409,8 +411,8 @@ pub fn write_geometry_provenance(dir: &Path, prov: &GeometryProvenance) -> anyho
 }
 
 /// Correction categories this run's `CorrectionOptions`,
-/// `layover_shadow_mask_files` and native OPERA input masks actually enable, in
-/// a fixed disclosure order.
+/// `layover_shadow_mask_files` and native input masks actually enable, in a
+/// fixed disclosure order.
 /// Deterministic from config alone: every current run can state this with
 /// certainty, so (unlike the geometry fields above) there is no absent case.
 fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
@@ -429,11 +431,15 @@ fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
         applied.push(CORRECTION_TROPOSPHERE.into());
     }
     // Native OPERA masks read the same STATIC `layover_shadow_mask` at
-    // publication; NISAR's native mask is a different quality layer (#195).
-    let native_layover_shadow = cfg.input_options.apply_native_input_masks
-        && cfg.input_options.input_type != InputType::NisarGslc;
-    if !cfg.layover_shadow_mask_files.is_empty() || native_layover_shadow {
+    // publication (#195); NISAR's native mask is the GSLC's own quality layer,
+    // disclosed under its own name (#210).
+    let native_masks = cfg.input_options.apply_native_input_masks;
+    let nisar = cfg.input_options.input_type == InputType::NisarGslc;
+    if !cfg.layover_shadow_mask_files.is_empty() || (native_masks && !nisar) {
         applied.push(CORRECTION_LAYOVER_SHADOW_MASK.into());
+    }
+    if native_masks && nisar {
+        applied.push(CORRECTION_NATIVE_QUALITY_MASK.into());
     }
     applied
 }
