@@ -2140,8 +2140,24 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
     def test_parallel_batch_children_generate_seed_descriptors_in_parallel_and_time_them(self):
         source_root = Path(__file__).parents[2]
         with tempfile.TemporaryDirectory() as directory:
+            # Each child's passthrough registers itself and waits until all four
+            # children are alive at once, so a serial run fails at the barrier
+            # instead of being judged against a wall-clock bound that also
+            # measures machine load.
+            arrivals = Path(directory) / "arrivals"
+            arrivals.mkdir()
             passthrough = Path(directory) / "passthrough"
-            passthrough.write_text("#!/bin/sh\ncat\n")
+            passthrough.write_text(
+                "#!/bin/sh\n"
+                f"touch '{arrivals}'/$$\n"
+                "polls=0\n"
+                f"while [ \"$(ls '{arrivals}' | wc -l)\" -lt 4 ]; do\n"
+                "  polls=$((polls + 1))\n"
+                "  [ \"$polls\" -gt 1200 ] && exit 1\n"
+                "  sleep 0.05\n"
+                "done\n"
+                "cat\n"
+            )
             passthrough.chmod(0o755)
             with mock.patch(
                 "validation.spatial_covariance_simulation._cell_request_at",
@@ -2156,8 +2172,8 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
                     batch_binary=passthrough,
                     generation_delay_seconds=0.2,
                 )
+            self.assertEqual(len(list(arrivals.iterdir())), 4)
         self.assertGreaterEqual(receipt["elapsed_seconds"], 0.6)
-        self.assertLess(receipt["elapsed_seconds"], 1.8)
         self.assertEqual(receipt["child_invocation_count"], 4)
         self.assertEqual(receipt["output_records"], 12)
 
