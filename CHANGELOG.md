@@ -177,6 +177,13 @@ All notable changes to dolphinRust are documented here. The format follows
   file failed with `EAGAIN` (the #191 failure, in production spawns). The new
   `dolphin_core::process::exclude_inherited_descriptors` marks every descriptor above 2
   close-on-exec in the child before exec, and `run_snaphu` and all three RAiDER spawns use it.
+- **Geometry provenance names the NISAR native quality mask** (issue #210). With
+  `input_options.input_type: nisar_gslc` and `input_options.apply_native_input_masks`, the
+  GSLC's own `<frequency group>/mask` layer restricts the published validity, and
+  `corrections_applied` now lists it as `native_quality_mask`, after `layover_shadow_mask` in
+  the disclosure order. It was previously not listed. The field's shape and the schema
+  (`dolphinrust-geometry-provenance/7`) are unchanged: this adds one stable name to the list's
+  vocabulary.
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
   #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and
   edited child lists with `retain`. The tree is now `parent`/`thread`/`rev_thread`/
