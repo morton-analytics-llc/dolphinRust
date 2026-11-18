@@ -11,6 +11,7 @@
 pub mod blocks;
 pub mod config;
 pub mod error;
+pub mod process;
 pub mod types;
 
 pub use blocks::{iter_blocks, BlockIndices, StridedBlockManager, TileBlocks, Trim};

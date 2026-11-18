@@ -609,6 +609,7 @@ name = "dolphin-core"
 version = "1.6.0"
 dependencies = [
  "chrono",
+ "libc",
  "ndarray",
  "num-complex",
  "serde",
@@ -749,6 +750,7 @@ name = "dolphin-unwrap"
 version = "1.6.0"
 dependencies = [
  "dolphin-core",
+ "libc",
  "ndarray",
  "ndarray-npy",
  "num-complex",

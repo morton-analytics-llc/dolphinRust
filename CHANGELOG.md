@@ -171,6 +171,12 @@ All notable changes to dolphinRust are documented here. The format follows
   not worse than the old on any frozen metric, and no reduction in junction steps was measured.
 
 ### Fixed
+- **SNAPHU and RAiDER no longer inherit open HDF5 files** (issue #214). libhdf5 opens files
+  without `O_CLOEXEC` and takes a `flock` on each. A SNAPHU or RAiDER child spawned while one
+  was open held that lock until the child exited, so a later create or read-write open of the
+  file failed with `EAGAIN` (the #191 failure, in production spawns). The new
+  `dolphin_core::process::exclude_inherited_descriptors` marks every descriptor above 2
+  close-on-exec in the child before exec, and `run_snaphu` and all three RAiDER spawns use it.
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
   #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and
   edited child lists with `retain`. The tree is now `parent`/`thread`/`rev_thread`/

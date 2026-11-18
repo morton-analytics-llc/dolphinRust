@@ -11,6 +11,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use dolphin_core::process::exclude_inherited_descriptors;
+
 use crate::error::{CorrectionError, Result};
 use crate::troposphere::{read_l4_netcdf, DelayGrid};
 
@@ -18,7 +20,7 @@ use crate::troposphere::{read_l4_netcdf, DelayGrid};
 /// `PATH`.
 #[must_use]
 pub fn raider_available() -> bool {
-    let py = Command::new("python")
+    let py = exclude_inherited_descriptors(&mut Command::new("python"))
         .args(["-c", "import RAiDER"])
         .status()
         .map(|s| s.success())
@@ -28,7 +30,7 @@ pub fn raider_available() -> bool {
 
 /// `raider.py` reachable on `PATH`.
 fn which(bin: &str) -> bool {
-    Command::new("command")
+    exclude_inherited_descriptors(&mut Command::new("command"))
         .args(["-v", bin])
         .status()
         .map(|s| s.success())
@@ -47,7 +49,7 @@ pub fn run_raider(config: &Path, output: &Path, var: &str) -> Result<DelayGrid> 
     if !raider_available() {
         return Err(CorrectionError::RaiderUnavailable);
     }
-    let status = Command::new("raider.py")
+    let status = exclude_inherited_descriptors(&mut Command::new("raider.py"))
         .arg("--file")
         .arg(config)
         .status()?;
