@@ -155,6 +155,7 @@ fn run_snaphu(
     cols: usize,
 ) -> Result<()> {
     let mut cmd = Command::new(&cfg.snaphu_path);
+    dolphin_core::process::exclude_inherited_descriptors(&mut cmd);
     cmd.arg(cost_flag(cfg.cost)).arg(init_flag(cfg.init));
     cmd.args(["-C", "CONNCOMPOUTTYPE UINT"]);
     cmd.args(["-C", "OUTFILEFORMAT FLOAT_DATA"]);
@@ -237,4 +238,45 @@ fn read_u32(path: &Path, shape: (usize, usize)) -> Result<Array2<u32>> {
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     Array2::from_shape_vec(shape, values).map_err(|e| UnwrapError::Shape(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// #214: SNAPHU runs without the parent's open files (libhdf5 opens them
+    /// without `O_CLOEXEC`), so it cannot hold their `flock`s while it runs.
+    #[test]
+    fn snaphu_child_does_not_inherit_open_descriptors() {
+        let scratch =
+            std::env::temp_dir().join(format!("dolphin_snaphu_fds_{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let held = CString::new(scratch.join("held").to_str().unwrap()).unwrap();
+        // SAFETY: plain open of a scratch file; closed below.
+        let descriptor = unsafe { libc::open(held.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(descriptor > 2);
+        let probe = scratch.join("probe.sh");
+        std::fs::write(
+            &probe,
+            format!("#!/bin/sh\nif [ -e /dev/fd/{descriptor} ]; then echo inherited >&2; else echo isolated >&2; fi\nexit 1\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = UnwrapConfig {
+            snaphu_path: probe.to_str().unwrap().to_string(),
+            ..UnwrapConfig::default()
+        };
+        let wrapped = ndarray::Array2::from_elem((2, 2), Cf32::new(1.0, 0.0));
+        let result = unwrap_with_corr(wrapped.view(), &scratch.join("corr.f4"), &cfg, &scratch);
+        // SAFETY: closes the descriptor opened above.
+        unsafe { libc::close(descriptor) };
+        std::fs::remove_dir_all(&scratch).unwrap();
+        match result {
+            Err(UnwrapError::Snaphu(stderr)) => assert_eq!(stderr.trim(), "isolated"),
+            Err(other) => panic!("probe should fail with its stderr, got {other}"),
+            Ok(_) => panic!("probe exits non-zero"),
+        }
+    }
 }

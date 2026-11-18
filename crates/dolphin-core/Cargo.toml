@@ -18,6 +18,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+libc = "0.2"
 
 [lints]
 workspace = true
