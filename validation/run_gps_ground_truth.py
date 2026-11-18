@@ -224,6 +224,24 @@ def apply_seasonal_override(base: dict[str, Any], velocity_seasonal: bool) -> No
     base["timeseries_options"]["velocity_seasonal"] = True
 
 
+def apply_loop_closure_override(base: dict[str, Any], loop_closure: str) -> None:
+    """Turn on the post-unwrap loop-closure gate, optionally with the integer
+    correction ahead of it (issue #142).
+
+    `off` leaves the generated config untouched. `gate` masks pixels whose
+    triangles miss closure; `correct` first solves each pixel's minimum-L1
+    integer-cycle correction and leaves the gate as its QC. Both need a network
+    with closed triangles, so they are refused without `--max-bandwidth`.
+    """
+    if loop_closure == "off":
+        return
+    if not base.get("interferogram_network", {}).get("max_bandwidth"):
+        raise ValueError("--loop-closure needs --max-bandwidth: a single-reference network has no loops")
+    timeseries = base.setdefault("timeseries_options", {})
+    timeseries["mask_unwrap_loop_errors"] = True
+    timeseries["correct_unwrap_loop_errors"] = loop_closure == "correct"
+
+
 def ensure_rust_binary(build: bool) -> None:
     if build or not RUST_BIN.exists():
         subprocess.run(
@@ -382,6 +400,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     base = generate_base_config(cslcs, base_path, run_root / "work_base")
     apply_network_override(base, args.max_bandwidth)
     apply_seasonal_override(base, args.velocity_seasonal)
+    apply_loop_closure_override(base, args.loop_closure)
     native, snaphu = build_backend_configs(
         base,
         [path.resolve() for path in static_files],
@@ -508,6 +527,15 @@ def parse_args() -> argparse.Namespace:
             "fit an annual seasonal term alongside the linear rate (issue #22). "
             "A single slope is misspecified over a window spanning a full seasonal "
             "cycle, which is where this cohort's InSAR-GNSS velocity gap lives"
+        ),
+    )
+    parser.add_argument(
+        "--loop-closure",
+        choices=["off", "gate", "correct"],
+        default="off",
+        help=(
+            "post-unwrap loop-closure QC: mask misclosed pixels (gate), or correct "
+            "integer-cycle errors first and gate the rest (correct; issue #142)"
         ),
     )
     parser.add_argument(
