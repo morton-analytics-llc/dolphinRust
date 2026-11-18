@@ -115,6 +115,25 @@ NEAR_TIE_CELL = "hw_1x1|stride_4|glrt_frozen|interior|shared_75_positive|four_bl
 LARGE_WINDOW_COINCIDENT_CELL = "hw_3x6|stride_4|glrt_frozen|interior|coincident|four_blocks|emi|well_separated|spatial_correlation_stress"
 
 
+def built_debug_batch() -> Path:
+    """Build the no-GPU debug batch example (a no-op when current) and return its path.
+
+    Tests that execute the binary directly must not depend on another test, or on
+    `cargo test`, having built it first.
+    """
+    source_root = Path(__file__).parents[2]
+    subprocess.run(
+        [
+            "cargo", "build", "--quiet", "-p", "dolphin-workflows",
+            "--no-default-features", "--features", "no-gpu", "--example",
+            "spatial_covariance_batch",
+        ],
+        check=True,
+        cwd=source_root,
+    )
+    return source_root / "target/debug/examples/spatial_covariance_batch"
+
+
 class SpatialCovarianceValidationV6Tests(unittest.TestCase):
     benchmark_stdout_by_scope = {}
     @classmethod
@@ -1312,16 +1331,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
 
     def test_final_scorer_replays_exact_rust_and_rejects_rehashed_summary_replacement(self):
         source_root = Path(__file__).parents[2]
-        batch = source_root / "target/debug/examples/spatial_covariance_batch"
-        subprocess.run(
-            [
-                "cargo", "build", "--quiet", "-p", "dolphin-workflows",
-                "--no-default-features", "--features", "no-gpu", "--example",
-                "spatial_covariance_batch",
-            ],
-            check=True,
-            cwd=source_root,
-        )
+        batch = built_debug_batch()
         cell_ordinal = expected_cell_ids(self.preregistration).index(MASKED_CELL)
         request = next(_iter_cell_requests(self.preregistration, MASKED_CELL, 1))
         completed = subprocess.run(
@@ -2522,8 +2532,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             regenerated["source_correlation_receipt_sha256"], expected_receipt
         )
 
-        source_root = Path(__file__).parents[2]
-        batch = source_root / "target/debug/examples/spatial_covariance_batch"
+        batch = built_debug_batch()
         request = _cell_request_at(
             self.preregistration,
             FROZEN_POSITIVE_OVERLAP_CELL,
@@ -2571,7 +2580,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             )
             completed = subprocess.run(
                 [
-                    str(Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch"),
+                    str(built_debug_batch()),
                     "--preregistration", str(PREREGISTRATION),
                     "--cell-id", cell_id,
                     "--ephemeral-evidence-stdout",
@@ -2613,7 +2622,7 @@ class SpatialCovarianceValidationV6Tests(unittest.TestCase):
             )
             completed = subprocess.run(
                 [
-                    str(Path(__file__).parents[2] / "target/debug/examples/spatial_covariance_batch"),
+                    str(built_debug_batch()),
                     "--preregistration", str(PREREGISTRATION),
                     "--cell-id", cell_id,
                     "--ephemeral-evidence-stdout",
