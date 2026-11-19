@@ -45,7 +45,7 @@ use dolphin_timeseries::{
     DEFAULT_CYCLE_STEP_TOLERANCE_CYCLES, JUNCTION_SUPPORT_LOOK_RADII, MIN_CYCLE_STEP_NEIGHBOURS,
 };
 use dolphin_unwrap::native::NativeConfig;
-use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig};
+use dolphin_unwrap::{CostMode, InitMethod, TophuConfig, UnwrapConfig, WhirlwindConfig};
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis};
 use sha2::{Digest, Sha256};
 
@@ -92,7 +92,7 @@ use crate::spatial_reference_covariance_output::{
 use crate::tiling::{plan_tiles, TilePlan};
 use crate::unwrap_backend::{
     unwrap_phase_correlated_network, CorrelatedNetworkUnwrap, InterpolationPlan,
-    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend,
+    NativeUnwrapBackend, SnaphuBackend, TophuBackend, UnwrapBackend, WhirlwindBackend,
 };
 use dolphin_corrections::LosGeometry;
 
@@ -5396,12 +5396,14 @@ fn unwrap_pool(n_parallel_jobs: i64) -> Result<rayon::ThreadPool> {
         .context("building unwrap thread pool")
 }
 
-/// Build the unwrap backend from the config: tophu when selected, else SNAPHU.
+/// Build the unwrap backend from the config: native, tophu or whirlwind when
+/// selected, else SNAPHU.
 /// `grid` is the unwrap grid `(rows, cols)`, used only for opt-in auto-tiling.
 fn unwrap_backend(cfg: &DisplacementWorkflow, grid: (usize, usize)) -> Box<dyn UnwrapBackend> {
     match cfg.unwrap_options.unwrap_method {
         UnwrapMethod::Tophu => Box::new(TophuBackend(tophu_config(cfg))),
         UnwrapMethod::Native => Box::new(NativeUnwrapBackend(native_config(cfg, grid))),
+        UnwrapMethod::Whirlwind => Box::new(WhirlwindBackend(WhirlwindConfig::default())),
         _ => Box::new(SnaphuBackend(unwrap_config(cfg, grid))),
     }
 }

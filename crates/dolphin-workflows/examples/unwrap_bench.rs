@@ -1,4 +1,5 @@
-//! Benchmark for the ifg-network unwrap: native in-process MCF vs SNAPHU.
+//! Benchmark for the ifg-network unwrap: native in-process MCF, whirlwind
+//! (`BACKEND=whirlwind`) and SNAPHU.
 //!
 //!     EPOCHS=12 ROWS=1024 COLS=1024 DENSE=1 TILE=4 BACKEND=native \
 //!         RAYON_NUM_THREADS=8 cargo run --release --example unwrap_bench
@@ -21,7 +22,8 @@ use anyhow::Result;
 use dolphin_core::Cf64;
 use dolphin_unwrap::native::NativeConfig;
 use dolphin_unwrap::UnwrapConfig;
-use dolphin_workflows::{NativeUnwrapBackend, SnaphuBackend, UnwrapBackend};
+use dolphin_unwrap::WhirlwindConfig;
+use dolphin_workflows::{NativeUnwrapBackend, SnaphuBackend, UnwrapBackend, WhirlwindBackend};
 use ndarray::{Array2, Array3};
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -151,6 +153,7 @@ fn main() -> Result<()> {
     };
     let backend: Box<dyn UnwrapBackend> = match name.as_str() {
         "native" => Box::new(NativeUnwrapBackend(native_cfg)),
+        "whirlwind" => Box::new(WhirlwindBackend(WhirlwindConfig::default())),
         _ => Box::new(SnaphuBackend(UnwrapConfig::default())),
     };
     let t0 = Instant::now();

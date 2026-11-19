@@ -15,7 +15,8 @@ use dolphin_core::{Cf32, Cf64};
 use dolphin_phaselink::{interpolate, INTERPOLATION_ALPHA, INTERPOLATION_NUM_NEIGHBORS};
 use dolphin_unwrap::native::{unwrap_native, NativeConfig};
 use dolphin_unwrap::{
-    unwrap_multiscale, unwrap_with_corr, write_correlation, TophuConfig, UnwrapConfig,
+    unwrap_multiscale, unwrap_whirlwind, unwrap_with_corr, write_correlation, TophuConfig,
+    UnwrapConfig, WhirlwindConfig,
 };
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
@@ -58,6 +59,10 @@ pub struct TophuBackend(pub TophuConfig);
 /// no scratch round-trip: each ifg is unwrapped from in-memory arrays, so the
 /// per-pair `par_iter` parallelizes with neither a fork nor flat-binary I/O.
 pub struct NativeUnwrapBackend(pub NativeConfig);
+
+/// In-process whirlwind unwrapper (`whirlwind-core`), unwrapped from memory
+/// like [`NativeUnwrapBackend`].
+pub struct WhirlwindBackend(pub WhirlwindConfig);
 
 /// Pre-unwrap interpolation of low-quality wrapped phase, as dolphin v0.35.0's
 /// `unwrap/_unwrap.py` runs it when `unwrap_options.run_interpolation` is set.
@@ -333,6 +338,27 @@ impl UnwrapBackend for NativeUnwrapBackend {
         let layers = pairs
             .par_iter()
             .map(|&pair| solve_native(pl, pair, correlation, &self.0))
+            .collect::<Result<Vec<_>>>()?;
+        stack_layers(layers)
+    }
+}
+
+impl UnwrapBackend for WhirlwindBackend {
+    fn unwrap_network(
+        &self,
+        pl: ArrayView3<Cf64>,
+        pairs: &[(usize, usize)],
+        correlation: ArrayView2<f32>,
+        _scratch: &Path,
+    ) -> Result<UnwrapNetworkOutput> {
+        let layers = pairs
+            .par_iter()
+            .map(|&pair| {
+                let ifg = form_ifg(pl, pair);
+                let out = unwrap_whirlwind(ifg.view(), correlation, &self.0)
+                    .context("whirlwind unwrap")?;
+                Ok((out.unwrapped.mapv(f64::from), out.conncomp))
+            })
             .collect::<Result<Vec<_>>>()?;
         stack_layers(layers)
     }

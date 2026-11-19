@@ -751,20 +751,46 @@ fn compatibility_only_non_defaults_fail_with_full_yaml_path() {
 
 #[test]
 fn unimplemented_unwrap_backends_fail_instead_of_falling_through_to_snaphu() {
-    for method in [
-        UnwrapMethod::Icu,
-        UnwrapMethod::Phass,
-        UnwrapMethod::Spurt,
-        UnwrapMethod::Whirlwind,
-    ] {
+    for method in [UnwrapMethod::Icu, UnwrapMethod::Phass, UnwrapMethod::Spurt] {
         let mut config = DisplacementWorkflow::default();
         config.unwrap_options.unwrap_method = method;
         let error = config.validate_supported_options().unwrap_err().to_string();
         assert!(error.contains("unwrap_options.unwrap_method"), "{error}");
         assert!(
-            error.contains("supports only native, snaphu, and tophu"),
+            error.contains("supports only native, snaphu, tophu, and whirlwind"),
             "{error}"
         );
+    }
+}
+
+/// #169: whirlwind is a supported backend, and SNAPHU options it would
+/// silently ignore are refused.
+#[test]
+fn whirlwind_backend_is_accepted_and_refuses_snaphu_only_options() {
+    let mut config = DisplacementWorkflow::default();
+    config.unwrap_options.unwrap_method = UnwrapMethod::Whirlwind;
+    config.validate_supported_options().unwrap();
+
+    for (path, edit) in [
+        (
+            "unwrap_options.snaphu_options.cost",
+            (|c: &mut DisplacementWorkflow| c.unwrap_options.snaphu_options.cost = "defo".into())
+                as fn(&mut DisplacementWorkflow),
+        ),
+        ("unwrap_options.snaphu_options.init_method", |c| {
+            c.unwrap_options.snaphu_options.init_method = "mst".into();
+        }),
+        ("unwrap_options.snaphu_options.ntiles", |c| {
+            c.unwrap_options.snaphu_options.ntiles = (2, 2);
+        }),
+    ] {
+        let mut rejected = config.clone();
+        edit(&mut rejected);
+        let error = rejected
+            .validate_supported_options()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(path), "{path}: {error}");
     }
 }
 

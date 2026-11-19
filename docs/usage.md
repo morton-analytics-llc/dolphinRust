@@ -377,6 +377,13 @@ unwrap_options:
   tophu_options: { ntiles: [4, 4], downsample_factor: [3, 3], init_method: mcf, cost: smooth }
 ```
 
+**`whirlwind`** (opt-in, #169) runs the `whirlwind-core` minimum-cost-flow solver in-process:
+linear Carballo costs over the whole grid, with SNAPHU-style connected components grown from
+the result. It needs no SNAPHU binary. `snaphu_options` must stay at their defaults
+(`cost: smooth`, default `init_method`, `ntiles: [1, 1]`), since whirlwind would ignore them.
+On the real MMX1 frame it matched SNAPHU to 0.08% or better per component on all 12
+interferograms, using 5.8 CPU-s against native's 36.3.
+
 ## 6. Known limitations (v1.0.0)
 
 - **Single-burst only** — multi-burst stitching pending.
