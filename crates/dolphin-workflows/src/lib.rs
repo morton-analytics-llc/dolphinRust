@@ -16,6 +16,7 @@ pub mod cslc_covariance_source;
 pub mod dates;
 pub mod displacement;
 pub mod fixed_cube;
+pub mod pairs;
 pub mod phase_steps;
 pub mod provenance;
 pub mod sequential;
@@ -52,6 +53,10 @@ pub use displacement::{
     VelocityEstimator,
 };
 pub use fixed_cube::{write_fixed_cube_bundle, FixedCubeReceipt};
+pub use pairs::{
+    plan_pairs, run_pairs, PairAcquisition, PairFile, PairPlan, PairRecord, PairsConfig,
+    PairsIndex, PairsMode, PlannedPair, PAIRS_INDEX_FILENAME,
+};
 pub use provenance::{
     assemble_geometry_provenance, assemble_geometry_provenance_with_bounds,
     assemble_geometry_provenance_with_coverage, write_geometry_provenance, BurstCoverageProvenance,

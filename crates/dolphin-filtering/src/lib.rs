@@ -7,4 +7,4 @@
 pub mod fft;
 pub mod filters;
 
-pub use filters::{filter_long_wavelength, goldstein};
+pub use filters::{filter_long_wavelength, goldstein, masked_gaussian_lowpass};

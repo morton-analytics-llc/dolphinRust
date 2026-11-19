@@ -16,6 +16,13 @@
 //!   dataset value OPERA uses. GDAL returns an identity geotransform for this, so
 //!   the affine transform is derived from the coordinate spacing directly.
 //!
+//! - **Each frequency band is its own grid.** A dual-band product carries the
+//!   main band under `frequencyA` and the side band under `frequencyB`, each with
+//!   its own coordinates (the 5 MHz side band is coarser), so every reader here
+//!   takes the band's own subdataset path. [`read_nisar_band_metadata`] reads the
+//!   band's `centerFrequency` and `rangeBandwidth` (Hz) from the same group — the
+//!   inputs to split-spectrum ionosphere estimation.
+//!
 //! Atmospheric (ionospheric/tropospheric) corrections are **out of scope** here:
 //! this path yields a geometrically-correct but atmospherically-uncorrected
 //! L-band product. Ionosphere is ~16× the C-band effect and is mandatory for a
@@ -104,6 +111,35 @@ pub fn read_nisar_geotransform(path: &Path, subdataset: &str) -> Result<GeoInfo>
     })
 }
 
+/// Radar metadata for one NISAR frequency band.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NisarBandMetadata {
+    /// `centerFrequency`: band center (carrier) frequency in Hz.
+    pub center_frequency_hz: f64,
+    /// `rangeBandwidth`: processed range bandwidth in Hz.
+    pub range_bandwidth_hz: f64,
+}
+
+/// Read `centerFrequency` and `rangeBandwidth` for the band holding
+/// `subdataset` (e.g. `/science/LSAR/GSLC/grids/frequencyB/HH` → the
+/// `frequencyB` group's scalars).
+///
+/// # Errors
+/// Returns `Err` if the file has no such band group or either scalar is absent.
+pub fn read_nisar_band_metadata(path: &Path, subdataset: &str) -> Result<NisarBandMetadata> {
+    let group = parent_group(subdataset);
+    let file = hdf5::File::open(path)?;
+    let scalar = |name: &str| -> Result<f64> {
+        Ok(file
+            .dataset(&format!("{group}/{name}"))?
+            .read_scalar::<f64>()?)
+    };
+    Ok(NisarBandMetadata {
+        center_frequency_hz: scalar("centerFrequency")?,
+        range_bandwidth_hz: scalar("rangeBandwidth")?,
+    })
+}
+
 /// EPSG from the `projection` dataset's `epsg_code` attribute (NISAR), else from
 /// the dataset's scalar value.
 fn read_epsg(file: &hdf5::File, group: &str) -> Result<u32> {
@@ -127,7 +163,10 @@ fn parent_group(subdataset: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nisar_fixture::{write_nisar_fixture, FREQUENCY_A_GROUP};
+    use crate::nisar_fixture::{
+        write_nisar_dual_band_fixture, write_nisar_fixture, FixtureBand, FREQUENCY_A_GROUP,
+        FREQUENCY_B_GROUP,
+    };
 
     /// Contract: the reader recovers the known pixel values, grid shape, and
     /// geotransform/EPSG from a synthesized NISAR-layout fixture — the de-risk
@@ -184,6 +223,71 @@ mod tests {
         let win = read_nisar_window(&path, &dataset, block).unwrap();
         let expected = full.slice(s![block.rows(), block.cols()]).to_owned();
         assert_eq!(win, expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contract: a dual-band fixture yields the `frequencyB` grid on its own
+    /// coarser geotransform, plus `centerFrequency`/`rangeBandwidth` per band,
+    /// while `frequencyA` reads exactly as before.
+    #[test]
+    fn reads_nisar_frequency_b_grid_and_band_metadata() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
+        let path = std::env::temp_dir().join("dolphin_nisar_dual_band_contract.h5");
+        let _ = std::fs::remove_file(&path);
+        let main_cpx = Array2::from_shape_fn((4, 6), |(r, c)| Cf32::new(r as f32, c as f32));
+        let side_cpx =
+            Array2::from_shape_fn((2, 3), |(r, c)| Cf32::new(-(r as f32), 7.0 + c as f32));
+        let main_x: Vec<f64> = (0..6).map(|i| 300_000.0 + 10.0 * i as f64).collect();
+        let main_y: Vec<f64> = (0..4).map(|i| 4_100_000.0 - 10.0 * i as f64).collect();
+        let side_x = [300_005.0_f64, 300_025.0, 300_045.0];
+        let side_y = [4_099_995.0_f64, 4_099_975.0];
+        let main = FixtureBand {
+            cpx: main_cpx.view(),
+            x: &main_x,
+            y: &main_y,
+            center_frequency_hz: 1.2575e9,
+            range_bandwidth_hz: 40e6,
+        };
+        let side = FixtureBand {
+            cpx: side_cpx.view(),
+            x: &side_x,
+            y: &side_y,
+            center_frequency_hz: 1.2935e9,
+            range_bandwidth_hz: 5e6,
+        };
+        write_nisar_dual_band_fixture(&path, "HH", &main, &side, 32610).unwrap();
+
+        let main_ds = format!("{FREQUENCY_A_GROUP}/HH");
+        let side_ds = format!("{FREQUENCY_B_GROUP}/HH");
+        assert_eq!(read_nisar_rslc(&path, &main_ds).unwrap(), main_cpx);
+        assert_eq!(read_nisar_rslc(&path, &side_ds).unwrap(), side_cpx);
+
+        let side_geo = read_nisar_geotransform(&path, &side_ds).unwrap();
+        assert_eq!(side_geo.epsg, 32610);
+        assert!((side_geo.geotransform[0] - 299_995.0).abs() < 1e-6);
+        assert!((side_geo.geotransform[1] - 20.0).abs() < 1e-9);
+        assert!((side_geo.geotransform[5] + 20.0).abs() < 1e-9);
+
+        let main_meta = read_nisar_band_metadata(&path, &main_ds).unwrap();
+        let side_meta = read_nisar_band_metadata(&path, &side_ds).unwrap();
+        assert_eq!(main_meta.center_frequency_hz, 1.2575e9);
+        assert_eq!(main_meta.range_bandwidth_hz, 40e6);
+        assert_eq!(side_meta.center_frequency_hz, 1.2935e9);
+        assert_eq!(side_meta.range_bandwidth_hz, 5e6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contract: a single-band product has no `frequencyB`, so its band metadata
+    /// read fails rather than returning a default.
+    #[test]
+    fn nisar_band_metadata_absent_without_frequency_b() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
+        let path = std::env::temp_dir().join("dolphin_nisar_single_band_contract.h5");
+        let _ = std::fs::remove_file(&path);
+        let cpx = Array2::from_elem((2, 2), Cf32::new(1.0, 0.0));
+        write_nisar_fixture(&path, "HH", cpx.view(), &[0.0, 10.0], &[0.0, -10.0], 32610).unwrap();
+        let side_ds = format!("{FREQUENCY_B_GROUP}/HH");
+        assert!(read_nisar_band_metadata(&path, &side_ds).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }

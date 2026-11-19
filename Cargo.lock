@@ -644,6 +644,7 @@ version = "1.6.0"
 dependencies = [
  "chrono",
  "dolphin-core",
+ "dolphin-filtering",
  "dolphin-io",
  "gdal",
  "hdf5-metno",

@@ -197,6 +197,89 @@ skipped rather than failing. Install RAiDER to enable it; the OPERA L4 path is p
 frame currently requires the grids to share a CRS (a 4326→UTM warp is the remaining step —
 see `VALIDATION.md`). The ionospheric path and L4 *ingest* are validated on real data.
 
+### 3b. Pair interferograms with split-spectrum ionosphere (`dolphin pairs`, `mode: interferogram`)
+
+`dolphin pairs --config pairs.yaml` with `mode: interferogram` and `input_type: nisar_gslc`
+forms one unwrapped, ionosphere-corrected interferogram per planned pair (`pair_plan`) from
+NISAR GSLCs that carry both a main band (`frequencyA`) and a side band (`frequencyB`). A
+product without `frequencyB` is refused. Per pair:
+
+1. **Interferograms.** `ref · conj(sec)` in both bands. A is multilooked onto the B grid; B
+   must be an integer multilook of A on the same CRS, and `strides` must equal those A→B
+   looks. Coherence is estimated on A with `half_window`.
+2. **Unwrapping.** Both bands are unwrapped with SNAPHU. The written
+   `connected_components` layer is A's.
+3. **Label-0 masking.** Pixels outside every A connected component (SNAPHU label 0) are set
+   to NaN in both bands before the ionosphere step. Their unwrapping is unreliable and no
+   single cycle offset holds there, so `ionosphere` and `corrected` are NaN at label 0.
+4. **Per-component inter-band cycle alignment.** SNAPHU picks an arbitrary integer-cycle
+   offset per component and band. Within each A component `c`, the side band is shifted by
+   `k_c = round(median((φ_B − r·φ_A) / 2π))`, `r = f_B / f_A`, over the pixels where both
+   bands are finite: `φ_B ← φ_B − 2π·k_c`. Without it, one slip in B adds a constant
+   `2π·r / (1 − r²)` rad to that component's ionosphere estimate.
+5. **Per-pixel side-band slip correction.** The narrow side band can also slip by whole
+   cycles *inside* one A component (SNAPHU unwraps B with A's coherence, so it rarely
+   puts a component boundary there), which one `k_c` cannot remove; on real data a
+   single such slip leaves a ≈ 73 rad step in the estimate. With `d = (φ_B − r·φ_A)/2π`
+   and `d₀` the component's circular-mean cycle fraction, each pixel is shifted by
+   `k₁ = round(median_w(d) − d₀)`, then re-wrapped against the window median of the
+   corrected field, `k₂ = round(d − k₁ − median_w(d − k₁))`. The window is ±100 m in
+   each axis (in that axis's pixels, at least one), same-component finite pixels only.
+   This assumes the true dispersive term stays within ±½ cycle of `d₀` over a
+   component (`±π·r/(1 − r²)` rad, ≈ ±36 rad at NISAR carriers).
+6. **Split-spectrum estimate.** Ionospheric phase in the A interferogram:
+   `φ_iono = r / (1 − r²) · (φ_B − r·φ_A)`, from the bands' `centerFrequency`.
+7. **Masked anisotropic low-pass.** `φ_iono` is smoothed by normalized convolution
+   (`G∗(x·m) / G∗m`) with a Gaussian whose half-power wavelength is
+   `ionosphere_lowpass_wavelength_m`, applied to each component separately so offsets never
+   bleed across component edges. σ is set per axis from the grid's y and x pixel spacings,
+   so the response is isotropic on the ground even when pixels are not square. A pixel whose
+   kernel holds less than a quarter of its mass on finite pixels of its own component is
+   NaN (straight edges and convex corners are kept; thin slivers and small islands drop).
+8. **Correction.** `corrected = unwrapped − ionosphere` (A, radians).
+
+Outputs per pair (`<layer>_<refYYYYMMDD>_<secYYYYMMDD>.tif`): `unwrapped`, `ionosphere`,
+`corrected`, `coherence`, `connected_components`; once per run `los_enu.tif` (ground→sensor
+unit vector, bands east/north/up, from the `nisar_geometry_group` radarGrid cube evaluated
+at `nisar_ellipsoidal_dem_file` heights). Each COG carries `WAVELENGTH_M`,
+`CENTER_FREQUENCY_A_HZ`, `CENTER_FREQUENCY_B_HZ`, `IONOSPHERE_METHOD` and
+`PHASE_SIGN = reference_times_conj_secondary`: positive phase is the `ref · conj(sec)` order
+of `tests/sign_convention.rs`. ISCE3-focused SLCs carry `exp(−j·4πR/λ)`, so an apparent
+range increase from reference to secondary is `+λ·φ / 4π`.
+
+`pairs.json` indexes every pair's IDs, dates, files and sha256, and adds an `interferogram`
+summary per pair:
+
+| Field | Meaning |
+|---|---|
+| `coherence_fraction_at_least_0_2` | fraction of finite coherence pixels ≥ 0.2 |
+| `median_coherence` | median finite coherence |
+| `ionosphere_std_rad` | population std of the finite low-passed ionosphere (rad) |
+| `in_component_fraction` | fraction of valid pixels inside an A component (label ≠ 0); only these carry `ionosphere` and `corrected` |
+| `side_band_cycle_alignment` | per A component: `component`, the cycle shift `k` removed from B, the `pixel_count` it was estimated over, and `cycle_slip_pixel_count`, the pixels shifted further by the per-pixel slip correction |
+
+A low `in_component_fraction` means most of the scene was left unwrapped-but-unlabelled
+(typically decorrelation) and has no corrected phase; a nonzero `k` is expected and records
+an inter-band SNAPHU offset that was removed. A large `cycle_slip_pixel_count` records
+B unwrapping slips inside the component that were removed.
+
+```yaml
+mode: interferogram
+input_type: nisar_gslc
+subdataset: /science/LSAR/GSLC/grids/frequencyA/HH
+work_directory: ./pairs
+acquisitions:
+  - {path: ref.h5, acquisition_id: REF_ID, acquisition_utc: 2025-01-01T00:00:00Z}
+  - {path: sec.h5, acquisition_id: SEC_ID, acquisition_utc: 2025-01-13T00:00:00Z}
+pair_plan: {pair_class_days: [12], tolerance_days: 1}
+half_window: {x: 11, y: 5}
+strides: {x: 8, y: 1}          # must equal the frequencyA→frequencyB looks
+bounds: [W, S, E, N]           # EPSG:4326
+nisar_geometry_group: /science/LSAR/GSLC/metadata/radarGrid
+nisar_ellipsoidal_dem_file: dem_ellipsoidal.tif
+ionosphere_lowpass_wavelength_m: 20000
+```
+
 ### Compute backend (CPU / GPU)
 
 Phase linking (covariance + EVD/EMI) has a first-class `wgpu` GPU backend compiled into the

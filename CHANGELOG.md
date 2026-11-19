@@ -18,6 +18,76 @@ All notable changes to dolphinRust are documented here. The format follows
   (16x16), or 417 untiled. `snaphu_options` cost, init method and tiling must stay at their
   defaults with this backend. The default stays `native`. `unwrap_bench` accepts
   `BACKEND=whirlwind`.
+- **`dolphin pairs` subcommand, coherence mode.** `dolphin pairs --config <yaml>` with
+  `mode: coherence` writes the pair coherence `|Γ_ij|` for a planned set of acquisition
+  pairs, one COG per pair named `coherence_<refYYYYMMDD>_<secYYYYMMDD>.tif`. `|Γ_ij|` comes
+  from `estimate_stack_covariance` with the phase-linking `half_window` and `strides`
+  semantics, so it is the off-diagonal phase linking computes and then discards; the
+  contract test matches it to the full-stack covariance to max |Δ| < 1e-6 on the real
+  cropped Mexico City stack. Pairs are either listed explicitly or formed from every
+  date-ordered pair whose calendar-day baseline is within `tolerance_days` of a
+  `pair_class_days` entry, so a gap in a 12-day series forms no pair across it. Each COG
+  carries `REFERENCE_ACQUISITION_ID`, `SECONDARY_ACQUISITION_ID`, `REFERENCE_DATE`,
+  `SECONDARY_DATE`, `TEMPORAL_BASELINE_DAYS` and `LAYER`. A `pairs.json` index lists each
+  pair's IDs, dates, files and sha256. Optional EPSG:4326 `bounds` go through the same
+  bounded-read planning as displacement runs. All acquisitions must share one grid. OPERA
+  CSLC only: `input_type: nisar_gslc` fails with an explicit error.
+- **`dolphin pairs` interferogram mode: NISAR split-spectrum ionosphere correction.**
+  `mode: interferogram` with `input_type: nisar_gslc` forms the `frequencyA` and
+  `frequencyB` interferograms `ref · conj(sec)` (the `tests/sign_convention.rs` order),
+  multilooks A onto the B grid by complex averaging, unwraps both with SNAPHU, aligns B's
+  integer cycles to A, estimates the ionosphere in the A interferogram with the
+  main/side-band split-spectrum kernel, low-pass filters it within each connected component
+  at `ionosphere_lowpass_wavelength_m`, and subtracts it. Per pair it writes
+  `unwrapped`, `ionosphere`, `corrected`, `coherence` and `connected_components`; once per
+  run it writes a three-band (east, north, up) ground→sensor `los_enu.tif` from the radarGrid
+  LOS cube (`nisar_geometry_group`, `nisar_ellipsoidal_dem_file`). Layers add the
+  `REFERENCE_CRID`, `SECONDARY_CRID`, `CENTER_FREQUENCY_A_HZ`, `CENTER_FREQUENCY_B_HZ`,
+  `WAVELENGTH_M`, `IONOSPHERE_METHOD=split_spectrum_main_side_band` and `PHASE_SIGN` tags, and
+  `pairs.json` gains a per-pair coherence ≥ 0.2 fraction, median coherence and ionosphere
+  std, plus the `los_enu` file. `corrected` is computed in f32 from the written `unwrapped`
+  and `ionosphere`, so `corrected − (unwrapped − ionosphere)` is exactly 0. `frequencyB`
+  must be an integer multilook of `frequencyA`, and `strides` must equal those looks. A
+  product without `frequencyB` is refused with `PairsError::MissingFrequencyB`. On a 256²
+  synthetic two-band pair a planted ionosphere screen is removed to 2.4e-3 rad RMS.
+  SNAPHU unwraps the two bands independently, so each connected component can carry its own
+  integer-cycle offset between them, and one cycle in B moves the estimate by about 73 rad at
+  NISAR L-band carriers. Before estimating, `align_side_band_cycles` computes, per
+  connected component `c` of the A `connected_components` layer, `k_c = round(median((φ_B −
+  (f_B/f_A)·φ_A) / 2π))` over the component's pixels where both bands are valid, and sets
+  `φ_B ← φ_B − 2π·k_c`. The A labels are used because they are the written layer and A,
+  multilooked from the wider band, is the better-unwrapped of the two. `pairs.json` records
+  each component's `k` and `pixel_count` under `side_band_cycle_alignment`. This removes the
+  inter-band ambiguity only; each component's absolute offset against ground truth remains
+  and is left to downstream anchoring. With +1 and −2 cycles planted on B in two components
+  of a synthetic pair, the kernel returns `k = 1` and `k = −2` and the ionosphere residual is
+  under 0.01 rad RMS. Pixels outside every A connected component (SNAPHU label 0) are NaN in
+  `ionosphere` and `corrected` (`unwrapped` and `coherence` are unchanged) and get no `k`;
+  `pairs.json` reports `in_component_fraction`, the share of valid pixels inside a component.
+  The low-pass is a normalized convolution, `G∗(x·m) / G∗m` with `m` the component's finite
+  pixels, run separately per component on a field zero-padded by 3σ per axis, so offsets do not
+  bleed across component edges or wrap across the image, and a valid `0.0` is data rather
+  than nodata (the previous filter zero-filled and treated exact zeros as gaps). A pixel
+  whose normalized weight `G∗m` is below 0.25 is NaN: a straight component edge sits at ½
+  and a convex corner at ¼, so slivers narrower than about 0.6σ and islands much smaller
+  than the filter scale are dropped. A smooth screen next to a 16×16 hole is recovered to
+  5.6e-3 rad, and two abutting components with constant offsets keep them to 1e-9 rad.
+  `σ_y` and `σ_x` are derived separately from the cutoff and the output grid's own y and x
+  spacings (from the geotransform), so the cutoff holds in metres on anisotropic NISAR grids
+  (e.g. 5 m × 40 m); the previous single σ from the geometric-mean spacing made the filter
+  about 2.8× too narrow along y and 2.8× too wide along x there. On a 5 m × 40 m grid a
+  sinusoid at the cutoff wavelength comes out at the half-power gain 1/√2 along both axes.
+  B unwrapping slips that do not follow an A component boundary are removed per pixel
+  (`correct_side_band_cycle_slips`): with `d = (φ_B − r·φ_A)/2π` and `d₀` the component's
+  circular-mean cycle fraction, `k₁ = round(median_w(d) − d₀)`, then a re-wrap against the
+  window median of the corrected field, over a ±100 m window of same-component pixels.
+  `side_band_cycle_alignment` gains `cycle_slip_pixel_count`. A half-component one-cycle
+  slip plus a two-cycle island under ±0.6 rad noise is restored to 1e-9 rad. On a real
+  dual-band 12-day pair one in-component B slip had left a 72 rad step (low-passed
+  ionosphere std 34 rad, about ten times the expected deformation phase); with the
+  correction the std is 0.45 rad over the same 51% in-component area. Intersecting the A and
+  B label maps instead also removed the step but kept only 5.6% of the scene, because
+  SNAPHU leaves most of B at label 0.
 - **Residual DEM-error term in the velocity fit** (issue #143). With
   `timeseries_options.estimate_dem_error`, the joint WLS velocity model gains one column
   `B⊥(t) / (R sin θ)` (Fattahi & Amelung 2013), scaled into LOS phase by `−4π/λ`. `B⊥(t)` is
@@ -195,6 +265,9 @@ All notable changes to dolphinRust are documented here. The format follows
   the disclosure order. It was previously not listed. The field's shape and the schema
   (`dolphinrust-geometry-provenance/7`) are unchanged: this adds one stable name to the list's
   vocabulary.
+- **`dolphin pairs` nodata.** A NaN input pixel used to come out of coherence mode as
+  coherence 0 with no nodata set. In both modes an output pixel is now NaN when any input
+  sample it is formed from is NaN, and every pair COG carries GDAL nodata NaN.
 - **Native unwrapper: the network simplex keeps its spanning tree in thread arrays** (issue
   #161). The child-list tree allocated per pivot, scanned the moved subtree for membership and
   edited child lists with `retain`. The tree is now `parent`/`thread`/`rev_thread`/

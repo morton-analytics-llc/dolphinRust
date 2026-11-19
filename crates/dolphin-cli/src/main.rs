@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dolphin_core::config::DisplacementWorkflow;
-use dolphin_workflows::{run_displacement, run_displacement_resumable, update_displacement};
+use dolphin_workflows::{
+    run_displacement, run_displacement_resumable, run_pairs, update_displacement, PairsConfig,
+};
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +42,15 @@ enum Command {
         #[arg(short, long, default_value_t = 2)]
         initial: usize,
     },
+    /// Write dated pairwise products for a planned set of acquisition pairs: pair
+    /// coherence (`mode: coherence`), or the NISAR split-spectrum ionosphere-corrected
+    /// unwrapped interferogram plus `los_enu.tif` (`mode: interferogram`), and a
+    /// `pairs.json` run index.
+    Pairs {
+        /// Path to the pairs config (YAML).
+        #[arg(short, long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -51,6 +62,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run { config } => run(&config),
         Command::Stream { config, initial } => stream(&config, initial),
+        Command::Pairs { config } => pairs(&config),
     }
 }
 
@@ -68,6 +80,20 @@ fn run(config: &PathBuf) -> Result<()> {
     let (dates, rows, cols) = out.displacement.dim();
     println!(
         "displacement: {dates} dates x {rows}x{cols}; outputs written to {}",
+        cfg.work_directory.display()
+    );
+    Ok(())
+}
+
+/// Parse the pairs config and write one product per planned pair.
+fn pairs(config: &PathBuf) -> Result<()> {
+    let yaml = std::fs::read_to_string(config)
+        .with_context(|| format!("reading config {}", config.display()))?;
+    let cfg = PairsConfig::from_yaml(&yaml)?;
+    let index = run_pairs(&cfg)?;
+    println!(
+        "{} pairs; outputs written to {}",
+        index.pairs.len(),
         cfg.work_directory.display()
     );
     Ok(())

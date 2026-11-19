@@ -30,10 +30,68 @@ pub fn filter_long_wavelength(
         return Err("wavelength_cutoff too large for image");
     }
     let filled = unwrapped.mapv(|v| if v.is_finite() { v } else { 0.0 });
-    let lowpass = gaussian_lowpass(filled.view(), sigma);
+    let lowpass = gaussian_lowpass(filled.view(), [sigma, sigma]);
     Ok(Array2::from_shape_fn((rows, cols), |ix| {
         let in_bounds = f64::from(filled[ix] != 0.0);
         filled[ix] - lowpass[ix] * in_bounds
+    }))
+}
+
+/// Masked Gaussian low-pass by normalized convolution: `G∗(x·m) / G∗m`, with the same
+/// `wavelength_cutoff` half-power point as [`filter_long_wavelength`] along both axes.
+/// `pixel_spacing` is `[y, x]` in the cutoff's units, so `σ_y` and `σ_x` (pixels) differ
+/// on an anisotropic grid and the response is the same in physical space.
+///
+/// `valid` is the mask `m`; invalid pixels contribute nothing (no zero-fill bias),
+/// whatever their value. The field is zero-padded by `3σ_y` rows and `3σ_x` columns on
+/// every side before the FFT, so the result does not wrap across image edges. A pixel is
+/// NaN when it is invalid or its normalized weight `G∗m` (the fraction of the Gaussian mass on valid
+/// pixels: 1 in the interior, ½ on a straight mask edge) is below `min_weight`.
+///
+/// # Errors
+/// Returns `Err` if `valid` differs in shape from `values`, or the cutoff, spacing or
+/// `min_weight` is non-finite or non-positive.
+pub fn masked_gaussian_lowpass(
+    values: ArrayView2<f64>,
+    valid: ArrayView2<bool>,
+    wavelength_cutoff: f64,
+    pixel_spacing: [f64; 2],
+    min_weight: f64,
+) -> Result<Array2<f64>, &'static str> {
+    if values.dim() != valid.dim() {
+        return Err("mask shape differs from values");
+    }
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    let [spacing_y, spacing_x] = pixel_spacing;
+    let usable = [wavelength_cutoff, spacing_y, spacing_x, min_weight];
+    if !usable.into_iter().all(positive) {
+        return Err("wavelength_cutoff, pixel_spacing and min_weight must be finite and positive");
+    }
+    let (rows, cols) = values.dim();
+    let sigma = [
+        filter_sigma(wavelength_cutoff, spacing_y),
+        filter_sigma(wavelength_cutoff, spacing_x),
+    ];
+    let [pad_y, pad_x] = sigma.map(|axis| (3.0 * axis).ceil() as usize);
+    let padded = (rows + 2 * pad_y, cols + 2 * pad_x);
+    let mut weighted = Array2::<f64>::zeros(padded);
+    let mut mask = Array2::<f64>::zeros(padded);
+    ndarray::Zip::indexed(&values)
+        .and(&valid)
+        .for_each(|(row, col), &value, &ok| {
+            if ok {
+                weighted[(row + pad_y, col + pad_x)] = value;
+                mask[(row + pad_y, col + pad_x)] = 1.0;
+            }
+        });
+    let numerator = gaussian_lowpass(weighted.view(), sigma);
+    let weight = gaussian_lowpass(mask.view(), sigma);
+    Ok(Array2::from_shape_fn((rows, cols), |(row, col)| {
+        let (pr, pc) = (row + pad_y, col + pad_x);
+        match valid[(row, col)] && weight[(pr, pc)] >= min_weight {
+            true => numerator[(pr, pc)] / weight[(pr, pc)],
+            false => f64::NAN,
+        }
     }))
 }
 
@@ -44,16 +102,17 @@ fn filter_sigma(wavelength_cutoff: f64, pixel_spacing: f64) -> f64 {
     sigma_x / pixel_spacing
 }
 
-/// Gaussian lowpass via `Re(ifft2(fft2(x) · G))`, `G = exp(-2π²σ²(fu²+fv²))`.
-fn gaussian_lowpass(filled: ArrayView2<f64>, sigma: f64) -> Array2<f64> {
+/// Gaussian lowpass via `Re(ifft2(fft2(x) · G))`, `G = exp(-2π²(σ_y²fu² + σ_x²fv²))`,
+/// `sigma = [σ_y, σ_x]` in pixels.
+fn gaussian_lowpass(filled: ArrayView2<f64>, sigma: [f64; 2]) -> Array2<f64> {
     let (rows, cols) = filled.dim();
     let mut spectrum = filled.mapv(|v| C::new(v, 0.0));
     fft2(&mut spectrum, false);
 
     let (fr, fc) = (fftfreq(rows), fftfreq(cols));
-    let k = -2.0 * PI * PI * sigma * sigma;
+    let [k_y, k_x] = sigma.map(|axis| -2.0 * PI * PI * axis * axis);
     spectrum.indexed_iter_mut().for_each(|((r, c), val)| {
-        *val *= (k * (fr[r] * fr[r] + fc[c] * fc[c])).exp();
+        *val *= (k_y * fr[r] * fr[r] + k_x * fc[c] * fc[c]).exp();
     });
 
     fft2(&mut spectrum, true);
