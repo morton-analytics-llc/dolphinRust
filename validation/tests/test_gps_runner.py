@@ -37,6 +37,19 @@ class RunnerContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scientific settings"):
             runner.assert_backend_config_identity(native, snaphu)
 
+    def test_loop_closure_override_sets_gate_and_correction(self) -> None:
+        base = {"timeseries_options": {}}
+        runner.apply_loop_closure_override(base, "off")
+        self.assertEqual(base, {"timeseries_options": {}})
+        with self.assertRaisesRegex(ValueError, "--max-bandwidth"):
+            runner.apply_loop_closure_override(base, "gate")
+        runner.apply_network_override(base, 2)
+        runner.apply_loop_closure_override(base, "gate")
+        self.assertTrue(base["timeseries_options"]["mask_unwrap_loop_errors"])
+        self.assertFalse(base["timeseries_options"]["correct_unwrap_loop_errors"])
+        runner.apply_loop_closure_override(base, "correct")
+        self.assertTrue(base["timeseries_options"]["correct_unwrap_loop_errors"])
+
     def test_result_payload_distinguishes_not_evaluable(self) -> None:
         payload = runner.result_payload("not_evaluable", "SNAPHU unavailable", {}, {})
         self.assertEqual(payload["schema"], "dolphinrust-gps-ground-truth/1")
