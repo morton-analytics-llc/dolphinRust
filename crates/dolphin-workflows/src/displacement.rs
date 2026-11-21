@@ -2505,15 +2505,8 @@ impl SpatialProducts {
         {
             mask2_f64(layer, mask);
         }
-        if let Some(qc) = self.loop_closure.as_mut() {
-            mask2_f64(&mut qc.bad_loop_count, mask);
-            mask2_f64(&mut qc.evaluable_loop_count, mask);
-            mask2_f64(&mut qc.worst_residual_cycles, mask);
-            if let Some(correction) = qc.correction.as_mut() {
-                mask2_f64(&mut correction.status, mask);
-                mask2_f64(&mut correction.corrected_interferogram_count, mask);
-            }
-        }
+        // Loop-closure QC stays on the analysed grid (#224). The gate is part
+        // of this mask, so masking its layers would erase why a pixel was dropped.
         if let Some(layer) = self.corrections.ionosphere.as_mut() {
             mask3_f64(layer, mask);
         }
@@ -6619,7 +6612,14 @@ mod tests {
                 worst_residual_cycles: Array2::from_elem((2, 2), 3.0),
                 unjudged_small_triple_pixels: 0,
                 small_root_triples: 0,
-                correction: None,
+                correction: Some(dolphin_timeseries::LoopClosureCorrection {
+                    status: Array2::from_elem(
+                        (2, 2),
+                        f64::from(PixelCorrection::Unevaluable as u8),
+                    ),
+                    corrected_interferogram_count: Array2::from_elem((2, 2), 4.0),
+                    corrected_per_band: Vec::new(),
+                }),
             }),
             junctions: Vec::new(),
             cycle_steps: CycleStepDetection::unjudged(2, 2),
@@ -6711,10 +6711,19 @@ mod tests {
                 .iter()
                 .all(|layer| layer[(row, col)].is_nan()));
             assert!(products.velocity_terms.dem_error_m.as_ref().unwrap()[(row, col)].is_nan());
+            // Loop-closure QC describes the analysed grid (#224): the gate is
+            // part of the publication mask, so masking these layers would hide
+            // why a pixel was dropped.
             let loop_closure = products.loop_closure.as_ref().unwrap();
-            assert!(loop_closure.bad_loop_count[(row, col)].is_nan());
-            assert!(loop_closure.evaluable_loop_count[(row, col)].is_nan());
-            assert!(loop_closure.worst_residual_cycles[(row, col)].is_nan());
+            assert_eq!(loop_closure.bad_loop_count[(row, col)], 1.0);
+            assert_eq!(loop_closure.evaluable_loop_count[(row, col)], 2.0);
+            assert_eq!(loop_closure.worst_residual_cycles[(row, col)], 3.0);
+            let correction = loop_closure.correction.as_ref().unwrap();
+            assert_eq!(
+                correction.status[(row, col)],
+                f64::from(PixelCorrection::Unevaluable as u8)
+            );
+            assert_eq!(correction.corrected_interferogram_count[(row, col)], 4.0);
             for band in 0..2 {
                 assert!(products.disp_rad[(band, row, col)].is_nan());
                 assert!(products.crlb_sigma.as_ref().unwrap()[(band, row, col)].is_nan());
