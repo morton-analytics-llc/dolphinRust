@@ -252,6 +252,15 @@ All notable changes to dolphinRust are documented here. The format follows
   not worse than the old on any frozen metric, and no reduction in junction steps was measured.
 
 ### Fixed
+- **Loop-closure QC rasters are no longer publication-masked** (issue #224).
+  `loop_closure_bad_count.tif`, `loop_closure_worst_cycles.tif`,
+  `loop_closure_correction_status.tif` and `loop_closure_corrected_count.tif` were NaN on
+  every pixel the publication mask removed, and the loop-closure gate is part of that mask,
+  so they could never show why a pixel was dropped: the bad count was 0 wherever it was
+  finite, and the status raster held only codes 0 and 1. They are now written on the
+  analysed grid (still cropped to the output bounds), as #142 documented, so codes 2 to 5
+  (ambiguous, unevaluable, non-integer, inconsistent) appear where they occur. The
+  `PublicationQuality` closure counts were already taken before the mask and are unchanged.
 - **SNAPHU and RAiDER no longer inherit open HDF5 files** (issue #214). libhdf5 opens files
   without `O_CLOEXEC` and takes a `flock` on each. A SNAPHU or RAiDER child spawned while one
   was open held that lock until the child exited, so a later create or read-write open of the
