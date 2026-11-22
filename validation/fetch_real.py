@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import netrc
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -30,53 +29,28 @@ import asf_search as asf
 import h5py
 from asf_search.exceptions import ASFAuthenticationError
 
+if __package__:
+    from .edl_token import earthdata_token
+else:
+    from edl_token import earthdata_token
+
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "real_data"
 DATE_RE = re.compile(r"_(20\d{6})T")
-
-
-TOKEN_KEYS = ("GP_EARTHDATA_TOKEN", "EARTHDATA_TOKEN")
-
-
-def resolve_token(
-    environment: Mapping[str, str] = os.environ,
-    *,
-    env_file: Path = ROOT.parent / ".env",
-) -> str:
-    """Return the Earthdata bearer token, without ever logging its value.
-
-    Reads the process environment first, then the repo `.env` — the same file the
-    module docstring already points at, and no more privileged than the
-    `~/.netrc` this module already reads. Sourcing a shell helper first therefore
-    remains supported but is no longer required.
-    """
-    for key in TOKEN_KEYS:
-        token = environment.get(key, "").strip()
-        if token:
-            return token
-    if not env_file.is_file():
-        return ""
-    for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key.strip() in TOKEN_KEYS:
-            token = value.strip().strip("'\"")
-            if token:
-                return token
-    return ""
 
 
 def require_token(
     environment: Mapping[str, str] = os.environ,
     *,
     env_file: Path = ROOT.parent / ".env",
+    rejected: bool = False,
 ) -> str:
-    """Return the Earthdata bearer token or fail without exposing its value."""
-    token = resolve_token(environment, env_file=env_file)
-    if not token:
-        raise RuntimeError(
-            "No Earthdata bearer token: set GP_EARTHDATA_TOKEN or put it in .env"
-        )
-    return token
+    """Return a usable Earthdata bearer token or fail without exposing a value.
+
+    See `edl_token.earthdata_token`: the pasted token while it is unexpired,
+    otherwise the live token from the `.env` username/password.
+    """
+    return earthdata_token(environment, env_file=env_file, rejected=rejected)
 
 
 def authenticated_session(
@@ -84,40 +58,22 @@ def authenticated_session(
     *,
     env_file: Path = ROOT.parent / ".env",
 ) -> asf.ASFSession:
-    """Authenticate by bearer token, falling back to the Earthdata netrc entry.
+    """An ASF session authenticated by an Earthdata bearer token.
 
-    The token is the supported path. netrc is only a fallback, and its failure is
-    reported separately from the token's so an expired token cannot hide behind a
-    stale netrc entry (or the reverse).
+    A pasted token that ASF rejects is replaced once by the live token from the
+    `.env` username/password; credentials never come from `~/.netrc`.
     """
-    token = resolve_token(environment, env_file=env_file)
-    token_error: Exception | None = None
-    if token:
-        try:
-            return asf.ASFSession().auth_with_token(token)
-        except ASFAuthenticationError as error:
-            token_error = error
-    token_state = (
-        f"bearer token was rejected ({token_error})"
-        if token_error
-        else "no bearer token found in the environment or .env"
-    )
+    token = require_token(environment, env_file=env_file)
     try:
-        credentials = netrc.netrc().authenticators("urs.earthdata.nasa.gov")
-    except (FileNotFoundError, netrc.NetrcParseError, OSError):
-        credentials = None
-    if credentials is None:
-        raise RuntimeError(
-            f"Earthdata authentication failed: {token_state}, and no usable"
-            " urs.earthdata.nasa.gov netrc entry exists"
-        )
-    username, _, password = credentials
+        return asf.ASFSession().auth_with_token(token)
+    except ASFAuthenticationError:
+        fresh = require_token(environment, env_file=env_file, rejected=True)
     try:
-        return asf.ASFSession().auth_with_creds(username, password)
+        return asf.ASFSession().auth_with_token(fresh)
     except ASFAuthenticationError as error:
         raise RuntimeError(
-            f"Earthdata authentication failed: {token_state}; the netrc fallback was"
-            " also rejected"
+            "Earthdata authentication failed: the pasted token and the token"
+            " minted from EARTHDATA_USERNAME/EARTHDATA_PASSWORD were both rejected"
         ) from error
 
 

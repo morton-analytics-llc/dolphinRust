@@ -24,6 +24,8 @@ import h5py
 import numpy as np
 import requests
 
+from edl_token import earthdata_token
+
 GRANULE = "OPERA_L4_TROPO-ZENITH_20180106T000000Z_20250922T192334Z_HRES_v1.0"
 URL = (
     "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L4_TROPO-ZENITH_V1/"
@@ -121,9 +123,10 @@ def bracketing(heights: np.ndarray, lo: float, hi: float) -> list[int]:
 
 
 def main() -> None:
-    token = os.environ.get("GP_EARTHDATA_TOKEN") or os.environ.get("EARTHDATA_TOKEN")
-    if not token:
-        sys.exit("no Earthdata token; run: source validation/creds.sh")
+    try:
+        token = earthdata_token()
+    except RuntimeError as error:
+        sys.exit(str(error))
     dem = json.loads((OUT / "dem_range.json").read_text())
     lo, hi = dem["terrain_min_m"], dem["terrain_max_m"]
 
