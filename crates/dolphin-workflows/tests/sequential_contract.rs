@@ -63,6 +63,7 @@ fn sequential_phase_history_matches_oracle() {
         // rather than inheriting dolphin's GLRT config default.
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        ps: None,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
@@ -113,6 +114,7 @@ fn multi_ministack_run(plan: CompressedSlcPlan) -> dolphin_workflows::Sequential
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        ps: None,
     };
     run_sequential(stack.view(), &cfg, &ComputeEngine::new(ComputeBackend::Cpu)).unwrap()
 }
@@ -216,6 +218,7 @@ fn stitching_and_quality_match_oracle_multiministack() {
         compute_average_coherence: true,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        ps: None,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let out = run_sequential(stack.view(), &cfg, &engine).unwrap();
@@ -316,6 +319,7 @@ fn zero_power_phase_does_not_resurrect_across_ministacks() {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
+        ps: None,
     };
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     for use_evd in [false, true] {

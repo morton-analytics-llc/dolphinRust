@@ -36,6 +36,7 @@ use dolphin_phaselink::{
     compress, compress_with_replay, AverageCoherenceAggregate, CompressionReplayGrid,
     ComputeEngine, FusedParams, PhaseReplayGrid, ResolvedBackend,
 };
+use dolphin_ps::{fill_ps_pixels, AmplitudeStats, PsResult};
 use dolphin_shp::{estimate_neighbors_glrt, estimate_neighbors_ks};
 use dolphin_stack::{MiniStack, MiniStackPlanner};
 use ndarray::{concatenate, s, Array2, Array3, Array4, ArrayView2, ArrayView3, Axis};
@@ -84,6 +85,23 @@ pub struct SequentialConfig {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
+    /// Persistent-scatterer selection and fill; `None` skips both.
+    pub ps: Option<PsSelection>,
+}
+
+/// Persistent-scatterer options for a sequential run.
+///
+/// Each ministack selects PS from the amplitude statistics of every real date
+/// up to and including its own (causal, exact Chan merge), so a sealed
+/// ministack's PS never changes when later dates arrive and an NRT update stays
+/// bit-identical to a full rerun. PS cells take the brightest PS's phase and
+/// temporal coherence 1, as in dolphin's `fill_ps_pixels`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PsSelection {
+    /// Amplitude dispersion below which a pixel is PS.
+    pub amp_dispersion_threshold: f64,
+    /// Exclude PS pixels from covariance estimation (dolphin `mask_input_ps`).
+    pub mask_input_ps: bool,
 }
 
 /// Output of a sequential run.
@@ -112,6 +130,9 @@ pub struct SequentialOutput {
     /// Output-grid validity after reducing an optional native layover/shadow
     /// mask. A stride cell is valid when any native pixel in it is valid.
     pub validity_mask: Array2<bool>,
+    /// Native-grid PS mask, amplitude dispersion and mean over every date;
+    /// `None` unless [`SequentialConfig::ps`] is set.
+    pub ps: Option<PsResult>,
 }
 
 /// Persisted state for an NRT incremental update: the outputs of the **sealed**
@@ -150,6 +171,11 @@ pub struct SequentialState {
     /// open; `Some` only for [`ShpMethod::Glrt`], which tests whole-stack
     /// statistics.
     amplitude_sums: Option<AmplitudeSums>,
+    /// PS options of the state-producing run, so an update cannot change them.
+    ps_selection: Option<PsSelection>,
+    /// PS amplitude statistics over the sealed ministacks' real dates; the open
+    /// ministack's dates are folded in again by the update that reruns it.
+    ps_stats: Option<AmplitudeStats>,
 }
 
 /// Running per-pixel amplitude sums over the real acquisitions of a series.
@@ -332,11 +358,72 @@ struct Drive {
     average_coherence: Vec<AverageCoherenceAggregate>,
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
+    /// PS statistics through the last sealed ministack processed (or the seed).
+    ps_sealed: Option<AmplitudeStats>,
+    /// PS statistics through the last ministack processed (or the seed).
+    ps_final: Option<AmplitudeStats>,
+}
+
+/// One ministack's PS inputs: the causal mask (`true` = PS, native grid) and
+/// mean amplitude used to pick the brightest PS in each output cell.
+struct MinistackPs {
+    mask: Array2<bool>,
+    mean: Array2<f64>,
+    mask_input: bool,
+}
+
+/// Fold `ms`'s real dates into `stats` and select that ministack's PS.
+fn ministack_ps(
+    stats: &mut Option<AmplitudeStats>,
+    real_stack: ArrayView3<Cf64>,
+    ms: MiniStack,
+    valid_mask: Option<ArrayView2<bool>>,
+    selection: PsSelection,
+) -> Result<MinistackPs, &'static str> {
+    let real = real_stack.slice(s![ms.real_start..ms.real_start + ms.num_real, .., ..]);
+    let batch = AmplitudeStats::from_stack(real).map_err(|_| "PS amplitude count overflows")?;
+    let merged = match stats.as_ref() {
+        Some(prior) => prior
+            .merge(&batch)
+            .map_err(|_| "PS amplitude statistics differ from the stack grid")?,
+        None => batch,
+    };
+    let ps = native_ps(&merged, selection.amp_dispersion_threshold, valid_mask);
+    let selected = MinistackPs {
+        mask: ps.ps.mapv(|flag| flag == 1),
+        mean: merged.mean.clone(),
+        mask_input: selection.mask_input_ps,
+    };
+    *stats = Some(merged);
+    Ok(selected)
+}
+
+/// PS products from `stats`, with layover/shadow-invalid pixels as nodata.
+fn native_ps(
+    stats: &AmplitudeStats,
+    threshold: f64,
+    valid_mask: Option<ArrayView2<bool>>,
+) -> PsResult {
+    let mut ps = stats.to_ps(threshold);
+    let Some(valid) = valid_mask else {
+        return ps;
+    };
+    ndarray::Zip::from(&mut ps.ps)
+        .and(&mut ps.amp_mean)
+        .and(&mut ps.amp_dispersion)
+        .and(valid)
+        .for_each(|flag, mean, dispersion, &valid| {
+            if !valid {
+                (*flag, *mean, *dispersion) = (255, 0.0, 0.0);
+            }
+        });
+    ps
 }
 
 /// Phase-link + compress each planned ministack of `real_stack`, carrying the
 /// compressed SLCs forward (seeded with `seed_compressed` from already-sealed
 /// ministacks). Returns only the products of the ministacks it processed.
+#[allow(clippy::too_many_arguments)]
 fn drive(
     plans: &[MiniStack],
     real_stack: ArrayView3<Cf64>,
@@ -345,6 +432,7 @@ fn drive(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
     shp_statistics: Option<&ShpStatistics>,
+    ps_seed: Option<&AmplitudeStats>,
 ) -> Result<Drive, &'static str> {
     let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
     let mut out = Drive {
@@ -354,10 +442,27 @@ fn drive(
         average_coherence: Vec::new(),
         crlb: Vec::new(),
         closure: Vec::new(),
+        ps_sealed: ps_seed.cloned(),
+        ps_final: ps_seed.cloned(),
     };
     for &ms in plans {
+        let ps = cfg
+            .ps
+            .map(|selection| ministack_ps(&mut out.ps_final, real_stack, ms, valid_mask, selection))
+            .transpose()?;
+        if ps.is_some() && ms.num_real >= cfg.ministack_size {
+            out.ps_sealed.clone_from(&out.ps_final);
+        }
         let combined = assemble(&carry, real_stack, ms);
-        let r = link_and_compress(combined.view(), ms, valid_mask, cfg, engine, shp_statistics)?;
+        let r = link_and_compress(
+            combined.view(),
+            ms,
+            valid_mask,
+            cfg,
+            engine,
+            shp_statistics,
+            ps.as_ref(),
+        )?;
         out.phases
             .push(r.cpx.slice(s![ms.num_compressed.., .., ..]).to_owned());
         carry.push(r.compressed.clone());
@@ -404,6 +509,8 @@ where
         average_coherence: Vec::new(),
         crlb: Vec::new(),
         closure: Vec::new(),
+        ps_sealed: None,
+        ps_final: None,
     };
     let mut source_resolver = source_resolver;
     for &ministack in plans {
@@ -469,6 +576,7 @@ where
 
 /// Assemble a [`SequentialOutput`] from the full per-ministack product lists
 /// (sealed prefix already chained in by the caller).
+#[allow(clippy::too_many_arguments)]
 fn build_output(
     phases: &[Array3<Cf64>],
     compressed: Vec<Array2<Cf64>>,
@@ -477,6 +585,7 @@ fn build_output(
     crlb: Vec<Array3<f64>>,
     closure: Vec<Array3<f64>>,
     validity_mask: Array2<bool>,
+    ps: Option<PsResult>,
 ) -> Result<SequentialOutput, &'static str> {
     let views: Vec<ArrayView3<Cf64>> = phases.iter().map(Array3::view).collect();
     let cpx_phase = concatenate(Axis(0), &views).map_err(|_| "phase-history concat failed")?;
@@ -490,6 +599,7 @@ fn build_output(
         crlb_sigma: concat_bands(crlb)?,
         closure_phase: concat_bands(closure)?,
         validity_mask,
+        ps,
     })
 }
 
@@ -634,6 +744,11 @@ fn run_sequential_with_covariance_capture_impl<F>(
 where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
 {
+    if cfg.ps.is_some() {
+        return Err(SequentialReplayError::Invalid(
+            "ps_options is not yet supported with covariance operator capture",
+        ));
+    }
     let (_, rows, cols) = slc_stack.dim();
     let fixed_validity = match native_validity {
         Some(mask) if mask.dim() == (rows, cols) => mask.to_owned(),
@@ -734,6 +849,7 @@ where
         d.crlb,
         d.closure,
         looked_validity(valid_mask, (rows, cols), cfg.strides),
+        None,
     )
     .map_err(SequentialReplayError::Execution)
 }
@@ -889,6 +1005,11 @@ fn plan_sequential_covariance_capture_impl(
     revision: &SequentialCovarianceRevision,
     configured_mask: bool,
 ) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
+    if cfg.ps.is_some() {
+        return Err(SequentialReplayError::Invalid(
+            "ps_options is not yet supported with covariance operator capture",
+        ));
+    }
     if revision.full_source_manifest_digest != request.source_manifest_digest
         || revision
             .source_model_receipt_digest
@@ -1068,6 +1189,11 @@ fn run_sequential_resumable_with_covariance_capture_impl<F>(
 where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
 {
+    if cfg.ps.is_some() {
+        return Err(SequentialReplayError::Invalid(
+            "ps_options is not yet supported with covariance operator capture",
+        ));
+    }
     if revision.prior_full_source_manifest_digest.is_some()
         || revision.full_source_manifest_digest != request.source_manifest_digest
         || revision
@@ -1161,6 +1287,7 @@ where
         drive.crlb.clone(),
         drive.closure.clone(),
         looked_validity(valid_mask, (rows, cols), cfg.strides),
+        None,
     )
     .map_err(SequentialReplayError::Execution)?;
     let mask_digest = sequential_covariance_mask_digest(native_validity, fixed_validity.view());
@@ -1180,6 +1307,7 @@ where
         native_validity,
         drive,
         amplitude_sums,
+        None,
     );
     Ok((
         output,
@@ -1340,6 +1468,11 @@ fn update_sequential_with_covariance_capture_impl(
     >,
     destination: &mut CovarianceOperatorWriter,
 ) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
+    if cfg.ps.is_some() {
+        return Err(SequentialReplayError::Invalid(
+            "ps_options is not yet supported with covariance operator capture",
+        ));
+    }
     let (n_open, rows, cols) = state.sequential.open_real_slcs.dim();
     let (n_new, nrows, ncols) = new_slcs.dim();
     if n_new == 0 || (nrows, ncols) != (rows, cols) {
@@ -1546,6 +1679,7 @@ fn update_sequential_with_covariance_capture_impl(
         crlb,
         closure,
         looked_validity(valid_mask, (rows, cols), cfg.strides),
+        None,
     )
     .map_err(SequentialReplayError::Execution)?;
     let generation_registry = build_covariance_generation_registry(
@@ -1564,6 +1698,7 @@ fn update_sequential_with_covariance_capture_impl(
         native_validity,
         drive,
         amplitude_sums,
+        None,
     )
     .with_sealed_prefix(&state.sequential);
     let state = SequentialCovarianceState {
@@ -1769,6 +1904,7 @@ fn run_sequential_resumable_impl(
         cfg,
         engine,
         shp_statistics.as_ref(),
+        None,
     )?;
     let output = build_output(
         &d.phases,
@@ -1782,6 +1918,7 @@ fn run_sequential_resumable_impl(
             (slc_stack.dim().1, slc_stack.dim().2),
             cfg.strides,
         ),
+        series_ps(cfg, &d, valid_mask),
     )?;
     let state = seal_state(
         &plans,
@@ -1790,6 +1927,7 @@ fn run_sequential_resumable_impl(
         native_validity,
         d,
         amplitude_sums,
+        cfg.ps,
     );
     Ok((output, state))
 }
@@ -1868,6 +2006,9 @@ fn update_sequential_impl(
     if prior_amplitude_sums_are_missing(state, cfg) {
         return Err("update_sequential: the series state holds no full-stack amplitude statistics");
     }
+    if state.ps_selection != cfg.ps {
+        return Err("update_sequential: ps_options differ from the series");
+    }
     let amplitude_sums = full_stack_amplitude_sums(cfg, state.amplitude_sums.as_ref(), new_slcs);
     let shp_statistics = amplitude_sums.as_ref().map(AmplitudeSums::statistics);
     let d = drive(
@@ -1878,6 +2019,7 @@ fn update_sequential_impl(
         cfg,
         engine,
         shp_statistics.as_ref(),
+        state.ps_stats.as_ref(),
     )?;
 
     let phases = chain(&state.sealed_phases, &d.phases);
@@ -1894,6 +2036,7 @@ fn update_sequential_impl(
         crlb,
         closure,
         looked_validity(valid_mask, (rows, cols), cfg.strides),
+        series_ps(cfg, &d, valid_mask),
     )?;
     let next = seal_state(
         &tail_plans,
@@ -1902,9 +2045,25 @@ fn update_sequential_impl(
         native_validity,
         d,
         amplitude_sums,
+        cfg.ps,
     )
     .with_sealed_prefix(state);
     Ok((output, next))
+}
+
+/// The published PS products: selection over every date the drive has seen.
+fn series_ps(
+    cfg: &SequentialConfig,
+    d: &Drive,
+    valid_mask: Option<ArrayView2<bool>>,
+) -> Option<PsResult> {
+    let selection = cfg.ps?;
+    let stats = d.ps_final.as_ref()?;
+    Some(native_ps(
+        stats,
+        selection.amp_dispersion_threshold,
+        valid_mask,
+    ))
 }
 
 fn nontrivial_mask<'a>(
@@ -1962,6 +2121,7 @@ fn seal_state(
     native_validity: Option<ArrayView2<bool>>,
     d: Drive,
     amplitude_sums: Option<AmplitudeSums>,
+    ps_selection: Option<PsSelection>,
 ) -> SequentialState {
     let (_, rows, cols) = real_stack.dim();
     let last = plans.last();
@@ -1983,6 +2143,8 @@ fn seal_state(
         sealed_closure: take_prefix(&d.closure, sealed),
         open_real_slcs,
         amplitude_sums,
+        ps_selection,
+        ps_stats: d.ps_sealed,
     }
 }
 
@@ -2197,6 +2359,7 @@ fn link_and_compress(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
     shp_statistics: Option<&ShpStatistics>,
+    ps: Option<&MinistackPs>,
 ) -> Result<MinistackResult, &'static str> {
     let output_reference_idx = ms.resolved_output_reference_idx()?;
     let compressed_reference_idx = ms.resolved_compressed_reference_idx()?;
@@ -2209,13 +2372,33 @@ fn link_and_compress(
         shp_statistics,
     );
     let compute = |input: ArrayView3<Cf64>| {
-        let fused = engine.link(
-            input,
+        // dolphin's `mask_input_ps`: PS pixels are left out of covariance so
+        // their bright, stable amplitude cannot dominate neighbouring estimates.
+        let without_ps = ps
+            .filter(|ps| ps.mask_input)
+            .map(|ps| mask_stack(input, ps.mask.mapv(|is_ps| !is_ps).view()));
+        let link_input = match without_ps.as_ref() {
+            Some(masked) => masked.view(),
+            None => input.view(),
+        };
+        let mut fused = engine.link(
+            link_input,
             cfg.half_window,
             cfg.strides,
             neighbors.as_ref().map(Array4::view),
             fused_params(ms, cfg, output_reference_idx),
         )?;
+        if let Some(ps) = ps {
+            fill_ps_pixels(
+                &mut fused.cpx_phase,
+                &mut fused.temporal_coherence,
+                input,
+                ps.mask.view(),
+                cfg.strides,
+                output_reference_idx,
+                Some(ps.mean.view()),
+            );
+        }
         let compressed = compress(
             input,
             fused.cpx_phase.view(),
@@ -2407,6 +2590,7 @@ mod tests {
             compute_average_coherence: false,
             shp_method,
             shp_alpha: 0.001,
+            ps: None,
         }
     }
 
@@ -2486,6 +2670,7 @@ mod tests {
                 &cfg,
                 &cpu(),
                 statistics,
+                None,
             )
             .unwrap();
             concatenate(Axis(0), &[d.phases[0].view(), d.phases[1].view()]).unwrap()

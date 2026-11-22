@@ -114,6 +114,7 @@ fn config() -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+        ps: None,
     }
 }
 
@@ -2737,6 +2738,7 @@ fn central_difference_config(
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+        ps: None,
     }
 }
 

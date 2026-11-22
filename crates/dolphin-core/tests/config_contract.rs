@@ -283,3 +283,33 @@ fn glrt_ministack_is_a_separate_shp_method() {
         ShpMethod::Glrt
     );
 }
+
+/// #232: PS is opt-in; its dependent options are refused while it is off, and
+/// covariance capture refuses it until PS cells have an operator form.
+#[test]
+fn ps_options_are_opt_in_and_validated() {
+    let defaults = DisplacementWorkflow::default();
+    assert!(!defaults.ps_options.enabled, "PS is off by default");
+    defaults.validate_supported_options().unwrap();
+
+    let parsed =
+        DisplacementWorkflow::from_yaml("ps_options:\n  enabled: true\n  amp_dispersion_threshold: 0.3\nphase_linking:\n  mask_input_ps: true\n")
+            .unwrap();
+    parsed.validate_supported_options().unwrap();
+
+    let mut masked_without_ps = DisplacementWorkflow::default();
+    masked_without_ps.phase_linking.mask_input_ps = true;
+    assert!(masked_without_ps.validate_supported_options().is_err());
+
+    let mut bad_threshold = parsed.clone();
+    bad_threshold.ps_options.amp_dispersion_threshold = 0.0;
+    assert!(bad_threshold.validate_supported_options().is_err());
+
+    let mut with_capture = parsed;
+    with_capture.phase_linking.write_covariance_operator = true;
+    let message = with_capture
+        .validate_supported_options()
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("ps_options.enabled"), "{message}");
+}

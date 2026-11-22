@@ -77,7 +77,7 @@ pub use sequential::{
     update_sequential_masked, update_sequential_masked_with_covariance_capture,
     update_sequential_masked_with_covariance_capture_and_source_factors,
     update_sequential_with_covariance_capture,
-    update_sequential_with_covariance_capture_and_source_factors, SequentialConfig,
+    update_sequential_with_covariance_capture_and_source_factors, PsSelection, SequentialConfig,
     SequentialCovarianceCapturePlan, SequentialCovarianceRevision, SequentialCovarianceState,
     SequentialOutput, SequentialState,
 };

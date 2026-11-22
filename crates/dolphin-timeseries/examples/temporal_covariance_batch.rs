@@ -993,6 +993,7 @@ fn sequential_config() -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.05,
+        ps: None,
     }
 }
 

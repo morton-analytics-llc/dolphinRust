@@ -101,6 +101,7 @@ fn config(shp_method: ShpMethod) -> SequentialConfig {
         compute_average_coherence: false,
         shp_method,
         shp_alpha: 0.001,
+        ps: None,
     }
 }
 
