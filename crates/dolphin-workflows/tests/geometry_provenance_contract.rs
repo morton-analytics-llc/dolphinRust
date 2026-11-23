@@ -223,6 +223,7 @@ fn coverage_v3_round_trips_without_identifiers() {
         output_pixels: 48,
         valid_pixels: 32,
         valid_fraction: 2.0 / 3.0,
+        excluded_bursts: Vec::new(),
     };
     let provenance = assemble_geometry_provenance_with_coverage(
         &DisplacementWorkflow::default(),
