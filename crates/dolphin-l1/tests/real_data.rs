@@ -184,3 +184,144 @@ fn phase2_safe_reader_matches_opera_burst_metadata() {
         cdse_samples.dim()
     );
 }
+
+fn t100_static() -> PathBuf {
+    PathBuf::from(std::env::var("T100_STATIC").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../../Documents/GitHub/dolphinRust/validation/real_data/t100_213486_iw2_p105_smel/",
+            "cropped/shared/static/OPERA_L2_CSLC-S1-STATIC_T100-213486-IW2_20140403_S1A_v1.0.h5"
+        )
+        .into()
+    }))
+}
+
+/// Phase 3 contract on T100-213486-IW2 2023-01-10 with its POEORB:
+/// - geo2rdr of ESA's annotation tie points lands on their annotated azimuth
+///   and range times (orbit interpolation + zero-Doppler solve);
+/// - GLO-30 + EGM2008 ellipsoidal heights match the GNSS heights of P105 and
+///   SMEL to within monument height plus DEM error (the geoid alone is ~17 m
+///   here, so a missing or wrong-sign geoid fails);
+/// - ground-to-satellite LOS east/north on OPERA's static-layer grid matches
+///   OPERA's own `los_east` / `los_north`.
+#[test]
+#[ignore = "reads phase1 downloads and GLO-30/EGM2008 over HTTP"]
+fn phase3_geometry_dem_and_los_match_references() {
+    use dolphin_l1::dem::{Dem, LonLatBounds};
+    use dolphin_l1::geometry::{geo2rdr, llh_to_ecef};
+    use dolphin_l1::orbit::Orbit;
+    use dolphin_l1::safe::{S1Burst, SPEED_OF_LIGHT};
+
+    let cache = setup();
+    let burst = S1Burst::open(&only_safe(cache.join("bursts")), "VV", None).unwrap();
+    let eof = std::fs::read_dir(cache.join("orbits"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let orbit = Orbit::from_eof(
+        &eof,
+        burst.sensing_start,
+        burst.sensing_start,
+        burst.sensing_stop(),
+        Duration::seconds(60),
+    )
+    .unwrap();
+
+    let grid = burst.geolocation_grid().unwrap();
+    let (mut worst_az, mut worst_rg) = (0.0_f64, 0.0_f64);
+    for point in &grid {
+        let target = llh_to_ecef(
+            point.latitude.to_radians(),
+            point.longitude.to_radians(),
+            point.height,
+        );
+        let annotated = orbit.seconds(point.azimuth_time);
+        let radar = geo2rdr(target, &orbit, annotated).unwrap();
+        worst_az = worst_az.max((radar.azimuth_time - annotated).abs());
+        worst_rg =
+            worst_rg.max((radar.slant_range - point.slant_range_time * SPEED_OF_LIGHT / 2.0).abs());
+    }
+    println!(
+        "phase3: {} tie points, max |Δaz| {worst_az:.3e} s, max |Δrange| {worst_rg:.3} m",
+        grid.len()
+    );
+    assert!(worst_az < 2.0e-5, "azimuth {worst_az}");
+    assert!(worst_rg < 0.05, "range {worst_rg}");
+
+    let bounds =
+        LonLatBounds::around(grid.iter().map(|p| (p.longitude, p.latitude)), 0.05).unwrap();
+    let dem = Dem::glo30(bounds).unwrap();
+    for (station, lon, lat, gnss_height) in [
+        ("P105", -112.504_087_744_9, 39.387_544_054_9, 1_431.482_52),
+        ("SMEL", -112.844_926_651_0, 39.425_644_204_6, 1_422.144_77),
+    ] {
+        let dem_height = dem.height(lon, lat).unwrap();
+        println!("phase3: {station} GNSS {gnss_height:.2} m, DEM {dem_height:.2} m");
+        assert!((dem_height - gnss_height).abs() < 4.0, "{station}");
+    }
+
+    let t_mid = orbit.seconds(burst.sensing_mid());
+    let (worst, compared) = los_difference_vs_opera(&dem, &orbit, t_mid);
+    println!("phase3: LOS vs OPERA static over {compared} pixels, max |Δ| {worst:.2e}");
+    assert!(compared > 1000);
+    assert!(worst < 2.0e-4, "LOS {worst}");
+}
+
+/// Max |Δ| of LOS east/north between our geometry and OPERA's static layers on
+/// a sparse sample of the T100 static grid, and the number of pixels compared.
+fn los_difference_vs_opera(
+    dem: &dolphin_l1::dem::Dem,
+    orbit: &dolphin_l1::orbit::Orbit,
+    t_mid: f64,
+) -> (f64, usize) {
+    use dolphin_l1::geometry::{geo2rdr, line_of_sight_enu, llh_to_ecef};
+    use dolphin_l1::grid::Projection;
+    let file = hdf5::File::open(t100_static()).unwrap();
+    let x: Vec<f64> = file
+        .dataset("data/x_coordinates")
+        .unwrap()
+        .read_raw()
+        .unwrap();
+    let y: Vec<f64> = file
+        .dataset("data/y_coordinates")
+        .unwrap()
+        .read_raw()
+        .unwrap();
+    let east = file
+        .dataset("data/los_east")
+        .unwrap()
+        .read_2d::<f32>()
+        .unwrap();
+    let north = file
+        .dataset("data/los_north")
+        .unwrap()
+        .read_2d::<f32>()
+        .unwrap();
+    let projection = Projection::new(32612).unwrap();
+    let mut worst = 0.0_f64;
+    let mut compared = 0;
+    for (r, &yy) in y.iter().enumerate().step_by(25) {
+        let cols: Vec<usize> = (0..x.len()).step_by(97).collect();
+        let mut lon: Vec<f64> = cols.iter().map(|&c| x[c]).collect();
+        let mut lat = vec![yy; cols.len()];
+        projection.to_lonlat(&mut lon, &mut lat).unwrap();
+        for (k, &c) in cols.iter().enumerate() {
+            if !east[[r, c]].is_finite() {
+                continue;
+            }
+            let h = dem.height(lon[k], lat[k]).unwrap();
+            let (la, lo) = (lat[k].to_radians(), lon[k].to_radians());
+            let target = llh_to_ecef(la, lo, h);
+            let radar = geo2rdr(target, orbit, t_mid).unwrap();
+            let los = line_of_sight_enu(target, la, lo, radar.platform.position);
+            let d = (los[0] - f64::from(east[[r, c]]))
+                .abs()
+                .max((los[1] - f64::from(north[[r, c]])).abs());
+            worst = worst.max(d);
+            compared += 1;
+        }
+    }
+    (worst, compared)
+}

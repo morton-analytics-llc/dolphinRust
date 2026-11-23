@@ -298,6 +298,48 @@ impl S1Burst {
     }
 }
 
+/// One annotation geolocation-grid tie point.
+#[derive(Debug, Clone, Copy)]
+pub struct GeolocationPoint {
+    /// Zero-Doppler azimuth time.
+    pub azimuth_time: DateTime<Utc>,
+    /// Two-way slant-range time (s).
+    pub slant_range_time: f64,
+    /// Latitude (deg).
+    pub latitude: f64,
+    /// Longitude (deg).
+    pub longitude: f64,
+    /// Height above the ellipsoid (m).
+    pub height: f64,
+}
+
+impl S1Burst {
+    /// The annotation geolocation grid (ESA tie points covering the burst).
+    pub fn geolocation_grid(&self) -> Result<Vec<GeolocationPoint>> {
+        let text = std::fs::read_to_string(&self.annotation)?;
+        let doc = roxmltree::Document::parse(&text)?;
+        let list = path_nodes(
+            doc.root_element(),
+            "geolocationGrid/geolocationGridPointList",
+        )?;
+        list.children()
+            .filter(|n| n.has_tag_name("geolocationGridPoint"))
+            .map(|point| {
+                let num = |tag: &str| -> Result<f64> {
+                    text_at(point, tag)?.trim().parse::<f64>().map_err(product)
+                };
+                Ok(GeolocationPoint {
+                    azimuth_time: parse_utc(text_at(point, "azimuthTime")?)?,
+                    slant_range_time: num("slantRangeTime")?,
+                    latitude: num("latitude")?,
+                    longitude: num("longitude")?,
+                    height: num("height")?,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Read a window of band 1 of a complex raster as complex f32.
 pub fn read_complex_window(
     path: &Path,

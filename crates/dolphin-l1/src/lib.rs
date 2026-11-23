@@ -7,7 +7,10 @@
 
 pub mod asf;
 pub mod cdse;
+pub mod dem;
 pub mod error;
+pub mod geometry;
+pub mod grid;
 pub mod orbit;
 pub mod safe;
 
