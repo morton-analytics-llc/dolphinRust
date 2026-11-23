@@ -7,6 +7,19 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Persistent-scatterer selection and fill, opt-in** (issue #232). `ps_options.enabled: true`
+  (default `false`, a forward divergence: dolphin always runs PS) selects PS by amplitude
+  dispersion below `ps_options.amp_dispersion_threshold`, and PS cells take the brightest PS's
+  referenced phase and temporal coherence 1 (dolphin `fill_ps_pixels`).
+  `phase_linking.mask_input_ps` leaves PS pixels out of covariance. Selection is causal: each
+  ministack uses exact running amplitude statistics (`dolphin_ps::AmplitudeStats`, Chan
+  pairwise merge) over every date up to its end, carried in `SequentialState`. So an NRT
+  update is bit-identical to a full rerun. Per-burst `ps/<burst_id>/{ps_pixels,amp_dispersion,amp_mean}.tif`
+  are written on the native grid. On the real 30-date T100 cohort the merge matches one-shot
+  `calc_ps` exactly, NRT resume matches a full run bit for bit, the tiled CLI's PS mask
+  matches an independent numpy D_A with zero flips, and default-config outputs are
+  byte-identical to the previous release. PS is refused with
+  `phase_linking.write_covariance_operator` (#233).
 - **Opt-in whirlwind unwrapper** (issue #169). `unwrap_method: whirlwind` now runs
   `whirlwind-core` (Scott Staniewicz's Rust minimum-cost-flow unwrapper, BSD-3-Clause OR
   Apache-2.0, git dependency pinned to its v0.10.0 tag) in-process through a new
