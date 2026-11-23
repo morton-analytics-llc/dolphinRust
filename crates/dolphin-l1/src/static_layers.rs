@@ -20,7 +20,7 @@ use ndarray::Array2;
 use rayon::prelude::*;
 
 use crate::dem::Dem;
-use crate::error::Result;
+use crate::error::{L1Error, Result};
 use crate::geometry::{
     cross, dot, ecef_to_llh, geo2rdr, line_of_sight_enu, llh_to_ecef, norm, rdr2geo, sub, LookSide,
 };
@@ -227,6 +227,23 @@ fn profile_height(dem: &Dem, lon: f64, lat: f64) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// A profile end: the DEM surface at `(t, range)`, or the 0 m surface where
+/// the end sits on the stack-DEM edge. There the surface steps from the
+/// terrain to the 0 m fill of [`profile_height`] and has no root (#248).
+fn profile_end(
+    t: f64,
+    range: f64,
+    orbit: &Orbit,
+    look: LookSide,
+    dem: &Dem,
+) -> Result<crate::geometry::GroundPoint> {
+    let height = |lon: f64, lat: f64| -> Result<f64> { Ok(profile_height(dem, lon, lat)) };
+    match rdr2geo(t, range, orbit, look, height) {
+        Err(L1Error::Geometry(_)) => rdr2geo(t, range, orbit, look, |_, _| Ok(0.0)),
+        found => found,
+    }
+}
+
 /// The layover/shadow flags along the ground profile of burst line `line`.
 fn trace_profile(burst: &RadarGeometry, orbit: &Orbit, dem: &Dem, line: usize) -> Result<Profile> {
     let t = orbit.seconds(burst.sensing_start) + line as f64 * burst.azimuth_time_interval;
@@ -234,9 +251,9 @@ fn trace_profile(burst: &RadarGeometry, orbit: &Orbit, dem: &Dem, line: usize) -
     // A profile end outside the stack DEM is treated like a DEM hole (0 m): it only
     // places the profile line, and must not abort the burst's CSLC (#240).
     let height = |lon: f64, lat: f64| -> Result<f64> { Ok(profile_height(dem, lon, lat)) };
-    let near = rdr2geo(t, burst.starting_range, orbit, burst.look, height)?;
+    let near = profile_end(t, burst.starting_range, orbit, burst.look, dem)?;
     let far_range = burst.starting_range + burst.samples as f64 * burst.range_pixel_spacing;
-    let far = rdr2geo(t, far_range, orbit, burst.look, height)?;
+    let far = profile_end(t, far_range, orbit, burst.look, dem)?;
     let span = sub(far.ecef, near.ecef);
     let across = {
         let n = norm(span);
@@ -350,6 +367,65 @@ mod tests {
         assert!((profile_height(&dem, 10.02, 49.98) - 100.0).abs() < 1e-3);
         assert_eq!(profile_height(&dem, 10.085, 49.915), 0.0);
         assert_eq!(profile_height(&dem, -109.67, 48.19), 0.0);
+    }
+
+    /// A profile end on the stack-DEM edge, where the DEM surface has no
+    /// root, lands on the 0 m surface instead of failing (#248).
+    #[test]
+    fn profile_end_on_the_dem_edge_falls_back_to_zero() {
+        let (r, omega, incl) = (7.07e6, 1.06e-3, 98.2_f64.to_radians());
+        let truth = |t: f64| {
+            let (s, c) = (omega * t).sin_cos();
+            let (si, ci) = incl.sin_cos();
+            (
+                [r * c, r * s * ci, r * s * si],
+                [-r * omega * s, r * omega * c * ci, r * omega * c * si],
+            )
+        };
+        let times: Vec<f64> = (0..40).map(|i| f64::from(i) * 10.0).collect();
+        let orbit = Orbit {
+            reference_epoch: chrono::Utc::now(),
+            positions: times.iter().map(|&t| truth(t).0).collect(),
+            velocities: times.iter().map(|&t| truth(t).1).collect(),
+            times,
+            orbit_type: "test".into(),
+        };
+        let (t, range) = (150.0, 9.3e5);
+        let at = |h: f64| rdr2geo(t, range, &orbit, LookSide::Right, |_, _| Ok(h)).unwrap();
+        let (high, zero) = (at(700.0), at(0.0));
+        let deg = |p: &crate::geometry::GroundPoint| (p.lon.to_degrees(), p.lat.to_degrees());
+        let ((lon_h, lat_h), (lon_z, lat_z)) = (deg(&high), deg(&zero));
+        // A 700 m DEM that covers the 0 m solution (the nearer one) and ends
+        // half-way to the 700 m one: inside, the surface is below the ray;
+        // past the edge it reads 0 m and is above it.
+        let (edge_lon, edge_lat) = ((lon_h + lon_z) / 2.0, (lat_h + lat_z) / 2.0);
+        let step = 0.0001;
+        let span = |a: f64, b: f64| (a.min(b) - 0.05, a.max(b) + 0.05);
+        let (lon_lo, lon_hi) = span(lon_z, lon_z);
+        let (lon_lo, lon_hi) = if lon_h > lon_z {
+            (lon_lo, edge_lon)
+        } else {
+            (edge_lon, lon_hi)
+        };
+        let (lat_lo, lat_hi) = span(lat_z, edge_lat);
+        let (cols, rows) = (
+            ((lon_hi - lon_lo) / step) as usize,
+            ((lat_hi - lat_lo) / step) as usize,
+        );
+        let dem = Dem::from_grid(
+            lon_lo,
+            lat_hi,
+            step,
+            -step,
+            ndarray::Array2::from_elem((rows, cols), 700.0_f32),
+        );
+        let height = |lon: f64, lat: f64| -> Result<f64> { Ok(profile_height(&dem, lon, lat)) };
+        assert!(rdr2geo(t, range, &orbit, LookSide::Right, height).is_err());
+        let end = profile_end(t, range, &orbit, LookSide::Right, &dem).unwrap();
+        assert!(end.height.abs() < 1e-4, "{}", end.height);
+        // Away from the edge the DEM solve is used as before.
+        let inside = profile_end(t, range - 2_000.0, &orbit, LookSide::Right, &dem).unwrap();
+        assert!((inside.height - 700.0).abs() < 1e-4, "{}", inside.height);
     }
 
     /// A ridge facing the radar: the near-range back-slope behind the crest
