@@ -1,0 +1,13 @@
+{
+ "pixels": 500000,
+ "agreement": 0.965478,
+ "ours_shadow": 0,
+ "compass_shadow": 0,
+ "ours_layover": 44963,
+ "compass_layover": 47006,
+ "ours_both": 0,
+ "compass_both": 0,
+ "flagged_iou": 0.683951295431658,
+ "compass_flagged_we_flag": 0.7946645109135004,
+ "ours_flagged_compass_flags": 0.8307719680626293
+}

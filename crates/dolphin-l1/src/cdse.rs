@@ -587,6 +587,7 @@ impl CdseClient {
     /// token goes only to HTTPS hosts under `dataspace.copernicus.eu`.
     fn try_download(&mut self, url: &str, method: Method, part: &Path) -> Result<()> {
         let mut current = url.to_string();
+        tracing::info!(url, "CDSE download");
         for _ in 0..=MAX_REDIRECTS {
             let request = match method {
                 Method::Get => self.http.get(&current),
@@ -776,6 +777,53 @@ mod tests {
             "t034_071054_iw3"
         );
         assert!(BurstId::parse("T100-IW2").is_err());
+    }
+
+    #[test]
+    fn bearer_goes_only_to_cdse_https_hosts() {
+        assert!(is_cdse_host(
+            "https://catalogue.dataspace.copernicus.eu/odata/v1/Bursts"
+        ));
+        assert!(is_cdse_host(
+            "https://bursts.dataspace.copernicus.eu/v1/product/x"
+        ));
+        assert!(is_cdse_host("https://dataspace.copernicus.eu/"));
+        assert!(!is_cdse_host("http://zipper.dataspace.copernicus.eu/x"));
+        assert!(!is_cdse_host("https://evil-dataspace.copernicus.eu/x"));
+        assert!(!is_cdse_host(
+            "https://dataspace.copernicus.eu.example.com/x"
+        ));
+        assert!(!is_cdse_host("https://s3.amazonaws.com/bucket"));
+    }
+
+    /// A burst listed by an original and a reprocessed parent resolves to the
+    /// parent CDSE received last; distinct dates are kept.
+    #[test]
+    fn duplicate_bursts_resolve_to_newest_parent() {
+        let record = |time: &str, parent: &str, origin: &str| BurstRecord {
+            id: parent.into(),
+            name: format!("S1A-SLC-{parent}"),
+            parent_product_name: parent.into(),
+            parent_product_id: parent.into(),
+            parent_origin: Some(origin.parse().unwrap()),
+            burst_id: 71054,
+            relative_orbit_number: 34,
+            swath_identifier: "IW3".into(),
+            polarisation_channels: "VV".into(),
+            azimuth_time: time.parse().unwrap(),
+            byte_offset: 0,
+            orbit_direction: "ASCENDING".into(),
+        };
+        let a = record("2022-01-11T00:27:06.1Z", "A", "2022-01-11T09:00:00Z");
+        let b = record("2022-01-11T00:27:06.1Z", "B", "2023-05-01T00:00:00Z");
+        let c = record("2022-01-23T00:27:06.0Z", "C", "2022-01-23T09:00:00Z");
+        assert!(same_acquisition(&a, &b));
+        assert!(!same_acquisition(&a, &c));
+        assert_eq!(
+            pick_newest(vec![a.clone(), b.clone()]).parent_product_name,
+            "B"
+        );
+        assert_eq!(pick_newest(vec![b, a]).parent_product_name, "B");
     }
 
     #[test]

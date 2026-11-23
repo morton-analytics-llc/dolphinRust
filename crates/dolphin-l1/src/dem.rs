@@ -88,6 +88,7 @@ impl Dem {
         for name in tile_names(bounds) {
             let url = format!("{GLO30_BUCKET}/{name}/{name}.tif");
             if tile_exists(&http, &url)? {
+                tracing::info!(url, "GLO-30 tile");
                 tiles.push(Dataset::open(format!("/vsicurl/{url}"))?);
             }
         }
@@ -158,6 +159,7 @@ impl Dem {
             north: self.lat0,
             south: self.lat0 + rows as f64 * self.dlat,
         };
+        tracing::info!(url = EGM2008_URL, "EGM2008 geoid");
         let geoid = Self::read_window(&Dataset::open(EGM2008_URL)?, bounds)?;
         let (lon0, lat0, dlon, dlat) = (self.lon0, self.lat0, self.dlon, self.dlat);
         for ((row, col), height) in self.heights.indexed_iter_mut() {

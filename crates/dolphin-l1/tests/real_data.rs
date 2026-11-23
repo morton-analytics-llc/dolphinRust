@@ -388,3 +388,97 @@ fn phase4_deramp_centres_azimuth_spectrum() {
     assert!(raw_max - raw_min > 200.0, "raw burst shows no TOPS sweep");
     assert!(worst < 15.0, "deramped Doppler off by {worst} Hz");
 }
+
+/// Houston contract (T034-071054-IW3, the OPERA crop window): two dates
+/// built from raw CDSE bursts give the same interferogram as OPERA's crop
+/// of the same dates. Over pixels where OPERA's 11×11 coherence is ≥ 0.9,
+/// the circular std of `arg(I_ours · conj(I_opera))` is ≤ 0.1 rad (the
+/// receipt in `validation/results/issue230_raw_front_end/` measures
+/// ≤ 0.018 rad over 14 pairs).
+#[test]
+#[ignore = "downloads two raw Houston bursts from CDSE and their GIMs"]
+fn houston_iw3_interferogram_matches_opera() {
+    use dolphin_l1::grid::GeoGrid;
+    use dolphin_l1::stack::{process_stack, StackRequest};
+    use num_complex::Complex64;
+
+    let cache = setup();
+    let crop = reference_dir().join("t034_071054_iw3_houston_crop/cslc");
+    let burst_db =
+        PathBuf::from(std::env::var("DOLPHIN_L1_BURST_DB").expect("set DOLPHIN_L1_BURST_DB"));
+    let burst_id = BurstId::parse("T034-071054-IW3").unwrap();
+    let out = cache.join("houston_contract");
+    let _ = std::fs::remove_dir_all(&out);
+    let start: DateTime<Utc> = "2022-01-23T00:00:00Z".parse().unwrap();
+    let request = StackRequest {
+        burst_id,
+        polarization: "VV".into(),
+        start,
+        end: start + Duration::days(13),
+        grid: GeoGrid::from_burst_db(&burst_db, &burst_id)
+            .unwrap()
+            .window(2704, 1266, 699, 3996)
+            .unwrap(),
+        cache_dir: cache.clone(),
+        output_dir: out,
+        keep_raw: false,
+        phase_layers: false,
+        ionosphere: true,
+    };
+    let mut cdse = CdseClient::from_env().unwrap();
+    let outputs = process_stack(&mut cdse, &request).unwrap();
+    assert_eq!(outputs.len(), 2);
+    let read = |path: &std::path::Path| {
+        hdf5::File::open(path)
+            .unwrap()
+            .dataset("data/VV")
+            .unwrap()
+            .read_2d::<num_complex::Complex32>()
+            .unwrap()
+    };
+    let opera_of = |day: &str| {
+        std::fs::read_dir(&crop)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(&format!("IW3_{day}T"))
+            })
+            .unwrap()
+    };
+    let (o1, o2) = (read(&outputs[0].path), read(&outputs[1].path));
+    let (r1, r2) = (read(&opera_of("20220123")), read(&opera_of("20220204")));
+    let (rows, cols) = o1.dim();
+    let c64 = |v: num_complex::Complex32| Complex64::new(f64::from(v.re), f64::from(v.im));
+    let mut resultant = Complex64::new(0.0, 0.0);
+    let mut compared = 0usize;
+    for r in (5..rows - 5).step_by(3) {
+        for c in (5..cols - 5).step_by(3) {
+            let (mut num, mut p1, mut p2) = (Complex64::new(0.0, 0.0), 0.0, 0.0);
+            for i in r - 5..=r + 5 {
+                for j in c - 5..=c + 5 {
+                    let (a, b) = (c64(r1[[i, j]]), c64(r2[[i, j]]));
+                    num += a * b.conj();
+                    p1 += a.norm_sqr();
+                    p2 += b.norm_sqr();
+                }
+            }
+            let coherence = num.norm() / (p1 * p2).sqrt();
+            let ours = c64(o1[[r, c]]) * c64(o2[[r, c]]).conj();
+            let opera = c64(r1[[r, c]]) * c64(r2[[r, c]]).conj();
+            let delta = ours * opera.conj();
+            if coherence >= 0.9 && delta.norm() > 0.0 && delta.norm().is_finite() {
+                resultant += delta / delta.norm();
+                compared += 1;
+            }
+        }
+    }
+    let circular_std = (-2.0 * (resultant.norm() / compared as f64).ln()).sqrt();
+    println!(
+        "houston: {compared} coherent pixels, interferogram circular std {circular_std:.4} rad"
+    );
+    assert!(compared > 1000, "only {compared} coherent pixels");
+    assert!(circular_std <= 0.1, "circular std {circular_std}");
+}

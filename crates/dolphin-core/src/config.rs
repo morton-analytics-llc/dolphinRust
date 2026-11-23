@@ -1266,18 +1266,32 @@ impl Default for UnwrapOptions {
 
 /// Input-product reader selection. **Forward divergence:** dolphin v0.35.0 has
 /// no product-type field on `InputOptions` (it dispatches by workflow entry
-/// point), so this field is dolphinRust-only. It deserializes to the OPERA
-/// default when absent, so an existing dolphin YAML round-trips unchanged.
+/// point), so this field is dolphinRust-only. It defaults to [`Self::L1Cslc`],
+/// the in-house CSLC built from raw Sentinel-1 bursts; OPERA products are
+/// accepted only with an explicit `input_type: opera_cslc` (backtests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InputType {
-    /// OPERA S1 CSLC: complex-f32 `(r, i)` HDF5 grids (the dolphin default).
+    /// dolphinRust's own CSLC from raw Sentinel-1 IW SLC bursts
+    /// (`dolphin cslc`, crate `dolphin-l1`), written in the OPERA CSLC-S1
+    /// HDF5 layout. The production default: OPERA-produced files are
+    /// rejected.
     #[default]
+    L1Cslc,
+    /// OPERA S1 CSLC: complex-f32 `(r, i)` HDF5 grids. Backtests only.
     OperaCslc,
     /// NISAR L-band geocoded SLC: complex-`f32` `{r, i}` compound grids in the
     /// NISAR product group layout (camelCase coordinates + `epsg_code`
     /// attribute). Differs from OPERA only in the geocoding-grid metadata.
     NisarGslc,
+}
+
+impl InputType {
+    /// `true` for the Sentinel-1 CSLC HDF5 layout (in-house or OPERA).
+    #[must_use]
+    pub fn is_s1_cslc(self) -> bool {
+        matches!(self, Self::L1Cslc | Self::OperaCslc)
+    }
 }
 
 /// Verified acquisition identity independent of staged filenames.

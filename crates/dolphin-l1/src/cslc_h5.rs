@@ -31,8 +31,6 @@ pub struct CslcProvenance<'a> {
     pub orbit_file: &'a str,
     /// GIM (IONEX) file of the ionospheric delay, when applied.
     pub gim_file: Option<&'a str>,
-    /// ESD azimuth shift applied (s).
-    pub azimuth_shift: f64,
     /// Burst centre `[lon, lat]` (deg).
     pub center_lonlat: [f64; 2],
 }
@@ -220,9 +218,5 @@ fn write_processing(file: &hdf5::File, burst: &S1Burst, provenance: &CslcProvena
     ] {
         put_bool(&parameters, name, applied)?;
     }
-    put_f64(
-        &parameters,
-        "esd_azimuth_shift_seconds",
-        provenance.azimuth_shift,
-    )
+    Ok(())
 }

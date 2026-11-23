@@ -15,6 +15,10 @@ pub enum IoError {
     #[error("{0}")]
     Shape(String),
 
+    /// An input is an OPERA product where only raw-derived CSLC is allowed.
+    #[error("{0}")]
+    NotRawDerived(String),
+
     /// Missing or malformed georeferencing metadata.
     #[error("geo: {0}")]
     Geo(String),

@@ -2,10 +2,8 @@
 //!
 //! Every date is geocoded independently onto the same fixed burst grid, so the
 //! geocoding *is* the coregistration: precise orbits and the DEM put each
-//! date's samples on the same ground pixel, and the residual azimuth
-//! misregistration that orbits leave is measured by ESD on burst overlaps
-//! ([`crate::esd`]) and fed back as `azimuth_shift`. One interpolation per
-//! date instead of resample-then-geocode.
+//! date's samples on the same ground pixel (as COMPASS does for OPERA
+//! CSLC-S1). One interpolation per date instead of resample-then-geocode.
 //!
 //! Per output pixel: grid (x, y) → lon/lat → DEM height → ECEF target →
 //! zero-Doppler `geo2rdr` → timing corrections → fractional burst line/sample
@@ -50,8 +48,6 @@ pub struct GeocodedBurst {
     pub grid: GeoGrid,
     /// Complex samples, NaN outside the burst's valid window.
     pub data: Array2<Complex32>,
-    /// Total TOPS Doppler (Hz) the pixel was imaged at, NaN where invalid.
-    pub doppler: Array2<f32>,
     /// Reramp (azimuth carrier) and flattening phases (rad, wrapped), when
     /// requested: OPERA's `azimuth_carrier_phase` / `flattening_phase`.
     pub phases: Option<(Array2<f32>, Array2<f32>)>,
@@ -61,7 +57,6 @@ pub struct GeocodedBurst {
 #[derive(Clone, Copy)]
 struct Pixel {
     value: Complex32,
-    doppler: f32,
     carrier: f32,
     flatten: f32,
 }
@@ -130,7 +125,6 @@ struct PixelContext<'a> {
     deramped: &'a DerampedBurst,
     kernel: &'a SincKernel,
     t_mid: f64,
-    azimuth_shift: f64,
     tide: [(BodyPosition, f64); 2],
     ionosphere: Option<&'a IonexMaps>,
     mid_time: DateTime<Utc>,
@@ -162,7 +156,7 @@ impl PixelContext<'_> {
         );
         let line = self
             .corrections
-            .line(radar.azimuth_time + correction.azimuth_time + self.azimuth_shift);
+            .line(radar.azimuth_time + correction.azimuth_time);
         let ionosphere = match self.ionosphere {
             Some(maps) => crate::gim::slant_delay(
                 maps,
@@ -189,7 +183,6 @@ impl PixelContext<'_> {
                 * rebaseband
                 * Complex32::from_polar(1.0, carrier_w)
                 * Complex32::from_polar(1.0, flatten_w),
-            doppler: carrier.total_doppler(line, range) as f32,
             carrier: carrier_w,
             flatten: flatten_w,
         })
@@ -197,8 +190,7 @@ impl PixelContext<'_> {
 }
 
 /// Geocode `burst` (its `orbit` and the stack `dem`) onto `grid`.
-/// `azimuth_shift` (s) is the ESD misregistration correction added to every
-/// azimuth sampling time (0 for the reference date). `keep_phases` also
+/// `keep_phases` also
 /// returns the carrier and flattening phase layers. `ionosphere` is the
 /// date's GIM; `None` leaves the ionospheric delay out of the sampling.
 pub fn geocode_burst(
@@ -206,7 +198,6 @@ pub fn geocode_burst(
     orbit: &Orbit,
     dem: &Dem,
     grid: &GeoGrid,
-    azimuth_shift: f64,
     keep_phases: bool,
     ionosphere: Option<&IonexMaps>,
 ) -> Result<GeocodedBurst> {
@@ -221,7 +212,6 @@ pub fn geocode_burst(
         deramped: &deramped,
         kernel: &kernel,
         t_mid: orbit.seconds(burst.sensing_mid()),
-        azimuth_shift,
         tide: tide_bodies(burst.sensing_start.naive_utc()),
         ionosphere,
         mid_time: burst.sensing_mid(),
@@ -229,7 +219,6 @@ pub fn geocode_burst(
     let projection = Projection::new(grid.epsg)?;
     let nan = Complex32::new(f32::NAN, f32::NAN);
     let mut data = Array2::from_elem((grid.rows, grid.cols), nan);
-    let mut doppler = Array2::from_elem((grid.rows, grid.cols), f32::NAN);
     let phase_shape = if keep_phases {
         (grid.rows, grid.cols)
     } else {
@@ -255,7 +244,6 @@ pub fn geocode_burst(
                 let Some(p) = pixel else { continue };
                 let at = (chunk0 + r, c);
                 data[at] = p.value;
-                doppler[at] = p.doppler;
                 if keep_phases {
                     carrier[at] = p.carrier;
                     flatten[at] = p.flatten;
@@ -266,7 +254,6 @@ pub fn geocode_burst(
     Ok(GeocodedBurst {
         grid: *grid,
         data,
-        doppler,
         phases: keep_phases.then_some((carrier, flatten)),
     })
 }

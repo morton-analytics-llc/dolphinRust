@@ -135,7 +135,7 @@ def circular_std(values: np.ndarray) -> float:
 
 
 def pair_files(ours_dir: Path, opera_dir: Path) -> list[tuple[str, Path, Path]]:
-    ours = {date_of(p): p for p in ours_dir.glob("*.h5")}
+    ours = {date_of(p): p for p in ours_dir.glob("CSLC-S1_*.h5")}
     opera = {date_of(p): p for p in opera_dir.glob("OPERA_L2_CSLC-S1_*.h5")}
     return [(d, ours[d], opera[d]) for d in sorted(set(ours) & set(opera))]
 

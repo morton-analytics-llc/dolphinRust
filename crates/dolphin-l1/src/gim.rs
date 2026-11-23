@@ -11,8 +11,9 @@
 //!
 //! Files come from NASA CDDIS with the Earthdata bearer token
 //! (`EARTHDATA_TOKEN`, or `GP_EARTHDATA_TOKEN`): the long name
-//! `JPL0OPSFIN_YYYYDDD0000_01D_02H_GIM.INX.gz` from GPS week 2238
-//! (2022-11-27) on, the short name `jplgDDD0.YYi.Z` (Unix `compress`) before.
+//! `JPL0OPSFIN_YYYYDDD0000_01D_02H_GIM.INX.gz` once JPL adopted it (between
+//! day 200 and 300 of 2023 on CDDIS), the short name `jplgDDD0.YYi.Z` (Unix
+//! `compress`) before; both are tried, long first.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,8 +27,6 @@ use reqwest::header::AUTHORIZATION;
 use crate::error::{product, L1Error, Result};
 
 const CDDIS_URL: &str = "https://cddis.nasa.gov/archive/gnss/products/ionex";
-/// First day of the long (IGS 2.0) GIM file names.
-const LONG_NAMES_FROM: (i32, u32, u32) = (2022, 11, 27);
 /// Ionospheric constant (m³/s²), COMPASS `K`.
 const K_IONO: f64 = 40.31;
 const ATTEMPTS: u32 = 4;
@@ -53,30 +52,46 @@ impl GimClient {
 
     /// The decompressed IONEX file for `day`, cached under `cache_dir`.
     pub fn fetch(&self, day: NaiveDate, cache_dir: &Path) -> Result<PathBuf> {
-        let (name, compressed) = file_name(day);
-        let dest = cache_dir.join(&name);
-        if dest.is_file() {
+        let candidates = file_names(day);
+        if let Some(found) = candidates
+            .iter()
+            .map(|(name, _)| cache_dir.join(name))
+            .find(|p| p.is_file())
+        {
+            return Ok(found);
+        }
+        let mut last = None;
+        for (name, compressed) in &candidates {
+            let url = format!(
+                "{CDDIS_URL}/{}/{:03}/{compressed}",
+                day.year(),
+                day.ordinal()
+            );
+            let bytes = match self.download(&url) {
+                Ok(bytes) => bytes,
+                Err(error @ L1Error::Service { status: 404, .. }) => {
+                    last = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let text = match compressed.rsplit('.').next() {
+                Some("gz") => {
+                    let mut out = Vec::new();
+                    flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut out)?;
+                    out
+                }
+                _ => uncompress_z(&bytes)?,
+            };
+            std::fs::create_dir_all(cache_dir)?;
+            let dest = cache_dir.join(name);
+            let part = dest.with_extension("part");
+            std::fs::write(&part, text)?;
+            std::fs::rename(&part, &dest)?;
+            tracing::info!(url, "fetched JPL GIM");
             return Ok(dest);
         }
-        let url = format!(
-            "{CDDIS_URL}/{}/{:03}/{compressed}",
-            day.year(),
-            day.ordinal()
-        );
-        let bytes = self.download(&url)?;
-        let text = match compressed.rsplit('.').next() {
-            Some("gz") => {
-                let mut out = Vec::new();
-                flate2::read::GzDecoder::new(bytes.as_slice()).read_to_end(&mut out)?;
-                out
-            }
-            _ => uncompress_z(&bytes)?,
-        };
-        std::fs::create_dir_all(cache_dir)?;
-        let part = dest.with_extension("part");
-        std::fs::write(&part, text)?;
-        std::fs::rename(&part, &dest)?;
-        Ok(dest)
+        Err(last.unwrap_or_else(|| L1Error::NotFound(format!("JPL GIM for {day}"))))
     }
 
     fn download(&self, url: &str) -> Result<Vec<u8>> {
@@ -113,21 +128,20 @@ impl GimClient {
     }
 }
 
-/// `(decompressed name, archive name)` of the JPL final GIM for `day`.
-pub fn file_name(day: NaiveDate) -> (String, String) {
-    let (y, m, d) = LONG_NAMES_FROM;
-    let long_from = NaiveDate::from_ymd_opt(y, m, d).unwrap_or(NaiveDate::MIN);
-    if day >= long_from {
-        let name = format!(
-            "JPL0OPSFIN_{}{:03}0000_01D_02H_GIM.INX",
-            day.year(),
-            day.ordinal()
-        );
-        (name.clone(), format!("{name}.gz"))
-    } else {
-        let name = format!("jplg{:03}0.{:02}i", day.ordinal(), day.year() % 100);
-        (name.clone(), format!("{name}.Z"))
-    }
+/// `(decompressed name, archive name)` candidates for the JPL final GIM of
+/// `day`, in the order tried: the long IGS name (gzip) that JPL moved to
+/// during 2023, then the short name (Unix compress) of earlier years.
+pub fn file_names(day: NaiveDate) -> [(String, String); 2] {
+    let long = format!(
+        "JPL0OPSFIN_{}{:03}0000_01D_02H_GIM.INX",
+        day.year(),
+        day.ordinal()
+    );
+    let short = format!("jplg{:03}0.{:02}i", day.ordinal(), day.year() % 100);
+    [
+        (long.clone(), format!("{long}.gz")),
+        (short.clone(), format!("{short}.Z")),
+    ]
 }
 
 /// Read a decompressed IONEX file.
@@ -262,13 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn gim_names_switch_at_gps_week_2238() {
-        let old = NaiveDate::from_ymd_opt(2022, 1, 11).unwrap();
-        assert_eq!(file_name(old).1, "jplg0110.22i.Z");
-        let new = NaiveDate::from_ymd_opt(2025, 11, 16).unwrap();
-        assert_eq!(
-            file_name(new).1,
-            "JPL0OPSFIN_20253200000_01D_02H_GIM.INX.gz"
-        );
+    fn gim_names_try_long_then_short() {
+        let day = NaiveDate::from_ymd_opt(2023, 1, 10).unwrap();
+        let [long, short] = file_names(day);
+        assert_eq!(long.1, "JPL0OPSFIN_20230100000_01D_02H_GIM.INX.gz");
+        assert_eq!(short.1, "jplg0100.23i.Z");
     }
 }

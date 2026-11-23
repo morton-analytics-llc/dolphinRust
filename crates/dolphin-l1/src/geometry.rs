@@ -146,39 +146,48 @@ pub fn rdr2geo(
     let up = unit(state.position);
     let down = unit(sub([0.0; 3], sub(up, scale(v, dot(up, v)))));
     let right = cross(down, v);
-    let point = |theta: f64| -> Result<(GroundPoint, f64)> {
-        let (sin_t, cos_t) = theta.sin_cos();
-        let ecef: Vec3 = std::array::from_fn(|k| {
-            state.position[k] + slant_range * (cos_t * down[k] + sin_t * right[k])
-        });
-        let (lat, lon, h) = ecef_to_llh(ecef);
-        let dem = height(lon.to_degrees(), lat.to_degrees())?;
-        let found = GroundPoint {
-            lat,
-            lon,
-            height: h,
-            ecef,
-            look_angle: theta,
+    let point =
+        |theta: f64, surface: &dyn Fn(f64, f64) -> Result<f64>| -> Result<(GroundPoint, f64)> {
+            let (sin_t, cos_t) = theta.sin_cos();
+            let ecef: Vec3 = std::array::from_fn(|k| {
+                state.position[k] + slant_range * (cos_t * down[k] + sin_t * right[k])
+            });
+            let (lat, lon, h) = ecef_to_llh(ecef);
+            let dem = surface(lon.to_degrees(), lat.to_degrees())?;
+            let found = GroundPoint {
+                lat,
+                lon,
+                height: h,
+                ecef,
+                look_angle: theta,
+            };
+            Ok((found, h - dem))
         };
-        Ok((found, h - dem))
+    let secant = |mut t0: f64,
+                  mut t1: f64,
+                  surface: &dyn Fn(f64, f64) -> Result<f64>|
+     -> Result<GroundPoint> {
+        let (mut f0, mut f1) = (point(t0, surface)?.1, point(t1, surface)?.1);
+        for _ in 0..RDR2GEO_ITERATIONS {
+            if (f1 - f0).abs() < f64::EPSILON {
+                break;
+            }
+            let t2 = t1 - f1 * (t1 - t0) / (f1 - f0);
+            let (found, f2) = point(t2, surface)?;
+            if f2.abs() < RDR2GEO_THRESHOLD {
+                return Ok(found);
+            }
+            (t0, f0, t1, f1) = (t1, f1, t2, f2);
+        }
+        Err(L1Error::Geometry(format!(
+            "rdr2geo did not converge at t = {azimuth_time:.6} s, R = {slant_range:.3} m"
+        )))
     };
-    // Start from the flat-ellipsoid look angle for a mid-swath guess.
-    let (mut t0, mut t1) = (0.35_f64, 0.75_f64);
-    let (mut f0, mut f1) = (point(t0)?.1, point(t1)?.1);
-    for _ in 0..RDR2GEO_ITERATIONS {
-        if (f1 - f0).abs() < f64::EPSILON {
-            break;
-        }
-        let t2 = t1 - f1 * (t1 - t0) / (f1 - f0);
-        let (found, f2) = point(t2)?;
-        if f2.abs() < RDR2GEO_THRESHOLD {
-            return Ok(found);
-        }
-        (t0, f0, t1, f1) = (t1, f1, t2, f2);
-    }
-    Err(L1Error::Geometry(format!(
-        "rdr2geo did not converge at t = {azimuth_time:.6} s, R = {slant_range:.3} m"
-    )))
+    // The bare ellipsoid first (any look angle is valid there), then the
+    // surface from that look angle, so the DEM is only sampled near the answer.
+    let ellipsoid = secant(0.35, 0.75, &|_, _| Ok(0.0))?;
+    let theta = ellipsoid.look_angle;
+    secant(theta, theta + 1e-4, &height)
 }
 
 fn scale(a: Vec3, k: f64) -> Vec3 {

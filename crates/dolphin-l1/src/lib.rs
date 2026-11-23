@@ -9,7 +9,6 @@ pub mod cdse;
 pub mod cslc_h5;
 pub mod dem;
 pub mod error;
-pub mod esd;
 pub mod geocode;
 pub mod geometry;
 pub mod gim;

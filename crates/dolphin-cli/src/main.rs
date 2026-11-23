@@ -84,9 +84,6 @@ enum Command {
         /// `KEY=VALUE` env file holding `CDSE_USERNAME` / `CDSE_PASSWORD`.
         #[arg(long)]
         env_file: Option<PathBuf>,
-        /// Skip ESD (no next-burst download, zero azimuth shift).
-        #[arg(long)]
-        no_esd: bool,
         /// Keep downloaded raw bursts in the cache after use.
         #[arg(long)]
         keep_raw: bool,
@@ -120,7 +117,6 @@ fn main() -> Result<()> {
             cache,
             out,
             env_file,
-            no_esd,
             keep_raw,
             phase_layers,
             no_ionosphere,
@@ -143,7 +139,6 @@ fn main() -> Result<()> {
                 start: day(start).context("start date")?,
                 end: day(end + chrono::Duration::days(1)).context("end date")?,
                 grid,
-                esd: !no_esd,
                 cache_dir: cache,
                 output_dir: out,
                 keep_raw,
@@ -155,24 +150,15 @@ fn main() -> Result<()> {
     }
 }
 
-/// Run the Sentinel-1 raw front end and print one line per written date.
+/// Run the Sentinel-1 raw front end and print one line per date.
 fn cslc(request: &dolphin_l1::stack::StackRequest) -> Result<()> {
     let mut client = dolphin_l1::CdseClient::from_env()?;
     let outputs = dolphin_l1::stack::process_stack(&mut client, request)?;
     for output in &outputs {
-        let esd = output
-            .esd
-            .map(|e| {
-                format!(
-                    "esd {:+.3e} s (residual {:+.1e}) from {} looks, coh {:.2}, df {:.0} Hz",
-                    e.azimuth_shift, e.residual_shift, e.looks, e.coherence, e.doppler_difference
-                )
-            })
-            .unwrap_or_else(|| "esd -".into());
+        let state = if output.written { "wrote" } else { "current" };
         println!(
-            "{}  shift {:+.3e} s  {esd}  {}",
+            "{}  {state}  {}",
             output.sensing_start,
-            output.azimuth_shift,
             output.path.display()
         );
     }

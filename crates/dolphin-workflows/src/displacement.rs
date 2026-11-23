@@ -407,6 +407,11 @@ pub fn run_displacement_with_output_policy(
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     validate_config(cfg)?;
+    if cfg.input_options.input_type == InputType::L1Cslc {
+        for path in &cfg.cslc_file_list {
+            dolphin_io::require_not_opera(path)?;
+        }
+    }
     anyhow::ensure!(
         !cfg.phase_linking.write_covariance_operator
             || output_policy == DisplacementOutputPolicy::Full,
@@ -3572,7 +3577,7 @@ fn read_burst_tile(
     block: BlockIndices,
 ) -> Result<Array3<Cf64>> {
     let reader = match input_type {
-        InputType::OperaCslc => read_cslc_window,
+        InputType::OperaCslc | InputType::L1Cslc => read_cslc_window,
         InputType::NisarGslc => read_nisar_window,
     };
     let mut tile = Array3::<Cf64>::zeros((files.len(), block.height(), block.width()));
@@ -3685,7 +3690,7 @@ fn preflight_burst_mask(
         .as_deref()
         .context("input_options.subdataset is required to align a layover/shadow mask")?;
     let source_geo = match cfg.input_options.input_type {
-        InputType::OperaCslc => read_geotransform(first_cslc, subdataset),
+        InputType::OperaCslc | InputType::L1Cslc => read_geotransform(first_cslc, subdataset),
         InputType::NisarGslc => read_nisar_geotransform(first_cslc, subdataset),
     }
     .context("reading source georeference for layover/shadow mask alignment")?;
@@ -5239,7 +5244,7 @@ fn resolve_burst_geo(
     source_offset: (usize, usize),
 ) -> Result<BurstGeo> {
     let geo_reader = match cfg.input_options.input_type {
-        InputType::OperaCslc => read_geotransform,
+        InputType::OperaCslc | InputType::L1Cslc => read_geotransform,
         InputType::NisarGslc => read_nisar_geotransform,
     };
     let geo = cfg
