@@ -7,6 +7,7 @@
 //! with the OPERA backtest reference and with the phase-linking path.
 
 use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+use gdal::vector::LayerAccess;
 
 use crate::error::{product, L1Error, Result};
 
@@ -53,6 +54,39 @@ impl GeoGrid {
             cols: cols as usize,
             rows: rows as usize,
         })
+    }
+
+    /// The OPERA grid of `burst_id` from the burst database (opera-adt
+    /// `burst_db` v0.10.0 `opera-burst-bbox-only.sqlite3`, table
+    /// `burst_id_map`: EPSG and bbox per `t<track>_<burst>_iw<n>`).
+    pub fn from_burst_db(db: &std::path::Path, burst_id: &crate::BurstId) -> Result<Self> {
+        let dataset = gdal::Dataset::open(db)?;
+        let mut layer = dataset.layer_by_name("burst_id_map")?;
+        let id = burst_id.opera();
+        layer.set_attribute_filter(&format!("burst_id_jpl = '{id}'"))?;
+        let feature = layer
+            .features()
+            .next()
+            .ok_or_else(|| L1Error::NotFound(format!("{id} in {}", db.display())))?;
+        let field = |name: &str| -> Result<f64> {
+            let index = feature.field_index(name)?;
+            feature.field_as_double(index)?.ok_or_else(|| {
+                L1Error::Product(format!("{id} has no {name} in the burst database"))
+            })
+        };
+        let epsg = u32::try_from(
+            feature
+                .field_as_integer(feature.field_index("epsg")?)?
+                .unwrap_or(0),
+        )
+        .map_err(product)?;
+        Self::opera_burst(
+            epsg,
+            field("xmin")?,
+            field("ymin")?,
+            field("xmax")?,
+            field("ymax")?,
+        )
     }
 
     /// A grid from explicit pixel-centre coordinate vectors (uniform spacing).
@@ -109,6 +143,7 @@ impl GeoGrid {
 /// Projected ↔ geographic (lon, lat degrees) transforms for one EPSG.
 pub struct Projection {
     to_lonlat: CoordTransform,
+    to_projected: CoordTransform,
 }
 
 impl Projection {
@@ -120,7 +155,16 @@ impl Projection {
         geographic.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
         Ok(Self {
             to_lonlat: CoordTransform::new(&projected, &geographic)?,
+            to_projected: CoordTransform::new(&geographic, &projected)?,
         })
+    }
+
+    /// Convert `(lon, lat)` degrees in place to projected `(x, y)`.
+    pub fn to_projected(&self, lon: &mut [f64], lat: &mut [f64]) -> Result<()> {
+        let mut z = vec![0.0; lon.len()];
+        self.to_projected
+            .transform_coords(lon, lat, &mut z)
+            .map_err(product)
     }
 
     /// Convert projected `(x, y)` in place to `(lon, lat)` degrees.

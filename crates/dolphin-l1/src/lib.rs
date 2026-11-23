@@ -5,14 +5,21 @@
 //! backtest reference (`validation/issue230_raw_front_end.py`), never an input.
 #![warn(missing_docs)]
 
-pub mod asf;
 pub mod cdse;
+pub mod cslc_h5;
 pub mod dem;
 pub mod error;
+pub mod esd;
+pub mod geocode;
 pub mod geometry;
+pub mod gim;
 pub mod grid;
+pub mod interp;
 pub mod orbit;
 pub mod safe;
+pub mod stack;
+pub mod static_layers;
+pub mod tops;
 
 pub use cdse::{BurstId, BurstQuery, BurstRecord, CdseClient, OrbitRecord, Swath};
 pub use error::{L1Error, Result};

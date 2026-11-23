@@ -1,8 +1,10 @@
 //! Copernicus GLO-30 DEM, referenced to the WGS84 ellipsoid.
 //!
 //! Tiles come from the public `copernicus-dem-30m` bucket as COGs read with
-//! GDAL range requests (`/vsicurl/`); ocean tiles do not exist and read as sea
-//! level. GLO-30 heights are EGM2008 orthometric, so the EGM2008 undulation
+//! GDAL range requests (`/vsicurl/`). A tile the bucket answers 404 for is
+//! open ocean and reads as sea level; any other failure is an error. Nodes
+//! that hold no valid height (non-finite or ≤ −1000 m) stay NaN, and every
+//! interpolation touching one is masked rather than filled. GLO-30 heights are EGM2008 orthometric, so the EGM2008 undulation
 //! (PROJ CDN grid `us_nga_egm08_25.tif`, 2.5′) is added to give ellipsoidal
 //! heights, the reference OPERA's DEM uses. A 1 m height error moves a pixel
 //! ≈ 1.2 m in ground range at Sentinel-1 incidence, so the geoid is not
@@ -15,7 +17,7 @@ use ndarray::Array2;
 
 use crate::error::{product, L1Error, Result};
 
-const GLO30_URL: &str = "/vsicurl/https://copernicus-dem-30m.s3.amazonaws.com";
+const GLO30_BUCKET: &str = "https://copernicus-dem-30m.s3.amazonaws.com";
 const EGM2008_URL: &str = "/vsicurl/https://cdn.proj.org/us_nga_egm08_25.tif";
 
 /// Geographic bounds in degrees.
@@ -79,10 +81,16 @@ impl Dem {
     /// Mosaic the GLO-30 tiles covering `bounds` and convert to ellipsoidal
     /// heights.
     pub fn glo30(bounds: LonLatBounds) -> Result<Self> {
-        let tiles: Vec<Dataset> = tile_names(bounds)
-            .into_iter()
-            .filter_map(|name| Dataset::open(format!("{GLO30_URL}/{name}/{name}.tif")).ok())
-            .collect();
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+        let mut tiles = Vec::new();
+        for name in tile_names(bounds) {
+            let url = format!("{GLO30_BUCKET}/{name}/{name}.tif");
+            if tile_exists(&http, &url)? {
+                tiles.push(Dataset::open(format!("/vsicurl/{url}"))?);
+            }
+        }
         let mut dem = match tiles.as_slice() {
             [] => Self::sea_level(bounds),
             _ => {
@@ -94,17 +102,18 @@ impl Dem {
         Ok(dem)
     }
 
-    /// Read `bounds` (plus a 2-node border for interpolation) from a geographic
-    /// raster; areas outside it read as 0.
+    /// Read `bounds` (plus a 3-node border for the 6×6 interpolation window)
+    /// from a geographic raster. Mosaic areas no tile covers are ocean tiles
+    /// and read as 0; invalid heights become NaN.
     fn read_window(dataset: &Dataset, bounds: LonLatBounds) -> Result<Self> {
         let gt = dataset.geo_transform()?;
         let (cols, rows) = dataset.raster_size();
         let col_of = |lon: f64| ((lon - gt[0]) / gt[1] - 0.5).floor() as isize;
         let row_of = |lat: f64| ((lat - gt[3]) / gt[5] - 0.5).floor() as isize;
-        let c0 = (col_of(bounds.west) - 2).max(0) as usize;
-        let c1 = ((col_of(bounds.east) + 3).max(0) as usize).min(cols);
-        let r0 = (row_of(bounds.north) - 2).max(0) as usize;
-        let r1 = ((row_of(bounds.south) + 3).max(0) as usize).min(rows);
+        let c0 = (col_of(bounds.west) - 3).max(0) as usize;
+        let c1 = ((col_of(bounds.east) + 4).max(0) as usize).min(cols);
+        let r0 = (row_of(bounds.north) - 3).max(0) as usize;
+        let r1 = ((row_of(bounds.south) + 4).max(0) as usize).min(rows);
         if c1 <= c0 || r1 <= r0 {
             return Err(L1Error::Product("DEM window is empty".into()));
         }
@@ -117,7 +126,13 @@ impl Dem {
             lat0: gt[3] + (r0 as f64 + 0.5) * gt[5],
             dlon: gt[1],
             dlat: gt[5],
-            heights: heights.mapv(|v| if v.is_finite() && v > -1000.0 { v } else { 0.0 }),
+            heights: heights.mapv(|v| {
+                if v.is_finite() && v > -1000.0 {
+                    v
+                } else {
+                    f32::NAN
+                }
+            }),
         })
     }
 
@@ -176,31 +191,29 @@ impl Dem {
         )
     }
 
-    /// Bicubic (Keys, a = −0.5) height at `(lon, lat)` in degrees.
+    /// Biquintic height at `(lon, lat)` in degrees: ISCE3's
+    /// `Spline2dInterpolator(6)`, the DEM interpolator COMPASS geocodes with
+    /// (a natural cubic spline through 6 nodes along each row, then through
+    /// the 6 row values). NaN when any of the 36 nodes is invalid.
     pub fn height(&self, lon: f64, lat: f64) -> Result<f64> {
         let (x, y) = self.fractional(lon, lat);
+        // ISCE3 places the 6-node window at floor − 1 .. floor + 4 (checked
+        // against `DEMInterpolator(BIQUINTIC)` on GLO-30: identical to 1e-4 m).
         let (i0, j0) = (y.floor() as isize - 1, x.floor() as isize - 1);
         let (rows, cols) = self.heights.dim();
-        if i0 < 0 || j0 < 0 || i0 as usize + 4 > rows || j0 as usize + 4 > cols {
+        if i0 < 0 || j0 < 0 || i0 as usize + 6 > rows || j0 as usize + 6 > cols {
             return Err(L1Error::Geometry(format!(
                 "({lon:.5}, {lat:.5}) is outside the DEM"
             )));
         }
-        let wy = keys_weights(y - y.floor());
-        let wx = keys_weights(x - x.floor());
-        let window = self.heights.slice(ndarray::s![i0..i0 + 4, j0..j0 + 4]);
-        Ok(window
-            .outer_iter()
-            .zip(wy)
-            .map(|(row, w_row)| {
-                w_row
-                    * row
-                        .iter()
-                        .zip(wx)
-                        .map(|(v, w)| f64::from(*v) * w)
-                        .sum::<f64>()
-            })
-            .sum())
+        let window = self.heights.slice(ndarray::s![i0..i0 + 6, j0..j0 + 6]);
+        let (fx, fy) = (x - j0 as f64, y - i0 as f64);
+        let mut column = [0.0; 6];
+        for (value, row) in column.iter_mut().zip(window.outer_iter()) {
+            let nodes: [f64; 6] = std::array::from_fn(|k| f64::from(row[k]));
+            *value = natural_spline_6(&nodes, fx);
+        }
+        Ok(natural_spline_6(&column, fy))
     }
 
     /// Write the grid as a GeoTIFF (EPSG:4326), for inspection.
@@ -226,12 +239,57 @@ impl Dem {
     }
 }
 
-/// Keys cubic-convolution weights for the four nodes around fraction `t`.
-fn keys_weights(t: f64) -> [f64; 4] {
-    let a = -0.5;
-    let near = |d: f64| ((a + 2.0) * d - (a + 3.0)) * d * d + 1.0;
-    let far = |d: f64| ((a * d - 5.0 * a) * d + 8.0 * a) * d - 4.0 * a;
-    [far(1.0 + t), near(t), near(1.0 - t), far(2.0 - t)]
+/// Natural cubic spline through `y[0..6]` at unit spacing, evaluated at `t`
+/// (0 at node 0). The second-derivative solve is ISCE3's `_initSpline`
+/// (Thomas algorithm with zero end curvature).
+fn natural_spline_6(y: &[f64; 6], t: f64) -> f64 {
+    const N: usize = 6;
+    let (mut q, mut r) = ([0.0; N], [0.0; N]);
+    for i in 1..N - 1 {
+        let p = 1.0 / (0.5 * q[i - 1] + 2.0);
+        q[i] = -0.5 * p;
+        r[i] = (3.0 * (y[i + 1] - 2.0 * y[i] + y[i - 1]) - 0.5 * r[i - 1]) * p;
+    }
+    r[N - 1] = 0.0;
+    for i in (1..N - 1).rev() {
+        r[i] += q[i] * r[i + 1];
+    }
+    // r holds the second derivatives; evaluate on the segment [j, j + 1]
+    // that holds t.
+    let j = (t.floor().max(0.0) as usize).min(N - 2);
+    let u = t - j as f64;
+    let (m0, m1) = (r[j], r[j + 1]);
+    y[j] + u * (y[j + 1] - y[j] - (2.0 * m0 + m1) / 6.0)
+        + u * u * m0 / 2.0
+        + u * u * u * (m1 - m0) / 6.0
+}
+
+/// HEAD the tile: `true` if it exists, `false` on 404 (ocean), error on
+/// anything else after the retries.
+fn tile_exists(http: &reqwest::blocking::Client, url: &str) -> Result<bool> {
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = http.head(url).send();
+        let status = outcome.as_ref().map(reqwest::blocking::Response::status);
+        match status {
+            Ok(s) if s.is_success() => return Ok(true),
+            Ok(s) if s == reqwest::StatusCode::NOT_FOUND => return Ok(false),
+            _ if attempt < 4 => {
+                tracing::warn!(url, ?status, attempt, "GLO-30 tile check failed; retrying");
+                std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt)));
+                attempt += 1;
+            }
+            Ok(s) => {
+                return Err(L1Error::Service {
+                    service: "GLO-30 bucket",
+                    status: s.as_u16(),
+                    url: url.to_string(),
+                    body: String::new(),
+                })
+            }
+            Err(_) => return Err(outcome.err().map_or_else(|| unreachable!(), L1Error::Http)),
+        }
+    }
 }
 
 /// GLO-30 tile names covering `bounds`.
@@ -280,9 +338,10 @@ mod tests {
         assert_eq!(south, vec!["Copernicus_DSM_COG_10_S34_00_E151_00_DEM"]);
     }
 
-    /// Keys weights sum to one and reproduce a linear ramp exactly.
+    /// The natural spline reproduces a linear ramp exactly and a sampled
+    /// node exactly; a NaN node masks the result.
     #[test]
-    fn bicubic_reproduces_planes() {
+    fn biquintic_reproduces_planes() {
         let heights =
             Array2::from_shape_fn((8, 8), |(r, c)| (3.0 * r as f64 - 2.0 * c as f64) as f32);
         let dem = Dem {
@@ -295,7 +354,11 @@ mod tests {
         let (lon, lat) = (10.0337, 49.9629);
         let expected = 3.0 * (50.0 - lat) / 0.01 - 2.0 * (lon - 10.0) / 0.01;
         assert!((dem.height(lon, lat).unwrap() - expected).abs() < 1e-4);
-        assert!((keys_weights(0.3).iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        let node = dem.height(10.03, 49.97).unwrap();
+        assert!((node - f64::from(dem.heights[[3, 3]])).abs() < 1e-4);
         assert!(dem.height(10.0, 50.0).is_err());
+        let mut holed = dem.clone();
+        holed.heights[[4, 4]] = f32::NAN;
+        assert!(holed.height(lon, lat).unwrap().is_nan());
     }
 }

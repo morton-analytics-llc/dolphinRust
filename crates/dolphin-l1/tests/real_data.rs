@@ -5,13 +5,14 @@
 //!
 //! ```text
 //! DOLPHIN_L1_ENV=../../.env DOLPHIN_L1_CACHE=/path/to/cache \
+//!   DOLPHIN_L1_REFERENCE=/path/to/validation/real_data \
+//!   DOLPHIN_L1_BURST_DB=/path/to/opera-burst-bbox-only.sqlite3 \
 //!   cargo test -p dolphin-l1 --test real_data -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
-use dolphin_l1::asf::AsfBurstClient;
 use dolphin_l1::{BurstId, BurstQuery, CdseClient};
 
 fn setup() -> PathBuf {
@@ -41,11 +42,10 @@ fn measurement_tiff(safe: &std::path::Path) -> PathBuf {
 
 /// Phase 1 contract: the CDSE burst for T100-213486-IW2 on 2023-01-10 is the
 /// burst OPERA processed (same parent SAFE and first-line time), the POEORB
-/// found is the one OPERA used and covers the burst, and the ASF fallback burst
-/// decodes to the same samples.
+/// found is the one OPERA used and covers the burst.
 #[test]
-#[ignore = "downloads raw Sentinel-1 data from CDSE and ASF"]
-fn phase1_cdse_burst_orbit_and_asf_fallback() {
+#[ignore = "downloads raw Sentinel-1 data from CDSE"]
+fn phase1_cdse_burst_and_orbit() {
     let cache = setup();
     let query = t100_query();
     let mut cdse = CdseClient::from_env().unwrap();
@@ -77,25 +77,13 @@ fn phase1_cdse_burst_orbit_and_asf_fallback() {
     let eof = cdse.download_orbit(&orbit, &cache.join("orbits")).unwrap();
     assert!(std::fs::read_to_string(&eof).unwrap().contains("<OSV>"));
 
-    let asf = AsfBurstClient::from_env().unwrap();
-    let asf_bursts = asf.search(&query).unwrap();
-    assert_eq!(asf_bursts.len(), 1);
-    let asf_safe = asf
-        .download(&asf_bursts[0], &cache.join("asf_bursts"))
-        .unwrap();
-    let shape = |p: PathBuf| {
-        let ds = gdal::Dataset::open(p).unwrap();
-        (ds.raster_size(), ds.raster_count())
-    };
-    let cdse_shape = shape(measurement_tiff(&safe));
-    assert_eq!(
-        cdse_shape,
-        shape(measurement_tiff(&asf_safe)),
-        "burst shapes differ"
-    );
+    let shape = gdal::Dataset::open(measurement_tiff(&safe))
+        .unwrap()
+        .raster_size();
+    assert_eq!(shape, (25997, 1513));
     println!(
-        "phase1: CDSE {} | ASF {} | orbit {} | shape {:?}",
-        record.name, asf_bursts[0].granule, orbit.name, cdse_shape
+        "phase1: CDSE {} | orbit {} | shape {:?}",
+        record.name, orbit.name, shape
     );
 }
 
@@ -115,15 +103,14 @@ fn only_safe(dir: PathBuf) -> PathBuf {
 
 /// Phase 2 contract: the burst reader recovers the values OPERA's s1-reader
 /// recorded for the same burst (T100-213486-IW2, 2023-01-10; OPERA CSLC
-/// `input_burst_metadata` / `burst_location_parameters`), and the CDSE and ASF
-/// bursts decode to identical complex samples.
+/// `input_burst_metadata` / `burst_location_parameters`), and the CInt16
+/// measurement decodes to the full burst.
 #[test]
 #[ignore = "reads the raw bursts downloaded by phase1"]
 fn phase2_safe_reader_matches_opera_burst_metadata() {
     use dolphin_l1::safe::S1Burst;
     let cache = setup();
     let cdse = S1Burst::open(&only_safe(cache.join("bursts")), "VV", None).unwrap();
-    let asf = S1Burst::open(&only_safe(cache.join("asf_bursts")), "VV", None).unwrap();
     let close =
         |a: f64, b: f64, tol: f64| assert!((a - b).abs() <= tol * b.abs().max(1.0), "{a} vs {b}");
     assert_eq!((cdse.lines, cdse.samples), (1513, 25997));
@@ -167,33 +154,31 @@ fn phase2_safe_reader_matches_opera_burst_metadata() {
     {
         close(*got, want, 1e-8);
     }
-    assert_eq!(asf.doppler().unwrap().coefficients, doppler.coefficients);
-    assert_eq!(asf.fm_rate().unwrap().coefficients, fm.coefficients);
 
     let cdse_samples = cdse.read_all().unwrap();
-    let asf_samples = asf.read_all().unwrap();
     assert_eq!(cdse_samples.dim(), (1513, 25997));
-    assert!(cdse_samples == asf_samples, "CDSE and ASF bursts differ");
     let nonzero = cdse_samples.iter().filter(|v| v.norm_sqr() > 0.0).count();
     assert!(
         nonzero > 1513 * 25997 / 2,
         "only {nonzero} non-zero samples"
     );
     println!(
-        "phase2: CDSE == ASF over {:?}; {nonzero} non-zero samples",
+        "phase2: {:?} burst, {nonzero} non-zero samples",
         cdse_samples.dim()
     );
 }
 
+/// Reference data root (`validation/real_data` of a dolphinRust checkout,
+/// or a copy of it) from `DOLPHIN_L1_REFERENCE`.
+fn reference_dir() -> PathBuf {
+    PathBuf::from(std::env::var("DOLPHIN_L1_REFERENCE").expect("set DOLPHIN_L1_REFERENCE"))
+}
+
 fn t100_static() -> PathBuf {
-    PathBuf::from(std::env::var("T100_STATIC").unwrap_or_else(|_| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../../Documents/GitHub/dolphinRust/validation/real_data/t100_213486_iw2_p105_smel/",
-            "cropped/shared/static/OPERA_L2_CSLC-S1-STATIC_T100-213486-IW2_20140403_S1A_v1.0.h5"
-        )
-        .into()
-    }))
+    reference_dir().join(
+        "t100_213486_iw2_p105_smel/cropped/shared/static/\
+         OPERA_L2_CSLC-S1-STATIC_T100-213486-IW2_20140403_S1A_v1.0.h5",
+    )
 }
 
 /// Phase 3 contract on T100-213486-IW2 2023-01-10 with its POEORB:
@@ -324,4 +309,82 @@ fn los_difference_vs_opera(
         }
     }
     (worst, compared)
+}
+
+/// Azimuth Doppler centroid (Hz) of `data[rows, cols]` from the lag-one
+/// correlation along azimuth.
+fn lag_one_doppler(
+    data: ndarray::ArrayView2<num_complex::Complex32>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+    line_interval: f64,
+) -> f64 {
+    let mut sum = num_complex::Complex64::new(0.0, 0.0);
+    for r in rows {
+        for c in cols.clone() {
+            let (a, b) = (data[[r + 1, c]], data[[r, c]]);
+            sum += num_complex::Complex64::new(f64::from(a.re), f64::from(a.im))
+                * num_complex::Complex64::new(f64::from(b.re), -f64::from(b.im));
+        }
+    }
+    sum.arg() / (2.0 * std::f64::consts::PI * line_interval)
+}
+
+/// Phase 4 contract (TOPS deramp) on T100-213486-IW2 2023-01-10: the raw
+/// burst's local azimuth Doppler sweeps through the burst (TOPS steering),
+/// and after deramping every 64-line block sits within 15 Hz of the annotated
+/// geometric Doppler centroid. A wrong carrier sign or rate leaves a sweep.
+#[test]
+#[ignore = "reads the raw burst downloaded by phase1"]
+fn phase4_deramp_centres_azimuth_spectrum() {
+    use dolphin_l1::geocode::DerampedBurst;
+    use dolphin_l1::orbit::Orbit;
+    use dolphin_l1::safe::S1Burst;
+    use dolphin_l1::tops::TopsCarrier;
+
+    let cache = setup();
+    let burst = S1Burst::open(&only_safe(cache.join("bursts")), "VV", None).unwrap();
+    let eof = std::fs::read_dir(cache.join("orbits"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let margin = Duration::seconds(60);
+    let orbit = Orbit::from_eof(
+        &eof,
+        burst.sensing_start,
+        burst.sensing_start,
+        burst.sensing_stop(),
+        margin,
+    )
+    .unwrap();
+    let carrier = TopsCarrier::new(&burst, &orbit).unwrap();
+    let deramped = DerampedBurst::read(&burst, &carrier).unwrap();
+    let raw = burst
+        .read_window(
+            deramped.row0,
+            deramped.col0,
+            deramped.samples.nrows(),
+            deramped.samples.ncols(),
+        )
+        .unwrap();
+    let cols = 12_000 - deramped.col0..12_512 - deramped.col0;
+    let range = burst.starting_range() + 12_256.0 * burst.range_pixel_spacing();
+    let geometric = burst.doppler().unwrap().eval_range(range);
+    let dt = burst.azimuth_time_interval;
+    let (mut worst, mut raw_min, mut raw_max) = (0.0_f64, f64::INFINITY, f64::NEG_INFINITY);
+    for start in (0..deramped.samples.nrows() - 65).step_by(64) {
+        let rows = start..start + 64;
+        let f = lag_one_doppler(deramped.samples.view(), rows.clone(), cols.clone(), dt);
+        let f_raw = lag_one_doppler(raw.view(), rows, cols.clone(), dt);
+        worst = worst.max((f - geometric).abs());
+        raw_min = raw_min.min(f_raw);
+        raw_max = raw_max.max(f_raw);
+    }
+    println!(
+        "phase4: deramped |f - f_geo| <= {worst:.1} Hz (f_geo {geometric:.1} Hz); raw sweeps {raw_min:.0}..{raw_max:.0} Hz"
+    );
+    assert!(raw_max - raw_min > 200.0, "raw burst shows no TOPS sweep");
+    assert!(worst < 15.0, "deramped Doppler off by {worst} Hz");
 }

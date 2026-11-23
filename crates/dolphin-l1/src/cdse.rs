@@ -33,8 +33,13 @@ const CATALOGUE_URL: &str = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 const ZIPPER_URL: &str = "https://zipper.dataspace.copernicus.eu/odata/v1";
 /// Refresh the access token this long before it expires.
 const TOKEN_MARGIN: Duration = Duration::from_secs(120);
-/// Attempts per download (transient 429/5xx answers are retried).
-const DOWNLOAD_ATTEMPTS: u32 = 4;
+/// Attempts per request (transient 429/5xx answers and dropped connections
+/// are retried with linear backoff).
+const ATTEMPTS: u32 = 4;
+/// Backoff step between attempts.
+const RETRY_STEP: Duration = Duration::from_secs(10);
+/// Hosts under this domain receive the Bearer token; nothing else does.
+const CDSE_DOMAIN: &str = "dataspace.copernicus.eu";
 /// Redirect hops followed by hand (so the Bearer token survives each hop).
 const MAX_REDIRECTS: usize = 5;
 
@@ -129,6 +134,10 @@ pub struct BurstRecord {
     pub parent_product_name: String,
     /// Parent SAFE product UUID.
     pub parent_product_id: String,
+    /// When CDSE received the parent product (set by [`CdseClient::search_bursts`]
+    /// only to choose between duplicates from reprocessed parents).
+    #[serde(skip)]
+    pub parent_origin: Option<DateTime<Utc>>,
     /// Burst number along the track.
     pub burst_id: u32,
     /// Relative orbit.
@@ -208,6 +217,13 @@ struct ContentDate {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ParentRow {
+    origin_date: Option<DateTime<Utc>>,
+    publication_date: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
 struct NodeListing {
     result: Vec<NodeRow>,
 }
@@ -238,6 +254,7 @@ pub struct CdseClient {
     username: String,
     password: String,
     token: Option<Token>,
+    retry_step: Duration,
 }
 
 impl CdseClient {
@@ -257,6 +274,7 @@ impl CdseClient {
             username,
             password,
             token: None,
+            retry_step: RETRY_STEP,
         })
     }
 
@@ -272,15 +290,48 @@ impl CdseClient {
             odata_time(query.start),
             odata_time(query.end),
         );
-        let first = self.http.get(format!("{CATALOGUE_URL}/Bursts")).query(&[
-            ("$filter", filter.as_str()),
-            ("$orderby", "ContentDate/Start asc"),
-            ("$top", "1000"),
-        ]);
-        let mut records: Vec<BurstRecord> = self.paged(first)?;
-        // Re-processed parents can list the same burst twice; keep the first.
-        records.dedup_by(|b, a| b.azimuth_time == a.azimuth_time);
-        Ok(records)
+        let records: Vec<BurstRecord> = self.paged(
+            &format!("{CATALOGUE_URL}/Bursts"),
+            &[
+                ("$filter", filter.as_str()),
+                ("$orderby", "ContentDate/Start asc"),
+                ("$top", "1000"),
+            ],
+        )?;
+        self.newest_processing(records)
+    }
+
+    /// Collapse bursts listed more than once (the same acquisition in a
+    /// reprocessed parent) to the one from the most recently received parent;
+    /// ties go to the later parent name.
+    fn newest_processing(&self, records: Vec<BurstRecord>) -> Result<Vec<BurstRecord>> {
+        let mut groups: Vec<Vec<BurstRecord>> = Vec::new();
+        for record in records {
+            match groups.last_mut() {
+                Some(group) if same_acquisition(&group[0], &record) => group.push(record),
+                _ => groups.push(vec![record]),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|mut group| {
+                if group.len() > 1 {
+                    for record in &mut group {
+                        record.parent_origin = Some(self.parent_origin(&record.parent_product_id)?);
+                    }
+                }
+                Ok(pick_newest(group))
+            })
+            .collect()
+    }
+
+    fn parent_origin(&self, id: &str) -> Result<DateTime<Utc>> {
+        let url = format!("{CATALOGUE_URL}/Products({id})");
+        let row: ParentRow = self
+            .with_retry(|| Ok(checked(self.http.get(&url).send()?, "CDSE catalogue")?.json()?))?;
+        row.origin_date.or(row.publication_date).ok_or_else(|| {
+            L1Error::Product(format!("parent {id} has no origin or publication date"))
+        })
     }
 
     /// The best orbit file covering `[start, stop]` for `mission` (`S1A`, `S1B`,
@@ -298,12 +349,14 @@ impl CdseClient {
                 odata_time(start),
                 odata_time(stop),
             );
-            let request = self.http.get(format!("{CATALOGUE_URL}/Products")).query(&[
-                ("$filter", filter.as_str()),
-                ("$orderby", "ContentDate/Start desc"),
-                ("$top", "20"),
-            ]);
-            let rows: Vec<ProductRow> = self.paged(request)?;
+            let rows: Vec<ProductRow> = self.paged(
+                &format!("{CATALOGUE_URL}/Products"),
+                &[
+                    ("$filter", filter.as_str()),
+                    ("$orderby", "ContentDate/Start desc"),
+                    ("$top", "20"),
+                ],
+            )?;
             // The newest production of a validity window wins (names sort by
             // production time after the mission/type prefix).
             let best = rows.into_iter().max_by(|a, b| a.name.cmp(&b.name));
@@ -362,7 +415,8 @@ impl CdseClient {
             "{ZIPPER_URL}/Products({})/Nodes({})/Nodes(annotation)/Nodes",
             record.parent_product_id, record.parent_product_name
         );
-        let listing: NodeListing = checked(self.http.get(&folder).send()?, "CDSE nodes")?.json()?;
+        let listing: NodeListing =
+            self.with_retry(|| Ok(checked(self.http.get(&folder).send()?, "CDSE nodes")?.json()?))?;
         let wanted = format!(
             "-iw2-slc-{}-",
             record.polarisation_channels.to_ascii_lowercase()
@@ -403,15 +457,39 @@ impl CdseClient {
         Ok(eof_path)
     }
 
-    fn paged<T: for<'de> Deserialize<'de>>(&self, first: RequestBuilder) -> Result<Vec<T>> {
+    /// Every row of an OData listing, following `@odata.nextLink`; each page
+    /// request is retried on transient failures.
+    fn paged<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
+        let fetch = |request: &dyn Fn() -> RequestBuilder| -> Result<ODataPage<T>> {
+            self.with_retry(|| Ok(checked(request().send()?, "CDSE catalogue")?.json()?))
+        };
         let mut out = Vec::new();
-        let mut page: ODataPage<T> = checked(first.send()?, "CDSE catalogue")?.json()?;
+        let mut page = fetch(&|| self.http.get(url).query(query))?;
         loop {
             out.append(&mut page.value);
             let Some(next) = page.next_link.take() else {
                 return Ok(out);
             };
-            page = checked(self.http.get(next).send()?, "CDSE catalogue")?.json()?;
+            page = fetch(&|| self.http.get(&next))?;
+        }
+    }
+
+    /// Run `call` up to [`ATTEMPTS`] times while it fails transiently.
+    fn with_retry<T>(&self, mut call: impl FnMut() -> Result<T>) -> Result<T> {
+        let mut attempt = 1;
+        loop {
+            match call() {
+                Err(error) if is_transient(&error) && attempt < ATTEMPTS => {
+                    tracing::warn!(%error, attempt, "CDSE transient failure; retrying");
+                    std::thread::sleep(self.retry_step * attempt);
+                    attempt += 1;
+                }
+                other => return other,
+            }
         }
     }
 
@@ -429,21 +507,36 @@ impl CdseClient {
             .as_ref()
             .and_then(|t| t.refresh.clone())
             .filter(|(_, until)| *until > now + TOKEN_MARGIN);
-        let response = match refresh {
-            Some((refresh_token, _)) => self.http.post(TOKEN_URL).form(&[
-                ("client_id", "cdse-public"),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
-            ]),
-            None => self.http.post(TOKEN_URL).form(&[
+        let refreshed = match refresh {
+            Some((refresh_token, _)) => {
+                let grant = [
+                    ("client_id", "cdse-public"),
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.as_str()),
+                ];
+                match self.token_grant(&grant) {
+                    // The server can revoke a refresh token before its stated
+                    // expiry (session ended, password changed): log in again.
+                    Err(L1Error::Service {
+                        status: 400 | 401, ..
+                    }) => {
+                        tracing::info!("CDSE refresh token rejected; using the password grant");
+                        None
+                    }
+                    other => Some(other?),
+                }
+            }
+            None => None,
+        };
+        let body = match refreshed {
+            Some(body) => body,
+            None => self.token_grant(&[
                 ("client_id", "cdse-public"),
                 ("grant_type", "password"),
                 ("username", self.username.as_str()),
                 ("password", self.password.as_str()),
-            ]),
-        }
-        .send()?;
-        let body: TokenResponse = checked(response, "CDSE identity")?.json()?;
+            ])?,
+        };
         let issued = Instant::now();
         let token = Token {
             access: body.access_token,
@@ -458,42 +551,68 @@ impl CdseClient {
         Ok(access)
     }
 
+    fn token_grant(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
+        self.with_retry(|| {
+            Ok(checked(
+                self.http.post(TOKEN_URL).form(form).send()?,
+                "CDSE identity",
+            )?
+            .json()?)
+        })
+    }
+
     fn download_authorized(&mut self, url: &str, method: Method, dest: &Path) -> Result<()> {
-        let mut last_error = None;
-        for attempt in 0..DOWNLOAD_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(10 * u64::from(attempt)));
+        let part = dest.with_extension("download");
+        let mut attempt = 1;
+        loop {
+            let result = self.try_download(url, method, &part);
+            if result.is_err() {
+                // Never leave a partial file where a later run could take it
+                // for a complete one.
+                let _ = std::fs::remove_file(&part);
             }
-            match self.try_download(url, method, dest) {
-                Ok(()) => return Ok(()),
-                Err(error) if is_transient(&error) => last_error = Some(error),
+            match result {
+                Ok(()) => return Ok(std::fs::rename(&part, dest)?),
+                Err(error) if is_transient(&error) && attempt < ATTEMPTS => {
+                    tracing::warn!(%error, attempt, "CDSE download failed; retrying");
+                    std::thread::sleep(self.retry_step * attempt);
+                    attempt += 1;
+                }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| L1Error::NotFound(url.to_string())))
     }
 
-    fn try_download(&mut self, url: &str, method: Method, dest: &Path) -> Result<()> {
+    /// One download into `part`, following redirects by hand. The Bearer
+    /// token goes only to HTTPS hosts under `dataspace.copernicus.eu`.
+    fn try_download(&mut self, url: &str, method: Method, part: &Path) -> Result<()> {
         let mut current = url.to_string();
         for _ in 0..=MAX_REDIRECTS {
-            let token = self.access_token()?;
             let request = match method {
                 Method::Get => self.http.get(&current),
                 Method::Post => self.http.post(&current),
             };
-            let response = request
-                .header(AUTHORIZATION, format!("Bearer {token}"))
-                .send()?;
+            let request = match is_cdse_host(&current) {
+                true => request.header(AUTHORIZATION, format!("Bearer {}", self.access_token()?)),
+                false => request,
+            };
+            let response = request.send()?;
             if response.status().is_redirection() {
                 current = redirect_target(&response)?;
                 continue;
             }
             let mut response = checked(response, "CDSE download")?;
-            let part = dest.with_extension("download");
-            let mut file = File::create(&part)?;
-            response.copy_to(&mut file)?;
+            let expected = response.content_length();
+            let mut file = File::create(part)?;
+            let written = response.copy_to(&mut file)?;
             file.flush()?;
-            std::fs::rename(&part, dest)?;
+            if let Some(expected) = expected.filter(|&e| e != written) {
+                return Err(L1Error::Incomplete {
+                    url: current,
+                    expected,
+                    written,
+                });
+            }
             return Ok(());
         }
         Err(L1Error::Product(format!("too many redirects from {url}")))
@@ -511,7 +630,7 @@ fn odata_time(time: DateTime<Utc>) -> String {
     time.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-pub(crate) fn redirect_target(response: &Response) -> Result<String> {
+fn redirect_target(response: &Response) -> Result<String> {
     let location = response
         .headers()
         .get(LOCATION)
@@ -525,7 +644,7 @@ pub(crate) fn redirect_target(response: &Response) -> Result<String> {
 }
 
 /// Pass a 2xx response through; turn anything else into [`L1Error::Service`].
-pub(crate) fn checked(response: Response, service: &'static str) -> Result<Response> {
+fn checked(response: Response, service: &'static str) -> Result<Response> {
     if response.status().is_success() {
         return Ok(response);
     }
@@ -545,12 +664,45 @@ pub(crate) fn checked(response: Response, service: &'static str) -> Result<Respo
     })
 }
 
-pub(crate) fn is_transient(error: &L1Error) -> bool {
+fn is_transient(error: &L1Error) -> bool {
     match error {
         L1Error::Service { status, .. } => *status == 429 || *status >= 500,
-        L1Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_body(),
+        L1Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode(),
+        L1Error::Incomplete { .. } => true,
         _ => false,
     }
+}
+
+/// `true` for an HTTPS URL whose host is `dataspace.copernicus.eu` or a
+/// subdomain of it.
+fn is_cdse_host(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| {
+                h == CDSE_DOMAIN
+                    || h.strip_suffix(CDSE_DOMAIN)
+                        .is_some_and(|p| p.ends_with('.'))
+            })
+    })
+}
+
+/// Two catalogue rows for the same burst acquisition (first-line times
+/// within a second; distinct acquisitions of one burst id are days apart).
+fn same_acquisition(a: &BurstRecord, b: &BurstRecord) -> bool {
+    (a.azimuth_time - b.azimuth_time).num_milliseconds().abs() < 1000
+}
+
+/// The record from the most recently received parent; ties go to the
+/// later parent name.
+fn pick_newest(group: Vec<BurstRecord>) -> BurstRecord {
+    group
+        .into_iter()
+        .max_by(|a, b| {
+            a.parent_origin
+                .cmp(&b.parent_origin)
+                .then_with(|| a.parent_product_name.cmp(&b.parent_product_name))
+        })
+        .expect("groups are never empty")
 }
 
 fn is_zip(path: &Path) -> Result<bool> {
@@ -559,7 +711,7 @@ fn is_zip(path: &Path) -> Result<bool> {
     Ok(read == 2 && &magic == b"PK")
 }
 
-pub(crate) fn unzip(zip_path: &Path, dest: &Path) -> Result<()> {
+fn unzip(zip_path: &Path, dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(File::open(zip_path)?)?;
     std::fs::create_dir_all(dest)?;
     for index in 0..archive.len() {
@@ -593,7 +745,7 @@ fn extract_member_with_suffix(zip_path: &Path, suffix: &str, dest: &Path) -> Res
 }
 
 /// The first `*.SAFE` directory under `root` (depth ≤ 2), if `root` exists.
-pub(crate) fn find_safe_dir(root: &Path) -> Result<Option<PathBuf>> {
+fn find_safe_dir(root: &Path) -> Result<Option<PathBuf>> {
     if !root.is_dir() {
         return Ok(None);
     }

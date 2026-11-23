@@ -1,4 +1,4 @@
-//! Sentinel-1 IW SLC burst reader (one-burst SAFE from CDSE or ASF).
+//! Sentinel-1 IW SLC burst reader (one-burst SAFE from CDSE).
 //!
 //! The product annotation XML carries everything the geometry needs: burst
 //! timing, range sampling, radar parameters, the Doppler-centroid and
@@ -218,27 +218,22 @@ impl S1Burst {
         self.slant_range_time * SPEED_OF_LIGHT / 2.0
     }
 
-    /// Zero-Doppler time of the burst's centre line, `lines / 2` (integer
-    /// division, as the TOPS carrier is referenced there).
+    /// s1-reader's `sensing_mid`: `sensing_start + lines·ATI/2`, exact for
+    /// odd line counts (half a line past the centre line's integer index).
     pub fn sensing_mid(&self) -> DateTime<Utc> {
-        self.sensing_start
-            + Duration::nanoseconds(
-                ((self.lines / 2) as f64 * self.azimuth_time_interval * 1e9) as i64,
-            )
+        self.sensing_start + seconds(0.5 * self.lines as f64 * self.azimuth_time_interval)
     }
 
-    /// Zero-Doppler time of the line after the last burst line.
+    /// s1-reader's `sensing_stop`: the zero-Doppler time of the last burst
+    /// line, `sensing_start + (lines − 1)·ATI`.
     pub fn sensing_stop(&self) -> DateTime<Utc> {
-        self.sensing_start
-            + Duration::nanoseconds((self.lines as f64 * self.azimuth_time_interval * 1e9) as i64)
+        self.sensing_start + seconds((self.lines - 1) as f64 * self.azimuth_time_interval)
     }
 
     /// The annotation polynomial nearest in time to the burst middle.
     pub fn nearest<'a>(&self, list: &'a [RangePolynomial]) -> Result<&'a RangePolynomial> {
         let mid = self.sensing_start
-            + Duration::nanoseconds(
-                (0.5 * (self.lines - 1) as f64 * self.azimuth_time_interval * 1e9) as i64,
-            );
+            + seconds(0.5 * (self.lines - 1) as f64 * self.azimuth_time_interval);
         list.iter()
             .min_by(|a, b| {
                 let da = seconds_since(mid, a.azimuth_time).abs();
@@ -296,6 +291,11 @@ impl S1Burst {
     pub fn read_all(&self) -> Result<Array2<Complex32>> {
         self.read_window(0, 0, self.lines, self.samples)
     }
+}
+
+/// A [`Duration`] from seconds, rounded to the nanosecond.
+fn seconds(value: f64) -> Duration {
+    Duration::nanoseconds((value * 1e9).round() as i64)
 }
 
 /// One annotation geolocation-grid tie point.

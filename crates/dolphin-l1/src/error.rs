@@ -10,7 +10,7 @@ pub enum L1Error {
     /// A data service answered with an unexpected status.
     #[error("{service} answered HTTP {status} for {url}: {body}")]
     Service {
-        /// Which service (CDSE catalogue, CDSE download, ASF, EDL).
+        /// Which service (CDSE identity, catalogue, download).
         service: &'static str,
         /// HTTP status code.
         status: u16,
@@ -18,6 +18,17 @@ pub enum L1Error {
         url: String,
         /// First bytes of the response body.
         body: String,
+    },
+
+    /// A download ended before its announced length.
+    #[error("download of {url} stopped at {written} of {expected} bytes")]
+    Incomplete {
+        /// Request URL.
+        url: String,
+        /// `Content-Length`.
+        expected: u64,
+        /// Bytes received.
+        written: u64,
     },
 
     /// A required credential is not in the environment.

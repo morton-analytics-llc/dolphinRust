@@ -51,6 +51,53 @@ enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Build geocoded CSLC HDF5 files for one Sentinel-1 burst from raw IW SLC
+    /// bursts on the Copernicus Data Space (CDSE), on the OPERA burst grid.
+    /// Re-running with `--start` at the last processed date picks up new
+    /// acquisitions and keeps the existing ones.
+    Cslc {
+        /// Burst id, e.g. `T100-213486-IW2`.
+        #[arg(long)]
+        burst_id: String,
+        /// Polarisation.
+        #[arg(long, default_value = "VV")]
+        polarization: String,
+        /// First acquisition date (YYYY-MM-DD, inclusive).
+        #[arg(long)]
+        start: chrono::NaiveDate,
+        /// Last acquisition date (YYYY-MM-DD, inclusive).
+        #[arg(long)]
+        end: chrono::NaiveDate,
+        /// OPERA burst database (`opera-burst-bbox-only.sqlite3`, burst_db
+        /// v0.10.0): the burst's fixed UTM grid, 5 m x 10 m posting.
+        #[arg(long)]
+        burst_db: PathBuf,
+        /// Process only the window `ROW0,COL0,ROWS,COLS` of the burst grid.
+        #[arg(long, value_delimiter = ',')]
+        window: Option<Vec<usize>>,
+        /// Raw-data cache directory (bursts, orbits).
+        #[arg(long)]
+        cache: PathBuf,
+        /// Output directory for the CSLC HDF5 files.
+        #[arg(long)]
+        out: PathBuf,
+        /// `KEY=VALUE` env file holding `CDSE_USERNAME` / `CDSE_PASSWORD`.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// Skip ESD (no next-burst download, zero azimuth shift).
+        #[arg(long)]
+        no_esd: bool,
+        /// Keep downloaded raw bursts in the cache after use.
+        #[arg(long)]
+        keep_raw: bool,
+        /// Also write the azimuth-carrier and flattening phase layers.
+        #[arg(long)]
+        phase_layers: bool,
+        /// Leave the JPL GIM ionospheric delay out of the sampling range
+        /// (otherwise it needs EARTHDATA_TOKEN).
+        #[arg(long)]
+        no_ionosphere: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -63,7 +110,73 @@ fn main() -> Result<()> {
         Command::Run { config } => run(&config),
         Command::Stream { config, initial } => stream(&config, initial),
         Command::Pairs { config } => pairs(&config),
+        Command::Cslc {
+            burst_id,
+            polarization,
+            start,
+            end,
+            burst_db,
+            window,
+            cache,
+            out,
+            env_file,
+            no_esd,
+            keep_raw,
+            phase_layers,
+            no_ionosphere,
+        } => {
+            if let Some(path) = env_file {
+                dolphin_l1::load_env_file(&path)?;
+            }
+            let burst_id = dolphin_l1::BurstId::parse(&burst_id)?;
+            let mut grid = dolphin_l1::grid::GeoGrid::from_burst_db(&burst_db, &burst_id)?;
+            if let Some(window) = window {
+                let [row0, col0, rows, cols] = window[..] else {
+                    anyhow::bail!("--window takes ROW0,COL0,ROWS,COLS");
+                };
+                grid = grid.window(row0, col0, rows, cols)?;
+            }
+            let day = |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+            let request = dolphin_l1::stack::StackRequest {
+                burst_id,
+                polarization,
+                start: day(start).context("start date")?,
+                end: day(end + chrono::Duration::days(1)).context("end date")?,
+                grid,
+                esd: !no_esd,
+                cache_dir: cache,
+                output_dir: out,
+                keep_raw,
+                phase_layers,
+                ionosphere: !no_ionosphere,
+            };
+            cslc(&request)
+        }
     }
+}
+
+/// Run the Sentinel-1 raw front end and print one line per written date.
+fn cslc(request: &dolphin_l1::stack::StackRequest) -> Result<()> {
+    let mut client = dolphin_l1::CdseClient::from_env()?;
+    let outputs = dolphin_l1::stack::process_stack(&mut client, request)?;
+    for output in &outputs {
+        let esd = output
+            .esd
+            .map(|e| {
+                format!(
+                    "esd {:+.3e} s (residual {:+.1e}) from {} looks, coh {:.2}, df {:.0} Hz",
+                    e.azimuth_shift, e.residual_shift, e.looks, e.coherence, e.doppler_difference
+                )
+            })
+            .unwrap_or_else(|| "esd -".into());
+        println!(
+            "{}  shift {:+.3e} s  {esd}  {}",
+            output.sensing_start,
+            output.azimuth_shift,
+            output.path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Parse a displacement config from YAML.
