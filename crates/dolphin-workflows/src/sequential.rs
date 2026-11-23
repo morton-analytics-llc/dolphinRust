@@ -85,11 +85,10 @@ pub struct SequentialConfig {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
-    /// Persistent-scatterer selection and fill; `None` skips both.
-    pub ps: Option<PsSelection>,
 }
 
-/// Persistent-scatterer options for a sequential run.
+/// Persistent-scatterer options for [`run_sequential_resumable_with_ps`] and
+/// [`update_sequential_with_ps`].
 ///
 /// Each ministack selects PS from the amplitude statistics of every real date
 /// up to and including its own (causal, exact Chan merge), so a sealed
@@ -131,7 +130,7 @@ pub struct SequentialOutput {
     /// mask. A stride cell is valid when any native pixel in it is valid.
     pub validity_mask: Array2<bool>,
     /// Native-grid PS mask, amplitude dispersion and mean over every date;
-    /// `None` unless [`SequentialConfig::ps`] is set.
+    /// `None` unless the run selected PS.
     pub ps: Option<PsResult>,
 }
 
@@ -432,6 +431,7 @@ fn drive(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
     shp_statistics: Option<&ShpStatistics>,
+    ps: Option<PsSelection>,
     ps_seed: Option<&AmplitudeStats>,
 ) -> Result<Drive, &'static str> {
     let mut carry: Vec<Array2<Cf64>> = seed_compressed.to_vec();
@@ -446,8 +446,7 @@ fn drive(
         ps_final: ps_seed.cloned(),
     };
     for &ms in plans {
-        let ps = cfg
-            .ps
+        let ps = ps
             .map(|selection| ministack_ps(&mut out.ps_final, real_stack, ms, valid_mask, selection))
             .transpose()?;
         if ps.is_some() && ms.num_real >= cfg.ministack_size {
@@ -744,11 +743,6 @@ fn run_sequential_with_covariance_capture_impl<F>(
 where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), &'static str>,
 {
-    if cfg.ps.is_some() {
-        return Err(SequentialReplayError::Invalid(
-            "ps_options is not yet supported with covariance operator capture",
-        ));
-    }
     let (_, rows, cols) = slc_stack.dim();
     let fixed_validity = match native_validity {
         Some(mask) if mask.dim() == (rows, cols) => mask.to_owned(),
@@ -1005,11 +999,6 @@ fn plan_sequential_covariance_capture_impl(
     revision: &SequentialCovarianceRevision,
     configured_mask: bool,
 ) -> Result<SequentialCovarianceCapturePlan, SequentialReplayError> {
-    if cfg.ps.is_some() {
-        return Err(SequentialReplayError::Invalid(
-            "ps_options is not yet supported with covariance operator capture",
-        ));
-    }
     if revision.full_source_manifest_digest != request.source_manifest_digest
         || revision
             .source_model_receipt_digest
@@ -1189,11 +1178,6 @@ fn run_sequential_resumable_with_covariance_capture_impl<F>(
 where
     F: FnMut(CovarianceOperatorBlock) -> Result<(), SequentialReplayError>,
 {
-    if cfg.ps.is_some() {
-        return Err(SequentialReplayError::Invalid(
-            "ps_options is not yet supported with covariance operator capture",
-        ));
-    }
     if revision.prior_full_source_manifest_digest.is_some()
         || revision.full_source_manifest_digest != request.source_manifest_digest
         || revision
@@ -1468,11 +1452,6 @@ fn update_sequential_with_covariance_capture_impl(
     >,
     destination: &mut CovarianceOperatorWriter,
 ) -> Result<(SequentialOutput, SequentialCovarianceState), SequentialReplayError> {
-    if cfg.ps.is_some() {
-        return Err(SequentialReplayError::Invalid(
-            "ps_options is not yet supported with covariance operator capture",
-        ));
-    }
     let (n_open, rows, cols) = state.sequential.open_real_slcs.dim();
     let (n_new, nrows, ncols) = new_slcs.dim();
     if n_new == 0 || (nrows, ncols) != (rows, cols) {
@@ -1865,7 +1844,7 @@ pub fn run_sequential_resumable(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
-    run_sequential_resumable_impl(slc_stack, None, cfg, engine)
+    run_sequential_resumable_impl(slc_stack, None, cfg, None, engine)
 }
 
 /// Run the masked sequential estimator and return resumable state.
@@ -1879,13 +1858,31 @@ pub fn run_sequential_resumable_masked(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
-    run_sequential_resumable_impl(slc_stack, Some(valid_mask), cfg, engine)
+    run_sequential_resumable_impl(slc_stack, Some(valid_mask), cfg, None, engine)
+}
+
+/// Run the sequential estimator with persistent-scatterer selection and fill
+/// (see [`PsSelection`]), optionally masked, and return resumable state.
+/// `ps: None` is exactly [`run_sequential_resumable`] /
+/// [`run_sequential_resumable_masked`].
+///
+/// # Errors
+/// As [`run_sequential_resumable_masked`].
+pub fn run_sequential_resumable_with_ps(
+    slc_stack: ArrayView3<Cf64>,
+    valid_mask: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    ps: Option<PsSelection>,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    run_sequential_resumable_impl(slc_stack, valid_mask, cfg, ps, engine)
 }
 
 fn run_sequential_resumable_impl(
     slc_stack: ArrayView3<Cf64>,
     native_validity: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
+    ps: Option<PsSelection>,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
     let valid_mask = match native_validity {
@@ -1904,6 +1901,7 @@ fn run_sequential_resumable_impl(
         cfg,
         engine,
         shp_statistics.as_ref(),
+        ps,
         None,
     )?;
     let output = build_output(
@@ -1918,7 +1916,7 @@ fn run_sequential_resumable_impl(
             (slc_stack.dim().1, slc_stack.dim().2),
             cfg.strides,
         ),
-        series_ps(cfg, &d, valid_mask),
+        series_ps(ps, &d, valid_mask),
     )?;
     let state = seal_state(
         &plans,
@@ -1927,7 +1925,7 @@ fn run_sequential_resumable_impl(
         native_validity,
         d,
         amplitude_sums,
-        cfg.ps,
+        ps,
     );
     Ok((output, state))
 }
@@ -1948,7 +1946,7 @@ pub fn update_sequential(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
-    update_sequential_impl(state, new_slcs, None, cfg, engine)
+    update_sequential_impl(state, new_slcs, None, cfg, None, engine)
 }
 
 /// Fold new acquisitions into masked resumable state using the same native
@@ -1964,7 +1962,23 @@ pub fn update_sequential_masked(
     cfg: &SequentialConfig,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
-    update_sequential_impl(state, new_slcs, Some(valid_mask), cfg, engine)
+    update_sequential_impl(state, new_slcs, Some(valid_mask), cfg, None, engine)
+}
+
+/// Fold new acquisitions into state from [`run_sequential_resumable_with_ps`].
+/// `valid_mask` and `ps` must match the state-producing run.
+///
+/// # Errors
+/// As [`update_sequential_masked`], and when `ps` differs from the series.
+pub fn update_sequential_with_ps(
+    state: &SequentialState,
+    new_slcs: ArrayView3<Cf64>,
+    valid_mask: Option<ArrayView2<bool>>,
+    cfg: &SequentialConfig,
+    ps: Option<PsSelection>,
+    engine: &ComputeEngine,
+) -> Result<(SequentialOutput, SequentialState), &'static str> {
+    update_sequential_impl(state, new_slcs, valid_mask, cfg, ps, engine)
 }
 
 fn update_sequential_impl(
@@ -1972,6 +1986,7 @@ fn update_sequential_impl(
     new_slcs: ArrayView3<Cf64>,
     native_validity: Option<ArrayView2<bool>>,
     cfg: &SequentialConfig,
+    ps: Option<PsSelection>,
     engine: &ComputeEngine,
 ) -> Result<(SequentialOutput, SequentialState), &'static str> {
     let (n_open, rows, cols) = state.open_real_slcs.dim();
@@ -2006,7 +2021,7 @@ fn update_sequential_impl(
     if prior_amplitude_sums_are_missing(state, cfg) {
         return Err("update_sequential: the series state holds no full-stack amplitude statistics");
     }
-    if state.ps_selection != cfg.ps {
+    if state.ps_selection != ps {
         return Err("update_sequential: ps_options differ from the series");
     }
     let amplitude_sums = full_stack_amplitude_sums(cfg, state.amplitude_sums.as_ref(), new_slcs);
@@ -2019,6 +2034,7 @@ fn update_sequential_impl(
         cfg,
         engine,
         shp_statistics.as_ref(),
+        ps,
         state.ps_stats.as_ref(),
     )?;
 
@@ -2036,7 +2052,7 @@ fn update_sequential_impl(
         crlb,
         closure,
         looked_validity(valid_mask, (rows, cols), cfg.strides),
-        series_ps(cfg, &d, valid_mask),
+        series_ps(ps, &d, valid_mask),
     )?;
     let next = seal_state(
         &tail_plans,
@@ -2045,7 +2061,7 @@ fn update_sequential_impl(
         native_validity,
         d,
         amplitude_sums,
-        cfg.ps,
+        ps,
     )
     .with_sealed_prefix(state);
     Ok((output, next))
@@ -2053,11 +2069,11 @@ fn update_sequential_impl(
 
 /// The published PS products: selection over every date the drive has seen.
 fn series_ps(
-    cfg: &SequentialConfig,
+    ps: Option<PsSelection>,
     d: &Drive,
     valid_mask: Option<ArrayView2<bool>>,
 ) -> Option<PsResult> {
-    let selection = cfg.ps?;
+    let selection = ps?;
     let stats = d.ps_final.as_ref()?;
     Some(native_ps(
         stats,
@@ -2590,7 +2606,6 @@ mod tests {
             compute_average_coherence: false,
             shp_method,
             shp_alpha: 0.001,
-            ps: None,
         }
     }
 
@@ -2670,6 +2685,7 @@ mod tests {
                 &cfg,
                 &cpu(),
                 statistics,
+                None,
                 None,
             )
             .unwrap();

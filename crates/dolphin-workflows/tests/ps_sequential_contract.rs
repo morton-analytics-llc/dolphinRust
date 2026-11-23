@@ -4,16 +4,15 @@
 //!   speckle-like one (D_A ≈ 0.40) is not;
 //! - an NRT update equals a full rerun exactly on phase, temporal coherence,
 //!   PS, D_A and mean (PS selection is causal per ministack);
-//! - `ps: None` leaves the output unchanged;
-//! - covariance capture refuses PS until #233 settles PS cells there.
+//! - `ps: None` is exactly the plain estimator. Covariance capture takes no
+//!   PS options; config validation refuses PS with capture (#233).
 
 use dolphin_core::config::{CompressedSlcPlan, ComputeBackend, ShpMethod};
 use dolphin_core::{Cf64, HalfWindow, Strides};
-use dolphin_io::CovarianceOperatorGrid;
 use dolphin_phaselink::ComputeEngine;
 use dolphin_workflows::{
-    run_sequential, run_sequential_resumable, run_sequential_with_covariance_capture,
-    update_sequential, PsSelection, SequentialConfig, SequentialCovarianceCaptureRequest,
+    run_sequential, run_sequential_resumable_with_ps, update_sequential_with_ps, PsSelection,
+    SequentialConfig, SequentialOutput, SequentialState,
 };
 use ndarray::{s, Array3};
 
@@ -44,7 +43,7 @@ fn stack(nslc: usize) -> Array3<Cf64> {
     })
 }
 
-fn cfg(ps: Option<PsSelection>) -> SequentialConfig {
+fn cfg() -> SequentialConfig {
     SequentialConfig {
         ministack_size: 5,
         max_num_compressed: 10,
@@ -60,8 +59,14 @@ fn cfg(ps: Option<PsSelection>) -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
-        ps,
     }
+}
+
+fn run(
+    data: ndarray::ArrayView3<Cf64>,
+    ps: Option<PsSelection>,
+) -> (SequentialOutput, SequentialState) {
+    run_sequential_resumable_with_ps(data, None, &cfg(), ps, &cpu()).unwrap()
 }
 
 const PS: PsSelection = PsSelection {
@@ -80,7 +85,7 @@ fn a_stable_pixel_is_ps_with_unit_coherence_and_speckle_is_not() {
             mask_input_ps,
             ..PS
         };
-        let out = run_sequential(stack(20).view(), &cfg(Some(selection)), &cpu()).unwrap();
+        let (out, _) = run(stack(20).view(), Some(selection));
         let ps = out.ps.as_ref().unwrap();
         assert_eq!(ps.ps[STABLE], 1);
         assert_eq!(ps.ps[BRIGHT_SPECKLE], 0);
@@ -99,13 +104,18 @@ fn a_stable_pixel_is_ps_with_unit_coherence_and_speckle_is_not() {
 #[test]
 fn nrt_update_equals_a_full_rerun_with_ps() {
     let data = stack(23);
-    let config = cfg(Some(PS));
-    let full = run_sequential(data.view(), &config, &cpu()).unwrap();
+    let (full, _) = run(data.view(), Some(PS));
     // Split inside a ministack so the update reruns an open one.
-    let (_, state) =
-        run_sequential_resumable(data.slice(s![..12, .., ..]), &config, &cpu()).unwrap();
-    let (inc, _) =
-        update_sequential(&state, data.slice(s![12.., .., ..]), &config, &cpu()).unwrap();
+    let (_, state) = run(data.slice(s![..12, .., ..]), Some(PS));
+    let (inc, _) = update_sequential_with_ps(
+        &state,
+        data.slice(s![12.., .., ..]),
+        None,
+        &cfg(),
+        Some(PS),
+        &cpu(),
+    )
+    .unwrap();
     assert_eq!(inc.cpx_phase, full.cpx_phase);
     assert_eq!(inc.temporal_coherence, full.temporal_coherence);
     let (a, b) = (inc.ps.unwrap(), full.ps.unwrap());
@@ -117,52 +127,25 @@ fn nrt_update_equals_a_full_rerun_with_ps() {
 #[test]
 fn an_update_refuses_different_ps_options() {
     let data = stack(12);
-    let (_, state) =
-        run_sequential_resumable(data.slice(s![..7, .., ..]), &cfg(Some(PS)), &cpu()).unwrap();
-    let error = update_sequential(&state, data.slice(s![7.., .., ..]), &cfg(None), &cpu())
+    let (_, state) = run(data.slice(s![..7, .., ..]), Some(PS));
+    let tail = data.slice(s![7.., .., ..]);
+    let error = update_sequential_with_ps(&state, tail, None, &cfg(), None, &cpu())
         .err()
         .unwrap();
     assert!(error.contains("ps_options"), "{error}");
 }
 
 #[test]
-fn ps_off_publishes_no_ps_and_ps_changes_only_ps_cells() {
+fn ps_off_is_the_plain_estimator_and_ps_changes_ps_cells() {
     let data = stack(20);
-    let off = run_sequential(data.view(), &cfg(None), &cpu()).unwrap();
-    let on = run_sequential(data.view(), &cfg(Some(PS)), &cpu()).unwrap();
+    let plain = run_sequential(data.view(), &cfg(), &cpu()).unwrap();
+    let (off, _) = run(data.view(), None);
+    let (on, _) = run(data.view(), Some(PS));
     assert!(off.ps.is_none());
+    assert_eq!(off.cpx_phase, plain.cpx_phase);
+    assert_eq!(off.temporal_coherence, plain.temporal_coherence);
     assert_ne!(
         off.temporal_coherence[STABLE],
         on.temporal_coherence[STABLE]
     );
-}
-
-#[test]
-fn covariance_capture_refuses_ps() {
-    let grid = CovarianceOperatorGrid {
-        row_start: 0,
-        col_start: 0,
-        rows: 10,
-        cols: 10,
-        stride_y: 1,
-        stride_x: 1,
-    };
-    let request = SequentialCovarianceCaptureRequest {
-        burst_id: "ps-contract".into(),
-        source_manifest_digest: [1; 32],
-        source_model_version_digest: [2; 32],
-        native_grid: grid,
-        output_grid: grid,
-        owned_output_grid: grid,
-        branch_tolerance: 1e-9,
-    };
-    let result = run_sequential_with_covariance_capture(
-        stack(10).view(),
-        &cfg(Some(PS)),
-        &cpu(),
-        &request,
-        |_| Ok(()),
-    );
-    let message = format!("{:?}", result.err().unwrap());
-    assert!(message.contains("ps_options"), "{message}");
 }

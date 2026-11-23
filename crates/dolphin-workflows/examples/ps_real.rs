@@ -19,7 +19,7 @@ use dolphin_io::{read_cslc_shape, read_cslc_window};
 use dolphin_phaselink::ComputeEngine;
 use dolphin_ps::{calc_ps, AmplitudeStats};
 use dolphin_workflows::{
-    run_sequential, run_sequential_resumable, update_sequential, PsSelection, SequentialConfig,
+    run_sequential_resumable_with_ps, update_sequential_with_ps, PsSelection, SequentialConfig,
 };
 use ndarray::{s, Array3, Axis};
 
@@ -116,18 +116,27 @@ fn nrt_vs_full(stack: &Array3<Cf64>) -> anyhow::Result<()> {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
-        ps: Some(PsSelection {
-            amp_dispersion_threshold: 0.25,
-            mask_input_ps: false,
-        }),
     };
+    let ps = Some(PsSelection {
+        amp_dispersion_threshold: 0.25,
+        mask_input_ps: false,
+    });
     let engine = ComputeEngine::new(ComputeBackend::Cpu);
     let split = 20.min(nslc - 1);
-    let full = run_sequential(stack.view(), &cfg, &engine).map_err(anyhow::Error::msg)?;
-    let (_, state) = run_sequential_resumable(stack.slice(s![..split, .., ..]), &cfg, &engine)
+    let (full, _) = run_sequential_resumable_with_ps(stack.view(), None, &cfg, ps, &engine)
         .map_err(anyhow::Error::msg)?;
-    let (inc, _) = update_sequential(&state, stack.slice(s![split.., .., ..]), &cfg, &engine)
-        .map_err(anyhow::Error::msg)?;
+    let (_, state) =
+        run_sequential_resumable_with_ps(stack.slice(s![..split, .., ..]), None, &cfg, ps, &engine)
+            .map_err(anyhow::Error::msg)?;
+    let (inc, _) = update_sequential_with_ps(
+        &state,
+        stack.slice(s![split.., .., ..]),
+        None,
+        &cfg,
+        ps,
+        &engine,
+    )
+    .map_err(anyhow::Error::msg)?;
     let phase = inc
         .cpx_phase
         .iter()

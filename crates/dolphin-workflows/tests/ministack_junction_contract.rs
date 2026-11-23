@@ -89,7 +89,6 @@ fn config() -> SequentialConfig {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
-        ps: None,
     }
 }
 

@@ -46,7 +46,6 @@ fn main() -> Result<()> {
         compute_average_coherence: false,
         shp_method: ShpMethod::Rect,
         shp_alpha: 0.001,
-        ps: None,
     };
     let out = run_sequential(stack.view(), &cfg, &ComputeEngine::new(ComputeBackend::Cpu))
         .map_err(anyhow::Error::msg)?;

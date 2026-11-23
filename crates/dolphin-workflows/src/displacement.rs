@@ -75,12 +75,12 @@ use crate::provenance::{
     ReferenceSelectionProvenance, INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
-    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
-    run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
-    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
-    run_sequential_with_covariance_capture_and_source_factors, update_sequential,
-    update_sequential_masked, PsSelection, SequentialConfig, SequentialCovarianceCaptureRequest,
-    SequentialOutput, SequentialState,
+    run_sequential_masked_with_covariance_capture,
+    run_sequential_masked_with_covariance_capture_and_source_factors,
+    run_sequential_resumable_with_ps, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, update_sequential_with_ps,
+    PsSelection, SequentialConfig, SequentialCovarianceCaptureRequest, SequentialOutput,
+    SequentialState,
 };
 use crate::sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
@@ -4437,15 +4437,13 @@ fn link_one_burst_resumable(
         .as_ref()
         .map(|mask| mask.reader.read(mask.reader.full_block()))
         .transpose()?;
-    let (out, state) = match native_validity.as_ref() {
-        Some(valid) => run_sequential_resumable_masked(
-            stack.view(),
-            valid.view(),
-            &sequential_config(cfg),
-            engine,
-        ),
-        None => run_sequential_resumable(stack.view(), &sequential_config(cfg), engine),
-    }
+    let (out, state) = run_sequential_resumable_with_ps(
+        stack.view(),
+        native_validity.as_ref().map(Array2::view),
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
     .map_err(anyhow::Error::msg)?;
     let mut link = burst_link(
         cfg,
@@ -4801,16 +4799,14 @@ fn update_one_burst(
         .as_ref()
         .map(|mask| mask.reader.read(mask.reader.full_block()))
         .transpose()?;
-    let (out, seq) = match native_validity.as_ref() {
-        Some(valid) => update_sequential_masked(
-            &prev.seq,
-            new_stack.view(),
-            valid.view(),
-            &sequential_config(cfg),
-            engine,
-        ),
-        None => update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine),
-    }
+    let (out, seq) = update_sequential_with_ps(
+        &prev.seq,
+        new_stack.view(),
+        native_validity.as_ref().map(Array2::view),
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
     .map_err(anyhow::Error::msg)?;
     let days = acquisition_days(cfg, &files)?;
     let mut link = burst_link(
@@ -5277,10 +5273,14 @@ fn phase_link(
     engine: &ComputeEngine,
     valid_mask: Option<ArrayView2<bool>>,
 ) -> Result<SequentialOutput> {
-    match valid_mask {
-        Some(mask) => run_sequential_masked(stack, mask, &sequential_config(cfg), engine),
-        None => run_sequential(stack, &sequential_config(cfg), engine),
-    }
+    run_sequential_resumable_with_ps(
+        stack,
+        valid_mask,
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
+    .map(|(output, _)| output)
     .map_err(anyhow::Error::msg)
 }
 
@@ -5315,11 +5315,15 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         compute_average_coherence: cfg.phase_linking.calc_average_coh,
         shp_method: cfg.phase_linking.shp_method,
         shp_alpha: cfg.phase_linking.shp_alpha,
-        ps: cfg.ps_options.enabled.then_some(PsSelection {
-            amp_dispersion_threshold: cfg.ps_options.amp_dispersion_threshold,
-            mask_input_ps: cfg.phase_linking.mask_input_ps,
-        }),
     }
+}
+
+/// `ps_options` as the sequential estimator's PS selection; `None` when off.
+fn ps_selection(cfg: &DisplacementWorkflow) -> Option<PsSelection> {
+    cfg.ps_options.enabled.then_some(PsSelection {
+        amp_dispersion_threshold: cfg.ps_options.amp_dispersion_threshold,
+        mask_input_ps: cfg.phase_linking.mask_input_ps,
+    })
 }
 
 /// Refuse, before unwrapping, a pair graph the SBAS inversion cannot solve:
