@@ -76,6 +76,26 @@ impl SincKernel {
         }
         Some(sum)
     }
+
+    /// Interpolate an 8 × 8 chip whose tap `[SINC_BEFORE][SINC_BEFORE]` is
+    /// the integer sample, at fractional offsets `frac_row`, `frac_col` in
+    /// `[0, 1)` from it. Same weights as [`Self::interpolate`].
+    pub fn interpolate_chip(
+        &self,
+        chip: &[[Complex32; SINC_TAPS]; SINC_TAPS],
+        frac_row: f64,
+        frac_col: f64,
+    ) -> Complex32 {
+        let wr = self.weights(frac_row);
+        let wc = self.weights(frac_col);
+        chip.iter()
+            .zip(wr)
+            .map(|(line, w_row)| {
+                let along: Complex32 = line.iter().zip(wc).map(|(v, w)| *v * *w).sum();
+                along * *w_row
+            })
+            .sum()
+    }
 }
 
 fn sinc(x: f64) -> f64 {

@@ -865,7 +865,9 @@ impl CslcCovarianceSourceResolver<'_> {
                 InputType::OperaCslc | InputType::L1Cslc => {
                     read_cslc_window(&member.path, &self.subdataset, window)
                 }
-                InputType::NisarGslc => read_nisar_window(&member.path, &self.subdataset, window),
+                InputType::NisarGslc | InputType::L1Nisar => {
+                    read_nisar_window(&member.path, &self.subdataset, window)
+                }
             }
             .map_err(|_| {
                 Self::provider_error(
@@ -1181,6 +1183,7 @@ fn input_type_tag(input_type: InputType) -> &'static [u8] {
         InputType::OperaCslc => b"opera_cslc",
         InputType::L1Cslc => b"l1_cslc",
         InputType::NisarGslc => b"nisar_gslc",
+        InputType::L1Nisar => b"l1_nisar",
     }
 }
 
@@ -1255,7 +1258,7 @@ fn member_content_digest(
         };
         let values = match input_type {
             InputType::OperaCslc | InputType::L1Cslc => read_cslc_window(path, subdataset, block),
-            InputType::NisarGslc => read_nisar_window(path, subdataset, block),
+            InputType::NisarGslc | InputType::L1Nisar => read_nisar_window(path, subdataset, block),
         }?;
         for value in values {
             digest.update(value.re.to_bits().to_le_bytes());

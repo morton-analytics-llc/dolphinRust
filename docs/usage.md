@@ -61,8 +61,20 @@ all handled by the NISAR reader:
 - **Granule names** (`NISAR_L2_PR_GSLC_..._20240601T120000_...h5`) parse with the default
   `cslc_date_fmt: "%Y%m%d"`.
 
-Select it with `input_options.input_type: nisar_gslc` (default `opera_cslc`). This is a
-forward divergence from dolphin v0.35.0, which has no product-type field.
+**Production NISAR input is built from raw L1 RSLC** (`input_type: l1_nisar`). `dolphin nisar`
+range-reads each NISAR L1 RSLC on ASF (no 25 GB download), applies the NISAR TEC ionosphere and
+solid-earth tide timing corrections, and geocodes it onto JPL's GSLC lattice in the same NISAR
+GSLC layout, plus `STATIC-NISAR_<frame>.h5` (LOS, layover/shadow) and `DEM-NISAR_<frame>.tif`
+(the ellipsoidal DEM for `nisar_ellipsoidal_dem_file`):
+
+```sh
+dolphin nisar --track 5 --direction A --frame 20 --start 2026-08-25 --end 2026-10-12 \
+  --epsg 32611 --bounds 660000,3996760,670240,4007000 --cache cache --out out --env-file .env
+```
+
+Under `l1_nisar`, JPL GSLC files are refused. JPL's GSLC is read only with an explicit
+`input_options.input_type: nisar_gslc`, for backtests. These are forward divergences from
+dolphin v0.35.0, which has no product-type field.
 
 > **Atmospheric correction is NOT applied (v1.3.0).** This is a geometrically-correct but
 > **atmospherically-uncorrected** L-band product. Ionospheric delay is ~16× the C-band

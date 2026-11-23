@@ -708,6 +708,7 @@ dependencies = [
 name = "dolphin-l1"
 version = "1.6.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dolphin-core",
  "dolphin-corrections",

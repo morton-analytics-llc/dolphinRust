@@ -303,9 +303,11 @@ struct PairGrid {
 /// a side band.
 pub fn run_pairs(cfg: &PairsConfig) -> Result<PairsIndex> {
     validate_config(cfg)?;
-    if cfg.input_type == InputType::L1Cslc {
-        for acquisition in &cfg.acquisitions {
-            dolphin_io::require_not_opera(&acquisition.path)?;
+    for acquisition in &cfg.acquisitions {
+        match cfg.input_type {
+            InputType::L1Cslc => dolphin_io::require_not_opera(&acquisition.path)?,
+            InputType::L1Nisar => dolphin_io::require_raw_nisar(&acquisition.path)?,
+            InputType::OperaCslc | InputType::NisarGslc => {}
         }
     }
     let planned = plan_pairs(&cfg.acquisitions, &cfg.pair_plan)?;
@@ -313,14 +315,16 @@ pub fn run_pairs(cfg: &PairsConfig) -> Result<PairsIndex> {
         (PairsMode::Coherence, InputType::OperaCslc | InputType::L1Cslc) => {
             run_coherence(cfg, &planned)?
         }
-        (PairsMode::Coherence, InputType::NisarGslc) => bail!(
-            "dolphin pairs coherence mode does not support input_type nisar_gslc; \
-             only opera_cslc is implemented"
+        (PairsMode::Coherence, InputType::NisarGslc | InputType::L1Nisar) => bail!(
+            "dolphin pairs coherence mode does not support NISAR input; \
+             only Sentinel-1 CSLC is implemented"
         ),
-        (PairsMode::Interferogram, InputType::NisarGslc) => run_interferogram(cfg, &planned)?,
+        (PairsMode::Interferogram, InputType::NisarGslc | InputType::L1Nisar) => {
+            run_interferogram(cfg, &planned)?
+        }
         (PairsMode::Interferogram, InputType::OperaCslc | InputType::L1Cslc) => bail!(
             "dolphin pairs interferogram mode needs two range bands for split-spectrum \
-             ionosphere; it supports input_type nisar_gslc only"
+             ionosphere; it supports NISAR input (l1_nisar, nisar_gslc) only"
         ),
     };
     let index_path = cfg.work_directory.join(PAIRS_INDEX_FILENAME);

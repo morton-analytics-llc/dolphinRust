@@ -1267,8 +1267,10 @@ impl Default for UnwrapOptions {
 /// Input-product reader selection. **Forward divergence:** dolphin v0.35.0 has
 /// no product-type field on `InputOptions` (it dispatches by workflow entry
 /// point), so this field is dolphinRust-only. It defaults to [`Self::L1Cslc`],
-/// the in-house CSLC built from raw Sentinel-1 bursts; OPERA products are
-/// accepted only with an explicit `input_type: opera_cslc` (backtests).
+/// the in-house CSLC built from raw Sentinel-1 bursts. NISAR production
+/// input is [`Self::L1Nisar`], built from raw NISAR L1 RSLC. OPERA CSLC and
+/// JPL NISAR GSLC products are accepted only with an explicit
+/// `input_type: opera_cslc` / `nisar_gslc` (backtests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InputType {
@@ -1280,10 +1282,15 @@ pub enum InputType {
     L1Cslc,
     /// OPERA S1 CSLC: complex-f32 `(r, i)` HDF5 grids. Backtests only.
     OperaCslc,
-    /// NISAR L-band geocoded SLC: complex-`f32` `{r, i}` compound grids in the
+    /// JPL's NISAR L2 GSLC: complex-`f32` `{r, i}` compound grids in the
     /// NISAR product group layout (camelCase coordinates + `epsg_code`
     /// attribute). Differs from OPERA only in the geocoding-grid metadata.
+    /// Backtests only.
     NisarGslc,
+    /// dolphinRust's own geocoded NISAR stack from raw NISAR L1 RSLC
+    /// (`dolphin nisar`, crate `dolphin-l1`), written in the NISAR GSLC HDF5
+    /// layout. The NISAR production input: JPL GSLC files are rejected.
+    L1Nisar,
 }
 
 impl InputType {
@@ -1291,6 +1298,12 @@ impl InputType {
     #[must_use]
     pub fn is_s1_cslc(self) -> bool {
         matches!(self, Self::L1Cslc | Self::OperaCslc)
+    }
+
+    /// `true` for the NISAR GSLC HDF5 layout (in-house or JPL).
+    #[must_use]
+    pub fn is_nisar(self) -> bool {
+        matches!(self, Self::L1Nisar | Self::NisarGslc)
     }
 }
 

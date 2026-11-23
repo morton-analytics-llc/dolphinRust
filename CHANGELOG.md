@@ -7,6 +7,17 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Raw NISAR front end** (issue #230, NISAR half). `dolphin nisar` builds the geocoded NISAR
+  stack from raw L1 RSLC (`NISAR_L1_RSLC_PROVISIONAL_V1`) in Rust: windowed HTTP range reads of
+  the RSLC through ASF's signed URL, native-Doppler baseband sinc interpolation (937–968 Hz
+  centroid on a zero-Doppler grid), left-looking geometry, NISAR TEC ionosphere (range and
+  azimuth) and solid-earth tide timing corrections, JPL's 40 m GSLC lattice, written in the NISAR
+  GSLC layout with LOS cube, mask, static layers and grid DEM. New `input_type: l1_nisar`
+  refuses JPL GSLC files; `nisar_gslc` is now for backtests only. Against JPL GSLC on Las Vegas
+  (track 5 A frame 20, 5 dates, 2048×2048 px): per-date |γ| ≥ 0.99998 (A) / 0.99992 (B), zero
+  offset, interferogram phase difference 0.016–0.021 rad (A) / 0.002–0.004 rad (B). Receipts in
+  `validation/results/issue230_raw_front_end/*nisar*`. `dolphin-io::read_nisar_rslc`, which
+  read GSLC, is renamed `read_nisar_grid`.
 - **Houston before/after for the integer loop-closure correction** (issue #142,
   `validation/issue142_houston_loop_closure.py`, receipt in
   `validation/results/issue142_houston_loop_closure/`). On the cropped Houston T034-071054-IW3

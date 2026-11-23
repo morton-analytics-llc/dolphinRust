@@ -94,6 +94,30 @@ pub fn geo2rdr(target: Vec3, orbit: &Orbit, t_guess: f64) -> Result<RadarPoint> 
     )))
 }
 
+/// Side of the ground track the radar looks to (Sentinel-1: right; NISAR:
+/// left).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookSide {
+    /// Right of the velocity vector.
+    Right,
+    /// Left of the velocity vector.
+    Left,
+}
+
+impl LookSide {
+    /// Parse a product's `Left` / `Right` (case-insensitive).
+    ///
+    /// # Errors
+    /// Any other value.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            other => Err(L1Error::Product(format!("look direction {other:?}"))),
+        }
+    }
+}
+
 /// Iterations allowed in `rdr2geo`.
 const RDR2GEO_ITERATIONS: usize = 50;
 /// `rdr2geo` convergence threshold on the height mismatch (m).
@@ -127,25 +151,30 @@ fn unit(a: Vec3) -> Vec3 {
     [a[0] / n, a[1] / n, a[2] / n]
 }
 
-/// The right-looking zero-Doppler point at slant range `slant_range` from
-/// the platform at `azimuth_time` (seconds since the orbit epoch) that lies on
-/// the surface `height(lon_deg, lat_deg)`.
+/// The zero-Doppler point on the `look` side at slant range `slant_range`
+/// from the platform at `azimuth_time` (seconds since the orbit epoch) that
+/// lies on the surface `height(lon_deg, lat_deg)`.
 ///
 /// Every candidate `P + R (cos θ d̂ + sin θ r̂)`, with `d̂` the down direction
-/// projected into the plane normal to the velocity and `r̂ = d̂ × v̂`, already
+/// projected into the plane normal to the velocity and `r̂ = d̂ × v̂` (right
+/// looking) or `v̂ × d̂` (left looking), already
 /// satisfies both range and zero Doppler, so the solve is one-dimensional in
 /// the look angle θ: a secant iteration on `h_ellipsoid(θ) − h_dem(θ)`.
 pub fn rdr2geo(
     azimuth_time: f64,
     slant_range: f64,
     orbit: &Orbit,
+    look: LookSide,
     height: impl Fn(f64, f64) -> Result<f64>,
 ) -> Result<GroundPoint> {
     let state = orbit.state(azimuth_time)?;
     let v = unit(state.velocity);
     let up = unit(state.position);
     let down = unit(sub([0.0; 3], sub(up, scale(v, dot(up, v)))));
-    let right = cross(down, v);
+    let right = match look {
+        LookSide::Right => cross(down, v),
+        LookSide::Left => cross(v, down),
+    };
     let point =
         |theta: f64, surface: &dyn Fn(f64, f64) -> Result<f64>| -> Result<(GroundPoint, f64)> {
             let (sin_t, cos_t) = theta.sin_cos();
@@ -256,8 +285,13 @@ mod tests {
             orbit_type: "test".into(),
         };
         let surface = |lon: f64, lat: f64| Ok(120.0 + 30.0 * (lon * 7.0).sin() * (lat * 5.0).cos());
-        for &(t, range) in &[(150.0, 8.5e5), (200.0, 9.3e5), (250.0, 7.9e5)] {
-            let ground = rdr2geo(t, range, &orbit, surface).unwrap();
+        let cases = [(150.0, 8.5e5), (200.0, 9.3e5), (250.0, 7.9e5)];
+        for (&(t, range), look) in
+            cases
+                .iter()
+                .zip([LookSide::Right, LookSide::Left, LookSide::Left])
+        {
+            let ground = rdr2geo(t, range, &orbit, look, surface).unwrap();
             let expected = surface(ground.lon.to_degrees(), ground.lat.to_degrees()).unwrap();
             assert!((ground.height - expected).abs() < 1e-4);
             let back = geo2rdr(ground.ecef, &orbit, t + 1.0).unwrap();
@@ -267,6 +301,10 @@ mod tests {
                 back.azimuth_time - t
             );
             assert!((back.slant_range - range).abs() < 1e-5);
+            let state = orbit.state(t).unwrap();
+            let right = cross(scale(state.position, -1.0), state.velocity);
+            let side = dot(sub(ground.ecef, state.position), right);
+            assert_eq!(side > 0.0, look == LookSide::Right, "{look:?}");
         }
     }
 }

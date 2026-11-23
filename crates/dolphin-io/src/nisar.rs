@@ -1,4 +1,7 @@
-//! NISAR / L-band geocoded-SLC reading from HDF5.
+//! NISAR / L-band geocoded-SLC reading from HDF5: JPL's L2 GSLC (backtests,
+//! `input_type: nisar_gslc`) and the in-house stack built from raw L1 RSLC
+//! (`input_type: l1_nisar`, same layout). The raw RSLC itself is read by
+//! `dolphin-l1::rslc`.
 //!
 //! **Verified against a real NISAR GSLC granule** (`NISAR_L2_GSLC_BETA_V1`, see
 //! `VALIDATION.md`). NISAR products differ from OPERA S1 CSLC in exactly one way
@@ -8,7 +11,7 @@
 //! - **Complex samples are an `{r: f32, i: f32}` compound** (complex64), the same
 //!   h5py-compatible `(r, i)` layout `read_cslc` already reads as [`Cf32`]. The
 //!   prompt's "complex-int16" assumption did **not** hold on real data; real NISAR
-//!   GSLC is float32, so [`read_nisar_rslc`] reads `Cf32` directly.
+//!   GSLC is float32, so [`read_nisar_grid`] reads `Cf32` directly.
 //! - **The geocoding grid lives in a NISAR product group** (e.g.
 //!   `/science/LSAR/GSLC/grids/frequencyA/`) with camelCase coordinate datasets
 //!   (`xCoordinates` F64, `yCoordinates` F64) and the EPSG carried as an
@@ -42,14 +45,14 @@ use crate::geo::GeoInfo;
 /// # Errors
 /// Returns `Err` if the HDF5 read fails or the dataset is not the expected
 /// complex-float32 compound type.
-pub fn read_nisar_rslc(path: &Path, dataset: &str) -> Result<Array2<Cf32>> {
+pub fn read_nisar_grid(path: &Path, dataset: &str) -> Result<Array2<Cf32>> {
     let file = hdf5::File::open(path)?;
     Ok(file.dataset(dataset)?.read_2d::<Cf32>()?)
 }
 
 /// Read a rectangular `block` window of a NISAR complex grid via HDF5 hyperslab
 /// selection — the NISAR mirror of [`crate::read_cslc_window`], bit-identical to
-/// [`read_nisar_rslc`] sliced to the same rectangle.
+/// [`read_nisar_grid`] sliced to the same rectangle.
 ///
 /// # Errors
 /// Returns `Err` if the HDF5 read fails or the dataset is not the expected
@@ -70,7 +73,7 @@ pub fn read_nisar_window(path: &Path, dataset: &str, block: BlockIndices) -> Res
 pub fn read_nisar_stack(files: &[PathBuf], dataset: &str) -> Result<Array3<Cf32>> {
     let layers = files
         .iter()
-        .map(|path| read_nisar_rslc(path, dataset))
+        .map(|path| read_nisar_grid(path, dataset))
         .collect::<Result<Vec<_>>>()?;
     let views: Vec<_> = layers.iter().map(Array2::view).collect();
     ndarray::stack(Axis(0), &views).map_err(|e| IoError::Shape(e.to_string()))
@@ -187,7 +190,7 @@ mod tests {
         write_nisar_fixture(&path, "HH", cpx.view(), &x, &y, 32610).unwrap();
 
         let dataset = format!("{FREQUENCY_A_GROUP}/HH");
-        let grid = read_nisar_rslc(&path, &dataset).unwrap();
+        let grid = read_nisar_grid(&path, &dataset).unwrap();
         assert_eq!(grid.dim(), (2, 3));
         assert_eq!(grid[(0, 0)], Cf32::new(-2.0, 10.0));
         assert_eq!(grid[(1, 2)], Cf32::new(3.0, 15.0));
@@ -259,8 +262,8 @@ mod tests {
 
         let main_ds = format!("{FREQUENCY_A_GROUP}/HH");
         let side_ds = format!("{FREQUENCY_B_GROUP}/HH");
-        assert_eq!(read_nisar_rslc(&path, &main_ds).unwrap(), main_cpx);
-        assert_eq!(read_nisar_rslc(&path, &side_ds).unwrap(), side_cpx);
+        assert_eq!(read_nisar_grid(&path, &main_ds).unwrap(), main_cpx);
+        assert_eq!(read_nisar_grid(&path, &side_ds).unwrap(), side_cpx);
 
         let side_geo = read_nisar_geotransform(&path, &side_ds).unwrap();
         assert_eq!(side_geo.epsg, 32610);

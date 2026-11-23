@@ -1,0 +1,33 @@
+{
+ "frame": "T005-A-F020 (Las Vegas window 660000-670240 E, 3996760-4007000 N, EPSG 32611)",
+ "dates": [
+  "2026-08-25",
+  "2026-09-06",
+  "2026-09-18",
+  "2026-09-30",
+  "2026-10-12"
+ ],
+ "steps": [
+  "dolphin nisar (raw L1 RSLC range reads + NISAR TEC -> CSLC-NISAR + STATIC + DEM)",
+  "dolphin run (displacement, input_type l1_nisar)"
+ ],
+ "file_opens": 731,
+ "file_opens_matching_gslc_case_insensitive": 0,
+ "cmr_collections_searched": [
+  "C2853145197-ASF",
+  "C3622219145-ASF"
+ ],
+ "gdal_range_requests": 181,
+ "gdal_range_requests_to_rslc_objects": 176,
+ "network_hosts": {
+  "cmr.earthdata.nasa.gov": 6,
+  "nisar.asf.earthdatacloud.nasa.gov": 10,
+  "copernicus-dem-30m.s3.amazonaws.com": 4,
+  "d1mv8zhcvry6x4.cloudfront.net": 176,
+  "cdn.proj.org": 2
+ },
+ "network_urls_matching_gslc": 0,
+ "displacement_completed": true,
+ "jpl_gslc_under_l1_nisar": "refused: is not built from raw NISAR RSLC (processingCenter)",
+ "method": "validation/issue230_access_log.c via DYLD_INSERT_LIBRARIES on the dolphin binary; HTTP from the CLI info log (CMR, ASF, DEM) and GDAL CPL_DEBUG VSICURL lines (range reads)"
+}
