@@ -155,9 +155,13 @@ pub struct BurstRecord {
 }
 
 impl BurstRecord {
-    /// Mission, e.g. `S1A`, from the burst name.
+    /// Mission, e.g. `S1C`, from the parent SAFE name. The burst `Name` is not
+    /// used: CDSE writes it as `S1A-SLC-...` for S1C bursts too (#238).
     pub fn mission(&self) -> &str {
-        self.name.split('-').next().unwrap_or_default()
+        self.parent_product_name
+            .split('_')
+            .next()
+            .unwrap_or_default()
     }
 }
 
@@ -824,6 +828,28 @@ mod tests {
             "B"
         );
         assert_eq!(pick_newest(vec![b, a]).parent_product_name, "B");
+    }
+
+    /// CDSE names S1C bursts `S1A-SLC-...`; the orbit mission comes from the
+    /// parent SAFE (observed over Malta, MT, track 78, 2026-11-14).
+    #[test]
+    fn mission_comes_from_the_parent_product_not_the_burst_name() {
+        let record = BurstRecord {
+            id: "x".into(),
+            name: "S1A-SLC-20261114T005600-165677-IW1-VV-000000".into(),
+            parent_product_name:
+                "S1C_IW_SLC__1SDV_20261114T005545_20261114T005612_005123_00A1B2_C3D4.SAFE".into(),
+            parent_product_id: "p".into(),
+            parent_origin: None,
+            burst_id: 165_677,
+            relative_orbit_number: 78,
+            swath_identifier: "IW1".into(),
+            polarisation_channels: "VV".into(),
+            azimuth_time: "2026-11-14T00:56:00.317367Z".parse().unwrap(),
+            byte_offset: 0,
+            orbit_direction: "ASCENDING".into(),
+        };
+        assert_eq!(record.mission(), "S1C");
     }
 
     #[test]
