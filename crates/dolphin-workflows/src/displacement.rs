@@ -386,6 +386,17 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     run_displacement_with_output_policy(cfg, DisplacementOutputPolicy::Full)
 }
 
+/// Under `input_type: l1_cslc` (the default), refuse any OPERA product in
+/// the stack: production input is CSLC built from raw Sentinel-1 bursts.
+fn require_raw_inputs(cfg: &DisplacementWorkflow) -> Result<()> {
+    if cfg.input_options.input_type == InputType::L1Cslc {
+        for path in &cfg.cslc_file_list {
+            dolphin_io::require_not_opera(path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Runtime-only serialization policy for a displacement run.
 ///
 /// This is deliberately separate from scientific configuration: it changes only
@@ -407,16 +418,12 @@ pub fn run_displacement_with_output_policy(
     output_policy: DisplacementOutputPolicy,
 ) -> Result<DisplacementOutput> {
     validate_config(cfg)?;
-    if cfg.input_options.input_type == InputType::L1Cslc {
-        for path in &cfg.cslc_file_list {
-            dolphin_io::require_not_opera(path)?;
-        }
-    }
     anyhow::ensure!(
         !cfg.phase_linking.write_covariance_operator
             || output_policy == DisplacementOutputPolicy::Full,
         "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
     );
+    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
@@ -4639,6 +4646,7 @@ pub fn run_displacement_resumable(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
     );
+    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
@@ -4726,6 +4734,7 @@ pub fn update_displacement(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is unsupported for resumable updates"
     );
+    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(

@@ -1779,10 +1779,10 @@ impl DisplacementWorkflow {
         }
         if self.timeseries_options.estimate_dem_error
             && (self.input_options.wavelength.is_none()
-                || self.input_options.input_type != InputType::OperaCslc)
+                || !self.input_options.input_type.is_s1_cslc())
         {
             return Err(CoreError::InvalidConfig(
-                "timeseries_options.estimate_dem_error requires OPERA CSLC inputs (for orbits) and input_options.wavelength".into(),
+                "timeseries_options.estimate_dem_error requires Sentinel-1 CSLC inputs (l1_cslc or opera_cslc, for orbits) and input_options.wavelength".into(),
             ));
         }
         if let Some(fraction) = self.correction_options.max_outside_static_fraction {
