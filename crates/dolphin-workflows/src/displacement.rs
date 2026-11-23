@@ -4646,7 +4646,6 @@ pub fn run_displacement_resumable(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is supported only by full batch displacement runs"
     );
-    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
@@ -4659,6 +4658,7 @@ pub fn run_displacement_resumable(
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    require_raw_inputs(cfg)?;
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
@@ -4734,7 +4734,6 @@ pub fn update_displacement(
         !cfg.phase_linking.write_covariance_operator,
         "phase_linking.write_covariance_operator is unsupported for resumable updates"
     );
-    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
@@ -4747,6 +4746,7 @@ pub fn update_displacement(
         return run_displacement_resumable(cfg);
     }
     let prepared_masks = preflight_update_masks(state, cfg, &groups, &masks)?;
+    require_raw_inputs(cfg)?;
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
