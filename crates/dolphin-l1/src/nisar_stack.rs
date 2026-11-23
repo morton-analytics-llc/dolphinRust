@@ -30,7 +30,7 @@ use crate::nisar_h5::{write_nisar, NisarProvenance};
 use crate::nisar_tec::{tec_corrections, TecCorrections};
 use crate::rslc::{AsfClient, GranuleRecord, NisarFrame, Rslc};
 use crate::stack::StackOutput;
-use crate::static_layers::{static_layers, write_static, RadarGeometry};
+use crate::static_layers::{static_layers, write_static, RadarGeometry, StaticIdentity};
 
 /// Pixel-edge lattice of the NISAR GSLC grids (m).
 pub const LATTICE: f64 = 40.0;
@@ -228,7 +228,17 @@ fn write_static_once(
         dem,
         &geocoded.grid,
     )?;
-    write_static(&path, &layers, &label)?;
+    write_static(
+        &path,
+        &layers,
+        &StaticIdentity {
+            burst_id: &label,
+            pass_direction: &rslc.pass_direction,
+            look: rslc.look_side,
+            zero_doppler_start: rslc.sensing_start(),
+            zero_doppler_end: rslc.sensing_stop(),
+        },
+    )?;
     tracing::info!(file = %path.display(), "wrote static layers");
     Ok(())
 }

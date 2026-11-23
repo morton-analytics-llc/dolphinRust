@@ -19,6 +19,7 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
+use crate::cslc_h5::{put_str, time_string};
 use crate::dem::Dem;
 use crate::error::{L1Error, Result};
 use crate::geometry::{
@@ -313,8 +314,32 @@ fn flag_profile(ranges: &[f64], looks: &[f64]) -> Vec<u8> {
     flags
 }
 
-/// Write `layers` in the CSLC-S1-STATIC layout.
-pub fn write_static(path: &std::path::Path, layers: &StaticLayers, burst_id: &str) -> Result<()> {
+/// The acquisition a STATIC file was derived from: written to `/identification` so
+/// readers can check pass, look side and timing against the CSLC stack (the same
+/// fields the CSLC writer records).
+#[derive(Debug, Clone, Copy)]
+pub struct StaticIdentity<'a> {
+    /// Burst id (S1) or frame label (NISAR).
+    pub burst_id: &'a str,
+    /// `Ascending` / `Descending`.
+    pub pass_direction: &'a str,
+    /// Radar look side.
+    pub look: LookSide,
+    /// Zero-Doppler time of the first line.
+    pub zero_doppler_start: chrono::DateTime<chrono::Utc>,
+    /// Zero-Doppler time of the last line.
+    pub zero_doppler_end: chrono::DateTime<chrono::Utc>,
+}
+
+/// Write the static layers in the OPERA CSLC-S1-STATIC layout.
+///
+/// # Errors
+/// HDF5 write failures.
+pub fn write_static(
+    path: &std::path::Path,
+    layers: &StaticLayers,
+    identity: &StaticIdentity<'_>,
+) -> Result<()> {
     let file = hdf5::File::create(path)?;
     let data = file.create_group("data")?;
     let (rows, cols) = layers.los_east.dim();
@@ -345,18 +370,90 @@ pub fn write_static(path: &std::path::Path, layers: &StaticLayers, burst_id: &st
         .create("projection")?
         .write_scalar(&i32::try_from(layers.grid.epsg).map_err(crate::error::product)?)?;
     let ident = file.create_group("identification")?;
-    let id = hdf5::types::FixedAscii::<64>::from_ascii(burst_id.as_bytes())
+    let id = hdf5::types::FixedAscii::<64>::from_ascii(identity.burst_id.as_bytes())
         .map_err(crate::error::product)?;
     ident
         .new_dataset::<hdf5::types::FixedAscii<64>>()
         .create("burst_id")?
         .write_scalar(&id)?;
+    put_str(&ident, "orbit_pass_direction", identity.pass_direction)?;
+    put_str(
+        &ident,
+        "look_direction",
+        match identity.look {
+            LookSide::Right => "Right",
+            LookSide::Left => "Left",
+        },
+    )?;
+    put_str(
+        &ident,
+        "zero_doppler_start_time",
+        &time_string(identity.zero_doppler_start),
+    )?;
+    put_str(
+        &ident,
+        "zero_doppler_end_time",
+        &time_string(identity.zero_doppler_end),
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STATIC files carry the identification fields provenance readers need (#252).
+    #[test]
+    fn static_files_record_pass_look_and_timing() {
+        let grid = GeoGrid {
+            epsg: 32613,
+            x0: 2.5,
+            y0: -5.0,
+            dx: 5.0,
+            dy: -10.0,
+            cols: 3,
+            rows: 2,
+        };
+        let layers = StaticLayers {
+            grid,
+            los_east: Array2::from_elem((2, 3), 0.6),
+            los_north: Array2::from_elem((2, 3), -0.1),
+            layover_shadow_mask: Array2::zeros((2, 3)),
+        };
+        let dir = std::env::temp_dir().join(format!("static-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("STATIC-S1_T078-165677-IW1_20260705.h5");
+        let start: chrono::DateTime<chrono::Utc> = "2026-07-05T00:55:57.337719Z".parse().unwrap();
+        write_static(
+            &path,
+            &layers,
+            &StaticIdentity {
+                burst_id: "t078_165677_iw1",
+                pass_direction: "Ascending",
+                look: LookSide::Right,
+                zero_doppler_start: start,
+                zero_doppler_end: start + chrono::Duration::seconds(3),
+            },
+        )
+        .unwrap();
+        let file = hdf5::File::open(&path).unwrap();
+        for (name, expected) in [
+            ("orbit_pass_direction", "Ascending"),
+            ("look_direction", "Right"),
+        ] {
+            let value = file
+                .dataset(&format!("identification/{name}"))
+                .unwrap()
+                .read_scalar::<hdf5::types::FixedAscii<64>>()
+                .unwrap();
+            assert_eq!(value.as_str(), expected);
+        }
+        assert!(file
+            .dataset("identification/zero_doppler_start_time")
+            .is_ok());
+        assert!(file.dataset("identification/zero_doppler_end_time").is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Outside the DEM and in a DEM hole the profile uses 0 m instead of failing (#240).
     #[test]

@@ -33,7 +33,7 @@ use crate::gim::{read_gim, GimClient};
 use crate::grid::GeoGrid;
 use crate::orbit::Orbit;
 use crate::safe::S1Burst;
-use crate::static_layers::{static_layers, write_static, RadarGeometry};
+use crate::static_layers::{static_layers, write_static, RadarGeometry, StaticIdentity};
 
 /// Orbit state vectors kept either side of the burst.
 const ORBIT_MARGIN_SECONDS: i64 = 60;
@@ -294,7 +294,18 @@ fn write_static_once(
         dem,
         &request.grid,
     )?;
-    write_static(&path, &layers, &id.opera())?;
+    let burst_id = id.opera();
+    write_static(
+        &path,
+        &layers,
+        &StaticIdentity {
+            burst_id: &burst_id,
+            pass_direction: &reference.burst.pass_direction,
+            look: crate::geometry::LookSide::Right,
+            zero_doppler_start: reference.burst.sensing_start,
+            zero_doppler_end: reference.burst.sensing_stop(),
+        },
+    )?;
     tracing::info!(file = %path.display(), "wrote static layers");
     Ok(path)
 }
