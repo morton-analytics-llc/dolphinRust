@@ -1,0 +1,33 @@
+[package]
+name = "dolphin-l1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Level-1 SAR front end for dolphinRust: Sentinel-1 IW SLC bursts and NISAR L1 RSLC to geocoded CSLC stacks."
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+dolphin-core.workspace = true
+dolphin-corrections.workspace = true
+ndarray = { workspace = true, features = ["rayon"] }
+num-complex.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+flate2 = "1"
+gdal = "0.19"
+gdal-sys = "0.12"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["complex"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "form", "query", "rustls"] }
+roxmltree = "0.21"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

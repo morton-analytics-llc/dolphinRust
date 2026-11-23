@@ -386,6 +386,17 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
     run_displacement_with_output_policy(cfg, DisplacementOutputPolicy::Full)
 }
 
+/// Under `input_type: l1_cslc` (the default), refuse any OPERA product in
+/// the stack: production input is CSLC built from raw Sentinel-1 bursts.
+fn require_raw_inputs(cfg: &DisplacementWorkflow) -> Result<()> {
+    if cfg.input_options.input_type == InputType::L1Cslc {
+        for path in &cfg.cslc_file_list {
+            dolphin_io::require_not_opera(path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Runtime-only serialization policy for a displacement run.
 ///
 /// This is deliberately separate from scientific configuration: it changes only
@@ -412,6 +423,7 @@ pub fn run_displacement_with_output_policy(
             || output_policy == DisplacementOutputPolicy::Full,
         "phase_linking.write_covariance_operator is unavailable under the GroundPulse output policy"
     );
+    require_raw_inputs(cfg)?;
     let groups = workflow_groups(cfg)?;
     validate_common_burst_dates(cfg, &groups)?;
     let masks = resolve_layover_shadow_masks(
@@ -3572,7 +3584,7 @@ fn read_burst_tile(
     block: BlockIndices,
 ) -> Result<Array3<Cf64>> {
     let reader = match input_type {
-        InputType::OperaCslc => read_cslc_window,
+        InputType::OperaCslc | InputType::L1Cslc => read_cslc_window,
         InputType::NisarGslc => read_nisar_window,
     };
     let mut tile = Array3::<Cf64>::zeros((files.len(), block.height(), block.width()));
@@ -3685,7 +3697,7 @@ fn preflight_burst_mask(
         .as_deref()
         .context("input_options.subdataset is required to align a layover/shadow mask")?;
     let source_geo = match cfg.input_options.input_type {
-        InputType::OperaCslc => read_geotransform(first_cslc, subdataset),
+        InputType::OperaCslc | InputType::L1Cslc => read_geotransform(first_cslc, subdataset),
         InputType::NisarGslc => read_nisar_geotransform(first_cslc, subdataset),
     }
     .context("reading source georeference for layover/shadow mask alignment")?;
@@ -4646,6 +4658,7 @@ pub fn run_displacement_resumable(
     let acquisitions = groups.values().map(Vec::len).max().unwrap_or(0);
     let crop = plan_bounds(cfg, &layouts, acquisitions)?;
     let prepared_masks = preflight_included_burst_masks(cfg, &groups, &masks, crop.as_ref())?;
+    require_raw_inputs(cfg)?;
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
@@ -4733,6 +4746,7 @@ pub fn update_displacement(
         return run_displacement_resumable(cfg);
     }
     let prepared_masks = preflight_update_masks(state, cfg, &groups, &masks)?;
+    require_raw_inputs(cfg)?;
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
     let mut bursts = Vec::with_capacity(groups.len());
     let mut states = Vec::with_capacity(groups.len());
@@ -5239,7 +5253,7 @@ fn resolve_burst_geo(
     source_offset: (usize, usize),
 ) -> Result<BurstGeo> {
     let geo_reader = match cfg.input_options.input_type {
-        InputType::OperaCslc => read_geotransform,
+        InputType::OperaCslc | InputType::L1Cslc => read_geotransform,
         InputType::NisarGslc => read_nisar_geotransform,
     };
     let geo = cfg

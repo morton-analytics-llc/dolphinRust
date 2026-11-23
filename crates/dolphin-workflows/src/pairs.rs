@@ -303,15 +303,22 @@ struct PairGrid {
 /// a side band.
 pub fn run_pairs(cfg: &PairsConfig) -> Result<PairsIndex> {
     validate_config(cfg)?;
+    if cfg.input_type == InputType::L1Cslc {
+        for acquisition in &cfg.acquisitions {
+            dolphin_io::require_not_opera(&acquisition.path)?;
+        }
+    }
     let planned = plan_pairs(&cfg.acquisitions, &cfg.pair_plan)?;
     let index = match (cfg.mode, cfg.input_type) {
-        (PairsMode::Coherence, InputType::OperaCslc) => run_coherence(cfg, &planned)?,
+        (PairsMode::Coherence, InputType::OperaCslc | InputType::L1Cslc) => {
+            run_coherence(cfg, &planned)?
+        }
         (PairsMode::Coherence, InputType::NisarGslc) => bail!(
             "dolphin pairs coherence mode does not support input_type nisar_gslc; \
              only opera_cslc is implemented"
         ),
         (PairsMode::Interferogram, InputType::NisarGslc) => run_interferogram(cfg, &planned)?,
-        (PairsMode::Interferogram, InputType::OperaCslc) => bail!(
+        (PairsMode::Interferogram, InputType::OperaCslc | InputType::L1Cslc) => bail!(
             "dolphin pairs interferogram mode needs two range bands for split-spectrum \
              ionosphere; it supports input_type nisar_gslc only"
         ),

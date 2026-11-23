@@ -128,7 +128,7 @@ pub(crate) fn resolve_layover_shadow_masks(
     }
 
     let is_single_group = groups.len() == 1 && groups.contains_key("single");
-    if input_type != InputType::OperaCslc || is_single_group {
+    if !input_type.is_s1_cslc() || is_single_group {
         ensure!(
             groups.len() == 1,
             "layover/shadow masks for non-OPERA inputs require exactly one active group; found {}",

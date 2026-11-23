@@ -1,0 +1,25 @@
+{
+ "burst": "T034-071054-IW3",
+ "dates": [
+  "2022-07-22",
+  "2022-08-03",
+  "2022-08-15",
+  "2022-08-27"
+ ],
+ "steps": [
+  "dolphin cslc (raw CDSE bursts -> CSLC + STATIC)",
+  "dolphin run (displacement, input_type default l1_cslc)"
+ ],
+ "file_opens": 578,
+ "file_opens_matching_opera_case_insensitive": 0,
+ "network_hosts": {
+  "catalogue.dataspace.copernicus.eu": 4,
+  "zipper.dataspace.copernicus.eu": 8,
+  "cddis.nasa.gov": 4,
+  "copernicus-dem-30m.s3.amazonaws.com": 5,
+  "cdn.proj.org": 1
+ },
+ "network_urls_matching_opera": 0,
+ "displacement_completed": true,
+ "method": "validation/issue230_access_log.c interposes open/openat/fopen via DYLD_INSERT_LIBRARIES; network endpoints from the CLI's info log"
+}

@@ -1,0 +1,225 @@
+{
+  "measured_at": "2026-11-23T07:07:21.153292+00:00",
+  "bursts": {
+    "T034-071054-IW3": [
+      {
+        "acquired": "2026-11-17T00:26:19.117015+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261117T002614_20261117T002641_005500_00A83A_C015.SAFE",
+        "cdse_published": "2026-11-17T03:18:07.175254+00:00",
+        "cdse_latency_h": 2.86,
+        "opera_cslc_inserted": "2026-11-18T08:30:46+00:00",
+        "opera_latency_h": 32.07,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-11-05T00:26:19.668335+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261105T002615_20261105T002642_005325_00A232_0936.SAFE",
+        "cdse_published": "2026-11-05T18:24:17.727472+00:00",
+        "cdse_latency_h": 17.97,
+        "opera_cslc_inserted": "2026-11-06T16:14:36+00:00",
+        "opera_latency_h": 39.8,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-10-24T00:26:20.046139+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261024T002615_20261024T002642_005150_009C37_909E.SAFE",
+        "cdse_published": "2026-10-24T03:27:08.703062+00:00",
+        "cdse_latency_h": 3.01,
+        "opera_cslc_inserted": "2026-10-25T08:39:10+00:00",
+        "opera_latency_h": 32.21,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-10-12T00:26:19.944516+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261012T002615_20261012T002642_004975_00963C_D27C.SAFE",
+        "cdse_published": "2026-10-12T15:07:08.228535+00:00",
+        "cdse_latency_h": 14.68,
+        "opera_cslc_inserted": "2026-10-13T08:17:57+00:00",
+        "opera_latency_h": 31.86,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-09-30T00:26:19.783564+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260930T002615_20260930T002642_004800_00901A_9991.SAFE",
+        "cdse_published": "2026-09-30T03:17:33.045983+00:00",
+        "cdse_latency_h": 2.85,
+        "opera_cslc_inserted": "2026-10-11T19:06:57+00:00",
+        "opera_latency_h": 282.68,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-09-18T00:26:19.770285+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260918T002615_20260918T002642_004625_008A00_4192.SAFE",
+        "cdse_published": "2026-09-18T11:46:10.212951+00:00",
+        "cdse_latency_h": 11.33,
+        "opera_cslc_inserted": "2026-10-12T04:21:16+00:00",
+        "opera_latency_h": 579.92,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-09-06T00:26:19.322035+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260906T002614_20260906T002641_004450_0083F5_1168.SAFE",
+        "cdse_published": "2026-09-06T03:31:41.200941+00:00",
+        "cdse_latency_h": 3.09,
+        "opera_cslc_inserted": "2026-10-11T22:32:00+00:00",
+        "opera_latency_h": 862.09,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-25T00:26:19.058240+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260825T002614_20260825T002641_004275_007DDC_51E9.SAFE",
+        "cdse_published": "2026-08-25T18:37:03.292819+00:00",
+        "cdse_latency_h": 18.18,
+        "opera_cslc_inserted": "2026-10-11T10:12:59+00:00",
+        "opera_latency_h": 1137.78,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-13T00:26:18.490400+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260813T002613_20260813T002640_004100_0077BE_303B.SAFE",
+        "cdse_published": "2026-08-13T03:28:35.947343+00:00",
+        "cdse_latency_h": 3.04,
+        "opera_cslc_inserted": "2026-10-11T00:46:29+00:00",
+        "opera_latency_h": 1416.34,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-01T00:26:17.928486+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260801T002613_20260801T002640_003925_0071AA_A5EA.SAFE",
+        "cdse_published": "2026-08-01T09:59:29.696455+00:00",
+        "cdse_latency_h": 9.55,
+        "opera_cslc_inserted": "2026-10-11T12:38:10+00:00",
+        "opera_latency_h": 1716.2,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-07-20T00:26:17.383534+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260720T002612_20260720T002639_003750_006B9F_113C.SAFE",
+        "cdse_published": "2026-07-20T03:38:34.922583+00:00",
+        "cdse_latency_h": 3.2,
+        "opera_cslc_inserted": "2026-10-10T20:05:47+00:00",
+        "opera_latency_h": 1987.66,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-07-08T00:26:16.398872+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260708T002611_20260708T002638_003575_0065A3_C26B.SAFE",
+        "cdse_published": "2026-07-08T21:53:02.181639+00:00",
+        "cdse_latency_h": 21.45,
+        "opera_cslc_inserted": "2026-10-10T07:40:58+00:00",
+        "opera_latency_h": 2263.24,
+        "opera_missing_after_h": null
+      }
+    ],
+    "T100-213486-IW2": [
+      {
+        "acquired": "2026-11-21T13:34:04.729633+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261121T133348_20261121T133415_005566_00AA88_AB6B.SAFE",
+        "cdse_published": "2026-11-21T15:52:46.853145+00:00",
+        "cdse_latency_h": 2.31,
+        "opera_cslc_inserted": "2026-11-22T08:32:36+00:00",
+        "opera_latency_h": 18.98,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-11-09T13:34:05.027973+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261109T133348_20261109T133415_005391_00A480_034E.SAFE",
+        "cdse_published": "2026-11-09T15:55:55.310918+00:00",
+        "cdse_latency_h": 2.36,
+        "opera_cslc_inserted": "2026-11-10T08:26:51+00:00",
+        "opera_latency_h": 18.88,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-10-28T13:34:05.254369+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261028T133348_20261028T133415_005216_009E78_4DE8.SAFE",
+        "cdse_published": "2026-10-28T17:29:50.043848+00:00",
+        "cdse_latency_h": 3.93,
+        "opera_cslc_inserted": "2026-10-30T00:28:44+00:00",
+        "opera_latency_h": 34.91,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-10-16T13:34:05.447367+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261016T133348_20261016T133415_005041_009876_4AB1.SAFE",
+        "cdse_published": "2026-10-16T15:57:03.521932+00:00",
+        "cdse_latency_h": 2.38,
+        "opera_cslc_inserted": "2026-10-17T17:54:08+00:00",
+        "opera_latency_h": 28.33,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-10-04T13:34:05.489237+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20261004T133348_20261004T133415_004866_00925F_4356.SAFE",
+        "cdse_published": "2026-10-04T15:54:05.137515+00:00",
+        "cdse_latency_h": 2.33,
+        "opera_cslc_inserted": "2026-10-12T20:08:35+00:00",
+        "opera_latency_h": 198.57,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-09-22T13:34:05.432493+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260922T133348_20260922T133415_004691_008C46_6ECF.SAFE",
+        "cdse_published": "2026-09-22T16:47:41.243886+00:00",
+        "cdse_latency_h": 3.23,
+        "opera_cslc_inserted": "2026-10-12T01:59:52+00:00",
+        "opera_latency_h": 468.43,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-09-10T13:34:05.105792+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260910T133348_20260910T133415_004516_008646_6976.SAFE",
+        "cdse_published": "2026-09-10T15:57:17.562892+00:00",
+        "cdse_latency_h": 2.39,
+        "opera_cslc_inserted": "2026-10-11T18:15:48+00:00",
+        "opera_latency_h": 748.7,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-29T13:34:04.803549+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260829T133348_20260829T133415_004341_00802A_8D68.SAFE",
+        "cdse_published": "2026-08-29T15:47:30.878919+00:00",
+        "cdse_latency_h": 2.22,
+        "opera_cslc_inserted": "2026-10-11T05:33:14+00:00",
+        "opera_latency_h": 1023.99,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-17T13:34:04.075048+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260817T133347_20260817T133414_004166_0079FF_2799.SAFE",
+        "cdse_published": "2026-08-17T15:53:28.672312+00:00",
+        "cdse_latency_h": 2.32,
+        "opera_cslc_inserted": "2026-10-11T15:14:05+00:00",
+        "opera_latency_h": 1321.67,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-08-05T13:34:03.536634+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260805T133346_20260805T133413_003991_0073FC_E460.SAFE",
+        "cdse_published": "2026-08-05T15:53:05.060246+00:00",
+        "cdse_latency_h": 2.32,
+        "opera_cslc_inserted": "2026-10-11T07:42:05+00:00",
+        "opera_latency_h": 1602.13,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-07-24T13:34:03.199450+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260724T133346_20260724T133413_003816_006DE2_4465.SAFE",
+        "cdse_published": "2026-07-24T15:55:23.197051+00:00",
+        "cdse_latency_h": 2.36,
+        "opera_cslc_inserted": "2026-10-10T16:53:21+00:00",
+        "opera_latency_h": 1875.32,
+        "opera_missing_after_h": null
+      },
+      {
+        "acquired": "2026-07-12T13:34:02.286601+00:00",
+        "slc": "S1D_IW_SLC__1SDV_20260712T133345_20260712T133412_003641_0067E3_9CD3.SAFE",
+        "cdse_published": "2026-07-12T17:50:57.469735+00:00",
+        "cdse_latency_h": 4.28,
+        "opera_cslc_inserted": "2026-10-10T06:42:01+00:00",
+        "opera_latency_h": 2153.13,
+        "opera_missing_after_h": null
+      }
+    ]
+  }
+}

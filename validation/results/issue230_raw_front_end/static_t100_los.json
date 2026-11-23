@@ -1,0 +1,22 @@
+{
+ "opera_static.los_east.max_abs_diff": 3.4689903259277344e-05,
+ "opera_static.los_east.pixels": 3232866,
+ "opera_static.los_north.max_abs_diff": 4.0978193283081055e-06,
+ "opera_static.los_north.pixels": 3232866,
+ "compass_static.los_east.max_abs_diff": 7.152557373046875e-06,
+ "compass_static.los_east.pixels": 3232866,
+ "compass_static.los_north.max_abs_diff": 7.82310962677002e-07,
+ "compass_static.los_north.pixels": 3232866,
+ "mask.pixels": 3232866,
+ "mask.ours.clear": 3232866,
+ "mask.compass.clear": 3232866,
+ "mask.ours.shadow": 0,
+ "mask.compass.shadow": 0,
+ "mask.ours.layover": 0,
+ "mask.compass.layover": 0,
+ "mask.ours.both": 0,
+ "mask.compass.both": 0,
+ "mask.agreement": 1.0,
+ "mask.flagged_iou": 0.0,
+ "mask.valid_footprint_agreement": 1.0
+}

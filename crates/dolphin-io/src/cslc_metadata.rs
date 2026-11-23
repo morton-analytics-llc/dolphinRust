@@ -93,6 +93,40 @@ pub fn read_cslc_identification(path: &Path) -> Result<CslcIdentification> {
     })
 }
 
+/// Fail when `path` is an OPERA product (file name `OPERA_*`, or
+/// `/identification/processing_center` naming JPL). Production input is the
+/// in-house CSLC built from raw Sentinel-1 bursts; OPERA CSLC is a backtest
+/// reference and needs `input_type: opera_cslc`.
+///
+/// # Errors
+/// [`crate::IoError::NotRawDerived`] for an OPERA product; HDF5 errors when
+/// the file cannot be opened.
+pub fn require_not_opera(path: &Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let reject = |why: &str| {
+        Err(crate::IoError::NotRawDerived(format!(
+            "{} is an OPERA product ({why}); input_type l1_cslc takes only CSLC built \
+             from raw Sentinel-1 bursts (`dolphin cslc`); use input_type opera_cslc for backtests",
+            path.display()
+        )))
+    };
+    if name.starts_with("OPERA_") {
+        return reject("file name");
+    }
+    let file = hdf5::File::open(path)?;
+    let center = file
+        .dataset("/identification/processing_center")
+        .ok()
+        .and_then(|d| d.read_scalar::<FixedAscii<64>>().ok());
+    if center.is_some_and(|c| c.as_str().contains("Jet Propulsion")) {
+        return reject("processing_center");
+    }
+    Ok(())
+}
+
 /// Read the `input_burst_metadata` provenance scalars.
 ///
 /// # Errors
@@ -247,6 +281,43 @@ mod tests {
             .with_data(&[-119.302, 36.684])
             .create("center")
             .unwrap();
+    }
+
+    /// OPERA products are rejected by name or by JPL's processing_center;
+    /// the in-house CSLC passes.
+    #[test]
+    fn require_not_opera_rejects_opera_products() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
+        let dir = std::env::temp_dir();
+        let write = |name: &str, center: &str| {
+            let path = dir.join(name);
+            let _ = std::fs::remove_file(&path);
+            let file = hdf5::File::create(&path).unwrap();
+            let value = FixedAscii::<64>::from_ascii(center.as_bytes()).unwrap();
+            file.create_group("identification")
+                .unwrap()
+                .new_dataset::<FixedAscii<64>>()
+                .create("processing_center")
+                .unwrap()
+                .write_scalar(&value)
+                .unwrap();
+            path
+        };
+        let ours = write("dolphin_l1_guard_ours.h5", "Morton Analytics dolphinRust");
+        let jpl = write("dolphin_l1_guard_jpl.h5", "Jet Propulsion Laboratory");
+        let named = write("OPERA_L2_CSLC-S1_guard.h5", "Morton Analytics dolphinRust");
+        assert!(require_not_opera(&ours).is_ok());
+        assert!(matches!(
+            require_not_opera(&jpl),
+            Err(crate::IoError::NotRawDerived(_))
+        ));
+        assert!(matches!(
+            require_not_opera(&named),
+            Err(crate::IoError::NotRawDerived(_))
+        ));
+        for path in [ours, jpl, named] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

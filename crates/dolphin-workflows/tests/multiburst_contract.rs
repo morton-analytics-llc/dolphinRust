@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dolphin_core::config::DisplacementWorkflow;
+use dolphin_core::config::{DisplacementWorkflow, InputType};
 use dolphin_core::types::{HalfWindow, Strides};
 use dolphin_io::write_raster;
 use dolphin_workflows::run_displacement;
@@ -111,7 +111,7 @@ fn equal_count_bursts_with_different_dates_fail_before_cslc_reads() {
         "dolphin_multiburst_date_axis_contract_{}",
         std::process::id()
     ));
-    let cfg = DisplacementWorkflow {
+    let mut cfg = DisplacementWorkflow {
         cslc_file_list: vec![
             dir.join("OPERA_T064-135518-IW1_20221119.h5"),
             dir.join("OPERA_T064-135518-IW1_20221201.h5"),
@@ -120,6 +120,7 @@ fn equal_count_bursts_with_different_dates_fail_before_cslc_reads() {
         ],
         ..Default::default()
     };
+    cfg.input_options.input_type = InputType::OperaCslc;
 
     let detail = displacement_error(&cfg);
     assert!(
@@ -176,6 +177,7 @@ fn two_bursts_stitch_into_a_frame() {
         work_directory: dir.join("masked"),
         ..Default::default()
     };
+    cfg.input_options.input_type = InputType::OperaCslc;
     cfg.input_options.subdataset = Some("/data/VV".into());
     cfg.input_options.wavelength = Some(0.055_465_76);
     cfg.phase_linking.ministack_size = 15;

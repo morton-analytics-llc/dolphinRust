@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 dolphin-core.workspace = true
 dolphin-workflows.workspace = true
+dolphin-l1.workspace = true
+chrono.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

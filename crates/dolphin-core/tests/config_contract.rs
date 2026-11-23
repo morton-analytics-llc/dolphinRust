@@ -124,22 +124,33 @@ fn compatibility_only_values_still_round_trip_before_runtime_validation() {
 }
 
 /// Forward divergence: `input_options.input_type` is dolphinRust-only. A legacy
-/// dolphin YAML (no `input_type`) must default to OPERA CSLC; a NISAR config must
-/// parse the `nisar_gslc` value and round-trip. The enum string is `snake_case`.
+/// dolphin YAML (no `input_type`) defaults to the in-house CSLC built from raw
+/// Sentinel-1 (`l1_cslc`); OPERA CSLC needs an explicit `opera_cslc`; a NISAR
+/// config must parse `nisar_gslc` and round-trip. The enum string is
+/// `snake_case`.
 #[test]
-fn nisar_input_type_round_trips_and_defaults_to_opera() {
+fn input_type_round_trips_and_defaults_to_raw_l1() {
     assert_eq!(
         DisplacementWorkflow::default().input_options.input_type,
-        InputType::OperaCslc
+        InputType::L1Cslc
     );
     assert_eq!(
         serde_yaml::to_string(&InputType::NisarGslc).unwrap().trim(),
         "nisar_gslc"
     );
+    assert_eq!(
+        serde_yaml::to_string(&InputType::L1Cslc).unwrap().trim(),
+        "l1_cslc"
+    );
 
-    // Legacy dolphin YAML with no input_type → OPERA default (round-trips).
+    // Legacy dolphin YAML with no input_type → raw-derived default.
     let legacy = DisplacementWorkflow::from_yaml("cslc_file_list: [/data/a.h5]").unwrap();
-    assert_eq!(legacy.input_options.input_type, InputType::OperaCslc);
+    assert_eq!(legacy.input_options.input_type, InputType::L1Cslc);
+    let backtest = DisplacementWorkflow::from_yaml(
+        "input_options:\n  input_type: opera_cslc\ncslc_file_list: [/data/a.h5]",
+    )
+    .unwrap();
+    assert_eq!(backtest.input_options.input_type, InputType::OperaCslc);
 
     // A NISAR config parses and round-trips with the L-band wavelength + grid path.
     let yaml = r#"

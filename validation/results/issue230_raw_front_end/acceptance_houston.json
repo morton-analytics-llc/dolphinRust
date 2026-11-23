@@ -1,0 +1,267 @@
+{
+  "label": "T034-071054-IW3",
+  "summary": {
+    "dates": 15,
+    "pairs_scored": 14,
+    "worst_median_correlation": 0.9999914169311523,
+    "worst_abs_offset_rows_px": 0.0,
+    "worst_abs_offset_cols_px": 0.0,
+    "worst_phase_circular_std_rad": 0.018020096369729417,
+    "median_phase_circular_std_rad": 0.014591042664108102,
+    "pass_registration": true,
+    "pass_phase": true
+  },
+  "dates": [
+    {
+      "date": "20220111",
+      "valid_fraction": 0.9482930713259755,
+      "median_correlation_stable": 0.9999982118606567,
+      "median_correlation_all": 0.9999979734420776,
+      "median_correlation_flattened_stable": 0.9999973177909851,
+      "stable_pixels": 587396,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 144
+    },
+    {
+      "date": "20220123",
+      "valid_fraction": 0.9453595226127415,
+      "median_correlation_stable": 0.9999979138374329,
+      "median_correlation_all": 0.9999973177909851,
+      "median_correlation_flattened_stable": 0.9999972581863403,
+      "stable_pixels": 163784,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220204",
+      "valid_fraction": 0.9429902005009301,
+      "median_correlation_stable": 0.9999962449073792,
+      "median_correlation_all": 0.9999953508377075,
+      "median_correlation_flattened_stable": 0.9999956488609314,
+      "stable_pixels": 139496,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220216",
+      "valid_fraction": 0.9445103186161842,
+      "median_correlation_stable": 0.9999942779541016,
+      "median_correlation_all": 0.9999939203262329,
+      "median_correlation_flattened_stable": 0.9999932646751404,
+      "stable_pixels": 516354,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220228",
+      "valid_fraction": 0.9446989908363299,
+      "median_correlation_stable": 0.999994158744812,
+      "median_correlation_all": 0.9999937415122986,
+      "median_correlation_flattened_stable": 0.9999932050704956,
+      "stable_pixels": 472164,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220312",
+      "valid_fraction": 0.9474793104979085,
+      "median_correlation_stable": 0.9999923706054688,
+      "median_correlation_all": 0.999991774559021,
+      "median_correlation_flattened_stable": 0.9999913573265076,
+      "stable_pixels": 404234,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220324",
+      "valid_fraction": 0.9516580242617438,
+      "median_correlation_stable": 0.9999914169311523,
+      "median_correlation_all": 0.9999906420707703,
+      "median_correlation_flattened_stable": 0.9999906420707703,
+      "stable_pixels": 256906,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 145
+    },
+    {
+      "date": "20220405",
+      "valid_fraction": 0.9463619556609543,
+      "median_correlation_stable": 0.9999931454658508,
+      "median_correlation_all": 0.9999923706054688,
+      "median_correlation_flattened_stable": 0.9999923706054688,
+      "stable_pixels": 301958,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220417",
+      "valid_fraction": 0.9436360537934214,
+      "median_correlation_stable": 0.9999921917915344,
+      "median_correlation_all": 0.999991774559021,
+      "median_correlation_flattened_stable": 0.999991238117218,
+      "stable_pixels": 441563,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220429",
+      "valid_fraction": 0.944816418707692,
+      "median_correlation_stable": 0.9999937415122986,
+      "median_correlation_all": 0.9999932050704956,
+      "median_correlation_flattened_stable": 0.9999927878379822,
+      "stable_pixels": 362671,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220511",
+      "valid_fraction": 0.9432622894711593,
+      "median_correlation_stable": 0.9999962449073792,
+      "median_correlation_all": 0.9999958276748657,
+      "median_correlation_flattened_stable": 0.9999954104423523,
+      "stable_pixels": 346327,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220523",
+      "valid_fraction": 0.9413390500658025,
+      "median_correlation_stable": 0.9999948740005493,
+      "median_correlation_all": 0.9999943375587463,
+      "median_correlation_flattened_stable": 0.9999939799308777,
+      "stable_pixels": 342969,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    },
+    {
+      "date": "20220604",
+      "valid_fraction": 0.9492690115007711,
+      "median_correlation_stable": 0.9999976754188538,
+      "median_correlation_all": 0.9999972581863403,
+      "median_correlation_flattened_stable": 0.9999968409538269,
+      "stable_pixels": 339259,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 144
+    },
+    {
+      "date": "20220616",
+      "valid_fraction": 0.9362108890005886,
+      "median_correlation_stable": 0.9999985694885254,
+      "median_correlation_all": 0.9999982714653015,
+      "median_correlation_flattened_stable": 0.9999978542327881,
+      "stable_pixels": 324111,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 142
+    },
+    {
+      "date": "20220628",
+      "valid_fraction": 0.9440513474848239,
+      "median_correlation_stable": 0.9999988079071045,
+      "median_correlation_all": 0.9999984502792358,
+      "median_correlation_flattened_stable": 0.999998152256012,
+      "stable_pixels": 324344,
+      "offset_rows_px": 0.0,
+      "offset_cols_px": 0.0,
+      "offset_patches": 143
+    }
+  ],
+  "phase_pairs": [
+    {
+      "pair": "20220111_20220123",
+      "pixels": 67598,
+      "circular_std_raw_rad": 0.008279282150094602,
+      "circular_std_rad": 0.008269204265403444
+    },
+    {
+      "pair": "20220123_20220204",
+      "pixels": 14410,
+      "circular_std_raw_rad": 0.014579487492887401,
+      "circular_std_rad": 0.014565574460547742
+    },
+    {
+      "pair": "20220204_20220216",
+      "pixels": 12704,
+      "circular_std_raw_rad": 0.012624942168756025,
+      "circular_std_rad": 0.012615736389510043
+    },
+    {
+      "pair": "20220216_20220228",
+      "pixels": 61417,
+      "circular_std_raw_rad": 0.015231373476722529,
+      "circular_std_rad": 0.015221311689635385
+    },
+    {
+      "pair": "20220228_20220312",
+      "pixels": 53328,
+      "circular_std_raw_rad": 0.014616239447153944,
+      "circular_std_rad": 0.014616510867668462
+    },
+    {
+      "pair": "20220312_20220324",
+      "pixels": 40839,
+      "circular_std_raw_rad": 0.016569787358852412,
+      "circular_std_rad": 0.016555721968882595
+    },
+    {
+      "pair": "20220324_20220405",
+      "pixels": 23205,
+      "circular_std_raw_rad": 0.01581130952656811,
+      "circular_std_rad": 0.015802999899058028
+    },
+    {
+      "pair": "20220405_20220417",
+      "pixels": 29563,
+      "circular_std_raw_rad": 0.016242769525745663,
+      "circular_std_rad": 0.01622866212493811
+    },
+    {
+      "pair": "20220417_20220429",
+      "pixels": 60766,
+      "circular_std_raw_rad": 0.01635614699761787,
+      "circular_std_rad": 0.016341581667119975
+    },
+    {
+      "pair": "20220429_20220511",
+      "pixels": 39549,
+      "circular_std_raw_rad": 0.01806054310124629,
+      "circular_std_rad": 0.018020096369729417
+    },
+    {
+      "pair": "20220511_20220523",
+      "pixels": 41319,
+      "circular_std_raw_rad": 0.010201588917127788,
+      "circular_std_rad": 0.010147448207080247
+    },
+    {
+      "pair": "20220523_20220604",
+      "pixels": 36898,
+      "circular_std_raw_rad": 0.011304709084563684,
+      "circular_std_rad": 0.011093463714270049
+    },
+    {
+      "pair": "20220604_20220616",
+      "pixels": 32360,
+      "circular_std_raw_rad": 0.009911148783454502,
+      "circular_std_rad": 0.009865723144356636
+    },
+    {
+      "pair": "20220616_20220628",
+      "pixels": 31474,
+      "circular_std_raw_rad": 0.007242428803953704,
+      "circular_std_rad": 0.00694704335621127
+    }
+  ]
+}

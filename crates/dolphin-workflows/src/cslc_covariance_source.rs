@@ -862,7 +862,9 @@ impl CslcCovarianceSourceResolver<'_> {
         let mut values = Array3::zeros((self.members.len(), window.height(), window.width()));
         for (component, member) in self.members.iter().enumerate() {
             let read = match self.input_type {
-                InputType::OperaCslc => read_cslc_window(&member.path, &self.subdataset, window),
+                InputType::OperaCslc | InputType::L1Cslc => {
+                    read_cslc_window(&member.path, &self.subdataset, window)
+                }
                 InputType::NisarGslc => read_nisar_window(&member.path, &self.subdataset, window),
             }
             .map_err(|_| {
@@ -1177,6 +1179,7 @@ impl SequentialPrimitiveSourceResolver for CslcCovarianceGenerationResolverBundl
 fn input_type_tag(input_type: InputType) -> &'static [u8] {
     match input_type {
         InputType::OperaCslc => b"opera_cslc",
+        InputType::L1Cslc => b"l1_cslc",
         InputType::NisarGslc => b"nisar_gslc",
     }
 }
@@ -1251,7 +1254,7 @@ fn member_content_digest(
             col_stop: shape.1,
         };
         let values = match input_type {
-            InputType::OperaCslc => read_cslc_window(path, subdataset, block),
+            InputType::OperaCslc | InputType::L1Cslc => read_cslc_window(path, subdataset, block),
             InputType::NisarGslc => read_nisar_window(path, subdataset, block),
         }?;
         for value in values {

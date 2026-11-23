@@ -949,10 +949,11 @@ fn outside_static_fraction_must_be_a_fraction() {
     }
 }
 
-/// `timeseries_options.estimate_dem_error` (#143) needs OPERA orbits and a
-/// wavelength to scale the baseline sensitivity into phase.
+/// `timeseries_options.estimate_dem_error` (#143) needs Sentinel-1 CSLC
+/// orbits (in-house or OPERA) and a wavelength to scale the baseline
+/// sensitivity into phase.
 #[test]
-fn dem_error_requires_wavelength_and_opera_inputs() {
+fn dem_error_requires_wavelength_and_s1_inputs() {
     let mut config = DisplacementWorkflow::default();
     config.timeseries_options.estimate_dem_error = true;
     let error = config.validate_supported_options().unwrap_err().to_string();
