@@ -169,14 +169,22 @@ fn trace_profiles(burst: &S1Burst, orbit: &Orbit, dem: &Dem) -> Result<Vec<Profi
         .collect()
 }
 
+/// DEM height for the layover/shadow profile: 0 m where the DEM has a hole or no
+/// coverage.
+fn profile_height(dem: &Dem, lon: f64, lat: f64) -> f64 {
+    dem.height(lon, lat)
+        .ok()
+        .filter(|h| h.is_finite())
+        .unwrap_or(0.0)
+}
+
 /// The layover/shadow flags along the ground profile of burst line `line`.
 fn trace_profile(burst: &S1Burst, orbit: &Orbit, dem: &Dem, line: usize) -> Result<Profile> {
     let t = orbit.seconds(burst.sensing_start) + line as f64 * burst.azimuth_time_interval;
     let state = orbit.state(t)?;
-    let height = |lon: f64, lat: f64| {
-        dem.height(lon, lat)
-            .map(|h| if h.is_finite() { h } else { 0.0 })
-    };
+    // A profile end outside the stack DEM is treated like a DEM hole (0 m): it only
+    // places the profile line, and must not abort the burst's CSLC (#240).
+    let height = |lon: f64, lat: f64| -> Result<f64> { Ok(profile_height(dem, lon, lat)) };
     let near = rdr2geo(t, burst.starting_range(), orbit, height)?;
     let far_range = burst.starting_range() + burst.samples as f64 * burst.range_pixel_spacing();
     let far = rdr2geo(t, far_range, orbit, height)?;
@@ -283,6 +291,17 @@ pub fn write_static(path: &std::path::Path, layers: &StaticLayers, burst_id: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outside the DEM and in a DEM hole the profile uses 0 m instead of failing (#240).
+    #[test]
+    fn profile_height_falls_back_to_zero_outside_the_dem() {
+        let mut heights = ndarray::Array2::from_elem((12, 12), 100.0_f32);
+        heights[[9, 9]] = f32::NAN;
+        let dem = Dem::from_grid(10.0, 50.0, 0.01, -0.01, heights);
+        assert!((profile_height(&dem, 10.02, 49.98) - 100.0).abs() < 1e-3);
+        assert_eq!(profile_height(&dem, 10.085, 49.915), 0.0);
+        assert_eq!(profile_height(&dem, -109.67, 48.19), 0.0);
+    }
 
     /// A ridge facing the radar: the near-range back-slope behind the crest
     /// is shadowed, a slope steeper than the look angle lays over.

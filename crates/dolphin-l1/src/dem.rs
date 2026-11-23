@@ -78,6 +78,24 @@ pub struct Dem {
 }
 
 impl Dem {
+    /// A DEM from an explicit node grid (tests).
+    #[cfg(test)]
+    pub(crate) fn from_grid(
+        lon0: f64,
+        lat0: f64,
+        dlon: f64,
+        dlat: f64,
+        heights: ndarray::Array2<f32>,
+    ) -> Self {
+        Self {
+            lon0,
+            lat0,
+            dlon,
+            dlat,
+            heights,
+        }
+    }
+
     /// Mosaic the GLO-30 tiles covering `bounds` and convert to ellipsoidal
     /// heights.
     pub fn glo30(bounds: LonLatBounds) -> Result<Self> {
