@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
-use dolphin_core::config::{DisplacementWorkflow, InputType};
+use dolphin_core::config::DisplacementWorkflow;
 use dolphin_corrections::geometry::OutsideStatic;
 use dolphin_corrections::LosGeometry;
 use dolphin_io::{
@@ -434,7 +434,7 @@ fn corrections_applied(cfg: &DisplacementWorkflow) -> Vec<String> {
     // publication (#195); NISAR's native mask is the GSLC's own quality layer,
     // disclosed under its own name (#210).
     let native_masks = cfg.input_options.apply_native_input_masks;
-    let nisar = cfg.input_options.input_type == InputType::NisarGslc;
+    let nisar = cfg.input_options.input_type.is_nisar();
     if !cfg.layover_shadow_mask_files.is_empty() || (native_masks && !nisar) {
         applied.push(CORRECTION_LAYOVER_SHADOW_MASK.into());
     }
@@ -528,7 +528,7 @@ fn read_granules(
     cfg: &DisplacementWorkflow,
     fields: &mut BTreeMap<String, FieldProvenance>,
 ) -> Option<Vec<GranuleMeta>> {
-    if cfg.input_options.input_type == InputType::NisarGslc {
+    if cfg.input_options.input_type.is_nisar() {
         let reason = "NISAR GSLC geometry metadata mapping not implemented";
         return mark_absent(fields, &CSLC_FIELDS, reason);
     }
@@ -569,7 +569,7 @@ fn orbit_ephemeris_class(
     cfg: &DisplacementWorkflow,
     fields: &mut BTreeMap<String, FieldProvenance>,
 ) -> Option<String> {
-    if cfg.input_options.input_type == InputType::NisarGslc {
+    if cfg.input_options.input_type.is_nisar() {
         return mark_absent(
             fields,
             ORBIT_EPHEMERIS_FIELD,
@@ -645,7 +645,7 @@ fn cslc_dem_source(
     cfg: &DisplacementWorkflow,
     fields: &mut BTreeMap<String, FieldProvenance>,
 ) -> Option<String> {
-    if cfg.input_options.input_type == InputType::NisarGslc {
+    if cfg.input_options.input_type.is_nisar() {
         return mark_absent(
             fields,
             CSLC_DEM_SOURCE_FIELD,
@@ -1049,7 +1049,7 @@ fn incidence(
     }
     // A wrong-track/wrong-pass STATIC yields plausible incidence (up is
     // sign-insensitive) — cross-check its identity against the CSLC stack.
-    let consistency_note = if cfg.input_options.input_type == InputType::NisarGslc {
+    let consistency_note = if cfg.input_options.input_type.is_nisar() {
         if cfg
             .correction_options
             .geometry_files

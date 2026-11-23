@@ -56,7 +56,8 @@ pub use covariance::{
 pub use cslc::{read_cslc, read_cslc_shape, read_cslc_stack, read_cslc_window};
 pub use cslc_metadata::{
     read_cslc_burst_metadata, read_cslc_dem_source, read_cslc_identification, read_cslc_orbit,
-    read_cslc_orbit_type, require_not_opera, CslcBurstMetadata, CslcIdentification, CslcOrbit,
+    read_cslc_orbit_type, require_not_opera, require_raw_nisar, CslcBurstMetadata,
+    CslcIdentification, CslcOrbit,
 };
 pub use error::{IoError, Result};
 pub use geo::{read_geotransform, transform_bounds, GeoInfo};
@@ -66,7 +67,7 @@ pub use geotiff::{
     read_raster_header, read_raster_window, write_raster, write_raster_with_metadata,
     BoundedCogWriter, RasterData, RasterHeader,
 };
-pub use nisar::{read_nisar_geotransform, read_nisar_rslc, read_nisar_stack, read_nisar_window};
+pub use nisar::{read_nisar_geotransform, read_nisar_grid, read_nisar_stack, read_nisar_window};
 
 #[cfg(test)]
 pub(crate) mod test_hdf5_lock {

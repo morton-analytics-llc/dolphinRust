@@ -1,20 +1,28 @@
 //! Level-1 front end: raw Sentinel-1 IW SLC bursts and NISAR L1 RSLC in,
-//! geocoded CSLC out, on the OPERA burst grid that the phase-linking path reads.
+//! geocoded CSLC out: Sentinel-1 on the OPERA burst grid, NISAR on JPL's GSLC
+//! lattice, each in the layout the phase-linking path reads.
 //!
-//! Production reads raw Level-1 data only. OPERA CSLC/DISP products are the
-//! backtest reference (`validation/issue230_raw_front_end.py`), never an input.
+//! Production reads raw Level-1 data only. OPERA CSLC/DISP and NISAR GSLC
+//! products are the backtest references (`validation/issue230_raw_front_end.py`,
+//! `validation/issue230_nisar_front_end.py`), never an input.
 #![warn(missing_docs)]
 
 pub mod cdse;
 pub mod cslc_h5;
 pub mod dem;
+pub mod earthdata;
 pub mod error;
 pub mod geocode;
 pub mod geometry;
 pub mod gim;
 pub mod grid;
 pub mod interp;
+pub mod nisar_geocode;
+pub mod nisar_h5;
+pub mod nisar_stack;
+pub mod nisar_tec;
 pub mod orbit;
+pub mod rslc;
 pub mod safe;
 pub mod stack;
 pub mod static_layers;

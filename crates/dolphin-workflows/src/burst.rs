@@ -43,7 +43,6 @@ pub fn group_by_burst(files: &[PathBuf]) -> BTreeMap<String, Vec<usize>> {
 pub fn workflow_groups(
     cfg: &dolphin_core::config::DisplacementWorkflow,
 ) -> Result<BTreeMap<String, Vec<usize>>> {
-    use dolphin_core::config::InputType;
     let metadata = &cfg.input_options.acquisition_metadata;
     if metadata.is_empty() {
         return Ok(group_by_burst(&cfg.cslc_file_list));
@@ -67,7 +66,7 @@ pub fn workflow_groups(
         groups.entry(m.spatial_group.clone()).or_default().push(i);
     }
     ensure!(
-        cfg.input_options.input_type != InputType::NisarGslc || groups.len() == 1,
+        !cfg.input_options.input_type.is_nisar() || groups.len() == 1,
         "NISAR requires one spatial group per run"
     );
     let mut common_dates = None;

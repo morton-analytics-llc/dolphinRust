@@ -387,12 +387,16 @@ pub fn run_displacement(cfg: &DisplacementWorkflow) -> Result<DisplacementOutput
 }
 
 /// Under `input_type: l1_cslc` (the default), refuse any OPERA product in
-/// the stack: production input is CSLC built from raw Sentinel-1 bursts.
+/// the stack, and under `l1_nisar` any JPL NISAR product: production input
+/// is built from raw Sentinel-1 bursts or NISAR RSLC.
 fn require_raw_inputs(cfg: &DisplacementWorkflow) -> Result<()> {
-    if cfg.input_options.input_type == InputType::L1Cslc {
-        for path in &cfg.cslc_file_list {
-            dolphin_io::require_not_opera(path)?;
-        }
+    let check = match cfg.input_options.input_type {
+        InputType::L1Cslc => dolphin_io::require_not_opera,
+        InputType::L1Nisar => dolphin_io::require_raw_nisar,
+        InputType::OperaCslc | InputType::NisarGslc => return Ok(()),
+    };
+    for path in &cfg.cslc_file_list {
+        check(path)?;
     }
     Ok(())
 }
@@ -1856,7 +1860,7 @@ fn restrict_publication_mask(
             .for_each(|valid, &value| *valid &= value == 1.0);
     }
     if cfg.input_options.apply_native_input_masks {
-        let nisar = cfg.input_options.input_type == InputType::NisarGslc;
+        let nisar = cfg.input_options.input_type.is_nisar();
         let files = if nisar {
             &cfg.cslc_file_list
         } else {
@@ -3585,7 +3589,7 @@ fn read_burst_tile(
 ) -> Result<Array3<Cf64>> {
     let reader = match input_type {
         InputType::OperaCslc | InputType::L1Cslc => read_cslc_window,
-        InputType::NisarGslc => read_nisar_window,
+        InputType::NisarGslc | InputType::L1Nisar => read_nisar_window,
     };
     let mut tile = Array3::<Cf64>::zeros((files.len(), block.height(), block.width()));
     for (k, path) in files.iter().enumerate() {
@@ -3698,7 +3702,9 @@ fn preflight_burst_mask(
         .context("input_options.subdataset is required to align a layover/shadow mask")?;
     let source_geo = match cfg.input_options.input_type {
         InputType::OperaCslc | InputType::L1Cslc => read_geotransform(first_cslc, subdataset),
-        InputType::NisarGslc => read_nisar_geotransform(first_cslc, subdataset),
+        InputType::NisarGslc | InputType::L1Nisar => {
+            read_nisar_geotransform(first_cslc, subdataset)
+        }
     }
     .context("reading source georeference for layover/shadow mask alignment")?;
     anyhow::ensure!(
@@ -5254,7 +5260,7 @@ fn resolve_burst_geo(
 ) -> Result<BurstGeo> {
     let geo_reader = match cfg.input_options.input_type {
         InputType::OperaCslc | InputType::L1Cslc => read_geotransform,
-        InputType::NisarGslc => read_nisar_geotransform,
+        InputType::NisarGslc | InputType::L1Nisar => read_nisar_geotransform,
     };
     let geo = cfg
         .input_options

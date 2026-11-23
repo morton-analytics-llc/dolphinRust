@@ -38,13 +38,13 @@ pub struct CslcProvenance<'a> {
 /// The DEM description written to `inputs/dem_source`.
 pub const DEM_SOURCE: &str = "Copernicus GLO-30 + EGM2008 (WGS84 ellipsoid)";
 
-fn time_string(t: DateTime<Utc>) -> String {
+pub(crate) fn time_string(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
 /// Fixed-length ASCII scalar; 64 bytes (what `dolphin-io` reads) when it
 /// fits, 256 otherwise.
-fn put_str(group: &hdf5::Group, name: &str, value: &str) -> Result<()> {
+pub(crate) fn put_str(group: &hdf5::Group, name: &str, value: &str) -> Result<()> {
     if value.len() <= 64 {
         let fixed = FixedAscii::<64>::from_ascii(value.as_bytes()).map_err(product)?;
         group
@@ -61,7 +61,7 @@ fn put_str(group: &hdf5::Group, name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn put_f64(group: &hdf5::Group, name: &str, value: f64) -> Result<()> {
+pub(crate) fn put_f64(group: &hdf5::Group, name: &str, value: f64) -> Result<()> {
     group
         .new_dataset::<f64>()
         .create(name)?
@@ -77,7 +77,7 @@ fn put_bool(group: &hdf5::Group, name: &str, value: bool) -> Result<()> {
     Ok(())
 }
 
-fn put_vec(group: &hdf5::Group, name: &str, values: &[f64]) -> Result<()> {
+pub(crate) fn put_vec(group: &hdf5::Group, name: &str, values: &[f64]) -> Result<()> {
     group
         .new_dataset_builder()
         .with_data(&Array1::from(values.to_vec()))

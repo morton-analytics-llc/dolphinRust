@@ -127,6 +127,44 @@ pub fn require_not_opera(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `identification/processingCenter` of NISAR files built by `dolphin nisar`
+/// from raw RSLC (`dolphin-l1::nisar_h5::PROCESSING_CENTER`).
+pub const NISAR_RAW_PROCESSING_CENTER: &str = "Morton Analytics dolphinRust";
+
+/// Fail unless `path` is a NISAR file built in-house from raw L1 RSLC: a
+/// name starting `NISAR_` (JPL's granule names) or any other
+/// `/science/LSAR/identification/processingCenter` is a JPL product, which
+/// needs `input_type: nisar_gslc` (backtests).
+///
+/// # Errors
+/// [`crate::IoError::NotRawDerived`] for a JPL product; HDF5 errors when
+/// the file cannot be opened.
+pub fn require_raw_nisar(path: &Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let reject = |why: &str| {
+        Err(crate::IoError::NotRawDerived(format!(
+            "{} is not built from raw NISAR RSLC ({why}); input_type l1_nisar takes only \
+             `dolphin nisar` output; use input_type nisar_gslc for JPL GSLC backtests",
+            path.display()
+        )))
+    };
+    if name.starts_with("NISAR_") {
+        return reject("JPL granule name");
+    }
+    let file = hdf5::File::open(path)?;
+    let center = file
+        .dataset("/science/LSAR/identification/processingCenter")
+        .ok()
+        .and_then(|d| d.read_scalar::<FixedAscii<64>>().ok());
+    match center {
+        Some(c) if c.as_str() == NISAR_RAW_PROCESSING_CENTER => Ok(()),
+        _ => reject("processingCenter"),
+    }
+}
+
 /// Read the `input_burst_metadata` provenance scalars.
 ///
 /// # Errors
@@ -315,6 +353,43 @@ mod tests {
             require_not_opera(&named),
             Err(crate::IoError::NotRawDerived(_))
         ));
+        for path in [ours, jpl, named] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// JPL NISAR products are rejected by name or processing center; the
+    /// in-house file passes.
+    #[test]
+    fn require_raw_nisar_rejects_jpl_products() {
+        let _hdf5 = crate::test_hdf5_lock::guard();
+        let dir = std::env::temp_dir();
+        let write = |name: &str, center: &str| {
+            let path = dir.join(name);
+            let _ = std::fs::remove_file(&path);
+            let file = hdf5::File::create(&path).unwrap();
+            let value = FixedAscii::<64>::from_ascii(center.as_bytes()).unwrap();
+            file.create_group("science")
+                .and_then(|g| g.create_group("LSAR"))
+                .and_then(|g| g.create_group("identification"))
+                .unwrap()
+                .new_dataset::<FixedAscii<64>>()
+                .create("processingCenter")
+                .unwrap()
+                .write_scalar(&value)
+                .unwrap();
+            path
+        };
+        let ours = write("dolphin_l1_nisar_ours.h5", NISAR_RAW_PROCESSING_CENTER);
+        let jpl = write("dolphin_l1_nisar_jpl.h5", "J");
+        let named = write("NISAR_L2_PR_GSLC_guard.h5", NISAR_RAW_PROCESSING_CENTER);
+        assert!(require_raw_nisar(&ours).is_ok());
+        for path in [&jpl, &named] {
+            assert!(matches!(
+                require_raw_nisar(path),
+                Err(crate::IoError::NotRawDerived(_))
+            ));
+        }
         for path in [ours, jpl, named] {
             std::fs::remove_file(path).unwrap();
         }

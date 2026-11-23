@@ -95,6 +95,50 @@ enum Command {
         #[arg(long)]
         no_ionosphere: bool,
     },
+    /// Build a geocoded NISAR stack from raw NISAR L1 RSLC on ASF (no GSLC),
+    /// in the NISAR GSLC layout that `input_type: l1_nisar` reads.
+    Nisar {
+        /// Track (relative orbit).
+        #[arg(long)]
+        track: u32,
+        /// Pass direction: `A` or `D`.
+        #[arg(long)]
+        direction: char,
+        /// Frame number.
+        #[arg(long)]
+        frame: u32,
+        /// First acquisition date (YYYY-MM-DD, inclusive).
+        #[arg(long)]
+        start: chrono::NaiveDate,
+        /// Last acquisition date (YYYY-MM-DD, inclusive).
+        #[arg(long)]
+        end: chrono::NaiveDate,
+        /// Output CRS: the frame's UTM zone, as JPL's GSLC uses.
+        #[arg(long)]
+        epsg: u32,
+        /// Output bounds `XMIN,YMIN,XMAX,YMAX` in `--epsg` (snapped outward
+        /// to the 40 m GSLC lattice).
+        #[arg(long, value_delimiter = ',')]
+        bounds: Vec<f64>,
+        /// Frequency bands.
+        #[arg(long, value_delimiter = ',', default_value = "A,B")]
+        frequencies: Vec<char>,
+        /// Polarisations.
+        #[arg(long, value_delimiter = ',', default_value = "HH")]
+        polarizations: Vec<String>,
+        /// Ancillary cache directory (TEC files).
+        #[arg(long)]
+        cache: PathBuf,
+        /// Output directory.
+        #[arg(long)]
+        out: PathBuf,
+        /// `KEY=VALUE` env file holding the Earthdata token or login.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// Leave the NISAR TEC ionospheric timing corrections out.
+        #[arg(long)]
+        no_ionosphere: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -146,6 +190,55 @@ fn main() -> Result<()> {
                 ionosphere: !no_ionosphere,
             };
             cslc(&request)
+        }
+        Command::Nisar {
+            track,
+            direction,
+            frame,
+            start,
+            end,
+            epsg,
+            bounds,
+            frequencies,
+            polarizations,
+            cache,
+            out,
+            env_file,
+            no_ionosphere,
+        } => {
+            if let Some(path) = env_file {
+                dolphin_l1::load_env_file(&path)?;
+            }
+            let [xmin, ymin, xmax, ymax] = bounds[..] else {
+                anyhow::bail!("--bounds takes XMIN,YMIN,XMAX,YMAX");
+            };
+            let day = |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+            let request = dolphin_l1::nisar_stack::NisarStackRequest {
+                frame: dolphin_l1::rslc::NisarFrame {
+                    track,
+                    direction: direction.to_ascii_uppercase(),
+                    frame,
+                },
+                start: day(start).context("start date")?,
+                end: day(end + chrono::Duration::days(1)).context("end date")?,
+                epsg,
+                bounds: [xmin, ymin, xmax, ymax],
+                frequencies: frequencies.iter().map(char::to_ascii_uppercase).collect(),
+                polarizations,
+                cache_dir: cache,
+                output_dir: out,
+                ionosphere: !no_ionosphere,
+            };
+            let client = dolphin_l1::rslc::AsfClient::from_env()?;
+            for output in dolphin_l1::nisar_stack::process_nisar_stack(&client, &request)? {
+                let state = if output.written { "wrote" } else { "current" };
+                println!(
+                    "{}  {state}  {}",
+                    output.sensing_start,
+                    output.path.display()
+                );
+            }
+            Ok(())
         }
     }
 }

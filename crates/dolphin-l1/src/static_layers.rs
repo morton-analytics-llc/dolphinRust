@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use crate::dem::Dem;
 use crate::error::Result;
 use crate::geometry::{
-    cross, dot, ecef_to_llh, geo2rdr, line_of_sight_enu, llh_to_ecef, norm, rdr2geo, sub,
+    cross, dot, ecef_to_llh, geo2rdr, line_of_sight_enu, llh_to_ecef, norm, rdr2geo, sub, LookSide,
 };
 use crate::grid::{GeoGrid, Projection};
 use crate::orbit::{Orbit, Vec3};
@@ -40,6 +40,54 @@ const ROW_CHUNK: usize = 128;
 pub const MASK_NODATA: u8 = 127;
 const SHADOW: u8 = 1;
 const LAYOVER: u8 = 2;
+
+/// The radar grid the static layers are traced over: a Sentinel-1 burst or
+/// the part of a NISAR RSLC under the output grid.
+#[derive(Debug, Clone, Copy)]
+pub struct RadarGeometry {
+    /// Zero-Doppler time of line 0.
+    pub sensing_start: chrono::DateTime<chrono::Utc>,
+    /// Line spacing (s).
+    pub azimuth_time_interval: f64,
+    /// Slant range of sample 0 (m).
+    pub starting_range: f64,
+    /// Slant-range spacing (m).
+    pub range_pixel_spacing: f64,
+    /// Lines.
+    pub lines: usize,
+    /// Samples.
+    pub samples: usize,
+    /// Valid lines `[first, last]` (inclusive).
+    pub valid_lines: (usize, usize),
+    /// Valid samples `[first, last]` (inclusive).
+    pub valid_samples: (usize, usize),
+    /// Look side.
+    pub look: LookSide,
+}
+
+impl RadarGeometry {
+    /// The radar grid of a Sentinel-1 burst (right looking).
+    pub fn from_s1(burst: &S1Burst) -> Self {
+        Self {
+            sensing_start: burst.sensing_start,
+            azimuth_time_interval: burst.azimuth_time_interval,
+            starting_range: burst.starting_range(),
+            range_pixel_spacing: burst.range_pixel_spacing(),
+            lines: burst.lines,
+            samples: burst.samples,
+            valid_lines: (burst.first_valid_line, burst.last_valid_line),
+            valid_samples: (burst.first_valid_sample, burst.last_valid_sample),
+            look: LookSide::Right,
+        }
+    }
+
+    fn sensing_mid(&self) -> chrono::DateTime<chrono::Utc> {
+        self.sensing_start
+            + crate::orbit::duration_from_seconds(
+                0.5 * self.lines as f64 * self.azimuth_time_interval,
+            )
+    }
+}
 
 /// The static layers of one burst on a grid.
 pub struct StaticLayers {
@@ -73,9 +121,10 @@ impl Profile {
     }
 }
 
-/// Compute the static layers of `burst` (on `orbit`, over `dem`) on `grid`.
+/// Compute the static layers of the radar grid `burst` (on `orbit`, over
+/// `dem`) on `grid`.
 pub fn static_layers(
-    burst: &S1Burst,
+    burst: &RadarGeometry,
     orbit: &Orbit,
     dem: &Dem,
     grid: &GeoGrid,
@@ -84,7 +133,7 @@ pub fn static_layers(
     let projection = Projection::new(grid.epsg)?;
     let t_mid = orbit.seconds(burst.sensing_mid());
     let t0 = orbit.seconds(burst.sensing_start);
-    let (r0, dr) = (burst.starting_range(), burst.range_pixel_spacing());
+    let (r0, dr) = (burst.starting_range, burst.range_pixel_spacing);
     let mut rows: Vec<Vec<(f32, f32, u8)>> = Vec::with_capacity(grid.rows);
     for chunk0 in (0..grid.rows).step_by(ROW_CHUNK) {
         let chunk_rows = ROW_CHUNK.min(grid.rows - chunk0);
@@ -133,7 +182,7 @@ pub fn static_layers(
 
 /// `(los_east, los_north, mask)` of one pixel, `None` outside the valid burst.
 fn pixel(
-    burst: &S1Burst,
+    burst: &RadarGeometry,
     orbit: &Orbit,
     dem: &Dem,
     profiles: &[Profile],
@@ -146,10 +195,10 @@ fn pixel(
     let radar = geo2rdr(target, orbit, t_mid).ok()?;
     let line = (radar.azimuth_time - t0) / burst.azimuth_time_interval;
     let sample = (radar.slant_range - r0) / dr;
-    let inside = line >= burst.first_valid_line as f64
-        && line <= burst.last_valid_line as f64
-        && sample >= burst.first_valid_sample as f64
-        && sample <= burst.last_valid_sample as f64;
+    let inside = line >= burst.valid_lines.0 as f64
+        && line <= burst.valid_lines.1 as f64
+        && sample >= burst.valid_samples.0 as f64
+        && sample <= burst.valid_samples.1 as f64;
     if !inside {
         return None;
     }
@@ -160,7 +209,7 @@ fn pixel(
     Some((los[0] as f32, los[1] as f32, nearest.flag_at(target)))
 }
 
-fn trace_profiles(burst: &S1Burst, orbit: &Orbit, dem: &Dem) -> Result<Vec<Profile>> {
+fn trace_profiles(burst: &RadarGeometry, orbit: &Orbit, dem: &Dem) -> Result<Vec<Profile>> {
     let mut lines: Vec<usize> = (0..burst.lines).step_by(PROFILE_STEP_LINES).collect();
     lines.push(burst.lines - 1);
     lines
@@ -179,15 +228,15 @@ fn profile_height(dem: &Dem, lon: f64, lat: f64) -> f64 {
 }
 
 /// The layover/shadow flags along the ground profile of burst line `line`.
-fn trace_profile(burst: &S1Burst, orbit: &Orbit, dem: &Dem, line: usize) -> Result<Profile> {
+fn trace_profile(burst: &RadarGeometry, orbit: &Orbit, dem: &Dem, line: usize) -> Result<Profile> {
     let t = orbit.seconds(burst.sensing_start) + line as f64 * burst.azimuth_time_interval;
     let state = orbit.state(t)?;
     // A profile end outside the stack DEM is treated like a DEM hole (0 m): it only
     // places the profile line, and must not abort the burst's CSLC (#240).
     let height = |lon: f64, lat: f64| -> Result<f64> { Ok(profile_height(dem, lon, lat)) };
-    let near = rdr2geo(t, burst.starting_range(), orbit, height)?;
-    let far_range = burst.starting_range() + burst.samples as f64 * burst.range_pixel_spacing();
-    let far = rdr2geo(t, far_range, orbit, height)?;
+    let near = rdr2geo(t, burst.starting_range, orbit, burst.look, height)?;
+    let far_range = burst.starting_range + burst.samples as f64 * burst.range_pixel_spacing;
+    let far = rdr2geo(t, far_range, orbit, burst.look, height)?;
     let span = sub(far.ecef, near.ecef);
     let across = {
         let n = norm(span);
