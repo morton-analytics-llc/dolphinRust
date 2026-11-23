@@ -5,13 +5,14 @@
 //! free public OPERA L4 tropospheric product (a DISP-S1-aligned netCDF); RAiDER is
 //! the fallback for scenes without an L4 product ([`crate::raider`]).
 //!
-//! netCDF is read through GDAL's `NETCDF:` driver (same GDAL the rest of the
-//! pipeline links), then resampled onto the displacement frame grid.
-//!
-//! GDAL's netCDF driver reaches the same libhdf5 the `hdf5` crate uses, but
-//! without that crate's library lock, and libhdf5 is not built thread-safe. Every
-//! GDAL access to a netCDF file therefore runs inside [`hdf5::sync::sync`], so it
-//! cannot overlap an HDF5 call on another thread (#133).
+//! A netCDF-4 variable is read with the `hdf5` crate (netCDF-4 is HDF5) into an
+//! in-memory GDAL dataset carrying the variable's grid, CRS, fill value and height
+//! levels, then resampled onto the displacement frame grid with GDAL. GDAL's own
+//! `netCDF` driver is not used to read: on a build whose GDAL links a different
+//! libhdf5 than the `hdf5` crate (the Debian worker image links HDF5 1.10 through
+//! libnetcdf and HDF5 2.x through the crate), opening a netCDF through GDAL mixes the
+//! two libraries in one process and aborts it. HDF5 access still runs inside
+//! [`hdf5::sync::sync`] (#133).
 
 use std::path::Path;
 
@@ -38,6 +39,184 @@ pub struct DelayGrid {
 
 /// Reject a height-resolved variable: GDAL maps each level to a band, so band 1
 /// is the lowest level (-500 m in the OPERA L4 product), not the terrain.
+/// Coordinate-variable names tried for the x and y axes, in order.
+const X_NAMES: [&str; 3] = ["longitude", "lon", "x"];
+const Y_NAMES: [&str; 3] = ["latitude", "lat", "y"];
+
+fn hdf5_error(error: hdf5::Error) -> CorrectionError {
+    CorrectionError::Shape(format!("netCDF read: {error}"))
+}
+
+/// Open netCDF variable `var` of `path` as an in-memory GDAL dataset: one band per
+/// height level (`NETCDF_DIM_height` band metadata, as GDAL's netCDF driver records),
+/// north-up geotransform from the 1-D coordinate variables, CRS from the variable's
+/// `grid_mapping` (`crs_wkt` / `spatial_ref`), and `_FillValue` as nodata. Leading
+/// dimensions other than height (a single `time` step) are dropped.
+///
+/// Callers hold [`hdf5::sync::sync`].
+fn open_netcdf_variable(path: &Path, var: &str) -> Result<Dataset> {
+    use gdal::DriverManager;
+
+    if !is_hdf5_file(path)? {
+        // A classic (netCDF-3) file holds no HDF5: GDAL's netCDF driver reads it
+        // without touching libhdf5.
+        let conn = format!("NETCDF:\"{}\":{var}", path.display());
+        return Ok(Dataset::open(Path::new(&conn))?);
+    }
+    let file = hdf5::File::open(path).map_err(hdf5_error)?;
+    let dataset = file.dataset(var).map_err(hdf5_error)?;
+    let shape = dataset.shape();
+    let values: Vec<f64> = dataset.read_raw::<f64>().map_err(hdf5_error)?;
+    let rank = shape.len();
+    if rank < 2 {
+        return Err(CorrectionError::Shape(format!("{var} has rank {rank}")));
+    }
+    let (rows, cols) = (shape[rank - 2], shape[rank - 1]);
+    let levels: usize = shape[..rank - 2].iter().product();
+    let coordinate = |names: &[&str], len: usize| -> Result<Vec<f64>> {
+        names
+            .iter()
+            .find_map(|name| file.dataset(name).ok())
+            .ok_or_else(|| CorrectionError::Shape(format!("{var}: no coordinate among {names:?}")))?
+            .read_raw::<f64>()
+            .map_err(hdf5_error)
+            .and_then(|v| {
+                if v.len() == len && len >= 2 {
+                    Ok(v)
+                } else {
+                    Err(CorrectionError::Shape(format!(
+                        "{var}: coordinate length {} for axis of {len}",
+                        v.len()
+                    )))
+                }
+            })
+    };
+    let x = coordinate(&X_NAMES, cols)?;
+    let y = coordinate(&Y_NAMES, rows)?;
+    let dx = (x[cols - 1] - x[0]) / (cols - 1) as f64;
+    let dy = (y[rows - 1] - y[0]) / (rows - 1) as f64;
+    if dx.is_nan() || dx <= 0.0 || dy == 0.0 || !dy.is_finite() {
+        return Err(CorrectionError::Shape(format!(
+            "{var}: irregular or empty axes"
+        )));
+    }
+    // Rows go north to south in the output; a south-up variable is flipped.
+    let flip = dy > 0.0;
+    let top = if flip { y[rows - 1] } else { y[0] };
+    let geotransform = [
+        x[0] - dx / 2.0,
+        dx,
+        0.0,
+        top + dy.abs() / 2.0,
+        0.0,
+        -dy.abs(),
+    ];
+
+    let mut ds = DriverManager::get_driver_by_name("MEM")?.create_with_band_type::<f64, _>(
+        "",
+        cols,
+        rows,
+        levels.max(1),
+    )?;
+    ds.set_geo_transform(&geotransform)?;
+    let crs_wkt = dataset
+        .attr("grid_mapping")
+        .ok()
+        .and_then(|attr| attribute_string(&attr))
+        .and_then(|name| file.dataset(name.trim()).ok())
+        .and_then(|mapping| {
+            ["crs_wkt", "spatial_ref"].iter().find_map(|key| {
+                mapping
+                    .attr(key)
+                    .ok()
+                    .and_then(|attr| attribute_string(&attr))
+            })
+        });
+    if let Some(wkt) = crs_wkt {
+        ds.set_spatial_ref(&SpatialRef::from_wkt(&wkt)?)?;
+    }
+    let fill = dataset
+        .attr("_FillValue")
+        .ok()
+        .and_then(|a| a.read_raw::<f64>().ok())
+        .and_then(|v| v.first().copied());
+    let heights = if levels > 1 {
+        file.dataset("height")
+            .ok()
+            .and_then(|d| d.read_raw::<f64>().ok())
+    } else {
+        None
+    };
+    write_levels(
+        &mut ds,
+        &values,
+        (rows, cols),
+        levels.max(1),
+        flip,
+        fill,
+        heights.as_deref(),
+    )?;
+    Ok(ds)
+}
+
+/// Write each height level of `values` (`levels × rows × cols`, row-major) as a band,
+/// flipping rows for a south-up variable.
+fn write_levels(
+    ds: &mut Dataset,
+    values: &[f64],
+    (rows, cols): (usize, usize),
+    levels: usize,
+    flip: bool,
+    fill: Option<f64>,
+    heights: Option<&[f64]>,
+) -> Result<()> {
+    let plane = rows * cols;
+    for level in 0..levels {
+        let mut slice = values[level * plane..(level + 1) * plane].to_vec();
+        if flip {
+            slice = slice
+                .chunks(cols)
+                .rev()
+                .flat_map(|row| row.iter().copied())
+                .collect();
+        }
+        let mut band = ds.rasterband(level + 1)?;
+        band.set_no_data_value(fill)?;
+        let mut buffer = Buffer::new((cols, rows), slice);
+        band.write((0, 0), (cols, rows), &mut buffer)?;
+        if let Some(height) = heights.and_then(|h| h.get(level)) {
+            band.set_metadata_item("NETCDF_DIM_height", &height.to_string(), "")?;
+        }
+    }
+    Ok(())
+}
+
+/// A string attribute, whether stored fixed-length (netCDF `NC_CHAR`, as GDAL and
+/// RAiDER write) or variable-length (`NC_STRING`).
+fn attribute_string(attr: &hdf5::Attribute) -> Option<String> {
+    attr.read_scalar::<hdf5::types::FixedAscii<4096>>()
+        .map(|v| v.as_str().to_string())
+        .or_else(|_| {
+            attr.read_scalar::<hdf5::types::VarLenUnicode>()
+                .map(|v| v.as_str().to_string())
+        })
+        .or_else(|_| {
+            attr.read_scalar::<hdf5::types::VarLenAscii>()
+                .map(|v| v.as_str().to_string())
+        })
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Whether `path` starts with the HDF5 signature (netCDF-4), as opposed to a classic
+/// netCDF-3 file (`CDF\x01` / `CDF\x02`).
+fn is_hdf5_file(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    let read = std::fs::File::open(path)?.read(&mut magic)?;
+    Ok(read == 8 && magic == *b"\x89HDF\r\n\x1a\n")
+}
+
 fn ensure_single_level(ds: &Dataset) -> Result<()> {
     let bands = ds.raster_count();
     match bands {
@@ -49,15 +228,14 @@ fn ensure_single_level(ds: &Dataset) -> Result<()> {
 /// Read a tropospheric range-delay band (meters) from an OPERA L4 netCDF variable.
 ///
 /// `var` is the netCDF variable name (e.g. `troposphere`); GDAL is opened on the
-/// `NETCDF:"path":var` connection string.
+/// variable read by [`open_netcdf_variable`].
 ///
 /// # Errors
 /// Returns [`CorrectionError::Gdal`] if the variable or grid cannot be read, or
 /// [`CorrectionError::TroposphereHeightLevels`] for a height-resolved variable.
 pub fn read_l4_netcdf(path: &Path, var: &str) -> Result<DelayGrid> {
     hdf5::sync::sync(|| {
-        let conn = format!("NETCDF:\"{}\":{var}", path.display());
-        let ds = Dataset::open(Path::new(&conn))?;
+        let ds = open_netcdf_variable(path, var)?;
         ensure_single_level(&ds)?;
         let (cols, rows) = ds.raster_size();
         let band = ds.rasterband(1)?;
@@ -90,8 +268,7 @@ pub fn read_l4_netcdf_for_grid(
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
     hdf5::sync::sync(|| {
-        let conn = format!("NETCDF:\"{}\":{var}", path.display());
-        let ds = Dataset::open(Path::new(&conn))?;
+        let ds = open_netcdf_variable(path, var)?;
         ensure_single_level(&ds)?;
         read_dataset_for_grid(&ds, 1, dst_gt, dst_epsg, dst_shape)
     })
@@ -107,8 +284,7 @@ pub fn read_l4_netcdf_for_grid(
 /// [`CorrectionError::Shape`] if a band carries no height coordinate.
 pub fn height_levels(path: &Path, var: &str) -> Result<Vec<f64>> {
     hdf5::sync::sync(|| {
-        let conn = format!("NETCDF:\"{}\":{var}", path.display());
-        let ds = Dataset::open(Path::new(&conn))?;
+        let ds = open_netcdf_variable(path, var)?;
         (1..=ds.raster_count())
             .map(|index| {
                 ds.rasterband(index)?
@@ -136,8 +312,7 @@ pub fn read_l4_level_for_grid(
     dst_shape: (usize, usize),
 ) -> Result<DelayGrid> {
     hdf5::sync::sync(|| {
-        let conn = format!("NETCDF:\"{}\":{var}", path.display());
-        let ds = Dataset::open(Path::new(&conn))?;
+        let ds = open_netcdf_variable(path, var)?;
         if level >= ds.raster_count() {
             return Err(CorrectionError::Shape(format!(
                 "height level {level} out of range ({} levels)",
@@ -497,7 +672,9 @@ fn write_netcdf_fixture(
     }
 
     let nc = DriverManager::get_driver_by_name("netCDF")?;
-    hdf5::sync::sync(|| src.create_copy(&nc, path, &Default::default()))?;
+    // netCDF-4 (HDF5), the format of OPERA L4 and RAiDER cubes.
+    let options = gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]);
+    hdf5::sync::sync(|| src.create_copy(&nc, path, &options))?;
     Ok(())
 }
 
@@ -527,7 +704,9 @@ fn write_netcdf_fixture_with_validity(
         band.write((0, 0), (cols, rows), &mut buffer)?;
     }
     let nc = DriverManager::get_driver_by_name("netCDF")?;
-    hdf5::sync::sync(|| src.create_copy(&nc, path, &Default::default()))?;
+    // netCDF-4 (HDF5), the format of OPERA L4 and RAiDER cubes.
+    let options = gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]);
+    hdf5::sync::sync(|| src.create_copy(&nc, path, &options))?;
     Ok(())
 }
 
@@ -703,6 +882,95 @@ mod tests {
             assert!(
                 (got - expected).abs() < 5e-3,
                 "pixel ({r},{cc}): warped {got} vs analytic {expected}"
+            );
+        }
+    }
+
+    /// A classic netCDF-3 file (no HDF5) still reads, through GDAL's netCDF driver,
+    /// and matches the netCDF-4 read of the same field.
+    #[test]
+    fn classic_and_netcdf4_reads_agree() {
+        use gdal::DriverManager;
+        let field = array![[0.10_f64, 0.12, 0.14], [0.16, 0.18, 0.20]];
+        let gt = [300_000.0, 20.0, 0.0, 4_100_000.0, 0.0, -20.0];
+        let nc4 = std::env::temp_dir().join("dolphin_l4_nc4.nc");
+        let classic = std::env::temp_dir().join("dolphin_l4_classic.nc");
+        let _ = std::fs::remove_file(&nc4);
+        let _ = std::fs::remove_file(&classic);
+        write_netcdf_fixture(&nc4, field.view(), gt, 32610).unwrap();
+        assert!(is_hdf5_file(&nc4).unwrap());
+        let source = hdf5::sync::sync(|| Dataset::open(&nc4)).unwrap();
+        let driver = DriverManager::get_driver_by_name("netCDF").unwrap();
+        hdf5::sync::sync(|| source.create_copy(&driver, &classic, &Default::default())).unwrap();
+        assert!(!is_hdf5_file(&classic).unwrap());
+        let a = read_l4_netcdf(&nc4, "Band1").unwrap();
+        let b = read_l4_netcdf(&classic, "Band1").unwrap();
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.geotransform, b.geotransform);
+        assert_eq!(a.epsg, b.epsg);
+        let _ = std::fs::remove_file(nc4);
+        let _ = std::fs::remove_file(classic);
+    }
+
+    /// Real-data gate: a RAiDER HRRR cube in the OPERA L4 layout (path in
+    /// `RAIDER_CUBE_REAL`) reads identically through the HDF5 path and through
+    /// GDAL's netCDF driver: every height level, geotransform and CRS.
+    #[test]
+    #[ignore = "requires a staged real cube; run explicitly with --ignored"]
+    fn real_raider_cube_matches_gdal_netcdf_driver() {
+        let path = std::env::var("RAIDER_CUBE_REAL").expect("RAIDER_CUBE_REAL");
+        let path = std::path::Path::new(&path);
+        for var in ["hydrostatic_delay", "wet_delay"] {
+            let ours = hdf5::sync::sync(|| open_netcdf_variable(path, var)).unwrap();
+            let conn = format!("NETCDF:\"{}\":{var}", path.display());
+            let gdal_ds = hdf5::sync::sync(|| Dataset::open(Path::new(&conn))).unwrap();
+            assert_eq!(ours.raster_count(), gdal_ds.raster_count(), "{var} levels");
+            assert_eq!(ours.raster_size(), gdal_ds.raster_size());
+            let (a, b) = (
+                ours.geo_transform().unwrap(),
+                gdal_ds.geo_transform().unwrap(),
+            );
+            for k in 0..6 {
+                assert!(
+                    (a[k] - b[k]).abs() < 1e-9,
+                    "{var} gt[{k}] {} vs {}",
+                    a[k],
+                    b[k]
+                );
+            }
+            let (cols, rows) = ours.raster_size();
+            for level in 1..=ours.raster_count() {
+                let x: Buffer<f64> = ours
+                    .rasterband(level)
+                    .unwrap()
+                    .read_as((0, 0), (cols, rows), (cols, rows), None)
+                    .unwrap();
+                let y: Buffer<f64> = hdf5::sync::sync(|| {
+                    gdal_ds.rasterband(level).unwrap().read_as(
+                        (0, 0),
+                        (cols, rows),
+                        (cols, rows),
+                        None,
+                    )
+                })
+                .unwrap();
+                assert_eq!(x.data(), y.data(), "{var} level {level}");
+                let hx = ours
+                    .rasterband(level)
+                    .unwrap()
+                    .metadata_item("NETCDF_DIM_height", "");
+                let hy = gdal_ds
+                    .rasterband(level)
+                    .unwrap()
+                    .metadata_item("NETCDF_DIM_height", "");
+                assert_eq!(
+                    hx.map(|v| v.parse::<f64>().unwrap()),
+                    hy.map(|v| v.parse::<f64>().unwrap())
+                );
+            }
+            assert_eq!(
+                ours.spatial_ref().unwrap().auth_code().ok(),
+                gdal_ds.spatial_ref().unwrap().auth_code().ok()
             );
         }
     }
