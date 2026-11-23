@@ -29,6 +29,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 import requests
+
+from edl_token import earthdata_token
 from netCDF4 import Dataset
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -177,9 +179,10 @@ def main() -> None:
                     default=[-99.17691, -98.97694, 19.40265, 19.48732])
     args = ap.parse_args()
 
-    token = os.environ.get("GP_EARTHDATA_TOKEN") or os.environ.get("EARTHDATA_TOKEN")
-    if not token:
-        sys.exit("no Earthdata token; run: source validation/creds.sh")
+    try:
+        token = earthdata_token()
+    except RuntimeError as error:
+        sys.exit(str(error))
     sel = json.loads(args.granules.read_text())
     args.out.mkdir(parents=True, exist_ok=True)
 

@@ -7,6 +7,31 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Houston before/after for the integer loop-closure correction** (issue #142,
+  `validation/issue142_houston_loop_closure.py`, receipt in
+  `validation/results/issue142_houston_loop_closure/`). On the cropped Houston T034-071054-IW3
+  burst of the #192 recipe (91 real OPERA CSLC dates, bandwidth-2 network, native unwrapper),
+  the loop-closure gate drops the valid fraction from 0.904 to 0.823. Gate plus
+  `correct_unwrap_loop_errors` brings it back to 0.893, recovering 86.6% of the pixels the gate
+  masks. The three GNSS stations stay 25/25 valid in every arm, and their station-pair LOS rate
+  error vs GNSS is unchanged (mean 0.72 mm/yr).
+- **EDL token from repo-env credentials** (issue #229). `validation/edl_token.py` gives
+  every fetch script the pasted `GP_EARTHDATA_TOKEN` while its JWT is unexpired, and otherwise
+  the live token from EDL `find_or_create_token` using `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`.
+  The netrc fallback in `fetch_real.py` is removed.
+- **Persistent-scatterer selection and fill, opt-in** (issue #232). `ps_options.enabled: true`
+  (default `false`, a forward divergence: dolphin always runs PS) selects PS by amplitude
+  dispersion below `ps_options.amp_dispersion_threshold`, and PS cells take the brightest PS's
+  referenced phase and temporal coherence 1 (dolphin `fill_ps_pixels`).
+  `phase_linking.mask_input_ps` leaves PS pixels out of covariance. Selection is causal: each
+  ministack uses exact running amplitude statistics (`dolphin_ps::AmplitudeStats`, Chan
+  pairwise merge) over every date up to its end, carried in `SequentialState`. So an NRT
+  update is bit-identical to a full rerun. Per-burst `ps/<burst_id>/{ps_pixels,amp_dispersion,amp_mean}.tif`
+  are written on the native grid. On the real 30-date T100 cohort the merge matches one-shot
+  `calc_ps` exactly, NRT resume matches a full run bit for bit, the tiled CLI's PS mask
+  matches an independent numpy D_A with zero flips, and default-config outputs are
+  byte-identical to the previous release. PS is refused with
+  `phase_linking.write_covariance_operator` (#233).
 - **Opt-in whirlwind unwrapper** (issue #169). `unwrap_method: whirlwind` now runs
   `whirlwind-core` (Scott Staniewicz's Rust minimum-cost-flow unwrapper, BSD-3-Clause OR
   Apache-2.0, git dependency pinned to its v0.10.0 tag) in-process through a new

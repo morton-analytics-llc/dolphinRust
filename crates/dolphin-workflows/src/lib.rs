@@ -72,14 +72,14 @@ pub use sequential::{
     run_sequential_resumable_masked_with_covariance_capture_and_source_factors,
     run_sequential_resumable_with_covariance_capture,
     run_sequential_resumable_with_covariance_capture_and_source_factors,
-    run_sequential_with_covariance_capture,
+    run_sequential_resumable_with_ps, run_sequential_with_covariance_capture,
     run_sequential_with_covariance_capture_and_source_factors, update_sequential,
     update_sequential_masked, update_sequential_masked_with_covariance_capture,
     update_sequential_masked_with_covariance_capture_and_source_factors,
     update_sequential_with_covariance_capture,
-    update_sequential_with_covariance_capture_and_source_factors, SequentialConfig,
-    SequentialCovarianceCapturePlan, SequentialCovarianceRevision, SequentialCovarianceState,
-    SequentialOutput, SequentialState,
+    update_sequential_with_covariance_capture_and_source_factors, update_sequential_with_ps,
+    PsSelection, SequentialConfig, SequentialCovarianceCapturePlan, SequentialCovarianceRevision,
+    SequentialCovarianceState, SequentialOutput, SequentialState,
 };
 pub use sequential_covariance::{
     empirical_source_factor_receipt_digest,

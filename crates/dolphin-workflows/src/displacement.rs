@@ -16,7 +16,7 @@ use dolphin_core::config::{
     CompressedSlcPlan, ComputeBackend, DisplacementWorkflow, InputType, ReferenceSelectionMethod,
     TimeseriesMethod, TimeseriesOptions, UnwrapMethod,
 };
-use dolphin_core::{BlockIndices, Cf32, Cf64};
+use dolphin_core::{BlockIndices, Cf32, Cf64, Strides};
 use dolphin_io::{
     covariance_identity_index_peak_bytes, covariance_source_model_identity_digest,
     read_aligned_raster_window, read_cslc_shape, read_cslc_window, read_geotransform,
@@ -29,6 +29,7 @@ use dolphin_io::{
 use dolphin_phaselink::{
     all_non_finite_acquisition_indices, correct_phase_bias, estimate_bias_velocity, ComputeEngine,
 };
+use dolphin_ps::PsResult;
 
 use dolphin_timeseries::{
     build_network, check_correction_network, correct_loop_closure_errors,
@@ -74,12 +75,12 @@ use crate::provenance::{
     ReferenceSelectionProvenance, INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
-    run_sequential, run_sequential_masked, run_sequential_masked_with_covariance_capture,
-    run_sequential_masked_with_covariance_capture_and_source_factors, run_sequential_resumable,
-    run_sequential_resumable_masked, run_sequential_with_covariance_capture,
-    run_sequential_with_covariance_capture_and_source_factors, update_sequential,
-    update_sequential_masked, SequentialConfig, SequentialCovarianceCaptureRequest,
-    SequentialOutput, SequentialState,
+    run_sequential_masked_with_covariance_capture,
+    run_sequential_masked_with_covariance_capture_and_source_factors,
+    run_sequential_resumable_with_ps, run_sequential_with_covariance_capture,
+    run_sequential_with_covariance_capture_and_source_factors, update_sequential_with_ps,
+    PsSelection, SequentialConfig, SequentialCovarianceCaptureRequest, SequentialOutput,
+    SequentialState,
 };
 use crate::sequential_covariance::{
     sequential_replay_config_digest, sequential_replay_kernel_digest,
@@ -477,6 +478,9 @@ fn finish_displacement(
         .first()
         .map(|b| b.days.clone())
         .context("cslc_file_list is empty")?;
+    if output_policy == DisplacementOutputPolicy::Full {
+        write_burst_ps_products(cfg, &groups, &bursts)?;
+    }
     let stitched = timed("stitch", || {
         stitch_bursts(
             bursts,
@@ -689,6 +693,54 @@ fn finish_displacement(
         production_covariance,
     };
     emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
+}
+
+/// Write each burst's native-grid PS mask, amplitude dispersion and mean to
+/// `ps/<burst_id>/`, with dolphin's nodata values (255, 0, 0).
+fn write_burst_ps_products(
+    cfg: &DisplacementWorkflow,
+    groups: &BTreeMap<String, Vec<usize>>,
+    bursts: &[BurstLink],
+) -> Result<()> {
+    let strides = cfg.output_options.strides;
+    for burst in bursts {
+        let Some(ps) = burst.ps.as_ref() else {
+            continue;
+        };
+        let id = groups
+            .keys()
+            .nth(burst.coverage.burst_index)
+            .context("PS burst ordinal outside the burst groups")?;
+        let dir = cfg.work_directory.join("ps").join(id);
+        std::fs::create_dir_all(&dir)?;
+        let geo = burst.geo.geo;
+        let mut gt = geo.geotransform;
+        gt[1] /= strides.x as f64;
+        gt[5] /= strides.y as f64;
+        let epsg = Some(geo.epsg);
+        write_raster(
+            &dir.join("ps_pixels.tif"),
+            ps.ps.view(),
+            gt,
+            epsg,
+            Some(255.0),
+        )?;
+        write_raster(
+            &dir.join("amp_dispersion.tif"),
+            ps.amp_dispersion.view(),
+            gt,
+            epsg,
+            Some(0.0),
+        )?;
+        write_raster(
+            &dir.join("amp_mean.tif"),
+            ps.amp_mean.view(),
+            gt,
+            epsg,
+            Some(0.0),
+        )?;
+    }
+    Ok(())
 }
 
 /// The configured reference, checked against the corrected series, else the
@@ -2700,6 +2752,8 @@ struct BurstLink {
     days: Vec<f64>,
     /// Global output-grid origin used by captured replay IDs.
     covariance_output_origin: Option<(u64, u64)>,
+    /// Native-grid PS mask, amplitude dispersion and mean, if PS is enabled.
+    ps: Option<PsResult>,
 }
 
 struct CovarianceCaptureArtifact {
@@ -3342,7 +3396,6 @@ fn phase_link_tiled_impl(
 ) -> Result<TiledPhaseLinkOutput> {
     let strides = cfg.output_options.strides;
     let half = cfg.phase_linking.half_window;
-    let out_shape = strides.out_shape(full_shape);
     let (bh, bw) = cfg.worker_settings.block_shape;
     let out_block = ((bh / strides.y).max(1), (bw / strides.x).max(1));
     // A written pixel's data dependency cone spans `num_ministacks` half-windows
@@ -3352,9 +3405,11 @@ fn phase_link_tiled_impl(
     let depth = nslc.div_ceil(cfg.phase_linking.ministack_size.max(1));
     let mut acc = TiledOutput::new(
         nslc,
-        out_shape,
+        full_shape,
+        strides,
         cfg.phase_linking.write_crlb,
         cfg.phase_linking.calc_average_coh,
+        cfg.ps_options.enabled,
     );
     let plans = plan_tiles(full_shape, strides, half, depth, out_block);
     let tile_count = plans.len();
@@ -4034,17 +4089,29 @@ struct TiledOutput {
     closure: Option<Array3<f64>>,
     validity_mask: Array2<bool>,
     out_shape: (usize, usize),
+    /// Native-grid PS products, filled from each linked tile's owned region.
+    ps: Option<PsResult>,
+    strides: Strides,
 }
 
 impl TiledOutput {
     fn new(
         nslc: usize,
-        out_shape: (usize, usize),
+        full_shape: (usize, usize),
+        strides: Strides,
         want_crlb: bool,
         want_average_coherence: bool,
+        want_ps: bool,
     ) -> Self {
+        let out_shape = strides.out_shape(full_shape);
         let (or, oc) = out_shape;
         Self {
+            ps: want_ps.then(|| PsResult {
+                amp_mean: Array2::zeros(full_shape),
+                amp_dispersion: Array2::zeros(full_shape),
+                ps: Array2::from_elem(full_shape, 255),
+            }),
+            strides,
             cpx: Array3::from_elem((nslc, or, oc), Cf64::new(f64::NAN, f64::NAN)),
             temp_coh: Array2::from_elem((or, oc), f64::NAN),
             ministack_lengths: Vec::new(),
@@ -4116,6 +4183,9 @@ impl TiledOutput {
         self.validity_mask
             .slice_mut(s![g.0..g.0 + h, g.1..g.1 + w])
             .assign(&out.validity_mask.slice(s![l.0..l.0 + h, l.1..l.1 + w]));
+        if let (Some(dst), Some(src)) = (self.ps.as_mut(), out.ps.as_ref()) {
+            place_native_ps(dst, src, plan, self.strides, self.out_shape)?;
+        }
         Ok(())
     }
 
@@ -4138,8 +4208,59 @@ impl TiledOutput {
             crlb_sigma: self.crlb,
             closure_phase: self.closure,
             validity_mask: self.validity_mask,
+            ps: self.ps,
         }
     }
+}
+
+/// Copy a tile's PS products for the native pixels its output cells own. The
+/// last row/column of tiles also owns whatever trailing partial stride it read;
+/// a partial stride no tile read stays nodata.
+fn place_native_ps(
+    dst: &mut PsResult,
+    src: &PsResult,
+    plan: &TilePlan,
+    strides: Strides,
+    out_shape: (usize, usize),
+) -> Result<()> {
+    let owned = |start: usize, stop: usize, stride: usize, out_len: usize, read_stop: usize| {
+        let end = if stop == out_len {
+            read_stop
+        } else {
+            stop * stride
+        };
+        (start * stride, end)
+    };
+    let (r0, r1) = owned(
+        plan.out.row_start,
+        plan.out.row_stop,
+        strides.y,
+        out_shape.0,
+        plan.read.row_stop,
+    );
+    let (c0, c1) = owned(
+        plan.out.col_start,
+        plan.out.col_stop,
+        strides.x,
+        out_shape.1,
+        plan.read.col_stop,
+    );
+    let (lr, lc) = (r0 - plan.read.row_start, c0 - plan.read.col_start);
+    let (h, w) = (r1 - r0, c1 - c0);
+    anyhow::ensure!(
+        lr + h <= src.ps.dim().0 && lc + w <= src.ps.dim().1,
+        "tile PS products smaller than the native region it owns"
+    );
+    let local = s![lr..lr + h, lc..lc + w];
+    let global = s![r0..r1, c0..c1];
+    dst.ps.slice_mut(global).assign(&src.ps.slice(local));
+    dst.amp_mean
+        .slice_mut(global)
+        .assign(&src.amp_mean.slice(local));
+    dst.amp_dispersion
+        .slice_mut(global)
+        .assign(&src.amp_dispersion.slice(local));
+    Ok(())
 }
 
 /// Assign a `(h, w)` block of a band-major `(bands, rows, cols)` array from the
@@ -4188,6 +4309,7 @@ fn burst_link(
         None
     };
     Ok(BurstLink {
+        ps: out.ps,
         pl: out.cpx_phase,
         temp_coh: out.temporal_coherence,
         ministack_lengths: out.ministack_lengths,
@@ -4315,15 +4437,13 @@ fn link_one_burst_resumable(
         .as_ref()
         .map(|mask| mask.reader.read(mask.reader.full_block()))
         .transpose()?;
-    let (out, state) = match native_validity.as_ref() {
-        Some(valid) => run_sequential_resumable_masked(
-            stack.view(),
-            valid.view(),
-            &sequential_config(cfg),
-            engine,
-        ),
-        None => run_sequential_resumable(stack.view(), &sequential_config(cfg), engine),
-    }
+    let (out, state) = run_sequential_resumable_with_ps(
+        stack.view(),
+        native_validity.as_ref().map(Array2::view),
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
     .map_err(anyhow::Error::msg)?;
     let mut link = burst_link(
         cfg,
@@ -4679,16 +4799,14 @@ fn update_one_burst(
         .as_ref()
         .map(|mask| mask.reader.read(mask.reader.full_block()))
         .transpose()?;
-    let (out, seq) = match native_validity.as_ref() {
-        Some(valid) => update_sequential_masked(
-            &prev.seq,
-            new_stack.view(),
-            valid.view(),
-            &sequential_config(cfg),
-            engine,
-        ),
-        None => update_sequential(&prev.seq, new_stack.view(), &sequential_config(cfg), engine),
-    }
+    let (out, seq) = update_sequential_with_ps(
+        &prev.seq,
+        new_stack.view(),
+        native_validity.as_ref().map(Array2::view),
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
     .map_err(anyhow::Error::msg)?;
     let days = acquisition_days(cfg, &files)?;
     let mut link = burst_link(
@@ -5155,10 +5273,14 @@ fn phase_link(
     engine: &ComputeEngine,
     valid_mask: Option<ArrayView2<bool>>,
 ) -> Result<SequentialOutput> {
-    match valid_mask {
-        Some(mask) => run_sequential_masked(stack, mask, &sequential_config(cfg), engine),
-        None => run_sequential(stack, &sequential_config(cfg), engine),
-    }
+    run_sequential_resumable_with_ps(
+        stack,
+        valid_mask,
+        &sequential_config(cfg),
+        ps_selection(cfg),
+        engine,
+    )
+    .map(|(output, _)| output)
     .map_err(anyhow::Error::msg)
 }
 
@@ -5194,6 +5316,14 @@ fn sequential_config(cfg: &DisplacementWorkflow) -> SequentialConfig {
         shp_method: cfg.phase_linking.shp_method,
         shp_alpha: cfg.phase_linking.shp_alpha,
     }
+}
+
+/// `ps_options` as the sequential estimator's PS selection; `None` when off.
+fn ps_selection(cfg: &DisplacementWorkflow) -> Option<PsSelection> {
+    cfg.ps_options.enabled.then_some(PsSelection {
+        amp_dispersion_threshold: cfg.ps_options.amp_dispersion_threshold,
+        mask_input_ps: cfg.phase_linking.mask_input_ps,
+    })
 }
 
 /// Refuse, before unwrapping, a pair graph the SBAS inversion cannot solve:
@@ -6211,6 +6341,7 @@ mod tests {
             },
             days: vec![0.0, 12.0],
             covariance_output_origin: Some((0, 0)),
+            ps: None,
         }
     }
 

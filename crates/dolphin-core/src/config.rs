@@ -98,6 +98,11 @@ pub const CONFIG_BEHAVIOR_CONTRACTS: &[ConfigBehaviorContract] = &[
         evidence: "dolphin-workflows::displacement::tests::workflow_network_options_map_to_network_builder plus dolphin-timeseries::timeseries_contract::networks_match_oracle",
     },
     ConfigBehaviorContract {
+        id: "CFG-PS",
+        reader: "dolphin-workflows::{displacement::{sequential_config, write_burst_ps_products}, sequential::{drive, link_and_compress}}",
+        evidence: "dolphin-workflows::ps_sequential_contract plus dolphin-ps::amplitude_stats_contract",
+    },
+    ConfigBehaviorContract {
         id: "CFG-UNWRAP-BACKEND",
         reader: "dolphin-workflows::displacement::{unwrap_network, unwrap_backend, native_config, unwrap_config, tophu_config}",
         evidence: "dolphin-workflows::displacement workflow-to-backend mapping contracts plus unwrap_backend_contract and unwrap_parallel_contract",
@@ -195,10 +200,7 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     consumed!("input_options", "CFG-INPUT-READ"),
     consumed!("cslc_file_list", "CFG-INPUT-READ"),
     consumed!("output_options", "CFG-BOUNDS-CROP"),
-    compatibility_only!(
-        "ps_options",
-        "persistent-scatterer update inputs are not implemented"
-    ),
+    consumed!("ps_options", "CFG-PS"),
     compatibility_only!(
         "amplitude_dispersion_files",
         "persistent-scatterer update inputs are not implemented"
@@ -229,9 +231,11 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     consumed!("work_directory", "CFG-OUTPUT-VALIDITY"),
     consumed!("worker_settings", "CFG-PHASE-LINK"),
     compatibility_only!("log_file", "the Rust CLI configures logging independently"),
-    compatibility_only!(
+    consumed!("ps_options.enabled", "CFG-PS"),
+    conditional!(
         "ps_options.amp_dispersion_threshold",
-        "persistent-scatterer selection and update inputs are not implemented"
+        "CFG-PS",
+        "ps_options.enabled is true"
     ),
     consumed!("phase_linking.ministack_size", "CFG-PHASE-LINK"),
     consumed!("phase_linking.max_num_compressed", "CFG-PHASE-LINK"),
@@ -242,9 +246,10 @@ pub const CONFIG_FIELD_DISPOSITIONS: &[ConfigFieldDispositionEntry] = &[
     consumed!("phase_linking.zero_correlation_threshold", "CFG-PHASE-LINK"),
     consumed!("phase_linking.shp_method", "CFG-SHP-WIRING"),
     consumed!("phase_linking.shp_alpha", "CFG-SHP-WIRING"),
-    compatibility_only!(
+    conditional!(
         "phase_linking.mask_input_ps",
-        "the workflow has no persistent-scatterer label input"
+        "CFG-PS",
+        "ps_options.enabled is true"
     ),
     compatibility_only!(
         "phase_linking.baseline_lag",
@@ -773,14 +778,19 @@ pub enum ReferenceSelectionMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PsOptions {
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// persistent-scatterer selection/update inputs are not implemented.
+    /// Run persistent-scatterer selection and fill during phase linking. **Off
+    /// by default**, unlike dolphin, which always runs it: enabling it changes
+    /// the linked phase and temporal coherence of PS cells. Forward divergence.
+    /// Not yet available with `phase_linking.write_covariance_operator`.
+    pub enabled: bool,
+    /// Amplitude dispersion below which a pixel is PS (read when `enabled`).
     pub amp_dispersion_threshold: f64,
 }
 
 impl Default for PsOptions {
     fn default() -> Self {
         Self {
+            enabled: false,
             amp_dispersion_threshold: 0.25,
         }
     }
@@ -811,8 +821,8 @@ pub struct PhaseLinkingOptions {
     pub shp_method: ShpMethod,
     /// Significance level (false-alarm probability) for the SHP test.
     pub shp_alpha: f64,
-    /// Dolphin YAML compatibility only; non-default values are rejected because
-    /// the workflow has no persistent-scatterer label input.
+    /// Leave PS pixels out of covariance estimation so their bright amplitude
+    /// does not dominate neighbouring estimates. Requires `ps_options.enabled`.
     pub mask_input_ps: bool,
     /// Dolphin YAML compatibility only; non-default values are rejected because
     /// sequential phase linking does not implement StBAS lag filtering.
@@ -1616,6 +1626,32 @@ impl DisplacementWorkflow {
         serde_yaml::to_string(self).map_err(CoreError::from)
     }
 
+    /// PS options: a real threshold when enabled, and no PS-dependent option or
+    /// capture mode while it is off or unsupported.
+    fn validate_ps(&self) -> Result<()> {
+        let ps = &self.ps_options;
+        if !ps.enabled {
+            if self.phase_linking.mask_input_ps {
+                return Err(CoreError::InvalidConfig(
+                    "phase_linking.mask_input_ps requires ps_options.enabled".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if !(ps.amp_dispersion_threshold.is_finite() && ps.amp_dispersion_threshold > 0.0) {
+            return Err(CoreError::InvalidConfig(format!(
+                "ps_options.amp_dispersion_threshold must be finite and positive, got {}",
+                ps.amp_dispersion_threshold
+            )));
+        }
+        if self.phase_linking.write_covariance_operator {
+            return Err(CoreError::InvalidConfig(
+                "ps_options.enabled is not yet supported with phase_linking.write_covariance_operator".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject modeled dolphin options whose non-default behavior is not implemented.
     ///
     /// Parsing and serialization intentionally remain permissive so a dolphin YAML
@@ -1839,10 +1875,9 @@ impl DisplacementWorkflow {
         );
         require_compatibility_default!(self, defaults, output_options.add_overviews);
         require_compatibility_default!(self, defaults, output_options.overview_levels);
-        require_compatibility_default!(self, defaults, ps_options.amp_dispersion_threshold);
+        self.validate_ps()?;
         require_compatibility_default!(self, defaults, amplitude_dispersion_files);
         require_compatibility_default!(self, defaults, amplitude_mean_files);
-        require_compatibility_default!(self, defaults, phase_linking.mask_input_ps);
         require_compatibility_default!(self, defaults, phase_linking.baseline_lag);
         require_compatibility_default!(self, defaults, unwrap_options.run_unwrap);
         require_compatibility_default!(self, defaults, unwrap_options.run_goldstein);

@@ -36,6 +36,7 @@ const EXPECTED_CONFIG_PATHS: &[&str] = &[
     "work_directory",
     "worker_settings",
     "log_file",
+    "ps_options.enabled",
     "ps_options.amp_dispersion_threshold",
     "phase_linking.ministack_size",
     "phase_linking.max_num_compressed",
@@ -254,9 +255,9 @@ fn audit_ps(value: PsOptions, paths: &mut Vec<&'static str>) {
         PsOptions,
         paths,
         "ps_options.",
-        [amp_dispersion_threshold,]
+        [enabled, amp_dispersion_threshold,]
     );
-    let _ = amp_dispersion_threshold;
+    let _ = (enabled, amp_dispersion_threshold);
 }
 
 fn audit_phase_linking(value: PhaseLinkingOptions, paths: &mut Vec<&'static str>) {
@@ -551,18 +552,12 @@ fn compatibility_only_cases() -> Vec<(&'static str, MutateConfig)> {
         ("output_options.overview_levels", |c| {
             c.output_options.overview_levels = vec![2]
         }),
-        ("ps_options.amp_dispersion_threshold", |c| {
-            c.ps_options.amp_dispersion_threshold = 0.5
-        }),
         ("amplitude_dispersion_files", |c| {
             c.amplitude_dispersion_files
                 .push(PathBuf::from("amp-disp.tif"))
         }),
         ("amplitude_mean_files", |c| {
             c.amplitude_mean_files.push(PathBuf::from("amp-mean.tif"))
-        }),
-        ("phase_linking.mask_input_ps", |c| {
-            c.phase_linking.mask_input_ps = true
         }),
         ("phase_linking.baseline_lag", |c| {
             c.phase_linking.baseline_lag = Some(2)

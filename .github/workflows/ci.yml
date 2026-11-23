@@ -1,21 +1,59 @@
 name: CI
 
+# Agents run the full local gates (fmt, clippy -D warnings, cargo test, Python
+# validation) before every push, so PR CI is a cheap confirmation, not a second
+# full build:
+# - a PR that touches no code (docs, markdown, prompts) skips `verify`; a
+#   required check skipped by `if:` reports success, so `verify` stays required;
+# - fmt, clippy and tests run in one job on one warm target dir;
+# - the two Python modules that rebuild the workspace in release mode
+#   (spatial/temporal covariance validation) run on PRs only when `validation/`
+#   changes, and always on push to main and nightly.
 on:
   pull_request:
   # Work lands on main directly as well as through PRs, so verify pushes to main
   # too — otherwise a direct commit is never checked by anything.
   push:
     branches: [main]
+  schedule:
+    - cron: "0 9 * * *" # UTC, nightly full run
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      validation: ${{ steps.filter.outputs.validation }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'validation/**'
+              - 'oracle/**'
+              - 'bench/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+            validation:
+              - 'validation/**'
+
   verify:
+    needs: scope
+    if: github.event_name != 'pull_request' || needs.scope.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
+      FULL_VALIDATION: ${{ github.event_name != 'pull_request' || needs.scope.outputs.validation == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -34,6 +72,10 @@ jobs:
           toolchain: 1.94.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR caches are scoped to the PR ref and never reused; only main's
+          # cache is restored by later runs, so only main saves.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -43,8 +85,6 @@ jobs:
             aiohttp asf-search fsspec h5py numpy pyproj rasterio requests ruamel.yaml scipy
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Workspace check
-        run: cargo check --workspace
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
       - name: Rust tests
@@ -54,4 +94,9 @@ jobs:
       - name: Python validation tests
         run: |
           python -m compileall -q validation
-          python -m unittest discover -s validation/tests -p 'test_*.py'
+          if [ "$FULL_VALIDATION" = "true" ]; then
+            python -m unittest discover -s validation/tests -p 'test_*.py'
+          else
+            modules=$(cd validation/tests && ls test_*.py | grep -v -e '^test_spatial_covariance_validation.py$' -e '^test_temporal_covariance.py$' | sed 's/\.py$//')
+            PYTHONPATH=validation/tests python -m unittest $modules
+          fi

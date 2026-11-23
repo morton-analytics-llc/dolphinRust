@@ -22,6 +22,7 @@ import h5py
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from edl_token import earthdata_token  # noqa: E402
 from probe_l4_tropo_transfer import (  # noqa: E402
     E,
     N,
@@ -39,9 +40,10 @@ COORDS = ("time", "height", "latitude", "longitude")
 
 
 def main() -> None:
-    token = os.environ.get("GP_EARTHDATA_TOKEN") or os.environ.get("EARTHDATA_TOKEN")
-    if not token:
-        sys.exit("no Earthdata token; run: source validation/creds.sh")
+    try:
+        token = earthdata_token()
+    except RuntimeError as error:
+        sys.exit(str(error))
     dem = json.loads((OUT / "dem_range.json").read_text())
     lo, hi = dem["terrain_min_m"], dem["terrain_max_m"]
 

@@ -175,3 +175,165 @@ fn fill_cell(
     });
     temp_coh[cell] = 1.0;
 }
+
+/// Error from combining or summarizing [`AmplitudeStats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PsError {
+    /// Two statistics (or a statistic and a stack) cover different grids.
+    ShapeMismatch,
+    /// A pixel was observed more often than `u32` can count.
+    CountOverflow,
+}
+
+impl std::fmt::Display for PsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShapeMismatch => f.write_str("amplitude statistics cover different grids"),
+            Self::CountOverflow => f.write_str("amplitude sample count overflows u32"),
+        }
+    }
+}
+
+impl std::error::Error for PsError {}
+
+/// Exact running amplitude statistics per pixel: finite-sample count, mean and
+/// sum of squared deviations (`m2`), over `num_dates` acquisitions.
+///
+/// Built per batch of dates with [`Self::from_stack`] and combined with
+/// [`Self::merge`] (Chan et al. pairwise update), so statistics over a long
+/// series can be extended one ministack at a time without rereading old dates.
+/// The result matches a one-shot [`calc_ps`] over all dates to rounding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmplitudeStats {
+    /// Acquisitions covered, finite or not.
+    pub num_dates: usize,
+    /// Finite amplitude samples per pixel.
+    pub count: Array2<u32>,
+    /// Mean amplitude of the finite samples (0 where `count` is 0).
+    pub mean: Array2<f64>,
+    /// Sum of squared deviations from `mean` (0 where `count` is 0).
+    pub m2: Array2<f64>,
+}
+
+impl AmplitudeStats {
+    /// Statistics of `|z|` over every date of `stack` `(nslc, rows, cols)`,
+    /// ignoring non-finite samples.
+    ///
+    /// # Errors
+    /// [`PsError::CountOverflow`] when `nslc` exceeds `u32`.
+    pub fn from_stack(stack: ArrayView3<Cf64>) -> Result<Self, PsError> {
+        let (nslc, rows, cols) = stack.dim();
+        u32::try_from(nslc).map_err(|_| PsError::CountOverflow)?;
+        let lanes: Vec<(u32, f64, f64)> = (0..rows * cols)
+            .into_par_iter()
+            .map(|idx| lane_stats(stack.slice(s![.., idx / cols, idx % cols])))
+            .collect();
+        let field = |pick: fn(&(u32, f64, f64)) -> f64| {
+            Array2::from_shape_fn((rows, cols), |(r, c)| pick(&lanes[r * cols + c]))
+        };
+        Ok(Self {
+            num_dates: nslc,
+            count: Array2::from_shape_fn((rows, cols), |(r, c)| lanes[r * cols + c].0),
+            mean: field(|lane| lane.1),
+            m2: field(|lane| lane.2),
+        })
+    }
+
+    /// Statistics over the dates of `self` followed by those of `later`.
+    ///
+    /// # Errors
+    /// [`PsError::ShapeMismatch`] when the grids differ;
+    /// [`PsError::CountOverflow`] when a pixel count exceeds `u32`.
+    pub fn merge(&self, later: &Self) -> Result<Self, PsError> {
+        if self.count.dim() != later.count.dim() {
+            return Err(PsError::ShapeMismatch);
+        }
+        let mut merged = self.clone();
+        merged.num_dates += later.num_dates;
+        let mut overflow = false;
+        ndarray::Zip::from(&mut merged.count)
+            .and(&mut merged.mean)
+            .and(&mut merged.m2)
+            .and(&later.count)
+            .and(&later.mean)
+            .and(&later.m2)
+            .for_each(|count, mean, m2, &count_b, &mean_b, &m2_b| {
+                let Some(total) = count.checked_add(count_b) else {
+                    overflow = true;
+                    return;
+                };
+                (*mean, *m2) = chan_merge((*count, *mean, *m2), (count_b, mean_b, m2_b));
+                *count = total;
+            });
+        match overflow {
+            true => Err(PsError::CountOverflow),
+            false => Ok(merged),
+        }
+    }
+
+    /// Amplitude dispersion `std/mean` (population std), NaN where undefined.
+    #[must_use]
+    pub fn dispersion(&self) -> Array2<f64> {
+        ndarray::Zip::from(&self.count)
+            .and(&self.mean)
+            .and(&self.m2)
+            .map_collect(|&count, &mean, &m2| match count {
+                0 => f64::NAN,
+                n => (m2 / f64::from(n)).sqrt() / mean,
+            })
+    }
+
+    /// PS selection from these statistics with [`calc_ps`]'s rules: a pixel with
+    /// any non-finite date is nodata, as is one with zero dispersion.
+    #[must_use]
+    pub fn to_ps(&self, threshold: f64) -> PsResult {
+        let dispersion = self.dispersion();
+        let complete = self.count.mapv(|count| count as usize == self.num_dates);
+        let disp =
+            ndarray::Zip::from(&dispersion)
+                .and(&complete)
+                .map_collect(|&disp, &complete| match complete {
+                    true => nan_to_num(disp),
+                    false => 0.0,
+                });
+        PsResult {
+            amp_mean: self.mean.mapv(|mean| nan_to_num(mean) as f32),
+            ps: disp.mapv(|disp| ps_flag(disp, threshold)),
+            amp_dispersion: disp.mapv(|disp| disp as f32),
+        }
+    }
+}
+
+/// `(count, mean, m2)` of the finite amplitudes in one temporal lane.
+fn lane_stats(lane: ArrayView1<Cf64>) -> (u32, f64, f64) {
+    let finite: Vec<f64> = lane
+        .iter()
+        .map(|z| z.norm())
+        .filter(|v| v.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return (0, 0.0, 0.0);
+    }
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let m2 = finite.iter().map(|v| (v - mean).powi(2)).sum::<f64>();
+    // `from_stack` checked the date count fits u32, and finite.len() ≤ it.
+    (finite.len() as u32, mean, m2)
+}
+
+/// Chan et al. pairwise combination of `(count, mean, m2)`; an empty side
+/// passes the other through unchanged so seeding with nothing is exact.
+fn chan_merge(a: (u32, f64, f64), b: (u32, f64, f64)) -> (f64, f64) {
+    match (a.0, b.0) {
+        (_, 0) => (a.1, a.2),
+        (0, _) => (b.1, b.2),
+        (na, nb) => {
+            let (na, nb) = (f64::from(na), f64::from(nb));
+            let total = na + nb;
+            let delta = b.1 - a.1;
+            let mean = a.1 + delta * nb / total;
+            let m2 = a.2 + b.2 + delta * delta * na * nb / total;
+            (mean, m2)
+        }
+    }
+}
