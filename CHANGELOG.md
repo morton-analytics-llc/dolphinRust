@@ -7,6 +7,18 @@ All notable changes to dolphinRust are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Houston before/after for the integer loop-closure correction** (issue #142,
+  `validation/issue142_houston_loop_closure.py`, receipt in
+  `validation/results/issue142_houston_loop_closure/`). On the cropped Houston T034-071054-IW3
+  burst of the #192 recipe (91 real OPERA CSLC dates, bandwidth-2 network, native unwrapper),
+  the loop-closure gate drops the valid fraction from 0.904 to 0.823. Gate plus
+  `correct_unwrap_loop_errors` brings it back to 0.893, recovering 86.6% of the pixels the gate
+  masks. The three GNSS stations stay 25/25 valid in every arm, and their station-pair LOS rate
+  error vs GNSS is unchanged (mean 0.72 mm/yr).
+- **EDL token from repo-env credentials** (issue #229). `validation/edl_token.py` gives
+  every fetch script the pasted `GP_EARTHDATA_TOKEN` while its JWT is unexpired, and otherwise
+  the live token from EDL `find_or_create_token` using `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`.
+  The netrc fallback in `fetch_real.py` is removed.
 - **Persistent-scatterer selection and fill, opt-in** (issue #232). `ps_options.enabled: true`
   (default `false`, a forward divergence: dolphin always runs PS) selects PS by amplitude
   dispersion below `ps_options.amp_dispersion_threshold`, and PS cells take the brightest PS's
