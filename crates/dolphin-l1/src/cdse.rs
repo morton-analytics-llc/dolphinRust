@@ -721,7 +721,7 @@ fn unzip(zip_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let Some(relative) = entry.enclosed_name().map(Path::to_path_buf) else {
+        let Some(relative) = entry.enclosed_name() else {
             continue;
         };
         let out = dest.join(relative);
@@ -741,8 +741,9 @@ fn extract_member_with_suffix(zip_path: &Path, suffix: &str, dest: &Path) -> Res
     let mut archive = zip::ZipArchive::new(File::open(zip_path)?)?;
     let name = archive
         .file_names()
+        .filter_map(std::result::Result::ok)
         .find(|n| n.ends_with(suffix))
-        .map(str::to_string)
+        .map(|n| n.into_owned())
         .ok_or_else(|| L1Error::Product(format!("{} holds no *{suffix}", zip_path.display())))?;
     let mut entry = archive.by_name(&name)?;
     std::io::copy(&mut entry, &mut File::create(dest)?)?;
