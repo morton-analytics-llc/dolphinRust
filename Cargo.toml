@@ -13,6 +13,7 @@ members = [
     "crates/dolphin-corrections",
     "crates/dolphin-ingest",
     "crates/dolphin-workflows",
+    "crates/dolphin-l1",
     "crates/dolphin-cli",
 ]
 
@@ -59,6 +60,7 @@ dolphin-filtering = { path = "crates/dolphin-filtering", version = "1.6.0" }
 dolphin-unwrap = { path = "crates/dolphin-unwrap", version = "1.6.0" }
 dolphin-corrections = { path = "crates/dolphin-corrections", version = "1.6.0" }
 dolphin-ingest = { path = "crates/dolphin-ingest", version = "1.6.0" }
+dolphin-l1 = { path = "crates/dolphin-l1", version = "1.6.0" }
 dolphin-workflows = { path = "crates/dolphin-workflows", version = "1.6.0", default-features = false }
 
 # Enforced idiomatic-Rust standards. Each crate opts in via `[lints] workspace = true`.
