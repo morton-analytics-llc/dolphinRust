@@ -732,7 +732,8 @@ mod tests {
     /// the GDAL ingest with its known field and geotransform recovered.
     #[test]
     fn ingests_synthesized_l4_netcdf() {
-        let path = std::env::temp_dir().join("dolphin_l4_contract.nc");
+        let path =
+            std::env::temp_dir().join(format!("dolphin_l4_contract-{}.nc", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let field = array![[0.10_f64, 0.12, 0.14], [0.16, 0.18, 0.20]];
         let gt = [300_000.0, 20.0, 0.0, 4_100_000.0, 0.0, -20.0];
@@ -751,7 +752,10 @@ mod tests {
 
     #[test]
     fn bounded_l4_read_is_native_windowed_and_resamples_exactly() {
-        let path = std::env::temp_dir().join("dolphin_l4_bounded_window.nc");
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_l4_bounded_window-{}.nc",
+            std::process::id()
+        ));
         let field = Array2::from_shape_fn((100, 120), |(row, col)| {
             1.0 + row as f64 * 0.001 + col as f64 * 0.002
         });
@@ -779,7 +783,10 @@ mod tests {
 
     #[test]
     fn bounded_l4_rejects_partial_coverage_nodata_and_missing_crs() {
-        let path = std::env::temp_dir().join("dolphin_l4_bounded_failures.nc");
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_l4_bounded_failures-{}.nc",
+            std::process::id()
+        ));
         let mut field = Array2::from_elem((20, 20), 2.0_f64);
         field[(10, 10)] = -9999.0;
         let gt = [300_000.0, 30.0, 0.0, 4_100_000.0, 0.0, -30.0];
@@ -813,7 +820,8 @@ mod tests {
             Err(CorrectionError::TroposphereNodata)
         ));
 
-        let no_crs = std::env::temp_dir().join("dolphin_l4_missing_crs.nc");
+        let no_crs =
+            std::env::temp_dir().join(format!("dolphin_l4_missing_crs-{}.nc", std::process::id()));
         write_netcdf_fixture_with_validity(&no_crs, field.view(), gt, None, None).unwrap();
         let error = read_l4_netcdf_for_grid(&no_crs, "Band1", gt, 32610, (5, 5)).unwrap_err();
         assert!(matches!(error, CorrectionError::NoSourceCrs));
@@ -906,8 +914,9 @@ mod tests {
         use gdal::DriverManager;
         let field = array![[0.10_f64, 0.12, 0.14], [0.16, 0.18, 0.20]];
         let gt = [300_000.0, 20.0, 0.0, 4_100_000.0, 0.0, -20.0];
-        let nc4 = std::env::temp_dir().join("dolphin_l4_nc4.nc");
-        let classic = std::env::temp_dir().join("dolphin_l4_classic.nc");
+        let nc4 = std::env::temp_dir().join(format!("dolphin_l4_nc4-{}.nc", std::process::id()));
+        let classic =
+            std::env::temp_dir().join(format!("dolphin_l4_classic-{}.nc", std::process::id()));
         let _ = std::fs::remove_file(&nc4);
         let _ = std::fs::remove_file(&classic);
         write_netcdf_fixture(&nc4, field.view(), gt, 32610).unwrap();
