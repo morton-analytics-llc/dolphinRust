@@ -648,8 +648,11 @@ fn sample(src: ArrayView2<f64>, fr: f64, fc: f64, rows: usize, cols: usize) -> f
     top * (1.0 - dr) + bot * dr
 }
 
-/// Write a single-band netCDF fixture (an OPERA-L4-format delay field) via GDAL,
-/// for the ingest contract test. The variable is GDAL's default `Band1`.
+/// Write a single-band netCDF-4 fixture (an OPERA-L4-format delay field) for the ingest
+/// contract tests: variable `Band1` on `y`/`x` cell-centre axes, an optional CF grid
+/// mapping (`spatial_ref`, `crs_wkt`) and an optional `_FillValue`. Written with the
+/// hdf5 crate, the same library the reader uses, so the fixture does not depend on the
+/// netCDF build GDAL links.
 #[cfg(test)]
 fn write_netcdf_fixture(
     path: &Path,
@@ -657,25 +660,7 @@ fn write_netcdf_fixture(
     geotransform: [f64; 6],
     epsg: u32,
 ) -> Result<()> {
-    use gdal::raster::Buffer;
-    use gdal::spatial_ref::SpatialRef;
-    use gdal::DriverManager;
-    let (rows, cols) = data.dim();
-    let mem = DriverManager::get_driver_by_name("MEM")?;
-    let mut src = mem.create_with_band_type::<f64, _>("", cols, rows, 1)?;
-    src.set_geo_transform(&geotransform)?;
-    src.set_spatial_ref(&SpatialRef::from_epsg(epsg)?)?;
-    {
-        let mut band = src.rasterband(1)?;
-        let mut buffer = Buffer::new((cols, rows), data.iter().copied().collect());
-        band.write((0, 0), (cols, rows), &mut buffer)?;
-    }
-
-    let nc = DriverManager::get_driver_by_name("netCDF")?;
-    // netCDF-4 (HDF5), the format of OPERA L4 and RAiDER cubes.
-    let options = gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]);
-    hdf5::sync::sync(|| src.create_copy(&nc, path, &options))?;
-    Ok(())
+    write_netcdf_fixture_with_validity(path, data, geotransform, Some(epsg), None)
 }
 
 #[cfg(test)]
@@ -686,28 +671,56 @@ fn write_netcdf_fixture_with_validity(
     epsg: Option<u32>,
     nodata: Option<f64>,
 ) -> Result<()> {
-    use gdal::raster::Buffer;
-    use gdal::spatial_ref::SpatialRef;
-    use gdal::DriverManager;
+    use hdf5::types::VarLenUnicode;
     let _ = std::fs::remove_file(path);
     let (rows, cols) = data.dim();
-    let mem = DriverManager::get_driver_by_name("MEM")?;
-    let mut src = mem.create_with_band_type::<f64, _>("", cols, rows, 1)?;
-    src.set_geo_transform(&geotransform)?;
-    if let Some(epsg) = epsg {
-        src.set_spatial_ref(&SpatialRef::from_epsg(epsg)?)?;
-    }
-    {
-        let mut band = src.rasterband(1)?;
-        band.set_no_data_value(nodata)?;
-        let mut buffer = Buffer::new((cols, rows), data.iter().copied().collect());
-        band.write((0, 0), (cols, rows), &mut buffer)?;
-    }
-    let nc = DriverManager::get_driver_by_name("netCDF")?;
-    // netCDF-4 (HDF5), the format of OPERA L4 and RAiDER cubes.
-    let options = gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]);
-    hdf5::sync::sync(|| src.create_copy(&nc, path, &options))?;
-    Ok(())
+    let [x0, dx, _, y0, _, dy] = geotransform;
+    let x: Vec<f64> = (0..cols).map(|c| x0 + (c as f64 + 0.5) * dx).collect();
+    let y: Vec<f64> = (0..rows).map(|r| y0 + (r as f64 + 0.5) * dy).collect();
+    let text = |value: &str| -> Result<VarLenUnicode> {
+        value
+            .parse::<VarLenUnicode>()
+            .map_err(|e| CorrectionError::Shape(format!("fixture string: {e}")))
+    };
+    hdf5::sync::sync(|| -> Result<()> {
+        let file = hdf5::File::create(path).map_err(hdf5_error)?;
+        file.new_dataset_builder()
+            .with_data(x.as_slice())
+            .create("x")
+            .map_err(hdf5_error)?;
+        file.new_dataset_builder()
+            .with_data(y.as_slice())
+            .create("y")
+            .map_err(hdf5_error)?;
+        let band = file
+            .new_dataset_builder()
+            .with_data(&data.to_owned())
+            .create("Band1")
+            .map_err(hdf5_error)?;
+        if let Some(fill) = nodata {
+            band.new_attr::<f64>()
+                .create("_FillValue")
+                .and_then(|attr| attr.write_scalar(&fill))
+                .map_err(hdf5_error)?;
+        }
+        if let Some(epsg) = epsg {
+            let wkt = SpatialRef::from_epsg(epsg)?.to_wkt()?;
+            let mapping = file
+                .new_dataset::<u8>()
+                .create("spatial_ref")
+                .map_err(hdf5_error)?;
+            mapping
+                .new_attr::<VarLenUnicode>()
+                .create("crs_wkt")
+                .and_then(|attr| attr.write_scalar(&text(&wkt).expect("wkt is unicode")))
+                .map_err(hdf5_error)?;
+            band.new_attr::<VarLenUnicode>()
+                .create("grid_mapping")
+                .and_then(|attr| attr.write_scalar(&text("spatial_ref").expect("ascii")))
+                .map_err(hdf5_error)?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -899,7 +912,25 @@ mod tests {
         let _ = std::fs::remove_file(&classic);
         write_netcdf_fixture(&nc4, field.view(), gt, 32610).unwrap();
         assert!(is_hdf5_file(&nc4).unwrap());
-        let source = hdf5::sync::sync(|| Dataset::open(&nc4)).unwrap();
+        // The classic file comes from GDAL's netCDF driver (its default format).
+        let (rows, cols) = field.dim();
+        let mut source = DriverManager::get_driver_by_name("MEM")
+            .unwrap()
+            .create_with_band_type::<f64, _>("", cols, rows, 1)
+            .unwrap();
+        source.set_geo_transform(&gt).unwrap();
+        source
+            .set_spatial_ref(&SpatialRef::from_epsg(32610).unwrap())
+            .unwrap();
+        source
+            .rasterband(1)
+            .unwrap()
+            .write(
+                (0, 0),
+                (cols, rows),
+                &mut Buffer::new((cols, rows), field.iter().copied().collect()),
+            )
+            .unwrap();
         let driver = DriverManager::get_driver_by_name("netCDF").unwrap();
         hdf5::sync::sync(|| source.create_copy(&driver, &classic, &Default::default())).unwrap();
         assert!(!is_hdf5_file(&classic).unwrap());
