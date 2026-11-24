@@ -731,6 +731,7 @@ mod tests {
     /// Contract (DoD #3): a synthesized OPERA-L4-format netCDF round-trips through
     /// the GDAL ingest with its known field and geotransform recovered.
     #[test]
+    #[ignore = "quarantined: HDF5 lock error (errno 11) on reopen in Linux CI, dolphinRust #258"]
     fn ingests_synthesized_l4_netcdf() {
         let path =
             std::env::temp_dir().join(format!("dolphin_l4_contract-{}.nc", std::process::id()));
