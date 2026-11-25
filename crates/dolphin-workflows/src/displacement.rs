@@ -71,7 +71,7 @@ use crate::phase_steps::{
     JunctionStep, MinistackReference,
 };
 use crate::provenance::{
-    BurstCoverageProvenance, GeometryProvenance, InputCoverageProvenance,
+    BurstCoverageProvenance, ExcludedBurstProvenance, GeometryProvenance, InputCoverageProvenance,
     ReferenceSelectionProvenance, INPUT_COVERAGE_POLICY_VERSION,
 };
 use crate::sequential::{
@@ -120,6 +120,22 @@ pub enum StitchError {
         support: usize,
         /// Required sample count.
         required: usize,
+    },
+}
+
+/// Typed failure from a single burst's phase-linking stage. Distinguishing
+/// [`Self::GloballyAllNonfinite`] by type (rather than string-matching the
+/// error) lets the burst-group dispatch loop drop just that burst instead of
+/// failing the whole run (issue #245 / eo#833), while any other phase-linking
+/// failure still hard-fails as before.
+#[derive(Debug, thiserror::Error)]
+pub enum PhaseLinkError {
+    /// Every tile saw these acquisition ordinals non-finite everywhere in the
+    /// burst; dolphinRust #8/D1 refuses to fabricate a result for them.
+    #[error("burst has globally all-nonfinite acquisition ordinals {ordinals:?}")]
+    GloballyAllNonfinite {
+        /// Zero-based acquisition ordinals with no finite sample anywhere.
+        ordinals: Vec<usize>,
     },
 }
 
@@ -450,31 +466,79 @@ pub fn run_displacement_with_output_policy(
     // One compute engine for the whole run: it acquires a single GPU context (if
     // selected and available) and is reused across every burst + ministack.
     let engine = ComputeEngine::new(configured_compute_backend(cfg));
-    let bursts = timed("phase_linking", || {
-        groups
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (id, idxs))| {
-                let window = crop
-                    .as_ref()
-                    .map_or(Some(None), |plan| plan.windows[index].map(Some))?;
-                Some(link_one_burst(
-                    cfg,
-                    idxs,
-                    id,
-                    index,
-                    &engine,
-                    window,
-                    prepared_masks[id].as_ref(),
-                    covariance.as_mut(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()
+    let (bursts, excluded_bursts) = timed("phase_linking", || -> Result<_> {
+        let mut bursts = Vec::with_capacity(groups.len());
+        let mut excluded_bursts = Vec::new();
+        for (index, (id, idxs)) in groups.iter().enumerate() {
+            let Some(window) = crop
+                .as_ref()
+                .map_or(Some(None), |plan| plan.windows[index].map(Some))
+            else {
+                continue;
+            };
+            let result = link_one_burst(
+                cfg,
+                idxs,
+                id,
+                index,
+                &engine,
+                window,
+                prepared_masks[id].as_ref(),
+                covariance.as_mut(),
+            );
+            match classify_burst_outcome(result, id, index)? {
+                Ok(link) => bursts.push(link),
+                Err(excluded) => excluded_bursts.push(excluded),
+            }
+        }
+        Ok((bursts, excluded_bursts))
     })?;
     let covariance_replay = covariance
         .map(|covariance| covariance.finish(prepared_masks))
         .transpose()?;
-    finish_displacement(cfg, bursts, crop.as_ref(), output_policy, covariance_replay)
+    finish_displacement(
+        cfg,
+        bursts,
+        &excluded_bursts,
+        crop.as_ref(),
+        output_policy,
+        covariance_replay,
+    )
+}
+
+/// Classifies one burst's `link_one_burst` outcome for the dispatch loop: a
+/// usable [`BurstLink`], or — when the only failure is
+/// [`PhaseLinkError::GloballyAllNonfinite`] (every acquisition non-finite
+/// everywhere in the burst, e.g. a burst that only grazes the AOI) — an
+/// excluded-burst provenance record, with a warning identifying the burst.
+/// Any other error still aborts the run.
+fn classify_burst_outcome(
+    result: Result<BurstLink>,
+    burst_id: &str,
+    burst_index: usize,
+) -> Result<std::result::Result<BurstLink, ExcludedBurstProvenance>> {
+    let error = match result {
+        Ok(link) => return Ok(Ok(link)),
+        Err(error) => error,
+    };
+    let Some(PhaseLinkError::GloballyAllNonfinite { ordinals }) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<PhaseLinkError>())
+    else {
+        return Err(error);
+    };
+    tracing::warn!(
+        burst_id,
+        burst_index,
+        acquisition_ordinals = ?ordinals,
+        "dropping burst from this run: every acquisition is non-finite everywhere \
+         in the burst (issue #245 / eo#833)"
+    );
+    Ok(Err(ExcludedBurstProvenance {
+        burst_index,
+        burst_id: burst_id.to_owned(),
+        reason: "globally_all_nonfinite".to_owned(),
+    }))
 }
 
 /// Shared downstream tail: stitch bursts → ifg network → SNAPHU unwrap → SBAS
@@ -485,6 +549,7 @@ pub fn run_displacement_with_output_policy(
 fn finish_displacement(
     cfg: &DisplacementWorkflow,
     bursts: Vec<BurstLink>,
+    excluded_bursts: &[ExcludedBurstProvenance],
     crop: Option<&BoundedPlan>,
     output_policy: DisplacementOutputPolicy,
     covariance_replay: Option<ProductionCovarianceReplayContext>,
@@ -708,7 +773,15 @@ fn finish_displacement(
         reference_selection: analysis_reference.map(|(_, selection)| selection),
         production_covariance,
     };
-    emit_displacement(cfg, days, epsg, crop, spatial, output_policy)
+    emit_displacement(
+        cfg,
+        days,
+        epsg,
+        crop,
+        spatial,
+        output_policy,
+        excluded_bursts,
+    )
 }
 
 /// Write each burst's native-grid PS mask, amplitude dispersion and mean to
@@ -1960,6 +2033,7 @@ fn emit_displacement(
     crop: Option<&BoundedPlan>,
     mut spatial: SpatialProducts,
     output_policy: DisplacementOutputPolicy,
+    excluded_bursts: &[ExcludedBurstProvenance],
 ) -> Result<DisplacementOutput> {
     if let Some(plan) = crop {
         spatial.trim(plan.target_in_analysis, &days, cfg)?;
@@ -2234,7 +2308,7 @@ fn emit_displacement(
             .write_cycle_step_diagnostics
             .then_some(&spatial.cycle_steps.steps),
     };
-    let input_coverage = summarize_input_coverage(&spatial);
+    let input_coverage = summarize_input_coverage(&spatial, excluded_bursts);
     let mut geometry_provenance = crate::provenance::assemble_geometry_provenance_with_coverage(
         cfg,
         spatial.corrections.los_geometry.as_ref(),
@@ -2418,7 +2492,10 @@ fn temporal_product_displacement_rasters(
         .collect())
 }
 
-fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenance {
+fn summarize_input_coverage(
+    spatial: &SpatialProducts,
+    excluded_bursts: &[ExcludedBurstProvenance],
+) -> InputCoverageProvenance {
     let output_pixels = spatial.validity_mask.len();
     let valid_pixels = spatial.validity_mask.iter().filter(|&&valid| valid).count();
     let sum =
@@ -2451,6 +2528,7 @@ fn summarize_input_coverage(spatial: &SpatialProducts) -> InputCoverageProvenanc
         output_pixels,
         valid_pixels,
         valid_fraction,
+        excluded_bursts: excluded_bursts.to_vec(),
     }
 }
 
@@ -3354,10 +3432,12 @@ impl TiledPhaseLinkStats {
             .enumerate()
             .filter_map(|(ordinal, &seen)| (!seen).then_some(ordinal))
             .collect();
-        anyhow::ensure!(
-            globally_empty.is_empty(),
-            "burst has globally all-nonfinite acquisition ordinals {globally_empty:?}"
-        );
+        if !globally_empty.is_empty() {
+            return Err(PhaseLinkError::GloballyAllNonfinite {
+                ordinals: globally_empty,
+            }
+            .into());
+        }
         anyhow::ensure!(
             self.linked_tiles > 0,
             "burst has no tile with complete temporal support"
@@ -4704,6 +4784,7 @@ pub fn run_displacement_resumable(
     let output = finish_displacement(
         cfg,
         bursts,
+        &[],
         crop.as_ref(),
         DisplacementOutputPolicy::Full,
         None,
@@ -4769,7 +4850,7 @@ pub fn update_displacement(
         states.push(st);
         bursts.push(link);
     }
-    let output = finish_displacement(cfg, bursts, None, DisplacementOutputPolicy::Full, None)?;
+    let output = finish_displacement(cfg, bursts, &[], None, DisplacementOutputPolicy::Full, None)?;
     Ok((
         output,
         DisplacementState {
@@ -6391,6 +6472,7 @@ mod tests {
         let out = finish_displacement(
             &cfg,
             vec![burst],
+            &[],
             None,
             DisplacementOutputPolicy::Full,
             None,
@@ -6462,6 +6544,7 @@ mod tests {
             let out = finish_displacement(
                 &cfg,
                 vec![burst],
+                &[],
                 None,
                 DisplacementOutputPolicy::Full,
                 None,
@@ -8148,6 +8231,7 @@ mod tests {
             None,
             products,
             DisplacementOutputPolicy::GroundPulse,
+            &[],
         )
         .expect("a fully masked frame publishes rather than fails");
         assert_eq!(out.reference_point, None);
@@ -8251,6 +8335,7 @@ mod tests {
             None,
             products,
             DisplacementOutputPolicy::Full,
+            &[],
         )
         .expect("an unavailable product skips the temporal stage rather than failing");
         assert!(matches!(
@@ -8286,6 +8371,7 @@ mod tests {
             None,
             products,
             DisplacementOutputPolicy::GroundPulse,
+            &[],
         )
         .unwrap();
         assert_eq!(out.geometry_provenance.outside_static_pixel_count, Some(2));
@@ -8316,6 +8402,7 @@ mod tests {
             None,
             products,
             DisplacementOutputPolicy::Full,
+            &[],
         )
         .expect("outside-STATIC pixels are masked, not a write-time error");
         for (point, &valid) in out.validity_mask.indexed_iter() {
@@ -8390,6 +8477,7 @@ mod tests {
             Some(&plan),
             split_products(),
             DisplacementOutputPolicy::Full,
+            &[],
         )
         .unwrap();
         let labels = out.unwrap_component.as_ref().expect("bounded run labels");
@@ -8425,6 +8513,7 @@ mod tests {
             Some(&plan),
             split_products(),
             DisplacementOutputPolicy::GroundPulse,
+            &[],
         )
         .err()
         .expect("half the target is outside the reference component");
@@ -8453,6 +8542,7 @@ mod tests {
                 plan,
                 products,
                 DisplacementOutputPolicy::GroundPulse,
+                &[],
             )
             .unwrap()
         };

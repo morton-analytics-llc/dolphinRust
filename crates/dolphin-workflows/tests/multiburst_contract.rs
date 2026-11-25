@@ -32,7 +32,16 @@ fn sample(t: usize, frame_col: usize) -> Complex<f32> {
     Complex::from_polar(1.0, phase as f32)
 }
 
-fn write_burst(dir: &Path, iw: u8, col_off: usize) -> Vec<PathBuf> {
+/// Writes one burst's `N` dates of CSLC, with each date's grid built by
+/// `grid_for_date(t)`. Shared by [`write_burst`] (a smooth frame-wide ramp)
+/// and [`write_all_nonfinite_burst`] (every pixel non-finite on every date —
+/// the eo#833 / dolphinRust#245 degenerate case).
+fn write_burst_dates(
+    dir: &Path,
+    iw: u8,
+    col_off: usize,
+    grid_for_date: impl Fn(usize) -> Array2<Complex<f32>>,
+) -> Vec<PathBuf> {
     let corner_x = FRAME_ORIGIN_X + col_off as f64 * DX;
     let x_centers: Vec<f64> = (0..BCOLS)
         .map(|j| corner_x + DX / 2.0 + j as f64 * DX)
@@ -46,7 +55,7 @@ fn write_burst(dir: &Path, iw: u8, col_off: usize) -> Vec<PathBuf> {
         .map(|t| {
             let stamp = (base + chrono::Duration::days(t as i64 * 12)).format("%Y%m%d");
             let path = dir.join(format!("OPERA_T064-135518-IW{iw}_{stamp}.h5"));
-            let grid = Array2::from_shape_fn((ROWS, BCOLS), |(_, j)| sample(t, col_off + j));
+            let grid = grid_for_date(t);
             let f = hdf5::File::create(&path).unwrap();
             let g = f.create_group("data").unwrap();
             g.new_dataset_builder()
@@ -69,6 +78,21 @@ fn write_burst(dir: &Path, iw: u8, col_off: usize) -> Vec<PathBuf> {
             path
         })
         .collect()
+}
+
+fn write_burst(dir: &Path, iw: u8, col_off: usize) -> Vec<PathBuf> {
+    write_burst_dates(dir, iw, col_off, |t| {
+        Array2::from_shape_fn((ROWS, BCOLS), |(_, j)| sample(t, col_off + j))
+    })
+}
+
+/// A burst that is present in the stack but contributes zero finite pixels on
+/// any date, anywhere — the eo#833 production case: a burst that only grazes
+/// the AOI's discovery box.
+fn write_all_nonfinite_burst(dir: &Path, iw: u8, col_off: usize) -> Vec<PathBuf> {
+    write_burst_dates(dir, iw, col_off, |_| {
+        Array2::from_elem((ROWS, BCOLS), Complex::new(f32::NAN, f32::NAN))
+    })
 }
 
 fn write_mask(
@@ -332,4 +356,79 @@ fn two_bursts_stitch_into_a_frame() {
         .velocity_mm_yr
         .iter()
         .all(|value| value.is_finite()));
+}
+
+/// eo#833 / dolphinRust#245: a third burst (IW3) that is present in the stack
+/// but non-finite on every pixel, every date, must be dropped from the run —
+/// not take down the two otherwise-valid bursts. `run_displacement` must
+/// succeed, stitch only IW1+IW2 onto their own union frame (unchanged from
+/// `two_bursts_stitch_into_a_frame`), and record the dropped burst in
+/// `geometry_provenance.input_coverage.excluded_bursts` by id and reason.
+#[test]
+fn one_globally_nonfinite_burst_is_excluded_not_fatal() {
+    let dir = std::env::temp_dir().join(format!(
+        "dolphin_multiburst_nonfinite_drop_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut files = write_burst(&dir, 1, 0);
+    files.extend(write_burst(&dir, 2, COL_OFF_IW2));
+    // Well clear of IW1/IW2 so it cannot affect their stitched overlap even
+    // if (contrary to the contract) it were not dropped.
+    const COL_OFF_IW3: usize = COL_OFF_IW2 + BCOLS + 40;
+    files.extend(write_all_nonfinite_burst(&dir, 3, COL_OFF_IW3));
+
+    let mut cfg = DisplacementWorkflow {
+        cslc_file_list: files,
+        work_directory: dir.join("dropped"),
+        ..Default::default()
+    };
+    cfg.input_options.input_type = InputType::OperaCslc;
+    cfg.input_options.subdataset = Some("/data/VV".into());
+    cfg.input_options.wavelength = Some(0.055_465_76);
+    cfg.phase_linking.ministack_size = 15;
+    cfg.phase_linking.half_window = HalfWindow { y: 2, x: 2 };
+    cfg.phase_linking.calc_average_coh = true;
+    cfg.output_options.strides = Strides { y: 1, x: 1 };
+    cfg.interferogram_network.reference_idx = Some(0);
+
+    let out = run_displacement(&cfg)
+        .expect("a burst with zero finite pixels anywhere must be dropped, not fatal");
+
+    // The stitched frame is the union of the two valid bursts only; the
+    // dropped burst's geometry never reaches the frame.
+    assert_eq!(
+        out.displacement.dim(),
+        (N - 1, ROWS, FRAME_COLS),
+        "frame dims must match the two-valid-burst union, not include IW3"
+    );
+    assert_eq!(out.epsg, Some(EPSG as u32), "frame CRS");
+    assert!(
+        out.velocity_mm_yr.iter().any(|value| value.is_finite()),
+        "the two valid bursts must still produce finite output"
+    );
+
+    let coverage = out
+        .geometry_provenance
+        .input_coverage
+        .as_ref()
+        .expect("input coverage provenance must be present");
+    assert_eq!(
+        coverage.bursts.len(),
+        2,
+        "only the two valid bursts are linked and stitched"
+    );
+    assert_eq!(
+        coverage.excluded_bursts.len(),
+        1,
+        "the degenerate burst must be recorded as excluded, not silently dropped"
+    );
+    let excluded = &coverage.excluded_bursts[0];
+    assert!(
+        excluded.burst_id.contains("IW3"),
+        "excluded burst id: {}",
+        excluded.burst_id
+    );
+    assert_eq!(excluded.reason, "globally_all_nonfinite");
 }

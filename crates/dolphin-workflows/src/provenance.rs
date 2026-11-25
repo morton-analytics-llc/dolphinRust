@@ -224,6 +224,15 @@ pub struct InputCoverageProvenance {
     pub valid_pixels: usize,
     /// `valid_pixels / output_pixels`, or zero for an empty grid.
     pub valid_fraction: f64,
+    /// Bursts dropped from this run entirely (never phase-linked, never
+    /// stitched) because every acquisition was non-finite everywhere in the
+    /// burst (issue #245 / eo#833) — a burst that only grazes the AOI's
+    /// discovery box. Additive field: an artifact written before it existed
+    /// deserializes it as empty, not a reconstruction. Schema unchanged
+    /// (dolphinrust-geometry-provenance/7): purely informational, gates
+    /// nothing downstream.
+    #[serde(default)]
+    pub excluded_bursts: Vec<ExcludedBurstProvenance>,
 }
 
 /// Aggregate temporal-coverage counts for one planned burst.
@@ -239,6 +248,17 @@ pub struct BurstCoverageProvenance {
     pub linked_tiles: usize,
     /// Tiles emitted as nodata for incomplete temporal support.
     pub nodata_tiles: usize,
+}
+
+/// A burst dropped from a run before stitching, and why (issue #245 / eo#833).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedBurstProvenance {
+    /// Stable zero-based burst position in the planner input.
+    pub burst_index: usize,
+    /// The burst's identifier (e.g. `T078-165678-IW1`).
+    pub burst_id: String,
+    /// Stable machine-readable reason, e.g. `globally_all_nonfinite`.
+    pub reason: String,
 }
 
 /// The nested provenance block naming source metadata keys + method version.

@@ -5477,6 +5477,7 @@ mod tests {
             output_pixels: 2,
             valid_pixels: 2,
             valid_fraction: 1.0,
+            excluded_bursts: Vec::new(),
         };
         assert!(validate_input_coverage(&coverage, 12, 2, 2).is_err());
         coverage.bursts = vec![

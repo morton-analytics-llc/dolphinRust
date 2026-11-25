@@ -288,6 +288,19 @@ All notable changes to dolphinRust are documented here. The format follows
   not worse than the old on any frozen metric, and no reduction in junction steps was measured.
 
 ### Fixed
+- **A globally all-nonfinite burst no longer aborts the whole run** (issue #245, eo#833). A
+  burst that only grazes the AOI's discovery box can have zero finite pixels on every date; the
+  issue #8 / D1 check in `TiledPhaseLinkStats::finish` correctly refuses to fabricate a result
+  for it, but that `Result` propagated through the burst-group dispatch loop's
+  `collect::<Result<Vec<_>>>()`, so one degenerate burst failed bursts that had nothing wrong
+  with them (a production Montana run lost its one scheduler retry this way after staging 1.18
+  GB of crops). The new `PhaseLinkError::GloballyAllNonfinite` typed error lets the dispatch
+  loop drop just that burst — with a `tracing::warn!` naming it — while any other phase-linking
+  error still hard-fails the run as before. The dropped burst is recorded in
+  `geometry_provenance.input_coverage.excluded_bursts` (new field, `#[serde(default)]`; schema
+  unchanged, `dolphinrust-geometry-provenance/7`) by burst id and reason, not just a log line.
+  Scope: the primary `run_displacement` dispatch loop only; the resumable/streaming-update
+  dispatch loops are untouched.
 - **Loop-closure QC rasters are no longer publication-masked** (issue #224).
   `loop_closure_bad_count.tif`, `loop_closure_worst_cycles.tif`,
   `loop_closure_correction_status.tif` and `loop_closure_corrected_count.tif` were NaN on
