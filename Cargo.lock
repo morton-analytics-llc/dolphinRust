@@ -650,6 +650,7 @@ name = "dolphin-core"
 version = "1.6.0"
 dependencies = [
  "chrono",
+ "hdf5-metno",
  "libc",
  "ndarray",
  "num-complex",

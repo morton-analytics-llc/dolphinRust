@@ -43,8 +43,9 @@ use crate::rslc::{Rslc, RslcBand};
 const CHIP_HALF: i64 = 4;
 /// Mask value where nothing was geocoded.
 pub const MASK_FILL: u8 = 255;
-/// Grid rows located per chunk.
-const ROW_CHUNK: usize = 256;
+/// Output pixels per tile side. Each tile is located, windowed in the RSLC
+/// and sampled on its own, so memory follows the tile, not the grid (#247).
+const TILE: usize = 1024;
 
 /// One band geocoded onto a grid.
 pub struct GeocodedBand {
@@ -128,16 +129,25 @@ impl Locator<'_> {
     }
 }
 
-/// The RSLC window `(row0, col0, rows, cols)` that every located pixel's
-/// chip falls in, clipped to the swath.
-fn radar_window(located: &[Option<Located>], rslc: &Rslc, band: &RslcBand) -> Option<[usize; 4]> {
-    let (mut l0, mut l1, mut s0, mut s1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+/// Fractional line and sample extent `[l0, l1, s0, s1]` of located pixels,
+/// grown from `extent` (start from [`EMPTY_EXTENT`]).
+fn grow_extent(mut extent: [f64; 4], located: &[Option<Located>]) -> [f64; 4] {
     for at in located.iter().flatten() {
-        l0 = l0.min(at.line);
-        l1 = l1.max(at.line);
-        s0 = s0.min(at.sample);
-        s1 = s1.max(at.sample);
+        extent[0] = extent[0].min(at.line);
+        extent[1] = extent[1].max(at.line);
+        extent[2] = extent[2].min(at.sample);
+        extent[3] = extent[3].max(at.sample);
     }
+    extent
+}
+
+/// The extent of no pixels.
+const EMPTY_EXTENT: [f64; 4] = [f64::MAX, f64::MIN, f64::MAX, f64::MIN];
+
+/// The RSLC window `(row0, col0, rows, cols)` that every chip of pixels
+/// within `extent` falls in, clipped to the swath.
+fn radar_window(extent: [f64; 4], rslc: &Rslc, band: &RslcBand) -> Option<[usize; 4]> {
+    let [l0, l1, s0, s1] = extent;
     let pad = SINC_TAPS as f64;
     let clip = |a: f64, b: f64, n: usize| -> Option<(usize, usize)> {
         let lo = (a.floor() - pad).max(0.0);
@@ -186,31 +196,40 @@ fn wrap(phase: f64) -> f32 {
         as f32
 }
 
-/// Locate every pixel of `grid`.
-fn locate_grid(locator: &Locator, grid: &GeoGrid) -> Result<Vec<Option<Located>>> {
-    let projection = Projection::new(grid.epsg)?;
-    let x = grid.x_coordinates();
-    let mut located = Vec::with_capacity(grid.rows * grid.cols);
-    for chunk0 in (0..grid.rows).step_by(ROW_CHUNK) {
-        let chunk_rows = ROW_CHUNK.min(grid.rows - chunk0);
-        let mut lon = Vec::with_capacity(chunk_rows * grid.cols);
-        let mut lat = Vec::with_capacity(chunk_rows * grid.cols);
-        for r in chunk0..chunk0 + chunk_rows {
-            lon.extend_from_slice(&x);
-            lat.extend(std::iter::repeat_n(grid.y0 + r as f64 * grid.dy, grid.cols));
-        }
-        projection.to_lonlat(&mut lon, &mut lat)?;
-        located.par_extend(
-            lon.par_iter()
-                .zip(lat.par_iter())
-                .map(|(&lo, &la)| locator.locate(lo, la)),
-        );
+/// Locate the pixels of `grid` in `rows` × `cols`, row-major.
+fn locate_tile(
+    locator: &Locator,
+    projection: &Projection,
+    grid: &GeoGrid,
+    x: &[f64],
+    (rows, cols): (std::ops::Range<usize>, std::ops::Range<usize>),
+) -> Result<Vec<Option<Located>>> {
+    let n = rows.len() * cols.len();
+    let mut lon = Vec::with_capacity(n);
+    let mut lat = Vec::with_capacity(n);
+    for r in rows {
+        lon.extend_from_slice(&x[cols.clone()]);
+        lat.extend(std::iter::repeat_n(
+            grid.y0 + r as f64 * grid.dy,
+            cols.len(),
+        ));
     }
-    Ok(located)
+    projection.to_lonlat(&mut lon, &mut lat)?;
+    Ok(lon
+        .par_iter()
+        .zip(lat.par_iter())
+        .map(|(&lo, &la)| locator.locate(lo, la))
+        .collect())
 }
 
 /// Geocode `polarizations` of `band` onto `grid`. `tec` is the date's
 /// ionospheric correction (`None` leaves it out of the sampling).
+///
+/// The grid is processed in [`TILE`] × [`TILE`] tiles: each tile's pixels
+/// are located, its own RSLC window (the tile's chips plus the sinc pad) is
+/// read, and its pixels are sampled from it. A pixel's value does not
+/// depend on the window it is read from, so the result is the one a single
+/// window under the whole grid gives.
 ///
 /// # Errors
 /// Projection, DEM or RSLC read failures, or a grid that misses the swath.
@@ -231,50 +250,75 @@ pub fn geocode_band(
         tide: tide_bodies(mid.naive_utc()),
         t_mid: rslc.orbit.seconds(mid),
     };
-    let located = locate_grid(&locator, grid)?;
-    let [row0, col0, rows, cols] = radar_window(&located, rslc, band).ok_or_else(|| {
+    let projection = Projection::new(grid.epsg)?;
+    let x = grid.x_coordinates();
+    let kernel = SincKernel::new();
+    let k = 4.0 * std::f64::consts::PI / band.wavelength();
+    let nan = Complex32::new(f32::NAN, f32::NAN);
+    let shape = (grid.rows, grid.cols);
+    let mut mask = Array2::from_elem(shape, MASK_FILL);
+    let mut layers = vec![Array2::from_elem(shape, nan); polarizations.len()];
+    let mut extent = EMPTY_EXTENT;
+    for r0 in (0..grid.rows).step_by(TILE) {
+        for c0 in (0..grid.cols).step_by(TILE) {
+            let (rows, cols) = (
+                r0..(r0 + TILE).min(grid.rows),
+                c0..(c0 + TILE).min(grid.cols),
+            );
+            let tile = ndarray::s![rows.clone(), cols.clone()];
+            let tile_shape = (rows.len(), cols.len());
+            let located = locate_tile(&locator, &projection, grid, &x, (rows, cols))?;
+            let tile_extent = grow_extent(EMPTY_EXTENT, &located);
+            extent = grow_extent(extent, &located);
+            let Some([row0, col0, win_rows, win_cols]) = radar_window(tile_extent, rslc, band)
+            else {
+                continue;
+            };
+            let tile_mask: Vec<u8> = located
+                .par_iter()
+                .map(|at| at.as_ref().map_or(MASK_FILL, |a| locator.mask(a)))
+                .collect();
+            for (pol, layer) in polarizations.iter().zip(&mut layers) {
+                let data =
+                    rslc.read_window(band.frequency, pol, (row0, col0), (win_rows, win_cols))?;
+                let values: Vec<Complex32> = located
+                    .par_iter()
+                    .zip(tile_mask.par_iter())
+                    .map(|(at, &m)| {
+                        let at = at.as_ref().filter(|_| m != 0 && m != MASK_FILL)?;
+                        let time = rslc.line_time(at.line);
+                        let range = band.starting_range + at.sample * band.range_spacing;
+                        if !band.doppler.contains(time, range) {
+                            return None;
+                        }
+                        let step = std::f64::consts::TAU
+                            * band.doppler.eval(time, range)
+                            * rslc.line_spacing;
+                        let value = sample_pixel(&data, (row0, col0), at, step, &kernel)?;
+                        Some(value * Complex32::from_polar(1.0, wrap(k * at.geometric_range)))
+                    })
+                    .map(|v| v.unwrap_or(nan))
+                    .collect();
+                layer.slice_mut(tile).assign(
+                    &Array2::from_shape_vec(tile_shape, values).map_err(crate::error::product)?,
+                );
+            }
+            mask.slice_mut(tile).assign(
+                &Array2::from_shape_vec(tile_shape, tile_mask).map_err(crate::error::product)?,
+            );
+        }
+    }
+    let radar_window = radar_window(extent, rslc, band).ok_or_else(|| {
         L1Error::NotFound(format!(
             "grid does not overlap frequency{} of {}",
             band.frequency, rslc.granule_id
         ))
     })?;
-    let mask: Vec<u8> = located
-        .par_iter()
-        .map(|at| at.as_ref().map_or(MASK_FILL, |a| locator.mask(a)))
-        .collect();
-    let kernel = SincKernel::new();
-    let k = 4.0 * std::f64::consts::PI / band.wavelength();
-    let nan = Complex32::new(f32::NAN, f32::NAN);
-    let layers = polarizations
-        .iter()
-        .map(|pol| {
-            let data = rslc.read_window(band.frequency, pol, (row0, col0), (rows, cols))?;
-            let values: Vec<Complex32> = located
-                .par_iter()
-                .zip(mask.par_iter())
-                .map(|(at, &m)| {
-                    let at = at.as_ref().filter(|_| m != 0 && m != MASK_FILL)?;
-                    let time = rslc.line_time(at.line);
-                    let range = band.starting_range + at.sample * band.range_spacing;
-                    if !band.doppler.contains(time, range) {
-                        return None;
-                    }
-                    let step =
-                        std::f64::consts::TAU * band.doppler.eval(time, range) * rslc.line_spacing;
-                    let value = sample_pixel(&data, (row0, col0), at, step, &kernel)?;
-                    Some(value * Complex32::from_polar(1.0, wrap(k * at.geometric_range)))
-                })
-                .map(|v| v.unwrap_or(nan))
-                .collect();
-            Array2::from_shape_vec((grid.rows, grid.cols), values).map_err(crate::error::product)
-        })
-        .collect::<Result<Vec<_>>>()?;
     Ok(GeocodedBand {
         grid: *grid,
-        radar_window: [row0, col0, rows, cols],
+        radar_window,
         layers,
-        mask: Array2::from_shape_vec((grid.rows, grid.cols), mask)
-            .map_err(crate::error::product)?,
+        mask,
     })
 }
 

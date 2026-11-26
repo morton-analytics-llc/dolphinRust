@@ -5,9 +5,11 @@
 //! child inherits across `fork`/`exec`, so a child spawned while an HDF5 file is
 //! open would hold that file's lock until it exits, even after the parent closes
 //! the file, and a later create or read-write open of it fails with `EAGAIN`
-//! (#191, #214).
+//! (#191, #214). Marking descriptors close-on-exec in the child still leaves the
+//! window between `fork` and `exec`, so the spawn also holds the HDF5 library
+//! lock: no HDF5 file is opened or closed while a child holds copies (#258).
 
-use std::process::Command;
+use std::process::{Child, Command};
 
 /// Highest descriptor count considered when the soft limit is unbounded or
 /// larger: Linux's default `nr_open` ceiling, and above macOS's default
@@ -20,13 +22,17 @@ const DESCRIPTOR_CEILING: libc::c_int = 1 << 20;
 /// The descriptors are marked close-on-exec in the child (not closed), so the
 /// standard library's exec-error reporting pipe keeps working. They are released
 /// when the child's exec completes, which can be shortly after `spawn` returns.
-pub fn exclude_inherited_descriptors(command: &mut Command) -> &mut Command {
+fn exclude_inherited_descriptors(command: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     let descriptor_limit = open_descriptor_limit();
     // SAFETY: the closure runs in the forked child before exec and calls only
-    // `fcntl`, which is async-signal-safe; it does not allocate or lock.
+    // `close_range` and `fcntl`, which are async-signal-safe; it does not
+    // allocate or lock.
     unsafe {
         command.pre_exec(move || {
+            if close_range_cloexec() {
+                return Ok(());
+            }
             (3..descriptor_limit).for_each(|descriptor| {
                 // A number that is not open fails with EBADF, which is fine.
                 libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -34,6 +40,42 @@ pub fn exclude_inherited_descriptors(command: &mut Command) -> &mut Command {
             Ok(())
         })
     }
+}
+
+/// Mark every descriptor from 3 up close-on-exec in one `close_range` call
+/// (Linux 5.11+), so the child (and the HDF5 lock held across its spawn) does
+/// not wait on one `fcntl` per possible descriptor. `false` where the call is
+/// unavailable.
+#[cfg(target_os = "linux")]
+fn close_range_cloexec() -> bool {
+    // SAFETY: a raw syscall on integer arguments, async-signal-safe.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        ) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_range_cloexec() -> bool {
+    false
+}
+
+/// Spawn `command` so its child inherits none of this process's files.
+///
+/// The child's descriptors above stdin/stdout/stderr are close-on-exec, and the
+/// spawn holds [`hdf5::sync::sync`], the lock every HDF5 call in this workspace
+/// takes. `spawn` returns once the child has exec'd, so no HDF5 file is closed
+/// and reopened while the child still shares its `flock`.
+///
+/// # Errors
+/// Whatever [`Command::spawn`] returns.
+pub fn spawn_isolated(command: &mut Command) -> std::io::Result<Child> {
+    exclude_inherited_descriptors(command);
+    hdf5::sync::sync(|| command.spawn())
 }
 
 /// One past the highest descriptor number this process can hold, read in the
@@ -56,7 +98,8 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::io::Read;
-    use std::process::{Child, Stdio};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// Open `path` the way libhdf5 does: no `O_CLOEXEC`, then an exclusive `flock`.
@@ -132,5 +175,39 @@ mod tests {
             "isolated child kept the lock"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// #258: an HDF5 close-then-reopen racing a stream of spawns never finds
+    /// the lock held by a child that forked between the two.
+    #[test]
+    fn reopen_after_close_is_never_blocked_by_a_concurrent_spawn() {
+        const SPAWNS: usize = 200;
+        let path = std::env::temp_dir().join(format!(
+            "dolphin_core_spawn_race_{}.lock",
+            std::process::id()
+        ));
+        let spawned = AtomicUsize::new(0);
+        let blocked = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..SPAWNS {
+                    spawn_isolated(&mut Command::new("true"))
+                        .unwrap()
+                        .wait()
+                        .unwrap();
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let mut blocked = 0;
+            while spawned.load(Ordering::Relaxed) < SPAWNS {
+                hdf5::sync::sync(|| {
+                    let descriptor = open_locked_without_cloexec(&path);
+                    unsafe { libc::close(descriptor) };
+                });
+                blocked += usize::from(!hdf5::sync::sync(|| can_lock(&path)));
+            }
+            blocked
+        });
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(blocked, 0, "{blocked} reopens found a child's lock");
     }
 }
