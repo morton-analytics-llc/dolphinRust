@@ -264,6 +264,10 @@ All notable changes to dolphinRust are documented here. The format follows
   are unchanged with the term unset.
 
 ### Changed
+- **NISAR staging geocodes in tiles** (issue #251). `geocode_band` locates, windows and
+  samples the output grid in 1024 × 1024 tiles, each with its own RSLC read window. On
+  T091A-F026 2026-10-06 (A+B, HH, ionosphere on) peak RSS drops from 1.81 GB to 0.92 GB and the
+  CSLC, STATIC and DEM outputs are identical (`h5diff -r`: 0 differences).
 - **`always_first` references each ministack to the newest carried compressed SLC** (issue
   #192). `MiniStackPlanner` gave `CompressedSlcPlan::AlwaysFirst` dolphin v0.35.0's rule: phase
   linking and compression were both referenced to index 0 of the combined ministack, the

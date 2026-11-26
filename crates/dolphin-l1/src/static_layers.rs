@@ -135,7 +135,10 @@ pub fn static_layers(
     let t_mid = orbit.seconds(burst.sensing_mid());
     let t0 = orbit.seconds(burst.sensing_start);
     let (r0, dr) = (burst.starting_range, burst.range_pixel_spacing);
-    let mut rows: Vec<Vec<(f32, f32, u8)>> = Vec::with_capacity(grid.rows);
+    let shape = (grid.rows, grid.cols);
+    let mut los_east = Array2::from_elem(shape, f32::NAN);
+    let mut los_north = Array2::from_elem(shape, f32::NAN);
+    let mut layover_shadow_mask = Array2::from_elem(shape, MASK_NODATA);
     for chunk0 in (0..grid.rows).step_by(ROW_CHUNK) {
         let chunk_rows = ROW_CHUNK.min(grid.rows - chunk0);
         let mut lon: Vec<f64> = Vec::with_capacity(chunk_rows * grid.cols);
@@ -145,39 +148,35 @@ pub fn static_layers(
             lat.extend(std::iter::repeat_n(grid.y0 + r as f64 * grid.dy, grid.cols));
         }
         projection.to_lonlat(&mut lon, &mut lat)?;
-        let chunk: Vec<Vec<(f32, f32, u8)>> = (0..chunk_rows)
+        let chunk: Vec<(f32, f32, u8)> = (0..chunk_rows * grid.cols)
             .into_par_iter()
-            .map(|r| {
-                (0..grid.cols)
-                    .map(|c| {
-                        let k = r * grid.cols + c;
-                        pixel(
-                            burst,
-                            orbit,
-                            dem,
-                            &profiles,
-                            (lon[k], lat[k]),
-                            (t_mid, t0, r0, dr),
-                        )
-                        .unwrap_or((f32::NAN, f32::NAN, MASK_NODATA))
-                    })
-                    .collect()
+            .map(|k| {
+                pixel(
+                    burst,
+                    orbit,
+                    dem,
+                    &profiles,
+                    (lon[k], lat[k]),
+                    (t_mid, t0, r0, dr),
+                )
+                .unwrap_or((f32::NAN, f32::NAN, MASK_NODATA))
             })
             .collect();
-        rows.extend(chunk);
+        let rows = ndarray::s![chunk0..chunk0 + chunk_rows, ..];
+        for ((p, e), (n, m)) in chunk.iter().zip(los_east.slice_mut(rows)).zip(
+            los_north
+                .slice_mut(rows)
+                .into_iter()
+                .zip(layover_shadow_mask.slice_mut(rows)),
+        ) {
+            (*e, *n, *m) = *p;
+        }
     }
-    let shape = (grid.rows, grid.cols);
-    let pick = |k: usize| -> Vec<f32> {
-        rows.iter()
-            .flat_map(|r| r.iter().map(move |p| if k == 0 { p.0 } else { p.1 }))
-            .collect()
-    };
-    let mask: Vec<u8> = rows.iter().flat_map(|r| r.iter().map(|p| p.2)).collect();
     Ok(StaticLayers {
         grid: *grid,
-        los_east: Array2::from_shape_vec(shape, pick(0)).map_err(crate::error::product)?,
-        los_north: Array2::from_shape_vec(shape, pick(1)).map_err(crate::error::product)?,
-        layover_shadow_mask: Array2::from_shape_vec(shape, mask).map_err(crate::error::product)?,
+        los_east,
+        los_north,
+        layover_shadow_mask,
     })
 }
 
