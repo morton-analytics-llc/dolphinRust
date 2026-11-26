@@ -7,7 +7,7 @@
 //! SNAPHU's native-endian format and numpy's `.tofile`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use dolphin_core::Cf32;
 use ndarray::{Array2, ArrayView2};
@@ -155,7 +155,6 @@ fn run_snaphu(
     cols: usize,
 ) -> Result<()> {
     let mut cmd = Command::new(&cfg.snaphu_path);
-    dolphin_core::process::exclude_inherited_descriptors(&mut cmd);
     cmd.arg(cost_flag(cfg.cost)).arg(init_flag(cfg.init));
     cmd.args(["-C", "CONNCOMPOUTTYPE UINT"]);
     cmd.args(["-C", "OUTFILEFORMAT FLOAT_DATA"]);
@@ -164,7 +163,10 @@ fn run_snaphu(
     add_tiling(&mut cmd, cfg);
     cmd.arg(ifg).arg(cols.to_string());
 
-    let output = cmd.output()?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = dolphin_core::process::spawn_isolated(&mut cmd)?.wait_with_output()?;
     if output.status.success() {
         return Ok(());
     }

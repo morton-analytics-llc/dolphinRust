@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use dolphin_core::process::exclude_inherited_descriptors;
+use dolphin_core::process::spawn_isolated;
 
 use crate::error::{CorrectionError, Result};
 use crate::troposphere::{read_l4_netcdf, DelayGrid};
@@ -20,9 +20,8 @@ use crate::troposphere::{read_l4_netcdf, DelayGrid};
 /// `PATH`.
 #[must_use]
 pub fn raider_available() -> bool {
-    let py = exclude_inherited_descriptors(&mut Command::new("python"))
-        .args(["-c", "import RAiDER"])
-        .status()
+    let py = spawn_isolated(Command::new("python").args(["-c", "import RAiDER"]))
+        .and_then(|mut child| child.wait())
         .map(|s| s.success())
         .unwrap_or(false);
     py || which("raider.py")
@@ -30,9 +29,8 @@ pub fn raider_available() -> bool {
 
 /// `raider.py` reachable on `PATH`.
 fn which(bin: &str) -> bool {
-    exclude_inherited_descriptors(&mut Command::new("command"))
-        .args(["-v", bin])
-        .status()
+    spawn_isolated(Command::new("command").args(["-v", bin]))
+        .and_then(|mut child| child.wait())
         .map(|s| s.success())
         .unwrap_or(false)
 }
@@ -49,10 +47,7 @@ pub fn run_raider(config: &Path, output: &Path, var: &str) -> Result<DelayGrid> 
     if !raider_available() {
         return Err(CorrectionError::RaiderUnavailable);
     }
-    let status = exclude_inherited_descriptors(&mut Command::new("raider.py"))
-        .arg("--file")
-        .arg(config)
-        .status()?;
+    let status = spawn_isolated(Command::new("raider.py").arg("--file").arg(config))?.wait()?;
     if !status.success() {
         return Err(CorrectionError::Raider(format!(
             "raider.py exited with {status}"

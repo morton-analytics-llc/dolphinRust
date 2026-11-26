@@ -292,6 +292,17 @@ All notable changes to dolphinRust are documented here. The format follows
   not worse than the old on any frozen metric, and no reduction in junction steps was measured.
 
 ### Fixed
+- **A spawn no longer races an HDF5 close-then-reopen** (issue #258). Marking descriptors
+  close-on-exec (#214) left the window between `fork` and `exec`: a child forked while an HDF5
+  file was open still shared its `flock` until it exec'd, so a reopen in that window failed
+  with `EAGAIN`. That was the intermittent `ingests_synthesized_l4_netcdf` /
+  `classic_and_netcdf4_reads_agree` failure, where the child was `raider_available`'s probe
+  in a parallel test (reproduced in an Ubuntu 24.04 container, about 1 run in 40). The new
+  `dolphin_core::process::spawn_isolated` holds `hdf5::sync::sync` across the spawn, which
+  returns only after exec, and on Linux marks descriptors close-on-exec with one
+  `close_range` call instead of one `fcntl` per possible descriptor. SNAPHU and all three
+  RAiDER spawns use it; `exclude_inherited_descriptors` is now private. The quarantined
+  troposphere test runs again.
 - **A globally all-nonfinite burst no longer aborts the whole run** (issue #245, eo#833). A
   burst that only grazes the AOI's discovery box can have zero finite pixels on every date; the
   issue #8 / D1 check in `TiledPhaseLinkStats::finish` correctly refuses to fabricate a result
